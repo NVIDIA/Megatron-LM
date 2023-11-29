@@ -345,7 +345,7 @@ class Graph:
         return order, t, best_time
 
 
-def initial_solution(graph):
+def initial_solution(graph, print_result=True):
     best_time, order, complete_time = None, None, None
     for allow_bubble_before_first_b in [True, False]:
         for prioritize_b in [True, False]:
@@ -360,8 +360,9 @@ def initial_solution(graph):
                     order = order_t
                     complete_time = complete_time_t
 
-    print_detail(graph, complete_time)
-    print("-" * 20, best_time, "-" * 20)
+    if print_result:
+        print_detail(graph, complete_time)
+        print("-" * 20, best_time, "-" * 20)
     return best_time, order, complete_time
 
 
@@ -701,6 +702,10 @@ def auto_schedule(nstages, nmb, config):
     else:
         best_time, order, complete_time = initial_solution(graph)
         return ilp_results(graph, complete_time)
+
+def do_heuristic_search(nstages, nmb, config):
+    graph = Graph.build_graph(nstages, nmb, config)
+    return initial_solution(graph, print_result=False)
 
 
 if __name__ == "__main__":

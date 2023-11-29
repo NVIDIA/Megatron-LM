@@ -113,51 +113,51 @@ class PipelineGraph(object):
                 pending_w[stage].append((2, chunk, _cnt))
             count[stage][cat * 2 + chunk] += 1
 
-        for _ in range(2 * self.n_stage):
-            for i in range(self.n_stage):
-                if count[i][1] >= count[i][0]:
-                    put(0, 0, i, assert_cnt=False)
-                    continue
-                if i == self.n_stage - 1:
-                    put(0, 1, i, assert_cnt=False)
-                    continue
-                fa_id = self.get_id(0, 1, i + 1, count[i][1])
-                if 0 <= end_time[fa_id] < cur_time[i + 1]:  # TODO
-                    put(0, 1, i, assert_cnt=False)
-                else:
-                    put(0, 0, i, assert_cnt=False)
+        # for _ in range(2 * self.n_stage):
+        #     for i in range(self.n_stage):
+        #         if count[i][1] >= count[i][0]:
+        #             put(0, 0, i, assert_cnt=False)
+        #             continue
+        #         if i == self.n_stage - 1:
+        #             put(0, 1, i, assert_cnt=False)
+        #             continue
+        #         fa_id = self.get_id(0, 1, i + 1, count[i][1])
+        #         if 0 <= end_time[fa_id] < cur_time[i + 1]:  # TODO
+        #             put(0, 1, i, assert_cnt=False)
+        #         else:
+        #             put(0, 0, i, assert_cnt=False)
 
-        # for i in range(self.n_stage):
-        #     put(0, 0, i)
-        # for i in range(self.n_stage - 1, -1, -1):
-        #     if i == self.n_stage - 1:
-        #         put(0, 1, i)
-        #         continue
-        #     tmp = end_time[self.get_id(0, 1, i + 1, 0)] + self.c_cost
-        #     while mem[i] + self.fbw_mem[0] * (2 + i * 2) <= self.max_mem and cur_time[i] + self.fbw_cost[0] <= tmp and count[i][0] < self.n_micro:
-        #         for j in range(i + 1):
-        #             put(0, 0, j)
-        #     put(0, 1, i)
-        # iter_chunk_ = 0
-        # end_tmp = 0
-        # for i in range(self.n_stage):
-        #     if i == 0:
-        #         end_tmp = cur_time[0] + self.fbw_cost[1]
-        #         continue
-        #     tmp = end_tmp + self.c_cost
-        #     while count[i][0] + count[i][1] < count[i - 1][0] + count[i - 1][1]:
-        #         for j in range(self.n_stage - 1, i - 1, -1):
-        #             if count[j][iter_chunk_] < self.n_micro:
-        #                 put(0, iter_chunk_, j)
-        #         iter_chunk_ = 1 - iter_chunk_
-        #     # while mem[i] + self.fbw_mem[0] <= self.max_mem and cur_time[i] + self.fbw_cost[0] <= tmp:
-        #     #     if iter_chunk_ == 0 and count[i][0] >= count[i - 1][0]:
-        #     #         break
-        #     #     for j in range(self.n_stage - 1, i - 1, -1):
-        #     #         if count[j][iter_chunk_] < self.n_micro:
-        #     #             put(0, iter_chunk_, j)
-        #     #     iter_chunk_ = 1 - iter_chunk_
-        #     # end_tmp = max(tmp, cur_time[i]) + self.fbw_cost[1]
+        for i in range(self.n_stage):
+            put(0, 0, i)
+        for i in range(self.n_stage - 1, -1, -1):
+            if i == self.n_stage - 1:
+                put(0, 1, i)
+                continue
+            tmp = end_time[self.get_id(0, 1, i + 1, 0)] + self.c_cost
+            while mem[i] + self.fbw_mem[0] * (2 + i * 2) <= self.max_mem and cur_time[i] + self.fbw_cost[0] <= tmp and count[i][0] < self.n_micro:
+                for j in range(i + 1):
+                    put(0, 0, j)
+            put(0, 1, i)
+        iter_chunk_ = 0
+        end_tmp = 0
+        for i in range(self.n_stage):
+            if i == 0:
+                end_tmp = cur_time[0] + self.fbw_cost[1]
+                continue
+            tmp = end_tmp + self.c_cost
+            while count[i][0] + count[i][1] < count[i - 1][0] + count[i - 1][1]:
+                for j in range(self.n_stage - 1, i - 1, -1):
+                    if count[j][iter_chunk_] < self.n_micro:
+                        put(0, iter_chunk_, j)
+                iter_chunk_ = 1 - iter_chunk_
+            # while mem[i] + self.fbw_mem[0] <= self.max_mem and cur_time[i] + self.fbw_cost[0] <= tmp:
+            #     if iter_chunk_ == 0 and count[i][0] >= count[i - 1][0]:
+            #         break
+            #     for j in range(self.n_stage - 1, i - 1, -1):
+            #         if count[j][iter_chunk_] < self.n_micro:
+            #             put(0, iter_chunk_, j)
+            #     iter_chunk_ = 1 - iter_chunk_
+            # end_tmp = max(tmp, cur_time[i]) + self.fbw_cost[1]
 
         # init_bubble = get_max_stage_bubble()
         # print(stage_bubble)
@@ -288,7 +288,7 @@ class PipelineGraph(object):
                 _str += _c
             print(_str)
 
-    def get_v_schedule(self):
+    def get_v_schedule(self, only_run_time=False):
         schedule, end_time, max_bubble = None, None, None
         expected_time = sum(self.fbw_cost) * self.n_micro * 2
         for fill_b in [True, False]:
@@ -301,10 +301,12 @@ class PipelineGraph(object):
                     max_bubble = _max_bubble
                     schedule = _schedule
                     end_time = _end_time
+        if only_run_time:
+            return max_bubble + expected_time
         # self.print_details(end_time, print_scaling=1)
-        bubble_rate = max_bubble / expected_time
-        print("%2d %3d, [%5d %5d %5d], %6d -> %6.4f" % \
-              (self.n_stage, self.n_micro, *self.fbw_cost, self.max_mem // self.f_mem, bubble_rate))
+        bubble_rate = max_bubble / (expected_time + max_bubble)
+        print("%2d %3d, [%5d %5d %5d %5d], %6d -> %6.4f" % \
+              (self.n_stage, self.n_micro, *self.fbw_cost, self.c_cost, self.max_mem // self.f_mem, bubble_rate))
         local_order = [[] for _ in range(self.n_stage)]
         comm_id = {}
         comm_id_counter = 0
@@ -434,14 +436,24 @@ if __name__ == '__main__':
         # (32, 96, 10419, 10207, 7715, 408, 6144, 48, 64),
         # (32, 128, 10408, 10204, 7703, 408, 6144, 48, 64),
         # (32, 256, 10402, 10248, 7698, 460, 6144, 48, 64),
-        (4, 8, 6, 4, 4, 1, 4096, 32, 32),
+        # (4, 8, 6, 4, 4, 1, 4096, 32, 32),
         # (8, 24, 29444, 29718, 19927, 527, 4096, 32, 32),
+        # ( 8, 32, 16099, 16504,  7589,  540, 2304, 24, 16),
+        (16, 48, 14407, 14380,  9676, 1610, 4096, 32, 32),
+        (16, 64, 14412, 14393,  9688, 1621, 4096, 32, 32),
+        (16, 128,14316, 14306,  9639, 1619, 4096, 32, 32),
+        (24, 72,  6763,  6969,  5251,  755, 5120, 40, 48),
+        (24, 96,  6783,  6984,  5259,  758, 5120, 40, 48),
+        (24, 192, 6785,  6990,  5260,  770, 5120, 40, 48),
+        (32,  96, 9458,  9748,  7288,  879, 6144, 48, 64),
+        (32, 128, 9469,  9744,  7306,  892, 6144, 48, 64),
+        (32, 256, 9447,  9644,  7193,  887, 6144, 48, 64),
     ]
     s = 1024
 
     # h, a, s = 4096, 32, 1024
     # cost_f, cost_b, cost_w, cost_c = 29718, 29444, 19927, 527
-    for p, n, f, b, w, c, h, a, l in settings:
+    for p, n, f, b, w, c, h, a, _ in settings:
         mem_f = 34 * h + 5 * a * s
         mem_w = - 32 * h
         mem_b = - mem_w - mem_f
@@ -459,3 +471,4 @@ if __name__ == '__main__':
                 max_mem=mem_f * (p * 2 + m_offset),
             )
             graph.get_v_schedule()
+            break
