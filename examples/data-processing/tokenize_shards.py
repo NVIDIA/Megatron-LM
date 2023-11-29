@@ -20,6 +20,8 @@ def get_args():
     parser.add_argument("--tokenizer-module", type = str, default='megatron', choices=['megatron', 'nemo'], help="Which version of script will be used to tokenize the data.")
     group.add_argument("--tokenizer-model", type = str, help="Compute target path to the tokenizer.model file")
     group.add_argument("--tokenizer-type", type = str, help="Type of the tokenizer model", required=True)
+    parser.add_argument("--vocab-file", type = str, default=None, help="Vocab file of the tokenizer.", required=False)
+    parser.add_argument("--merge-file", type = str, default=None, help="Merge file of the tokenizer.", required=False)
     group.add_argument("--num-proc", type = int, help="Compute target number of workers per node", required=True)
     group.add_argument('--log-interval', type=int, default=10000, help='Loggin interval between tokenizer progress updates.')
     group.add_argument("--overwrite", action='store_true', help="Overwrite pre-existing bin-idx.")
@@ -27,7 +29,6 @@ def get_args():
     group = parser.add_argument_group(title='Misc. params.')
     parser.add_argument("--compute-target", type = str, default='azure', choices=['local', 'azure'], help="Conpute targets. Both --input-folder-path, --bin-idx-folder-path and --tokenizer-model should use same compute target. TODO: Enable cross compute.")
     group.add_argument("--dry-run", action='store_true', help="Simulate run before submitting jobs.")
-    
     
     args = parser.parse_args()
 
@@ -81,8 +82,19 @@ def match_pre_existing_bin_idx(input_shard_dict, output_shards_dict):
     return de_dup_shard_collection
 
 def local_submit_job(args):
-    num_file_workers = os.cpu_count()//args.num_proc
-    cmd = f"""python examples/data-processing/multiprocess_runner.py --glob-input-path {args.input_folder_path} --output-folder {args.bin_idx_folder_path} --tokenizer-model {args.tokenizer_model} --tokenizer-type {args.tokenizer_model} --num-proc {args.num_proc} --num-file-workers {num_file_workers}"""
+    per_file_workers = os.cpu_count()//args.num_proc
+    cmd = f"python examples/data-processing/multiprocess_runner.py "
+    cmd = cmd + f' --glob-input-path {args.input_folder_path}'
+    cmd = cmd + f' --output-folder {args.bin_idx_folder_path}'
+    cmd = cmd + f' --tokenizer-module {args.tokenizer_module}'
+    cmd = cmd + f' --tokenizer-type {args.tokenizer_type}'
+    cmd = cmd + f' --tokenizer-model {args.tokenizer_model}'
+    if args.vocab_file is not None: cmd = cmd + f' --vocab-file {args.vocab_file}'
+    if args.merge_file is not None: cmd = cmd + f' --merge-file {args.merge_file}'
+    cmd = cmd + f' --per-file-workers {per_file_workers}'
+    cmd = cmd + f' --num-file-workers {args.num_proc}'
+    cmd = cmd + f' --log-interval {args.log_interval}'
+    print(f"Running {cmd} ...")
     subprocess.check_output(cmd, shell=True)
 
 def azure_submit_jobs(args, input_shard_dict, script_path):
@@ -114,7 +126,9 @@ def azure_submit_jobs(args, input_shard_dict, script_path):
 
 def list_files_with_size(folder_path):
     file_path_with_size = {}
-    print(folder_path)
+    if os.path.isfile(folder_path):
+        file_path_with_size[folder_path] = os.path.getsize(folder_path)
+        return file_path_with_size
     for root, dirs, files in os.walk(folder_path):
         for file in files:
             file_path = os.path.join(root, file)
@@ -142,8 +156,7 @@ if __name__ == "__main__":
     script_path = os.path.abspath(__file__)
     args =  get_args()
     input_shard_dict = get_shard_info(args, args.input_folder_path)
-    print(input_shard_dict)
-    # output_shards_dict = get_shard_info(args, args.bin_idx_folder_path)
-    # if not args.overwrite:
-    #     input_shard_dict = match_pre_existing_bin_idx(input_shard_dict, output_shards_dict)
-    # submit_jobs(args, input_shard_dict, script_path)
+    output_shards_dict = get_shard_info(args, args.bin_idx_folder_path)
+    if not args.overwrite:
+        input_shard_dict = match_pre_existing_bin_idx(input_shard_dict, output_shards_dict)
+    submit_jobs(args, input_shard_dict, script_path)

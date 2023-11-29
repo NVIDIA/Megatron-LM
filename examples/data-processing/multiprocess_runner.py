@@ -19,14 +19,13 @@ if __name__ == "__main__":
     parser.add_argument("--per-file-workers", type = int, help="Number of workers per file", required=True)
     parser.add_argument("--num-file-workers", type = int, help="Number of file to be processed at the same time", required=True)
     parser.add_argument('--log-interval', type=int, default=1000, help='Interval between progress updates')
-    parser.add_argument('--path-to-nemo', type=int, default='/workspace/', help='Path to the nemo directory')
     
     
     args = parser.parse_args()
 
     def process(file):
         if args.tokenizer_module == 'nemo':
-            cmd = f"python {args.path_to_nemo}/scripts/nlp_language_modeling/preprocess_data_for_megatron.py"
+            cmd = f"python tools/preprocess_data_for_megatron.py"
             cmd = cmd + f' --tokenizer-library {args.tokenizer_type}'
         elif args.tokenizer_module == 'megatron':
             cmd = "python tools/preprocess_data.py"
@@ -44,15 +43,7 @@ if __name__ == "__main__":
 
     input_paths = glob(args.glob_input_path, recursive=True)
     with concurrent.futures.ProcessPoolExecutor(max_workers=args.num_file_workers) as executor:
-        for _out in tqdm(
-                executor.map(
-                        process, 
-                        [ input_path for input_path in input_paths ],
-                ),
-                total=len(input_paths),
-        ):
-                try:
-                    pass
-                except Exception as emsg:
-                    print("Exception msg: {}".format(emsg))
-                    raise
+        executor.map(
+                process, 
+                [ input_path for input_path in input_paths ],
+        )

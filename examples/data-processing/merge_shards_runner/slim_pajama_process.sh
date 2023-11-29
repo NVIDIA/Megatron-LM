@@ -6,5 +6,5 @@ find $PATH_TO_SLIM_PAJAMA/train -type f -name '*.jsonl' | sort | xargs -I {} cat
 find $PATH_TO_SLIM_PAJAMA/validation -type f -name '*.jsonl' | sort | xargs -I {} cat {} >> $PATH_TO_SLIM_PAJAMA/export/validation.jsonl
 find $PATH_TO_SLIM_PAJAMA/test -type f -name '*.jsonl' | sort | xargs -I {} cat {} >> $PATH_TO_SLIM_PAJAMA/export/test.jsonl
 
-split --line-bytes=43G --additional-suffix=.jsonl -d -a 4 $PATH_TO_SLIM_PAJAMA/export/train.jsonl $PATH_TO_SLIM_PAJAMA/export/train_
-rm $PATH_TO_SLIM_PAJAMA/export/train.jsonl
+# split --line-bytes=43G --additional-suffix=.jsonl -d -a 4 $PATH_TO_SLIM_PAJAMA/export/train.jsonl $PATH_TO_SLIM_PAJAMA/export/train_
+# rm $PATH_TO_SLIM_PAJAMA/export/train.jsonl
