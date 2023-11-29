@@ -43,7 +43,7 @@ done
 word_count=$(jq -r '.text' $output_file | wc -w)
 formatted_word_count=$(format_number $word_count)
 
-new_output_file="${output_file%.jsonl}_wc_${formatted_word_count}.jsonl"
+new_output_file="${output_file%.jsonl}_wc=${formatted_word_count}.jsonl"
 mv $output_file $new_output_file
 output_file=$new_output_file
 

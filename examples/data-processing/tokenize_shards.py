@@ -103,7 +103,7 @@ def azure_submit_jobs(args, input_shard_dict, script_path):
     with open(args.az_configs['az-sample-yaml-job-file']) as fileptr:
         data = yaml.safe_load(fileptr)
     sas_token = args.az_configs['az-sas-token']
-    prefix_command = f"""bash examples/data-processing/remote_az_batch_tokenize.sh """
+    prefix_command = f"""bash examples/data-processing/remote_scripts/remote_az_batch_tokenize.sh """
     for idx, (shard_name, size) in enumerate(input_shard_dict.items()):
         cmd= prefix_command
         cmd = cmd + f' \"{shard_name}\"'

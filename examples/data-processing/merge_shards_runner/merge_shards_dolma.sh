@@ -2,7 +2,7 @@
 NUM_TOKEN=43486543872
 
 python examples/data-processing/merge_shards.py \
---input-folder-path "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/dolma/data/c4/" \
+--input-folder-path "`https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data`/dolma/data/c4/" \
 --output-folder-path "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/dolma/merged_shards" \
 --prefix-name "en_dolma_c4_" \
 --az-configs "examples/configs/azure_login_configs.json" \
