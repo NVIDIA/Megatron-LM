@@ -89,9 +89,6 @@ def add_text_generate_args(parser):
 
 
 def init_megatron():
-    #args = get_args()
-    #print("ARGS: ", args)
-
     #if args.tokenizer_type == "GPT2BPETokenizer":
     #    tokenizer_args = {'tokenizer_type': 'GPT2BPETokenizer',
     #                                    'no_load_rng': True,
@@ -103,9 +100,10 @@ def init_megatron():
     #                'no_load_optim': True}
         
     initialize_megatron(extra_args_provider=add_text_generate_args,
-                        args_defaults = {'tokenizer_type': 'GPT2BPETokenizer',
-                                        'no_load_rng': True,
-                                        'no_load_optim': True})
+                        args_defaults = {'tokenizer_type': 'HFAutoTokenizer',
+                        'hf_autotokenizer_model': 'EleutherAI/gpt-neox-20b',
+                        'no_load_rng': True,
+                        'no_load_optim': True})
 
 
 
@@ -148,18 +146,13 @@ class MegatronEvaluateHarness(BaseLM):
     
     def _model_call(self, inps):
         self.forward_step = ForwardStep(self.model, max_batch_size = self.max_batch_size, max_sequence_length = self.max_length)
-        #print("IN MODEL CALL", inps.shape)
-        #print(self.tok_decode(inps[0,:]))
-        #print("IN MODEL CALL: ", inps.shape)
         with torch.no_grad():
             attention_mask, position_ids = _build_attention_mask_and_position_ids(inps)
             logits = self.forward_step(inps, position_ids, attention_mask)
             return logits
         
     def _model_generate(self,context, max_length, eos_token_id):
-        #print("IN MODEL GENERATE: ")
         args = get_args()
-        #print("ARGS EOS: ", args.eos_token_id)
         response, response_seg, response_logprobs, _ = \
         generate_and_post_process(
         self.model,
@@ -235,7 +228,7 @@ if __name__ == '__main__':
     
     # EXAMPLE COMMAND:
     # torchrun --nproc_per_node 8 --nnodes 1 --node_rank 0 --master_addr localhost --master_port 6000 evaluation.py --config /opt/Megatron-LM/examples/megarun_slurm/moe_1p3B_8E_bare.sh --checkpoint /checkpoints/megarun/ckpts_1p3b_bf16 --task-list openbookqa,arc_easy,winogrande,hellaswag,arc_challenge,piqa,boolq,lambada_openai
-    # task list openbookqa,arc_easy,winogrande,hellaswag,arc_challenge,piqa,boolq,lambada_openai
+    # task list openbookqa,arc_easy,winogrande,hellaswag,arc_challenge,piqa,boolq,lambada_openai,lambada_standard
     parser = argparse.ArgumentParser(description='Download evaluation harness', allow_abbrev=False)
     parser.add_argument('--config', type=str, help='Path to the model config file.')
     parser.add_argument('--checkpoint', type=str, help='Path to the model config file.')
