@@ -21,7 +21,7 @@ Experiments shows zero bubble pipeline parallelism can accelerate training up to
 
 **Notices**
 * ZBV schedule requires the number of layers per pipeline to be an even number, so that each stage can be splited into two virtual stages evenly.
-* To achieve a better throughput, we recommend setting `--num-layers` to a value to `k * pipeline-model-parallel-size - 2` where k can be any value $\gt1$. This is used to compensate for the additional embedding layer on the first/last pipeline stages which could otherwise brings bubble to all other stages.
+* To achieve a better throughput, we recommend setting `--num-layers` to a value to `k * pipeline-model-parallel-size - 2` where k can be any value $\ge1$. This is used to compensate for the additional embedding layer on the first/last pipeline stages which could otherwise brings bubble to all other stages.
 
 ## Zero Bubble Schedules
 The key of achieving zero bubble is to breaking a backward pass into a $B$ pass and $W$ pass. $B$ on one stage will only depend on the $B$ on its next stage, compared to depending on both $B$ and $W$ of in 1F1B.
@@ -36,7 +36,8 @@ The key of achieving zero bubble is to breaking a backward pass into a $B$ pass 
 * ZB2P
 ![image](https://hackmd.io/_uploads/S10QgvmV6.png)
 * ZBV - Each device is assigned to exactly 2 chunks (virtual stages), where white text colors represent the first chunk and black text colors represent the second chunk. The sequence of dependencies among model chunks follows a ”V” shape pattern for both the forward and backward passes.
-![image](https://hackmd.io/_uploads/HkCgLKEET.png)
+![image](https://hackmd.io/_uploads/Sk9uyY4ra.png)
+
 
 
     
