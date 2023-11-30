@@ -2,7 +2,6 @@ TOK_MODEL="https://allamllmstorageuks.blob.core.windows.net/tokenizer/tokenizer_
 TOK_TYPE="sentencepiece"
 INPUT_FOLDER_PATH="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/the_pile"
 BIN_IDX_PATH="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/the_pile_bin_idx"
-AZJOB_FILE="examples/data-processing/tokenize/tokenize.yaml"
 MATCHING_PREFIX_NAME="en_pile_"
 
 python examples/data-processing/tokenize_shards.py \

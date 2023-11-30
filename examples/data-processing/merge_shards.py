@@ -67,11 +67,12 @@ def group_shards(shard_dict, shard_size_limit):
     for shard_name, size_in_byte in  shard_dict.items():
         assert size_in_byte < shard_size_limit
         curr_group_size += size_in_byte
-        if curr_group_size > shard_size_limit:
-            groups.append((curr_group_size,copy.deepcopy(curr_group)))
-            curr_group = []
-            curr_group_size = 0
         curr_group.append(shard_name)
+        if curr_group_size > shard_size_limit:
+            curr_group_size -= size_in_byte
+            groups.append((curr_group_size,copy.deepcopy(curr_group)))
+            curr_group = [shard_name]
+            curr_group_size = size_in_byte
     if len(curr_group) > 0: groups.append((curr_group_size, curr_group))
     return groups
 

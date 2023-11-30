@@ -40,7 +40,7 @@ for arg in "$@"; do
     fi
 done
 
-# word_count=$(jq -r '.text' $output_file | wc -w)
+# word_count=$(python $output_file)
 # formatted_word_count=$(format_number $word_count)
 
 # new_output_file="${output_file%.jsonl}_wc=${formatted_word_count}.jsonl"
