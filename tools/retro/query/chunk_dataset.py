@@ -13,7 +13,7 @@ from pretrain_gpt import is_dataset_built_on_rank
 from tools.retro.db.utils import get_indexed_dataset_infos
 from tools.retro.utils import get_num_chunks_per_sample
 
-from .custom_gpt_dataset import RetroCustomGPTDataset, RetroCustomGPTDatasetConfig
+from .multi_split_gpt_dataset import MultiSplitGPTDataset, MultiSplitGPTDatasetConfig
 from .utils import get_neighbor_dirname, get_query_workdir
 
 
@@ -63,7 +63,7 @@ class ChunkDataset(torch.utils.data.Dataset):
 
 
 def core_retro_dataset_config_from_args(args, retro_args):
-    return RetroCustomGPTDatasetConfig(
+    return MultiSplitGPTDatasetConfig(
         is_built_on_rank=is_dataset_built_on_rank,
         random_seed=retro_args.retro_gpt_seed,
         sequence_length=retro_args.retro_gpt_seq_length,
@@ -85,7 +85,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
                  'for GPT ...')
     
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-        RetroCustomGPTDataset,
+        MultiSplitGPTDataset,
         train_val_test_num_samples,
         core_retro_dataset_config_from_args(args, retro_args)
     ).build()
