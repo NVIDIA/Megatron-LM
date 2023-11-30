@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class RetroDatasetConfig(GPTDatasetConfig):
+class RetroCustomGPTDatasetConfig(GPTDatasetConfig):
     """Configuration object for Megatron Core blended and megatron Retro datasets
 
     Attributes:
@@ -50,8 +50,8 @@ class RetroDatasetConfig(GPTDatasetConfig):
             )
 
 
-class RetroDataset(GPTDataset):
-    """The base Retro dataset
+class RetroCustomGPTDataset(GPTDataset):
+    """Retro's customized GPT dataset.
 
     Args:
         indexed_dataset (MMapIndexedDataset): The MMapIndexedDataset around which to build the
@@ -63,7 +63,7 @@ class RetroDataset(GPTDataset):
 
         index_split (Split): The indexed_indices Split
 
-        config (RetroDatasetConfig): The Retro-specific container for all config sourced parameters
+        config (RetroCustomGPTDatasetConfig): The Retro-specific container for all config sourced parameters
     """
 
     def __init__(
@@ -72,7 +72,7 @@ class RetroDataset(GPTDataset):
         indexed_indices: numpy.ndarray,
         num_samples: int,
         index_split: Split,
-        config: RetroDatasetConfig,
+        config: RetroCustomGPTDatasetConfig,
     ) -> None:
         super().__init__(indexed_dataset, indexed_indices, num_samples, index_split, config)
 
@@ -102,4 +102,4 @@ class RetroDataset(GPTDataset):
         Returns:
             List[str]: The key config attributes
         """
-        return super(RetroDataset, RetroDataset)._key_config_attributes() + ["split_preprocessing"]
+        return super(RetroCustomGPTDataset, RetroCustomGPTDataset)._key_config_attributes() + ["split_preprocessing"]

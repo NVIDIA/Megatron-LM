@@ -558,21 +558,12 @@ def _add_retro_args(parser):
                        'database.')
     group.add_argument("--retro-return-doc-ids", action="store_true",
                        help="Turn this on when preprocessing retro data.")
-    # >>>
     group.add_argument("--retro-attention-gate", type=float, default=1,
                        help="Gated cross attention.")
-    # group.add_argument("--retro-fix-sub-epoch", action="store_true",
-    #                    help="Fix the sub epoch issue for gpt dataset")
     group.add_argument("--retro-no-verify-neighbor-count", action="store_false",
                        dest="retro_verify_neighbor_count",
                        help="Skip verifying that len(GPT dataset) == len(saved "
                        "neighbors).")
-    # group.add_argument("--retro-split-preprocessing",
-    #                    help="Comma-separated list of proportions for training, "
-    #                    "validation, and test split, used during Retro "
-    #                    "preprocessing. The intersection of this value and "
-    #                    "'--split' is used to compute document ranges.")
-    # <<<
 
     # Enforce argument naming convention.
     for action in group._group_actions:

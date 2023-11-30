@@ -5,19 +5,16 @@ import torch
 
 from megatron import get_args, get_retro_args, print_rank_0
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.retro_dataset import RetroDatasetConfig
-from megatron.core.datasets.retro_dataset import RetroDataset
 from megatron.training import (
     build_train_valid_test_datasets as build_pretraining_train_valid_test_datasets,
     update_train_iters,
 )
+from pretrain_gpt import is_dataset_built_on_rank
 from tools.retro.db.utils import get_indexed_dataset_infos
 from tools.retro.utils import get_num_chunks_per_sample
 
+from .custom_gpt_dataset import RetroCustomGPTDataset, RetroCustomGPTDatasetConfig
 from .utils import get_neighbor_dirname, get_query_workdir
-
-from pretrain_gpt import is_dataset_built_on_rank
-
 
 
 class ChunkDataset(torch.utils.data.Dataset):
@@ -87,7 +84,7 @@ class ChunkDataset(torch.utils.data.Dataset):
 
 
 def core_retro_dataset_config_from_args(args, retro_args):
-    return RetroDatasetConfig(
+    return RetroCustomGPTDatasetConfig(
         is_built_on_rank=is_dataset_built_on_rank,
         random_seed=retro_args.retro_gpt_seed,
         sequence_length=retro_args.retro_gpt_seq_length,
@@ -112,7 +109,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
                  'for GPT ...')
     
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-        RetroDataset,
+        RetroCustomGPTDataset,
         train_val_test_num_samples,
         core_retro_dataset_config_from_args(args, retro_args)
     ).build()
