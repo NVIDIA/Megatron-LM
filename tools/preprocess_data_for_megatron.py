@@ -329,7 +329,7 @@ def main():
         else:
             fin = open(args.input, 'r', encoding='utf-8')
 
-        encoded_docs = pool.imap(encoder.encode, fin, 25)
+        encoded_docs = pool.imap(encoder.encode, fin, 1)
 
         for i, (doc, bytes_processed) in enumerate(encoded_docs, start=1):
             total_bytes_processed += bytes_processed

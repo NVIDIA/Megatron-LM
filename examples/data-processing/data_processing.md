@@ -74,7 +74,18 @@ To use the script, follow these steps:
 4. Run the script, providing the required command-line arguments. For example:
 
    ```bash
-   python examples/data-processing/tokenize_shards.py --az-subscription <subscription_id> --az-resource-group <resource_group> --az-workspace-name <workspace_name> --az-sas-token <sas_token> --az-sample-yaml-job-file <sample_job_file.yaml> --input-folder-path <input_folder> --bin-idx-folder-path <output_folder> --tokenizer-module megatron --tokenizer-type <tokenizer_type> --tokenizer-model <model_path> --num-proc 16
+   python examples/data-processing/tokenize_shards.py \
+    --az-subscription <subscription_id> 
+    --az-resource-group <resource_group> 
+    --az-workspace-name <workspace_name> 
+    --az-sas-token <sas_token> 
+    --az-sample-yaml-job-file <sample_job_file.yaml> 
+    --input-folder-path <input_folder> 
+    --bin-idx-folder-path <output_folder> 
+    --tokenizer-module megatron/nemo 
+    --tokenizer-type <tokenizer_type> 
+    --tokenizer-model <model_path> 
+    --num-proc 16
    ```
 
 5. The script will analyze the input data, check for existing tokenized files (if not overwriting), and submit tokenization jobs to the specified compute target.

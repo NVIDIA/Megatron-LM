@@ -58,7 +58,7 @@ if [ "$TOK_MODULE" = "megatron" ]; then
 
 elif [ "$TOK_MODULE" = "nemo" ]; then
     echo "Running tokenization via NeMo-Megatron module..."
-    python /workspace/nemo/scripts/nlp_language_modeling/preprocess_data_for_megatron.py \
+    python tools/preprocess_data_for_megatron.py \
     --input $SHARD_NAME \
     --output-prefix $SHARD_NAME_WITHOUT_EXT \
     --tokenizer-library $TOK_TYPE \
