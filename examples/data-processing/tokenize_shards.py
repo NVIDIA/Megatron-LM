@@ -54,7 +54,7 @@ def get_args() -> argparse.Namespace:
             args.az_configs['az-sample-yaml-job-file'] = args.az_sample_yaml_job_file
 
     if not args.bin_idx_folder_path.endswith("/"):
-        args.bin_idx_folder_path.endswith += '/'
+        args.bin_idx_folder_path += '/'
 
     return args
 
@@ -136,10 +136,10 @@ def azure_submit_jobs(args: argparse.Namespace, input_shard_dict: Dict[str, int]
             with open(az_yaml_file, 'w') as wrt_ptr:
                 yaml.dump(data, wrt_ptr, default_flow_style=False)
             cmd = f"az ml job create "
-            cmd = cmd + f' --subscription {args.az_configs['az-subscription']}'
-            cmd = cmd + f' --resource-group {args.az_configs['az-resource-group']}'
-            cmd = cmd + f' --workspace-name {args.az_configs['az-workspace-name']}'
-            cmd = cmd + f' ---file {az_yaml_file}'
+            cmd = cmd + f' --subscription {args.az_configs["az-subscription"]}'
+            cmd = cmd + f' --resource-group {args.az_configs["az-resource-group"]}'
+            cmd = cmd + f' --workspace-name {args.az_configs["az-workspace-name"]}'
+            cmd = cmd + f' --file {az_yaml_file}'
             subprocess.check_output(cmd, shell=True)
 
 def list_files_with_size(folder_path: str) -> Dict[str, int]:

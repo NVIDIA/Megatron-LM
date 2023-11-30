@@ -3,7 +3,6 @@ VOCAB_FILE="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-tra
 TOK_TYPE="sentencepiece"
 INPUT_FOLDER_PATH="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/test_dataset"
 BIN_IDX_PATH="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/test_dataset/nemo_bin_idx"
-MATCHING_PREFIX_NAME="en_test_"
 
 python examples/data-processing/tokenize_shards.py \
 --input-folder-path "$INPUT_FOLDER_PATH" \
@@ -23,7 +22,6 @@ VOCAB_FILE="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-tra
 TOK_TYPE="Llama2Tokenizer"
 INPUT_FOLDER_PATH="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/test_dataset"
 BIN_IDX_PATH="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/test_dataset/megatron_bin_idx/"
-MATCHING_PREFIX_NAME="en_test_"
 
 python examples/data-processing/tokenize_shards.py \
 --input-folder-path "$INPUT_FOLDER_PATH" \
