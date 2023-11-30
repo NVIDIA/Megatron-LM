@@ -669,6 +669,8 @@ def _add_logging_args(parser):
                        help='If set, calculate and log parameters norm.')
     group.add_argument('--log-num-zeros-in-grad', action='store_true',
                        help='If set, calculate and log the number of zeros in gradient.')
+    group.add_argument('--log-throughput', action='store_true',
+                       help='If set, calculate and log throughput per GPU.')
     group.add_argument('--timing-log-level', type=int,
                        default=0, choices=range(0,3),
                        help='Granularity level to measure and report timing. '
