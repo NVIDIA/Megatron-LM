@@ -644,7 +644,7 @@ class ParallelAttention(MegatronModule):
                                      head_dim)
                                      
     def split_tensor(self, mixed_x_layer):
-        query_layer = mixed_x_layer[:, :, :, :-2, :].reshape(mixed_x_layer.shape[:-1] + (-1, self.hidden_size_per_attention_head))
+        query_layer = mixed_x_layer[:, :, :, :-2, :].reshape(mixed_x_layer.shape[:2] + (-1, self.hidden_size_per_attention_head))
         key_layer = mixed_x_layer[:, :, :, -2, :]
         value_layer = mixed_x_layer[:, :, :, -1, :]
 
