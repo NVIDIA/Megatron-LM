@@ -1,6 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import numpy as np
 import torch
 from torch.nn.parameter import Parameter
 
@@ -148,16 +147,15 @@ class GroupedMLP(BaseMoELayer):
         global_hidden_states, global_indices = self.token_permutation(hidden_states)
 
         with torch.no_grad():
-            sorted, indices = torch.sort(global_indices, stable=True)
-            # Permutation of tokens
-            sorted_global_hidden_states = global_hidden_states[indices]
-            # Histogram the expert ids to identify the number of tokens routed to each expert
-            # Note that for np.histogram, all but the last (righthand-most) bin is half-open.
-            tokens_per_expert, bin_edges = np.histogram(
-                sorted.cpu(), bins=np.arange(self.config.num_moe_experts + 1)
-            )
-            tokens_per_expert = torch.tensor(tokens_per_expert).to(torch.long)
-            reverse_indices = indices.argsort()
+            sorted_indices = torch.argsort(global_indices)
+            # Permutation of tokens to each expert group.
+            sorted_global_hidden_states = global_hidden_states[sorted_indices]
+            # GroupedGEMM requires tokens_per_expert is on cpu.
+            tokens_per_expert = torch.histc(
+                global_indices,
+                bins=self.config.num_moe_experts,
+                min=0,
+                max=self.config.num_moe_experts-1).cpu()
 
         w1, w2 = (self.scale_grad(self.weight1), self.scale_grad(self.weight2))
         # Reshape the weights for the grouped GEMMs.
@@ -170,7 +168,8 @@ class GroupedMLP(BaseMoELayer):
 
         fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=True)
         # Un-permutation of tokens
-        output_total = fc2_output[reverse_indices]
+        original_order_ghs = torch.empty_like(fc2_output)
+        original_order_ghs[sorted_indices] = fc2_output
+        output_total, _ = self.token_unpermutation(original_order_ghs)
 
-        output_total, _ = self.token_unpermutation(output_total)
         return output_total, None
