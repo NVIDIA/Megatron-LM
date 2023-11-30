@@ -26,19 +26,19 @@ echo "LOG_INTERVAL " $LOG_INTERVAL
 echo "SAS_TOKEN " $SAS_TOKEN
 
 
-echo "Running azcopy copy \"$INPUT_FOLDER/$SHARD_NAME?$SAS_TOKEN\" \".\"" >> out.txt
+echo "Running azcopy copy \"$INPUT_FOLDER/$SHARD_NAME?$SAS_TOKEN\" \".\""
 azcopy copy "$INPUT_FOLDER/$SHARD_NAME?$SAS_TOKEN" "."
 
-echo "Running azcopy copy \"$TOK_MODEL?$SAS_TOKEN\" \".\"" >> out.txt
+echo "Running azcopy copy \"$TOK_MODEL?$SAS_TOKEN\" \".\""
 azcopy copy "$TOK_MODEL?$SAS_TOKEN" "."
 
 if [ "$VOCAB_FILE" != "None" ]; then
-echo "Running azcopy copy \"$VOCAB_FILE?$SAS_TOKEN\" \".\"" >> out.txt
+echo "Running azcopy copy \"$VOCAB_FILE?$SAS_TOKEN\" \".\"" 
 azcopy copy "$VOCAB_FILE?$SAS_TOKEN" "."
 fi
 
 if [ "$MERGE_FILE" != "None" ]; then
-echo "Running azcopy copy \"$MERGE_FILE?$SAS_TOKEN\" \".\"" >> out.txt
+echo "Running azcopy copy \"$MERGE_FILE?$SAS_TOKEN\" \".\""
 azcopy copy "$MERGE_FILE?$SAS_TOKEN" "."
 fi
 
@@ -73,9 +73,9 @@ else
 fi
 
 echo "Uploading bin ..."
-echo "azcopy copy $SHARD_NAME_WITHOUT_EXT\"_text_document.bin\"  \"$OUTPUT_FOLDER?$SAS_TOKEN\""  >> out.txt
+echo "azcopy copy $SHARD_NAME_WITHOUT_EXT\"_text_document.bin\"  \"$OUTPUT_FOLDER?$SAS_TOKEN\""
 azcopy copy $SHARD_NAME_WITHOUT_EXT"_text_document.bin"  "$OUTPUT_FOLDER?$SAS_TOKEN"
 
 echo "Uploading idx ..."
-echo "azcopy copy $SHARD_NAME_WITHOUT_EXT\"_text_document.idx\" \"$OUTPUT_FOLDER?$SAS_TOKEN\"" >> out.txt
+echo "azcopy copy $SHARD_NAME_WITHOUT_EXT\"_text_document.idx\" \"$OUTPUT_FOLDER?$SAS_TOKEN\""
 azcopy copy $SHARD_NAME_WITHOUT_EXT"_text_document.idx" "$OUTPUT_FOLDER?$SAS_TOKEN"

@@ -51,6 +51,9 @@ def get_args():
             print("Overloading config args from  --az-sample-yaml-job-file")
             args.az_configs['az-sample-yaml-job-file'] = args.az_sample_yaml_job_file
 
+    if not args.bin_idx_folder_path.endswith("/"):
+        args.bin_idx_folder_path.endswith += '/'
+
     return args
 
 def azcopy_list(path, sas_token):
@@ -83,7 +86,7 @@ def match_pre_existing_bin_idx(input_shard_dict, output_shards_dict):
     return de_dup_shard_collection
 
 def local_submit_job(args):
-    per_file_workers = os.cpu_count()//args.num_proc
+    num_file_workers = os.cpu_count()//args.num_proc
     cmd = f"python examples/data-processing/multiprocess_runner.py "
     cmd = cmd + f' --glob-input-path {args.input_folder_path}'
     cmd = cmd + f' --output-folder {args.bin_idx_folder_path}'
@@ -92,8 +95,8 @@ def local_submit_job(args):
     cmd = cmd + f' --tokenizer-model {args.tokenizer_model}'
     if args.vocab_file is not None: cmd = cmd + f' --vocab-file {args.vocab_file}'
     if args.merge_file is not None: cmd = cmd + f' --merge-file {args.merge_file}'
-    cmd = cmd + f' --per-file-workers {per_file_workers}'
-    cmd = cmd + f' --num-file-workers {args.num_proc}'
+    cmd = cmd + f' --per-file-workers {args.num_proc}'
+    cmd = cmd + f' --num-file-workers {num_file_workers}'
     cmd = cmd + f' --log-interval {args.log_interval}'
     print(f"Running {cmd} ...")
     subprocess.check_output(cmd, shell=True)
