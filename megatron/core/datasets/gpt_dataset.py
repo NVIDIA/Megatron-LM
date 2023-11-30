@@ -17,10 +17,7 @@ from megatron.core.datasets.utils import Split, log_single_rank
 logger = logging.getLogger(__name__)
 
 
-# >>>
-# @dataclass(kw_only=True)
 @dataclass
-# <<<
 class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Configuration object for Megatron Core blended and megatron GPT datasets
     """
@@ -216,22 +213,10 @@ class GPTDataset(MegatronDataset):
                 f"Build and save the {type(self).__name__} {self.index_split.name} indices",
             )
 
-            # >>>
-            raise Exception("rebuild?")
-            # <<<
-
             sequence_length = getattr(self.config, "sequence_length")
 
             if num_epochs == 1:
                 separate_final_epoch = False
-                # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-                # # ......... hacky: needs +1 samples .........
-                # # Handle case of using less than total available tokens.
-                # from megatron import get_args
-                # args = get_args()
-                # if args.retro_fix_sub_epoch:
-                #     num_tokens_per_epoch = type(num_tokens_per_epoch)(self.num_samples * sequence_length)
-                # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
             else:
                 # Get the number of samples for the last epoch
                 num_samples_sans_final_epoch = (
