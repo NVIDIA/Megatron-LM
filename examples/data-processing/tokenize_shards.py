@@ -3,9 +3,10 @@ import json
 import yaml
 import argparse 
 import subprocess
+from typing import Dict
 from datetime import datetime
 
-def get_args():
+def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Azure batch job submission for tokenization")
     group = parser.add_argument_group(title='Azure login params.')
     group.add_argument("--az-subscription", default=None, type = str, help="Azure subscription id.")
@@ -28,7 +29,8 @@ def get_args():
     group.add_argument("--overwrite", action='store_true', help="Overwrite pre-existing bin-idx.")
 
     group = parser.add_argument_group(title='Misc. params.')
-    parser.add_argument("--compute-target", type = str, default='azure', choices=['local', 'azure'], help="Conpute targets. Both --input-folder-path, --bin-idx-folder-path and --tokenizer-model should use same compute target. TODO: Enable cross compute.")
+    parser.add_argument("--compute-target", type = str, default='azure', choices=['local', 'azure'], help="Conpute targets. Both --input-folder-path, --bin-idx-folder-path"
+                        " and --tokenizer-model should use same compute target. TODO: Enable cross compute.")
     group.add_argument("--dry-run", action='store_true', help="Simulate run before submitting jobs.")
     
     args = parser.parse_args()
@@ -56,7 +58,7 @@ def get_args():
 
     return args
 
-def azcopy_list(path, sas_token):
+def azcopy_list(path: str, sas_token: str) -> Dict[str, int]:
     shard_dict = {}
     path_with_sas_token = f"{path}?{sas_token}"
     cmd = f"azcopy list \"{path_with_sas_token}\" --output-type json --machine-readable"
@@ -72,20 +74,21 @@ def azcopy_list(path, sas_token):
         shard_dict[pre_shard_name] = pre_shard_size
     return shard_dict
 
-def match_pre_existing_bin_idx(input_shard_dict, output_shards_dict):
+def match_pre_existing_bin_idx(input_shard_dict: Dict[str, int], output_shards_dict: Dict[str, int]) -> Dict[str, int]:
     de_dup_shard_collection = {}
     for shard_name, n_byte in input_shard_dict.items():
         is_done = False
         for pre_exist_shard_name, _ in output_shards_dict.items():
             if pre_exist_shard_name.startswith(shard_name):
-                print("Skipping...! Shard already in output folder. Potentially already processed by other process.")
+                print("Skipping...! Shard already in output folder."
+                      " Potentially already processed by other process.")
                 is_done = True
                 break
         if is_done is False:
             de_dup_shard_collection[shard_name] = n_byte
     return de_dup_shard_collection
 
-def local_submit_job(args):
+def local_submit_job(args: argparse.Namespace) -> None:
     num_file_workers = os.cpu_count()//args.num_proc
     cmd = f"python examples/data-processing/multiprocess_runner.py "
     cmd = cmd + f' --glob-input-path {args.input_folder_path}'
@@ -101,8 +104,7 @@ def local_submit_job(args):
     print(f"Running {cmd} ...")
     subprocess.check_output(cmd, shell=True)
 
-def azure_submit_jobs(args, input_shard_dict, script_path):
-    output_folder = os.path.dirname(script_path)
+def azure_submit_jobs(args: argparse.Namespace, input_shard_dict: Dict[str, int]) -> None:
     with open(args.az_configs['az-sample-yaml-job-file']) as fileptr:
         data = yaml.safe_load(fileptr)
     sas_token = args.az_configs['az-sas-token']
@@ -127,13 +129,20 @@ def azure_submit_jobs(args, input_shard_dict, script_path):
             data['code'] = "../"
             prefix_path = '.temp/'
             os.makedirs(prefix_path, exist_ok=True)
-            az_yaml_file = os.path.join(prefix_path, f'tokenize_{datetime.now().strftime("%Y-%m-%d-%H-%M-%S")}.yaml')
+            az_yaml_file = os.path.join(
+                prefix_path, 
+                f'tokenize_{datetime.now().strftime("%Y-%m-%d-%H-%M-%S")}.yaml'
+            )
             with open(az_yaml_file, 'w') as wrt_ptr:
                 yaml.dump(data, wrt_ptr, default_flow_style=False)
-            cmd = f"az ml job create --subscription {args.az_configs['az-subscription']} --resource-group {args.az_configs['az-resource-group']} --workspace-name {args.az_configs['az-workspace-name']} --file {az_yaml_file}"
+            cmd = f"az ml job create "
+            cmd = cmd + f' --subscription {args.az_configs['az-subscription']}'
+            cmd = cmd + f' --resource-group {args.az_configs['az-resource-group']}'
+            cmd = cmd + f' --workspace-name {args.az_configs['az-workspace-name']}'
+            cmd = cmd + f' ---file {az_yaml_file}'
             subprocess.check_output(cmd, shell=True)
 
-def list_files_with_size(folder_path):
+def list_files_with_size(folder_path: str) -> Dict[str, int]:
     file_path_with_size = {}
     if os.path.isfile(folder_path):
         file_path_with_size[folder_path] = os.path.getsize(folder_path)
@@ -145,15 +154,15 @@ def list_files_with_size(folder_path):
             file_path_with_size[file_path] = size
     return file_path_with_size
 
-def submit_jobs(args, input_shard_dict, script_path):
+def submit_jobs(args: argparse.Namespace, input_shard_dict: Dict[str, int]) -> None:
     if args.compute_target == "local":
         local_submit_job(args)
     elif args.compute_target == "azure":
-        return azure_submit_jobs(args, input_shard_dict, script_path)
+        return azure_submit_jobs(args, input_shard_dict)
     else:
         raise NotImplementedError()
 
-def get_shard_info(args, shard_folder):
+def get_shard_info(args: argparse.Namespace, shard_folder: str) -> Dict[str, int]:
     if args.compute_target == "local":
         return list_files_with_size(shard_folder)
     elif args.compute_target == "azure":
@@ -162,10 +171,9 @@ def get_shard_info(args, shard_folder):
         raise NotImplementedError()
 
 if __name__ == "__main__":
-    script_path = os.path.abspath(__file__)
     args =  get_args()
     input_shard_dict = get_shard_info(args, args.input_folder_path)
     output_shards_dict = get_shard_info(args, args.bin_idx_folder_path)
     if not args.overwrite:
         input_shard_dict = match_pre_existing_bin_idx(input_shard_dict, output_shards_dict)
-    submit_jobs(args, input_shard_dict, script_path)
+    submit_jobs(args, input_shard_dict)
