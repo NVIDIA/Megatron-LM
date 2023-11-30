@@ -62,36 +62,12 @@ class ChunkDataset(torch.utils.data.Dataset):
         }
 
 
-# >>>
-# def verify_indexed_dataset_order():
-#     '''Verify pretraining order same as DB order.'''
-
-#     args = get_retro_args()
-
-#     # DB dataset prefixes.
-#     db_indexed_dataset_infos = get_indexed_dataset_infos()
-#     db_prefixes = [ info["prefix"] for info in db_indexed_dataset_infos ]
-
-#     # Verify order & prefixes.
-#     assert len(args.data_path) >= 2, "blended dataset supported only."
-#     pretraining_prefixes = args.data_path[1:None:2]
-
-#     if len(db_prefixes) != len(pretraining_prefixes):
-#         raise Exception("inconsistent dataset count between db & pretraining.")
-#     if db_prefixes != pretraining_prefixes:
-#         raise Exception("inconsistent dataset order between db & pretraining.")
-# <<<
-
-
 def core_retro_dataset_config_from_args(args, retro_args):
     return RetroCustomGPTDatasetConfig(
         is_built_on_rank=is_dataset_built_on_rank,
         random_seed=retro_args.retro_gpt_seed,
         sequence_length=retro_args.retro_gpt_seq_length,
-        # >>>
-        # blend=retro_args.retro_gpt_data_path,
         blend=args.data_path if args.data_path is not None else retro_args.retro_gpt_data_path,
-        # <<<
         split=args.split,
         path_to_cache=args.data_cache_path,
         return_document_ids=retro_args.retro_return_doc_ids,
@@ -128,11 +104,6 @@ def get_chunk_dataset_map():
 
     args.iteration = 0
     args.consumed_train_samples = 0
-
-    # >>>
-    # # Verify indexed dataset order.
-    # verify_indexed_dataset_order()
-    # <<<
 
     # Datasets.
     print_rank_0(" > datasets.")
