@@ -96,3 +96,5 @@ To use the script, follow these steps:
 - The script can be extended or modified to support additional tokenization modules or compute targets as needed.
 
 - Please note that `--compute-target=local or azure` works different way. `--compute-target=azure` submits one shard at a time as a job to process, each of the job assumes they have `--num-proc` cpu cores in the node. `--compute-target=local` uses `--num-proc` to tokenize one single shard. If it has more than `--num-proc` shards, it calculates number of concurrent file to be processed by `os.cpu_count()//args.num_proc`.
+
+- Please note that all of your data need to be under same SAS token. So please make sure they are in same container. This is actually an intended feature to force user less messy with their data. 
