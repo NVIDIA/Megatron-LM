@@ -182,11 +182,11 @@ if __name__ == "__main__":
     model_names += "retro-open_inst_pp1_same_format_ctx1_843m_128_5e-6",
     model_names += "retro-qc_pp1_same_format_ctx1_843m_128_5e-6",
 
-    model_names += "retro-open_inst_pp1_same_format_ctx1_43b_128_5e-6",
+    # model_names += "retro-open_inst_pp1_same_format_ctx1_43b_128_5e-6",
     model_names += "retro-qc_pp1_same_format_ctx1_43b_128_5e-6",
 
     for model_name in model_names:
-        ckpt_path = "/lustre/fsw/adlr/adlr-nlp/boxinw/github-version/retro/Megatron-LM/checkpoints/applications/{}/".format(model_name)
+        ckpt_path = "/lustre/fsw/adlr/adlr-nlp/boxinw/no-hack-open-instructretro-megatron/checkpoints/applications/{}/".format(model_name)
 
         n_ctx = 5
         n_enc = 2
@@ -194,10 +194,10 @@ if __name__ == "__main__":
         # model_param = "843m"
         model_param = "843m" if "800m" in model_name or "843m" in model_name else "43b"
 
-        # prediction_file = ckpt_path + "/retro-generate-nq_{}_{}_{}_test_greedy_0_20000_{}.txt".format(
-        #     n_ctx, n_enc, model_param, iter)
-        prediction_file = ckpt_path + "/flex_gate_0_reuse_foundational_qa_nq_{}_{}_{}_test_greedy_0_20000_{}.txt".format(
+        prediction_file = ckpt_path + "/retro-generate-nq_{}_{}_{}_test_greedy_0_20000_{}.txt".format(
             n_ctx, n_enc, model_param, iter)
+        # prediction_file = ckpt_path + "/flex_gate_0_reuse_foundational_qa_nq_{}_{}_{}_test_greedy_0_20000_{}.txt".format(
+        #     n_ctx, n_enc, model_param, iter)
         ground_truth_file = "/lustre/fsw/adlr/adlr-nlp/boxinw/instruction_tuning_data/NQ/test.json"
 
         print(prediction_file)
@@ -209,8 +209,8 @@ if __name__ == "__main__":
 
         prediction_file = ckpt_path + "/retro-generate-ford_tasb_ftmsmarcominilm_chunkbysents150_benzlandroverford_retrieved_{}_{}_{}_test_greedy_0_20000_{}.txt".format(
             n_ctx, n_enc, model_param, iter)
-        prediction_file = ckpt_path + "/flex_gate_0_reuse_foundational_qa_ford_tasb_ftmsmarcominilm_chunkbysents150_benzlandroverford_retrieved_{}_{}_{}_test_greedy_0_20000_{}.txt".format(
-            n_ctx, n_enc, model_param, iter)
+        # prediction_file = ckpt_path + "/flex_gate_0_reuse_foundational_qa_ford_tasb_ftmsmarcominilm_chunkbysents150_benzlandroverford_retrieved_{}_{}_{}_test_greedy_0_20000_{}.txt".format(
+        #     n_ctx, n_enc, model_param, iter)
         ground_truth_file = "/lustre/fsw/adlr/adlr-nlp/boxinw/instruction_tuning_data/ford_tasb_ftmsmarcominilm_chunkbysents150_benzlandroverford_retrieved/test.json"
         print(prediction_file)
         print(ground_truth_file)
@@ -223,8 +223,8 @@ if __name__ == "__main__":
 
         prediction_file = ckpt_path + "/retro-generate-doc2dial_{}_{}_{}_test_greedy_0_20000_{}.txt".format(
             n_ctx, n_enc, model_param, iter)
-        prediction_file = ckpt_path + "/flex_gate_0_reuse_foundational_qa_doc2dial_{}_{}_{}_test_greedy_0_20000_{}.txt".format(
-            n_ctx, n_enc, model_param, iter)
+        # prediction_file = ckpt_path + "/flex_gate_0_reuse_foundational_qa_doc2dial_{}_{}_{}_test_greedy_0_20000_{}.txt".format(
+        #     n_ctx, n_enc, model_param, iter)
         ground_truth_file = "/lustre/fsw/adlr/adlr-nlp/zihanl/datasets/foundational-qa/multi-turn-qa/doc2dial/doc2dial_ftdragon_chatgptgen7k_chunk150_QA_test.json"
         print(prediction_file)
         print(ground_truth_file)

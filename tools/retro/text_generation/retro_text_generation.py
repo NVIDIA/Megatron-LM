@@ -22,11 +22,7 @@ import numpy as np
 import time
 import megatron.model
 from megatron.arguments import core_transformer_config_from_args
-from megatron.core.transformer.spec_utils import import_module
-from megatron.core.models.gpt.gpt_layer_specs import (
-    gpt_layer_with_transformer_engine_spec,
-    gpt_layer_with_transformer_engine_spec_moe
-)
+
 
 
 def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.model.GPTModel]:
@@ -42,41 +38,17 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
     Returns:
         Union[GPTModel, megatron.model.GPTModel]: The returned model
     """
-    args = get_args()
-
     print_rank_0('building GPT model ...')
     config = core_transformer_config_from_args(get_args())
 
-    if args.use_mcore_models:
-        if args.model_spec is not None:
-            transformer_layer_spec = import_module(args.model_spec)
-        else:
-            if args.num_experts is None:
-                transformer_layer_spec = gpt_layer_with_transformer_engine_spec
-            else:
-                transformer_layer_spec = gpt_layer_with_transformer_engine_spec_moe
-
-        model = GPTModel(
-            config=config,
-            transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.padded_vocab_size,
-            max_sequence_length=args.max_position_embeddings,
-            pre_process=pre_process,
-            post_process=post_process,
-            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
-            parallel_output=False,
-            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-            position_embedding_type=args.position_embedding_type,
-            rotary_percent=args.rotary_percent
-        )
-    else:
-        model = megatron.model.GPTModel(
-            config,
-            num_tokentypes=0,
-            parallel_output=False,
-            pre_process=pre_process,
-            post_process=post_process
-        )
+    # not support core model yet
+    model = megatron.model.GPTModel(
+        config,
+        num_tokentypes=0,
+        parallel_output=False,
+        pre_process=pre_process,
+        post_process=post_process
+    )
 
     return model
 

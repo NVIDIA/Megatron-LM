@@ -13,7 +13,7 @@ ckpt=${10}
 K=${11}
 retrieve=${12}
 
-QA_HOME="/lustre/fsw/adlr/adlr-nlp/boxinw/github-version/retro/Megatron-LM"
+QA_HOME="/lustre/fsw/adlr/adlr-nlp/boxinw/no-hack-open-instructretro-megatron"
 
 TOKENIZER_MODEL="/lustre/fsw/adlr/adlr-nlp/adlr-nlp-sharing/nvllm-1.1t/utils/mt_nlg_plus_multilingual_ja_zh_the_stack_frac_015_256k.model"
 
@@ -153,7 +153,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 MOUNTS="/lustre/fsw/adlr/adlr-nlp/"
 PARTITION="luna"
 DOCKER="gitlab-master.nvidia.com/adlr/megatron-lm/boxinw/retro.23.04"
-
+DOCKER="/lustre/fsw/adlr/adlr-nlp/boxinw/images/retro.23.09.sqsh"
 submit_job --gpu ${mod_par} --nodes ${pip_par} --email_mode never  --mounts $MOUNTS --partition $PARTITION --image $DOCKER  -c "$COMMAND" -n "generate_${model_size}_${TASK}" --duration 4
 # $COMMAND
 # -m torch.distributed.launch $DISTRIBUTED_ARGS 
