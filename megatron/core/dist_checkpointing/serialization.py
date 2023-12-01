@@ -5,7 +5,7 @@ import os
 from collections import Counter, defaultdict
 from itertools import chain
 from pathlib import Path
-from typing import Iterable, List, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -67,6 +67,8 @@ def load(
     if common_strategy is not None:
         raise NotImplementedError('The only supported common strategy is torch')
 
+    sharded_strategy = _verify_checkpoint_and_load_strategy(checkpoint_dir, sharded_strategy)
+
     checkpoint_dir = Path(checkpoint_dir)
     common_state_dict = load_common_state_dict(checkpoint_dir)
     if not sharded_state_dict:
@@ -74,10 +76,6 @@ def load(
 
     sharded_objects, sharded_state_dict = load_sharded_objects(sharded_state_dict, checkpoint_dir)
     merge(common_state_dict, sharded_objects)
-
-    saved_config = maybe_load_config(checkpoint_dir)
-    if saved_config is None:
-        raise CheckpointingException(f'{checkpoint_dir} is not a distributed checkpoint')
 
     sh_ten_factories, _ = extract_matching_values(
         sharded_state_dict,
@@ -93,6 +91,32 @@ def load(
     if validate_access_integrity:
         validate_sharding_integrity(nested_values(sharded_state_dict))
 
+    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir)
+
+    loaded_state_dict = apply_factory_merges(loaded_state_dict, sh_ten_factories)
+
+    merge(common_state_dict, loaded_state_dict)
+    return common_state_dict
+
+
+def _verify_checkpoint_and_load_strategy(
+    checkpoint_dir: str, sharded_strategy: Optional[LoadShardedStrategy] = None,
+) -> LoadShardedStrategy:
+    """ Verifies if checkpoint metadata exists and matches given strategy.
+
+    Args:
+        checkpoint_dir (str): checkpoint directory
+        sharded_strategy (LoadShardedStrategy, optional): load strategy to be verified
+            if compatible with the checkpoint content. If None, the default load strategy
+            for the checkpoint backend will be returned.
+    """
+    if not Path(checkpoint_dir).exists():
+        raise CheckpointingException(f'Checkpoint directory {checkpoint_dir} does not exist')
+
+    saved_config = maybe_load_config(checkpoint_dir)
+    if saved_config is None:
+        raise CheckpointingException(f'{checkpoint_dir} is not a distributed checkpoint')
+
     if sharded_strategy is None:
         sharded_strategy = get_default_strategy(
             StrategyAction.LOAD_SHARDED,
@@ -102,17 +126,20 @@ def load(
     else:
         # TODO: implement consistency checks here
         pass
-    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir)
 
-    loaded_state_dict = apply_factory_merges(loaded_state_dict, sh_ten_factories)
-
-    merge(common_state_dict, loaded_state_dict)
-    return common_state_dict
+    return sharded_strategy
 
 
 # TODO: implement it as common torch strategy
 def load_common_state_dict(checkpoint_dir: Path):
-    return torch.load(Path(checkpoint_dir) / COMMON_STATE_FNAME, map_location='cpu')
+    load_path = Path(checkpoint_dir) / COMMON_STATE_FNAME
+    try:
+        return torch.load(load_path, map_location='cpu')
+    except FileNotFoundError as e:
+        err_msg = f'Common file {load_path} does not exist'
+        ckpt_files = [f.name for f in checkpoint_dir.iterdir()]
+        logger.debug(f'{err_msg}. Checkpoint directory content: {ckpt_files}')
+        raise CheckpointingException(err_msg) from e
 
 
 def load_sharded_objects(sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
@@ -123,7 +150,20 @@ def load_sharded_objects(sharded_state_dict: ShardedStateDict, checkpoint_dir: P
     def load_sharded_object(sh_obj: ShardedObject):
         sh_obj.data = None
         load_path = (checkpoint_dir / sh_obj.unique_key).with_suffix('.pt')
-        loaded_obj = torch.load(load_path)
+        try:
+            loaded_obj = torch.load(load_path)
+        except FileNotFoundError as e:
+            err_msg = f'Object shard {load_path} not found'
+            obj_subdir = checkpoint_dir / sh_obj.key
+            if obj_subdir.exists():
+                obj_files = [f.name for f in obj_subdir.iterdir()]
+                logger.debug(f'{err_msg}. Object {sh_obj.key} directory content: {obj_files}')
+            else:
+                ckpt_files = [f.name for f in checkpoint_dir.iterdir()]
+                logger.debug(
+                    f'{err_msg}. Object {sh_obj.key} directory does not exist. Checkpoint directory content: {ckpt_files}'
+                )
+            raise CheckpointingException(err_msg) from e
         return loaded_obj
 
     return dict_list_map_inplace(load_sharded_object, sharded_objects), sharded_state_dict
@@ -144,19 +184,7 @@ def load_tensors_metadata(
     Concrete implementation depends on the loading strategy. If no strategy is
     given, a default for a given backend is used.
     """
-    saved_config = maybe_load_config(checkpoint_dir)
-    if saved_config is None:
-        raise CheckpointingException(f'{checkpoint_dir} is not a distributed checkpoint')
-
-    if sharded_strategy is None:
-        sharded_strategy = get_default_strategy(
-            StrategyAction.LOAD_SHARDED,
-            saved_config.sharded_backend,
-            saved_config.sharded_backend_version,
-        )
-    else:
-        # TODO: implement consistency checks here
-        pass
+    sharded_strategy = _verify_checkpoint_and_load_strategy(checkpoint_dir, sharded_strategy)
     return sharded_strategy.load_tensors_metadata(Path(checkpoint_dir))
 
 
