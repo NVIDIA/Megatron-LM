@@ -155,7 +155,8 @@ class GroupedMLP(BaseMoELayer):
                 global_indices,
                 bins=self.config.num_moe_experts,
                 min=0,
-                max=self.config.num_moe_experts-1).cpu()
+                max=self.config.num_moe_experts - 1,
+            ).cpu()
 
         w1, w2 = (self.scale_grad(self.weight1), self.scale_grad(self.weight2))
         # Reshape the weights for the grouped GEMMs.
