@@ -1,0 +1,2 @@
+
+python examples/data-processing/data_ratio_from_file.py --prefix-paths-from-json "examples/data-processing/data_signature/the_pile_tokenizer_v5_improved.json" --domain-ratio-from-json  "examples/pretrain-allam/training/allam_pile_1.3/data_ratio.json" --lang-select-prob-json "examples/pretrain-allam/training/allam_pile_1.3/lang_prob.json" --exclude-iterator-json "examples/pretrain-allam/training/allam_pile_1.3/exclude_iterator.json" --total-token 300000000000 --output-for-script
