@@ -20,11 +20,11 @@ def get_args() -> argparse.Namespace:
     group.add_argument("--input-folder-path", type = str, help="Compute target folder path to input jsonl files, each job process a single jsonl file.")
     group.add_argument("--output-folder-path", type = str, help="Compute target folder path to output folder path.")
     group.add_argument("--config-path-for-process-function", type = str, help="Config path for process function.")
-    group.add_argument("--overwrite", action='store_true', help="Overwrite pre-existing bin-idx.")
+    group.add_argument("--num-shards", type = int, default=1, help="How many shards to be processed in one pass.")
 
     group = parser.add_argument_group(title='Misc. params.')
-    parser.add_argument("--compute-target", type = str, default='azure', choices=['local', 'azure'], help="Conpute targets. Both --input-folder-path, --bin-idx-folder-path"
-                        " and --tokenizer-model should use same compute target. TODO: Enable cross compute.")
+    parser.add_argument("--compute-target", type = str, default='azure', choices=['local', 'azure'], help="Conpute targets. Both --input-folder-path, --output-folder-path"
+                        " TODO: Enable cross compute.")
     group.add_argument("--dry-run", action='store_true', help="Simulate run before submitting jobs.")
     
     args = parser.parse_args()
@@ -46,9 +46,6 @@ def get_args() -> argparse.Namespace:
         if args.az_sample_yaml_job_file is not None:
             print("Overloading config args from  --az-sample-yaml-job-file")
             args.az_configs['az-sample-yaml-job-file'] = args.az_sample_yaml_job_file
-
-    if not args.bin_idx_folder_path.endswith("/"):
-        args.bin_idx_folder_path += '/'
 
     return args
 
@@ -83,13 +80,30 @@ def match_pre_existing_bin_idx(input_shard_dict: Dict[str, int], output_shards_d
     return de_dup_shard_collection
 
 def parse_command(args, input_shard_dict):
-    for idx, (shard_name, size) in enumerate(input_shard_dict.items()):
+    shard_queue = []
+
+    def parse(queue):
         cmd = f"python examples/data-processing/remote_scripts/remote_process_shard.py "
-        cmd = cmd + f' --shard-name {args.shard_name}'
+        cmd = cmd + f' --shard-names ' + ' '.join([ name for name, size in queue])
         cmd = cmd + f' --input-folder-path {args.input_folder_path}'
         cmd = cmd + f' --output-folder-path {args.output_folder_path}'
         cmd = cmd + f' --config-path-for-process-function {args.config_path_for_process_function}'
-        print(f"RUN [{idx}][{shard_name}][{size/1000000000}GB]: {cmd}")
+        cmd = cmd + f' --compute-target {args.compute_target}'
+        _size = sum([size for name, size in queue])
+        return cmd, _size
+    
+    launch_cnt = 1
+    for idx, (shard_name, size) in enumerate(input_shard_dict.items()):
+        shard_queue.append((shard_name, size))
+        if len(shard_queue) == args.num_shards:
+            cmd, size = parse(shard_queue)
+            print(f"RUN [{launch_cnt}][{size/1000000000}GB]: {cmd}")
+            yield cmd
+            launch_cnt += 1
+            shard_queue = []
+    if len(shard_queue) > 0:
+        cmd, size = parse(shard_queue)
+        print(f"RUN [{launch_cnt}][{size/1000000000}GB]: {cmd}")
         yield cmd
 
 def local_submit_job(args: argparse.Namespace) -> None:
@@ -153,7 +167,4 @@ def get_shard_info(args: argparse.Namespace, shard_folder: str) -> Dict[str, int
 if __name__ == "__main__":
     args =  get_args()
     input_shard_dict = get_shard_info(args, args.input_folder_path)
-    output_shards_dict = get_shard_info(args, args.output_folder_path)
-    if not args.overwrite:
-        input_shard_dict = match_pre_existing_bin_idx(input_shard_dict, output_shards_dict)
     submit_jobs(args, input_shard_dict)
