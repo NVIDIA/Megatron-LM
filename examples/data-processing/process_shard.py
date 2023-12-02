@@ -84,7 +84,7 @@ def match_pre_existing_bin_idx(input_shard_dict: Dict[str, int], output_shards_d
 
 def parse_command(args, input_shard_dict):
     for idx, (shard_name, size) in enumerate(input_shard_dict.items()):
-        cmd = f"python examples/data-processing/remote_scripts/remote_shard_process.py "
+        cmd = f"python examples/data-processing/remote_scripts/remote_process_shard.py "
         cmd = cmd + f' --shard-name {args.shard_name}'
         cmd = cmd + f' --input-folder-path {args.input_folder_path}'
         cmd = cmd + f' --output-folder-path {args.output_folder_path}'
@@ -111,7 +111,7 @@ def azure_submit_jobs(args: argparse.Namespace, input_shard_dict: Dict[str, int]
             os.makedirs(prefix_path, exist_ok=True)
             az_yaml_file = os.path.join(
                 prefix_path, 
-                f'tokenize_{datetime.now().strftime("%Y-%m-%d-%H-%M-%S")}.yaml'
+                f'process_shard_{datetime.now().strftime("%Y-%m-%d-%H-%M-%S")}.yaml'
             )
             with open(az_yaml_file, 'w') as wrt_ptr:
                 yaml.dump(data, wrt_ptr, default_flow_style=False)
