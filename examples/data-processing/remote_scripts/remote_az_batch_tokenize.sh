@@ -73,7 +73,7 @@ fi
 
 python examples/data-processing/count_token_and_rename_bin_idx.py \
   --source-prefix-paths $SHARD_NAME_WITHOUT_EXT"_text_document.bin" \
-  --megatron-path '*'
+  --megatron-path '.'
 
 echo "Uploading bin ..."
 echo "azcopy copy *.bin\"  \"$OUTPUT_FOLDER?$SAS_TOKEN\""

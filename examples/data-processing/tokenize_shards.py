@@ -129,7 +129,7 @@ def azure_submit_jobs(args: argparse.Namespace, input_shard_dict: Dict[str, int]
         if not args.dry_run:
             data['command'] = cmd
             data['code'] = "../"
-            data['display_name'] = shard_name
+            data['display_name'] = "tokenize " + shard_name
             prefix_path = '.temp/'
             os.makedirs(prefix_path, exist_ok=True)
             az_yaml_file = os.path.join(

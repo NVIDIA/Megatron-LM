@@ -1,5 +1,5 @@
 
-NUM_TOKEN=43486543872
+NUM_TOKEN=91268055040
 
 python examples/data-processing/merge_shards.py \
 --input-folder-path "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/dolma/data/c4/" \
