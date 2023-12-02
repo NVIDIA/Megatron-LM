@@ -3,14 +3,14 @@
 $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
 command: >-
-  bash examples/pretrain-allam/training/allam_pile_1b_mlm/allam_pile_1b_mlm.sh \
+  bash examples/pretrain-allam/training/allam-1b_pile_mlm/allam-1b_pile_mlm.sh \
    ${{inputs.tokenizer_model_path}} \
    ${{inputs.bin_idx_data_dir}} \
    ${{outputs.data_cache}} \
    ${{outputs.checkpoint_dir}} \
    ${{outputs.checkpoint_dir}}
 
-display_name: allam_pile_1b_mlm
+display_name: allam-1b_pile_mlm
 
 experiment_name: 1b_mlm
 code: ../../../../
