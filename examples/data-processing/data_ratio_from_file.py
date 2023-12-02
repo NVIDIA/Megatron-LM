@@ -20,13 +20,17 @@ def get_args():
                        help='Total token to be sampled.')
     parser.add_argument('--verbose', action='store_true',
                        help='Print additional information')
-    parser.add_argument('--output-for-script', action='store_true',
-                       help='Print output for bash script content.')
+    parser.add_argument('--export-for-script', type=str,
+                       help='Export output to this file for running it in megatron format atgument.')
+    parser.add_argument('--prefix-for-file-path', type=str,
+                       help='Add additional prefix to the file path.')
     args = parser.parse_args()
     if args.source_prefix_paths is not None:
         assert args.prefix_paths_from_json is None
     if args.prefix_paths_from_json is not None:
         assert args.source_prefix_paths is None
+    if args.prefix_for_file_path.endswith("/"):
+        args.prefix_for_file_path = args.prefix_for_file_path[:-1]
     return args
 
 if __name__ == "__main__":
@@ -93,6 +97,11 @@ if __name__ == "__main__":
         print(f"\t\t{lang}:{token:_}")
     print("\n")
     lang_token = {k:0 for k, _ in lang_prob_dict.items()}
+    if args.output_for_script is not None:
+        if not args.output_for_script.endswish(".sh"): args.output_for_script = args.output_for_script + ".sh"
+        out_file_ptr = open(f"{args.output_for_script}", "w")
+        out_file_ptr.write("""
+        DATA_PATH=( --data-path """)
     for prob, iterator_name, total_token_to_be_sampled, total_token_exists in iterator_selection_prob:
         lang = iterator_name.split("_")[0]
         lang_token[lang] += total_token_to_be_sampled
@@ -100,5 +109,10 @@ if __name__ == "__main__":
             print(f"{prob} {os.path.basename(iterator_name)} {total_token_to_be_sampled:_} {total_token_exists:_} {total_token_to_be_sampled/total_token_exists}")
         else:
             __output_format = os.path.basename(iterator_name).replace('=', '\\=')
-            print(f"{prob} $BIN_IDX_PATH/{__output_format}")
+            print(f"{prob} {args.prefix_for_file_path}/{__output_format}")
+            if args.output_for_script is not None:
+                out_file_ptr.write(f"\n{prob} {args.prefix_for_file_path}/{__output_format}\n")
+    if args.output_for_script is not None:
+        out_file_ptr.write("\n)\nexport DATA_PATH\n")
+        out_file_ptr.close()
     print(f"\n\nOut of {args.total_token} token, language wise token distribution.\n{json.dumps(lang_token, indent=4)}")
