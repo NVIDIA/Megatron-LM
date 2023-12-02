@@ -18,3 +18,4 @@ user_logs
 examples/pretrain-llama/data-processing/tokenize/output.*
 examples/pretrain-llama/data-processing/merge_shard/output.yaml
 .temp/
+merge_shard.txt
