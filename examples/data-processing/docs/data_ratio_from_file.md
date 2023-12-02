@@ -1,40 +1,74 @@
 # Doc for data_ratio_from_file.py
 
-## Introduction
-This Python script is designed to process and select data sources based on certain criteria of the pretraining. It takes into account various parameters and input sources such as JSON files, file paths, and probabilities to create a data distribution by language.
+# Script Documentation
+
+## Overview
+This script is designed to preprocess data files and generate information for language model training. It takes input parameters and performs various operations like selecting data files, calculating language probabilities, and generating output information. Below is the documentation for the script.
+
+The script calculates the sampling probability distribution of each of the iterator (loaded from `*.bin`, `*.idx`).
 
 ## Usage
-To run the script, you need to provide the following command-line arguments:
+You can use the script with the following command line arguments:
 
-- `--source-prefix-paths`: A glob path to the folder where all the binary and index files are located. This argument is mutually exclusive with `--prefix-paths-from-json`.
-- `--prefix-paths-from-json`: A JSON file containing a list of file names. This argument is mutually exclusive with `--source-prefix-paths`.
-- `--domain-ratio-from-json`: Path to a JSON file that contains domain multipliers for different languages.
-- `--lang-select-prob-json`: Path to a JSON file that indicates the language selection probabilities.
-- `--exclude-iterator-json`: Path to a JSON file that lists restricted iterator names.
+- `--source-prefix-paths`: A glob path to the folder where all the binary (`bin`) and index (`idx`) files are located. This is an alternative to providing file names in a JSON format (`--prefix-paths-from-json`).
+
+- `--prefix-paths-from-json`: A JSON file containing a list of file names. This is an alternative to specifying `--source-prefix-paths`.
+
+- `--domain-ratio-from-json`: A JSON file specifying domain multipliers for languages.
+
+- `--lang-select-prob-json`: A JSON file indicating the language selection probabilities.
+
+- `--exclude-iterator-json`: A JSON file listing restricted iterator names.
+
 - `--total-token`: The total number of tokens to be sampled.
-- `--verbose`: Optional. If specified, the script will print additional information.
-- `--output-for-script`: Optional. If specified, the script will print output in a format suitable for a bash script.
 
-## Main Functionality
-Here is an overview of what the script does:
+- `--verbose`: A flag to print additional information.
 
-1. Parses command-line arguments using `argparse`.
-2. Validates the arguments to ensure that `--source-prefix-paths` and `--prefix-paths-from-json` are mutually exclusive.
-3. Reads input data from JSON files and sets up the necessary data structures.
-4. Processes the data and calculates language-specific token distributions.
-5. Calculates iterator selection probabilities based on language, domain, and domain multipliers.
-6. Prints the selected iterators and token distributions.
+- `--export-for-script`: The path to a file where the output will be exported in Megatron format.
 
-## Detailed Explanation
-- The script first parses command-line arguments using the `argparse` library.
-- It checks if either `--source-prefix-paths` or `--prefix-paths-from-json` is provided and asserts that they are mutually exclusive.
-- The script then reads input data from JSON files, including domain ratios, language selection probabilities, and excluded iterator names.
-- It processes the binary file paths based on certain naming conventions and filters out iterators based on the exclusion list.
-- For each valid iterator, it calculates language-specific token distributions and iterator selection probabilities.
-- The script prints the selected iterators, token distributions, and language-wise token distribution in JSON format.
+- `--prefix-for-file-path`: An additional prefix to be added to the file path.
+
+## Script Functionality
+The script performs the following main tasks:
+
+1. Parse command line arguments using the `argparse` module.
+
+2. Check for conflicts between `--source-prefix-paths` and `--prefix-paths-from-json` arguments.
+
+3. Remove trailing slashes from `--prefix-for-file-path`.
+
+4. Load necessary JSON files (`domain-ratio-from-json`, `lang-select-prob-json`, `exclude-iterator-json`) and store their data in corresponding dictionaries/lists.
+
+5. Process files from the specified paths or JSON, and calculate language-wise data distribution.
+
+6. Calculate probabilities for iterator selection and store them in a list.
+
+7. Ensure that the language probabilities match the total probability distribution.
+
+8. Print statistics about the total token count by language.
+
+9. If `--export-for-script` is provided, create a script file in the Megatron format with the selected files.
+
+10. Display language-wise token distribution.
+
+## Example Usage
+Here's an example of how to use the script:
+
+```bash
+python script.py \
+  --source-prefix-paths /path/to/data/files/ \
+  --domain-ratio-from-json domain_ratios.json \
+  --lang-select-prob-json lang_probabilities.json \
+  --exclude-iterator-json excluded_iterators.json \
+  --total-token 1000000 \
+  --verbose \
+  --export-for-script output_script.sh \
+  --prefix-for-file-path /data/
+```
 
 ## Output
-The script generates various output, including the list of selected iterators, token distributions by language, and language-wise token distribution. The output can be printed to the console or formatted for a bash script, depending on the specified options.
+Usually you can copy paste the output to your bash script. However if you want to bring the data argument programatically, you can use `--export-for-script` argument. It will create a bash file with a DATA_PATH bash variable. In your megatron launcher script, just simply source the `--export-for-script` and use the DATA_PATH variable as `${DATA_PATH[@]}`. 
 
-## Conclusion
-This script serves as a tool for selecting and processing data sources based on specific criteria, such as language, domain, and token distribution, for various natural language processing tasks. It provides flexibility in handling input data from both file paths and JSON files and allows for detailed control over data selection and distribution.
+## Notes
+- Make sure to provide the correct paths to the required JSON files.
+- The script is designed for a specific data preprocessing task and may require adjustments for different use cases.
