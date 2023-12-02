@@ -34,6 +34,8 @@ python examples/data-processing/merge_shards.py \
 --az-sample-yaml-job-file "examples/data-processing/az_templates/template_merge_shard.yaml" \
 --shard-size $NUM_TOKEN 
 
+NUM_TOKEN=63887638528
+
 python examples/data-processing/merge_shards.py \
 --input-folder-path "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/dolma/data/stack-code/" \
 --output-folder-path "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/dolma/merged_shards/" \
@@ -41,6 +43,8 @@ python examples/data-processing/merge_shards.py \
 --az-configs "examples/configs/azure_login_configs.json" \
 --az-sample-yaml-job-file "examples/data-processing/az_templates/template_merge_shard.yaml" \
 --shard-size $NUM_TOKEN 
+
+NUM_TOKEN=91268055040
 
 python examples/data-processing/merge_shards.py \
 --input-folder-path "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/dolma/data/wiki-en-simple/" \
