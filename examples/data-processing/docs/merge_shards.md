@@ -1,4 +1,4 @@
-# Documentation for the Provided Code
+# Doc for merge_shards.py
 
 The provided Python script is designed to facilitate the merging of data shards stored on Azure Blob Storage or locally, depending on the specified compute target. The script is intended to be used for batch job submission and can merge shards based on a given shard size limit.
 
@@ -89,5 +89,10 @@ Please ensure that you have the necessary Azure credentials and permissions to p
 
 Note:
 
-- If your folder has too many smaller sized file the script may fail due to long length of bash arguments.
+- If your folder has too many smaller sized file the script may fail due to long length of bash arguments. In that case you may have to process the data first. We had this issue in the slim pajama. Please take a look at the script at `examples/data-processing/merge_shards_runner/slim_pajama_process.sh`. 
+   - Solution to this problem: 
+      - Write the shard names in a text file.
+      - Instead of sending file names in bash args, send them via the text file.
+      - read the text file in the `data-processing/remote_scripts/remote_merge_shard.sh`
+      - make sure you have backward compatibility intact (read merge file list from arguments) in the script. 
 - merge shard can only merge. It cannot split. If your folder has a larger file than `--shard-size` it'll raise an argument. 
