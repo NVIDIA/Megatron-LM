@@ -20,6 +20,7 @@ def get_args() -> argparse.Namespace:
     group.add_argument("--input-folder-path", type = str, help="Compute target folder path to input jsonl files, each job process a single jsonl file.")
     group.add_argument("--output-folder-path", type = str, help="Compute target folder path to output folder path.")
     group.add_argument("--config-path-for-process-function", type = str, help="Config path for process function.")
+    group.add_argument("--overwrite", action='store_true', help="Overwrite pre-existing bin-idx.")
 
     group = parser.add_argument_group(title='Misc. params.')
     parser.add_argument("--compute-target", type = str, default='azure', choices=['local', 'azure'], help="Conpute targets. Both --input-folder-path, --bin-idx-folder-path"
@@ -81,36 +82,28 @@ def match_pre_existing_bin_idx(input_shard_dict: Dict[str, int], output_shards_d
             de_dup_shard_collection[shard_name] = n_byte
     return de_dup_shard_collection
 
+def parse_command(args, input_shard_dict):
+    for idx, (shard_name, size) in enumerate(input_shard_dict.items()):
+        cmd = f"python examples/data-processing/remote_scripts/remote_shard_process.py "
+        cmd = cmd + f' --shard-name {args.shard_name}'
+        cmd = cmd + f' --input-folder-path {args.input_folder_path}'
+        cmd = cmd + f' --output-folder-path {args.output_folder_path}'
+        cmd = cmd + f' --config-path-for-process-function {args.config_path_for_process_function}'
+        print(f"RUN [{idx}][{shard_name}][{size/1000000000}GB]: {cmd}")
+        yield cmd
+
 def local_submit_job(args: argparse.Namespace) -> None:
-    num_file_workers = os.cpu_count()//args.num_proc
-    cmd = f"python examples/data-processing/multiprocess_runner.py "
-    cmd = cmd + f' --input-folder-path {args.input_folder_path}'
-    cmd = cmd + f' --output-folder-path {args.output_folder_path}'
-    cmd = cmd + f' --config-path-for-process-function {args.config_path_for_process_function}'
-    print(f"Running {cmd} ...")
-    subprocess.check_output(cmd, shell=True)
+    for cmd in parse_command(args, input_shard_dict):
+        if not args.dry_run:
+            subprocess.check_output(cmd, shell=True)
 
 def azure_submit_jobs(args: argparse.Namespace, input_shard_dict: Dict[str, int]) -> None:
     with open(args.az_configs['az-sample-yaml-job-file']) as fileptr:
         data = yaml.safe_load(fileptr)
     sas_token = args.az_configs['az-sas-token']
-    prefix_command = f"""bash examples/data-processing/remote_scripts/remote_az_batch_tokenize.sh """
-    for idx, (shard_name, size) in enumerate(input_shard_dict.items()):
-        cmd= prefix_command
-        cmd = cmd + f' \"{shard_name}\"'
-        cmd = cmd + f' \"{args.input_folder_path}\"'
-        cmd = cmd + f' \"{args.bin_idx_folder_path}\"'
-        cmd = cmd + f' \"{args.tokenizer_module}\"'
-        cmd = cmd + f' \"{args.tokenizer_type}\"'
-        cmd = cmd + f' \"{args.tokenizer_model}\"'
-        cmd = cmd + f' \"{args.vocab_file}\"'
-        cmd = cmd + f' \"{args.merge_file}\"'
-        cmd = cmd + f' \"{args.num_proc}\"'
-        cmd = cmd + f' \"{args.log_interval}\"'
-        cmd = cmd + f' \"{sas_token}\"'
-        
-        print(f"RUN [{idx}][{shard_name}][{size/1000000000}GB]: {cmd}")
+    for cmd in parse_command(args, input_shard_dict):
         if not args.dry_run:
+            shard_name = cmd.split("--shard-name")[1].split()[0]
             data['command'] = cmd
             data['code'] = "../"
             data['display_name'] = shard_name
@@ -160,7 +153,7 @@ def get_shard_info(args: argparse.Namespace, shard_folder: str) -> Dict[str, int
 if __name__ == "__main__":
     args =  get_args()
     input_shard_dict = get_shard_info(args, args.input_folder_path)
-    output_shards_dict = get_shard_info(args, args.bin_idx_folder_path)
+    output_shards_dict = get_shard_info(args, args.output_folder_path)
     if not args.overwrite:
         input_shard_dict = match_pre_existing_bin_idx(input_shard_dict, output_shards_dict)
     submit_jobs(args, input_shard_dict)
