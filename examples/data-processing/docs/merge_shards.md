@@ -89,4 +89,5 @@ Please ensure that you have the necessary Azure credentials and permissions to p
 
 Note:
 
-- If your folder has too many smaller sized file the script may fail. 
+- If your folder has too many smaller sized file the script may fail due to long length of bash arguments.
+- merge shard can only merge. It cannot split. If your folder has a larger file than `--shard-size` it'll raise an argument. 
