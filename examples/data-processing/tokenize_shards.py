@@ -91,6 +91,8 @@ def match_pre_existing_bin_idx(input_shard_dict: Dict[str, int], output_shards_d
 def local_submit_job(args: argparse.Namespace) -> None:
     num_file_workers = os.cpu_count()//args.num_proc
     cmd = f"python examples/data-processing/multiprocess_runner.py "
+    if os.path.isdir(args.input_folder_path):
+        args.input_folder_path =  args.input_folder_path + "/*.jsonl"
     cmd = cmd + f' --glob-input-path {args.input_folder_path}'
     cmd = cmd + f' --output-folder {args.bin_idx_folder_path}'
     cmd = cmd + f' --tokenizer-module {args.tokenizer_module}'

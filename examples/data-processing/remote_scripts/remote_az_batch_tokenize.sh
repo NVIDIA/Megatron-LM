@@ -1,4 +1,3 @@
-
 SHARD_NAME=$1
 INPUT_FOLDER=$2
 OUTPUT_FOLDER=$3
@@ -72,10 +71,16 @@ else
     exit 1
 fi
 
+python examples/data-processing/count_token_and_rename_bin_idx.py \
+  --source-prefix-paths $SHARD_NAME_WITHOUT_EXT"_text_document.bin" \
+  --megatron-path '*'
+
 echo "Uploading bin ..."
-echo "azcopy copy $SHARD_NAME_WITHOUT_EXT\"_text_document.bin\"  \"$OUTPUT_FOLDER?$SAS_TOKEN\""
-azcopy copy $SHARD_NAME_WITHOUT_EXT"_text_document.bin"  "$OUTPUT_FOLDER?$SAS_TOKEN"
+echo "azcopy copy *.bin\"  \"$OUTPUT_FOLDER?$SAS_TOKEN\""
+azcopy copy *.bin  "$OUTPUT_FOLDER?$SAS_TOKEN"
 
 echo "Uploading idx ..."
-echo "azcopy copy $SHARD_NAME_WITHOUT_EXT\"_text_document.idx\" \"$OUTPUT_FOLDER?$SAS_TOKEN\""
-azcopy copy $SHARD_NAME_WITHOUT_EXT"_text_document.idx" "$OUTPUT_FOLDER?$SAS_TOKEN"
+echo "azcopy copy *.idx\" \"$OUTPUT_FOLDER?$SAS_TOKEN\""
+azcopy copy *.idx "$OUTPUT_FOLDER?$SAS_TOKEN"
+
+sleep infinity

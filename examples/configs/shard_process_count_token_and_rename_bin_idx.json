@@ -1,8 +1,0 @@
-{
-    "binary_to_run": "python", 
-    "path_to_the_script": "examples/data-processing/count_token_and_rename_bin_idx.py",
-    "args": {
-        "--source-prefix-paths": "az_data/*",
-        "--megatron-path": "./"
-    }
-}
