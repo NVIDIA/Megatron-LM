@@ -7,7 +7,7 @@ from typing import Dict
 from datetime import datetime
 
 def get_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Azure batch job submission for tokenization")
+    parser = argparse.ArgumentParser(description="Listing files in a folder.")
     group = parser.add_argument_group(title='Azure login params.')
     group.add_argument("--az-subscription", default=None, type = str, help="Azure subscription id.")
     group.add_argument("--az-resource-group", default=None, type = str, help="Azure subscription id.")
