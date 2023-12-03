@@ -82,5 +82,3 @@ azcopy copy *.bin  "$OUTPUT_FOLDER?$SAS_TOKEN"
 echo "Uploading idx ..."
 echo "azcopy copy *.idx\" \"$OUTPUT_FOLDER?$SAS_TOKEN\""
 azcopy copy *.idx "$OUTPUT_FOLDER?$SAS_TOKEN"
-
-sleep infinity
