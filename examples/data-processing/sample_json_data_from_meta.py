@@ -15,15 +15,16 @@ def load_jsonl_file(output_folder, file_path, meta_keys):
                 for meta_key in meta_keys:
                     meta_idx = meta_idx[meta_key]
                 if meta_idx not in fileptr_dict:
-                    file_path = f"{output_folder}/{meta_idx}.jsonl"
-                    mode = "a" if os.path.exists(file_path) else "w"
-                    fileptr_dict[meta_idx] = open(file_path, mode)
+                    jsonl_output_file_path = f"{output_folder}/{meta_idx}.jsonl"
+                    mode = "a" if os.path.exists(jsonl_output_file_path) else "w"
+                    fileptr_dict[meta_idx] = open(jsonl_output_file_path, mode)
                 fileptr_dict[meta_idx].write(f"{json.dumps(dt)}\n")
             except:
                 pass
 
 def process_files(output_folder_path, file_paths, meta_keys):
     for file_path in file_paths:
+        print("Processing file: ", file_path")
         try:
             load_jsonl_file(output_folder_path, file_path, meta_keys)
         except Exception as exc:
