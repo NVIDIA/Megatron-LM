@@ -862,6 +862,9 @@ def _add_training_args(parser):
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd'],
                        help='Optimizer function')
+    group.add_argument('--warmup-optimizer-states', action='store_true',
+                       default=False, 
+                       help='freezes the model in place and just updates optimizer states')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic'],
                        help='Single pass vs multiple pass data loader')
