@@ -15,7 +15,9 @@ def load_jsonl_file(output_folder, file_path, meta_keys):
                 for meta_key in meta_keys:
                     meta_idx = meta_idx[meta_key]
                 if meta_idx not in fileptr_dict:
-                    fileptr_dict[meta_idx] = open(f"{output_folder}/{meta_idx}.jsonl", "w")
+                    file_path = f"{output_folder}/{meta_idx}.jsonl"
+                    mode = "a" if os.path.exists(file_path) else "w"
+                    fileptr_dict[meta_idx] = open(file_path, mode)
                 fileptr_dict[meta_idx].write(f"{json.dumps(dt)}\n")
             except:
                 pass
