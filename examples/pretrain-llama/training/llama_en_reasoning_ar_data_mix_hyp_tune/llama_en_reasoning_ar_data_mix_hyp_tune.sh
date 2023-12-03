@@ -109,16 +109,14 @@ do
     
     source examples/pretrain-llama/training/llama_en_reasoning_ar_data_mix_hyp_tune/iterator_selection_prob.sh
 
-    echo DATA_PATH: $DATA_PATH
     # $BIN_IDX_PATH/$BIN_IDX_PATH/torchrun ${\DISTRIBUTED_ARGS[@]}\ pretrain_gpt.py\ \
-    # python pretrain_gpt.py \
-    #     ${GPT_MODEL_ARGS[@]} \
-    #     ${LOGISTICS_ARGS[@]} \
-    #     ${TRAINING_ARGS[@]} \
-    #     ${MODEL_PARALLEL_ARGS[@]} \
-    #     ${DATA_PATH[@]}
+    python pretrain_gpt.py \
+        ${GPT_MODEL_ARGS[@]} \
+        ${LOGISTICS_ARGS[@]} \
+        ${TRAINING_ARGS[@]} \
+        ${MODEL_PARALLEL_ARGS[@]} \
+        ${DATA_PATH[@]}
 
     rm examples/pretrain-llama/training/llama_en_reasoning_ar_data_mix_hyp_tune/iterator_selection_prob.sh
     rm examples/pretrain-llama/training/llama_en_reasoning_ar_data_mix_hyp_tune/lang_prob.json
-
 done

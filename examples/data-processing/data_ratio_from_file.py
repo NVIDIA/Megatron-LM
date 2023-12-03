@@ -106,8 +106,9 @@ if __name__ == "__main__":
     if args.export_script is not None:
         if not args.export_script.endswith(".sh"): args.export_script = args.export_script + ".sh"
         out_file_ptr = open(f"{args.export_script}", "w")
-        out_file_ptr.write("_DATA_PATH=( --data-path ")
+        out_file_ptr.write("DATA_PATH=( --data-path ")
     for prob, iterator_name, total_token_to_be_sampled, total_token_exists in iterator_selection_prob:
+        if (prob-0.0) < 1e-3: continue
         lang = iterator_name.split("_")[0]
         lang_token[lang] += total_token_to_be_sampled
         if args.verbose:
@@ -118,6 +119,7 @@ if __name__ == "__main__":
             if args.export_script is not None:
                 out_file_ptr.write(f"\n{prob} {args.prefix_for_file_path}/{__output_format}")
     if args.export_script is not None:
-        out_file_ptr.write("\n)\nexport DATA_PATH=${_DATA_PATH[@]}")
+        # out_file_ptr.write("\n)\nexport DATA_PATH=${_DATA_PATH[@]}")
+        out_file_ptr.write("\n)")
         out_file_ptr.close()
     print(f"\n\nOut of {args.total_token} token, language wise token distribution.\n{json.dumps(lang_token, indent=4)}")

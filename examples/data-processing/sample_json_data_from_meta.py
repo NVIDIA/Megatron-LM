@@ -24,7 +24,7 @@ def load_jsonl_file(output_folder, file_path, meta_keys):
 
 def process_files(output_folder_path, file_paths, meta_keys):
     for file_path in file_paths:
-        print("Processing file: ", file_path")
+        print("Processing file: ", file_path)
         try:
             load_jsonl_file(output_folder_path, file_path, meta_keys)
         except Exception as exc:
