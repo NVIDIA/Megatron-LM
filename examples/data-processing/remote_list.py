@@ -13,7 +13,6 @@ def get_args() -> argparse.Namespace:
     group.add_argument("--az-resource-group", default=None, type = str, help="Azure subscription id.")
     group.add_argument("--az-workspace-name", default=None, type = str, help="Azure subscription id.")
     group.add_argument("--az-sas-token", default=None, type = str, help="Azure blob SAS token")
-    group.add_argument("--az-sample-yaml-job-file", default=None, type = str, help="Path to a sample job file.")
     group.add_argument("--az-configs", default=None, type = str, help="Path to a sample job file.")
 
     group = parser.add_argument_group(title='I/O params.')
@@ -41,9 +40,6 @@ def get_args() -> argparse.Namespace:
         if args.az_sas_token is not None:
             print("Overloading config args from  --az-sas-token")
             args.az_configs['az-sas-token'] = args.az_sas_token
-        if args.az_sample_yaml_job_file is not None:
-            print("Overloading config args from  --az-sample-yaml-job-file")
-            args.az_configs['az-sample-yaml-job-file'] = args.az_sample_yaml_job_file
 
     return args
 
