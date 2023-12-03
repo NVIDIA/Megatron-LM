@@ -18,6 +18,7 @@ def get_args() -> argparse.Namespace:
 
     group = parser.add_argument_group(title='I/O params.')
     group.add_argument("--input-folder-path", type = str, help="Compute target folder path to input jsonl files, each job process a single jsonl file.")
+    group.add_argument("--export-data-signature", type = str, default=None, help="Export file names in data-signature format.")
 
     group = parser.add_argument_group(title='Misc. params.')
     parser.add_argument("--compute-target", type = str, default='azure', choices=['local', 'azure'], help="Conpute targets. Both --input-folder-path, --bin-idx-folder-path"
@@ -74,14 +75,6 @@ def list_files_with_size(folder_path: str) -> Dict[str, int]:
             file_path_with_size[file_path] = size
     return file_path_with_size
 
-def submit_jobs(args: argparse.Namespace, input_shard_dict: Dict[str, int]) -> None:
-    if args.compute_target == "local":
-        local_submit_job(args)
-    elif args.compute_target == "azure":
-        return azure_submit_jobs(args, input_shard_dict)
-    else:
-        raise NotImplementedError()
-
 def get_shard_info(args: argparse.Namespace, shard_folder: str) -> Dict[str, int]:
     if args.compute_target == "local":
         return list_files_with_size(shard_folder)
@@ -94,5 +87,9 @@ if __name__ == "__main__":
     args =  get_args()
     input_shard_dict = get_shard_info(args, args.input_folder_path)
     for shard_name, n_byte in input_shard_dict.items():
-        print(f"{shard_name}: {n_byte//1000000000} GB")    
+        print(f"{shard_name}: {n_byte//1000000000} GB")
+    if args.export_data_signature is not None:
+        with open(args.export_data_signature, 'w') as f:
+            shard_names = [ k for k in input_shard_dict.keys()]
+            json.dump(shard_names, f, indent=4)
     

@@ -72,3 +72,8 @@ Usually you can copy paste the output to your bash script. However if you want t
 ## Notes
 - Make sure to provide the correct paths to the required JSON files.
 - The script is designed for a specific data preprocessing task and may require adjustments for different use cases.
+- Note unless you have all the `*.bin` / `*.idx` downloaded in your local drive it is recommended to use `--prefix-paths-from-json` arguments. For `--prefix-paths-from-json` you only have to send a data signature of the `*.bin` / `*.idx`. Run the following command to create a data signature file,
+
+```
+python examples/data-processing/remote_list.py --help
+```
