@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.arguments import parse_args
-from megatron.core.models.gpt.gpt_layer_specs import gpt_layer_with_transformer_engine_spec_moe
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.grouped_mlp import GroupedMLP
 from megatron.core.transformer.switch_mlp import SwitchMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -46,8 +46,10 @@ class TestParallelGroupedMLP:
         ## Vanilla sequential GEMM
         # Set random seed for reproducability
         _set_random_seed(seed_=123, data_parallel_random_init=False)
+        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            self.num_experts, moe_grouped_gemm=False)
         self.switch_mlp_smm = SwitchMLP(tf_config,
-            gpt_layer_with_transformer_engine_spec_moe.submodules.mlp.submodules)
+            transformer_layer_spec.submodules.mlp.submodules)
 
         self.args = parse_args(ignore_unknown_args=True)
         self.args.bf16=True

@@ -25,11 +25,8 @@ from megatron.utils import (
     average_losses_across_data_parallel_group
 )
 from megatron.arguments import core_transformer_config_from_args
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_transformer_engine_spec,
-    gpt_layer_with_transformer_engine_spec_moe,
-    gpt_layer_with_transformer_engine_spec_moe_grouped_gemm,
-)
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+
 
 def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.model.GPTModel]:
     """Builds the model.
@@ -53,12 +50,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
         if args.spec is not None:
             transformer_layer_spec = import_module(args.spec)
         else:
-            if args.num_experts is None:
-                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec()
-            elif args.moe_grouped_gemm:
-                transformer_layer_spec = gpt_layer_with_transformer_engine_spec_moe_grouped_gemm
-            else:
-                transformer_layer_spec = gpt_layer_with_transformer_engine_spec_moe
+            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm)
 
         model = GPTModel(
             config=config,

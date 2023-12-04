@@ -8,7 +8,7 @@ from megatron.core.transformer.switch_mlp import SwitchMLP
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.gpt.gpt_layer_specs import gpt_layer_with_transformer_engine_spec_moe
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 
 class TestParallelSwitchMLP:
 
@@ -16,9 +16,11 @@ class TestParallelSwitchMLP:
         Utils.initialize_model_parallel(1,1)
         model_parallel_cuda_manual_seed(123)
         print("done intializing")
-        transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, num_moe_experts= 2, use_cpu_initialization=True)
-        self.switch_mlp = SwitchMLP(transformer_config,
-                       gpt_layer_with_transformer_engine_spec_moe.submodules.mlp.submodules)
+        num_moe_experts = 2
+        transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, num_moe_experts=num_moe_experts, use_cpu_initialization=True)
+        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=num_moe_experts, moe_grouped_gemm=False)
+        self.switch_mlp = SwitchMLP(transformer_config, transformer_layer_spec.submodules.mlp.submodules)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
