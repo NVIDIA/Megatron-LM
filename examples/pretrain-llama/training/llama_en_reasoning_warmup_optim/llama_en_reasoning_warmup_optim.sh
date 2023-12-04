@@ -33,8 +33,8 @@ LOGISTICS_ARGS=(
     --tokenizer-model $TOKENIZER_MODEL
     --split 9998,1,1 
     --log-interval 10
-    --save-interval 500 
-    --eval-interval 500
+    --save-interval 200 
+    --eval-interval 200
     --eval-iters 10
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     --tensorboard-log-interval 10
@@ -56,7 +56,7 @@ TRAINING_ARGS=(
     --clip-grad 1.0 
     --lr 1.0e-5
     --min-lr 1.0e-5
-    --lr-warmup-iters 1000
+    --lr-warmup-iters 100
     --lr-decay-style cosine 
     --use-flash-attn
     --bf16
