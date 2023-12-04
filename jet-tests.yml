@@ -1,0 +1,63 @@
+.jet_common:
+  stage: jet
+  rules:
+    - if: '"JET" =~ $TESTS_TO_RUN_ON_THIS_COMMIT'
+    - if: $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH && "JET" =~ $TESTS_TO_RUN_AFTER_MERGING
+    - if: $CI_MERGE_REQUEST_APPROVED && "JET" =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
+    - if: '$CI_MERGE_REQUEST_LABELS == "READY FOR REVIEW" && "JET" =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED'
+
+jet-generate:
+  extends: .jet_common
+  tags:
+    - docker_local_runner
+  variables:
+    JET_WORKLOADS_REF_MAIN: megatron-core
+    JET_WORKLOADS_REF_EPHEMERAL: ephemeral/${CI_PROJECT_PATH_SLUG}/${CI_PIPELINE_ID}
+  script:
+    - wget https://github.com/mikefarah/yq/releases/download/v4.35.2/yq_linux_amd64.tar.gz -O - | tar xz && mv yq_linux_amd64 /usr/local/bin/yq
+    - git clone https://gitlab-ci-token:${JET_WORKLOADS_TOKEN}@gitlab-master.nvidia.com/dl/jet/workloads-registry jet-workloads-registry 
+
+    - cd jet-workloads-registry
+    - git config user.name "Megatron-LM CI"  
+    - git config user.email "megatron-lm@ci.nvidia.com"  
+
+    - git checkout -f "$JET_WORKLOADS_REF_MAIN"
+    - git checkout -b "$JET_WORKLOADS_REF_EPHEMERAL"
+
+    - yq e ".spec.source.ref = \"${CI_COMMIT_REF_NAME}\"" -i recipes/build-pyt.yaml 
+
+    - git add recipes/build-pyt.yaml
+    - git commit -m "Dynamic configuration - ${CI_PIPELINE_ID}"
+    - git push origin "$JET_WORKLOADS_REF_EPHEMERAL"
+
+jet-trigger:
+  extends: .jet_common
+  needs: [ jet-generate ]
+  when: on_success
+  inherit:
+    variables:
+      - CI_PROJECT_PATH_SLUG
+      - CI_PIPELINE_ID
+      - TESTS_TO_RUN_ON_THIS_COMMIT
+      - TESTS_TO_RUN_AFTER_MERGING
+      - TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
+  variables:
+    JET_WORKLOADS_REF: ephemeral/${CI_PROJECT_PATH_SLUG}/${CI_PIPELINE_ID}
+    JET_WORKLOADS_FILTER: "True"
+  trigger:
+    project: dl/jet/ci
+    branch: megatron-core
+    strategy: depend
+
+jet-functional-results:
+  extends: .jet_common
+  tags:
+    - docker_local_runner
+  image: gitlab-master.nvidia.com:5005/dl/jet/api:latest
+  needs: [ jet-trigger ]
+  when: on_success
+  before_script:
+    - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $CI_JOB_JWT
+  script: 
+    - python -m pip install -U --no-cache-dir prettytable
+    - python tests/functional_tests/python_test_utils/jet_check_pipeline_job_statuses.py "ephemeral/${CI_PROJECT_PATH_SLUG}/${CI_PIPELINE_ID}"

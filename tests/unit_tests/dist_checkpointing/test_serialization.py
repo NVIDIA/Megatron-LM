@@ -222,3 +222,30 @@ class TestSerialization:
         assert not any(map(bool, diffs)), diffs
 
         Utils.destroy_model_parallel()
+
+    def test_load_error_msg(self, tmp_path_dist_ckpt):
+        ckpt_dir_name = 'test_load_error_msg'
+        Utils.initialize_model_parallel(1, 1)
+        sh_ten = ShardedTensor.from_rank_offsets('keyA', torch.rand(10), replica_id=Utils.rank)
+        state_dict = {'some_key': sh_ten}
+
+        # Non-existent directory
+        non_ex_path = f'/tmp/non-existent-path/{ckpt_dir_name}'
+        with pytest.raises(CheckpointingException) as exc_info:
+            load(state_dict, non_ex_path)
+        assert f'directory {non_ex_path} does not exist' in str(exc_info.value)
+
+        with TempNamedDir(tmp_path_dist_ckpt / ckpt_dir_name) as ckpt_dir:
+            torch.distributed.barrier()
+            # Empty directory - not a distributed checkpoint
+            with pytest.raises(CheckpointingException) as exc_info:
+                load(state_dict, ckpt_dir)
+            assert f'is not a distributed checkpoint' in str(exc_info.value)
+
+            # Missing Zarr arrays
+            torch.distributed.barrier()
+            save(state_dict, ckpt_dir)
+            sh_ten.key = 'different_key'
+            with pytest.raises(CheckpointingException) as exc_info:
+                load(state_dict, ckpt_dir)
+            assert f'{ckpt_dir / "different_key"}' in str(exc_info.value)

@@ -60,7 +60,7 @@ def clip_grad_norm_fp32(parameters, grads_for_norm,
     # Calculate norm.
     if norm_type == inf:
         total_norm = max(grad.abs().max() for grad in grads_for_norm)
-        total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
+        total_norm_cuda = torch.tensor([float(total_norm)], dtype=torch.float, device='cuda')
         # Take max across all model-parallel GPUs.
         torch.distributed.all_reduce(total_norm_cuda,
                                      op=torch.distributed.ReduceOp.MAX,
@@ -69,7 +69,7 @@ def clip_grad_norm_fp32(parameters, grads_for_norm,
 
     else:
         if norm_type == 2.0:
-            dummy_overflow_buf = torch.cuda.IntTensor([0])
+            dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
             # Use apex's multi-tensor applier for efficiency reasons.
             # Multi-tensor applier takes a function and a list of list
             # and performs the operation on that list all in one kernel.
@@ -81,7 +81,7 @@ def clip_grad_norm_fp32(parameters, grads_for_norm,
                     False # no per-parameter norm
                 )
             else:
-                grad_norm = torch.cuda.FloatTensor([0])
+                grad_norm = torch.tensor([0], dtype=torch.float, device='cuda')
             # Since we will be summing across data parallel groups,
             # we need the pow(norm-type).
             total_norm = grad_norm ** norm_type
@@ -110,7 +110,7 @@ def clip_grad_norm_fp32(parameters, grads_for_norm,
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
     if clip_coeff < 1.0:
-        dummy_overflow_buf = torch.cuda.IntTensor([0])
+        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
         multi_tensor_applier(amp_C.multi_tensor_scale,
                              dummy_overflow_buf,
                              [grads, grads],
@@ -128,7 +128,7 @@ def count_zeros_fp32(parameters, model_parallel_group):
     #   - grad should not be none
     #   - parameter should not be shared
     #   - should not be a replica due to tensor model parallelism
-    total_num_zeros = torch.cuda.FloatTensor([0.0])
+    total_num_zeros = torch.tensor([0.0], dtype=torch.float, device='cuda')
     for param in parameters:
         grad_not_none = param.grad is not None
         is_not_shared = param_is_not_shared(param)

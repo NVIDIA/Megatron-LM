@@ -13,4 +13,8 @@ try:
     from .tensorstore import _import_trigger
     from .zarr import _import_trigger
 except ImportError:
-    logger.warning('Zarr-based strategies will not be registered because of missing packages')
+    # Only print warning on first rank.
+    import os
+
+    if int(os.getenv('RANK', '0')) == 0:
+        logger.warning('Zarr-based strategies will not be registered because of missing packages')

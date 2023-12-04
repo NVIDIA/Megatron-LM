@@ -63,7 +63,7 @@ if __name__ == "__main__":
         server.run("0.0.0.0",port=args.port)
 
     while True:
-        choice = torch.cuda.LongTensor(1)
+        choice = torch.tensor(1, dtype=torch.long, device='cuda')
         torch.distributed.broadcast(choice, 0)
         if choice[0].item() == 0:
             try:
