@@ -110,7 +110,6 @@ def retro_generate_tokens_probs_and_return_on_first_stage(
     with torch.no_grad():
         attention_mask, position_ids = _build_attention_mask_and_position_ids(
             tokens)
-        print(min_prompt_length, max_sequence_length)
         for context_length in range(min_prompt_length, max_sequence_length):
             prev_context_length = 0
             sizes_list = None

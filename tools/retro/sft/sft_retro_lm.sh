@@ -123,27 +123,28 @@ else
       --no-load-optim "
 fi
 
-DIR=`pwd`
-# -m torch.distributed.launch --nproc_per_node 8
-run_cmd="python -u ${DIR}/tools/retro/sft/sft_retro.py ${options}"
-# srun -l \
-#      --container-image "gitlab-master.nvidia.com/adlr/megatron-lm/boxinw/faissgpu" \
-#      --container-mounts "/home/pengx/projects/retro/:/home/pengx/projects/retro/" \
-#      --output=$DIR/logs/%x_%j_$DATETIME.log sh -c "${run_cmd}"
-# $run_cmd
+######## Command. ########
 
-export SUBMIT_LOGS="${SFT_HOME}/megatron-lm/logs"
-mkdir -p $SUBMIT_LOGS
+run_cmd="python -u ${SFT_HOME}/tools/retro/sft/sft_retro.py ${options}"
+
 export NCCL_DEBUG=INFO
-
 export NCCL_IB_TIMEOUT=19
 export NCCL_IB_SL=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-DOCKER="gitlab-master.nvidia.com/adlr/megatron-lm/boxinw/retro.23.04"
-MOUNTS="/lustre/fsw/"
-PARTITION="luna"
-LAUNCH="${ADLR_UTILS}/mp_launch"
+NPROCS=8
+CMD="\
+    pwd && cd ${SFT_HOME} && pwd && \
+    export PYTHONPATH=$PYTHONPATH:${SFT_HOME} && \
+    python -m torch.distributed.run \
+    --nproc_per_node ${NPROCS} \
+    --nnodes 1 \
+    --node_rank 0 \
+    --master_port 6000 \
+    ${run_cmd} \
+"
+echo "~~~~~~~~~~~~~~~~~~~~~~~~~~"
+echo "CMD = '$CMD'."
+echo "~~~~~~~~~~~~~~~~~~~~~~~~~~"
+eval $CMD
 
-echo ${run_cmd}
-submit_job --gpu ${num_gpus} --nodes ${num_nodes} --email_mode never  --mounts $MOUNTS --partition $PARTITION  --image $DOCKER -c "$LAUNCH ${run_cmd}" -n "${SAVENAME}" --duration 3  # --dependent_clones 1

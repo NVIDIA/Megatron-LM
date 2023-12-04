@@ -101,6 +101,8 @@ DISTRIBUTED_ARGS="--nproc_per_node ${mod_par} \
                   --node_rank 0 \
                   --master_port 8889"
 
+######## Command. ########
+
 COMMAND="python -m torch.distributed.run $DISTRIBUTED_ARGS ${DIR}/tools/retro/text_generation/retro_text_generation.py"
 
 COMMAND="$COMMAND \
@@ -110,18 +112,14 @@ COMMAND="$COMMAND \
        --micro-batch-size $micro_bsz \
        $FT_ARGS"
 
-export SUBMIT_LOGS="${QA_HOME}/megatron-lm/logs"
-mkdir -p $SUBMIT_LOGS
 export NCCL_DEBUG=INFO
-
 export NCCL_IB_TIMEOUT=19
 export NCCL_IB_SL=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-MOUNTS="/lustre/fsw/adlr/adlr-nlp/"
-PARTITION="luna"
-DOCKER="gitlab-master.nvidia.com/adlr/megatron-lm/boxinw/retro.23.04"
 
-submit_job --gpu ${mod_par} --nodes ${pip_par} --email_mode never  --mounts $MOUNTS --partition $PARTITION --image $DOCKER  -c "$COMMAND" -n "generate_${model_size}_${TASK}" --duration 4
-# $COMMAND
-# -m torch.distributed.launch $DISTRIBUTED_ARGS 
+echo "~~~~~~~~~~~~~~~~~~~~~~~~~~"
+echo "CMD = '$CMD'."
+echo "~~~~~~~~~~~~~~~~~~~~~~~~~~"
+eval $COMMAND
+

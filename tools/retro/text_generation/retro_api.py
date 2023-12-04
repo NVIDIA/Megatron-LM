@@ -189,26 +189,18 @@ def retro_generate(model,
     if torch.distributed.get_rank() == 0:
         assert prompts is not None
 
-    # print_rank_0(prompts)
     context_tokens_tensor, context_length_tensor = tokenize_prompts(
         prompts=prompts, tokens_to_generate=tokens_to_generate, add_BOS=add_BOS)
-    # print_rank_0(context_tokens_tensor)
-    print_rank_0("context_length_tensor:")
-    print_rank_0(context_length_tensor)
 
     retro_args = get_retro_args()
     retro_args.retro_gpt_chunk_length = context_length_tensor.item()
-    print("retro_args.retro_gpt_chunk_length", retro_args.retro_gpt_chunk_length)
 
     retro_args = get_retro_args()
     args = get_args()
     r = retro_args.retro_gpt_retrieved_length
     l = int(np.ceil(min(args.max_position_embeddings, context_tokens_tensor.size(1)) / retro_args.retro_gpt_chunk_length))
-    # print("neighbours_array:", neighbours_array.shape)
     if torch.distributed.get_rank() == 0:
         neighbours_array = neighbours_array.reshape(1, args.retro_num_neighbors, r).repeat(l, axis=0)  ## dim (l, k, r)
-    # print("l:", l)
-    # print("neighbor tokens shape:", neighbours_array.shape)
 
     if tokens_to_generate == 0:
         return score_and_return_on_first_stage(
