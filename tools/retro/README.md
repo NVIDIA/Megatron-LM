@@ -6,7 +6,7 @@ This README provides an end-to-end tutorial to reproduce InstructRetro.
 
 ## Citations
 
-See more details from our paper:
+See more details from our papers:
 
 [Shall we Pretrain Autoregressive Language Models with Retrieval? A Comprehensive Study.](https://arxiv.org/abs/2304.06762)
 
@@ -16,7 +16,7 @@ _Boxin Wang, Wei Ping, Peng Xu, Lawrence McAfee, Zihan Liu, Mohammad Shoeybi, Yi
 
 _Boxin Wang, Wei Ping, Lawrence McAfee, Peng Xu, Bo Li, Mohammad Shoeybi, Bryan Catanzaro._ 
 
-Please cite the paper as follows if you use the data or code from this repo:
+Please cite the papers as follows if you use the data or code from this repo:
 
 ```bibtex
 @inproceedings{wang2023shall,
@@ -40,23 +40,17 @@ In this README, we provide an end-to-end reproduction guide for InstructRetro, c
 
 ## Step 0: Prepare the environment
 
-We recommend using a` docker environment  to run the code.
+We recommend using docker environment to run the code.
 
 ### Docker image
 
-[//]: # (We provide docker images for the reproduction. )
 
-[//]: # ()
-[//]: # (```bash)
-
-[//]: # (```)
-
-We provide a [docker build file](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/retro/examples/Dockerfile) for the reproduction. The docker image is based on `nvcr.io/nvidia/pytorch:23.09-py3`.
+We provide a docker build file in [tools/retro/examples/Dockerfile](tools/retro/examples/Dockerfile) for the reproduction. The docker image is based on `nvcr.io/nvidia/pytorch:23.09-py3`.
 
 
 ### Install dependencies
 
-If docker is not available, we recommend start from a clean conda environment, including:
+If docker is not available, we recommend starting from a clean conda environment, including:
 - Python 3.10
 - NVIDIA CUDA® 12.2.1
 - NVIDIA cuBLAS 12.2.5.6
@@ -80,7 +74,7 @@ pip install -U einops
 
 In this step, we build a large-scale retrieval database for InstructRetro through [Faiss](https://github.com/facebookresearch/faiss) to retrieve from trillions of tokens, and preprocess (and save) the retrieval neighbors for the pretraining step.
 
-Please refer to `tools/retro/build_db.md` for more details.
+Please refer to [tools/retro/build_db.md](tools/retro/build_db.md) for more details.
 
 ## Step 2: Pretraining
 
