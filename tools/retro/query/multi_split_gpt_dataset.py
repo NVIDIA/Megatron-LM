@@ -1,8 +1,8 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from dataclasses import dataclass
+from typing import Dict, List
 
 import numpy
 import torch
@@ -37,6 +37,8 @@ class MultiSplitGPTDatasetConfig(GPTDatasetConfig):
     def __post_init__(self):
         super().__post_init__()
         assert self.split is not None, "the Retro data pipeline does not support 'blend_per_split'"
+        assert self.return_document_ids is not None, "this attribute must be user defined"
+        assert self.split_preprocessing is not None, "this attribute must be user defined"
         split_vector = parse_and_normalize_split(self.split)
         split_preprocessing_vector = parse_and_normalize_split(self.split_preprocessing)
         if not numpy.allclose(split_vector, split_preprocessing_vector):
@@ -102,4 +104,6 @@ class MultiSplitGPTDataset(GPTDataset):
         Returns:
             List[str]: The key config attributes
         """
-        return super(MultiSplitGPTDataset, MultiSplitGPTDataset)._key_config_attributes() + ["split_preprocessing"]
+        return super(MultiSplitGPTDataset, MultiSplitGPTDataset)._key_config_attributes() + [
+            "split_preprocessing"
+        ]
