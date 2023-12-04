@@ -241,24 +241,23 @@ With full global batch size of 1536 on 1024 A100 GPUs, each iteration takes arou
 
 
 Retro [(Borgeaud et al., 2022)](https://arxiv.org/abs/2112.04426) is an autoregressive decoder-only language model (LM) pretrained with retrieval-augmentation. 
-Retro features practical scalibility to support large-scale pretraining from scratch by retrieving
-trillions of token.
+Retro features practical scalibility to support large-scale pretraining from scratch by retrieving from trillions of token.
 Pretraining with retrieval provides a more efficient storage mechanism of factual knowledge, when compared to storing factual knowledge implicitly within the network's parameters, thus largely reducing model parameters while achieving lower perplexity than standard GPT. 
 Retro also provides the flexibility to update the
 knowledge stored in LMs [(Wang et al., 2023a)](https://arxiv.org/abs/2304.06762)
 by updating the retrieval database without training LMs again.
 
-InstructRetro [(Wang et al., 2023b)](https://arxiv.org/abs/2310.07713) further scales up the size of Retro to 48B, featuring the largest LLM pretrained with retrieval. 
+InstructRetro [(Wang et al., 2023b)](https://arxiv.org/abs/2310.07713) further scales up the size of Retro to 48B, featuring the largest LLM pretrained with retrieval (as of December 2023). 
 The obtained foundation model, Retro 48B, largely outperforms the GPT counterpart in terms of perplexity.
-With instruction tuning on Retro, InstructRetro demonstrates significant improvement over the instruction tuned GPT on downstream tasks in the zero-shot setting. Specifically, the average improvement of InstructRetro is 7% over its GPT counterpart across 8 short-form QA tasks, and 10% over GPT across 4 challenging long-form QA tasks. We also find that one can ablate the encoder from InstructRetro architecture and directly use InstructRetro decoder backbone as GPT, while achieving comparable results.
+With instruction tuning on Retro, InstructRetro demonstrates significant improvement over the instruction tuned GPT on downstream tasks in the zero-shot setting. Specifically, the average improvement of InstructRetro is 7% over its GPT counterpart across 8 short-form QA tasks, and 10% over GPT across 4 challenging long-form QA tasks. We also find that one can ablate the encoder from InstructRetro architecture and directly use the InstructRetro decoder backbone as GPT, while achieving comparable results.
 
 In this repo, we provide an end-to-end reproduction guide to implement Retro and InstructRetro, covering
-- **Retrieval database construction**, which supports billions or even trillions of tokens as large-scale retrieval database. 
+- **Retrieval database construction**, which supports billions or even trillions of tokens as a large-scale retrieval database. 
 - **Pretraining with retrieval**, which supports pretraining from scratch and pretraining from a pretrained GPT model (Retro-fitting).      
 - **Instruction tuning**, where we provide an open-source instruction tuning dataset and the training recipe for instruction tuning on Retro.
 - **Downstream task evaluation**, where we provide the text generation and evaluation scripts for zero-shot question answering tasks.
 
-Please see `tools/retro/README.md` for a detailed overview.
+Please see [tools/retro/README.md](tools/retro/README.md) for a detailed overview.
 
 <!--
 ## REALM Pipeline

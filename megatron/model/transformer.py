@@ -1125,6 +1125,7 @@ class ParallelTransformerLayer(MegatronModule):
                 norm_input,
                 (0, 0, 0, 0, pad, 0),
                 'constant', 0)[:ns] # [ns, b, d]
+            # TODO: better redesign with inference param
             args = get_args()
             norm_input = args.retro_attention_gate * norm_input + residual
 
@@ -1142,6 +1143,7 @@ class ParallelTransformerLayer(MegatronModule):
                 rotary_pos_emb=None):
 
         # Update the params in case the retro param changes during inference
+        # TODO: better redesign with inference param
         args = get_args()
         if args.retro_add_retriever:
             retro_args = get_retro_args()

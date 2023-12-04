@@ -45,11 +45,11 @@ Sample code flow:
 
 # Tutorial
 
-In this tutorial example, we use Wikipedia corpus to demonstrate how we build a retrieval database and index for this corpus, and then query the pretraining datasets for their neighbors.
+In this tutorial example, we use the Wikipedia corpus to demonstrate how we build a retrieval database and index for this corpus, and then query the pretraining datasets for their neighbors.
 
 ## Step 1: Prepare your retrieval text corpus
 
-The format of text corpus follows the same format as in Megatron training. See [data precessing](https://github.com/NVIDIA/Megatron-LM/tree/main#data-preprocessing) for more details on how to convert your json dataset into the mmap format.
+The format of text corpus follows the same format as in Megatron training. See [data precessing](README.md#data-preprocessing) for more details on how to convert your json dataset into the mmap format.
 
 Assume we have the Wikipedia corpus in the following format:
 
@@ -68,7 +68,7 @@ We discard chunks that would convert to an empty Bert sequence (rare case, happe
 
 Take the Wikipedia corpus as an example to build the retrieval chunk database:
 
-Prepare the following arguments and update our templates in `tools/retro/examples/preprocess_data.sh`:
+Prepare the following arguments and update our templates in [tools/retro/examples/preprocess_data.sh](tools/retro/examples/preprocess_data.sh):
 - `--retro-workdir`: The directory in which the preprocessing pipeline saves its datasets and configuration files. 
   **This argument should remain consistent for a full pass through the pipeline, and for pretraining.**
 - `--data-path`: text corpus path to build retrieval database. In the case of Wikipedia corpus, it could be
@@ -94,7 +94,7 @@ After the `db-build` is finished, the output includes:
 
 ## Step 3: Build index for similarity search
 
-To match pretraining chunks to database chunks, a search index must be built to perform this querying. We use Faiss (https://github.com/facebookresearch/faiss) for training and building this index. Generally, the index is trained on a subset of all chunks in the database (specified via `--retro-nchunks-sampled`). After training, all chunks are added into the index, to be available during querying.
+To match pretraining chunks to database chunks, a search index must be built to perform this querying. We use Faiss (https://github.com/facebookresearch/faiss) for training and building this index. Generally, the index is trained on a subset of all chunks in the database (specified via `--retro-index-ntrain`). After training, all chunks are added into the index, to be available during querying.
 
 Indexes only accept 1-D floating point vectors for training and adding, so each chunk must first be embedded before passing to the index for either training or adding. We use Bert embeddings for this purpose, and the embeddings are generated automatically within the pipeline.
 
@@ -413,6 +413,7 @@ See `tools/retro/main.py`'s `add_retro_args()` and `megatron/arguments.py`'s `_a
   - `--retro-add-retriever` : Must be used to select Retro model.
   - `--retro-num-neighbors` : Number of neighbors to retrieve from the retrieval database (defaults to 2).
   - `--retro-num-retrieved-chunks` : For each neighbor, the number consecutive chunks to retrieve, including the initial neighbor (defaults to 2).
+  - `--retro-attention-gate` : Gated mechanism to incorporate information of cross attention from retrieved neighbor  (defaults to 1 during pretraining).
 
 <!-- ################ pretraining ################ -->
 <!-- # Pretraining -->
