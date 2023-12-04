@@ -10,7 +10,7 @@ command: >-
    ${{outputs.checkpoint_dir}} \
    ${{outputs.checkpoint_dir}}
 
-display_name: allam-1b_dolma_mlm
+display_name: allam-1b_dolma_non_mcore
 
 experiment_name: 1b_mlm
 code: ../../../../
@@ -35,11 +35,11 @@ outputs:
   data_cache:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/allam_index_mapped_data_allamllmuksstandard/paths/allam-1b_dolma_mlm/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/allam_index_mapped_data_allamllmuksstandard/paths/allam-1b_dolma_non_mcore/
   checkpoint_dir:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/allam_checkpoints_allamllmuksstandard/paths/allam-1b_dolma_mlm/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/allam_checkpoints_allamllmuksstandard/paths/allam-1b_dolma_non_mcore/
 
 
 services:

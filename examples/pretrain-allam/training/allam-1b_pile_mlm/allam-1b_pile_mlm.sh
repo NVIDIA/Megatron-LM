@@ -26,7 +26,6 @@ GPT_MODEL_ARGS=(
     --swiglu
     --tokenizer-type Llama2Tokenizer
     --untie-embeddings-and-output-weights
-    --position_embedding_type 'rope'
     --use-rotary-position-embeddings
     --normalization RMSNorm
     --no-position-embedding
