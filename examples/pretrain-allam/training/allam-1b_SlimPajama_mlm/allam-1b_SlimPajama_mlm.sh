@@ -13,11 +13,11 @@ TENSORBOARD_LOGS_PATH=$5
 # )
 
 GPT_MODEL_ARGS=(
-    --use-mcore-models
     --seq-length 2048 
     --max-position-embeddings 2048 
     --num-layers 24
     --hidden-size 2048
+    --ffn-hidden-size 3072
     --num-attention-heads 16
     --hidden-dropout 0.0
     --attention-dropout 0.0
@@ -46,6 +46,7 @@ LOGISTICS_ARGS=(
     --tensorboard-log-interval 100
     --data-cache-path $DATA_CACHE
     --log-validation-ppl-to-tensorboard 
+    --seed 1234
 )
 
 TRAINING_ARGS=(
