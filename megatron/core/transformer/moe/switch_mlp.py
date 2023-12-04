@@ -3,10 +3,10 @@
 import numpy as np
 import torch
 
+from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 from .base_moe_layer import BaseMoELayer
-from .mlp import MLP, MLPSubmodules
 
 
 class SwitchMLP(BaseMoELayer):

@@ -9,7 +9,7 @@ from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_gpu,
 )
 from megatron.core.tensor_parallel.utils import divide
-from megatron.core.transformer import grouped_gemm_util as gg
+from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 from .base_moe_layer import BaseMoELayer

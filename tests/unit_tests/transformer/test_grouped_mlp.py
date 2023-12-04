@@ -7,8 +7,8 @@ import torch.nn.functional as F
 
 from megatron.arguments import parse_args
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.transformer.grouped_mlp import GroupedMLP
-from megatron.core.transformer.switch_mlp import SwitchMLP
+from megatron.core.transformer.moe.grouped_mlp import GroupedMLP
+from megatron.core.transformer.moe.switch_mlp import SwitchMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.initialize import _set_random_seed
 from megatron.model import Float16Module

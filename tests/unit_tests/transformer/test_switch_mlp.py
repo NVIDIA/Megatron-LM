@@ -4,7 +4,7 @@ import pytest
 
 import torch
 
-from megatron.core.transformer.switch_mlp import SwitchMLP
+from megatron.core.transformer.moe.switch_mlp import SwitchMLP
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
