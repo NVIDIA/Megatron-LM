@@ -49,7 +49,7 @@ In this tutorial example, we use the Wikipedia corpus to demonstrate how we buil
 
 ## Step 1: Prepare your retrieval text corpus
 
-The format of text corpus follows the same format as in Megatron training. See [data precessing](README.md#data-preprocessing) for more details on how to convert your json dataset into the mmap format.
+The format of text corpus follows the same format as in Megatron training. See [data precessing](../../README.md#data-preprocessing) for more details on how to convert your json dataset into the mmap format.
 
 Assume we have the Wikipedia corpus in the following format:
 
