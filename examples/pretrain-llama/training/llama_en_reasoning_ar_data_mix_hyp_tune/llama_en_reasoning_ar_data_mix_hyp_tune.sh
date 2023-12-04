@@ -1,3 +1,4 @@
+set -e
 
 PRETRAINED_LLAMA_MODEL_PATH=$1
 TOKENIZER_MODEL=$2
@@ -26,7 +27,7 @@ TOTAL_NUM_TOKENS=10_000_000_000
 # )
 
 
-for ENG_TOK in {0..10}
+for ENG_TOK in {2..10}
 do
     AR_TOK=$((10 - $ENG_TOK))
     echo "Training with ENG_TOK: $ENG_TOK"
