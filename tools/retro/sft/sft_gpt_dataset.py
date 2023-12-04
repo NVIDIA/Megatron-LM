@@ -12,11 +12,6 @@ from tools.retro.sft.dataset_conv import FtDataset as SFTDataset
 from tools.retro.sft.dataset_conv import get_processed_dataset
 
 
-MEGATRON_CORE_DUMMY_CONFIG = SimpleNamespace(
-    is_built_on_rank = lambda: mpu.get_tensor_model_parallel_rank() == 0,
-    path_to_cache = getattr(get_args(), "data_cache_path")
-)
-
 
 def build_train_valid_test_datasets(data_prefix, seq_length):
     """Build train, valid, and test datasets."""
@@ -56,6 +51,11 @@ def build_train_valid_test_datasets(data_prefix, seq_length):
             test_size += len(test_ds)
 
     # Blend
+    MEGATRON_CORE_DUMMY_CONFIG = SimpleNamespace(
+        is_built_on_rank=lambda: mpu.get_tensor_model_parallel_rank() == 0,
+        path_to_cache=getattr(get_args(), "data_cache_path")
+    )
+
     blending_train_dataset = None
     if train_datasets:
         blending_train_dataset = BlendedMegatronDatasetBuilder.build_generic_dataset(
