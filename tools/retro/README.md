@@ -78,11 +78,11 @@ Please refer to [tools/retro/build_db.md](tools/retro/build_db.md) for more deta
 
 ## Step 2: Pretraining
 
-*Please strictly follow the Step 1 to build the retrieval database before pretraining to make sure the preprocessed retrieval neighbors match the pretraining corpus.*
+*Please strictly follow Step 1 to build the retrieval database before pretraining to make sure the preprocessed retrieval neighbors match the pretraining corpus.*
 
 In the pretraining step, we support both pretraining from scratch and continued pretraining from a pretrained GPT model.
 
-We provide a template pretraining script to pretrain 800M Retro from scratch. Prepare your own arguments and update our templates in `tools/retro/examples/pretrain_model.sh`. Please note that the data path should be exactly matching the one used in Step 1 to make sure the preprocessed retrieval neighbors match the pretraining corpus.
+We provide a template pretraining script to pretrain 843M Retro from scratch. Prepare your own arguments and update our templates in [tools/retro/examples/pretrain_model.sh](tools/retro/examples/pretrain_model.sh). Please note that the data path should be exactly matching the one used in Step 1 to make sure the preprocessed retrieval neighbors match the pretraining corpus.
 
 [//]: # (Take the example of the Wikipedia corpus)
 
@@ -91,7 +91,9 @@ bash tools/retro/examples/pretrain_model.sh
 ```
 After pretraining, the model checkpoints will be saved in the `--save` directory if you specified the arg in `pretrain_model.sh`.
 
-To continue pretraining with retrieval from a pretrained GPT model, please specify `--load` in `pretrain_model.sh` to load the pretrained GPT model checkpoint (the architecture of GPT, including hidden size, number of layers, and activation methods, should be exactly the same as the one used for Retro). You should also specify   `--no-load-optim --finetune` to make sure the optimizer state is not loaded from the pretrained GPT model and the continued pretraining with retrieval is from a clean start.
+To continue pretraining with retrieval from a pretrained GPT model, please specify `--load` in `pretrain_model.sh` to load the pretrained GPT model checkpoint (the architecture of GPT, including hidden size, number of layers, and activation methods, should be exactly the same as the one used for Retro). You should also specify  `--no-load-optim --finetune` to make sure the optimizer state is not loaded from the pretrained GPT model and the continued pretraining with retrieval is from a clean start. After the first job / the first run, you will continue pretraining with retrieval from your last checkpoint. In the follow-up jobs, you should launch the pretraining without the flags `--no-load-optim --finetune` to make sure the optimizer state is correctly loaded from your last job.
+
+```bash 
 
 ## Step 3: Perplexity evaluation
 
@@ -105,9 +107,9 @@ bash tools/retro/examples/pretrain_model.sh
 
 ## Step 4: Instruction tuning
 
-In this step, we fine-tune the pretrained model on the downstream task with instructions. We provide a template instruction tuning script to fine-tune 800M Retro.
+In this step, we fine-tune the pretrained model on the downstream task with instructions. We provide a template instruction tuning script to fine-tune 843M Retro.
 
-We also provide an open-source blend of instruction tuning datasets. The dataset is available to download through the [Google Drive link](https://drive.google.com/file/d/1nzKwwYf8lYb9gN3P4YO8pFNU_B2nMYe1/view?usp=sharing). The blendable dataset consists of the following open-source instruction tuning datasets:
+We also provide an open-source blend of instruction tuning datasets. The dataset is available to download through [here](https://drive.google.com/file/d/1nzKwwYf8lYb9gN3P4YO8pFNU_B2nMYe1/view?usp=sharing). The blendable dataset consists of the following open-source instruction tuning datasets:
 
 ### Instruction Tuning Dataset Breakdown
 | Dataset                                                    | Samples | Epochs | Sampling Prob |
@@ -124,18 +126,18 @@ We also provide an open-source blend of instruction tuning datasets. The dataset
 
 Refer to the paper links above for more details about each instruction tuning dataset.
 
-*We note that the provided instruction tuning dataset is all from open-source instruction tuning datasets. It is slightly different from what we use in [InstructRetro](https://arxiv.org/abs/2310.07713), which contains private and proprietary datasets. Thus 1-2% accuracy difference in downstream tasks may be expected.*  
+*We note that the provided instruction tuning dataset is all from open-source instruction tuning datasets. It is slightly different from what we use in [InstructRetro](https://arxiv.org/abs/2310.07713), which contains private and proprietary datasets. Thus a 1-2% accuracy difference in downstream tasks may be expected.*  
 
 ### Instruction tuning script
-Download the [blended instruction tuning dataset](https://drive.google.com/file/d/1nzKwwYf8lYb9gN3P4YO8pFNU_B2nMYe1/view?usp=sharing) in your data home directory `$DATA_HOME` and update our templates in `tools/retro/sft/sft_retro_lm.sh`.
+Download the [blended instruction tuning dataset](https://drive.google.com/file/d/1nzKwwYf8lYb9gN3P4YO8pFNU_B2nMYe1/view?usp=sharing) in your data home directory `$DATA_HOME` and update our templates in [tools/retro/sft/sft_retro_lm.sh`](tools/retro/sft/sft_retro_lm.sh).
 
-An example command to run instruction tuning on 800M Retro is as follows:
+An example command to run instruction tuning on 843M Retro is as follows:
 ```bash
                                       [blend-dataset-name] [model-size] [batch-size]  [lr]    [checkpoints]
 bash tools/retro/sft/sft_retro_lm.sh       open_inst               843m            128    5e-6  <path/to/pretrained/retro>  
 ```
 
-The `blend_dataset_name` argument will blend all the datasets within the `$DATA_HOME$` following the weights and configurations specified in the `${blend_dataset_name}$.sh` (`open_inst.sh` in the example above).
+The `blend_dataset_name` argument will blend all the datasets within the `$DATA_HOME` following the weights and configurations specified in the `${blend_dataset_name}.sh` (`open_inst.sh` in the example above).
 The checkpoints will be saved in the `--save` directory. For example, it will be saved to 
 `<SFT_HOME>/checkpoints/applications/retro-sft_pp1_same_format_ctx1_843m_128_5e-6`. 
 
