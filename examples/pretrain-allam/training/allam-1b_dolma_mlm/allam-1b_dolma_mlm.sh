@@ -17,6 +17,7 @@ GPT_MODEL_ARGS=(
     --max-position-embeddings 2048 
     --num-layers 24
     --hidden-size 2048
+    --ffn-hidden-size 3072
     --num-attention-heads 16
     --hidden-dropout 0.0
     --attention-dropout 0.0
@@ -49,7 +50,7 @@ LOGISTICS_ARGS=(
 )
 
 TRAINING_ARGS=(
-    --micro-batch-size 8 
+    --micro-batch-size 4 
     --global-batch-size 512
     --train-iters 286000
     --lr 0.0002 

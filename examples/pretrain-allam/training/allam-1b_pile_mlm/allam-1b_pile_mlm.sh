@@ -17,6 +17,7 @@ GPT_MODEL_ARGS=(
     --max-position-embeddings 2048 
     --num-layers 24
     --hidden-size 2048
+    --ffn-hidden-size 3072
     --num-attention-heads 16
     --hidden-dropout 0.0
     --attention-dropout 0.0
