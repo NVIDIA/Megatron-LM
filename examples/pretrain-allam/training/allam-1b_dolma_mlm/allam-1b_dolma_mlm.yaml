@@ -3,14 +3,14 @@
 $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
 command: >-
-  bash examples/pretrain-allam/training/allam-1b_pile_mlm/allam-1b_pile_mlm.sh \
+  bash examples/pretrain-allam/training/allam-1b_dolma_mlm/allam-1b_dolma_mlm.sh \
    ${{inputs.tokenizer_model_path}} \
    ${{inputs.bin_idx_data_dir}} \
    ${{outputs.data_cache}} \
    ${{outputs.checkpoint_dir}} \
    ${{outputs.checkpoint_dir}}
 
-display_name: allam-1b_pile_non_mcore
+display_name: allam-1b_dolma_non_mcore
 
 experiment_name: 1b_mlm
 code: ../../../../
@@ -30,16 +30,16 @@ inputs:
   bin_idx_data_dir:
     type: uri_folder
     mode: ro_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/allam_ix_data_allamllmuksstandard/paths/the_pile_bin_idx_sp_with_data_signature/the_pile_bin_idx_sp/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/dolma/meg_lm_tok_v5_improved_bin_idx/
 outputs:
   data_cache:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/allam_index_mapped_data_allamllmuksstandard/paths/allam_1b_pile_non_mcore/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/allam_index_mapped_data_allamllmuksstandard/paths/allam-1b_dolma_non_mcore/
   checkpoint_dir:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/allam_checkpoints_allamllmuksstandard/paths/allam_1b_pile_non_mcore/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/allam_checkpoints_allamllmuksstandard/paths/allam-1b_dolma_non_mcore/
 
 
 services:
@@ -56,5 +56,5 @@ distribution:
   process_count_per_instance: 8
 
 resources:
-  instance_count: 8
+  instance_count: 16
   shm_size: 1250g

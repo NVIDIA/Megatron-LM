@@ -48,8 +48,8 @@ if __name__ == "__main__":
     domain_dict = json.load(open(args.domain_ratio_from_json))
     lang_prob_dict = normalize(json.load(open(args.lang_select_prob_json)))
     exclude_iterator_list = json.load(open(args.exclude_iterator_json))['exclude_iterator_name']
-
-
+    exclude_iterator_list = sorted([ exclude_iterator.replace(".bin", "") for exclude_iterator in exclude_iterator_list if exclude_iterator.endswith(".bin")])
+    
     source_prefix_paths = sorted([ source_prefix_path.replace(".bin", "") for source_prefix_path in source_prefix_paths if source_prefix_path.endswith(".bin")])
     data_dist_by_lang, tot_token_by_lang, tot_sampled_token_by_lang = {}, {}, {}
     
@@ -63,7 +63,7 @@ if __name__ == "__main__":
         sc = int(source_prefix_path.split("sc=")[1].split("_")[0])
         tc = int(source_prefix_path.split("tc=")[1].split("_")[0])
         lang = source_prefix_path.split("_")[0]
-        domain = source_prefix_path.split("_")[1]
+        domain = source_prefix_path.split("_")[2]
         domain_multiplier = copy.deepcopy(domain_dict)
         if lang in domain_dict: domain_multiplier = domain_multiplier[lang]
         if domain in domain_multiplier:
@@ -82,7 +82,7 @@ if __name__ == "__main__":
     for lang, iterator_list in  data_dist_by_lang.items():
         tot_prob_covered = 0.0
         for (iterator_tok_cnt, iterators_name) in iterator_list:
-            domain = iterators_name.split("_")[1]
+            domain = iterators_name.split("_")[2]
             prob = iterator_tok_cnt/tot_sampled_token_by_lang[lang] * lang_prob_dict[lang]
             domain_multiplier = copy.deepcopy(domain_dict)
             if lang in domain_dict: domain_multiplier = domain_multiplier[lang]
