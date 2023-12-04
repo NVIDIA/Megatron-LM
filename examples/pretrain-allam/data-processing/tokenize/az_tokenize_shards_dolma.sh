@@ -19,8 +19,8 @@
 
 TOK_MODEL="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/tokenizer_v5_improved/ar_en.model"
 TOK_TYPE="Llama2Tokenizer"
-INPUT_FOLDER_PATH="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/dolma/merged_shards"
-BIN_IDX_PATH="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/dolma/meg_lm_tok_v5_improved_bin_idx"
+INPUT_FOLDER_PATH="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/dolma/dolma_merged_shards"
+BIN_IDX_PATH="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/dolma/meglm_tok_v5_improved_bin_idx"
 AZ_LOGIN_CONFIG="examples/configs/azure_login_configs.json"
 AZJOB_FILE="examples/data-processing/az_templates/template_nemo_tokenize.yaml"
 
