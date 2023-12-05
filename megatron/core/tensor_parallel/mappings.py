@@ -77,12 +77,14 @@ def _gather_along_last_dim(input_):
 
     # Size and dimension.
     last_dim = input_.dim() - 1
-    rank = get_tensor_model_parallel_rank()
-
-    tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
-    tensor_list[rank] = input_
-    torch.distributed.all_gather(tensor_list, input_, group=get_tensor_model_parallel_group())
-
+    gather_buffer = torch.empty(world_size * input_.numel(),
+                                dtype=input_.dtype,
+                                device=input_.device)
+    torch.distributed._all_gather_base(gather_buffer, input_, group=get_tensor_model_parallel_group())
+    tensor_list = [
+            gather_buffer.narrow(0, input_.numel() * i, input_.numel()).view_as(input_)
+            for i in range(world_size)
+    ]
     # Note: torch.cat already creates a contiguous tensor.
     output = torch.cat(tensor_list, dim=last_dim).contiguous()
 

@@ -47,7 +47,7 @@ def compute_feature_bank(model):
     )
     classes = len(train_ds.classes)
     dataloader = build_data_loader(train_ds)
-     
+
     for m in model:
         m.eval()
 
@@ -59,33 +59,34 @@ def compute_feature_bank(model):
             feature = F.normalize(teacher_feature.float(), dim=1)
             feature_bank.append(feature)
             feature_label.append(labels)
-    
+
     for m in model:
         m.train()
 
     # [N', D]
     feature_bank = torch.cat(feature_bank, dim=0).contiguous()
     feature_label = torch.cat(feature_label, dim=0).contiguous()
-
-    feature_banks = [torch.zeros_like(feature_bank)
-                     for i in range(mpu.get_data_parallel_world_size())]
-    torch.distributed.all_gather(feature_banks,
+    world_size = mpu.get_data_parallel_world_size()
+    dim_size = list(feature_bank.size())
+    dim_size[0] = dim_size[0] * world_size
+    feature_banks = torch.empty(dim_size,
+                                dtype=feature_bank.dtype,
+                                device=feature_bank.device)
+    torch.distributed._all_gather_base(feature_banks,
                                  feature_bank,
                                  group=mpu.get_data_parallel_group())
 
-    assert torch.all(torch.eq(feature_banks[mpu.get_data_parallel_rank()],
-                              feature_bank))
-
-    feature_labels = [torch.zeros_like(feature_label)
-                      for i in range(mpu.get_data_parallel_world_size())]
-    torch.distributed.all_gather(feature_labels,
+    dim_size = list(feature_label.size())
+    dim_size[0] = dim_size[0] * world_size
+    feature_labels = torch.empty(dim_size,
+                                dtype=feature_label.dtype,
+                                device=feature_label.device)
+    torch.distributed._all_gather_base(feature_labels,
                                  feature_label,
                                  group=mpu.get_data_parallel_group())
 
     # [D, N]
-    feature_banks = torch.cat(feature_banks, dim=0).t().contiguous()
-    # [N]
-    feature_labels = torch.cat(feature_labels, dim=0).contiguous()
+    feature_banks = feature_banks.t().contiguous()
     print_rank_0("feature_banks size is {}".format(feature_banks.size()))
     print_rank_0("feature labels size is {}".format(feature_labels.size()))
 

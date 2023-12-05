@@ -47,14 +47,14 @@ class AllgatherFromDataParallelRegion(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input_):
         assert input_.dim() == 2
-        group, rank, world_size = get_group_world_size_rank()
+        group, _, world_size = get_group_world_size_rank()
 
-        tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
-        tensor_list[rank] = input_
-        torch.distributed.all_gather(tensor_list, input_, group=group)
-
-        output = torch.cat(tensor_list, dim=0).contiguous()
-
+        dim_size = list(input_.size())
+        dim_size[0] = dim_size[0] * world_size
+        output = torch.empty(dim_size,
+                             dtype=input_.dtype,
+                             device=input_.device)
+        torch.distributed._all_gather_base(output, input_, group=group)
         return output
 
 

@@ -25,13 +25,11 @@ def check_and_append_tensor_for_gather(group, rank, world_size, input_):
 
     # gather the size of the first dimension of the tensor from all ranks
     current_length = input_.size()[0]
-    first_dim = torch.tensor([[current_length]], 
+    first_dim = torch.tensor(current_length,
         device=torch.cuda.current_device())
-    input_list = [torch.empty_like(first_dim) for _ in range(world_size)]
-    input_list[rank].copy_(first_dim)
-    torch.distributed.all_gather(input_list, first_dim, group=group)
-    all_input_list = torch.cat(input_list, dim=0).contiguous()
-    max_length = torch.max(all_input_list)
+    input = torch.empty(world_size, device=torch.cuda.current_device())
+    torch.distributed._all_gather_base(input, first_dim, group=group)
+    max_length = torch.max(input)
 
     # if the size are different than the max, extend the tensor
     # accordingly
@@ -103,33 +101,20 @@ def orqa(Dataset):
         query_logits, context_logits = output_tensor
 
         if world_size > 1:
-            input_ = torch.empty_like(context_logits).copy_(\
-                context_logits).detach_()
-            tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
-            tensor_list[rank].copy_(input_)
-            torch.distributed.all_gather(tensor_list, input_, group=group)
-
-            # Check if all-gather happens in order
-            assert tensor_list[rank].sum().item() == \
-                context_logits.sum().item()
-
-            # Preserves the gradient
-            tensor_list[rank] = context_logits
-            all_context_logits = torch.cat(tensor_list, dim=0).contiguous()
+            logits_size = list(context_logits.size())
+            logits_size[0] = logits_size[0] * world_size
+            all_context_logits = torch.empty(logits_size,
+                                             dtype=context_logits.dtype,
+                                             device=context_logits.device)
+            torch.distributed._all_gather_base(all_context_logits, context_logits, group=group)
 
             # Query tensors
-            input_ = torch.empty_like(query_logits).copy_(\
-                query_logits).detach_()
-            tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
-            tensor_list[rank].copy_(input_)
-            torch.distributed.all_gather(tensor_list, input_, group=group)
-
-            # Check if all-gather happens in order
-            assert tensor_list[rank].sum().item() == query_logits.sum().item()
-
-            # Preserves the gradient
-            tensor_list[rank] = query_logits
-            all_query_logits = torch.cat(tensor_list, dim=0).contiguous()
+            logits_size = list(query_logits.size())
+            logits_size[0] = logits_size[0] * world_size
+            all_query_logits= torch.empty(logits_size,
+                                          dtype=query_logits.dtype,
+                                          device=query_logits.device)
+            torch.distributed._all_gather_base(all_query_logits, query_logits, group=group)
         else:
             all_query_logits = query_logits
             all_context_logits = context_logits
