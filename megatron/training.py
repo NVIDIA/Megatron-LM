@@ -10,6 +10,7 @@ import sys
 from .log_handler import CustomHandler
 # Make default logging level INFO, but filter out all log messages not from MCore.
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
+from .theoretical_memory_usage import report_theoretical_memory
 import time
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
@@ -54,6 +55,25 @@ def print_datetime(string):
     torch.distributed.barrier()
     time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print_rank_0('[' + string + '] datetime: {} '.format(time_str))
+
+
+def num_floating_point_operations(args, batch_size):
+    if not args.group_query_attention:
+        args.num_query_groups = args.num_attention_heads
+    return (
+        60
+        * batch_size
+        * args.seq_length
+        * args.num_layers
+        * args.hidden_size
+        * args.hidden_size
+        * (
+            1
+            + (args.num_query_groups / (5 * args.num_attention_heads))
+            + (args.seq_length / (5 * args.hidden_size))
+            + (args.padded_vocab_size / (10 * args.num_layers * args.hidden_size))
+        )
+    )
 
 
 def pretrain(train_valid_test_dataset_provider,
@@ -628,19 +648,28 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     if iteration % args.log_interval == 0:
         elapsed_time = timers('interval-time').elapsed(barrier=True)
         elapsed_time_per_iteration = elapsed_time / total_iterations
-        if writer:
-            if args.log_timers_to_tensorboard:
+        throughput = num_floating_point_operations(args, batch_size) / (
+            elapsed_time_per_iteration * 10**12 * args.world_size)
+        if args.log_timers_to_tensorboard:
+            if writer:
                 writer.add_scalar('iteration-time',
                                   elapsed_time_per_iteration, iteration)
-                if wandb_writer:
-                    wandb_writer.log({'iteration-time':
-                                     elapsed_time_per_iteration}, iteration)
+            if wandb_writer:
+                wandb_writer.log({'iteration-time': elapsed_time_per_iteration},
+                                 iteration)
         log_string = ' iteration {:8d}/{:8d} |'.format(
             iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(
             args.consumed_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time_per_iteration * 1000.0)
+        if args.log_throughput:
+            log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
+            if args.log_timers_to_tensorboard:
+                if writer:
+                    writer.add_scalar('throughput', throughput, iteration)
+                if wandb_writer:
+                    wandb_writer.log({'throughput': throughput}, iteration)
         log_string += ' learning rate: {:.3E} |'.format(learning_rate)
         log_string += ' global batch size: {:5d} |'.format(batch_size)
         for key in total_loss_dict:
@@ -668,6 +697,9 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         print_rank_last(log_string)
         if report_memory_flag and learning_rate > 0.:
             # Report memory after optimizer state has been initialized.
+            if torch.distributed.get_rank() == 0:
+                num_microbatches = get_num_microbatches()
+                report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
             report_memory('(after {} iterations)'.format(iteration))
             report_memory_flag = False
         timers.log(timers_to_log, normalizer=args.log_interval)
@@ -780,6 +812,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         # Evaluation
         if args.eval_interval and iteration % args.eval_interval == 0 and \
            args.do_valid:
+            timers('interval-time').stop()
             if args.manual_gc and args.manual_gc_eval:
                 # Collect all objects.
                 gc.collect()
@@ -791,6 +824,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             if args.manual_gc and args.manual_gc_eval:
                 # Collect only the objects created and used in evaluation.
                 gc.collect(generation=0)
+            timers('interval-time', log_level=0).start(barrier=True)
 
         # Checkpointing
         saved_checkpoint = False
@@ -805,9 +839,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
         if args.save and args.save_interval and \
            iteration % args.save_interval == 0:
+            timers('interval-time').stop()
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler)
             saved_checkpoint = True
+            timers('interval-time', log_level=0).start(barrier=True)
 
         # Exiting based on duration
         if args.exit_duration_in_mins:
@@ -867,6 +903,9 @@ def evaluate(forward_step_func,
              verbose=False):
     """Evaluation."""
     args = get_args()
+    timers = get_timers()
+
+    timers('evaluate', log_level=0).start(barrier=True)
 
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         compute_feature_bank(model)
@@ -941,9 +980,6 @@ def evaluate(forward_step_func,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 collect_non_loss_data=True)
-        
-        
-
 
     # Move model back to the train mode.
     for model_module in model:
@@ -951,6 +987,9 @@ def evaluate(forward_step_func,
 
     for key in total_loss_dict:
         total_loss_dict[key] /= args.eval_iters * eval_num_microbatches
+
+    timers('evaluate').stop()
+    timers.log(['evaluate'])
 
     return total_loss_dict, collected_non_loss_data, False
 
