@@ -537,34 +537,19 @@ class ColumnParallelLinear(torch.nn.Module):
     The linear layer is defined as Y = XA + b. A is parallelized along
     its second dimension as A = [A_1, ..., A_p].
 
-    Arguments:
+    Args:
         input_size: first dimension of matrix A.
         output_size: second dimension of matrix A.
-
-    Keyword Arguments
         bias: If true, add bias
-        gather_output: If true, call all-gather on output and make Y available
-                       to all GPUs, otherwise, every GPU will have its output
-                       which is Y_i = XA_i
-        init_method: method to initialize weights. Note that bias is always set
-                     to zero.
+        gather_output: If true, call all-gather on output and make Y available to all GPUs, otherwise, every GPU will have its output which is Y_i = XA_i
+        init_method: method to initialize weights. Note that bias is always set to zero.
         stride: For the strided linear layers.
-        keep_master_weight_for_test: This was added for testing and should be
-                                     set to False. It returns the master weights
-                                     used for initialization.
-        skip_bias_add: If True, do not add the bias term, instead
-                       return it to be added by the caller. This
-                       enables performance optimations where bias can
-                       be fused with other elementwise operations.
-        skip_weight_param_allocation: If True, weight parameter is not allocated and must be passed
-                                      as a keyword argument `weight` during the forward pass. Note
-                                      that this does not affect bias, which will be allocated if
-                                      bias is True. Defaults to False.
+        keep_master_weight_for_test: This was added for testing and should be set to False. It returns the master weights used for initialization.
+        skip_bias_add: If True, do not add the bias term, instead return it to be added by the caller. This enables performance optimations where bias can be fused with other elementwise operations.
+        skip_weight_param_allocation: If True, weight parameter is not allocated and must be passed as a keyword argument `weight` during the forward pass. Note that this does not affect bias, which will be allocated if bias is True. Defaults to False.
         is_expert: If True, the layer is treated as an MoE expert layer.
         config: ModelParallelConfig object
-        tp_comm_buffer_name: Communication buffer name is not used in
-                             non-Transformer-Engine modules.
-
+        tp_comm_buffer_name: Communication buffer name is not used in non-Transformer-Engine modules.
     """
 
     def __init__(
@@ -767,34 +752,17 @@ class ColumnParallelLinear(torch.nn.Module):
 class RowParallelLinear(torch.nn.Module):
     """Linear layer with row parallelism.
 
-    The linear layer is defined as Y = XA + b. A is parallelized along
-    its first dimension and X along its second dimension as:
-               -   -
-              | A_1 |
-              | .   |
-          A = | .   |        X = [X_1, ..., X_p]
-              | .   |
-              | A_p |
-               -   -
-    Arguments:
+    The linear layer is defined as Y = XA + b. A is parallelized along its first dimension and X along its second dimension. A = transpose([A_1 .. A_p]) X = [X_1, ..., X_p]
+
+    Args:
         input_size: first dimension of matrix A.
         output_size: second dimension of matrix A.
-
-    Keyword Arguments:
         bias: If true, add bias. Note that bias is not parallelized.
-        input_is_parallel: If true, we assume that the input is already
-                           split across the GPUs and we do not split
-                           again.
-        init_method: method to initialize weights. Note that bias is always set
-                     to zero.
+        input_is_parallel: If true, we assume that the input is already split across the GPUs and we do not split again.
+        init_method: method to initialize weights. Note that bias is always set to zero.
         stride: For the strided linear layers.
-        keep_master_weight_for_test: This was added for testing and should be
-                                     set to False. It returns the master weights
-                                     used for initialization.
-        skip_bias_add: If True, do not add the bias term, instead
-                       return it to be added by the caller. This
-                       enables performance optimations where bias can
-                       be fused with other elementwise operations.
+        keep_master_weight_for_test: This was added for testing and should be set to False. It returns the master weights used for initialization.
+        skip_bias_add: If True, do not add the bias term, instead return it to be added by the caller. This enables performance optimations where bias can be fused with other elementwise operations.
         is_expert: If True, the layer is treated as an MoE expert layer
         tp_comm_buffer_name: Communication buffer name. Not used in
                              non-Transformer-Engine modules.

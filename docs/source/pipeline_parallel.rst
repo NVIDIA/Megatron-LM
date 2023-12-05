@@ -7,7 +7,7 @@ Submodules
 pipeline\_parallel.p2p\_communication module
 --------------------------------------------
 
-.. automodule:: pipeline_parallel.p2p_communication
+.. automodule:: core.pipeline_parallel.p2p_communication
    :members:
    :undoc-members:
    :show-inheritance:
@@ -15,7 +15,7 @@ pipeline\_parallel.p2p\_communication module
 pipeline\_parallel.schedules module
 -----------------------------------
 
-.. automodule:: pipeline_parallel.schedules
+.. automodule:: core.pipeline_parallel.schedules
    :members:
    :undoc-members:
    :show-inheritance:
@@ -23,7 +23,7 @@ pipeline\_parallel.schedules module
 Module contents
 ---------------
 
-.. automodule:: pipeline_parallel
+.. automodule:: core.pipeline_parallel
    :members:
    :undoc-members:
    :show-inheritance:
