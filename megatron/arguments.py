@@ -181,6 +181,13 @@ def validate_args(args, defaults={}):
     if args.fp16:
         assert not args.bf16
         args.params_dtype = torch.half
+        # Turn off checking for NaNs in loss and grads if using dynamic loss scaling,
+        # where NaNs in grads / loss are signal to the loss scaler.
+        if not args.loss_scale:
+            args.check_for_nan_in_loss_and_grad = False
+            if args.rank == 0:
+                print('WARNING: Setting args.check_for_nan_in_loss_and_grad to False since '
+                      'dynamic loss scaling is being used')
     if args.bf16:
         assert not args.fp16
         args.params_dtype = torch.bfloat16

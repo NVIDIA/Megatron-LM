@@ -78,8 +78,6 @@ class OptimizerConfig:
     clip_grad (float): Gradient clipping based on global L2 norm.
 
     log_num_zeros_in_grad (bool): If true, calculate and log the number of zeros in gradient.
-
-    check_for_nan_in_loss_and_grad (bool): If true, check for NaNs in loss and gradient.
     """
 
     # Precision.
@@ -113,4 +111,3 @@ class OptimizerConfig:
     # Miscellaneous.
     clip_grad: float = 1.0
     log_num_zeros_in_grad: bool = False
-    check_for_nan_in_loss_and_grad: bool = False

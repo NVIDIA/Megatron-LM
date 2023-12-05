@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import math
+import os
 from logging import getLogger
 from typing import Dict, List
 
@@ -44,6 +45,7 @@ class Bucket:
         gradient_scaling_factor: This factor is utilized to scale gradients prior to their
             communication. Its application is twofold: it facilitates the averaging of gradients
             and the scaling of gradients in the context of the Mixture of Experts (MoE) model.
+        check_for_nan_in_grad: If true, check if local grad norm is NaN.
     """
 
     def __init__(
@@ -57,6 +59,7 @@ class Bucket:
         overlap_grad_reduce: bool,
         use_distributed_optimizer: bool,
         gradient_scaling_factor: float,
+        check_for_nan_in_grad: bool,
     ):
         # State for bookkeeping: params is the set of parameters this bucket is
         # responsible for, params_with_grad is the set of parameters with grads
@@ -76,6 +79,7 @@ class Bucket:
         self.overlap_grad_reduce = overlap_grad_reduce
         self.use_distributed_optimizer = use_distributed_optimizer
         self.gradient_scaling_factor = gradient_scaling_factor
+        self.check_for_nan_in_grad = check_for_nan_in_grad
 
         self.reset()
 
@@ -99,6 +103,17 @@ class Bucket:
         assert (
             self.communication_handle is None and not self.communication_issued
         ), 'Should not have multiple communication calls in flight at once'
+
+        # Make sure norm of grads in bucket are not NaN
+        # prior to data-parallel all-reduce / reduce-scatter.
+        if self.check_for_nan_in_grad:
+            global_rank = torch.distributed.get_rank()
+            norm = self.data.norm(p=2)
+            assert not norm.isnan(), (
+                f'Rank {global_rank}: found NaN in local grad norm in '
+                f'backward pass before data-parallel communication collective. '
+                f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
+            )
 
         self.data *= self.gradient_scaling_factor
         # Use async_op only when overlap_grad_reduce is True.
@@ -173,6 +188,7 @@ class GradBuffer:
         gradient_scaling_factor: This factor is utilized to scale gradients prior to their
             communication. Its application is twofold: it facilitates the averaging of gradients
             and the scaling of gradients in the context of the Mixture of Experts (MoE) model.
+        check_for_nan_in_grad: If true, check if local grad norm is NaN.
     """
 
     def __init__(
@@ -185,6 +201,7 @@ class GradBuffer:
         overlap_grad_reduce: bool,
         use_distributed_optimizer: bool,
         gradient_scaling_factor: float,
+        check_for_nan_in_grad: bool,
     ):
 
         # Check that params are unique.
@@ -203,6 +220,7 @@ class GradBuffer:
         self.overlap_grad_reduce = overlap_grad_reduce
         self.use_distributed_optimizer = use_distributed_optimizer
         self.gradient_scaling_factor = gradient_scaling_factor
+        self.check_for_nan_in_grad = check_for_nan_in_grad
         self.is_last_microbatch = True
 
         # Data structures to store underlying buckets and relevant indexing data.
@@ -384,6 +402,7 @@ class GradBuffer:
             overlap_grad_reduce=self.overlap_grad_reduce,
             use_distributed_optimizer=self.use_distributed_optimizer,
             gradient_scaling_factor=self.gradient_scaling_factor,
+            check_for_nan_in_grad=self.check_for_nan_in_grad,
         )
         self.buckets.append(bucket)
         for bucket_param in bucket_params:
