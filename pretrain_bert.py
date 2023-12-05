@@ -13,11 +13,13 @@ from megatron import get_timers
 from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.data.dataset_utils import build_train_valid_test_datasets
-from megatron.model import BertModel
+import megatron.model
+from megatron.core.models.bert.bert_model import BertModel
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
 from megatron.arguments import core_transformer_config_from_args
-
+from megatron.core.transformer.spec_utils import import_module
+from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
@@ -27,13 +29,33 @@ def model_provider(pre_process=True, post_process=True):
     args = get_args()
     config = core_transformer_config_from_args(args)
     num_tokentypes = 2 if args.bert_binary_head else 0
-    model = BertModel(
-        config=config,
-        num_tokentypes=num_tokentypes,
-        add_binary_head=args.bert_binary_head,
-        parallel_output=True,
-        pre_process=pre_process,
-        post_process=post_process)
+
+    if args.use_mcore_models:
+
+        if args.spec is not None:
+            transformer_layer_spec = import_module(args.spec)
+        else:
+            transformer_layer_spec = bert_layer_with_transformer_engine_spec 
+
+        model = BertModel(
+            config=config,
+            transformer_layer_spec=transformer_layer_spec,
+            vocab_size=args.padded_vocab_size,
+            max_sequence_length=args.max_position_embeddings,
+            num_tokentypes=num_tokentypes, 
+            add_binary_head=args.bert_binary_head,
+            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+            parallel_output=True,
+            pre_process=pre_process,
+            post_process=post_process)
+    else:
+        model = megatron.model.BertModel(
+            config=config,
+            num_tokentypes=num_tokentypes,
+            add_binary_head=args.bert_binary_head,
+            parallel_output=True,
+            pre_process=pre_process,
+            post_process=post_process)
 
     return model
 
@@ -42,7 +64,8 @@ def get_batch(data_iterator):
     """Build the batch."""
 
     # Items and their type.
-    keys = ['text', 'types', 'labels', 'is_random', 'loss_mask', 'padding_mask']
+    keys = ['text', 'types', 'labels',
+            'is_random', 'loss_mask', 'padding_mask']
     datatype = torch.int64
 
     # Broadcast data.
@@ -104,8 +127,8 @@ def forward_step(data_iterator, model):
         types = None
 
     # Forward pass through the model.
-    output_tensor = model(tokens, padding_mask, tokentype_ids=types,
-                          lm_labels=lm_labels)
+    output_tensor = model(tokens, padding_mask,
+                          tokentype_ids=types, lm_labels=lm_labels)
 
     return output_tensor, partial(loss_func, loss_mask, sentence_order)
 

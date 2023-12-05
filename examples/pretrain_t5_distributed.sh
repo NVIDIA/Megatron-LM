@@ -58,7 +58,7 @@ OUTPUT_ARGS="
     --eval-iters 10
 "
 
-torchrun $DISTRIBUTED_ARGS pretrain_t5.py \
+torchrun $DISTRIBUTED_ARGS pretrain_t5_core.py \
     $T5_ARGS \
     $DATA_ARGS \
     $OUTPUT_ARGS \

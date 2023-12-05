@@ -51,7 +51,7 @@ class ChunkDataset(torch.utils.data.Dataset):
         # Extract sample data.
         sample = self.sample_dataset[sample_idx]
         sample_token_ids = sample["text"]
-        sample_doc_ids = sample["doc_ids"]
+        sample_doc_ids = sample["document_ids"]
 
         # Chunk start/end token idxs.
         token_start_idx = chunk_idx * self.chunk_length

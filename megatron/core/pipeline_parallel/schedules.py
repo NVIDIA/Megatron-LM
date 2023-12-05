@@ -409,7 +409,10 @@ def forward_backward_pipelining_with_interleaving(
     no_sync_context = None
 
     if config.grad_sync_func is not None and not isinstance(config.grad_sync_func, list):
-        config.grad_sync_func = [config.grad_sync_func for model_chunk in model]
+        config.grad_sync_func = [config.grad_sync_func for _ in model]
+
+    if config.param_sync_func is not None and not isinstance(config.param_sync_func, list):
+        config.param_sync_func = [config.param_sync_func for _ in model]
 
     def disable_grad_sync():
         """Disable asynchronous grad reductions"""
@@ -494,8 +497,8 @@ def forward_backward_pipelining_with_interleaving(
 
     # Synchronize params for first two model chunks
     if config.param_sync_func is not None:
-        config.param_sync_func(model[0].parameters())
-        config.param_sync_func(model[1].parameters())
+        config.param_sync_func[0](model[0].parameters())
+        config.param_sync_func[1](model[1].parameters())
 
     def get_model_chunk_id(microbatch_id, forward):
         """Helper method to get the model chunk ID given the iteration number."""
@@ -547,7 +550,9 @@ def forward_backward_pipelining_with_interleaving(
             ):
                 param_sync_chunk_id = get_model_chunk_id(param_sync_microbatch_id, forward=True) + 1
                 if 1 < param_sync_chunk_id < num_model_chunks:
-                    config.param_sync_func(model[param_sync_chunk_id].parameters())
+                    config.param_sync_func[param_sync_chunk_id](
+                        model[param_sync_chunk_id].parameters()
+                    )
 
         # forward step
         if parallel_state.is_pipeline_first_stage():

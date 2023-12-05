@@ -6,15 +6,21 @@ import logging
 from copy import deepcopy
 from dataclasses import replace
 from itertools import chain
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
 import torch
 
 from .dict_utils import nested_values
-from .mapping import LocalNonpersitentObject, ShardedStateDict, ShardedTensor, StateDict
-from .utils import extract_sharded_tensors
+from .mapping import (
+    LocalNonpersitentObject,
+    ShardedStateDict,
+    ShardedTensor,
+    ShardedTensorFactory,
+    StateDict,
+)
+from .utils import extract_sharded_tensors, extract_sharded_tensors_and_factories
 
 
 def get_optim_param_to_id_map(optim_params_iter: Iterable[torch.nn.Parameter]) -> Dict[int, int]:
@@ -27,8 +33,8 @@ def get_optim_param_to_id_map(optim_params_iter: Iterable[torch.nn.Parameter]) -
 
 def get_param_id_to_sharded_param_map(
     model_sharded_state_dict: ShardedStateDict, optim_params_iter: Iterable[torch.nn.Parameter]
-) -> Dict[int, ShardedTensor]:
-    model_sharded_state_dict, _ = extract_sharded_tensors(model_sharded_state_dict)
+) -> Dict[int, Union[ShardedTensor, ShardedTensorFactory]]:
+    model_sharded_state_dict, _ = extract_sharded_tensors_and_factories(model_sharded_state_dict)
     id_to_sharded_param_map = {}
     param_to_id_map = get_optim_param_to_id_map(optim_params_iter)
     for ten in nested_values(model_sharded_state_dict):
@@ -47,8 +53,11 @@ def get_param_id_to_sharded_param_map(
 
 
 def make_sharded_optimizer_tensor(
-    model_param: ShardedTensor, optim_param: torch.Tensor, prefix: str
-) -> ShardedTensor:
+    model_param: Union[ShardedTensor, ShardedTensorFactory], optim_param: torch.Tensor, prefix: str
+) -> Union[ShardedTensor, ShardedTensorFactory]:
+    if isinstance(model_param, ShardedTensorFactory):
+        return replace(model_param, key=f'{prefix}.{model_param.key}', data=optim_param)
+
     assert (
         tuple(optim_param.shape) == model_param.local_shape
     ), f'Optimizer shape ({tuple(optim_param.shape)} does not match model shape ({model_param.local_shape})'
