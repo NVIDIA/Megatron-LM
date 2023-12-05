@@ -258,6 +258,9 @@ class CheckpointFunction(torch.autograd.Function):
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
+
+        # filter out non tensor outputs for backward pass
+        outputs, args = zip(*filter(lambda x: torch.is_tensor(x[0]), zip(outputs, args)))
         torch.autograd.backward(outputs, args)
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs)
         return (None, None) + grads
