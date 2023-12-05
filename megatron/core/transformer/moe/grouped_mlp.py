@@ -70,54 +70,58 @@ class GroupedMLP(BaseMoELayer):
         fc2_input_size = self.config.ffn_hidden_size * self.num_local_experts
         fc2_input_size_per_partition = divide(fc2_input_size, tp_size)
 
+        # Note: The current kernel implementations of grouped_gemm
+        # does not support transposition with CUTLASS grouped GEMM
+        # (https://github.com/fanshiqing/grouped_gemm/blob/main/csrc/grouped_gemm.cu#L355-L358)
+        # and as a result we avoid allocate the transpose of weights.
         # Initialize weight.
         if config.use_cpu_initialization:
             self.weight1 = Parameter(
                 torch.empty(
-                    fc1_output_size_per_partition,
                     self.config.hidden_size,
+                    fc1_output_size_per_partition,
                     dtype=config.params_dtype,
                 )
             )
             self.weight2 = Parameter(
                 torch.empty(
-                    self.config.hidden_size,
                     fc2_input_size_per_partition,
+                    self.config.hidden_size,
                     dtype=config.params_dtype,
                 )
             )
             if config.perform_initialization:
                 _initialize_affine_weight_cpu(
                     self.weight1,
-                    fc1_output_size,
                     self.config.hidden_size,
+                    fc1_output_size,
                     fc1_output_size_per_partition,
-                    partition_dim=0,
+                    partition_dim=1,
                     init_method=config.init_method,
                     params_dtype=config.params_dtype,
                 )
                 _initialize_affine_weight_cpu(
                     self.weight2,
-                    self.config.hidden_size,
                     fc2_input_size,
+                    self.config.hidden_size,
                     fc2_input_size_per_partition,
-                    partition_dim=1,
+                    partition_dim=0,
                     init_method=config.output_layer_init_method,
                     params_dtype=config.params_dtype,
                 )
         else:
             self.weight1 = Parameter(
                 torch.empty(
-                    fc1_output_size_per_partition,
                     self.config.hidden_size,
+                    fc1_output_size_per_partition,
                     device=torch.cuda.current_device(),
                     dtype=config.params_dtype,
                 )
             )
             self.weight2 = Parameter(
                 torch.empty(
-                    self.config.hidden_size,
                     fc2_input_size_per_partition,
+                    self.config.hidden_size,
                     device=torch.cuda.current_device(),
                     dtype=config.params_dtype,
                 )
@@ -126,13 +130,13 @@ class GroupedMLP(BaseMoELayer):
                 _initialize_affine_weight_gpu(
                     self.weight1,
                     config.init_method,
-                    partition_dim=0,
+                    partition_dim=1,
                     expert_parallel=self.expert_parallel,
                 )
                 _initialize_affine_weight_gpu(
                     self.weight2,
                     config.output_layer_init_method,
-                    partition_dim=1,
+                    partition_dim=0,
                     expert_parallel=self.expert_parallel,
                 )
         setattr(self.weight1, 'allreduce', not self.expert_parallel)
@@ -160,14 +164,14 @@ class GroupedMLP(BaseMoELayer):
 
         w1, w2 = (self.scale_grad(self.weight1), self.scale_grad(self.weight2))
         # Reshape the weights for the grouped GEMMs.
-        w1 = w1.view(self.num_local_experts, -1, self.config.hidden_size)
-        w2 = w2.view(self.num_local_experts, self.config.hidden_size, -1)
+        w1 = w1.view(self.num_local_experts, self.config.hidden_size, -1)
+        w2 = w2.view(self.num_local_experts, -1, self.config.hidden_size)
 
-        fc1_output = gg.ops.gmm(sorted_global_hidden_states, w1, tokens_per_expert, trans_b=True)
+        fc1_output = gg.ops.gmm(sorted_global_hidden_states, w1, tokens_per_expert, trans_b=False)
 
         intermediate_parallel = self.activation_func(fc1_output)
 
-        fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=True)
+        fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
         # Un-permutation of tokens
         original_order_ghs = torch.empty_like(fc2_output)
         original_order_ghs[sorted_indices] = fc2_output

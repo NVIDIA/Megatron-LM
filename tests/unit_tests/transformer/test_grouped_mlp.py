@@ -21,8 +21,8 @@ class TestParallelGroupedMLP:
         print("Test for use_cpu_initilization={} and swiglu={}.".format(use_cpu_initialization, swiglu))
         print("============")
         Utils.initialize_model_parallel(1,1)
-        num_layers=1 # 2
-        self.hidden_size=2 # 12
+        num_layers = 1 # 2
+        self.hidden_size = 2 # 12
         self.num_experts = 2
         self.gated_linear_unit = True
         self.use_cpu_initialization = use_cpu_initialization
@@ -86,13 +86,13 @@ class TestParallelGroupedMLP:
 
         assert torch.equal(self.switch_mlp_smm.router.weight, self.switch_mlp_gmm.router.weight)
 
-        # weight1: [num_experts*4h, h]
-        # weight2: [h, num_experts*4h]
-        assert self.switch_mlp_gmm.weight1.shape[0] == self.num_experts * self.fc1_ffn_hidden_size
-        assert self.switch_mlp_gmm.weight1.shape[1] == self.hidden_size
+        # weight1: [h, num_experts*4h]
+        # weight2: [num_experts*4h, h]
+        assert self.switch_mlp_gmm.weight1.shape[0] == self.hidden_size
+        assert self.switch_mlp_gmm.weight1.shape[1] == self.num_experts * self.fc1_ffn_hidden_size
         if self.gated_linear_unit:
-            assert self.switch_mlp_gmm.weight2.shape[0] == self.hidden_size
-            assert self.switch_mlp_gmm.weight2.shape[1] == self.num_experts * self.fc2_ffn_hidden_size
+            assert self.switch_mlp_gmm.weight2.shape[0] == self.num_experts * self.fc2_ffn_hidden_size
+            assert self.switch_mlp_gmm.weight2.shape[1] == self.hidden_size
         else:
             assert self.switch_mlp_gmm.weight1.shape == self.switch_mlp_gmm.weight2.t().shape
 
