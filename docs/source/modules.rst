@@ -10,3 +10,4 @@ API Guide
    fusions
    transformer
    dist_checkpointing
+   distributed
