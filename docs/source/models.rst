@@ -12,7 +12,7 @@ Subpackages
 Module contents
 ---------------
 
-.. automodule:: models
+.. automodule:: core.models
    :members:
    :undoc-members:
    :show-inheritance:
