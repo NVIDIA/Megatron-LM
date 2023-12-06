@@ -1262,7 +1262,7 @@ def get_zero_bubble_forward_backward_func():
                 nstages,
                 nmb,
                 f,b,w,c,
-                f_mem=f_mem, b_mem=b_mem, w_mem=w_mem,
+                f_mem=f_mem_approx, b_mem=b_mem_approx, w_mem=w_mem_approx,
                 max_mem=None
                 # Mem ignored for now
             ).get_v_schedule()
