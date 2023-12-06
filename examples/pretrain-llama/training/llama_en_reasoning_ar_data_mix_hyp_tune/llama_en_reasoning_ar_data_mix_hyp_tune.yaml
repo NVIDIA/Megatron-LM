@@ -9,7 +9,8 @@ command: >-
    ${{inputs.bin_idx_data_dir}} \
    ${{outputs.data_cache}} \
    ${{outputs.checkpoint_dir}} \
-   ${{outputs.tensorboard_dir}}
+   ${{outputs.tensorboard_dir}} \
+   ${{ENG_TOK}}
 
 display_name: LLaMa-Allam-Reasoning-Data-with-Ar-data-mix-hyp-tune
 
@@ -64,5 +65,5 @@ distribution:
   process_count_per_instance: 8
 
 resources:
-  instance_count: 16
+  instance_count: 26
   shm_size: 1250g
