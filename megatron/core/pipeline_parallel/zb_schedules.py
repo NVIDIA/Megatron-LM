@@ -1262,7 +1262,7 @@ def get_zero_bubble_forward_backward_func():
                 nstages,
                 nmb,
                 f,b,w,c,
-                f_mem=f_mem[0], b_mem=b_mem[0], w_mem=w_mem[0],
+                f_mem=f_mem, b_mem=b_mem, w_mem=w_mem,
                 max_mem=None
                 # Mem ignored for now
             ).get_v_schedule()
@@ -1283,10 +1283,10 @@ def get_zero_bubble_forward_backward_func():
                     cost_b=b,
                     cost_w=w,
                     cost_comm=c,
-                    mem_f=f_mem[0],
-                    mem_b=b_mem[0],
-                    mem_w=w_mem[0],
-                    max_mem=mem * f_mem[0],
+                    mem_f=f_mem,
+                    mem_b=b_mem,
+                    mem_w=w_mem,
+                    max_mem=mem * max(f_mem[:2]),
                     print_scaling=1000
                 ),
             )

@@ -13,9 +13,9 @@ from pulp import lpDot, lpSum
 
 @dataclass
 class GraphConfig:
-    mem_f: float = 2
-    mem_b: float = -1
-    mem_w: float = -1
+    mem_f: List[float] = None
+    mem_b: List[float] = None
+    mem_w: List[float] = None
     max_mem: float = None
     cost_f: int = 1
     cost_b: int = 1
@@ -28,7 +28,7 @@ class GraphConfig:
         assert type(self.cost_b) is int
         assert type(self.cost_w) is int
         assert type(self.cost_comm) is int
-        assert self.mem_f + self.mem_b + self.mem_w == 0
+        assert all([f + b + w == 0 for (f,b,w) in zip(self.mem_f, self.mem_b, self.mem_w)])
 
 @dataclass(eq=True, frozen=True)
 class ScheduledNode:
@@ -67,7 +67,8 @@ class Graph:
 
     def get_mem(self, id):
         type = id // (self.nstages * self.nmb)
-        return [self.config.mem_f, self.config.mem_b, self.config.mem_w][type]
+        stage = self.get_stage(id)
+        return [self.config.mem_f[stage], self.config.mem_b[stage], self.config.mem_w[stage]][type]
 
     def requires_order(self, i, j):
         return (
