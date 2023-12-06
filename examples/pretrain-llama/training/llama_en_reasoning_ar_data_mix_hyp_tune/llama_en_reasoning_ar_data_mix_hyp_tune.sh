@@ -105,7 +105,7 @@ python examples/data-processing/data_ratio_from_file.py \
 --total-token $TOTAL_NUM_TOKENS \
 --exclude-iterator-json "examples/pretrain-llama/training/llama_en_reasoning_ar_data_mix_hyp_tune/exclude_iterator.json" \
 --prefix-for-file-path "\$BIN_IDX_PATH/" \
---export-script "examples/pretrain-llama/training/llama_en_reasoning_ar_data_mix_hyp_tune/iterator_selection_prob.sh" \
+--export-script "examples/pretrain-llama/training/llama_en_reasoning_ar_data_mix_hyp_tune/iterator_selection_prob.sh"
 
 source examples/pretrain-llama/training/llama_en_reasoning_ar_data_mix_hyp_tune/iterator_selection_prob.sh
 
