@@ -1,5 +1,3 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
-
 
 # The following code is adapted from
 # https://github.com/facebookresearch/ParlAI/blob/master/parlai/core/metrics.py, 

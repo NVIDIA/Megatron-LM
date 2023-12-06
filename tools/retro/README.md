@@ -1,8 +1,17 @@
-# InstructRetro: Instruction Tuning post Retrieval-Augmented Pretraining
+# Retro and InstructRetro
 
-InstructRetro is an innovative extension of the large language model (LLM) architecture, aimed at advancing the state of LLM capabilities. By augmenting the pretraining phase with a retrieval mechanism, InstructRetro showcases notable improvements in terms of perplexity and factual accuracy, thus opening new avenues for enhanced instruction tuning and zero-shot generalization.
+Retro [(Borgeaud et al., 2022)](https://arxiv.org/abs/2112.04426) is an autoregressive decoder-only language model (LM) pretrained with retrieval-augmentation. 
+Retro features practical scalibility to support large-scale pretraining from scratch by retrieving from trillions of token.
+Pretraining with retrieval provides a more efficient storage mechanism of factual knowledge, when compared to storing factual knowledge implicitly within the network's parameters, thus largely reducing model parameters while achieving lower perplexity than standard GPT. 
+Retro also provides the flexibility to update the
+knowledge stored in LMs [(Wang et al., 2023a)](https://arxiv.org/abs/2304.06762)
+by updating the retrieval database without training LMs again.
 
-This README provides an end-to-end tutorial to reproduce InstructRetro.   
+InstructRetro [(Wang et al., 2023b)](https://arxiv.org/abs/2310.07713) further scales up the size of Retro to 48B, featuring the largest LLM pretrained with retrieval (as of December 2023). 
+The obtained foundation model, Retro 48B, largely outperforms the GPT counterpart in terms of perplexity.
+With instruction tuning on Retro, InstructRetro demonstrates significant improvement over the instruction tuned GPT on downstream tasks in the zero-shot setting. Specifically, the average improvement of InstructRetro is 7% over its GPT counterpart across 8 short-form QA tasks, and 10% over GPT across 4 challenging long-form QA tasks. We also find that one can ablate the encoder from InstructRetro architecture and directly use the InstructRetro decoder backbone as GPT, while achieving comparable results.
+
+This README provides an end-to-end tutorial to reproduce Retro and InstructRetro.   
 
 ## Citations
 
@@ -93,7 +102,6 @@ After pretraining, the model checkpoints will be saved in the `--save` directory
 
 To continue pretraining with retrieval from a pretrained GPT model, please specify `--load` in `pretrain_model.sh` to load the pretrained GPT model checkpoint (the architecture of GPT, including hidden size, number of layers, and activation methods, should be exactly the same as the one used for Retro). You should also specify  `--no-load-optim --finetune` to make sure the optimizer state is not loaded from the pretrained GPT model and the continued pretraining with retrieval is from a clean start. After the first job / the first run, you will continue pretraining with retrieval from your last checkpoint. In the follow-up jobs, you should launch the pretraining without the flags `--no-load-optim --finetune` to make sure the optimizer state is correctly loaded from your last job.
 
-```bash 
 
 ## Step 3: Perplexity evaluation
 

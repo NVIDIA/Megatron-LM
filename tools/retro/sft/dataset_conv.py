@@ -9,6 +9,68 @@ from collections import OrderedDict
 from megatron import get_tokenizer, get_args, get_retro_args
 
 
+class FtDataset(torch.utils.data.Dataset):
+    """
+    This class represents a dataset for fine-tuning GPT models using the Megatron framework.
+
+    Args:
+        name (str): Name of the dataset equals to data_prefix
+
+        indexed_dataset (IndexedDataset): The dataset object containing the data samples.
+
+        max_seq_length (int): Maximum sequence length for each sample in the dataset.
+
+        fewshot_list (list): A list of few-shot learning examples, if applicable.
+    """
+    def __init__(self, name, indexed_dataset, max_seq_length,
+                 fewshot_list=None):
+
+        # Params to store.
+        self.dataset_name = name  # dataset_name equals to data_prefix in pretrain
+        self.max_seq_length = max_seq_length
+        self.desc = name
+
+        # For compatibility with Megatron Core BlendedDataset
+        self.unique_identifiers = OrderedDict()
+        self.unique_identifiers["class"] = type(self).__name__
+        self.unique_identifiers["name"] = name
+
+        # Dataset.
+        self.indexed_dataset = indexed_dataset
+
+        # Vocab stuff.
+        tokenizer = get_tokenizer()
+        self.eos_id = tokenizer.eod
+        self.pad_id = tokenizer.eod
+        self.fewshot_list = fewshot_list
+
+        self.args = get_args()
+
+    def __len__(self):
+        return len(list(self.indexed_dataset))
+
+    def __getitem__(self, idx):
+
+        idx = idx % len(self.indexed_dataset)
+        sample = self.indexed_dataset[idx]
+
+        if self.args.retro_add_retriever:
+            return build_retro_training_sample(sample,
+                                               self.max_seq_length,  # needed for padding
+                                               self.pad_id, self.eos_id,
+                                               self.dataset_name,
+                                               self.args.ft_neighbours,
+                                               self.args.shuffle_topn)
+        else:
+            return build_normal_training_sample(sample,
+                                                self.max_seq_length,  # needed for padding
+                                                self.pad_id, self.eos_id,
+                                                self.dataset_name,
+                                                self.args.ft_neighbours,
+                                                self.args.shuffle_topn,
+                                                self.fewshot_list)
+
+
 def format_multichoice(multichoice_options):
     options_text = ["({}) {}".format(chr(ord('A') + i), option) for i, option in
                     zip(range(len(multichoice_options)), multichoice_options)]
@@ -21,9 +83,6 @@ def format_multichoice_question(question, multichoice_options):
 
 def format_answer(answer):
     return " {}".format(answer)
-
-
-"""GPT sft dataset."""
 
 
 def preprocess(data_file, inference_only=False, retrieved_neighbours=False, fix_newsqa=True):
@@ -128,57 +187,6 @@ def count_stat(dataset, tokenizer):
     print("max of len nb", max(nb_lens))
     print("num of cut ", sum([l > 128 for l in nb_lens]), sum([l > 128 for l in nb_lens]) // len(nb_lens))
     print("last max", sorted(nb_lens)[-10:])
-
-
-class FtDataset(torch.utils.data.Dataset):
-
-    def __init__(self, name, indexed_dataset, max_seq_length,
-                 max_seq_length_dec=0, fewshot_list=None):
-
-        # Params to store.
-        self.dataset_name = name  # dataset_name equals to data_prefix in pretrain
-        self.max_seq_length = max_seq_length
-        self.desc = name
-
-        # For compatibility with Megatron Core BlendedDataset
-        self.unique_identifiers = OrderedDict()
-        self.unique_identifiers["class"] = type(self).__name__
-        self.unique_identifiers["name"] = name
-
-        # Dataset.
-        self.indexed_dataset = indexed_dataset
-
-        # Vocab stuff.
-        tokenizer = get_tokenizer()
-        self.eos_id = tokenizer.eod
-        self.pad_id = tokenizer.eod
-        self.fewshot_list = fewshot_list
-
-        self.args = get_args()
-
-    def __len__(self):
-        return len(list(self.indexed_dataset))
-
-    def __getitem__(self, idx):
-
-        idx = idx % len(self.indexed_dataset)
-        sample = self.indexed_dataset[idx]
-
-        if self.args.retro_add_retriever:
-            return build_retro_training_sample(sample,
-                                               self.max_seq_length,  # needed for padding
-                                               self.pad_id, self.eos_id,
-                                               self.dataset_name,
-                                               self.args.ft_neighbours,
-                                               self.args.shuffle_topn)
-        else:
-            return build_normal_training_sample(sample,
-                                                self.max_seq_length,  # needed for padding
-                                                self.pad_id, self.eos_id,
-                                                self.dataset_name,
-                                                self.args.ft_neighbours,
-                                                self.args.shuffle_topn,
-                                                self.fewshot_list)
 
 
 def reformat_prompt_retro(query, neighbours, dataset_name, ft_neighbours, \
@@ -401,7 +409,6 @@ def build_retro_training_sample(sample,
         'context_len': len(input_tokens)
     }
     return train_sample
-
 
 
 def pad_and_convert_to_numpy(input_ids, output_ids,

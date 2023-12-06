@@ -12,7 +12,6 @@ from tools.retro.sft.dataset_conv import FtDataset as SFTDataset
 from tools.retro.sft.dataset_conv import get_processed_dataset
 
 
-
 def build_train_valid_test_datasets(data_prefix, seq_length):
     """Build train, valid, and test datasets."""
 
