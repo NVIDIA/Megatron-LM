@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from abc import ABC, abstractmethod
+
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
@@ -34,7 +36,7 @@ def get_router_linear_layer(config):
     return router
 
 
-class BaseMoELayer(MegatronModule):
+class BaseMoELayer(ABC, MegatronModule):
     """
     Basic MoE layer.
     """
@@ -135,3 +137,7 @@ class BaseMoELayer(MegatronModule):
             output_bias_total = None
 
         return output_total, output_bias_total
+
+    @abstractmethod
+    def forward(self, hidden_states):
+        pass
