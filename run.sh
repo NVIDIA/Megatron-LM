@@ -1,0 +1,49 @@
+DISTRIBUTED_ARGS=(
+    --nproc_per_node 1
+    --nnodes 1
+    --master_addr "localhost"
+    --master_port "12345"
+)
+torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
+--use-mcore-models \
+--tensor-model-parallel-size 1 \
+--pipeline-model-parallel-size 1 \
+--seq-length 512 \
+--max-position-embeddings 512 \
+--tokenizer-type "Llama2Tokenizer" \
+--tokenizer-model "${AZUREML_CR_DATA_CAPABILITY_PATH}/INPUT_tokenizer/tokenizer.model" \
+--num-layers=4 \
+--hidden-size=512 \
+--ffn-hidden-size=1024 \
+--num-attention-heads=8 \
+--position-embedding-type='rope' \
+--untie-embeddings-and-output-weights \
+--vocab-size=32000 \
+--bf16 \
+--untie-embeddings-and-output-weights \
+--use-rotary-position-embeddings \
+--normalization "RMSNorm" \
+--no-position-embedding \
+--no-masked-softmax-fusion \
+--no-query-key-layer-scaling \
+--micro-batch-size 1 \
+--global-batch-size 4 \
+--train-iters 3000 \
+--warmup-optimizer-states \
+--lr 0.0003 \
+--lr-decay-style "cosine" \
+--min-lr 0.00003  \
+--lr-warmup-iters 20 \
+--weight-decay 0.1 \
+--clip-grad 1.0 \
+--save "/mnt/dev100/haidark/model_dir/" \
+--data-path 1.0 "${AZUREML_CR_DATA_CAPABILITY_PATH}/INPUT_data/en_encyclopedia_m_wikipedia_split_00_text_document_dc=14935020_sc=14935020_tc=14038206007" \
+--data-cache-path "/mnt/dev100/haidark/data_cache/" \
+--split "9998,1,1" \
+--log-interval 10 \
+--save-interval 200 \
+--eval-interval 200 \
+--eval-iters 100 \
+--no-async-tensor-model-parallel-allreduce \
+--use-flash-attn 
+

@@ -1,0 +1,7 @@
+{
+    "az-subscription": "c7209a17-0d9f-41df-8e45-e0172343698d",
+    "az-resource-group": "LLM-Test",
+    "az-workspace-name": "Provisioning-Test",
+    "az-sas-token": "sv=2023-01-03&ss=btqf&srt=sco&st=2023-12-03T21%3A43%3A17Z&se=2025-05-30T21%3A43%3A00Z&sp=rwdxftlacup&sig=51chDeU9Xqnk7GrTSA3u2gEfdgCUQIq9SDAJEQCPQxE%3D",
+    "az-sample-yaml-job-file": "None"
+}

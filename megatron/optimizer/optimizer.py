@@ -336,12 +336,19 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         num_zeros_in_grad = self.count_zeros() if \
                             self.log_num_zeros_in_grad else None
         timers('optimizer-count-zeros').stop()
-
+        # save the model weights
+        if args.warmup_optimizer_states:
+            model_groups_copy, main_groups_copy = self._get_model_and_main_params_groups_copy()
+        
         # Step the optimizer.
         timers('optimizer-inner-step', log_level=1).start(
             barrier=args.barrier_with_L1_time)
         self.optimizer.step()
         timers('optimizer-inner-step').stop()
+
+        # if < 100 steps, copy the model weights
+        if args.warmup_optimizer_states:
+            self._set_model_and_main_params_groups(model_groups_copy, main_groups_copy)
 
         # Update params from main params.
         timers('optimizer-copy-main-to-model-params', log_level=1).start(
@@ -481,7 +488,30 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         
         return main_grads
 
-
+    def _get_model_and_main_params_groups_copy(self):
+        model_groups = []
+        main_groups = []
+        for model_group, main_group in zip(self.float16_groups,
+                                           self.fp32_from_float16_groups):
+            model_data = []
+            main_data = []
+            for model_param, main_param in zip(model_group, main_group):
+                model_data.append(model_param.data.clone().detach())
+                main_data.append(main_param.data.clone().detach())
+            model_groups.append(model_data)
+            main_groups.append(main_data)
+        return model_groups, main_groups
+    
+    def _set_model_and_main_params_groups(self, model_groups_copy, main_groups_copy):
+        for model_group, main_group, model_group_copy, main_group_copy in zip(self.float16_groups,
+                                           self.fp32_from_float16_groups, 
+                                           model_groups_copy, main_groups_copy):
+            for model_param, main_param, model_param_copy, main_param_copy in zip(model_group, main_group,
+                                                                                model_group_copy, 
+                                                                                main_group_copy):
+                model_param.data = model_param_copy.data
+                main_param.data = main_param_copy.data
+    
     def _get_model_and_main_params_data_float16(self):
         model_data = []
         main_data = []

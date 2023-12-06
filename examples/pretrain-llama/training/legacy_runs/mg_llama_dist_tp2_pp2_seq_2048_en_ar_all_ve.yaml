@@ -1,0 +1,98 @@
+# Training job submission via AML CLI v2
+
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+
+command: >-
+  python pretrain_gpt.py
+  --tensor-model-parallel-size 2
+  --pipeline-model-parallel-size 2
+  --seq-length 4096
+  --max-position-embeddings 4096
+  --tokenizer-type Llama2Tokenizer
+  --tokenizer-model ${{inputs.tokenizer}}
+  --load ${{inputs.load_initial_model}}
+  --exit-on-missing-checkpoint
+  --use-checkpoint-args
+  --no-initialization
+  --no-load-optim
+  --no-load-rng
+  --bf16
+  --untie-embeddings-and-output-weights
+  --use-rotary-position-embeddings
+  --normalization RMSNorm
+  --no-position-embedding
+  --no-masked-softmax-fusion
+  --no-query-key-layer-scaling
+  --micro-batch-size 2 
+  --global-batch-size 936
+  --train-iters 125000
+  --lr 0.000001 
+  --lr-decay-style cosine 
+  --min-lr 0.000001
+  --lr-warmup-iters 10000 
+  --weight-decay 0.1 
+  --clip-grad 1.0 
+  --save ${{outputs.model_dir}} 
+  --data-cache-path ${{outputs.cache}}
+  --split 9994,3,3
+  --log-interval 100
+  --log-validation-ppl-to-tensorboard 
+  --save-interval 10000 
+  --eval-interval 1000
+  --eval-iters 100
+  --tensorboard-dir ${{outputs.model_dir}}/tensorboard
+  --tensorboard-log-interval 100
+  --no-async-tensor-model-parallel-allreduce
+  --use-flash-attn
+  --data-path 0.009228745699783679 ${{inputs.data}}/ar_books_split_00_text_document 0.008136138885578672 ${{inputs.data}}/ar_books_split_01_text_document 0.0006644927825429117 ${{inputs.data}}/ar_encyclopedias_split_00_text_document 0.0034991476876137947 ${{inputs.data}}/ar_news_split_00_text_document 0.0038614816821805915 ${{inputs.data}}/ar_news_split_01_text_document 0.0040818818509767716 ${{inputs.data}}/ar_news_split_02_text_document 0.003803011679463937 ${{inputs.data}}/ar_news_split_03_text_document 0.0023848945429055086 ${{inputs.data}}/ar_news_split_04_text_document 0.0011628514551180703 ${{inputs.data}}/ar_others_split_00_text_document 0.0006786480291598388 ${{inputs.data}}/ar_transcribed_split_00_text_document 0.0012560915235753118 ${{inputs.data}}/ar_translated_En_wikipedia_split_translated_split_00_text_document 0.002813421179119451 ${{inputs.data}}/ar_web_arabicweb16_v2_split_00_text_document 0.00283736936364746 ${{inputs.data}}/ar_web_arabicweb16_v2_split_01_text_document 0.0028427726000193783 ${{inputs.data}}/ar_web_arabicweb16_v2_split_02_text_document 0.0028246282720505596 ${{inputs.data}}/ar_web_arabicweb16_v2_split_03_text_document 0.0028313549246821402 ${{inputs.data}}/ar_web_arabicweb16_v2_split_04_text_document 0.0028404596176561142 ${{inputs.data}}/ar_web_arabicweb16_v2_split_05_text_document 0.0028252086577064787 ${{inputs.data}}/ar_web_arabicweb16_v2_split_06_text_document 0.0028296017833498066 ${{inputs.data}}/ar_web_arabicweb16_v2_split_07_text_document 0.002827349578835466 ${{inputs.data}}/ar_web_arabicweb16_v2_split_08_text_document 0.0028331414510300796 ${{inputs.data}}/ar_web_arabicweb16_v2_split_09_text_document 0.0011039029338443973 ${{inputs.data}}/ar_web_arabicweb16_v2_split_10_text_document 0.0026190296495323968 ${{inputs.data}}/ar_web_arabicweb22_split_00_text_document 0.0017729686074992844 ${{inputs.data}}/ar_web_arabicweb22_split_01_text_document 0.002834035998243111 ${{inputs.data}}/ar_web_metadialog_split_00_text_document 0.0028119625107452828 ${{inputs.data}}/ar_web_metadialog_split_01_text_document 0.0028723637082108356 ${{inputs.data}}/ar_web_metadialog_split_02_text_document 0.0028852118030628835 ${{inputs.data}}/ar_web_metadialog_split_03_text_document 0.0028365792516114523 ${{inputs.data}}/ar_web_metadialog_split_04_text_document 0.002814374792129324 ${{inputs.data}}/ar_web_metadialog_split_05_text_document 0.002820269387448879 ${{inputs.data}}/ar_web_metadialog_split_06_text_document 0.0028038020144947285 ${{inputs.data}}/ar_web_metadialog_split_07_text_document 0.00280492169655659 ${{inputs.data}}/ar_web_metadialog_split_08_text_document 0.0028135572872599983 ${{inputs.data}}/ar_web_metadialog_split_09_text_document 0.0028403243655416082 ${{inputs.data}}/ar_web_metadialog_split_10_text_document 0.002828067784684015 ${{inputs.data}}/ar_web_metadialog_split_11_text_document 0.0008583082066042528 ${{inputs.data}}/ar_web_metadialog_split_12_text_document 0.0026896303972785912 ${{inputs.data}}/ar_web_oscar2301_split_00_text_document 0.0026911472754235595 ${{inputs.data}}/ar_web_oscar2301_split_01_text_document 5.082141003872465e-05 ${{inputs.data}}/ar_web_oscar2301_split_02_text_document 0.01814888801954023 ${{inputs.data}}/en_books_books_split_00_text_document 0.018152673366694322 ${{inputs.data}}/en_books_books_split_01_text_document 0.015750945499702056 ${{inputs.data}}/en_code_github_split_00_text_document 0.015745053900473645 ${{inputs.data}}/en_code_github_split_01_text_document 0.015747390851566064 ${{inputs.data}}/en_code_github_split_02_text_document 0.015755861229243526 ${{inputs.data}}/en_code_github_split_03_text_document 0.003835754247525993 ${{inputs.data}}/en_code_github_split_04_text_document 0.015436026359543116 ${{inputs.data}}/en_code_stackexchange_split_00_text_document 0.007548334907986816 ${{inputs.data}}/en_code_stackexchange_split_01_text_document 0.01760869535433268 ${{inputs.data}}/en_encyclopedia_m_wikipedia_split_00_text_document 0.01127283573107105 ${{inputs.data}}/en_encyclopedia_m_wikipedia_split_01_text_document 0.0014145898812557528 ${{inputs.data}}/en_encyclopedia_m_wikipedia_split_02_text_document 0.007252920321176125 ${{inputs.data}}/en_encyclopedia_wikipedia_split_00_text_document 0.015097004522155733 ${{inputs.data}}/en_reasoning_open-web-math_split_00_text_document 0.0034038411722931484 ${{inputs.data}}/en_reasoning_open-web-math_split_01_text_document 0.013130013332293142 ${{inputs.data}}/en_reasoning_peS2o_split_00_text_document 0.014490414197064174 ${{inputs.data}}/en_reasoning_peS2o_split_01_text_document 0.015367982989594943 ${{inputs.data}}/en_reasoning_peS2o_split_02_text_document 0.015369192554391127 ${{inputs.data}}/en_reasoning_peS2o_split_03_text_document 0.015368779093813238 ${{inputs.data}}/en_reasoning_peS2o_split_04_text_document 0.015370951687905749 ${{inputs.data}}/en_reasoning_peS2o_split_05_text_document 0.015369677921156476 ${{inputs.data}}/en_reasoning_peS2o_split_06_text_document 0.015367744158329453 ${{inputs.data}}/en_reasoning_peS2o_split_07_text_document 0.015369767803890799 ${{inputs.data}}/en_reasoning_peS2o_split_08_text_document 0.015369736986953316 ${{inputs.data}}/en_reasoning_peS2o_split_09_text_document 0.007592908183950979 ${{inputs.data}}/en_reasoning_peS2o_split_10_text_document 0.019510626853013625 ${{inputs.data}}/en_scientific_arxiv_split_00_text_document 0.018378397161440588 ${{inputs.data}}/en_scientific_arxiv_split_01_text_document 0.005140857542088978 ${{inputs.data}}/en_web_c4_split_00_text_document 0.005142075667145575 ${{inputs.data}}/en_web_c4_split_01_text_document 0.0051411871121148315 ${{inputs.data}}/en_web_c4_split_02_text_document 0.0051419755120987575 ${{inputs.data}}/en_web_c4_split_03_text_document 0.005141586876276062 ${{inputs.data}}/en_web_c4_split_04_text_document 0.00514113489452632 ${{inputs.data}}/en_web_c4_split_05_text_document 0.005141308667812679 ${{inputs.data}}/en_web_c4_split_06_text_document 0.005141365165531397 ${{inputs.data}}/en_web_c4_split_07_text_document 0.0051410364515315846 ${{inputs.data}}/en_web_c4_split_08_text_document 0.005141586876276062 ${{inputs.data}}/en_web_c4_split_09_text_document 0.005141463608526133 ${{inputs.data}}/en_web_c4_split_10_text_document 0.0051414524801875975 ${{inputs.data}}/en_web_c4_split_11_text_document 0.005141031315375338 ${{inputs.data}}/en_web_c4_split_12_text_document 0.005140921744042066 ${{inputs.data}}/en_web_c4_split_13_text_document 0.005141871076921734 ${{inputs.data}}/en_web_c4_split_14_text_document 0.005141390846312632 ${{inputs.data}}/en_web_c4_split_15_text_document 0.0006151865385970729 ${{inputs.data}}/en_web_c4_split_16_text_document 0.005158465997756019 ${{inputs.data}}/en_web_cc_split_00_text_document 0.00514927827025605 ${{inputs.data}}/en_web_cc_split_01_text_document 0.005174083336851279 ${{inputs.data}}/en_web_cc_split_02_text_document 0.0051609099521035835 ${{inputs.data}}/en_web_cc_split_03_text_document 0.00514991686568277 ${{inputs.data}}/en_web_cc_split_04_text_document 0.005152451558790699 ${{inputs.data}}/en_web_cc_split_05_text_document 0.005186429800443196 ${{inputs.data}}/en_web_cc_split_06_text_document 0.005304046922475077 ${{inputs.data}}/en_web_cc_split_07_text_document 0.005307798028587521 ${{inputs.data}}/en_web_cc_split_08_text_document 0.00530710721557229 ${{inputs.data}}/en_web_cc_split_09_text_document 0.005302713233902921 ${{inputs.data}}/en_web_cc_split_10_text_document 0.005305731581724116 ${{inputs.data}}/en_web_cc_split_11_text_document 0.005307670480707386 ${{inputs.data}}/en_web_cc_split_12_text_document 0.00530818152825397 ${{inputs.data}}/en_web_cc_split_13_text_document 0.005222037059652056 ${{inputs.data}}/en_web_cc_split_14_text_document 0.005164823703163852 ${{inputs.data}}/en_web_cc_split_15_text_document 0.005165779028225807 ${{inputs.data}}/en_web_cc_split_16_text_document 0.0051809923230296305 ${{inputs.data}}/en_web_cc_split_17_text_document 0.005162355780087134 ${{inputs.data}}/en_web_cc_split_18_text_document 0.005165242299897988 ${{inputs.data}}/en_web_cc_split_19_text_document 0.005166415911600444 ${{inputs.data}}/en_web_cc_split_20_text_document 0.005181069365373337 ${{inputs.data}}/en_web_cc_split_21_text_document 0.005259073882349684 ${{inputs.data}}/en_web_cc_split_22_text_document 0.005329853539538485 ${{inputs.data}}/en_web_cc_split_23_text_document 0.005321080128642446 ${{inputs.data}}/en_web_cc_split_24_text_document 0.0053223735839906675 ${{inputs.data}}/en_web_cc_split_25_text_document 0.005323682447807629 ${{inputs.data}}/en_web_cc_split_26_text_document 0.005329336499809613 ${{inputs.data}}/en_web_cc_split_27_text_document 0.005327276045128496 ${{inputs.data}}/en_web_cc_split_28_text_document 0.005319381772976748 ${{inputs.data}}/en_web_cc_split_29_text_document 0.0053237671943857055 ${{inputs.data}}/en_web_cc_split_30_text_document 0.005288559699338076 ${{inputs.data}}/en_web_cc_split_31_text_document 0.005146800074866839 ${{inputs.data}}/en_web_cc_split_32_text_document 0.005140494587047519 ${{inputs.data}}/en_web_cc_split_33_text_document 0.005146187160221355 ${{inputs.data}}/en_web_cc_split_34_text_document 0.0051468463002730626 ${{inputs.data}}/en_web_cc_split_35_text_document 0.005147091979746881 ${{inputs.data}}/en_web_cc_split_36_text_document 0.0051467307367575035 ${{inputs.data}}/en_web_cc_split_37_text_document 0.005140374743401754 ${{inputs.data}}/en_web_cc_split_38_text_document 0.005205213579864775 ${{inputs.data}}/en_web_cc_split_39_text_document 0.005285567888324158 ${{inputs.data}}/en_web_cc_split_40_text_document 0.005288274642666364 ${{inputs.data}}/en_web_cc_split_41_text_document 0.005293042707715728 ${{inputs.data}}/en_web_cc_split_42_text_document 0.005290410427639104 ${{inputs.data}}/en_web_cc_split_43_text_document 0.005285709988646993 ${{inputs.data}}/en_web_cc_split_44_text_document 0.005285993333266624 ${{inputs.data}}/en_web_cc_split_45_text_document 0.005290353073894345 ${{inputs.data}}/en_web_cc_split_46_text_document 0.005295189621027004 ${{inputs.data}}/en_web_cc_split_47_text_document 0.005226573997670302 ${{inputs.data}}/en_web_cc_split_48_text_document 0.005110454065184442 ${{inputs.data}}/en_web_cc_split_49_text_document 0.005104865071161588 ${{inputs.data}}/en_web_cc_split_50_text_document 0.005101659253637375 ${{inputs.data}}/en_web_cc_split_51_text_document 0.0051101578801741945 ${{inputs.data}}/en_web_cc_split_52_text_document 0.005105101334348954 ${{inputs.data}}/en_web_cc_split_53_text_document 0.005105353862031101 ${{inputs.data}}/en_web_cc_split_54_text_document 0.005101379333121909 ${{inputs.data}}/en_web_cc_split_55_text_document 0.005262152151993761 ${{inputs.data}}/en_web_cc_split_56_text_document 0.005270109770072556 ${{inputs.data}}/en_web_cc_split_57_text_document 0.005267916631355058 ${{inputs.data}}/en_web_cc_split_58_text_document 0.005265747461366712 ${{inputs.data}}/en_web_cc_split_59_text_document 0.005269934284734115 ${{inputs.data}}/en_web_cc_split_60_text_document 0.0052701345948277505 ${{inputs.data}}/en_web_cc_split_61_text_document 0.005267605893902109 ${{inputs.data}}/en_web_cc_split_62_text_document 0.0052658296398666645 ${{inputs.data}}/en_web_cc_split_63_text_document 0.0051000696132789064 ${{inputs.data}}/en_web_cc_split_64_text_document 0.005099674985273923 ${{inputs.data}}/en_web_cc_split_65_text_document 0.005102468198246288 ${{inputs.data}}/en_web_cc_split_66_text_document 0.0050932179808453135 ${{inputs.data}}/en_web_cc_split_67_text_document 0.005098620361191191 ${{inputs.data}}/en_web_cc_split_68_text_document 0.005094639840099712 ${{inputs.data}}/en_web_cc_split_69_text_document 0.005102441661439012 ${{inputs.data}}/en_web_cc_split_70_text_document 0.005099977162466459 ${{inputs.data}}/en_web_cc_split_71_text_document 0.005117075426612958 ${{inputs.data}}/en_web_cc_split_72_text_document 0.005249341722287526 ${{inputs.data}}/en_web_cc_split_73_text_document 0.005257745329933775 ${{inputs.data}}/en_web_cc_split_74_text_document 0.005252815475962628 ${{inputs.data}}/en_web_cc_split_75_text_document 0.005256510084356354 ${{inputs.data}}/en_web_cc_split_76_text_document 0.005252064741124515 ${{inputs.data}}/en_web_cc_split_77_text_document 0.005252968704623999 ${{inputs.data}}/en_web_cc_split_78_text_document 0.005256465571002213 ${{inputs.data}}/en_web_cc_split_79_text_document 0.0052527358655407985 ${{inputs.data}}/en_web_cc_split_80_text_document 0.0035149850254016374 ${{inputs.data}}/en_web_cc_split_81_text_document   
+
+display_name: MegatronLM-Allam-V2-data_VE
+
+experiment_name: MegatronLM-Vocab-Expansion
+code: ../../../
+environment: azureml:Megatron-LLaMA:4
+environment_variables:
+  HYDRA_FULL_ERROR: '1'
+  UCX_IB_PCI_RELAXED_ORDERING: 'auto'
+  NCCL_IB_PCI_RELAXED_ORDERING: '2'
+  NCCL_IB_TIMEOUT: '22'
+  NCCL_DEBUG: WARN
+  CUDA_DEVICE_MAX_CONNECTIONS: '1'
+inputs:
+  load_initial_model:
+    type: uri_folder
+    mode: ro_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/srashed/paths/vocab_expansion_assets/megatronlm_models/Llama-2-7b-hf-ExpTok-32K_10M_tp2_pp2_seq4096_gb48/
+  tokenizer:
+    type: uri_file
+    mode: ro_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/tokenized_data/allam_data_2-1_splits-llama2-VE-indexed_data/tokenizer/tokenizer.model
+  data:
+    type: uri_folder
+    mode: ro_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/tokenized_data/allam_data_2-1_splits-llama2-VE-indexed_data/llama2_ve_bin_idx/
+outputs:
+  cache:
+    type: uri_folder
+    mode: rw_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/experiments/ALLaM_V2/cache
+  model_dir:
+    type: uri_folder
+    mode: rw_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/experiments/ALLaM_V2/
+
+
+services:
+  my_jupyterlab:
+    type: jupyter_lab
+    nodes: all
+
+compute: azureml:A100-SSH
+
+distribution:
+  type: pytorch
+  process_count_per_instance: 8
+
+resources:
+  instance_count: 26
+  shm_size: 800g

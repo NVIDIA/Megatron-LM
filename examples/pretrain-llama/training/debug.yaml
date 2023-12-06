@@ -1,0 +1,52 @@
+# Training job submission via AML CLI v2
+
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+
+display_name: dual_gpu_dev
+experiment_name: sbmaruf_dev
+code: ../../../
+environment: azureml:NeMo_2308_dev:2
+environment_variables:
+  HYDRA_FULL_ERROR: '1'
+
+inputs:
+  experiment:
+    type: uri_file
+    mode: download
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/
+  llama2_tokenizer:
+    type: uri_file
+    mode: download
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/allam_data_2-1_splits-llama2-indexed_data/tokenizer/tokenizer.model
+  llama2_ve_tokenizer:
+    type: uri_file
+    mode: download
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/allam_data_2-1_splits-llama2-VE-indexed_data/tokenizer/tokenizer.model
+
+outputs:
+  checkpoint_dir:
+    type: uri_folder
+    mode: rw_mount
+    path:  azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/sbmaruf_debug
+
+services:
+  my_jupyterlab:
+    type: jupyter_lab
+    nodes: all
+  my_vscode:
+    type: vs_code
+    nodes: all
+  my_tensorboard:
+    type: tensor_board
+    log_dir: "outputs/runs/"
+    nodes: all
+
+compute: azureml:A100-MULTI-DEV3
+
+resources:
+  instance_count: 1
+  shm_size: 800g
+
+# command for quick testing
+command: >-
+  sleep infinity

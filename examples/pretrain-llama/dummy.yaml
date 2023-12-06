@@ -1,0 +1,42 @@
+# Training job submission via AML CLI v2
+
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+
+command: >-
+  sleep infinity
+  
+display_name: debug-haidark
+
+experiment_name: megatron-optimizer
+code: ./
+environment: azureml:Megatron-LLaMA:7
+environment_variables:
+  HYDRA_FULL_ERROR: '1'
+
+inputs:
+  load_initial_model:
+    type: uri_folder
+    mode: ro_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/megatronlm_models/Llama-2-7b-hf-default-tp2_pp2/
+  tokenizer:
+    type: uri_file
+    mode: ro_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/allam_data_2-1_splits-llama2-indexed_data/tokenizer/tokenizer.model
+  data:
+    type: uri_folder
+    mode: ro_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/allam_data_2-1_splits-llama2-indexed_data/llama2_bin_idx/
+
+services:
+  my_jupyterlab:
+    type: jupyter_lab
+    nodes: all
+  my_vscode:
+    type: vs_code
+    nodes: all
+
+compute: azureml:A100-MULTI-DEV3
+
+resources:
+  instance_count: 1
+  shm_size: 800g

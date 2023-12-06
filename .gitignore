@@ -7,3 +7,15 @@ build
 slurm*
 logs
 .vscode
+.hypothesis/
+## AzureML Runtime - Ignore the following log directories START
+azureml-logs
+logs/azureml
+system_logs
+user_logs
+## AzureML Runtime - Ignore the following log directories END
+.DS_Store
+examples/pretrain-llama/data-processing/tokenize/output.*
+examples/pretrain-llama/data-processing/merge_shard/output.yaml
+.temp/
+merge_shard.txt

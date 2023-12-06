@@ -1,0 +1,68 @@
+# Training job submission via AML CLI v2
+
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+
+command: >-
+  bash examples/pretrain-llama/training/llama_ve_en_reasoning_ar/llama_ve_en_reasoning_ar.sh \
+   ${{inputs.pretrained_llama_model}} \
+   ${{inputs.tokenizer_model_path}} \
+   ${{inputs.bin_idx_data_dir}} \
+   ${{outputs.data_cache}} \
+   ${{outputs.checkpoint_dir}} \
+   ${{outputs.tensorboard_dir}}
+
+display_name: LLaMa-VE-Allam-Reasoning-Data-with-Ar
+
+experiment_name: Vocab-Expansion
+code: ../../../../
+environment: azureml:Megatron-LLaMA:7
+environment_variables:
+  HYDRA_FULL_ERROR: '1'
+  UCX_IB_PCI_RELAXED_ORDERING: 'auto'
+  NCCL_IB_PCI_RELAXED_ORDERING: '2'
+  NCCL_IB_TIMEOUT: '22'
+  NCCL_DEBUG: WARN
+  CUDA_DEVICE_MAX_CONNECTIONS: '1'
+inputs:
+  pretrained_llama_model:
+    type: uri_folder
+    mode: ro_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/megatronlm_models/Llama-2-7b-hf-ExpTok-32K_10M_tp2_pp2_seq4096_gb48/
+  tokenizer_model_path:
+    type: uri_file
+    mode: ro_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/allam_data_2-1_splits-llama2-VE-indexed_data/tokenizer/tokenizer.model
+  bin_idx_data_dir:
+    type: uri_folder
+    mode: ro_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/allam_data_2-1_splits-llama2-VE-indexed_data/llama2_ve_bin_idx/
+outputs:
+  data_cache:
+    type: uri_folder
+    mode: rw_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/llama_ve_en_reasoning_ar/cache/
+  checkpoint_dir:
+    type: uri_folder
+    mode: rw_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/llama_ve_en_reasoning_ar
+  tensorboard_dir:
+    type: uri_folder
+    mode: rw_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/llama_ve_en_reasoning_ar/tensorboard
+
+services:
+  my_jupyterlab:
+    type: jupyter_lab
+  my_tensorboard:
+    type: tensor_board
+    log_dir: ${{outputs.tensorboard_dir}}
+
+compute: azureml:A100-SSH
+
+distribution:
+  type: pytorch
+  process_count_per_instance: 8
+
+resources:
+  instance_count: 16
+  shm_size: 1250g
