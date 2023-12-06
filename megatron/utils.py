@@ -295,7 +295,6 @@ def get_ltor_masks_and_position_ids_for_non_data_ranks(data_shape,
 
     return attention_mask, None, None #loss_mask, position_ids
 
-
 def is_second_last_pipeline_stage():
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     pipeline_rank_to_run = pipeline_model_parallel_size - 2 if pipeline_model_parallel_size > 1 else 0

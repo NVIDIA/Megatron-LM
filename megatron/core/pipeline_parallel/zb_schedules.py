@@ -4,7 +4,7 @@ from typing import Iterator, List, Union
 
 import torch
 
-from megatron import core, get_args, get_num_microbatches, print_rank_0
+from megatron import core, get_args, get_num_microbatches, print_rank_0, get_tokenizer
 from megatron.core import parallel_state
 from megatron.core.pipeline_parallel import auto_schedule, v_schedule
 from megatron.core.utils import get_model_config, get_model_type
@@ -38,6 +38,9 @@ class ScheduleTimers:
     f_cnt = 0
     b_cnt = 0
     w_cnt = 0
+    f_mem = 0
+    b_mem = 0
+    w_mem = 0
     iter_counter = 0
     comm_time = 0
     concluded = False
@@ -49,11 +52,15 @@ class ScheduleTimers:
         assert cls.b_cnt > 0
         avg_f = cls.f.elapsed(reset=False) / cls.f_cnt * 1000
         avg_b = cls.b.elapsed(reset=False) / cls.b_cnt * 1000
+        avg_f_mem = cls.f_mem / cls.f_cnt // 1000000
+        avg_b_mem = cls.b_mem / cls.b_cnt // 1000000
         if cls.w_cnt > 0:
             avg_w = cls.w.elapsed(reset=False) / cls.w_cnt * 1000
         else:
             avg_w = avg_b
-        return (avg_f, avg_b, avg_w, cls.comm_time * 1000)
+        avg_w_mem = 0 - avg_f_mem - avg_b_mem
+        return (avg_f, avg_b, avg_w, cls.comm_time * 1000, 
+            avg_f_mem, avg_b_mem, avg_w_mem)
 
 
 def bootstrap_and_profile_p2p_communication(
@@ -826,6 +833,7 @@ class ZeroBubbleScheduler:
         if self.run_timer:
             ScheduleTimers.f_cnt += 1
             ScheduleTimers.f.start()
+            mem_before = torch.cuda.memory_allocated()
         output_tensor = forward_step(
             self.forward_step_func,
             self.data_iterator,
@@ -839,6 +847,7 @@ class ZeroBubbleScheduler:
         )
         if self.run_timer:
             ScheduleTimers.f.stop()
+            ScheduleTimers.f_mem += torch.cuda.memory_allocated() - mem_before
         if get_args().profile:
             torch.cuda.nvtx.range_pop()
         self.send_forward_buffer.append(output_tensor)
@@ -865,12 +874,14 @@ class ZeroBubbleScheduler:
             if self.run_timer:
                 ScheduleTimers.b_cnt += 1
                 ScheduleTimers.b.start()
+                mem_before = torch.cuda.memory_allocated()
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, self.model_type,
                 self.config
             )
             if self.run_timer:
                 ScheduleTimers.b.stop()
+                ScheduleTimers.b_mem += torch.cuda.memory_allocated() - mem_before
             if get_args().profile:
                 torch.cuda.nvtx.range_pop()
             self.send_backward_buffer.append(input_tensor_grad)
@@ -883,9 +894,11 @@ class ZeroBubbleScheduler:
             if self.run_timer:
                 ScheduleTimers.w_cnt += 1
                 ScheduleTimers.w.start()
+                mem_before = torch.cuda.memory_allocated()
             WeightGradStore.pop()
             if self.run_timer:
                 ScheduleTimers.w.stop()
+                ScheduleTimers.w_mem += torch.cuda.memory_allocated() - mem_before
             if get_args().profile:
                 torch.cuda.nvtx.range_pop()
 
@@ -1163,15 +1176,18 @@ schedule = None
 is_auto_schedule = False
 
 
-def update_schedule(scheduler, f, b, w, c):
+def update_schedule(scheduler, f, b, w, c, f_mem, b_mem, w_mem):
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     ag_arguments = [None] * torch.distributed.get_world_size()
-    torch.distributed.all_gather_object(ag_arguments, (f,b,w))
+    torch.distributed.all_gather_object(ag_arguments, (f,b,w,f_mem,b_mem,w_mem))
     assert len(ag_arguments) == torch.distributed.get_world_size()
     f_mid = sorted([x[0] for x in ag_arguments])[len(ag_arguments) // 2]
     b_mid = sorted([x[1] for x in ag_arguments])[len(ag_arguments) // 2]
     w_mid = sorted([x[2] for x in ag_arguments])[len(ag_arguments) // 2]
-    if is_second_last_pipeline_stage():
+    f_mem = [x[3] for x in ag_arguments]
+    b_mem = [x[4] for x in ag_arguments]
+    w_mem = [x[5] for x in ag_arguments]
+    if parallel_state.get_pipeline_model_parallel_rank() == 0 and parallel_state.get_data_parallel_rank() == 0 and parallel_state.get_tensor_model_parallel_rank() == 0:
         print(f"rank {torch.distributed.get_rank()} Performing ILP with {f_mid} {b_mid} {w_mid} {c}")
         schedule = scheduler(
             pipeline_model_parallel_size,
@@ -1180,6 +1196,7 @@ def update_schedule(scheduler, f, b, w, c):
             max(int(b_mid * 1000), 1),
             max(int(w_mid * 1000), 1),
             max(int(c * 1000), 1),
+            f_mem, b_mem, w_mem,
             get_args().zero_bubble_max_pending_backward
         )
         ag_result = [None] * torch.distributed.get_world_size()
@@ -1201,19 +1218,36 @@ def get_zero_bubble_forward_backward_func():
     hidden_size = args.hidden_size
     num_attention_heads = args.num_attention_heads
     seq_length = args.seq_length
-    f_mem = 34 * hidden_size + 5 * num_attention_heads * seq_length
-    w_mem = - 32 * hidden_size
-    b_mem = - f_mem - w_mem
+    f_mem_approx = 34 * hidden_size + 5 * num_attention_heads * seq_length
+    w_mem_approx = - 32 * hidden_size
+    b_mem_approx = - f_mem_approx - w_mem_approx
+
+    final_layer_additional_mem = 2 * get_tokenizer().vocab_size
+
+    # f_mem_array = [f_mem] * pipeline_model_parallel_size
+    # b_mem_array = [b_mem] * pipeline_model_parallel_size
+    # w_mem_array = [w_mem] * pipeline_model_parallel_size
+    # if not args.zero_bubble_v_schedule:
+    #     f_mem_array[0] += final_layer_additional_mem
+    #     w_mem_array[0] -= final_layer_additional_mem
 
     def wrapped_auto_schedule_forward_backward_func(func, scheduler):
         global schedule, is_auto_schedule
         if schedule is None:
-            schedule = update_schedule(scheduler, 1, 1, 1, 0)
+            schedule = update_schedule(scheduler,
+                f=1,
+                b=1,
+                w=1,
+                c=0,
+                f_mem=f_mem_approx,
+                b_mem=b_mem_approx,
+                w_mem=w_mem_approx)
         if ScheduleTimers.concluded and not is_auto_schedule:
             conclusion = ScheduleTimers.conclusion()
             # TODO(wanxy): Maybe an all-reduce here to collect global stats?
             print(f"rank {torch.distributed.get_rank()} profiling conclusion: {conclusion}")
-            schedule = update_schedule(scheduler, *conclusion)
+            schedule = update_schedule(scheduler,
+                *conclusion)
             is_auto_schedule = True
 
         def wrap_schedule(**kwargs):
@@ -1223,12 +1257,12 @@ def get_zero_bubble_forward_backward_func():
         return wrap_schedule
 
     if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
-        def scheduler(nstages, nmb, f, b, w, c, mem):
+        def scheduler(nstages, nmb, f, b, w, c, f_mem, b_mem, w_mem, mem):
             return v_schedule.PipelineGraph(
                 nstages,
                 nmb,
                 f,b,w,c,
-                f_mem=f_mem, b_mem=b_mem, w_mem=w_mem,
+                f_mem=f_mem[0], b_mem=b_mem[0], w_mem=w_mem[0],
                 max_mem=None
                 # Mem ignored for now
             ).get_v_schedule()
@@ -1240,7 +1274,7 @@ def get_zero_bubble_forward_backward_func():
         else:
             raise ValueError("got virtual pipeline parallel but v_schedule is disabled")
     else:
-        def scheduler(nstages, nmb, f, b, w, c, mem):
+        def scheduler(nstages, nmb, f, b, w, c, f_mem, b_mem, w_mem, mem):
             return auto_schedule.auto_schedule(
                 nstages,
                 nmb,
@@ -1249,10 +1283,10 @@ def get_zero_bubble_forward_backward_func():
                     cost_b=b,
                     cost_w=w,
                     cost_comm=c,
-                    mem_f=f_mem,
-                    mem_b=b_mem,
-                    mem_w=w_mem,
-                    max_mem=mem * f_mem,
+                    mem_f=f_mem[0],
+                    mem_b=b_mem[0],
+                    mem_w=w_mem[0],
+                    max_mem=mem * f_mem[0],
                     print_scaling=1000
                 ),
             )
