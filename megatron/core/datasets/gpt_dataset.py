@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class GPTDatasetConfig(BlendedMegatronDatasetConfig):
-    """Configuration object for Megatron Core blended and megatron GPT datasets
+    """Configuration object for Megatron Core megatron GPT datasets
     """
 
     pass
