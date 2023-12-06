@@ -148,7 +148,9 @@ class DistributedDataParallel(MegatronModule):
                     assert (
                         param.grad is not None
                     ), 'param.grad being None is not safe when overlap_grad_reduce is True'
-                if param.grad is not None and not param.grad_added_to_main_grad:
+                if param.grad is not None and (
+                    not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
+                ):
                     param.main_grad.add_(param.grad.data)
                 param.grad = None
                 if self.overlap_grad_reduce:
