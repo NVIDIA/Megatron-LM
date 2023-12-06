@@ -189,6 +189,9 @@ class SwitchMLP(MegatronModule):
         super(SwitchMLP, self).__init__()
         args = get_args()
         self.router = get_router_linear_layer(config)
+        if config.sequence_parallel:
+            setattr(self.router.weight, 'sequence_parallel', True)
+
         self.expert_parallel_size = mpu.get_expert_model_parallel_world_size()
         self.sequence_parallel = config.sequence_parallel
         self.add_bias = config.add_bias_linear
