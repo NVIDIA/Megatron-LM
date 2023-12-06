@@ -1,29 +1,29 @@
-TOK_MODEL="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/allam_data_2-1_splits-llama2-indexed_data/tokenizer/tokenizer.model"
+AZ_LOGIN_CONF="examples/configs/azure_login_configs.json"
+AZJOB_FILE="examples/data-processing/az_templates/template_nemo_tokenize.yaml"
 TOK_TYPE="Llama2Tokenizer"
-INPUT_FOLDER_PATH="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/processed/merged_shards"
-BIN_IDX_PATH="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/allam_data_2-1_splits-llama2-indexed_data/llama2_bin_idx_trans/"
-AZJOB_FILE="examples/pretrain-llama/data-processing/tokenize/tokenize.yaml"
-MATCHING_PREFIX_NAME="ar_translated_"
 
-python examples/data-processing/az_batch_tokenize.py \
+TOK_MODEL="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/allam_data_2-1_splits-llama2-indexed_data/tokenizer/tokenizer.model"
+INPUT_FOLDER_PATH="https://allamllmuksstandard.blob.core.windows.net/llm-data/allam-v2-data/merged_shards/"
+OUTPUT_BIN_IDX_PATH="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/allam_data_2-1_splits-llama2-indexed_data/llama2_bin_idx_with_trans/"
+
+python examples/data-processing/tokenize_shards.py \
 --input-folder-path "$INPUT_FOLDER_PATH" \
---bin-idx-folder-path "$BIN_IDX_PATH" \
+--bin-idx-folder-path "$OUTPUT_BIN_IDX_PATH" \
 --tokenizer-model "$TOK_MODEL" \
 --tokenizer-type $TOK_TYPE \
---az-configs "examples/configs/azure_login_configs.json" \
---num-proc 16
+--az-configs $AZ_LOGIN_CONF \
+--az-sample-yaml-job-file "$AZJOB_FILE" \
+--num-proc 16 
 
 TOK_MODEL="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/allam_data_2-1_splits-llama2-VE-indexed_data/tokenizer/tokenizer.model"
-TOK_TYPE="Llama2Tokenizer"
-INPUT_FOLDER_PATH="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/processed/merged_shards"
-BIN_IDX_PATH="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/allam_data_2-1_splits-llama2-VE-indexed_data/llama2_ve_bin_idx_trans/"
-AZJOB_FILE="examples/configs/azure_login_configs.json"
-MATCHING_PREFIX_NAME="ar_translated_"
+INPUT_FOLDER_PATH="https://allamllmuksstandard.blob.core.windows.net/llm-data/allam-v2-data/merged_shards/"
+OUTPUT_BIN_IDX_PATH="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/allam_data_2-1_splits-llama2-VE-indexed_data/llama2_bin_idx_with_trans/"
 
-python examples/data-processing/az_batch_tokenize.py \
+python examples/data-processing/tokenize_shards.py \
 --input-folder-path "$INPUT_FOLDER_PATH" \
---bin-idx-folder-path "$BIN_IDX_PATH" \
+--bin-idx-folder-path "$OUTPUT_BIN_IDX_PATH" \
 --tokenizer-model "$TOK_MODEL" \
 --tokenizer-type $TOK_TYPE \
---az-configs "examples/configs/azure_login_configs.json" \
---num-proc 16
+--az-configs $AZ_LOGIN_CONF \
+--az-sample-yaml-job-file "$AZJOB_FILE" \
+--num-proc 16 
