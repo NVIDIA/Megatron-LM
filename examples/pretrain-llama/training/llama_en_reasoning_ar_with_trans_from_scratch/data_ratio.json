@@ -1,0 +1,22 @@
+{
+    "en" : {
+        "books": 1, 
+        "code": 2, 
+        "reasoning": 3, 
+        "scientific": 2
+    },
+    "ar" : {
+        "books": 3, 
+        "encyclopedias": 2, 
+        "news": 1, 
+        "others": 1, 
+        "transcribed": 2.5, 
+        "web": 1
+    },
+    "trans-ar" : {
+        "books": 3, 
+        "c4": 2, 
+        "peS20": 2, 
+        "wiki": 1
+    }
+}
