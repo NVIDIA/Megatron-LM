@@ -12,7 +12,7 @@ from megatron import get_timers, get_args, get_retro_args, core, get_num_microba
 from .module import MegatronModule
 from megatron.core import parallel_state, tensor_parallel, mpu
 from megatron.core.enums import ModelType
-from megatron.model import LayerNorm
+from megatron.model import LayerNorm, RMSNorm
 from megatron.model.enums import AttnMaskType, LayerType, AttnType
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
@@ -49,11 +49,6 @@ except ImportError:
 
 FlashAttentionBuilder = get_accelerator().get_op_builder("FlashAttentionBuilder")
 flash_attn_builder = None
-
-try:
-    from apex.normalization import MixedFusedRMSNorm
-except ImportError:
-    MixedFusedRMSNorm = None
 
 
 """ We use the following notation throughout this file:
@@ -899,7 +894,7 @@ class ParallelTransformerLayer(MegatronModule):
                     config.hidden_size,
                     eps=config.layernorm_epsilon)
         else:
-            self.input_layernorm = MixedFusedRMSNorm(config.hidden_size, config.layernorm_epsilon)
+            self.input_layernorm = RMSNorm(config.hidden_size, config.layernorm_epsilon)
         # Self attention.
         self.self_attention = ParallelAttention(
             config,
@@ -925,7 +920,7 @@ class ParallelTransformerLayer(MegatronModule):
                     config.hidden_size,
                     eps=config.layernorm_epsilon)
         else:
-            self.post_attention_layernorm = MixedFusedRMSNorm(config.hidden_size, config.layernorm_epsilon)
+            self.post_attention_layernorm = RMSNorm(config.hidden_size, config.layernorm_epsilon)
             # Cross attention.
         if self.layer_type in (LayerType.decoder,
                                LayerType.retro_decoder,
@@ -945,7 +940,7 @@ class ParallelTransformerLayer(MegatronModule):
                     apply_layernorm_1p=args.apply_layernorm_1p,
                     mem_efficient_ln=args.mem_efficient_ln)
             else:
-                self.post_inter_attention_layernorm = MixedFusedRMSNorm(config.hidden_size, config.layernorm_epsilon)
+                self.post_inter_attention_layernorm = RMSNorm(config.hidden_size, config.layernorm_epsilon)
 
         # MLP
         self.num_experts = num_experts
@@ -1709,7 +1704,7 @@ class ParallelTransformer(MegatronModule):
                         config.hidden_size,
                         eps=config.layernorm_epsilon)
             else:
-                self.final_layernorm = MixedFusedRMSNorm(config.hidden_size, config.layernorm_epsilon)
+                self.final_layernorm = RMSNorm(config.hidden_size, config.layernorm_epsilon)
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]

@@ -3,7 +3,9 @@
 from deepspeed.accelerator.real_accelerator import get_accelerator
 if get_accelerator().device_name() == 'cuda':
     from .fused_layer_norm import MixedFusedLayerNorm as LayerNorm
+    from apex.normalization import MixedFusedRMSNorm as RMSNorm
 else:
+    from .rmsnorm import RMSNorm
     from torch.nn import LayerNorm
 
 from .distributed import DistributedDataParallel
