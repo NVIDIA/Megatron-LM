@@ -59,7 +59,7 @@ def build_train_valid_test_datasets(data_prefix, seq_length):
     if train_datasets:
         blending_train_dataset = BlendedMegatronDatasetBuilder.build_generic_dataset(
             BlendedDataset,
-            getattr(MEGATRON_CORE_DUMMY_CONFIG, "is_built_on_rank"),
+            MEGATRON_CORE_DUMMY_CONFIG.is_built_on_rank,
             train_datasets,
             weights,
             train_size,
@@ -69,7 +69,7 @@ def build_train_valid_test_datasets(data_prefix, seq_length):
     if valid_datasets:
         blending_valid_dataset = BlendedMegatronDatasetBuilder.build_generic_dataset(
             BlendedDataset,
-            getattr(MEGATRON_CORE_DUMMY_CONFIG, "is_built_on_rank"),
+            MEGATRON_CORE_DUMMY_CONFIG.is_built_on_rank,
             valid_datasets,
             weights,
             valid_size,
@@ -79,7 +79,7 @@ def build_train_valid_test_datasets(data_prefix, seq_length):
     if test_datasets:
         blending_test_dataset = BlendedMegatronDatasetBuilder.build_generic_dataset(
             BlendedDataset,
-            getattr(MEGATRON_CORE_DUMMY_CONFIG, "is_built_on_rank"),
+            MEGATRON_CORE_DUMMY_CONFIG.is_built_on_rank,
             test_datasets,
             weights,
             test_size,

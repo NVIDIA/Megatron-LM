@@ -178,7 +178,7 @@ class GPTDataset(MegatronDataset):
 
         TODO: Explain the 80% threshold
         """
-        path_to_cache = getattr(self.config, "path_to_cache")
+        path_to_cache = self.config.path_to_cache
         if path_to_cache is None:
             path_to_cache = os.path.join(
                 self.indexed_dataset.path_prefix, "cache", f"{type(self).__name__}_indices"
@@ -213,7 +213,7 @@ class GPTDataset(MegatronDataset):
                 f"Build and save the {type(self).__name__} {self.index_split.name} indices",
             )
 
-            sequence_length = getattr(self.config, "sequence_length")
+            sequence_length = self.config.sequence_length
 
             if num_epochs == 1:
                 separate_final_epoch = False
@@ -251,7 +251,7 @@ class GPTDataset(MegatronDataset):
                 logger, logging.DEBUG, f"> separate_final_epoch: {separate_final_epoch}"
             )
 
-            numpy_random_state = numpy.random.RandomState(getattr(self.config, "random_seed"))
+            numpy_random_state = numpy.random.RandomState(self.config.random_seed)
 
             os.makedirs(path_to_cache, exist_ok=True)
 
@@ -381,7 +381,7 @@ class GPTDataset(MegatronDataset):
         """
         num_epochs = 0
         num_tokens = 0
-        num_tokens_requested = (self.num_samples * getattr(self.config, "sequence_length")) + 1
+        num_tokens_requested = (self.num_samples * self.config.sequence_length) + 1
         while True:
             num_epochs += 1
             num_tokens += num_tokens_per_epoch

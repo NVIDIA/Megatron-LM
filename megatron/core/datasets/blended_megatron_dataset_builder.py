@@ -67,9 +67,9 @@ class BlendedMegatronDatasetBuilder(object):
             MegatronDataset or BlendedDataset (or None) per split
         """
 
-        if getattr(self.config, "blend"):
-            blend = getattr(self.config, "blend")
-            split = getattr(self.config, "split_matrix")
+        if self.config.blend:
+            blend = self.config.blend
+            split = self.config.split_matrix
 
             # Blend consists of a single prefix
             if len(blend) == 1:
@@ -107,7 +107,7 @@ class BlendedMegatronDatasetBuilder(object):
                     blended_datasets.append(
                         self.build_generic_dataset(
                             BlendedDataset,
-                            getattr(self.config, "is_built_on_rank"),
+                            self.config.is_built_on_rank,
                             megatron_datasets[i],
                             weight_per_dataset,
                             size_per_split[i],
@@ -120,7 +120,7 @@ class BlendedMegatronDatasetBuilder(object):
         else:
             blended_datasets = []
             for i in range(len(Split)):
-                blend = getattr(self.config, "blend_per_split")[i]
+                blend = self.config.blend_per_split[i]
 
                 # Blend is not provided
                 if not blend:
@@ -159,7 +159,7 @@ class BlendedMegatronDatasetBuilder(object):
                     blended_datasets.append(
                         self.build_generic_dataset(
                             BlendedDataset,
-                            getattr(self.config, "is_built_on_rank"),
+                            self.config.is_built_on_rank,
                             megatron_datasets,
                             weight_per_dataset,
                             size_per_split[i],
@@ -186,7 +186,7 @@ class BlendedMegatronDatasetBuilder(object):
         """
         indexed_dataset = self.build_generic_dataset(
             MMapIndexedDataset,
-            getattr(self.config, "is_built_on_rank"),
+            self.config.is_built_on_rank,
             path_prefix,
             self.cls.is_multimodal(),
         )
@@ -218,7 +218,7 @@ class BlendedMegatronDatasetBuilder(object):
                 megatron_datasets.append(
                     self.build_generic_dataset(
                         self.cls,
-                        getattr(self.config, "is_built_on_rank"),
+                        self.config.is_built_on_rank,
                         indexed_dataset,
                         split_indices[i],
                         sizes[i],
