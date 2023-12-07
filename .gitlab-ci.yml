@@ -41,6 +41,20 @@ unit_tests:
   rules:
     - when: always
 
+docs_build_test:
+  stage: test
+  tags:
+    - docker_local_runner
+  script:
+    - cd ..
+    - rm -rf documentation && git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab-master.nvidia.com/nemo-megatron-core-tme/documentation.git
+    - mv megatron-lm/ documentation/
+    - cd documentation/
+    - ./repo docs
+  allow_failure: true
+  except:
+    - main
+
 formatting:
   image: nvcr.io/nvidia/pytorch:23.04-py3
   tags:

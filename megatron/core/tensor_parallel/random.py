@@ -160,14 +160,8 @@ def model_parallel_cuda_manual_seed(seed):
     after this function. Basically, this is replacement for that
     function.
     Two set of RNG states are tracked:
-        default state: This is for data parallelism and is the same among a
-                       set of model parallel GPUs but different across
-                       different model paralle groups. This is used for
-                       example for dropout in the non-tensor-model-parallel regions.
-        tensor-model-parallel state: This state is different among a set of model
-                              parallel GPUs, but the same across data parallel
-                              groups. This is used for example for dropout in
-                              model parallel regions.
+    default state: This is for data parallelism and is the same among a set of model parallel GPUs but different across different model paralle groups. This is used for example for dropout in the non-tensor-model-parallel regions.
+    tensor-model-parallel state: This state is different among a set of model parallel GPUs, but the same across data parallel groups. This is used for example for dropout in model parallel regions.
     """
     # 2718 is just for fun and any POSITIVE value will work.
     offset = seed + 2718
@@ -190,11 +184,11 @@ def model_parallel_cuda_manual_seed(seed):
 
 
 class CheckpointFunction(torch.autograd.Function):
-    """This function is adapted from torch.utils.checkpoint with
-       two main changes:
-           1) torch.cuda.set_rng_state is replaced with `_set_cuda_rng_state`
-           2) the states in the model parallel tracker are also properly
-              tracked/set/reset.
+    """Checkpoint Function 
+
+    This function is adapted from torch.utils.checkpoint with two main changes:
+    1) torch.cuda.set_rng_state is replaced with `_set_cuda_rng_state`
+    2) the states in the model parallel tracker are also properly tracked/set/reset.
     """
 
     @staticmethod
@@ -258,6 +252,9 @@ class CheckpointFunction(torch.autograd.Function):
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
+
+        # filter out non tensor outputs for backward pass
+        outputs, args = zip(*filter(lambda x: torch.is_tensor(x[0]), zip(outputs, args)))
         torch.autograd.backward(outputs, args)
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs)
         return (None, None) + grads
