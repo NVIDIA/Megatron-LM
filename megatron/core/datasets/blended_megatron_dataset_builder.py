@@ -185,10 +185,7 @@ class BlendedMegatronDatasetBuilder(object):
             List[Optional[MegatronDataset]]: The MegatronDatset (or None) per split
         """
         indexed_dataset = self.build_generic_dataset(
-            MMapIndexedDataset,
-            self.config.is_built_on_rank,
-            path_prefix,
-            self.cls.is_multimodal(),
+            MMapIndexedDataset, self.config.is_built_on_rank, path_prefix, self.cls.is_multimodal(),
         )
 
         if indexed_dataset is not None:
