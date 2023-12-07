@@ -6,7 +6,8 @@ import subprocess
 import sys
 
 import setuptools
-from setuptools.command.install import install
+from setuptools import Extension, setup
+from setuptools.command.build_ext import build_ext
 
 spec = importlib.util.spec_from_file_location('package_info', 'megatron/core/package_info.py')
 package_info = importlib.util.module_from_spec(spec)
@@ -55,16 +56,7 @@ install_requires = req_file("requirements.txt")
 #                             Extension Making                                #
 # %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% #
 
-
-class Install(install):
-    def run(self):
-        command = ["make", "-C", os.path.join("megatron", "core", "datasets")]
-        if subprocess.run(command).returncode != 0:
-            sys.exit(1)
-        super().run()
-
-
-cmdclass_override = {"install": Install}
+extra_compile_args = subprocess.check_output(["python3",  "-m",  "pybind11", "--includes"]).decode("utf-8").strip().split()
 
 ###############################################################################
 
@@ -122,7 +114,14 @@ setuptools.setup(
         'Operating System :: OS Independent',
     ],
     packages=setuptools.find_packages(include=['megatron.core', 'megatron.core.*'],),
-    cmdclass=cmdclass_override,
+    ext_modules=[
+        Extension(
+            "megatron.core.datasets.helpers",
+            sources=["megatron/core/datasets/helpers.cpp"],
+            language="c++",
+            extra_compile_args=extra_compile_args,
+        )
+    ],
     # Add in any packaged data.
     include_package_data=True,
     # PyPI package information.
