@@ -415,12 +415,20 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 # are all run on the main backprop thread to prevent deadlocks. Setup
                 # dummy grad_weight tensor to prevent backward hooks from being run
                 # in a background thread.
-                grad_weight = torch.empty(
-                    weight.main_grad.shape,
-                    dtype=input.dtype,
-                    device=torch.cuda.current_device(),
-                    requires_grad=False,
-                )
+                if getattr(weight, 'zero_out_wgrad', False):
+                    grad_weight = torch.zeros(
+                        weight.main_grad.shape,
+                        dtype=input.dtype,
+                        device=torch.cuda.current_device(),
+                        requires_grad=False,
+                    )
+                else:
+                    grad_weight = torch.empty(
+                        weight.main_grad.shape,
+                        dtype=input.dtype,
+                        device=torch.cuda.current_device(),
+                        requires_grad=False,
+                    )
                 weight.grad_added_to_main_grad = True
             else:
                 grad_weight = None
