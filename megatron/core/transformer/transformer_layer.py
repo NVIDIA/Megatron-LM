@@ -12,6 +12,7 @@ from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from megatron.core.utils import make_viewless_tensor
 
 
@@ -228,18 +229,28 @@ class TransformerLayer(MegatronModule):
             (0, global_layer_offset, num_layers)
         ]  # PP sharding offset for ShardedTensors
 
-        attn_state_dict = self.self_attention.sharded_state_dict(
-            prefix=f'{state_dict_prefix}self_attention.',
-            sharded_key_prefix=f'{prefix}self_attention.',
-            sharded_offsets=sharded_pp_offset,
-        )
+        sharded_state_dict = {}
 
-        mlp_state_dict = self.mlp.sharded_state_dict(
-            prefix=f'{state_dict_prefix}mlp.',
-            sharded_key_prefix=f'{prefix}mlp.',
-            sharded_offsets=sharded_pp_offset,
-        )
-
-        sharded_state_dict = {**mlp_state_dict, **attn_state_dict}
+        # TODO: consider `self._modules.items()` instead of explicit enumeration
+        for name, module in [
+            ('input_layernorm', self.input_layernorm),
+            ('self_attention', self.self_attention),
+            ('pre_cross_attn_layernorm', self.pre_cross_attn_layernorm),
+            ('cross_attention', self.cross_attention),
+            ('pre_mlp_layernorm', self.pre_mlp_layernorm),
+            ('mlp', self.mlp),
+        ]:
+            if hasattr(module, 'sharded_state_dict'):
+                module_sharded_sd = module.sharded_state_dict(
+                    prefix=f'{state_dict_prefix}{name}.',
+                    sharded_key_prefix=f'{prefix}{name}.',
+                    sharded_offsets=sharded_pp_offset,
+                )
+            else:
+                module_sd = module.state_dict(prefix='', keep_vars=True)
+                module_sharded_sd = make_sharded_tensors_for_checkpoint(
+                    module_sd, f'{state_dict_prefix}{name}.', f'{prefix}{name}.', {}, sharded_pp_offset
+                )
+            sharded_state_dict.update(module_sharded_sd)
 
         return sharded_state_dict
