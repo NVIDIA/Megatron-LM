@@ -48,8 +48,8 @@ if __name__ == "__main__":
     domain_dict = json.load(open(args.domain_ratio_from_json))
     lang_prob_dict = normalize(json.load(open(args.lang_select_prob_json)))
     exclude_iterator_list = json.load(open(args.exclude_iterator_json))['exclude_iterator_name']
-    exclude_iterator_list = sorted([ exclude_iterator.replace(".bin", "") for exclude_iterator in exclude_iterator_list if exclude_iterator.endswith(".bin")])
     
+    exclude_iterator_list = sorted([ exclude_iterator.replace(".bin", "") for exclude_iterator in exclude_iterator_list if exclude_iterator.endswith(".bin")])
     source_prefix_paths = sorted([ source_prefix_path.replace(".bin", "") for source_prefix_path in source_prefix_paths if source_prefix_path.endswith(".bin")])
     data_dist_by_lang, tot_token_by_lang, tot_sampled_token_by_lang = {}, {}, {}
     
@@ -59,15 +59,17 @@ if __name__ == "__main__":
         if source_prefix_path in exclude_iterator_list:
             continue
         print(f"\t{source_prefix_path}")
+        
         dc = int(source_prefix_path.split("dc=")[1].split("_")[0])
         sc = int(source_prefix_path.split("sc=")[1].split("_")[0])
         tc = int(source_prefix_path.split("tc=")[1].split("_")[0])
+        
         lang = source_prefix_path.split("_")[0]
         domain = source_prefix_path.split("_")[1]
         domain_multiplier = copy.deepcopy(domain_dict)
+
         if lang in domain_dict: domain_multiplier = domain_multiplier[lang]
-        if domain in domain_multiplier:
-            domain_multiplier = domain_multiplier[domain]
+        if domain in domain_multiplier: domain_multiplier = domain_multiplier[domain]
         if isinstance(domain_multiplier, dict): continue
         if lang not in data_dist_by_lang: data_dist_by_lang[lang] = []
         if lang not in tot_token_by_lang: tot_token_by_lang[lang] = 0
@@ -94,7 +96,7 @@ if __name__ == "__main__":
             )
             tot_prob_covered += prob
         assert abs(lang_prob_dict[lang] - tot_prob_covered) < 1e-6
-    
+
     print(f"\n\n> Total token by language.")
     for lang, token in tot_token_by_lang.items():
         print(f"\t\t{lang}:{token:_}")
@@ -102,6 +104,8 @@ if __name__ == "__main__":
     for lang, token in tot_sampled_token_by_lang.items():
         print(f"\t\t{lang}:{token:_}")
     print("\n")
+
+    print("> Iterator selection probability.\n")
     lang_token = {k:0 for k, _ in lang_prob_dict.items()}
     if args.export_script is not None:
         if not args.export_script.endswith(".sh"): args.export_script = args.export_script + ".sh"
@@ -112,10 +116,10 @@ if __name__ == "__main__":
         lang = iterator_name.split("_")[0]
         lang_token[lang] += total_token_to_be_sampled
         if args.verbose:
-            print(f"{prob} {os.path.basename(iterator_name)} {total_token_to_be_sampled:_} {total_token_exists:_} {total_token_to_be_sampled/total_token_exists}")
+            print(f"\t{prob} {os.path.basename(iterator_name)} {total_token_to_be_sampled:_} {total_token_exists:_} {total_token_to_be_sampled/total_token_exists}")
         else:
             __output_format = os.path.basename(iterator_name).replace('=', '\\=')
-            print(f"{prob} {args.prefix_for_file_path}/{__output_format}")
+            print(f"\t{prob} {args.prefix_for_file_path}/{__output_format}")
             if args.export_script is not None:
                 out_file_ptr.write(f"\n{prob} {args.prefix_for_file_path}/{__output_format}")
     if args.export_script is not None:
