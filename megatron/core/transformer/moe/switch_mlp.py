@@ -24,24 +24,30 @@ class SwitchMLP(BaseMoELayer):
             self.local_experts.append(expert)
 
     def forward(self, hidden_states):
-        global_hidden_states, global_indices = self.token_permutation(hidden_states)
+        # global_hidden_states, global_indices = self.token_permutation(hidden_states)
+        permuted_local_hidden_states, tokens_per_expert = self.token_permutation(hidden_states)
 
-        output_total = torch.zeros_like(global_hidden_states)
-        output_bias_total = None
+        output_local = torch.zeros_like(permuted_local_hidden_states)
+        output_bias_local = None
         if self.add_bias:
-            output_bias_total = torch.zeros_like(global_hidden_states)
+            output_bias_local = torch.zeros_like(permuted_local_hidden_states)
 
+        cumsum_num_tokens = torch.cumsum(tokens_per_expert, dim=0)
+        # Insert zero at the begining for offset index's convenience
+        zero_tensor = torch.zeros(1, dtype=torch.long)
+        cumsum_num_tokens = torch.cat((zero_tensor, cumsum_num_tokens))
         for expert_num, expert in enumerate(self.local_experts):
-            local_expert_index = self.local_expert_indices[expert_num]
-            local_indices = (global_indices == local_expert_index).nonzero()
-            hidden = global_hidden_states[local_indices, :]
+            start = cumsum_num_tokens[expert_num]
+            end = cumsum_num_tokens[expert_num + 1]
+            hidden = permuted_local_hidden_states[start:end]
             output, output_bias = expert(hidden)
 
-            output_total[local_indices, :] = output
+            output_local[start:end] = output
             if self.add_bias:
                 output_bias = output_bias.expand_as(output)
-                output_bias_total[local_indices, :] = output_bias
+                output_bias_local[start:end, :] = output_bias
 
-        output_total, output_bias_total = self.token_unpermutation(output_total, output_bias_total)
+        # Un-permutation of tokens.
+        output_total, output_bias_total = self.token_unpermutation(output_local, output_bias_local)
 
         return output_total, output_bias_total

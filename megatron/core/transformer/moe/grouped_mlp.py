@@ -148,33 +148,21 @@ class GroupedMLP(BaseMoELayer):
         return scale_gradient(w, self.gradient_scale)
 
     def forward(self, hidden_states):
-        global_hidden_states, global_indices = self.token_permutation(hidden_states)
-
-        with torch.no_grad():
-            sorted_indices = torch.argsort(global_indices)
-            # Permutation of tokens to each expert group.
-            sorted_global_hidden_states = global_hidden_states[sorted_indices]
-            # GroupedGEMM requires tokens_per_expert is on cpu.
-            tokens_per_expert = torch.histc(
-                global_indices,
-                bins=self.config.num_moe_experts,
-                min=0,
-                max=self.config.num_moe_experts - 1,
-            ).cpu()
+        # Permutation of tokens
+        permuted_local_hidden_states, tokens_per_expert = self.token_permutation(hidden_states)
 
         w1, w2 = (self.scale_grad(self.weight1), self.scale_grad(self.weight2))
         # Reshape the weights for the grouped GEMMs.
         w1 = w1.view(self.num_local_experts, self.config.hidden_size, -1)
         w2 = w2.view(self.num_local_experts, -1, self.config.hidden_size)
 
-        fc1_output = gg.ops.gmm(sorted_global_hidden_states, w1, tokens_per_expert, trans_b=False)
+        fc1_output = gg.ops.gmm(permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False)
 
         intermediate_parallel = self.activation_func(fc1_output)
 
         fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
-        # Un-permutation of tokens
-        original_order_ghs = torch.empty_like(fc2_output)
-        original_order_ghs[sorted_indices] = fc2_output
-        output_total, _ = self.token_unpermutation(original_order_ghs)
+
+        # Un-permutation of tokens.
+        output_total, _ = self.token_unpermutation(fc2_output)
 
         return output_total, None

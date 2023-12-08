@@ -125,7 +125,7 @@ class TestParallelGroupedMLP:
         # [sequence length, batch size, hidden size]
         seq_len = 3 #32
         batch_size = 2
-        hidden_states = torch.ones(
+        hidden_states = torch.rand(
             (seq_len, batch_size, self.switch_mlp_smm.config.hidden_size),
             dtype=torch.bfloat16)
         hidden_states = hidden_states.cuda()
