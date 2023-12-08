@@ -2,10 +2,10 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import erf_gelu, get_linear_layer, openai_gelu
-from megatron.model import LayerNorm
 
 
 class BertLMHead(MegatronModule):
@@ -42,8 +42,11 @@ class BertLMHead(MegatronModule):
         setattr(self.dense.weight, 'sequence_parallel', config.sequence_parallel)
         setattr(self.dense.bias, 'sequence_parallel', config.sequence_parallel)
 
-        self.layernorm = LayerNorm(
-            hidden_size, eps=config.layernorm_epsilon, sequence_parallel=config.sequence_parallel
+        self.layernorm = FusedLayerNorm(
+            config=config,
+            hidden_size=hidden_size,
+            eps=config.layernorm_epsilon,
+            sequence_parallel=config.sequence_parallel,
         )
 
         self.gelu = torch.nn.functional.gelu
