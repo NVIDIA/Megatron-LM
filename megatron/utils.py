@@ -275,6 +275,9 @@ def get_batch_on_this_tp_rank(data_iterator):
 
     args = get_args()
 
+    def _broadcast(item):
+       torch.distributed.broadcast(item, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group())
+
     if mpu.get_tensor_model_parallel_rank() == 0:
 
        if data_iterator is not None:
@@ -291,59 +294,52 @@ def get_batch_on_this_tp_rank(data_iterator):
        }
 
        if args.pipeline_model_parallel_size == 1:
-           torch.distributed.broadcast(batch['tokens'], mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group())
-           torch.distributed.broadcast(batch['labels'], mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group()) 
-           torch.distributed.broadcast(batch['loss_mask'], mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group()) 
-           torch.distributed.broadcast(batch['attention_mask'], mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group()) 
-           torch.distributed.broadcast(batch['position_ids'], mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group()) 
+           _broadcast(batch['tokens'])
+           _broadcast(batch['labels'])
+           _broadcast(batch['loss_mask'])
+           _broadcast(batch['attention_mask'])
+           _broadcast(batch['position_ids'])
 
        elif mpu.is_pipeline_first_stage():
-           torch.distributed.broadcast(batch['tokens'], mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group())
-           torch.distributed.broadcast(batch['attention_mask'], mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group()) 
-           torch.distributed.broadcast(batch['position_ids'], mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group()) 
+           _broadcast(batch['tokens'])
+           _broadcast(batch['attention_mask'])
+           _broadcast(batch['position_ids'])
 
        elif mpu.is_pipeline_last_stage():
-           torch.distributed.broadcast(batch['labels'], mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group()) 
-           torch.distributed.broadcast(batch['loss_mask'], mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group()) 
-           torch.distributed.broadcast(batch['attention_mask'], mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group()) 
-
+           _broadcast(batch['labels'])
+           _broadcast(batch['loss_mask'])
+           _broadcast(batch['attention_mask'])
 
     else:
 
-       if args.pipeline_model_parallel_size == 1:
-           tokens=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
-           labels=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
-           loss_mask=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.float32 , device = torch.cuda.current_device())
-           attention_mask=torch.empty((args.micro_batch_size,args.micro_batch_size,args.seq_length,args.seq_length), dtype = torch.bool , device = torch.cuda.current_device())
-           position_ids=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
-    
-           torch.distributed.broadcast(tokens, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group())
-           torch.distributed.broadcast(labels, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group()) 
-           torch.distributed.broadcast(loss_mask, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group()) 
-           torch.distributed.broadcast(attention_mask, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group()) 
-           torch.distributed.broadcast(position_ids, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group())
+       tokens=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
+       labels=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
+       loss_mask=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.float32 , device = torch.cuda.current_device())
+       attention_mask=torch.empty((args.micro_batch_size,args.micro_batch_size,args.seq_length,args.seq_length), dtype = torch.bool , device = torch.cuda.current_device())
+       position_ids=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
 
+       if args.pipeline_model_parallel_size == 1:
+           _broadcast(tokens)
+           _broadcast(labels)
+           _broadcast(loss_mask)
+           _broadcast(attention_mask)
+           _broadcast(position_ids)
+ 
        elif mpu.is_pipeline_first_stage():
-           tokens=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
            labels=None
            loss_mask=None
-           attention_mask=torch.empty((args.micro_batch_size,args.micro_batch_size,args.seq_length,args.seq_length), dtype = torch.bool , device = torch.cuda.current_device())
-           position_ids=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
    
-           torch.distributed.broadcast(tokens, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group())
-           torch.distributed.broadcast(attention_mask, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group()) 
-           torch.distributed.broadcast(position_ids, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group())
+           _broadcast(tokens)
+           _broadcast(attention_mask)
+           _broadcast(position_ids)
 
        elif mpu.is_pipeline_last_stage():
            tokens=None
-           labels=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
-           loss_mask=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.float32 , device = torch.cuda.current_device())
-           attention_mask=torch.empty((args.micro_batch_size,args.micro_batch_size,args.seq_length,args.seq_length), dtype = torch.bool , device = torch.cuda.current_device())
            position_ids=None
     
-           torch.distributed.broadcast(labels, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group()) 
-           torch.distributed.broadcast(loss_mask, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group()) 
-           torch.distributed.broadcast(attention_mask, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group())
+           _broadcast(labels)
+           _broadcast(loss_mask)
+           _broadcast(attention_mask)
  
        batch = {
            'tokens': tokens,

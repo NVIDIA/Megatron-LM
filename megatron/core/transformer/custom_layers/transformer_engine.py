@@ -4,7 +4,6 @@ from typing import Callable
 
 import torch
 import transformer_engine as te
-from transformer_engine.pytorch.attention import _SplitAlongDim
 from pkg_resources import packaging
 
 from megatron.core import ModelParallelConfig
@@ -401,5 +400,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             **extra_kwargs,
         )
 
+try:
 
-SplitAlongDim = _SplitAlongDim.apply
+   from transformer_engine.pytorch.attention import _SplitAlongDim
+   SplitAlongDim = _SplitAlongDim.apply
+
+except ImportError:
+
+   SplitAlongDim = None

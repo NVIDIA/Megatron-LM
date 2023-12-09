@@ -13,6 +13,7 @@ from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.custom_layers.transformer_engine import SplitAlongDim
 from megatron.core.utils import divide
 
 from .enums import AttnMaskType
@@ -310,42 +311,32 @@ class SelfAttention(Attention):
         )
         mixed_qkv = mixed_qkv.view(*new_tensor_shape)
 
-        try:
+        split_arg_list = [
+                            (
+                                self.num_attention_heads_per_partition
+                                // self.num_query_groups_per_partition
+                                * self.hidden_size_per_attention_head
+                            ),
+                            self.hidden_size_per_attention_head,
+                            self.hidden_size_per_attention_head,
+                         ]
 
-           from megatron.core.transformer.custom_layers.transformer_engine import SplitAlongDim
-   
+        if SplitAlongDim is not None:
+
            # [sq, b, ng, (np/ng + 2) * hn] --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
            (query, key, value) = SplitAlongDim(
                mixed_qkv,
                3,
-               [
-                   (
-                       self.num_attention_heads_per_partition
-                       // self.num_query_groups_per_partition
-                       * self.hidden_size_per_attention_head
-                   ),
-                   self.hidden_size_per_attention_head,
-                   self.hidden_size_per_attention_head,
-               ],
+               split_arg_list,
            )
-
-        except ImportError:
+        else:
 
            # [sq, b, ng, (np/ng + 2) * hn] --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
            (query, key, value) = torch.split(
                mixed_qkv,
-               [
-                   (
-                       self.num_attention_heads_per_partition
-                       // self.num_query_groups_per_partition
-                       * self.hidden_size_per_attention_head
-                   ),
-                   self.hidden_size_per_attention_head,
-                   self.hidden_size_per_attention_head,
-               ],
+               split_arg_list,
                dim=3,
            )
-
  
         # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
