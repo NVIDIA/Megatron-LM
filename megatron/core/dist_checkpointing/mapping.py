@@ -1,15 +1,18 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
 """ Core library classes. """
-
+import logging
 from dataclasses import dataclass, replace
 from itertools import chain
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
 
 from .core import CheckpointingException
+from .dict_utils import dict_list_map_inplace, dict_list_map_outplace
+
+logger = logging.getLogger(__name__)
 
 # These type definitions are just hints to differentiate a plain model state
 #  dict (StateDict) from a state dict with tensors replaced with ShardedTensors
@@ -26,25 +29,18 @@ class ShardedTensor:
     Global tensor is assumed to consist of many local tensors distributed
     between different processes.
 
-    Attributes:
+    Args:
         key: unique identifier of a global tensor
         data: local tensor data. Can be None only for consistency validation
         dtype: tensor dtype
         local_shape: local tensor shape
         global_shape: global tensor shape
-        global_offset: offset of a local tensor in a global tensor, specified
-            in number of tensor elements
+        global_offset: offset of a local tensor in a global tensor, specified in number of tensor elements
         axis_fragmentations: global tensor fragmentation of each axis
-        replica_id: indicates given local tensor's replication wrt. local
-            tensors in different processes
-        prepend_axis_num: number of axes prepended to the local tensor
-            to reflect global tensor shape.
-            The behavior is similar to unsqueezing the local tensor.
-        allow_shape_mismatch: if True, during loading, the global shape of a
-            stored tensor does not have to match the expected global shape.
-            Useful for representing tensors with flexible shape, e.g. padded.
-        flattened_range: specifies a slice that should be applied to a flattened
-            tensor with `local_shape` in order to get the tensor stored as `data`
+        replica_id: indicates given local tensor's replication wrt. local tensors in different processes
+        prepend_axis_num: number of axes prepended to the local tensor to reflect global tensor shape. The behavior is similar to unsqueezing the local tensor.
+        allow_shape_mismatch: if True, during loading, the global shape of a stored tensor does not have to match the expected global shape. Useful for representing tensors with flexible shape, e.g. padded.
+        flattened_range: specifies a slice that should be applied to a flattened tensor with `local_shape` in order to get the tensor stored as `data`
     """
 
     key: str
@@ -128,13 +124,11 @@ class ShardedTensor:
         allow_shape_mismatch: bool = False,
     ):
         """Allows to construct the ShardedTensor given offset specified in process ranks.
-        Arguments:
+
+        Args:
             key: unique key
             data: local tensor data
-            rank_offsets: each tuple (axis, axis_rank_offset, axis_fragm)
-                says that if global tensor is divided into `axis_fragm`
-                 fragment along `axis` axis, then local tensor data
-                 corresponds to the `axis_rank_offset` chunk.
+            rank_offsets: each tuple (axis, axis_rank_offset, axis_fragm) says that if global tensor is divided into `axis_fragm` fragment along `axis` axis, then local tensor data corresponds to the `axis_rank_offset` chunk.
             replica_id: see ShardedTensor
             prepend_axis_num: see ShardedTensor
             allow_shape_mismatch: see ShardedTensor
@@ -211,14 +205,12 @@ class ShardedObject:
     sharding. Conceptually, ShardedObject is a fully-sharded ShardedTensor
     with atomic arbitrary typed elements.
 
-    Attributes:
+    Args:
         key: unique identifier of a global tensor
         data: local object data. Can be None only for consistency validation
         global_shape: global object shape
-        global_offset: offset of a local object in a global object, specified
-            in number of shards
-        replica_id: indicates local object replication wrt. local
-            objects in different processes
+        global_offset: offset of a local object in a global object, specified in number of shards
+        replica_id: indicates local object replication wrt. local objects in different processes
     """
 
     key: str
@@ -236,3 +228,70 @@ class ShardedObject:
 
     def __str__(self):
         return f'{self.__class__.__name__}(key=\'{self.key}\')'
+
+
+@dataclass
+class ShardedTensorFactory:
+    """ Allows to apply transformations to tensors before/after serialization.
+
+    The essence of those transformations is that they can be applied to
+    optimizer states the same way they are applied to the model params.
+
+    Builder creates a sub-state-dict out of a tensor before saving, and merger
+    merges the corresponding state dict after loading.
+    """
+
+    key: str
+    data: torch.Tensor
+    build_fn: Callable[[str, torch.Tensor], ShardedStateDict]
+    merge_fn: Callable[[StateDict], torch.Tensor]
+
+    def build(self):
+        return self.build_fn(self.key, self.data)
+
+
+def apply_factories(sharded_state_dict: ShardedStateDict):
+    def apply(x):
+        if isinstance(x, ShardedTensorFactory):
+            x = x.build()
+        return x
+
+    dict_list_map_inplace(apply, sharded_state_dict)
+
+
+def apply_factory_merges(x1: StateDict, x2: ShardedStateDict, key: Tuple[str, ...] = ()):
+    if isinstance(x2, ShardedTensorFactory):
+        return x2.merge_fn(x1)
+
+    # There rest is almost the same as the `merge` function from `dict_utils`
+    if isinstance(x1, dict) and isinstance(x2, dict):
+        for k, v2 in x2.items():
+            if k not in x1:
+                raise ValueError(
+                    f'Different dict keys encountered in `apply_factory_merges` ({x1.keys()} vs {x2.keys()})'
+                )
+            else:
+                x1[k] = apply_factory_merges(x1[k], v2, key=key + (k,))
+    elif isinstance(x1, list) and isinstance(x2, list):
+        if len(x1) != len(x2):
+            err_msg = f'Cannot merge two lists with different lengths ({len(x1)} and {len(x2)}, encountered at key {key})'
+            logger.error(err_msg + f'\nx1: {x1}\nx2: {x2}')
+            raise ValueError(err_msg)
+        for i, v2 in enumerate(x2):
+            x1[i] = apply_factory_merges(x1[i], v2, key=key + (i,))
+    elif isinstance(x1, list) and isinstance(x2, dict):
+        for k, v2 in x2.items():
+            if not isinstance(k, int):
+                raise ValueError(
+                    f'Invalid dict key {k} non-integer type encountered in a list-dict merge at level {key}'
+                )
+            if k >= len(x1):
+                raise ValueError(
+                    f'Dict key {k} out of bound for list of length {len(x1)} (encountered at level {key})'
+                )
+            x1[k] = apply_factory_merges(x1[k], v2, key=key + (k,))
+    else:
+        raise ValueError(
+            f'Duplicate non-dict and non-list values encountered: `{x1}` and `{x2} (at key {key})`'
+        )
+    return x1

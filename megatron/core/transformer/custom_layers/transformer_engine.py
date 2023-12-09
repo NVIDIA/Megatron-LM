@@ -5,6 +5,7 @@ from typing import Callable
 import torch
 import transformer_engine as te
 from pkg_resources import packaging
+from torch import Tensor
 
 from megatron.core import ModelParallelConfig
 from megatron.core.parallel_state import (
@@ -87,6 +88,7 @@ class TELinear(te.pytorch.Linear):
         bias: bool,
         skip_bias_add: bool,
         skip_weight_param_allocation: bool,
+        tp_comm_buffer_name: str = None,
     ):
         self.config = config
 
@@ -106,12 +108,14 @@ class TELinear(te.pytorch.Linear):
 
         te_version = packaging.version.Version(version("transformer-engine"))
         if te_version >= packaging.version.Version("0.8.0"):
-            extra_kwargs["ub_split_ag"] = (
-                self.config.tp_comm_overlap and self.config.tp_comm_split_ag
-            )
-            extra_kwargs["ub_split_rs"] = (
-                self.config.tp_comm_overlap and self.config.tp_comm_split_rs
-            )
+            if self.config.tp_comm_overlap:
+                extra_kwargs["ub_split_ag"] = self.config.tp_comm_split_ag
+                extra_kwargs["ub_split_rs"] = self.config.tp_comm_split_rs
+                if te_version > packaging.version.Version("1.0.0"):
+                    assert (
+                        tp_comm_buffer_name is not None
+                    ), "Buffer name should be set to configure communication overlap settings"
+                    extra_kwargs["ub_name"] = tp_comm_buffer_name
 
         super().__init__(
             in_features=input_size,
@@ -157,6 +161,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         skip_bias_add: bool,
         is_expert: bool,
         skip_weight_param_allocation: bool = False,
+        tp_comm_buffer_name: str = None,
     ):
         self.config = config
 
@@ -190,15 +195,15 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             )
 
         if te_version >= packaging.version.Version("0.8.0"):
-            extra_kwargs["ub_bulk_wgrad"] = (
-                self.config.tp_comm_overlap and self.config.tp_comm_bulk_wgrad
-            )
-            extra_kwargs["ub_bulk_dgrad"] = (
-                self.config.tp_comm_overlap and self.config.tp_comm_bulk_dgrad
-            )
-            extra_kwargs["ub_split_ag"] = (
-                self.config.tp_comm_overlap and self.config.tp_comm_split_ag
-            )
+            if self.config.tp_comm_overlap:
+                extra_kwargs["ub_bulk_wgrad"] = self.config.tp_comm_bulk_wgrad
+                extra_kwargs["ub_bulk_dgrad"] = self.config.tp_comm_bulk_dgrad
+                extra_kwargs["ub_split_ag"] = self.config.tp_comm_split_ag
+                if te_version > packaging.version.Version("1.0.0"):
+                    assert (
+                        tp_comm_buffer_name is not None
+                    ), "Buffer name should be set to configure communication overlap settings"
+                    extra_kwargs["ub_name"] = tp_comm_buffer_name
 
         super().__init__(
             in_features=input_size,
@@ -254,6 +259,7 @@ class TEColumnParallelLinear(TELinear):
         skip_bias_add: bool,
         is_expert: bool,
         skip_weight_param_allocation: bool = False,
+        tp_comm_buffer_name: str = None,
     ):
         if gather_output:
             raise ValueError('Transformer Engine linear layers do not support gather_output = True')
@@ -270,6 +276,7 @@ class TEColumnParallelLinear(TELinear):
             bias=bias,
             skip_bias_add=skip_bias_add,
             skip_weight_param_allocation=skip_weight_param_allocation,
+            tp_comm_buffer_name=tp_comm_buffer_name,
         )
 
     def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
@@ -297,6 +304,7 @@ class TERowParallelLinear(TELinear):
         input_is_parallel: bool,
         skip_bias_add: bool,
         is_expert: bool,
+        tp_comm_buffer_name: str = None,
     ):
         if not input_is_parallel:
             raise ValueError(
@@ -315,6 +323,7 @@ class TERowParallelLinear(TELinear):
             bias=bias,
             skip_bias_add=skip_bias_add,
             skip_weight_param_allocation=False,  # We don't currently use this for row parallel layers
+            tp_comm_buffer_name=tp_comm_buffer_name,
         )
 
     def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
@@ -343,8 +352,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
+        attention_dropout: float = None,
     ):
         self.config = config
+        self.te_forward_mask_type = False
 
         if self.config.apply_query_key_layer_scaling != bool(
             int(os.getenv('NVTE_APPLY_QK_LAYER_SCALING', '0'))
@@ -372,9 +383,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             extra_kwargs["attention_type"] = attention_type
             # older version don't need attention_type
 
-        # Only Transformer-Engine version > 0.13.0 supports context parallelism
-        te_version = packaging.version.Version(version("transformer-engine"))
-        if te_version > packaging.version.Version("0.13.0"):
+        if te_version > packaging.version.Version("0.12.0"):
+            self.te_forward_mask_type = True
+
+        # Only Transformer-Engine version >= 1.0.0 supports context parallelism
+        if te_version >= packaging.version.Version("1.0.0"):
             if getattr(TEDotProductAttention, "cp_stream") is None:
                 TEDotProductAttention.cp_stream = torch.cuda.Stream()
             extra_kwargs["cp_group"] = get_context_parallel_group(check_initialized=False)
@@ -385,12 +398,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         else:
             assert (
                 self.config.context_parallel_size == 1
-            ), "Only Transformer-Engine version > 0.13.0 supports context parallelism"
+            ), "Only Transformer-Engine version >= 1.0.0 supports context parallelism!"
 
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
             kv_channels=self.config.kv_channels,
-            attention_dropout=self.config.attention_dropout,
+            attention_dropout=self.config.attention_dropout
+            if attention_dropout is None
+            else attention_dropout,
             attn_mask_type=attn_mask_type.name,
             sequence_parallel=self.config.sequence_parallel,
             tp_size=self.config.tensor_model_parallel_size,
@@ -400,6 +415,21 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             **extra_kwargs,
         )
 
+    def forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Tensor,
+        attn_mask_type: AttnMaskType,
+    ):
+        if self.te_forward_mask_type:
+            return super().forward(
+                query, key, value, attention_mask, attn_mask_type=attn_mask_type.name
+            )
+        else:
+            return super().forward(query, key, value, attention_mask)
+
 try:
 
    from transformer_engine.pytorch.attention import _SplitAlongDim
@@ -408,3 +438,4 @@ try:
 except ImportError:
 
    SplitAlongDim = None
+

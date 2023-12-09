@@ -40,10 +40,17 @@ class LanguageModule(MegatronModule):
         """Intializes the word embeddings in the final stage.
 
         This function just initalizes word embeddings in the final stage, when we are
-        using pipeline parallelism and sharind word embeddings. Nothing to do if we
-        arn't sharing weights or aren't using Pipeline parallelism
+        using pipeline parallelism and sharing word embeddings. Nothing to do if we
+        aren't sharing weights or aren't using pipeline parallelism.
         """
-        if not self.share_embeddings_and_output_weights or (self.pre_process and self.post_process):
+        if not self.share_embeddings_and_output_weights:
+            return
+
+        if self.pre_process and self.post_process:
+            # Zero out wgrad if sharing embeddings between two layers on same
+            # pipeline stage to make sure grad accumulation into main_grad is
+            # correct and does not include garbage values (e.g., from torch.empty).
+            self.shared_embedding_or_output_weight().zero_out_wgrad = True
             return
 
         if self.post_process and not self.pre_process:

@@ -69,7 +69,7 @@ def calc_params_l2_norm(model):
         "apex is not available, please install it from https://github.com/NVIDIA/apex"
 
     # Calculate norm
-    dummy_overflow_buf = torch.cuda.IntTensor([0])
+    dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
     norm, _ = multi_tensor_applier(
         amp_C.multi_tensor_l2norm,
         dummy_overflow_buf,

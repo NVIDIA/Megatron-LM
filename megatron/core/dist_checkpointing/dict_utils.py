@@ -9,15 +9,30 @@ import torch
 
 
 def extract_matching_values(
-    x: Union[dict, list], predicate: Callable
+    x: Union[dict, list], predicate: Callable[[Any], bool], return_lists_as_dicts: bool = False
 ) -> Tuple[Union[dict, list], Union[dict, list]]:
-    """ Return matching and nonmatching values. Keeps hierarchy. """
+    """ Return matching and nonmatching values. Keeps hierarchy.
+
+    Arguments:
+        x (Union[dict, list]) : state dict to process. Top-level argument must be a dict or list
+        predicate (object -> bool): determines matching values
+        return_lists_as_dicts (bool): if True, matching lists will be turned
+            into dicts, with keys indicating the indices of original elements.
+            Useful for reconstructing the original hierarchy.
+    """
+
+    def _set_elem(target, k, v):
+        if return_lists_as_dicts:
+            target[k] = v
+        else:
+            target.append(v)
+
     if isinstance(x, dict):
         matching_vals = {}
         nonmatching_vals = {}
         for k, v in x.items():
             if isinstance(v, (list, dict)):
-                match, nonmatch = extract_matching_values(v, predicate)
+                match, nonmatch = extract_matching_values(v, predicate, return_lists_as_dicts)
                 if match:
                     matching_vals[k] = match
                 if nonmatch or not v:
@@ -26,21 +41,21 @@ def extract_matching_values(
                 matching_vals[k] = v
             else:
                 nonmatching_vals[k] = v
-    else:
-        assert isinstance(x, list)
-        matching_vals = []
-        nonmatching_vals = []
-        for v in x:
+    elif isinstance(x, list):
+        matching_vals = {} if return_lists_as_dicts else []
+        nonmatching_vals = {} if return_lists_as_dicts else []
+        for ind, v in enumerate(x):
             if isinstance(v, (list, dict)) and v:
-                match, nonmatch = extract_matching_values(v, predicate)
+                match, nonmatch = extract_matching_values(v, predicate, return_lists_as_dicts)
                 if match:
-                    matching_vals.append(match)
+                    _set_elem(matching_vals, ind, match)
                 if nonmatch or not v:
-                    nonmatching_vals.append(nonmatch)
-            elif predicate(v):
-                matching_vals.append(v)
+                    _set_elem(nonmatching_vals, ind, nonmatch)
             else:
-                nonmatching_vals.append(v)
+                target = matching_vals if predicate(v) else nonmatching_vals
+                _set_elem(target, ind, v)
+    else:
+        raise ValueError(f'Unexpected top-level object type: {type(x)}')
     return matching_vals, nonmatching_vals
 
 
@@ -169,20 +184,24 @@ def dict_list_map_outplace(f: Callable, x: Union[dict, list]):
         return f(x)
 
 
-def merge(x1: dict, x2: dict):
+def merge(x1: dict, x2: dict, key: Tuple[str, ...] = ()):
     if isinstance(x1, dict) and isinstance(x2, dict):
         for k, v2 in x2.items():
             if k not in x1:
                 x1[k] = v2
             else:
-                x1[k] = merge(x1[k], v2)
+                x1[k] = merge(x1[k], v2, key=key + (k,))
     elif isinstance(x1, list) and isinstance(x2, list):
         if len(x1) != len(x2):
-            raise ValueError('Cannot merge two lists with different lengths')
+            raise ValueError(
+                f'Cannot merge two lists with different lengths ({len(x1)} and {len(x2)}, encountered at level {key})'
+            )
         for i, v2 in enumerate(x2):
-            x1[i] = merge(x1[i], v2)
+            x1[i] = merge(x1[i], v2, key=key + (i,))
     else:
-        raise ValueError(f'Duplicate non-dict and non-list values encountered: `{x1}` and `{x2}`')
+        raise ValueError(
+            f'Duplicate non-dict and non-list values encountered: `{x1}` and `{x2}` (at level {key})'
+        )
     return x1
 
 

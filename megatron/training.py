@@ -10,6 +10,7 @@ import sys
 from .log_handler import CustomHandler
 # Make default logging level INFO, but filter out all log messages not from MCore.
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
+from .theoretical_memory_usage import report_theoretical_memory
 import time
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
@@ -54,6 +55,25 @@ def print_datetime(string):
     torch.distributed.barrier()
     time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print_rank_0('[' + string + '] datetime: {} '.format(time_str))
+
+
+def num_floating_point_operations(args, batch_size):
+    if not args.group_query_attention:
+        args.num_query_groups = args.num_attention_heads
+    return (
+        60
+        * batch_size
+        * args.seq_length
+        * args.num_layers
+        * args.hidden_size
+        * args.hidden_size
+        * (
+            1
+            + (args.num_query_groups / (5 * args.num_attention_heads))
+            + (args.seq_length / (5 * args.hidden_size))
+            + (args.padded_vocab_size / (10 * args.num_layers * args.hidden_size))
+        )
+    )
 
 
 def pretrain(train_valid_test_dataset_provider,
@@ -102,7 +122,9 @@ def pretrain(train_valid_test_dataset_provider,
     # This will be closer to what scheduler will see (outside of
     # image ... launches.
     global _TRAIN_START_TIME
-    start_time_tensor = torch.cuda.DoubleTensor([_TRAIN_START_TIME])
+    start_time_tensor = torch.tensor([_TRAIN_START_TIME],
+                                     dtype=torch.double,
+                                     device='cuda')
     torch.distributed.all_reduce(start_time_tensor,
                                  op=torch.distributed.ReduceOp.MIN)
     _TRAIN_START_TIME = start_time_tensor.item()
@@ -273,8 +295,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # Disallow training and inference with Transformer Engine
     # for non-GPT models
     args.allow_transformer_engine = all([type(m) == GPTModel for m in model])
-    assert args.allow_transformer_engine or args.transformer_impl == 'local', \
-        'Transformer Engine is only approved for GPT models'
+    # assert args.allow_transformer_engine or args.transformer_impl == 'local', \
+    #     'Transformer Engine is only approved for GPT models'
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -415,8 +437,11 @@ def train_step(forward_step_func, data_iterator,
     timers = get_timers()
 
     # Set grad to zero.
-    for partition in model:
-        partition.zero_grad_buffer()
+    for model_chunk in model:
+        # If using distributed optimizer, don't zero buffer here; zeroing of buffer is
+        # handled automatically by the optimizer after all-gathers finish.
+        # Otherwise, zero the buffer.
+        model_chunk.zero_grad_buffer(zero_buffer=(not args.use_distributed_optimizer))
     optimizer.zero_grad()
 
     # Forward pass.
@@ -444,10 +469,6 @@ def train_step(forward_step_func, data_iterator,
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
     timers('optimizer').stop()
-
-    # Gather params.
-    if update_successful:
-        optimizer.gather_model_params(args, timers)
 
     # Vision momentum.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
@@ -506,7 +527,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     for key in loss_dict:
         if not skipped_iter:
             total_loss_dict[key] = total_loss_dict.get(
-                key, torch.cuda.FloatTensor([0.0])) + loss_dict[key]
+                key, torch.tensor([0.0], dtype=torch.float, device='cuda')) + loss_dict[key]
         else:
             value = loss_dict[key].float().sum().item()
             is_nan = value == float('inf') or \
@@ -629,19 +650,28 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     if iteration % args.log_interval == 0:
         elapsed_time = timers('interval-time').elapsed(barrier=True)
         elapsed_time_per_iteration = elapsed_time / total_iterations
-        if writer:
-            if args.log_timers_to_tensorboard:
+        throughput = num_floating_point_operations(args, batch_size) / (
+            elapsed_time_per_iteration * 10**12 * args.world_size)
+        if args.log_timers_to_tensorboard:
+            if writer:
                 writer.add_scalar('iteration-time',
                                   elapsed_time_per_iteration, iteration)
-                if wandb_writer:
-                    wandb_writer.log({'iteration-time':
-                                     elapsed_time_per_iteration}, iteration)
+            if wandb_writer:
+                wandb_writer.log({'iteration-time': elapsed_time_per_iteration},
+                                 iteration)
         log_string = ' iteration {:8d}/{:8d} |'.format(
             iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(
             args.consumed_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time_per_iteration * 1000.0)
+        if args.log_throughput:
+            log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
+            if args.log_timers_to_tensorboard:
+                if writer:
+                    writer.add_scalar('throughput', throughput, iteration)
+                if wandb_writer:
+                    wandb_writer.log({'throughput': throughput}, iteration)
         log_string += ' learning rate: {:.3E} |'.format(learning_rate)
         log_string += ' global batch size: {:5d} |'.format(batch_size)
         for key in total_loss_dict:
@@ -651,7 +681,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                       float(max(1, total_loss_dict[advanced_iters_key]))
                 if avg > 0.0:
                     log_string += ' {}: {:.6E} |'.format(key, avg)
-                total_loss_dict[key] = torch.cuda.FloatTensor([0.0])
+                total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
         log_string += ' loss scale: {:.1f} |'.format(loss_scale)
         if grad_norm is not None:
             log_string += ' grad norm: {:.3f} |'.format(grad_norm)
@@ -669,6 +699,9 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         print_rank_last(log_string)
         if report_memory_flag and learning_rate > 0.:
             # Report memory after optimizer state has been initialized.
+            if torch.distributed.get_rank() == 0:
+                num_microbatches = get_num_microbatches()
+                report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
             report_memory('(after {} iterations)'.format(iteration))
             report_memory_flag = False
         timers.log(timers_to_log, normalizer=args.log_interval)
@@ -720,6 +753,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
             if len(model) == 1:
                 config.grad_sync_func = config.grad_sync_func[0]
+    if args.overlap_param_gather and args.delay_param_gather:
+        config.param_sync_func = [lambda x: optimizer.finish_param_sync(model_index, x)
+                                  for model_index in range(len(model))]
+        if len(model) == 1:
+            config.param_sync_func = config.param_sync_func[0]
     config.finalize_model_grads_func = finalize_model_grads
 
     timers('interval-time', log_level=0).start(barrier=True)
@@ -776,6 +814,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         # Evaluation
         if args.eval_interval and iteration % args.eval_interval == 0 and \
            args.do_valid:
+            timers('interval-time').stop()
             if args.manual_gc and args.manual_gc_eval:
                 # Collect all objects.
                 gc.collect()
@@ -787,6 +826,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             if args.manual_gc and args.manual_gc_eval:
                 # Collect only the objects created and used in evaluation.
                 gc.collect(generation=0)
+            timers('interval-time', log_level=0).start(barrier=True)
 
         # Checkpointing
         saved_checkpoint = False
@@ -801,15 +841,18 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
         if args.save and args.save_interval and \
            iteration % args.save_interval == 0:
+            timers('interval-time').stop()
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler)
             saved_checkpoint = True
+            timers('interval-time', log_level=0).start(barrier=True)
 
         # Exiting based on duration
         if args.exit_duration_in_mins:
             train_time = (time.time() - _TRAIN_START_TIME) / 60.0
-            done_cuda = torch.cuda.IntTensor(
-                [train_time > args.exit_duration_in_mins])
+            done_cuda = torch.tensor(
+                [train_time > args.exit_duration_in_mins],
+                dtype=torch.int, device='cuda')
             torch.distributed.all_reduce(
                 done_cuda, op=torch.distributed.ReduceOp.MAX)
             done = done_cuda.item()
@@ -863,6 +906,9 @@ def evaluate(forward_step_func,
              verbose=False):
     """Evaluation."""
     args = get_args()
+    timers = get_timers()
+
+    timers('evaluate', log_level=0).start(barrier=True)
 
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         compute_feature_bank(model)
@@ -910,14 +956,15 @@ def evaluate(forward_step_func,
                 for loss_dict in loss_dicts:
                     for key in loss_dict:
                         total_loss_dict[key] = total_loss_dict.get(
-                            key, torch.cuda.FloatTensor([0.0])) + loss_dict[key]
+                            key, torch.tensor([0.0], dtype=torch.float, device='cuda')) + loss_dict[key]
 
             args.consumed_valid_samples += eval_batch_size
 
             if args.exit_duration_in_mins:
                 train_time = (time.time() - _TRAIN_START_TIME) / 60.0
-                done_cuda = torch.cuda.IntTensor(
-                    [train_time > args.exit_duration_in_mins])
+                done_cuda = torch.tensor(
+                    [train_time > args.exit_duration_in_mins],
+                    dtype=torch.int, device='cuda')
                 torch.distributed.all_reduce(
                     done_cuda, op=torch.distributed.ReduceOp.MAX)
                 done = done_cuda.item()
@@ -937,9 +984,6 @@ def evaluate(forward_step_func,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 collect_non_loss_data=True)
-        
-        
-
 
     # Move model back to the train mode.
     for model_module in model:
@@ -947,6 +991,9 @@ def evaluate(forward_step_func,
 
     for key in total_loss_dict:
         total_loss_dict[key] /= args.eval_iters * eval_num_microbatches
+
+    timers('evaluate').stop()
+    timers.log(['evaluate'])
 
     return total_loss_dict, collected_non_loss_data, False
 
@@ -1074,10 +1121,11 @@ def build_train_valid_test_data_loaders(
         do_train = train_dataloader is not None and args.train_iters > 0
         do_valid = valid_dataloader is not None and args.eval_iters > 0
         do_test = test_dataloader is not None and args.eval_iters > 0
-        flags = torch.cuda.LongTensor(
-            [int(do_train), int(do_valid), int(do_test)])
+        flags = torch.tensor(
+            [int(do_train), int(do_valid), int(do_test)],
+            dtype=torch.long, device='cuda')
     else:
-        flags = torch.cuda.LongTensor([0, 0, 0])
+        flags = torch.tensor([0, 0, 0], dtype=torch.long, device='cuda')
 
     torch.distributed.broadcast(flags, 0)
 

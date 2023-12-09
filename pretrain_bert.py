@@ -32,8 +32,8 @@ def model_provider(pre_process=True, post_process=True):
 
     if args.use_mcore_models:
 
-        if args.model_spec is not None:
-            transformer_layer_spec = import_module(args.model_spec)
+        if args.spec is not None:
+            transformer_layer_spec = import_module(args.spec)
         else:
             transformer_layer_spec = bert_layer_with_transformer_engine_spec 
 

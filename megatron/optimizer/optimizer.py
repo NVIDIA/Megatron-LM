@@ -184,14 +184,6 @@ class MegatronOptimizer(ABC):
         pass
 
 
-    def gather_model_params(self, args, timers):
-        """
-        For the case of a non-distributed-optimizer, there is nothing to
-        do here.
-        """
-        pass
-
-
 
 class MixedPrecisionOptimizer(MegatronOptimizer):
     """Base class for both the float-16 and the distributed optimizer.
@@ -246,7 +238,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         # Note that we keep this for the cases that grad scaler is none.
         # We still record nan/inf if we have a bfloat16 with a grad scaler.
         if self.grad_scaler:
-            self.found_inf = torch.cuda.FloatTensor([0.0])
+            self.found_inf = torch.tensor([0.0], dtype=torch.float, device='cuda')
 
         # Dummy tensor needed for apex multi-apply tensor.
         # For bfloat, we don't have multi-tensor apply and for now
@@ -254,11 +246,11 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if bf16:
             self._dummy_overflow_buf = None
         else:
-            self._dummy_overflow_buf = torch.cuda.IntTensor([0])
+            self._dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
 
         # In case grad scaler is not passed, define the unity scale.
         if self.grad_scaler is None:
-            self._scale_one = torch.cuda.FloatTensor([1.0])
+            self._scale_one = torch.tensor([1.0], dtype=torch.float, device='cuda')
 
 
     def get_loss_scale(self):
@@ -585,7 +577,7 @@ class FP32Optimizer(MegatronOptimizer):
             check_for_nan_in_grad, params_have_main_grad,
             models)
 
-        self._scale = torch.cuda.FloatTensor([1.0])
+        self._scale = torch.tensor([1.0], dtype=torch.float, device='cuda')
 
 
     def zero_grad(self, set_to_none=True):
