@@ -53,21 +53,6 @@
         "en_dolma-stack-code_026_text_document_dc=7977985_sc=7977985_tc=25015363379.idx",
         "en_dolma-stack-code_027_text_document_dc=2848034_sc=2848034_tc=6830287235.bin",
         "en_dolma-stack-code_027_text_document_dc=2848034_sc=2848034_tc=6830287235.idx",
-        "en_dolma-c4_000_text_document_dc=38478822_sc=38478822_tc=19955375141.bin",
-        "en_dolma-c4_000_text_document_dc=38478822_sc=38478822_tc=19955375141.idx",
-
-        "en_dolma-c4_002_text_document_dc=38478741_sc=38478741_tc=19951366447.bin",
-        "en_dolma-c4_002_text_document_dc=38478741_sc=38478741_tc=19951366447.idx",
-
-        "en_dolma-c4_004_text_document_dc=38478681_sc=38478681_tc=19947592062.bin",
-        "en_dolma-c4_004_text_document_dc=38478681_sc=38478681_tc=19947592062.idx",
-
-        "en_dolma-c4_006_text_document_dc=38478833_sc=38478833_tc=19948280705.bin",
-        "en_dolma-c4_006_text_document_dc=38478833_sc=38478833_tc=19948280705.idx",
-
-        "en_dolma-c4_008_text_document_dc=38478664_sc=38478664_tc=19958446800.bin",
-        "en_dolma-c4_008_text_document_dc=38478664_sc=38478664_tc=19958446800.idx",
-
         
         "en_dolma-common-crawl_001_text_document_dc=28261543_sc=28261543_tc=20051874910.bin",
         "en_dolma-common-crawl_001_text_document_dc=28261543_sc=28261543_tc=20051874910.idx",
@@ -163,8 +148,7 @@
         "en_dolma-common-crawl_048_text_document_dc=29137934_sc=29137934_tc=19687560789.idx",
         "en_dolma-common-crawl_049_text_document_dc=28378274_sc=28378274_tc=20693464638.bin",
         "en_dolma-common-crawl_049_text_document_dc=28378274_sc=28378274_tc=20693464638.idx",
-        "en_dolma-common-crawl_050_text_document_dc=27842543_sc=27842543_tc=20089876467.bin",
-        "en_dolma-common-crawl_050_text_document_dc=27842543_sc=27842543_tc=20089876467.idx",
+        
         "en_dolma-common-crawl_051_text_document_dc=27188848_sc=27188848_tc=19688611753.bin",
         "en_dolma-common-crawl_051_text_document_dc=27188848_sc=27188848_tc=19688611753.idx",
         "en_dolma-common-crawl_052_text_document_dc=28568595_sc=28568595_tc=20270842120.bin",
@@ -183,8 +167,7 @@
         "en_dolma-common-crawl_058_text_document_dc=28531355_sc=28531355_tc=19555353559.idx",
         "en_dolma-common-crawl_059_text_document_dc=28549771_sc=28549771_tc=20310054725.bin",
         "en_dolma-common-crawl_059_text_document_dc=28549771_sc=28549771_tc=20310054725.idx",
-        "en_dolma-common-crawl_060_text_document_dc=28053241_sc=28053241_tc=20200638502.bin",
-        "en_dolma-common-crawl_060_text_document_dc=28053241_sc=28053241_tc=20200638502.idx",
+        
         "en_dolma-common-crawl_061_text_document_dc=26928745_sc=26928745_tc=19652818068.bin",
         "en_dolma-common-crawl_061_text_document_dc=26928745_sc=26928745_tc=19652818068.idx",
         "en_dolma-common-crawl_062_text_document_dc=27902560_sc=27902560_tc=19803273766.bin",
@@ -203,8 +186,7 @@
         "en_dolma-common-crawl_068_text_document_dc=29432622_sc=29432622_tc=19706080923.idx",
         "en_dolma-common-crawl_069_text_document_dc=30169477_sc=30169477_tc=20006726590.bin",
         "en_dolma-common-crawl_069_text_document_dc=30169477_sc=30169477_tc=20006726590.idx",
-        "en_dolma-common-crawl_070_text_document_dc=30669473_sc=30669473_tc=20358396891.bin",
-        "en_dolma-common-crawl_070_text_document_dc=30669473_sc=30669473_tc=20358396891.idx",
+        
         "en_dolma-common-crawl_071_text_document_dc=30301268_sc=30301268_tc=20202883770.bin",
         "en_dolma-common-crawl_071_text_document_dc=30301268_sc=30301268_tc=20202883770.idx",
         "en_dolma-common-crawl_072_text_document_dc=29643029_sc=29643029_tc=19609436450.bin",

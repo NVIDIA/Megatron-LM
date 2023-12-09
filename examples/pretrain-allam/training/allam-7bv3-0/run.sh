@@ -37,7 +37,7 @@ GPT_MODEL_ARGS=(
 LOGISTICS_ARGS=(
     --save $CHECKPOINT_DIR 
     --tokenizer-model $TOKENIZER_MODEL
-    --split 99990,8,2 
+    --split 99996,2,2 
     --log-interval 100
     --save-interval 5000 
     --eval-interval 1000 
@@ -52,7 +52,7 @@ LOGISTICS_ARGS=(
 TRAINING_ARGS=(
     --micro-batch-size 1
     --global-batch-size 1024
-    --train-iters 119000
+    --train-iters 120000
     --lr 3.0e-04 
     --lr-decay-style cosine 
     --weight-decay 0.1 
