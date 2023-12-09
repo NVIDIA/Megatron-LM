@@ -7,7 +7,7 @@ Submodules
 tensor\_parallel.cross\_entropy module
 --------------------------------------
 
-.. automodule:: tensor_parallel.cross_entropy
+.. automodule:: core.tensor_parallel.cross_entropy
    :members:
    :undoc-members:
    :show-inheritance:
@@ -15,7 +15,7 @@ tensor\_parallel.cross\_entropy module
 tensor\_parallel.data module
 ----------------------------
 
-.. automodule:: tensor_parallel.data
+.. automodule:: core.tensor_parallel.data
    :members:
    :undoc-members:
    :show-inheritance:
@@ -23,7 +23,7 @@ tensor\_parallel.data module
 tensor\_parallel.layers module
 ------------------------------
 
-.. automodule:: tensor_parallel.layers
+.. automodule:: core.tensor_parallel.layers
    :members:
    :undoc-members:
    :show-inheritance:
@@ -31,7 +31,7 @@ tensor\_parallel.layers module
 tensor\_parallel.mappings module
 --------------------------------
 
-.. automodule:: tensor_parallel.mappings
+.. automodule:: core.tensor_parallel.mappings
    :members:
    :undoc-members:
    :show-inheritance:
@@ -39,7 +39,7 @@ tensor\_parallel.mappings module
 tensor\_parallel.random module
 ------------------------------
 
-.. automodule:: tensor_parallel.random
+.. automodule:: core.tensor_parallel.random
    :members:
    :undoc-members:
    :show-inheritance:
@@ -47,7 +47,7 @@ tensor\_parallel.random module
 tensor\_parallel.utils module
 -----------------------------
 
-.. automodule:: tensor_parallel.utils
+.. automodule:: core.tensor_parallel.utils
    :members:
    :undoc-members:
    :show-inheritance:
@@ -55,7 +55,7 @@ tensor\_parallel.utils module
 Module contents
 ---------------
 
-.. automodule:: tensor_parallel
+.. automodule:: core.tensor_parallel
    :members:
    :undoc-members:
    :show-inheritance:

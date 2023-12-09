@@ -66,7 +66,7 @@ def sharded_tensor_chunk_id(sharded_tensor: ShardedTensor):
 
 
 class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
-    """ Loads one checkpoint replica from storage and broadcasts to other nodes.
+    """Loads one checkpoint replica from storage and broadcasts to other nodes.
 
     This strategy loads checkpoint from storage on minimal set of nodes
     and distributes the checkpoint to other nodes with torch.distributed.
@@ -77,19 +77,18 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
     1. Exchange ShardedTensors metadata between all nodes
     2. Align needed tensors within DP groups
     3. For each globally unique tensor:
-      a) on one of the ranks load it from storage to CPU and move to CUDA
-      b) allocate CUDA tensor on other ranks
-      c) broadcast within DP group
-      d) copy tensor content to the model param location
-      e) free tensor buffers from a) and b)
+    3.a) on one of the ranks load it from storage to CPU and move to CUDA
+    3.b) allocate CUDA tensor on other ranks
+    3.c) broadcast within DP group
+    3.d) copy tensor content to the model param location
+    3.e) free tensor buffers from a) and b)
 
     Notes:
     1. Loading and broadcasting is done sequentially to avoid both host and device OOMs
     2. There is a lot of overlap potential between all three steps done for each tensor:
-      a) loading from storage to numpy
-      b) moving CPU tensors to CUDA
-      c) broadcast
-
+    2.a) loading from storage to numpy
+    2.b) moving CPU tensors to CUDA
+    2.c) broadcast
     """
 
     def __init__(self, data_parallel_group, cpu_transfer=True):

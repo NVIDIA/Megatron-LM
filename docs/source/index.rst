@@ -14,16 +14,10 @@ A reference implementation of megatorn core can be found in  `NeMo <https://gith
    :maxdepth: 2
    :caption: User Guide
 
-   user-guide
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Developer Guide
-
-   developer-guide
+   user-guide/index
 
 .. toctree::
    :maxdepth: 3
    :caption: API Guide
    
-   modules
+   api-guide/index

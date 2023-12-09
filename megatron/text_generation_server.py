@@ -20,12 +20,12 @@ class MegatronGenerate(Resource):
 
     @staticmethod
     def send_do_generate():
-        choice = torch.cuda.LongTensor([GENERATE_NUM])
+        choice = torch.tensor([GENERATE_NUM], dtype=torch.long, device='cuda')
         torch.distributed.broadcast(choice, 0)
      
     @staticmethod
     def send_do_beam_search():
-        choice = torch.cuda.LongTensor([BEAM_NUM])
+        choice = torch.tensor([BEAM_NUM], dtype=torch.long, device='cuda')
         torch.distributed.broadcast(choice, 0)
     
     def put(self):

@@ -7,7 +7,7 @@ Submodules
 transformer.attention module
 ----------------------------
 
-.. automodule:: transformer.attention
+.. automodule:: core.transformer.attention
    :members:
    :undoc-members:
    :show-inheritance:
@@ -15,7 +15,7 @@ transformer.attention module
 transformer.dot\_product\_attention module
 ------------------------------------------
 
-.. automodule:: transformer.dot_product_attention
+.. automodule:: core.transformer.dot_product_attention
    :members:
    :undoc-members:
    :show-inheritance:
@@ -23,7 +23,7 @@ transformer.dot\_product\_attention module
 transformer.enums module
 ------------------------
 
-.. automodule:: transformer.enums
+.. automodule:: core.transformer.enums
    :members:
    :undoc-members:
    :show-inheritance:
@@ -31,7 +31,7 @@ transformer.enums module
 transformer.identity\_op module
 -------------------------------
 
-.. automodule:: transformer.identity_op
+.. automodule:: core.transformer.identity_op
    :members:
    :undoc-members:
    :show-inheritance:
@@ -39,7 +39,7 @@ transformer.identity\_op module
 transformer.mlp module
 ----------------------
 
-.. automodule:: transformer.mlp
+.. automodule:: core.transformer.mlp
    :members:
    :undoc-members:
    :show-inheritance:
@@ -47,7 +47,7 @@ transformer.mlp module
 transformer.module module
 -------------------------
 
-.. automodule:: transformer.module
+.. automodule:: core.transformer.module
    :members:
    :undoc-members:
    :show-inheritance:
@@ -55,7 +55,7 @@ transformer.module module
 transformer.transformer\_block module
 -------------------------------------
 
-.. automodule:: transformer.transformer_block
+.. automodule:: core.transformer.transformer_block
    :members:
    :undoc-members:
    :show-inheritance:
@@ -63,7 +63,7 @@ transformer.transformer\_block module
 transformer.transformer\_config module
 --------------------------------------
 
-.. automodule:: transformer.transformer_config
+.. automodule:: core.transformer.transformer_config
    :members:
    :undoc-members:
    :show-inheritance:
@@ -71,7 +71,7 @@ transformer.transformer\_config module
 transformer.transformer\_layer module
 -------------------------------------
 
-.. automodule:: transformer.transformer_layer
+.. automodule:: core.transformer.transformer_layer
    :members:
    :undoc-members:
    :show-inheritance:
@@ -79,7 +79,7 @@ transformer.transformer\_layer module
 transformer.utils module
 ------------------------
 
-.. automodule:: transformer.utils
+.. automodule:: core.transformer.utils
    :members:
    :undoc-members:
    :show-inheritance:
@@ -87,7 +87,7 @@ transformer.utils module
 Module contents
 ---------------
 
-.. automodule:: transformer
+.. automodule:: core.transformer
    :members:
    :undoc-members:
    :show-inheritance:
