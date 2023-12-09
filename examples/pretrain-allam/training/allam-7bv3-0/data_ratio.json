@@ -1,7 +1,8 @@
 {
-    "dolma-gutenberg-books": 1,
+    "dolma-gutenberg-books": 1.5,
     "dolma-peS2o": 1,
-    "dolma-wiki-en-simple": 3,
+    "dolma-wiki-en-simple": 1.5,
     "dolma-c4": 1,
-    "dolma-stack-code": 1
+    "dolma-stack-code": 1,
+    "dolma-common-crawl": 1
 }
