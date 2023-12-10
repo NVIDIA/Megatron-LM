@@ -92,8 +92,13 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --split 99982,9,9 \
     --save $CHECKPOINT_PATH \
     --load $CHECKPOINT_PATH \
-    --log-interval 100 \
     --tensorboard-dir ${TENSORBOARD_DIR} \
+    --log-params-norm \
+    --log-num-zeros-in-grad \
+    --log-validation-ppl-to-tensorboard \
+    --log-timers-to-tensorboard \
+    --timing-log-level 2 \
+    --log-interval 1 \
     --save-interval 5000 \
     --eval-interval 1000 \
     --eval-iters 10 \
