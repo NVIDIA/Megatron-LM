@@ -770,7 +770,7 @@ train.t5_core.220m_te_tp1_pp1_1node_100steps:
     NUM_NODES: 1
     MAX_STEPS: 100
     TIME_LIMIT: "30:00"
-    TEST_LEVEL: NIGHTLY_TESTS
+    TEST_LEVEL: MR_TESTS
     PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
 
 train.t5_core.220m_te_tp2_pp1_1node_100steps:

@@ -24,7 +24,12 @@ jet-generate:
     - git checkout -f "$JET_WORKLOADS_REF_MAIN"
     - git checkout -b "$JET_WORKLOADS_REF_EPHEMERAL"
 
-    - yq e ".spec.source.ref = \"${CI_COMMIT_REF_NAME}\"" -i recipes/build-pyt.yaml 
+    - |
+      if [[ $CI_PIPELINE_SOURCE == "merge_request_event" ]]; then
+        yq e ".spec.source.ref = \"merge-requests/${CI_MERGE_REQUEST_IID}/head\"" -i recipes/build-pyt.yaml
+      else
+        yq e ".spec.source.ref = \"${CI_COMMIT_REF_NAME}\"" -i recipes/build-pyt.yaml
+      fi
 
     - git add recipes/build-pyt.yaml
     - git commit -m "Dynamic configuration - ${CI_PIPELINE_ID}"
