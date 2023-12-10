@@ -163,28 +163,34 @@ class BaseMoELayer(ABC, MegatronModule):
             output_total: un-permuted updated hidden states output from all local experts
             with shape of [SeqLen/TP, MBS, HiddenSize]
         """
-        # Unpermute the tokens locally.
-        original_order_lhs = torch.zeros_like(hidden_states)
-        original_order_lhs[self.permuted_indices] = hidden_states
-        output_total = original_order_lhs
-        output_bias_total = bias
+        # Unpermute the tokens and bias locally respectively.
+        unpermuted_local_hidden = torch.zeros_like(hidden_states)
+        unpermuted_local_hidden[self.permuted_indices] = hidden_states
+        unpermuted_local_bias = None
+        if self.add_bias:
+            assert bias is not None
+            unpermuted_local_bias = torch.zeros_like(hidden_states)
+            unpermuted_local_bias[self.permuted_indices] = bias
+
+        output_total = unpermuted_local_hidden
+        output_bias_total = unpermuted_local_bias
 
         # Unpermute the tokens across expert parallel devices.
         if self.sequence_parallel or (self.expert_parallel_size > 1):
-            original_order_ghs = torch.zeros(
+            unpermuted_global_hidden = torch.zeros(
                 self.ghs_shape, dtype=hidden_states.dtype, device=torch.cuda.current_device()
             )
             global_local_map = torch.squeeze(self.mask.nonzero().contiguous())
-            original_order_ghs[global_local_map] = original_order_lhs
+            unpermuted_global_hidden[global_local_map] = unpermuted_local_hidden
             output_total = tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
-                original_order_ghs
+                unpermuted_global_hidden
             )
             if self.add_bias:
-                assert bias is not None
-                original_order_bias = torch.zeros_like(original_order_ghs)
-                original_order_bias[global_local_map] = bias
+                # Unpermute the bias across expert parallel devices.
+                unpermuted_global_bias = torch.zeros_like(unpermuted_global_hidden)
+                unpermuted_global_bias[global_local_map] = unpermuted_local_bias
                 output_bias_total = tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
-                    original_order_bias
+                    unpermuted_global_bias
                 )
                 # bias is duplicated across tensor parallelism ranks;
                 # reduce scatter reduces bias across tensor parallel_ranks
