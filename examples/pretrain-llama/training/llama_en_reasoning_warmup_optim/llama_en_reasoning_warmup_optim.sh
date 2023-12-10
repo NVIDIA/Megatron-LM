@@ -72,7 +72,7 @@ MODEL_PARALLEL_ARGS=(
 
 source examples/pretrain-llama/training/llama_en_reasoning_warmup_optim/iter_prob.sh
 
-# torchrun ${\DISTRIBUTED_ARGS[@]}\ pretrain_gpt.py\ \
+# torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
 python pretrain_gpt.py \
     ${GPT_MODEL_ARGS[@]} \
     ${LOGISTICS_ARGS[@]} \
