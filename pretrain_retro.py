@@ -17,6 +17,7 @@ from megatron.core.enums import ModelType
 from megatron.core.models.retro import get_retro_decoder_block_spec, RetroModel
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
+from tools.retro.query.chunk_dataset import train_valid_test_datasets_provider as gpt_train_valid_test_datasets_provider
 from tools.retro.query.retro_dataset import get_retro_datasets
 
 from pretrain_gpt import loss_func, model_provider as default_model_provider
@@ -71,7 +72,9 @@ def get_batch(data_iterator):
     tokenizer = get_tokenizer()
 
     # Items and their type.
-    keys = ['text', 'neighbor_tokens']
+    keys = ['text']
+    if args.retro_add_retriever:
+        keys.append('neighbor_tokens')
     datatype = torch.int64
 
     # Broadcast data.
@@ -87,10 +90,11 @@ def get_batch(data_iterator):
     labels = tokens_[:, 1:].contiguous()
     tokens = tokens_[:, :-1].contiguous()
 
-    # note: [bs * l * k, r]
-    # note: 2x == neighbor, continuation
-    neighbor_tokens = data_b['neighbor_tokens'] \
-        .view(-1, retro_args.retro_gpt_retrieved_length).long()
+    if args.retro_add_retriever:
+        # note: [bs * l * k, r]
+        # note: 2x == neighbor, continuation
+        neighbor_tokens = data_b['neighbor_tokens'] \
+            .view(-1, retro_args.retro_gpt_retrieved_length).long()
 
     # Get the masks and postition ids.
     attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
@@ -99,16 +103,20 @@ def get_batch(data_iterator):
         args.reset_position_ids,
         args.reset_attention_mask,
         args.eod_mask_loss)
-    _, _, neighbor_position_ids = get_ltor_masks_and_position_ids(
-        neighbor_tokens,
-        tokenizer.eod,
-        args.reset_position_ids,
-        args.reset_attention_mask,
-        args.eod_mask_loss)
-    neighbor_attention_mask = None
 
-    return tokens, labels, loss_mask, attention_mask, position_ids, \
-           neighbor_tokens, neighbor_attention_mask, neighbor_position_ids
+    if args.retro_add_retriever:
+        _, _, neighbor_position_ids = get_ltor_masks_and_position_ids(
+            neighbor_tokens,
+            tokenizer.eod,
+            args.reset_position_ids,
+            args.reset_attention_mask,
+            args.eod_mask_loss)
+        neighbor_attention_mask = None
+        return tokens, labels, loss_mask, attention_mask, position_ids, \
+               neighbor_tokens, neighbor_attention_mask, neighbor_position_ids
+
+    else:
+        return tokens, labels, loss_mask, attention_mask, position_ids
 
 
 def forward_step(data_iterator, model):
@@ -118,9 +126,15 @@ def forward_step(data_iterator, model):
 
     # Get the batch.
     timers('batch-generator').start()
-    tokens, labels, loss_mask, attention_mask, position_ids, \
+    if args.retro_add_retriever:
+        tokens, labels, loss_mask, attention_mask, position_ids, \
+            neighbor_tokens, neighbor_attention_mask, neighbor_position_ids = \
+                get_batch(data_iterator)
+    else:
+        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
+            data_iterator)
         neighbor_tokens, neighbor_attention_mask, neighbor_position_ids = \
-            get_batch(data_iterator)
+            None, None, None
     timers('batch-generator').stop()
 
     # Model call.
@@ -145,7 +159,11 @@ def forward_step(data_iterator, model):
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build train, valid, and test datasets."""
-    return get_retro_datasets()
+    args = get_args()
+    if args.retro_add_retriever:
+        return get_retro_datasets()
+    else:
+        return gpt_train_valid_test_datasets_provider(train_val_test_num_samples)
 
 
 if __name__ == "__main__":
@@ -157,5 +175,4 @@ if __name__ == "__main__":
              model_provider,
              ModelType.retro_decoder,
              forward_step,
-             args_defaults={'tokenizer_type': 'GPT2BPETokenizer',
-                            'retro_add_retriever': True})
+             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})

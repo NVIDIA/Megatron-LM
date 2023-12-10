@@ -365,7 +365,8 @@ def validate_args(args, defaults={}):
         assert args.pipeline_model_parallel_size == 1, \
             "retro currently does not support pipeline parallelism."
 
-        # Load retro args.
+    # Load retro args (used by both Retro & GPT).
+    if args.retro_workdir:
         retro_args_path = get_retro_args_path(args.retro_workdir)
         assert os.path.exists(retro_args_path), "retro workdir missing args.json"
         with open(retro_args_path) as f:
@@ -557,6 +558,8 @@ def _add_retro_args(parser):
                        'database.')
     group.add_argument("--retro-return-doc-ids", action="store_true",
                        help="Turn this on when preprocessing retro data.")
+    group.add_argument("--retro-attention-gate", type=float, default=1,
+                       help="Gated cross attention.")
     group.add_argument("--retro-no-verify-neighbor-count", action="store_false",
                        dest="retro_verify_neighbor_count",
                        help="Skip verifying that len(GPT dataset) == len(saved "
