@@ -11,7 +11,7 @@ command: >-
    ${{outputs.checkpoint_dir}} \
    ${{outputs.tensorboard_dir}}
 
-display_name: LLaMa-Allam-Reasoning-Data-En-Warmup
+display_name: LLaMa-Allam-Reasoning-Data-En-Warmup-No-Dropout
 
 experiment_name: Vocab-Expansion
 code: ../../../../
@@ -64,5 +64,5 @@ distribution:
   process_count_per_instance: 8
 
 resources:
-  instance_count: 8
+  instance_count: 16
   shm_size: 1250g

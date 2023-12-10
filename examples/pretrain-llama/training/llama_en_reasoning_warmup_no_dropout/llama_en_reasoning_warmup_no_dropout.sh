@@ -71,7 +71,7 @@ MODEL_PARALLEL_ARGS=(
     --no-async-tensor-model-parallel-allreduce
 )
 
-source examples/pretrain-llama/training/llama_en_reasoning_warmup/iter_prob.sh
+source examples/pretrain-llama/training/llama_en_reasoning_warmup_no_dropout/iter_prob.sh
 
 # torchrun ${\DISTRIBUTED_ARGS[@]}\ pretrain_gpt.py\ \
 python pretrain_gpt.py \
