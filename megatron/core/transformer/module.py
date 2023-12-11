@@ -48,15 +48,23 @@ class MegatronModule(torch.nn.Module):
         return self.state_dict(prefix=prefix, keep_vars=keep_vars)
 
     def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
-        """Override sharded state dict with Dist Checkpointing.
+        """Sharded state dict with Distributed Checkpointing.
 
-        Override sharded_state_dict when using distributed checkpointing. keep_vars must always be set to True so that optimizer states can be sharded.
+        General definition of sharded_state_dict tries to call `sharded_state_dict`
+        of submodules when possible, otherwise assumes tensors are replicated
+        across TP and DP.
+        When overriding, keep_vars argument of plain `state_dict` method must
+        always be set to True so that optimizer states can be sharded.
 
         Args:
-            prefix (str, optional): _description_. Defaults to ''.
+            prefix (str): prefix for the state dict keys
+            sharded_key_prefix (str, optional): prefix for the ShardedTensor keys.
+                If None, the same prefix as for state dict keys is assumed.
+            sharded_offsets (Iterable[Tuple[int, int, int]], optional): sharding already
+                applied (e.g. PP related) by sup-modules. Passed along to ShardedTensor
 
         Returns:
-            _type_: _description_
+            dict: dictionary of state dict keys mapped to ShardedTensors
         """
         sharded_key_prefix = prefix if sharded_key_prefix is None else sharded_key_prefix
         sharded_state_dict = {}
