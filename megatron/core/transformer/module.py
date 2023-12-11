@@ -7,6 +7,7 @@ from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
 _FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
 _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
@@ -46,7 +47,7 @@ class MegatronModule(torch.nn.Module):
 
         return self.state_dict(prefix=prefix, keep_vars=keep_vars)
 
-    def sharded_state_dict(self, prefix: str = ''):
+    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
         """Override sharded state dict with Dist Checkpointing.
 
         Override sharded_state_dict when using distributed checkpointing. keep_vars must always be set to True so that optimizer states can be sharded.
@@ -57,7 +58,28 @@ class MegatronModule(torch.nn.Module):
         Returns:
             _type_: _description_
         """
-        return self.state_dict(prefix=prefix, keep_vars=True)
+        sharded_key_prefix = prefix if sharded_key_prefix is None else sharded_key_prefix
+        sharded_state_dict = {}
+
+        for name, module in self._modules.items():
+            if hasattr(module, 'sharded_state_dict'):
+                module_sharded_sd = module.sharded_state_dict(
+                    prefix=f'{prefix}{name}.',
+                    sharded_key_prefix=f'{sharded_key_prefix}{name}.',
+                    sharded_offsets=sharded_offsets,
+                )
+            else:
+                module_sd = module.state_dict(prefix='', keep_vars=True)
+                module_sharded_sd = make_sharded_tensors_for_checkpoint(
+                    module_sd,
+                    f'{prefix}{name}.',
+                    f'{sharded_key_prefix}{name}.',
+                    {},
+                    sharded_offsets,
+                )
+            sharded_state_dict.update(module_sharded_sd)
+
+        return sharded_state_dict
 
 
 def conversion_helper(val, conversion):
@@ -146,12 +168,12 @@ class Float16Module(MegatronModule):
         """Retrieve state_dict from the module being wrapped."""
         return self.module.state_dict_for_save_checkpoint(prefix=prefix, keep_vars=keep_vars)
 
-    def sharded_state_dict(self, prefix=''):
+    def sharded_state_dict(self, prefix='', *args, **kwargs):
         """Retrieve state_dict from the module being wrapped.
 
         When using distributed checkpointing, keep_vars must always be set to True.
         """
-        return self.module.sharded_state_dict(prefix=prefix)
+        return self.module.sharded_state_dict(prefix, *args, **kwargs)
 
     def load_state_dict(self, state_dict, strict=True):
         self.module.load_state_dict(state_dict, strict=strict)

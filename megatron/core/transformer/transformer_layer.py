@@ -231,15 +231,7 @@ class TransformerLayer(MegatronModule):
 
         sharded_state_dict = {}
 
-        # TODO: consider `self._modules.items()` instead of explicit enumeration
-        for name, module in [
-            ('input_layernorm', self.input_layernorm),
-            ('self_attention', self.self_attention),
-            ('pre_cross_attn_layernorm', self.pre_cross_attn_layernorm),
-            ('cross_attention', self.cross_attention),
-            ('pre_mlp_layernorm', self.pre_mlp_layernorm),
-            ('mlp', self.mlp),
-        ]:
+        for name, module in self._modules.items():
             if hasattr(module, 'sharded_state_dict'):
                 module_sharded_sd = module.sharded_state_dict(
                     prefix=f'{state_dict_prefix}{name}.',
