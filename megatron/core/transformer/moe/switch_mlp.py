@@ -24,8 +24,12 @@ class SwitchMLP(BaseMoELayer):
             self.local_experts.append(expert)
 
     def forward(self, hidden_states):
-        # global_hidden_states, global_indices = self.token_permutation(hidden_states)
-        permuted_local_hidden_states, tokens_per_expert = self.token_permutation(hidden_states)
+        (
+            permuted_local_hidden_states,
+            tokens_per_expert,
+            indices,
+            global_local_map,
+        ) = self.token_permutation(hidden_states)
 
         output_local = torch.zeros_like(permuted_local_hidden_states)
         output_bias_local = None
@@ -48,6 +52,8 @@ class SwitchMLP(BaseMoELayer):
                 output_bias_local[start:end, :] = output_bias
 
         # Un-permutation of tokens.
-        output_total, output_bias_total = self.token_unpermutation(output_local, output_bias_local)
+        output_total, output_bias_total = self.token_unpermutation(
+            output_local, indices, global_local_map, output_bias_local
+        )
 
         return output_total, output_bias_total

@@ -95,6 +95,11 @@ class BaseMoELayer(ABC, MegatronModule):
         Returns:
             permuted_local_hidden_states: Permutation of tokens to local experts group.
             tokens_per_expert: the number of tokens each local expert to process.
+            indices: The indices of `local_indices` (which holds the un-sorted expert
+            indices of tokens that local expert can process) that give its sorted order along dim 0.
+            global_local_map (optional): A mask of mapping between global and local tokens where each
+            element is True if it's between the local_expert_indices. Only useful
+            when cross device token permutation is enabled and **AllGahter** is performed.
         """
         self.hidden_shape = hidden_states.shape
         route = self.router(hidden_states)
@@ -123,20 +128,21 @@ class BaseMoELayer(ABC, MegatronModule):
                 hidden_states
             )
             global_indices = self.gather_indices(max_ind)
-            self.ghs_shape = global_hidden_states.shape
-            # Create a mask where each element is True if it's between the local_expert_indices
-            self.mask = (global_indices >= self.local_expert_indices[0]) & (
+            # Create a mask of mapping between global and local tokens where each
+            # element is True if it's between the local_expert_indices
+            global_local_map = (global_indices >= self.local_expert_indices[0]) & (
                 global_indices <= self.local_expert_indices[-1]
             )
-            local_indices = global_indices[self.mask]
-            local_hidden_states = global_hidden_states[self.mask, :]
+            local_indices = global_indices[global_local_map]
+            local_hidden_states = global_hidden_states[global_local_map]
         else:
-            self.ghs_shape = hidden_states.shape
             local_indices = max_ind
             local_hidden_states = hidden_states
+            global_local_map = None
 
         with torch.no_grad():
-            self.permuted_indices = torch.argsort(local_indices)
+            # The indices of local_indices that give its sorted order along dim 0.
+            indices = torch.argsort(local_indices)
             tokens_per_expert = torch.histc(
                 local_indices,
                 bins=self.num_local_experts,
@@ -145,41 +151,51 @@ class BaseMoELayer(ABC, MegatronModule):
             )
             tokens_per_expert = tokens_per_expert.cpu().to(torch.long)
         # Permute the tokens locally so that they are grouped by their expert assignment
-        permuted_local_hidden_states = local_hidden_states[self.permuted_indices]
+        permuted_local_hidden_states = local_hidden_states[indices]
 
-        return permuted_local_hidden_states, tokens_per_expert
+        return permuted_local_hidden_states, tokens_per_expert, indices, global_local_map
 
-    def token_unpermutation(self, hidden_states, bias=None):
-        """Reverse process of 'token_permutation' which permutes the ouput of local
-        experts into the original order to produce the final output.
+    def token_unpermutation(self, hidden_states, indices, global_local_map=None, bias=None):
+        """Reverse process of `token_permutation()` which permutes the ouput of local
+        experts locallay and across expert parallel rank into the original order to
+        produce the final output.
 
         Args:
             hidden_states: 2D tensor of shape [sum_tokens_of_all_local_experts, HiddenSize],
             ouput of local experts.
+            indices: The indices of `local_indices` (which holds the un-sorted expert
+            indices of tokens that local expert can process) that give its sorted order along dim 0.
+            global_local_map (optional): A mask of mapping between global and local tokens where each
+            element is True if it's between the local_expert_indices. Only useful
+            when cross device token permutation is enabled and **AllGahter** is performed.
             bias: bias if self.add_bias is enabled.
 
         Returns:
             output_total: un-permuted updated hidden states output from all local experts
             with shape of [SeqLen/TP, MBS, HiddenSize]
+            output_bias_total: un-permuted bias output from all local experts if
+            self.add_bias is enabled.
         """
         # Unpermute the tokens and bias locally respectively.
         unpermuted_local_hidden = torch.zeros_like(hidden_states)
-        unpermuted_local_hidden[self.permuted_indices] = hidden_states
+        unpermuted_local_hidden[indices] = hidden_states
         unpermuted_local_bias = None
         if self.add_bias:
             assert bias is not None
             unpermuted_local_bias = torch.zeros_like(hidden_states)
-            unpermuted_local_bias[self.permuted_indices] = bias
+            unpermuted_local_bias[indices] = bias
 
         output_total = unpermuted_local_hidden
         output_bias_total = unpermuted_local_bias
 
         # Unpermute the tokens across expert parallel devices.
         if self.sequence_parallel or (self.expert_parallel_size > 1):
+            assert global_local_map is not None, "global_local_map is necessary for `AllGather`."
+            # Shape of global_hidden_size: [SeqLen*MBS, HiddenSize]
+            global_hidden_shape = [global_local_map.shape[0], hidden_states.shape[-1]]
             unpermuted_global_hidden = torch.zeros(
-                self.ghs_shape, dtype=hidden_states.dtype, device=torch.cuda.current_device()
+                global_hidden_shape, dtype=hidden_states.dtype, device=torch.cuda.current_device()
             )
-            global_local_map = torch.squeeze(self.mask.nonzero().contiguous())
             unpermuted_global_hidden[global_local_map] = unpermuted_local_hidden
             output_total = tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
                 unpermuted_global_hidden

@@ -149,7 +149,12 @@ class GroupedMLP(BaseMoELayer):
 
     def forward(self, hidden_states):
         # Permutation of tokens
-        permuted_local_hidden_states, tokens_per_expert = self.token_permutation(hidden_states)
+        (
+            permuted_local_hidden_states,
+            tokens_per_expert,
+            indices,
+            global_local_map,
+        ) = self.token_permutation(hidden_states)
 
         w1, w2 = (self.scale_grad(self.weight1), self.scale_grad(self.weight2))
         # Reshape the weights for the grouped GEMMs.
@@ -163,6 +168,6 @@ class GroupedMLP(BaseMoELayer):
         fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
 
         # Un-permutation of tokens.
-        output_total, _ = self.token_unpermutation(fc2_output)
+        output_total, _ = self.token_unpermutation(fc2_output, indices, global_local_map)
 
         return output_total, None
