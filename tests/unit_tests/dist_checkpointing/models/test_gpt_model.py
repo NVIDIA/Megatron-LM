@@ -37,18 +37,12 @@ def initialize_gpt_model(seed, layer_spec_fn=get_gpt_layer_with_transformer_engi
 
 
 class TestGPTModel:
-
-    def setup_method(self, method):
-        Utils.initialize_model_parallel(2,4)
-
-    def teardown_method(self, method):
-        Utils.destroy_model_parallel()
-
     @pytest.mark.parametrize('layer_spec_fn', [
         get_gpt_layer_with_transformer_engine_spec,
         get_gpt_layer_local_spec,
     ])
     def test_sharded_state_dict_save_load(self, layer_spec_fn, tmp_path_dist_ckpt):
+        Utils.initialize_model_parallel(2,4)
         gpt_model = initialize_gpt_model(1, layer_spec_fn)
         with TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model') as ckpt_dir:
             # Save
@@ -59,6 +53,7 @@ class TestGPTModel:
             sharded_state_dict = gpt_model.sharded_state_dict()
             state_dict = load(sharded_state_dict, ckpt_dir)
             gpt_model.load_state_dict(state_dict)
+        Utils.destroy_model_parallel()
 
 
 class TestGPTModelReconfiguration:

@@ -27,6 +27,7 @@ class TestSerialization:
 
         with TempNamedDir(tmp_path_dist_ckpt / 'test_single_process_save_load') as ckpt_dir:
             save(sharded_state_dict, ckpt_dir)
+            torch.distributed.barrier()
 
             assert (ckpt_dir / 'keyA').is_dir()
             assert (ckpt_dir / 'keyB').is_dir()
@@ -161,6 +162,7 @@ class TestSerialization:
 
         with TempNamedDir(tmp_path_dist_ckpt / 'test_load_tensors_metadata') as ckpt_dir:
             save(state_dict, ckpt_dir)
+            torch.distributed.barrier()
             assert (ckpt_dir / 'keyA').is_dir()
 
             del state_dict
