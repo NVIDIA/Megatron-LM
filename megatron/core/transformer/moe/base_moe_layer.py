@@ -128,25 +128,24 @@ class BaseMoELayer(ABC, MegatronModule):
             self.mask = (global_indices >= self.local_expert_indices[0]) & (
                 global_indices <= self.local_expert_indices[-1]
             )
-            self.local_indices = global_indices[self.mask]
+            local_indices = global_indices[self.mask]
             local_hidden_states = global_hidden_states[self.mask, :]
         else:
             self.ghs_shape = hidden_states.shape
-            self.local_indices = max_ind
+            local_indices = max_ind
             local_hidden_states = hidden_states
 
-        # Permute the tokens locally so that they are grouped by their expert assignment
         with torch.no_grad():
-            self.permuted_indices = torch.argsort(self.local_indices)
-            # Permutation of tokens to each expert group.
-            permuted_local_hidden_states = local_hidden_states[self.permuted_indices]
+            self.permuted_indices = torch.argsort(local_indices)
             tokens_per_expert = torch.histc(
-                self.local_indices,
+                local_indices,
                 bins=self.num_local_experts,
                 min=self.local_expert_indices[0],
                 max=self.local_expert_indices[-1],
             )
             tokens_per_expert = tokens_per_expert.cpu().to(torch.long)
+        # Permute the tokens locally so that they are grouped by their expert assignment
+        permuted_local_hidden_states = local_hidden_states[self.permuted_indices]
 
         return permuted_local_hidden_states, tokens_per_expert
 
