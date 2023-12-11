@@ -377,7 +377,19 @@ if __name__ == "__main__":
         print("\n[Fail] Please install `transformers` package to test fused kernels\n")
         exit(-1)
 
-    load()
+    import argparse
+    import os
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rank", type=int, default=int(os.getenv("RANK", 0)))
+    parser.add_argument('--no-masked-softmax-fusion',
+                        action='store_false',
+                        help='Disable fusion of query_key_value scaling, '
+                             'masking, and softmax.',
+                        dest='masked_softmax_fusion')
+    args, _ = parser.parse_known_args()
+
+    load(args)
     test_masked_softmax_forward()
     test_masked_softmax_backward()
     test_allmasked_softmax_forward()
