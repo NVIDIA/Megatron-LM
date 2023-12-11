@@ -22,6 +22,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 
+from ..transformer.utils import make_sharded_tensors_for_checkpoint
 from .mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
@@ -32,7 +33,6 @@ from .mappings import (
 )
 from .random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from .utils import VocabUtility, divide, split_tensor_along_last_dim
-from ..transformer.utils import make_sharded_tensors_for_checkpoint
 
 _grad_accum_fusion_available = True
 try:
