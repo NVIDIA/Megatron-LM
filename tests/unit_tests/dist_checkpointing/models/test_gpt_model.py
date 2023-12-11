@@ -14,10 +14,11 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.models.gpt.gpt_layer_specs import \
-    get_gpt_layer_with_transformer_engine_spec, get_gpt_layer_local_spec
+    get_gpt_layer_with_transformer_engine_spec, get_gpt_layer_local_spec, \
+    gpt_layer_with_transformer_engine_spec_moe, gpt_layer_local_spec_moe
 
 
-def initialize_gpt_model(seed, use_te=True, **config_kwargs):
+def initialize_gpt_model(seed, layer_spec_fn=get_gpt_layer_with_transformer_engine_spec, **config_kwargs):
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
 
@@ -26,8 +27,7 @@ def initialize_gpt_model(seed, use_te=True, **config_kwargs):
     transformer_config = TransformerConfig(**default_config_kwargs)
     pre_process = ps.is_pipeline_first_stage()
     post_process = ps.is_pipeline_last_stage()
-    layer_spec = get_gpt_layer_with_transformer_engine_spec() if use_te else get_gpt_layer_local_spec()
-    model = GPTModel(config=transformer_config, transformer_layer_spec=layer_spec, vocab_size=128, max_sequence_length=4,
+    model = GPTModel(config=transformer_config, transformer_layer_spec=layer_spec_fn(), vocab_size=128, max_sequence_length=4,
                      pre_process=pre_process, post_process=post_process)
 
     with torch.no_grad():
@@ -44,9 +44,12 @@ class TestGPTModel:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize('use_te', [True])  # non-TE not supported yet
-    def test_sharded_state_dict_save_load(self, use_te, tmp_path_dist_ckpt):
-        gpt_model = initialize_gpt_model(use_te)
+    @pytest.mark.parametrize('layer_spec_fn', [
+        get_gpt_layer_with_transformer_engine_spec,
+        get_gpt_layer_local_spec,
+    ])
+    def test_sharded_state_dict_save_load(self, layer_spec_fn, tmp_path_dist_ckpt):
+        gpt_model = initialize_gpt_model(1, layer_spec_fn)
         with TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model') as ckpt_dir:
             # Save
             sharded_state_dict = gpt_model.sharded_state_dict()
