@@ -14,6 +14,11 @@ from megatron.initialize import _set_random_seed
 from megatron.model import Float16Module
 from tests.unit_tests.test_utilities import Utils
 
+DEVICE_CAPABILITY = None
+if torch.cuda.is_available():
+    DEVICE_CAPABILITY = torch.cuda.get_device_capability()
+
+
 class TestParallelGroupedMLP:
 
     def setup_method(self, method, use_cpu_initialization=False, swiglu=True):
@@ -119,6 +124,9 @@ class TestParallelGroupedMLP:
             assert torch.equal(gmm_expert2_fc2, smm_expert2_fc2)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(
+        not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8, reason='GroupedGEMM kernels are not supported on this device.'
+    )
     def test_gpu_forward(self):
         self.switch_mlp_smm.cuda()
         self.switch_mlp_gmm.cuda()
