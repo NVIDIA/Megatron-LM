@@ -32,7 +32,7 @@ unit_tests:
     - pip install nltk
     - pip install wrapt
     - pip install zarr "tensorstore==0.1.45"  # for distributed checkpointing tests
-    - pip install git+https://github.com/tgale96/grouped_gemm@main  # for grouped gemm tests
+    - pip install git+https://github.com/fanshiqing/grouped_gemm@main  # for grouped gemm tests
     - torchrun --nproc_per_node=8 -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/unit_tests
   coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
   artifacts:
