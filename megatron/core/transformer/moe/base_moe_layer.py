@@ -121,7 +121,7 @@ class BaseMoELayer(ABC, MegatronModule):
         # [S/TP, B, H] -> [S*B/TP, H]
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
-        # Permute the tokens across the expert parallel devices.
+        # Stage1: permute the tokens across the expert parallel devices.
         if self.sequence_parallel or (self.expert_parallel_size > 1):
             # [S*B/TP, H] -> [S*B, H]
             global_hidden_states = tensor_parallel.gather_from_sequence_parallel_region_to_moe(
@@ -133,8 +133,9 @@ class BaseMoELayer(ABC, MegatronModule):
             global_local_map = (global_indices >= self.local_expert_indices[0]) & (
                 global_indices <= self.local_expert_indices[-1]
             )
-            local_indices = global_indices[global_local_map]
-            local_hidden_states = global_hidden_states[global_local_map]
+            global_local_map = torch.squeeze(global_local_map.nonzero())
+            local_indices = torch.index_select(global_indices, 0, global_local_map)
+            local_hidden_states = torch.index_select(global_hidden_states, 0, global_local_map)
         else:
             local_indices = max_ind
             local_hidden_states = hidden_states
@@ -150,8 +151,9 @@ class BaseMoELayer(ABC, MegatronModule):
                 max=self.local_expert_indices[-1],
             )
             tokens_per_expert = tokens_per_expert.cpu().to(torch.long)
-        # Permute the tokens locally so that they are grouped by their expert assignment
-        permuted_local_hidden_states = local_hidden_states[indices]
+
+        # Stage2: permute the tokens locally so that they are grouped by their expert assignment
+        permuted_local_hidden_states = torch.index_select(local_hidden_states, 0, indices)
 
         return permuted_local_hidden_states, tokens_per_expert, indices, global_local_map
 
@@ -163,9 +165,9 @@ class BaseMoELayer(ABC, MegatronModule):
         Args:
             hidden_states: 2D tensor of shape [sum_tokens_of_all_local_experts, HiddenSize],
             ouput of local experts.
-            indices: The indices of `local_indices` (which holds the un-sorted expert
+            indices: 1D tensor of the indices of `local_indices` (which holds the un-sorted expert
             indices of tokens that local expert can process) that give its sorted order along dim 0.
-            global_local_map (optional): A mask of mapping between global and local tokens where each
+            global_local_map (optional): 1D tensor, a mask of mapping between global and local tokens where each
             element is True if it's between the local_expert_indices. Only useful
             when cross device token permutation is enabled and **AllGahter** is performed.
             bias: bias if self.add_bias is enabled.
@@ -176,34 +178,48 @@ class BaseMoELayer(ABC, MegatronModule):
             output_bias_total: un-permuted bias output from all local experts if
             self.add_bias is enabled.
         """
-        # Unpermute the tokens and bias locally respectively.
+        # Stage1: unpermute the tokens and bias locally respectively.
         unpermuted_local_hidden = torch.zeros_like(hidden_states)
-        unpermuted_local_hidden[indices] = hidden_states
+        # Reshape global_local_map to be compatible with Tensor.scatter
+        indices = torch.unsqueeze(indices, 1).expand(-1, hidden_states.shape[-1])
+        assert indices.shape == hidden_states.shape
+        unpermuted_local_hidden = unpermuted_local_hidden.scatter(0, indices, hidden_states)
+
         unpermuted_local_bias = None
         if self.add_bias:
             assert bias is not None
             unpermuted_local_bias = torch.zeros_like(hidden_states)
-            unpermuted_local_bias[indices] = bias
+            assert indices.shape == bias.shape
+            unpermuted_local_bias = unpermuted_local_bias.scatter(0, indices, bias)
 
         output_total = unpermuted_local_hidden
         output_bias_total = unpermuted_local_bias
 
-        # Unpermute the tokens across expert parallel devices.
+        # Stage2: unpermute the tokens across expert parallel devices.
         if self.sequence_parallel or (self.expert_parallel_size > 1):
             assert global_local_map is not None, "global_local_map is necessary for `AllGather`."
-            # Shape of global_hidden_size: [SeqLen*MBS, HiddenSize]
-            global_hidden_shape = [global_local_map.shape[0], hidden_states.shape[-1]]
+            ep_group_size = parallel_state.get_tensor_and_expert_parallel_world_size()
+            # hidden_shape: [SeqLen/TP, MBS, HiddenSize], glboal_num_tokens = SeqLen/TP*MBS*(TP*EP)
+            global_num_tokens = self.hidden_shape[0] * self.hidden_shape[1] * ep_group_size
+            global_hidden_shape = [global_num_tokens, hidden_states.shape[-1]]
             unpermuted_global_hidden = torch.zeros(
                 global_hidden_shape, dtype=hidden_states.dtype, device=torch.cuda.current_device()
             )
-            unpermuted_global_hidden[global_local_map] = unpermuted_local_hidden
+            # Reshape global_local_map to be compatible with Tensor.scatter
+            global_local_map = global_local_map.unsqueeze(1).expand(-1, hidden_states.shape[-1])
+            assert global_local_map.shape == unpermuted_local_hidden.shape
+            unpermuted_global_hidden = unpermuted_global_hidden.scatter(
+                0, global_local_map, unpermuted_local_hidden
+            )
             output_total = tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
                 unpermuted_global_hidden
             )
             if self.add_bias:
                 # Unpermute the bias across expert parallel devices.
                 unpermuted_global_bias = torch.zeros_like(unpermuted_global_hidden)
-                unpermuted_global_bias[global_local_map] = unpermuted_local_bias
+                unpermuted_global_bias = unpermuted_global_bias.scatter(
+                    0, global_local_map, unpermuted_local_bias
+                )
                 output_bias_total = tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
                     unpermuted_global_bias
                 )
