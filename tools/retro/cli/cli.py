@@ -79,7 +79,7 @@ class retro:
         # Load data.
         cls.db_indexed_dataset_infos = get_db_indexed_dataset_infos()
         cls.db_dataset = get_db_dataset()
-        pt_train_ds, pt_valid_ds, _ = get_retro_datasets(verify_sizes=False)
+        pt_train_ds, pt_valid_ds, _ = get_retro_datasets()
         cls.pt_datasets = types.SimpleNamespace(
             train=pt_train_ds,
             valid=pt_valid_ds,

@@ -1,223 +1,169 @@
-This directory contains a collection of tools for building the retrieval database and pretraining neighbors for Retro. This preprocessing pipeline is broken into 3 main stages:
+# Retro and InstructRetro
 
-1. **Build retrieval chunk database** : Used for retrieving neighbors and continuation chunks, which are then passed through the retrieval encoder.
-2. **Build index for similarity search** : Train and build a search index for querying chunk neighbors.
-3. **Query pretraining neighbors** : For matching pretraining samples to database chunks. Neighbors are generated separately for training, validation, and test datasets.
+Retro [(Borgeaud et al., 2022)](https://arxiv.org/abs/2112.04426) is an autoregressive decoder-only language model (LM) pretrained with retrieval-augmentation. 
+Retro features practical scalibility to support large-scale pretraining from scratch by retrieving from trillions of token.
+Pretraining with retrieval provides a more efficient storage mechanism of factual knowledge, when compared to storing factual knowledge implicitly within the network's parameters, thus largely reducing model parameters while achieving lower perplexity than standard GPT. 
+Retro also provides the flexibility to update the
+knowledge stored in LMs [(Wang et al., 2023a)](https://arxiv.org/abs/2304.06762)
+by updating the retrieval database without training LMs again.
 
-The following overview goes into more detail on the pipeline, code structure, usage, and pretraining.
+InstructRetro [(Wang et al., 2023b)](https://arxiv.org/abs/2310.07713) further scales up the size of Retro to 48B, featuring the largest LLM pretrained with retrieval (as of December 2023). 
+The obtained foundation model, Retro 48B, largely outperforms the GPT counterpart in terms of perplexity.
+With instruction tuning on Retro, InstructRetro demonstrates significant improvement over the instruction tuned GPT on downstream tasks in the zero-shot setting. Specifically, the average improvement of InstructRetro is 7% over its GPT counterpart across 8 short-form QA tasks, and 10% over GPT across 4 challenging long-form QA tasks. We also find that one can ablate the encoder from InstructRetro architecture and directly use the InstructRetro decoder backbone as GPT, while achieving comparable results.
 
-<!-- ################ contents ################ -->
-# Contents
+This README provides an end-to-end tutorial to reproduce Retro and InstructRetro.   
 
-  * [Quick start](#quick-start)
-  * [Stages](#stages)
-  * [Code structure](#code-structure)
-  * [Arguments](#arguments)
-  <!-- * [Pretraining](#pretraining) -->
+## Citations
 
-<!-- ################ quick start ################ -->
-# Quick start
+See more details from our papers:
 
-Key files:
+[Shall we Pretrain Autoregressive Language Models with Retrieval? A Comprehensive Study.](https://arxiv.org/abs/2304.06762)
 
-- `main.py` : Entry point for processing.
-- `examples/preprocess_data.sh` : Example preprocessing launch (calls `main.py`).
-- `examples/pretrain_data.sh` : Example pretraining launch (calls `pretrain_retro.py`).
+_Boxin Wang, Wei Ping, Peng Xu, Lawrence McAfee, Zihan Liu, Mohammad Shoeybi, Yi Dong, Oleksii Kuchaiev, Bo Li, Chaowei Xiao, Anima Anandkumar, Bryan Catanzaro._ (EMNLP 2023)
 
-Use `--retro-tasks` to move through the preprocessing pipeline.
+[InstructRetro: Instruction Tuning post Retrieval-Augmented Pretraining.](https://arxiv.org/abs/2310.07713) 
 
-- Simplest setup (builds everything): `--retro-tasks build`
-- Alternatively, for tuning compute resources, run stages independently:
-  - Build retrieval database: `--retro-tasks db-build`
-  - Build search index: `--retro-tasks index-build`
-  - Query neighbors: `--retro-tasks pretraining-query-neighbors`
+_Boxin Wang, Wei Ping, Lawrence McAfee, Peng Xu, Bo Li, Mohammad Shoeybi, Bryan Catanzaro._ 
 
-Sample code flow:
+Please cite the papers as follows if you use the data or code from this repo:
 
-- `main.py` : Entry point (e.g., using `--retro-tasks X`).
-- `db/build.py` : Build retrieval database.
-- `index/build.py` : Build search index. Calls the following two files:
-  - `index/train.py` : Train index on subset of database.
-  - `index/add.py` : Add database chunks to index.
-- `pretraining/query.py` : Query pretraining samples for database neighbors (saved to disk and used during pretraining).
+```bibtex
+@inproceedings{wang2023shall,
+    title   = {Shall We Pretrain Autoregressive Language Models with Retrieval? A Comprehensive Study},
+    author  = {Boxin Wang and Wei Ping and Peng Xu and Lawrence McAfee and Zihan Liu and Mohammad Shoeybi and Yi Dong and Oleksii Kuchaiev and Bo Li and Chaowei Xiao and Anima Anandkumar and Bryan Catanzaro},
+    journal = {The 2023 Conference on Empirical Methods in Natural Language Processing},
+    year    = {2023}
+}
 
-<!-- ################ stages ################ -->
-# Stages
-
-### Build retrieval chunk database
-
-This *database* (stored as a 2-D array, NOT a relational database) consists of a list of chunks (traditionally length 64) extracted from the original GPT token dataset. This is simply a consecutive, non-overlapping chunking of the token dataset. Chunking only takes place within a document, and therefore the final chunk of each document has length: 1 <= chunk_length <= max_chunk_length.
-
-We discard chunks that would convert to an empty Bert sequence (rare case, happens ~1/100,000 chunks in our case), since we use Bert embeddings for building our index. Thus, the total number of chunks in the database will be slightly less than a naive calculation.
-
-### Build index for similarity search
-
-To match pretraining chunks to database chunks, a search index must be built to perform this querying. We use Faiss (https://github.com/facebookresearch/faiss) for training and building this index. Generally, the index is trained on a subset of all chunks in the database (specified via `--retro-nchunks-sampled`). After training, all chunks are added into the index, to be available during querying.
-
-Indexes only accept 1-D floating point vectors for training and adding, so each chunk must first be embedded before passing to the index for either training or adding. We use Bert embeddings for this purpose, and the embeddings are generated automatically within the pipeline.
-
-### Query pretraining neighbors
-
-To ensure fast Retro pretraining, the database neighbors for pretraining samples are pre-computed and saved to disk, for efficient access within the Retro dataset. In this stage, the pretraining datasets (training, validation, and test) are iterated, each sample is broken into chunks, and the chunks are used for querying the index. Similar to when building the index, each chunk is embedded (via Bert) before querying the index.
-
-The saved neighbors are labeled with unique dataset properties (i.e., seed, sequence length, number of samples, etc.) to ensure the neighbors generated during preprocessing match the neighbors requested during pretraining.
-
-<!-- ################ code structure ################ -->
-# Code structure
-
-### `tools/retro/main.py`
-
-This is the main entry point for Retro preprocessing. Call `main.py --help` to see arguments. Additionally, some Retro arguments are in Megatron's core arguments, so also see `add_retro_args()` section of `megatron/arguments.py` for additional arguments. Two of the most important arguments to customize are `--retro-workdir` and `--retro-tasks`.
-
-- **`--retro-workdir`** : Set the directory in which the preprocessing pipeline saves its datasets and configuration files. This argument should remain consistent for a full pass through the pipeline, and for pretraining.
-
-- **`--retro-tasks`** : Set the stages of preprocessing to perform. As mentioned previously, the three high-level stages are: 1) build retrieval database, 2) build search index, and 3) query pretraining neighbors. `--retro-tasks` can be used to either run the full pipeline, or run each of these stages in isolation. The latter case is useful for tuning compute resources for each stage. For example, index training utilizes GPUs and requires relatively less time, while querying neighbors uses the CPU and is a relatively slow process. Example tasks include:
-
-  - **`--retro-tasks build`** : Run entire preprocessing pipeline.
-  - **`--retro-tasks db-build`** : Build retrieval database.
-  - **`--retro-tasks index-build`** : Train and build search index.
-  - **`--retro-tasks pretraining-query-neighbors`** : Query pretraining neighbors.
-
-Multiple tasks can be specified by separating with commas (e.g., `--retro-tasks db-build,index-build`). Additionally, various 'miscellaneous' tasks are currently including, primarily for validating data for each stage; these task names can be seen in `main.py`.
-
-### `tools/retro/examples`
-
-Example scripts for setting arguments and launch Retro preprocessing. The key files here are:
-
-- **`preprocess_data.sh`** : Example launch script for preprocessing retro data.
-- **`pretrain_model.sh`** : Example launch script for pretraining a retro model.
-
-### `tools/retro/db`
-
-Build the retrieval chunk database. The key files here are:
-
-- **`build.py`** : Entry point for building the database. This code is responsible for iterating the input datasets (i.e., `--data-path`), parsing each dataset into consecutive chunks, checking for empty Bert (Wordpiece) conversions, and storing this information to disk. Two databases are created: 1) the retrieval database, and 2) a sampled database used for training the search index.
-- **`dataset.py`** : Defines database class, for iterating or accessing chunks in the database. Each chunk contains its tokens, Bert conversion length, and dataset index.
-
-Input data:
-
-<!-- - Token datasets, as generated by `tools/preprocess_data.py`. Each dataset should include a `.bin` and `.idx` file. Multiple datasets can be specified by using a blended configuration (see `--data-path` in `megatron/arguments.py`). -->
-- Token datasets, as loaded by `gpt_dataset.py`. Multiple datasets can be specified by using a blended configuration (see `--data-path` in `megatron/arguments.py`).
-
-Output data:
-
-- **`<RETRO_WORKDIR>/db/merged/train.hdf5`** : The main retrieval database. (*Database* here is used to denote a list of indexed chunks, rather than a *relational database*.) The chunks in this database are added to the search index, and are used for retrieval during pretraining. This file contains a single dataset `'chunks'`, which contains 5 columns:
-
-  - `dataset_idx` : Dataset index, from list of blended indexed datasets.
-  - `document_idx` : Document index within dataset.
-  - `chunk_start_idx` : Chunk's starting token index within document.
-  - `chunk_end_idx` : Chunk's ending token index (exclusive) within document.
-  - `bert_chunk_length` : Length of Bert token sequence, after converting from GPT.
-
-- **`<RETRO_WORKDIR>/db/merged/sampled.hdf5`** : Subset of training database that is used for training the search index. This file has the same structure as detailed above. In general, this database is significanly smaller than the `train.hdf5` database, since the search index only needs a relatively small number of samples to understand the data's structure. After training, all chunks in the main database (`train.hdf5`) are *added* to the search index.
-
-### `tools/retro/index`
-
-Build the search index. The key files here are:
-
-- `build.py` : Entry point for building the search index. First, the index is trained on the sampled chunk database (see above) by calling `train.py`, and then all chunks for the full database are added to the index by calling `add.py`. Note that training requires first embedding (using Bert) all chunks (a parallel operation), and then loading these embeddings and training the index (a sequential operation), so it's best to change one's compute setup after all chunks have been embedded and saved to disk.
-- `indexes/faiss_base.py` : Wrapper class for building a Faiss index, following the standard `train()` and `add()` operations.
-- `indexes/faiss_par_add.py` : Similar to above, except it uses an embarrassingly parallel (multi-node, multi-process) `add()` operation. Vectors are first added to separate index copies, and then merged together.
-
-Input data:
-
-- **`<RETRO_WORKDIR>/db/merged/sampled.hdf5`** : Chunks used for training the search index.
-- **`<RETRO_WORKDIR>/db/merged/train.hdf5`** : Chunks used for adding to the *trained* search index.
-
-Output data:
-
-- **`<RETRO_WORKDIR>/index/<RETRO_INDEX_TYPE>/<RETRO_INDEX_STR>/added.faissindex`** : The final index, which has been trained and has had all database chunks added to it. This index is ready for querying neighbors. Here, `RETRO_INDEX_TYPE` and `RETRO_INDEX_STR` correspond to the same-name arguments `--retro-index-type` (e.g., `faiss-par-add`) and `--retro-index-str` (e.g., `OPQ32_256,IVF4194304_HNSW32,PQ32`).
-- **`<RETRO_WORKDIR>/index/<RETRO_INDEX_TYPE>/<RETRO_INDEX_STR>/empty.faissindex`** : Generally can be discarded once `added.faissindex` has been built, but this file contains the *post-training*, *pre-adding* index. Useful for debugging or building other indexes.
-
-### `tools/retro/pretraining`
-
-Query the pretraining datasets (training, validation, test) for their neighbors within the database. Neighbors are queried during preprocessing -- rather than during pretraining -- because querying is a fairly slow operation, so it would be a bottleneck if performed during pretraining. Queried neighbors are tagged with their unique identifying information (e.g., `train_indexmap_27662746ns_2048sl_1234s`), so as to avoid incorrect references during pretraining. The key files here are:
-
-- **`query.py`** : Entry point for querying. The pretraining datasets are iterated, and each chunk within each sample is queried using the search index. These neighbors are filtered by discarding any database chunks that fall within the same document as any chunk within a pretraining sample.
-- **`chunk_dataset.py`** : This creates an iterable 'chunk' dataset form of a pretraining dataset. This is just a light wrapper, but makes it easier to deterministically iterate and assign IDs to each chunk in a sample dataset.
-- **`retro_dataset.py`** : The Retro dataset used for pretraining (not used in preprocessing). Each sample returns the sample tokens, along with neighbor tokens for each chunk within the sample.
-
-Input data:
-
-- Token datasets, as loaded by `gpt_dataset.py`.
-- **`<RETRO_WORKDIR>/index/<RETRO_INDEX_TYPE>/<RETRO_INDEX_STR>/added.faissindex`** : The trained index, with all database chunks added to it (see previous section for details).
-
-Output data:
-
-- **`<RETRO_WORKDIR>/{train,valid,test}_XXns_YYsl_ZZs/WW.hdf5`** : These directories/files contain the indexes of neighbors for each chunk within each sample of the pretraining datasets. Each directory (e.g., `train_indexmap_2047435ns_2048sl_1234s`) contains a list of HDF5 files (e.g., one file might be called `0075700000-0075800000.hdf5`). Each HDF5 file contains a consecutive subset of neighbor IDs for a given chunk, for indexing into the main retrieval database. All HDF5 files taken together within a given directory, represent the entire set of neighbors for a dataset. The size of these HDF5 files is determined by the argument `--retro-block-size`. The `XX`, `YY`, `ZZ`, `WW` notation above denotes the dataset properties that are used for uniquely tagging the neighbor files, to ensure compatibility during model pretraining. These neighbor files are ultimated used by `retro_dataset.py` during pretraining, for building Retro samples.
-
-### `tools/retro/cli`
-
-Inspect preprocessed data. To use the CLI, open a Python terminal via the `python` command, and then load a Retro workdir with the following:
-
-```
-from tools.retro.cli import retro
-retro.init("/path/to/retro/workdir")
+@article{wang2023instructretro,
+    title   = {InstructRetro: Instruction Tuning post Retrieval-Augmented Pretraining},
+    author  = {Boxin Wang and Wei Ping and Lawrence McAfee and Peng Xu and Bo Li and Mohammad Shoeybi and Bryan Catanzaro},
+    year    = {2023},
+    journal = {arXiv preprint arXiv: 2310.07713}
+}
 ```
 
-This initializes Megatron, and prepares the Retro data for inspection. See the printed usage for available functions. Several routines are included for viewing data in the retrieval database and viewing pretraining samples and neighbors. For example:
+# End-to-end Reproduction Guide
 
-```python
-retro.get_db_num_indexed_datasets() # 15
-retro.get_db_chunk_text(92874113) # 'research project at ...  and philosophy'
-retro.get_pt_sample('train', 62005) # '[16084, 26158, 25387 ..., 6898, 9568]'
+In this README, we provide an end-to-end reproduction guide for InstructRetro, covering from large-scale retrieval construction, pretraining, perplexity evaluation, instruction tuning, to downstream task evaluation. 
+
+## Step 0: Prepare the environment
+
+We recommend using docker environment to run the code.
+
+### Docker image
+
+
+We provide a docker build file in [tools/retro/examples/Dockerfile](tools/retro/examples/Dockerfile) for the reproduction. The docker image is based on `nvcr.io/nvidia/pytorch:23.09-py3`.
+
+
+### Install dependencies
+
+If docker is not available, we recommend starting from a clean conda environment, including:
+- Python 3.10
+- NVIDIA CUDA® 12.2.1
+- NVIDIA cuBLAS 12.2.5.6
+- NVIDIA cuDNN 8.9.5
+- NVIDIA NCCL 2.18.5
+- 2.1.0a0+32f93b1
+
+Then install Retro-specific dependencies, including:
+```bash
+pip install -U faiss-gpu
+pip install -U transformers
+pip install -U sentencepiece
+pip install -U h5py
+pip install -U nltk
+pip install -U einops
 ```
 
-Most methods within the CLI are prefixed to denote the data being inspected:
-
-- **'db'** : Retrieval database (i.e., chunk tokens, document IDs, and dataset IDs)
-- **'pt'** : Pretraining datasets (i.e., sample tokens and neighbor tokens)
-
-### `tools/retro/utils.py`
-
-A collection of utility methods. Most importantly, this contains:
-
-- **`def get_gpt_tokenizer()`** : Get the GPT tokenizer.
-- **`def get_bert_tokenizer()`** : Get the Bert tokenizer.
-- **`class GPTToTextDataset`** : Wrapper class that converts GPT (BPE) samples to raw text.
-
-### `tools/bert_embedding`
-
-Generate Bert embeddings. The main files here are:
-
-- **`embed.py`** : Entry point for generating embeddings, and contains the two main embedding classes, `BertEmbedder` and `DiskDataParallelBertEmbedder` (more below). This file contains code for generating Megatron embeddings, while the file below contains code for Huggingface embeddings.
-- **`huggingface.py`** : Used by `embed.py` when the embedder is configured (see below) to output Huggingface embeddings.
-- **`dataset.py`** : Wrapper class for converting a raw-text dataset to Bert (Wordpiece) tokens.
-
-The Bert embeddings can be configured along two axes. The first axis is the output type:
-
-- **`class BertEmbedder`** : This class takes a raw-text dataset as input, generates its embeddings, and returns a Numpy array. The main functions are `embed_text_dataset` (accepts a raw-text dataset) and `embed_text` (accepts a string).
-- **`class DiskDataParallelBertEmbedder`** : This class wraps `BertEmbedder`, and rather than returning a Numpy array, it saves the embeddings to disk. Additionally, this class automatically splits data across data parallel ranks (using interleaving), and also processes data in a specified `block_size` (e.g., 1,000,000).
-
-The second axis is the type of embedding model to use, controlled by the argument `--bert-embedder-type`:
-
-- **`--bert-embedder-type megatron`** : Use Megatron's Bert model. The specific model used is dependent on the loaded checkpoint, vocab file, and tokenizer.
-- **`--bert-embedder-type huggingface`** : Use Huggingface's `bert-large-cased`. (*Note*: Huggingface's inclusion is likely to be deprecated; and there is no ability to configure cased/uncased.)
-
-### Pretraining
-
-- **`pretrain_retro.py`** : Launch script for pretraining Retro. Similar to `pretrain_gpt.py`, except this script handles loading neighbor tokens and setting up the neighbor attention mask.
-<!-- - `megatron/data/gpt_dataset.py` : ? -->
-- **`megatron/model/retro_transformer.py`** : Implementation of Retro model, including the main transformer, the retrieval encoder, and chunked cross-attention layers. Note that currently, `retro_transformer.py` contains several classes that are nearly identical to `transformer.py`, except for 1 or 2 lines, due to code changes that are yet to be integrated.
-- **`tools/retro/pretraining/retro_dataset.py`** : The Retro dataset used for pretraining (not used in preprocessing). Each sample returns the sample tokens, along with neighbor tokens for each chunk within the sample.
 
 
-<!-- ################ arguments ################ -->
-# Arguments
+## Step 1: Build retrieval database
 
-See `tools/retro/main.py`'s `add_retro_args()` and `megatron/arguments.py`'s `_add_retro_args()` for details and descriptions. Here we list some particularly important arguments:
+In this step, we build a large-scale retrieval database for InstructRetro through [Faiss](https://github.com/facebookresearch/faiss) to retrieve from trillions of tokens, and preprocess (and save) the retrieval neighbors for the pretraining step.
 
-- `--retro-workdir` : Mentioned previously, this argument determines the directory in which a set of Retro data is stored (during preprocessing) and loaded (during pretraining). Any change in this directory during preprocessing may result in preprocessing starting over from scratch, and any change before pretraining will result in pretraining throwing an error.
-- Preprocessing
-  - `--retro-gpt-chunk-length` : Retro chunk length (e.g., 64 in original paper).
-  - `--retro-tasks` : Comma-separated list of preprocessing tasks. Generally, the `build` task is the simplest way to run the preprocessing pipeline. For finer control, individual stages can be run by using tasks (in order): `db-build`, `index-build`, and `pretraining-query-neighbors`.
-  - `--retro-index-str` : Faiss index string that defines the index configuration. This will vary based on data size, compute/disk setup, and user needs. For example, this string looks something like `IVF262144_HNSW32,Flat` or `OPQ32_256,IVF4194304_HNSW32,PQ32`.
-- Pretraining
-  - `--retro-add-retriever` : Must be used to select Retro model.
-  - `--retro-num-neighbors` : Number of neighbors to retrieve from the retrieval database (defaults to 2).
-  - `--retro-num-retrieved-chunks` : For each neighbor, the number consecutive chunks to retrieve, including the initial neighbor (defaults to 2).
+Please refer to [tools/retro/build_db.md](tools/retro/build_db.md) for more details.
 
-<!-- ################ pretraining ################ -->
-<!-- # Pretraining -->
-<!-- - New retro args in arguments.py (add_retro_args). -->
-<!-- - Most important arg is `--retro-add-retriever`. -->
+## Step 2: Pretraining
+
+*Please strictly follow Step 1 to build the retrieval database before pretraining to make sure the preprocessed retrieval neighbors match the pretraining corpus.*
+
+In the pretraining step, we support both pretraining from scratch and continued pretraining from a pretrained GPT model.
+
+We provide a template pretraining script to pretrain 843M Retro from scratch. Prepare your own arguments and update our templates in [tools/retro/examples/pretrain_model.sh](tools/retro/examples/pretrain_model.sh). Please note that the data path should be exactly matching the one used in Step 1 to make sure the preprocessed retrieval neighbors match the pretraining corpus.
+
+[//]: # (Take the example of the Wikipedia corpus)
+
+```bash
+bash tools/retro/examples/pretrain_model.sh
+```
+After pretraining, the model checkpoints will be saved in the `--save` directory if you specified the arg in `pretrain_model.sh`.
+
+To continue pretraining with retrieval from a pretrained GPT model, please specify `--load` in `pretrain_model.sh` to load the pretrained GPT model checkpoint (the architecture of GPT, including hidden size, number of layers, and activation methods, should be exactly the same as the one used for Retro). You should also specify  `--no-load-optim --finetune` to make sure the optimizer state is not loaded from the pretrained GPT model and the continued pretraining with retrieval is from a clean start. After the first job / the first run, you will continue pretraining with retrieval from your last checkpoint. In the follow-up jobs, you should launch the pretraining without the flags `--no-load-optim --finetune` to make sure the optimizer state is correctly loaded from your last job.
+
+
+## Step 3: Perplexity evaluation
+
+During pretraining, we will automatically evaluate the model perplexity on the specified validation corpus every `--eval-interval` steps. The validation corpus should be exactly the same as the one used in Step 1 to make sure the preprocessed retrieval neighbors match the pretraining corpus.
+
+To evaluate the perplexity of a pretrained model, please add `--skip-train` in `pretrain_model.sh` to skip the pretraining step and only evaluate the perplexity of the model specified in `--load` on the validation corpus. Run the above command again to evaluate the perplexity of a pretrained model:
+
+```bash
+bash tools/retro/examples/pretrain_model.sh
+```
+
+## Step 4: Instruction tuning
+
+In this step, we fine-tune the pretrained model on the downstream task with instructions. We provide a template instruction tuning script to fine-tune 843M Retro.
+
+We also provide an open-source blend of instruction tuning datasets. The dataset is available to download through [here](https://drive.google.com/file/d/1nzKwwYf8lYb9gN3P4YO8pFNU_B2nMYe1/view?usp=sharing). The blendable dataset consists of the following open-source instruction tuning datasets:
+
+### Instruction Tuning Dataset Breakdown
+| Dataset                                                    | Samples | Epochs | Sampling Prob |
+|------------------------------------------------------------|--------:|-------:|--------------:|
+| [soda](https://arxiv.org/abs/2212.10465)                   |    2560 |  0.005 |         0.020 |
+| [eli5](https://arxiv.org/abs/1907.09190)                   |    2561 |  0.055 |         0.020 |
+| [self_instruct_short](https://arxiv.org/abs/2212.10560)    |    1280 |  0.043 |         0.010 |
+| [self_instruct_long](https://arxiv.org/abs/2212.10560)     |    2560 |  0.333 |         0.020 |
+| [unnatural-instructions](https://arxiv.org/abs/2212.09689) |    2560 |  0.024 |         0.020 |
+| [flan_cot](https://arxiv.org/abs/2210.11416)               |    1280 |  0.093 |         0.010 |
+| [dolly](https://arxiv.org/abs/2305.13735)                  |    6400 |  0.938 |         0.050 |
+| [oasst-skip-noncode](https://open-assistant.io/)           |  104558 |  1.839 |         0.817 |
+| [oasst-skip-code](https://open-assistant.io/)              |    4243 |  1.839 |         0.033 |
+
+Refer to the paper links above for more details about each instruction tuning dataset.
+
+*We note that the provided instruction tuning dataset is all from open-source instruction tuning datasets. It is slightly different from what we use in [InstructRetro](https://arxiv.org/abs/2310.07713), which contains private and proprietary datasets. Thus a 1-2% accuracy difference in downstream tasks may be expected.*  
+
+### Instruction tuning script
+Download the [blended instruction tuning dataset](https://drive.google.com/file/d/1nzKwwYf8lYb9gN3P4YO8pFNU_B2nMYe1/view?usp=sharing) in your data home directory `$DATA_HOME` and update our templates in [tools/retro/sft/sft_retro_lm.sh`](tools/retro/sft/sft_retro_lm.sh).
+
+An example command to run instruction tuning on 843M Retro is as follows:
+```bash
+                                      [blend-dataset-name] [model-size] [batch-size]  [lr]    [checkpoints]
+bash tools/retro/sft/sft_retro_lm.sh       open_inst               843m            128    5e-6  <path/to/pretrained/retro>  
+```
+
+The `blend_dataset_name` argument will blend all the datasets within the `$DATA_HOME` following the weights and configurations specified in the `${blend_dataset_name}.sh` (`open_inst.sh` in the example above).
+The checkpoints will be saved in the `--save` directory. For example, it will be saved to 
+`<SFT_HOME>/checkpoints/applications/retro-sft_pp1_same_format_ctx1_843m_128_5e-6`. 
+
+## Step 5: Downstream task evaluation
+
+In this step, we demonstrate how to run InstructRetro for zero-shot evaluation on downstream question answering (QA) tasks. 
+
+We present an example command to run retro generation given the InstructRetro checkpoints and the Natural Question (NQ) task. The example command is for the 843m InstructRetro obtained in Step 4. Please specify the directory for the NQ dataset and update the command accordingly for other checkpoints.  
+
+```bash
+bash tools/retro/text_generation/retro_generate.sh nq 843m greedy test  0 20000 1000 5 pp1 <SFT_HOME>/checkpoints/applications/retro-sft_pp1_same_format_ctx1_843m_128_5e-6 2
+```
+
+The generated responses will be saved in the corresponding checkpoint directory. For example, for the 843m InstructRetro, it will be saved to 
+`<SFT_HOME>/checkpoints/applications/retro-sft_pp1_same_format_ctx1_843m_128_5e-6/retro-generate-nq_5_2_843m_test_greedy_0_20000_1000.txt`.
+
+To evaluate the F1 / Exact Match (EM) scores of the generated responses, we provide an example script to run the evaluation on the NQ dataset. Please specify the directory for the NQ dataset and update the command accordingly for other checkpoints and downstream tasks.  
+
+```bash
+python3 tools/retro/text_generation/evaluate.py
+```
