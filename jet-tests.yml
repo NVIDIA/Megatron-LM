@@ -65,4 +65,17 @@ jet-functional-results:
     - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $CI_JOB_JWT
   script: 
     - python -m pip install -U --no-cache-dir prettytable
-    - python tests/functional_tests/python_test_utils/jet_check_pipeline_job_statuses.py "ephemeral/${CI_PROJECT_PATH_SLUG}/${CI_PIPELINE_ID}"
+    - python tests/functional_tests/python_test_utils/jet_test_pipeline.py "ephemeral/${CI_PROJECT_PATH_SLUG}/${CI_PIPELINE_ID}" --test exit
+
+jet-compare-metrics:
+  extends: .jet_common
+  tags:
+    - docker_local_runner
+  image: gitlab-master.nvidia.com:5005/dl/jet/api:latest
+  needs: [ jet-functional-results ]
+  when: on_success
+  before_script:
+    - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $CI_JOB_JWT
+  script:
+    - python -m pip install -U --no-cache-dir pytest tensorboard
+    - python tests/functional_tests/python_test_utils/jet_test_pipeline.py "ephemeral/${CI_PROJECT_PATH_SLUG}/${CI_PIPELINE_ID}" --test metrics
