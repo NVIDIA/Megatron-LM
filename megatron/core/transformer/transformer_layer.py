@@ -229,24 +229,4 @@ class TransformerLayer(MegatronModule):
             (0, global_layer_offset, num_layers)
         ]  # PP sharding offset for ShardedTensors
 
-        sharded_state_dict = {}
-
-        for name, module in self._modules.items():
-            if hasattr(module, 'sharded_state_dict'):
-                module_sharded_sd = module.sharded_state_dict(
-                    prefix=f'{state_dict_prefix}{name}.',
-                    sharded_key_prefix=f'{prefix}{name}.',
-                    sharded_offsets=sharded_pp_offset,
-                )
-            else:
-                module_sd = module.state_dict(prefix='', keep_vars=True)
-                module_sharded_sd = make_sharded_tensors_for_checkpoint(
-                    module_sd,
-                    f'{state_dict_prefix}{name}.',
-                    f'{prefix}{name}.',
-                    {},
-                    sharded_pp_offset,
-                )
-            sharded_state_dict.update(module_sharded_sd)
-
-        return sharded_state_dict
+        return self._intermediate_sharded_state_dict(state_dict_prefix, prefix, sharded_pp_offset)

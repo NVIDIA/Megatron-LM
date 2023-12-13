@@ -48,6 +48,10 @@ class MegatronModule(torch.nn.Module):
         return self.state_dict(prefix=prefix, keep_vars=keep_vars)
 
     def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
+        self._intermediate_sharded_state_dict(prefix, sharded_key_prefix, sharded_offsets)
+
+
+    def _intermediate_sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
         """Sharded state dict with Distributed Checkpointing.
 
         General definition of sharded_state_dict tries to call `sharded_state_dict`
