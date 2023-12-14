@@ -106,6 +106,10 @@ class TransformerConfig(ModelParallelConfig):
     fp8_amax_compute_algo: str = "most_recent"
     fp8_wgrad: bool = True
 
+    # cpu offload
+    cpu_offloading: bool = True
+    cpu_offloading_num_layers: int = 1
+
     # miscellaneous
     clone_scatter_output_in_embedding: bool = True
 
@@ -148,6 +152,15 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
             raise ValueError(f'num_moe_experts must be non None to use expert-parallel.')
+
+        if self.cpu_offloading_num_layers < 0 or self.cpu_offloading_num_layers >= self.num_layers:
+            raise ValueError(f'CPU offloading can be done only for layers less than {self.num_layers}')
+
+        if self.cpu_offloading and self.pipeline_model_parallel_size > 1:
+            raise ValueError(f'Currently there is no support for Pipeline parallelism with CPU offloading')
+
+        if self.cpu_offloading and self.recompute_granularity is not None:
+            raise ValueError(f'CPU offloading does not work when activation recomputation is enabled')
 
         if self.recompute_granularity is not None:
             if not self.recompute_granularity in ['full', 'selective']:

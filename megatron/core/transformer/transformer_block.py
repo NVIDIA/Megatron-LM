@@ -17,6 +17,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
+from megatron.core.cpu_offload import get_cpu_offload_context
 
 
 def get_num_layers_to_build(config: TransformerConfig) -> int:
@@ -104,6 +105,11 @@ class TransformerBlock(MegatronModule):
 
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
+
+        self.offload_context, self.group_prefetch_offload_commit_async = get_cpu_offload_context(
+                                                                         self.config.cpu_offloading,
+                                                                         self.config.cpu_offloading_num_layers
+                                                                         )
 
     def _build_layers(self):
         # Transformer layers.
@@ -308,14 +314,19 @@ class TransformerBlock(MegatronModule):
                 )
             else:
                 for layer in self.layers:
-                    hidden_states, context = layer(
-                        hidden_states=hidden_states,
-                        attention_mask=attention_mask,
-                        context=context,
-                        context_mask=context_mask,
-                        rotary_pos_emb=rotary_pos_emb,
-                        inference_params=inference_params,
-                    )
+
+                    with self.offload_context:
+                        hidden_states, context = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            context=context,
+                            context_mask=context_mask,
+                            rotary_pos_emb=rotary_pos_emb,
+                            inference_params=inference_params,
+                        )
+ 
+                    if torch.is_grad_enabled() and self.config.cpu_offloading:
+                       hidden_states = self.group_prefetch_offload_commit_async(hidden_states) 
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
