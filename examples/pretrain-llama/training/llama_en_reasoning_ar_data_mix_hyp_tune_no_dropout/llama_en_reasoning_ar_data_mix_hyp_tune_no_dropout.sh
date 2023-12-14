@@ -27,7 +27,6 @@ TOTAL_NUM_TOKENS=10_000_000_000
 #     --master_port $MASTER_PORT
 # )
 
-
 AR_TOK=$((10 - $ENG_TOK))
 echo "Training with ENG_TOK: $ENG_TOK"
 echo "Training with AR_TOK: $AR_TOK"

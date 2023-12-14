@@ -1,4 +1,4 @@
-for ENG_TOK in 0 1 2 3 4 5 6 7 8 9 10
+for ENG_TOK in 8 9 10
 do
     sed "s/\${{ENG_TOK}}/$ENG_TOK/g" examples/pretrain-llama/training/llama_en_reasoning_ar_data_mix_hyp_tune_no_dropout/llama_en_reasoning_ar_data_mix_hyp_tune_no_dropout.yaml > examples/pretrain-llama/training/llama_en_reasoning_ar_data_mix_hyp_tune_no_dropout/temp.yaml
     cat examples/pretrain-llama/training/llama_en_reasoning_ar_data_mix_hyp_tune_no_dropout/temp.yaml
