@@ -1,8 +1,8 @@
 # Universal Checkpoint examples
 
-This folder contains example scripts that demonstrate how to use Universal Checkpoints to change the number of GPUs when training with ZeRO. With Universal Checkpoints, training can be resumed with a different parallelism degree on any of tensor slicing (TP), pipeline parallelism (PP), and data parallelism (DP). Using universal checkpoints involves the following three steps:
+This folder contains example scripts that demonstrate how to use Universal Checkpoints to change the number of GPUs when training with ZeRO. With Universal Checkpoints, training can be resumed with a different parallelism degree on any of tensor slicing (TP), pipeline parallelism (PP), sequence parallelism (SP) and data parallelism (DP). Using universal checkpoints involves the following three steps:
 
-1. ZeRO-based training run, optionally combining TP and PP, that creates normal ZeRO checkpoints.  
+1. ZeRO-based training run, optionally combining TP and PP or SP, that creates normal ZeRO checkpoints.  
 2. Converting ZeRO checkpoint into the universal format using `ds_to_universal.py` utility of DeepSpeed.
 3. Resuming training with the universal checkpoint, on a different number of GPUs.
 
@@ -55,6 +55,11 @@ This resumption script effects the loading of universal checkpoint rather than t
 
 Please see the corresponding [pull request](https://github.com/microsoft/Megatron-DeepSpeed/pull/276) for visualizations of matching loss values between original and universal checkpoint runs for bf16 and fp16 examples.
 
-## ZeRO stage 2 training (**Coming soon**)
+Combining sequence parallelism with data parallelism is another good use case for universal checkpointing, see [sp pull request](https://github.com/microsoft/DeepSpeed/pull/4752) for example and visualization of matching loss values.
+
+## ZeRO stage 2 training 
+Repeat steps in ZeRO stage 1 training above with the following modifications to your job batch scripts:
+* Set ZERO_STAGE=2 
+* Add `--no-pipeline-parallel` flag to deepspeed options  
 
 ## ZeRO stage 3 training (**Coming soon**)
