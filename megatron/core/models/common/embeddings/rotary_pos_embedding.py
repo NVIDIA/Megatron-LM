@@ -140,6 +140,12 @@ def _rotate_half(x: Tensor) -> Tensor:
     x1, x2 = torch.chunk(x, 2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
 
+def split_odd_even(x: Tensor) -> Tensor:
+    return torch.cat([x[..., ::2], x[..., 1::2]], dim=-1).reshape_as(x)
+
+def merge_odd_even(x: Tensor) -> Tensor:
+    n = x.shape[-1]
+    return torch.stack([x[..., :n//2], x[..., n//2:]], dim=-1).reshape_as(x)
 
 def apply_rotary_pos_emb(t: Tensor, freqs: Tensor) -> Tensor:
     """Apply rotary positional embedding to input tensor T.
@@ -162,6 +168,7 @@ def apply_rotary_pos_emb(t: Tensor, freqs: Tensor) -> Tensor:
     # second part is sine component, need to change signs with _rotate_half method
     cos_ = torch.cos(freqs).to(t.dtype)
     sin_ = torch.sin(freqs).to(t.dtype)
-
+    t = split_odd_even(t)
     t = (t * cos_) + (_rotate_half(t) * sin_)
+    t = merge_odd_even(t)
     return torch.cat((t, t_pass), dim=-1)
