@@ -61,6 +61,7 @@ class BaseMoELayer(ABC, MegatronModule):
         self.local_expert_indices = [
             local_expert_indices_offset + i for i in range(self.num_local_experts)
         ]
+        self.k = 1  # TODO: self.config.top_k
 
     def gather_indices(self, local_indices):
         """ Gather tensors and concatenate along the first dimension."""
@@ -110,14 +111,13 @@ class BaseMoELayer(ABC, MegatronModule):
                 norm_route = self.route_algo(
                     route.detach().to(dtype=torch.float32)
                 )  # explicit fp32 conversion for stability
-                _, max_ind = torch.max(norm_route, dim=1)
+                _, max_ind = torch.topk(norm_route, k=self.k, dim=1)
             route = self.router_activation(route)
-            max_prob = route[torch.arange(route.size(0)), max_ind]
+            # max_ind = max_ind.view(-1)
+            max_prob = torch.gather(route, 1, max_ind)
         else:
             route = self.router_activation(route)
-            max_prob, max_ind = torch.max(route, dim=1)
-
-        self.max_prob = torch.unsqueeze(max_prob, 1)
+            max_prob, max_ind = torch.topk(route, k=self.k, dim=1)
         # [S/TP, B, H] -> [S*B/TP, H]
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
@@ -133,17 +133,24 @@ class BaseMoELayer(ABC, MegatronModule):
             global_local_map = (global_indices >= self.local_expert_indices[0]) & (
                 global_indices <= self.local_expert_indices[-1]
             )
-            global_local_map = torch.squeeze(global_local_map.nonzero())
-            local_indices = torch.index_select(global_indices, 0, global_local_map)
+            local_indices = global_indices[global_local_map]
+            if self.k > 1:  # k > 1
+                global_probs = self.gather_indices(max_prob)
+                local_probs = global_probs[global_local_map]
+            else:
+                local_probs = max_prob
+            global_local_map = torch.squeeze(global_local_map.nonzero()[:, 0])
             local_hidden_states = torch.index_select(global_hidden_states, 0, global_local_map)
         else:
             local_indices = max_ind
+            local_probs = max_prob
             local_hidden_states = hidden_states
             global_local_map = None
+        self.max_prob = local_probs
 
         with torch.no_grad():
             # The indices of local_indices that give its sorted order along dim 0.
-            indices = torch.argsort(local_indices)
+            indices = torch.argsort(local_indices, dim=0)
             tokens_per_expert = torch.histc(
                 local_indices,
                 bins=self.num_local_experts,
@@ -153,7 +160,7 @@ class BaseMoELayer(ABC, MegatronModule):
             tokens_per_expert = tokens_per_expert.cpu().to(torch.long)
 
         # Stage2: permute the tokens locally so that they are grouped by their expert assignment
-        permuted_local_hidden_states = torch.index_select(local_hidden_states, 0, indices)
+        permuted_local_hidden_states = torch.index_select(local_hidden_states, 0, indices.view(-1))
 
         return permuted_local_hidden_states, tokens_per_expert, indices, global_local_map
 
@@ -181,9 +188,12 @@ class BaseMoELayer(ABC, MegatronModule):
         # Stage1: unpermute the tokens and bias locally respectively.
         unpermuted_local_hidden = torch.zeros_like(hidden_states)
         # Reshape global_local_map to be compatible with Tensor.scatter
-        indices = torch.unsqueeze(indices, 1).expand(-1, hidden_states.shape[-1])
+        indices = indices.view(-1, 1).expand(-1, hidden_states.shape[1])
         assert indices.shape == hidden_states.shape
         unpermuted_local_hidden = unpermuted_local_hidden.scatter(0, indices, hidden_states)
+        # Scale the expert output prior to reduction and subsequent to local unpermutation if k > 1.
+        if self.k > 1:
+            unpermuted_local_hidden = unpermuted_local_hidden * self.max_prob.view(-1, 1)
 
         unpermuted_local_bias = None
         if self.add_bias:
@@ -191,6 +201,8 @@ class BaseMoELayer(ABC, MegatronModule):
             unpermuted_local_bias = torch.zeros_like(hidden_states)
             assert indices.shape == bias.shape
             unpermuted_local_bias = unpermuted_local_bias.scatter(0, indices, bias)
+            if self.k > 1:
+                unpermuted_local_bias = unpermuted_local_bias * self.max_prob.view(-1, 1)
 
         output_total = unpermuted_local_hidden
         output_bias_total = unpermuted_local_bias
@@ -208,7 +220,7 @@ class BaseMoELayer(ABC, MegatronModule):
             # Reshape global_local_map to be compatible with Tensor.scatter
             global_local_map = global_local_map.unsqueeze(1).expand(-1, hidden_states.shape[-1])
             assert global_local_map.shape == unpermuted_local_hidden.shape
-            unpermuted_global_hidden = unpermuted_global_hidden.scatter(
+            unpermuted_global_hidden = unpermuted_global_hidden.scatter_add(
                 0, global_local_map, unpermuted_local_hidden
             )
             output_total = tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
@@ -217,7 +229,7 @@ class BaseMoELayer(ABC, MegatronModule):
             if self.add_bias:
                 # Unpermute the bias across expert parallel devices.
                 unpermuted_global_bias = torch.zeros_like(unpermuted_global_hidden)
-                unpermuted_global_bias = unpermuted_global_bias.scatter(
+                unpermuted_global_bias = unpermuted_global_bias.scatter_add(
                     0, global_local_map, unpermuted_local_bias
                 )
                 output_bias_total = tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
@@ -228,12 +240,12 @@ class BaseMoELayer(ABC, MegatronModule):
                 output_bias_total = (
                     output_bias_total / parallel_state.get_tensor_model_parallel_world_size()
                 )
-
-        output_total = output_total * self.max_prob
+        if self.k == 1:
+            output_total = output_total * self.max_prob.view(-1, 1)
         output_total = output_total.view(self.hidden_shape)
         if self.add_bias:
             assert output_bias_total is not None
-            output_bias_total = output_bias_total * self.max_prob
+            output_bias_total = output_bias_total * self.max_prob.view(-1, 1)
             output_bias_total = output_bias_total.view(self.hidden_shape)
         else:
             output_bias_total = None
