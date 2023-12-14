@@ -4,32 +4,28 @@ import numpy as np
 import torch
 
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-from .base_moe_layer import BaseMoELayer
 
-
-class SwitchMLP(BaseMoELayer):
+class SwitchMLP(MegatronModule):
     """
     Top-1 Mixture of Experts Layer. Routes input to one of N MLP "experts"
     Curently supports Sinkhorn based expert routing.
     """
 
-    def __init__(self, config: TransformerConfig, submodules: MLPSubmodules):
+    def __init__(self, num_local_experts, config: TransformerConfig, submodules: MLPSubmodules):
         super().__init__(config=config)
-
+        self.add_bias = config.add_bias_linear
+        self.num_local_experts = num_local_experts
         self.local_experts = torch.nn.ModuleList()
         for _ in range(self.num_local_experts):
             expert = MLP(self.config, submodules, is_expert=True)
             self.local_experts.append(expert)
 
-    def forward(self, hidden_states):
-        (
-            permuted_local_hidden_states,
-            tokens_per_expert,
-            indices,
-            global_local_map,
-        ) = self.token_permutation(hidden_states)
+    def forward(self, permuted_local_hidden_states, tokens_per_expert):
+        # global_hidden_states, global_indices = self.token_permutation(hidden_states)
+        # permuted_local_hidden_states, tokens_per_expert = self.token_permutation(hidden_states)
 
         output_local = torch.zeros_like(permuted_local_hidden_states)
         output_bias_local = None
@@ -52,8 +48,6 @@ class SwitchMLP(BaseMoELayer):
                 output_bias_local[start:end, :] = output_bias
 
         # Un-permutation of tokens.
-        output_total, output_bias_total = self.token_unpermutation(
-            output_local, indices, global_local_map, output_bias_local
-        )
+        # output_total, output_bias_total = self.token_unpermutation(output_local, output_bias_local)
 
-        return output_total, output_bias_total
+        return output_local, output_bias_local

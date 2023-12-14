@@ -36,6 +36,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_autoresume_args(parser)
     parser = _add_biencoder_args(parser)
     parser = _add_vision_args(parser)
+    parser = _add_moe_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_inference_args(parser)
     parser = _add_transformer_engine_args(parser)
@@ -653,14 +654,6 @@ def _add_network_size_args(parser):
     group.add_argument('--bert-no-binary-head', action='store_false',
                        help='Disable BERT binary head.',
                        dest='bert_binary_head')
-    group.add_argument('--num-experts', type=int, default=None,
-                       help='Number of Experts in Switch Transformer (None means no Switch)')
-    group.add_argument('--moe-grouped-gemm', action='store_true',
-                       help='When there are multiple experts per rank, compress '
-                       'multiple local (potentially small) gemms in a single kernel '
-                       'launch to improve the utilization and performance by '
-                       'leveraging the Grouped GEMM feature introduced since '
-                       'CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).')
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
                        help='Untie embeddings and output weights.'),
     return parser
@@ -1411,6 +1404,28 @@ def _add_vision_args(parser):
                        help='teacher temperature')
     group.add_argument('--dino-warmup-teacher-temp-epochs', type=int, default=30,
                        help='warmup teacher temperaure epochs')
+
+    return parser
+
+def _add_moe_args(parser):
+    group = parser.add_argument_group(title="moe")
+
+    # general moe arguements
+    group.add_argument('--num-experts', type=int, default=None,
+                       help='Number of Experts in MoE (None means no MoE)')
+    group.add_argument('--moe-grouped-gemm', action='store_true',
+                       help='When there are multiple experts per rank, compress '
+                       'multiple local (potentially small) gemms in a single kernel '
+                       'launch to improve the utilization and performance by '
+                       'leveraging the Grouped GEMM feature introduced since '
+                       'CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).')
+    group.add_argument('--moe-loss-coeff', type=float, default=0.01,
+                       help='Scaling coefficient for adding MoE loss to model loss')
+    group.add_argument('--moe-router-type', type=str, default='top1',
+                       help='Options for router type, support top1 and ec')
+    # zero token drop moe arguments
+    
+    # token drop moe arugments
 
     return parser
 

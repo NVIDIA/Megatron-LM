@@ -9,6 +9,7 @@ from torch.autograd.variable import Variable
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import p2p_communication
+from megatron.core.transformer.moe.base_moe_layer import MoEAuxLossAutoScaler
 from megatron.core.utils import get_attr_wrapped_model, get_model_config, get_model_type
 
 # Types
@@ -206,6 +207,11 @@ def forward_step(
 
     if config.timers is not None:
         config.timers('forward-compute').stop()
+
+    # set loss scale for the auxiliary loss of MoE layer
+    if config.num_moe_experts is not None:
+        loss_scale = config.grad_scale_func(1.0) if config.grad_scale_func is not None else 1.0
+        MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
 
     # If T5 model (or other model with encoder and decoder)
     # and in decoder stack, then send encoder_hidden_state

@@ -14,8 +14,7 @@ from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
-from megatron.core.transformer.moe.grouped_mlp import GroupedMLP
-from megatron.core.transformer.moe.switch_mlp import SwitchMLP
+from megatron.core.transformer.moe.moe_layer import GroupedGemmMoELayer, SwitchMLPLayer
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
@@ -92,11 +91,11 @@ def _get_mlp_module_spec(
         )
     elif moe_grouped_gemm:
         # GroupedMLP based MoE with modules in megatron core.
-        return GroupedMLP
+        return GroupedGemmMoELayer
     else:
         # SwitchMLP based MoE with modules in megatron core.
         return ModuleSpec(
-            module=SwitchMLP,
+            module=SwitchMLPLayer,
             submodules=MLPSubmodules(
                 linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear,
             ),

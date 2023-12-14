@@ -9,21 +9,21 @@ from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_gpu,
 )
 from megatron.core.tensor_parallel.utils import divide
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-from .base_moe_layer import BaseMoELayer
 
-
-class GroupedMLP(BaseMoELayer):
+class GroupedMLP(MegatronModule):
     """
     Top-1 Mixture of Experts Layer with Grouped GEMM. Routes input to one of N MLP "experts"
     Curently supports Sinkhorn based expert routing.
     """
 
-    def __init__(self, config: TransformerConfig):
+    def __init__(self, num_local_experts: int, config: TransformerConfig):
         super().__init__(config=config)
         self.config: TransformerConfig = config
+        self.num_local_experts = num_local_experts
 
         gg.assert_grouped_gemm_is_available()
         assert (
@@ -125,14 +125,9 @@ class GroupedMLP(BaseMoELayer):
         setattr(self.weight1, 'allreduce', not self.expert_parallel)
         setattr(self.weight2, 'allreduce', not self.expert_parallel)
 
-    def forward(self, hidden_states):
+    def forward(self, permuted_local_hidden_states, tokens_per_expert):
         # Permutation of tokens
-        (
-            permuted_local_hidden_states,
-            tokens_per_expert,
-            indices,
-            global_local_map,
-        ) = self.token_permutation(hidden_states)
+        # permuted_local_hidden_states, tokens_per_expert = self.token_permutation(hidden_states)
 
         # Reshape the weights for the grouped GEMMs.
         w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
@@ -145,6 +140,6 @@ class GroupedMLP(BaseMoELayer):
         fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
 
         # Un-permutation of tokens.
-        output_total, _ = self.token_unpermutation(fc2_output, indices, global_local_map)
+        # output_total, _ = self.token_unpermutation(fc2_output)
 
-        return output_total, None
+        return fc2_output, None
