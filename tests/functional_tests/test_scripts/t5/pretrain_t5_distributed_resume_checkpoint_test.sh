@@ -58,7 +58,7 @@ pip install pydantic==2.2.1
 # Runs the "220M" parameter model
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 
-# Run for 1000 iterations and save checkpoint at 500
+# Run for 100 iterations and save checkpoint at 50
 torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     pretrain_t5.py \
     --encoder-num-layers 12 \
@@ -75,7 +75,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --micro-batch-size ${MBS:-4} \
     --global-batch-size ${GBS:-32} \
     --lr 0.0001 \
-    --train-iters 1000 \
+    --train-iters 100 \
     --lr-decay-iters $MAX_STEPS \
     --lr-decay-style linear \
     --min-lr 0.00001 \
@@ -93,9 +93,14 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --split 99982,9,9 \
     --save $CHECKPOINT_PATH \
     --load $CHECKPOINT_PATH \
-    --log-interval 100 \
     --tensorboard-dir ${TENSORBOARD_DIR} \
-    --save-interval 500 \
+    --log-params-norm \
+    --log-num-zeros-in-grad \
+    --log-validation-ppl-to-tensorboard \
+    --log-timers-to-tensorboard \
+    --timing-log-level 2 \
+    --log-interval 1 \
+    --save-interval 50 \
     --eval-interval 1000 \
     --eval-iters 10 \
     --distributed-backend nccl \
@@ -108,7 +113,7 @@ echo "--------------------------------------------------------------------------
 echo "$command1" >> $SCRIPTS_DIR/pretrain_t5_distributed_command.sh
 eval $command1
 
-echo 500 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt
+echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt
 
 # Resume from 50th iteration ckpt and continue to 100 iterations
 torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
@@ -127,7 +132,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --micro-batch-size ${MBS:-4} \
     --global-batch-size ${GBS:-32} \
     --lr 0.0001 \
-    --train-iters 1000 \
+    --train-iters 100 \
     --lr-decay-iters $MAX_STEPS \
     --lr-decay-style linear \
     --min-lr 0.00001 \
@@ -145,9 +150,14 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --split 99982,9,9 \
     --save $CHECKPOINT_PATH \
     --load $CHECKPOINT_PATH \
-    --log-interval 100 \
     --tensorboard-dir ${TENSORBOARD_DIR} \
-    --save-interval 500 \
+    --log-params-norm \
+    --log-num-zeros-in-grad \
+    --log-validation-ppl-to-tensorboard \
+    --log-timers-to-tensorboard \
+    --timing-log-level 2 \
+    --log-interval 1 \
+    --save-interval 50 \
     --eval-interval 1000 \
     --eval-iters 10 \
     --distributed-backend nccl \

@@ -29,9 +29,9 @@ The following applies to all files unless otherwise noted:
 --
 
 This repository also contains code from Hugging Face Inc., Google Research,
-Facebook (from their Fairseq and Dino projects), Microsoft(from their 
-Swin-Transformer project)and Philip Popien. Files from these 
-organizations have notices at  the top of each file. Below are 
+Facebook (from their Fairseq, Dino, and ParlAI projects), Microsoft (from their
+Swin-Transformer project) and Philip Popien. Files from these
+organizations have notices at the top of each file. Below are
 licenses used in those files, as indicated.
 
 
@@ -240,7 +240,7 @@ licenses used in those files, as indicated.
    See the License for the specific language governing permissions and
    limitations under the License.
 
-------------- LICENSE FOR Facebook Fairseq code --------------
+------------- LICENSE FOR various code from Facebook --------------
 
 MIT License
 
