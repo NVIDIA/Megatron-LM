@@ -803,24 +803,27 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                     loaded_state["per_bucket_numel"][model_idx][dtype][bucket_idx]
                                 numel = self.per_bucket_numel[model_idx][dtype][bucket_idx]
                                 numel_unpadded = self.per_bucket_numel_unpadded[model_idx][dtype][bucket_idx]
-                                print(f"numel_in_checkpoint={numel_in_checkpoint}, numel={numel}, numel_unpadded={numel_unpadded}")
                                 assert world_tensor.numel() == numel_in_checkpoint
                                 assert numel_unpadded <= world_tensor.numel(), \
                                     ("True number of elements should be fewer than number of elements in "
                                      "checkpoint tensor")
-                                if world_tensor.numel() >= numel:
+                                if world_tensor.numel() > numel:
                                     # Truncate extra values, which are padding anyway.
+                                    print_rank_0(f"Truncating extra values from checkpoint (numel_in_checkpoint={numel_in_checkpoint}, "
+                                                 f"numel={numel}, numel_unpadded={numel_unpadded})")
                                     world_tensor = world_tensor[:numel]
-                                else:
+                                elif world_tensor.numel() < numel:
                                     # In this case, numel > world_tensor.numel() (which is numel_in_checkpoint).
                                     # Create new tensor with right number of values, then copy and use new tensor.
+                                    print_rank_0(f"Expanding tensor from checkpoint (numel_in_checkpoint={numel_in_checkpoint}, "
+                                                 f"numel={numel}, numel_unpadded={numel_unpadded})")
                                     world_tensor_reshaped = torch.empty((numel,),
                                                                         dtype=world_tensor.dtype,
                                                                         device=world_tensor.device)
                                     world_tensor_reshaped[:numel_in_checkpoint].copy_(world_tensor)
                                     world_tensor = world_tensor_reshaped
                             else:
-                                print("***WARNING*** Using older checkpoint so skipping padding checks")
+                                print_rank_0("***WARNING*** Using older checkpoint so skipping padding checks")
                             gbuf_start_idxs = \
                                 list(range(0, gbuf_world_numel, gbuf_local_numel))
                             send_tensors = [world_tensor[i:(i+gbuf_local_numel)]
