@@ -98,7 +98,7 @@ class BaseMoELayer(ABC, MegatronModule):
             tokens_per_expert: the number of tokens each local expert to process.
             indices: The indices of `local_indices` (which holds the un-sorted expert
             indices of tokens that local expert can process) that give its sorted order along dim 0.
-            global_local_map (optional): A mask of mapping between global and local tokens where each
+            global_local_map (optional): 2D tensor. A mask of mapping between global and local tokens where each
             element is True if it's between the local_expert_indices. Only useful
             when cross device token permutation is enabled and **AllGahter** is performed.
         """
@@ -127,20 +127,23 @@ class BaseMoELayer(ABC, MegatronModule):
             global_hidden_states = tensor_parallel.gather_from_sequence_parallel_region_to_moe(
                 hidden_states
             )
-            global_indices = self.gather_indices(max_ind)
-            # Create a mask of mapping between global and local tokens where each
-            # element is True if it's between the local_expert_indices
-            global_local_map = (global_indices >= self.local_expert_indices[0]) & (
-                global_indices <= self.local_expert_indices[-1]
-            )
-            local_indices = global_indices[global_local_map]
-            if self.k > 1:  # k > 1
-                global_probs = self.gather_indices(max_prob)
-                local_probs = global_probs[global_local_map]
-            else:
-                local_probs = max_prob
-            global_local_map = torch.squeeze(global_local_map.nonzero()[:, 0])
-            local_hidden_states = torch.index_select(global_hidden_states, 0, global_local_map)
+            with torch.no_grad():
+                global_indices = self.gather_indices(max_ind)
+                # Create a mask of mapping between global and local tokens where each
+                # element is True if it's between the local_expert_indices
+                global_local_map = (global_indices >= self.local_expert_indices[0]) & (
+                    global_indices <= self.local_expert_indices[-1]
+                )
+                local_indices = global_indices[global_local_map]
+                if self.k > 1:  # k > 1
+                    global_probs = self.gather_indices(max_prob)
+                    local_probs = global_probs[global_local_map]
+                else:
+                    local_probs = max_prob
+                # Reshape global_local_map to be compatible with Tensor.gather
+                global_local_map = global_local_map.nonzero()[:, 0]
+                global_local_map = global_local_map.view(-1, 1).expand(-1, hidden_states.shape[-1])
+            local_hidden_states = torch.gather(global_hidden_states, 0, global_local_map)
         else:
             local_indices = max_ind
             local_probs = max_prob
@@ -161,7 +164,10 @@ class BaseMoELayer(ABC, MegatronModule):
 
         # Stage2: permute the tokens locally so that they are grouped by their expert assignment
         permuted_local_hidden_states = torch.index_select(local_hidden_states, 0, indices.view(-1))
+        # Reshape indices to be compatible with Tensor.gather
+        indices = indices.view(-1, 1).expand(-1, hidden_states.shape[-1])
 
+        permuted_local_hidden_states = torch.gather(local_hidden_states, 0, indices)
         return permuted_local_hidden_states, tokens_per_expert, indices, global_local_map
 
     def token_unpermutation(self, hidden_states, indices, global_local_map=None, bias=None):
@@ -172,9 +178,9 @@ class BaseMoELayer(ABC, MegatronModule):
         Args:
             hidden_states: 2D tensor of shape [sum_tokens_of_all_local_experts, HiddenSize],
             ouput of local experts.
-            indices: 1D tensor of the indices of `local_indices` (which holds the un-sorted expert
+            indices: 2D tensor of the indices of `local_indices` (which holds the un-sorted expert
             indices of tokens that local expert can process) that give its sorted order along dim 0.
-            global_local_map (optional): 1D tensor, a mask of mapping between global and local tokens where each
+            global_local_map (optional): 2D tensor, a mask of mapping between global and local tokens where each
             element is True if it's between the local_expert_indices. Only useful
             when cross device token permutation is enabled and **AllGahter** is performed.
             bias: bias if self.add_bias is enabled.
@@ -187,10 +193,9 @@ class BaseMoELayer(ABC, MegatronModule):
         """
         # Stage1: unpermute the tokens and bias locally respectively.
         unpermuted_local_hidden = torch.zeros_like(hidden_states)
-        # Reshape global_local_map to be compatible with Tensor.scatter
-        indices = indices.view(-1, 1).expand(-1, hidden_states.shape[1])
         assert indices.shape == hidden_states.shape
         unpermuted_local_hidden = unpermuted_local_hidden.scatter(0, indices, hidden_states)
+
         # Scale the expert output prior to reduction and subsequent to local unpermutation if k > 1.
         if self.k > 1:
             unpermuted_local_hidden = unpermuted_local_hidden * self.max_prob.view(-1, 1)
@@ -218,7 +223,6 @@ class BaseMoELayer(ABC, MegatronModule):
                 global_hidden_shape, dtype=hidden_states.dtype, device=torch.cuda.current_device()
             )
             # Reshape global_local_map to be compatible with Tensor.scatter
-            global_local_map = global_local_map.unsqueeze(1).expand(-1, hidden_states.shape[-1])
             assert global_local_map.shape == unpermuted_local_hidden.shape
             unpermuted_global_hidden = unpermuted_global_hidden.scatter_add(
                 0, global_local_map, unpermuted_local_hidden
@@ -245,7 +249,8 @@ class BaseMoELayer(ABC, MegatronModule):
         output_total = output_total.view(self.hidden_shape)
         if self.add_bias:
             assert output_bias_total is not None
-            output_bias_total = output_bias_total * self.max_prob.view(-1, 1)
+            if self.k == 1:
+                output_bias_total = output_bias_total * self.max_prob.view(-1, 1)
             output_bias_total = output_bias_total.view(self.hidden_shape)
         else:
             output_bias_total = None
