@@ -63,7 +63,7 @@ class MegatronModule(torch.nn.Module):
 
         Args:
             prefix (str): prefix for the state dict keys
-            sharded_offsets (Iterable[Tuple[int, int, int]], optional): sharding already
+            sharded_offsets (Tuple[Tuple[int, int, int]], optional): sharding already
                 applied (e.g. PP related) by sup-modules. Passed along to ShardedTensor
 
         Returns:
@@ -164,10 +164,7 @@ class Float16Module(MegatronModule):
         return self.module.state_dict_for_save_checkpoint(prefix=prefix, keep_vars=keep_vars)
 
     def sharded_state_dict(self, prefix='', *args, **kwargs):
-        """Retrieve state_dict from the module being wrapped.
-
-        When using distributed checkpointing, keep_vars must always be set to True.
-        """
+        """Retrieve sharded_state_dict from the module being wrapped."""
         return self.module.sharded_state_dict(prefix, *args, **kwargs)
 
     def load_state_dict(self, state_dict, strict=True):

@@ -333,12 +333,8 @@ class T5Model(LanguageModule):
             return self.lm_head.output_layer.weight
         return None
 
-    def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: Tuple[Tuple[int, int, int]] = ()
-    ) -> ShardedStateDict:
-        assert (
-            not sharded_offsets
-        ), "We don't expect any sharded offsets at this level of model hierarchy"
+    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()) -> ShardedStateDict:
+        assert not sharded_offsets, "Unexpected sharded offsets"
         sharded_state_dict = {}
 
         if self.pre_process:

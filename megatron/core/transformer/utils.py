@@ -157,7 +157,7 @@ def sharded_state_dict_default(
     Args:
         module (torch.nn.Module): module which sharded state dict we want to obtain
         prefix (str): prefix for the state dict keys
-        sharded_offsets (Iterable[Tuple[int, int, int]], optional): sharding already
+        sharded_offsets (Tuple[Tuple[int, int, int]], optional): sharding already
             applied (e.g. PP related) by sup-modules. Passed along to ShardedTensor
 
     Returns:

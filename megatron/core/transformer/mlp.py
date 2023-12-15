@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict, ShardedTensorFactory
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -106,7 +106,7 @@ class MLP(MegatronModule):
 
         return output, output_bias
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=()):
+    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()) -> ShardedStateDict:
         sharded_state_dict = {}
         for name, module in self._modules.items():
             if name == 'linear_fc1' and self.config.gated_linear_unit:
