@@ -52,7 +52,7 @@ def replace_prefix_for_sharding(
         if isinstance(x, (ShardedTensor, ShardedTensorFactory, ShardedObject)):
             if not x.key.startswith(old_prefix):
                 raise ValueError(f'Expected {x.key} to begin with prefix {old_prefix}')
-            x.key = f'{new_prefix}{x.key.removeprefix(old_prefix)}'
+            x.key = f'{new_prefix}{x.key[len(old_prefix):]}'  # str.removeprefix in Python >= 3.9
         return x
 
     dict_list_map_inplace(replace_prefix, sharded_state_dict)
