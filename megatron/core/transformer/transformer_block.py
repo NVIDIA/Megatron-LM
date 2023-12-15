@@ -3,7 +3,7 @@
 import re
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Union, Tuple
+from typing import List, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -326,8 +326,12 @@ class TransformerBlock(MegatronModule):
 
         return hidden_states
 
-    def sharded_state_dict(self, prefix: str = '', sharded_offsets: Tuple[Tuple[int, int, int]] = ()) -> ShardedStateDict:
-        assert not sharded_offsets, "We don't expect any sharded offsets at this level of model hierarchy"
+    def sharded_state_dict(
+        self, prefix: str = '', sharded_offsets: Tuple[Tuple[int, int, int]] = ()
+    ) -> ShardedStateDict:
+        assert (
+            not sharded_offsets
+        ), "We don't expect any sharded offsets at this level of model hierarchy"
         sharded_state_dict = {}
 
         layer_prefix = f'{prefix}layers.'
@@ -336,19 +340,21 @@ class TransformerBlock(MegatronModule):
             offset = layer._get_layer_offset()
 
             global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
-            state_dict_prefix = (
-                f'{layer_prefix}{global_layer_offset - offset}.'  # module list index in TransformerBlock
-            )
+            state_dict_prefix = f'{layer_prefix}{global_layer_offset - offset}.'  # module list index in TransformerBlock
             sharded_pp_offset = [
                 (0, global_layer_offset, num_layers)
             ]  # PP sharding offset for ShardedTensors
-            layer_sharded_state_dict = layer.sharded_state_dict(prefix=state_dict_prefix, sharded_offsets=sharded_pp_offset)
+            layer_sharded_state_dict = layer.sharded_state_dict(
+                prefix=state_dict_prefix, sharded_offsets=sharded_pp_offset
+            )
             replace_prefix_for_sharding(layer_sharded_state_dict, state_dict_prefix, layer_prefix)
             sharded_state_dict.update(layer_sharded_state_dict)
 
         # Add modules other than self.layers
         for name, module in self.named_children():
             if not module is self.layers:
-                sharded_state_dict.update(sharded_state_dict_default(module, f'{prefix}{name}.', sharded_offsets))
+                sharded_state_dict.update(
+                    sharded_state_dict_default(module, f'{prefix}{name}.', sharded_offsets)
+                )
 
         return sharded_state_dict

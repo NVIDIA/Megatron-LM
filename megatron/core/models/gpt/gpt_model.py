@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-from typing import Literal, Optional, Union, Tuple
+from typing import Literal, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -189,8 +189,12 @@ class GPTModel(LanguageModule):
 
         return loss
 
-    def sharded_state_dict(self, prefix: str = '', sharded_offsets: Tuple[Tuple[int, int, int]] = ()) -> ShardedStateDict:
-        assert not sharded_offsets, "We don't expect any sharded offsets at this level of model hierarchy"
+    def sharded_state_dict(
+        self, prefix: str = '', sharded_offsets: Tuple[Tuple[int, int, int]] = ()
+    ) -> ShardedStateDict:
+        assert (
+            not sharded_offsets
+        ), "We don't expect any sharded offsets at this level of model hierarchy"
         sharded_state_dict = {}
 
         if self.pre_process:

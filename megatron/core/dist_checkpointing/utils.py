@@ -5,10 +5,11 @@ from typing import Tuple
 from .dict_utils import dict_list_map_inplace, extract_matching_values
 from .mapping import (
     LocalNonpersitentObject,
+    ShardedObject,
     ShardedStateDict,
     ShardedTensor,
     ShardedTensorFactory,
-    StateDict, ShardedObject,
+    StateDict,
 )
 
 
@@ -44,7 +45,9 @@ def add_prefix_for_sharding(sharded_state_dict: ShardedStateDict, prefix: str):
     dict_list_map_inplace(add_prefix, sharded_state_dict)
 
 
-def replace_prefix_for_sharding(sharded_state_dict: ShardedStateDict, old_prefix: str, new_prefix: str):
+def replace_prefix_for_sharding(
+    sharded_state_dict: ShardedStateDict, old_prefix: str, new_prefix: str
+):
     def replace_prefix(x):
         if isinstance(x, (ShardedTensor, ShardedTensorFactory, ShardedObject)):
             if not x.key.startswith(old_prefix):

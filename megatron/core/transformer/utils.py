@@ -2,13 +2,12 @@
 
 """Utilities for transformer layers."""
 from operator import itemgetter
-from typing import Any, Dict, Iterable, Optional, Tuple, Union, Iterator
+from typing import Any, Dict, Iterable, Iterator, Optional, Tuple, Union
 
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing.mapping import ShardedObject, StateDict, \
-    ShardedStateDict
+from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict, StateDict
 from megatron.core.utils import (
     make_sharded_tensor_for_checkpoint,
     make_tp_sharded_tensor_for_checkpoint,
@@ -144,7 +143,9 @@ def _get_extra_state_offsets(
     return extra_state_shape, extra_state_offset
 
 
-def sharded_state_dict_default(module: torch.nn.Module, prefix: str = '', sharded_offsets: Tuple[Tuple[int, int, int]] = ()) -> ShardedStateDict:
+def sharded_state_dict_default(
+    module: torch.nn.Module, prefix: str = '', sharded_offsets: Tuple[Tuple[int, int, int]] = ()
+) -> ShardedStateDict:
     """Provides implementation for sharded_state_dict method for non-MegatronModules.
 
     Tries to call `module.sharded_state_dict` when possible,
@@ -165,15 +166,11 @@ def sharded_state_dict_default(module: torch.nn.Module, prefix: str = '', sharde
 
     if hasattr(module, 'sharded_state_dict'):
         module_sharded_sd = module.sharded_state_dict(
-            prefix=prefix,
-            sharded_offsets=sharded_offsets,
+            prefix=prefix, sharded_offsets=sharded_offsets,
         )
     else:
         module_sd = module.state_dict(prefix='', keep_vars=True)
         module_sharded_sd = make_sharded_tensors_for_checkpoint(
-            module_sd,
-            prefix,
-            {},
-            sharded_offsets,
+            module_sd, prefix, {}, sharded_offsets,
         )
     return module_sharded_sd

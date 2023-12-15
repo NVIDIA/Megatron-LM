@@ -9,8 +9,10 @@ from torch.nn.parameter import Parameter
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint, \
-    sharded_state_dict_default
+from megatron.core.transformer.utils import (
+    make_sharded_tensors_for_checkpoint,
+    sharded_state_dict_default,
+)
 
 _FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
 _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
@@ -50,7 +52,9 @@ class MegatronModule(torch.nn.Module):
 
         return self.state_dict(prefix=prefix, keep_vars=keep_vars)
 
-    def sharded_state_dict(self, prefix: str = '', sharded_offsets: Tuple[Tuple[int, int, int]] = ()) -> ShardedStateDict:
+    def sharded_state_dict(
+        self, prefix: str = '', sharded_offsets: Tuple[Tuple[int, int, int]] = ()
+    ) -> ShardedStateDict:
         """Default implementation for sharded state dict for distributed checkpointing.
 
         General definition of sharded_state_dict simply calls `sharded_state_dict_default`
@@ -67,7 +71,9 @@ class MegatronModule(torch.nn.Module):
         """
         sharded_state_dict = {}
         for name, module in self.named_children():
-            sharded_state_dict.update(sharded_state_dict_default(module, f'{prefix}{name}.', sharded_offsets))
+            sharded_state_dict.update(
+                sharded_state_dict_default(module, f'{prefix}{name}.', sharded_offsets)
+            )
         return sharded_state_dict
 
 

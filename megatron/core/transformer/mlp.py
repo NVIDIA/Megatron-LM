@@ -110,13 +110,10 @@ class MLP(MegatronModule):
         sharded_state_dict = {}
         for name, module in self._modules.items():
             if name == 'linear_fc1' and self.config.gated_linear_unit:
-                sub_sd = self._sharded_state_dict_for_glu(
-                    name, module, prefix, sharded_offsets
-                )
+                sub_sd = self._sharded_state_dict_for_glu(name, module, prefix, sharded_offsets)
             else:
                 sub_sd = module.sharded_state_dict(
-                    prefix=f'{prefix}{name}.',
-                    sharded_offsets=sharded_offsets,
+                    prefix=f'{prefix}{name}.', sharded_offsets=sharded_offsets,
                 )
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
@@ -130,8 +127,7 @@ class MLP(MegatronModule):
     ):
         assert module_name == 'linear_fc1', module_name
         sharded_state_dict = module.sharded_state_dict(
-            prefix=f'{prefix}{module_name}.',
-            sharded_offsets=sharded_offsets,
+            prefix=f'{prefix}{module_name}.', sharded_offsets=sharded_offsets,
         )
         weight_key = f'{prefix}{module_name}.weight'
         prev_sh_ten = sharded_state_dict[weight_key]

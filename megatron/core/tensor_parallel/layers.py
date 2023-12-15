@@ -21,9 +21,10 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from ..dist_checkpointing.mapping import ShardedStateDict
 
+from ..dist_checkpointing.mapping import ShardedStateDict
 from ..transformer.utils import make_sharded_tensors_for_checkpoint
+from ..utils import make_tp_sharded_tensor_for_checkpoint
 from .mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
@@ -34,7 +35,6 @@ from .mappings import (
 )
 from .random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from .utils import VocabUtility, divide, split_tensor_along_last_dim
-from ..utils import make_tp_sharded_tensor_for_checkpoint
 
 _grad_accum_fusion_available = True
 try:
@@ -225,7 +225,9 @@ class VocabParallelEmbedding(torch.nn.Module):
         output = reduce_from_tensor_model_parallel_region(output_parallel)
         return output
 
-    def sharded_state_dict(self, prefix: str = '', sharded_offsets: Tuple[Tuple[int, int, int]] = ()) -> ShardedStateDict:
+    def sharded_state_dict(
+        self, prefix: str = '', sharded_offsets: Tuple[Tuple[int, int, int]] = ()
+    ) -> ShardedStateDict:
         """ Non-default implementation for embeddings due to `allow_shape_mismatch` param """
         state_dict = self.state_dict(prefix='', keep_vars=True)
 
@@ -235,7 +237,7 @@ class VocabParallelEmbedding(torch.nn.Module):
                 tensor=state_dict['weight'],
                 key=weight_prefix,
                 allow_shape_mismatch=True,
-                prepend_offsets=sharded_offsets
+                prepend_offsets=sharded_offsets,
             )
         }
 
