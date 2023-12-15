@@ -1,12 +1,13 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Tuple
 
 import torch
 from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
@@ -332,7 +333,8 @@ class T5Model(LanguageModule):
             return self.lm_head.output_layer.weight
         return None
 
-    def sharded_state_dict(self, prefix: str = ''):
+    def sharded_state_dict(self, prefix: str = '', sharded_offsets: Tuple[Tuple[int, int, int]] = ()) -> ShardedStateDict:
+        assert not sharded_offsets, "We don't expect any sharded offsets at this level of model hierarchy"
         sharded_state_dict = {}
 
         if self.pre_process:

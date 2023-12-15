@@ -2,12 +2,13 @@
 
 """Utilities for transformer layers."""
 from operator import itemgetter
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Optional, Tuple, Union, Iterator
 
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing.mapping import ShardedObject, StateDict
+from megatron.core.dist_checkpointing.mapping import ShardedObject, StateDict, \
+    ShardedStateDict
 from megatron.core.utils import (
     make_sharded_tensor_for_checkpoint,
     make_tp_sharded_tensor_for_checkpoint,
@@ -141,3 +142,38 @@ def _get_extra_state_offsets(
         extra_state_shape = (1,)
         extra_state_offset = (0,)
     return extra_state_shape, extra_state_offset
+
+
+def sharded_state_dict_default(module: torch.nn.Module, prefix: str = '', sharded_offsets: Tuple[Tuple[int, int, int]] = ()) -> ShardedStateDict:
+    """Provides implementation for sharded_state_dict method for non-MegatronModules.
+
+    Tries to call `module.sharded_state_dict` when possible,
+    otherwise uses regular state dict and assumes tensors are replicated across TP and DP.
+
+    `keep_vars=True` is passed to module.state_dict so that optimizer states
+    can be sharded later on.
+
+    Args:
+        module (torch.nn.Module): module which sharded state dict we want to obtain
+        prefix (str): prefix for the state dict keys
+        sharded_offsets (Iterable[Tuple[int, int, int]], optional): sharding already
+            applied (e.g. PP related) by sup-modules. Passed along to ShardedTensor
+
+    Returns:
+        dict: dictionary of state dict keys mapped to ShardedTensors
+    """
+
+    if hasattr(module, 'sharded_state_dict'):
+        module_sharded_sd = module.sharded_state_dict(
+            prefix=prefix,
+            sharded_offsets=sharded_offsets,
+        )
+    else:
+        module_sd = module.state_dict(prefix='', keep_vars=True)
+        module_sharded_sd = make_sharded_tensors_for_checkpoint(
+            module_sd,
+            prefix,
+            {},
+            sharded_offsets,
+        )
+    return module_sharded_sd

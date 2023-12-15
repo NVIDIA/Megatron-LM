@@ -1,13 +1,16 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 """Megatron Module."""
+from typing import Tuple
 
 import torch
 from torch.autograd import Variable
 from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint, \
+    sharded_state_dict_default
 
 _FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
 _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
@@ -47,23 +50,15 @@ class MegatronModule(torch.nn.Module):
 
         return self.state_dict(prefix=prefix, keep_vars=keep_vars)
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=()):
-        return self._intermediate_sharded_state_dict(prefix, sharded_offsets)
+    def sharded_state_dict(self, prefix: str = '', sharded_offsets: Tuple[Tuple[int, int, int]] = ()) -> ShardedStateDict:
+        """Default implementation for sharded state dict for distributed checkpointing.
 
-
-    def _intermediate_sharded_state_dict(self, prefix='', sharded_offsets=()):
-        """Sharded state dict with Distributed Checkpointing.
-
-        General definition of sharded_state_dict tries to call `sharded_state_dict`
-        of submodules when possible, otherwise assumes tensors are replicated
-        across TP and DP.
-        When overriding, keep_vars argument of plain `state_dict` method must
-        always be set to True so that optimizer states can be sharded.
+        General definition of sharded_state_dict simply calls `sharded_state_dict_default`
+        (which call sharded_state_dict method if possible or a default implementation otherwise)
+        recursively on all submodules.
 
         Args:
             prefix (str): prefix for the state dict keys
-            sharded_key_prefix (str, optional): prefix for the ShardedTensor keys.
-                If None, the same prefix as for state dict keys is assumed.
             sharded_offsets (Iterable[Tuple[int, int, int]], optional): sharding already
                 applied (e.g. PP related) by sup-modules. Passed along to ShardedTensor
 
@@ -71,23 +66,8 @@ class MegatronModule(torch.nn.Module):
             dict: dictionary of state dict keys mapped to ShardedTensors
         """
         sharded_state_dict = {}
-
-        for name, module in self._modules.items():
-            if hasattr(module, 'sharded_state_dict'):
-                module_sharded_sd = module.sharded_state_dict(
-                    prefix=f'{prefix}{name}.',
-                    sharded_offsets=sharded_offsets,
-                )
-            else:
-                module_sd = module.state_dict(prefix='', keep_vars=True)
-                module_sharded_sd = make_sharded_tensors_for_checkpoint(
-                    module_sd,
-                    f'{prefix}{name}.',
-                    {},
-                    sharded_offsets,
-                )
-            sharded_state_dict.update(module_sharded_sd)
-
+        for name, module in self.named_children():
+            sharded_state_dict.update(sharded_state_dict_default(module, f'{prefix}{name}.', sharded_offsets))
         return sharded_state_dict
 
 
