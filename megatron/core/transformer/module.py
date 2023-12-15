@@ -47,11 +47,11 @@ class MegatronModule(torch.nn.Module):
 
         return self.state_dict(prefix=prefix, keep_vars=keep_vars)
 
-    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
-        self._intermediate_sharded_state_dict(prefix, sharded_key_prefix, sharded_offsets)
+    def sharded_state_dict(self, prefix='', sharded_offsets=()):
+        return self._intermediate_sharded_state_dict(prefix, sharded_offsets)
 
 
-    def _intermediate_sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
+    def _intermediate_sharded_state_dict(self, prefix='', sharded_offsets=()):
         """Sharded state dict with Distributed Checkpointing.
 
         General definition of sharded_state_dict tries to call `sharded_state_dict`
@@ -70,14 +70,12 @@ class MegatronModule(torch.nn.Module):
         Returns:
             dict: dictionary of state dict keys mapped to ShardedTensors
         """
-        sharded_key_prefix = prefix if sharded_key_prefix is None else sharded_key_prefix
         sharded_state_dict = {}
 
         for name, module in self._modules.items():
             if hasattr(module, 'sharded_state_dict'):
                 module_sharded_sd = module.sharded_state_dict(
                     prefix=f'{prefix}{name}.',
-                    sharded_key_prefix=f'{sharded_key_prefix}{name}.',
                     sharded_offsets=sharded_offsets,
                 )
             else:
@@ -85,7 +83,6 @@ class MegatronModule(torch.nn.Module):
                 module_sharded_sd = make_sharded_tensors_for_checkpoint(
                     module_sd,
                     f'{prefix}{name}.',
-                    f'{sharded_key_prefix}{name}.',
                     {},
                     sharded_offsets,
                 )

@@ -8,7 +8,7 @@ from .mapping import (
     ShardedStateDict,
     ShardedTensor,
     ShardedTensorFactory,
-    StateDict,
+    StateDict, ShardedObject,
 )
 
 
@@ -42,3 +42,14 @@ def add_prefix_for_sharding(sharded_state_dict: ShardedStateDict, prefix: str):
         return t
 
     dict_list_map_inplace(add_prefix, sharded_state_dict)
+
+
+def replace_prefix_for_sharding(sharded_state_dict: ShardedStateDict, old_prefix: str, new_prefix: str):
+    def replace_prefix(x):
+        if isinstance(x, (ShardedTensor, ShardedTensorFactory, ShardedObject)):
+            if not x.key.startswith(old_prefix):
+                raise ValueError(f'Expected {x.key} to begin with prefix {old_prefix}')
+            x.key = f'{new_prefix}{x.key.removeprefix(old_prefix)}'
+        return x
+
+    dict_list_map_inplace(replace_prefix, sharded_state_dict)

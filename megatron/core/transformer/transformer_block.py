@@ -9,6 +9,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.enums import AttnMaskType
@@ -323,13 +324,25 @@ class TransformerBlock(MegatronModule):
 
         return hidden_states
 
-    def sharded_state_dict(self, prefix: str = ''):
+    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()):
 
         sharded_state_dict = {}
 
         layer_prefix = f'{prefix}layers.'
+        num_layers = self.config.num_layers
         for layer in self.layers:
-            sharded_state_dict.update(layer.sharded_state_dict(prefix=layer_prefix))
+            offset = layer._get_layer_offset()
+
+            global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
+            state_dict_prefix = (
+                f'{layer_prefix}{global_layer_offset - offset}.'  # module list index in TransformerBlock
+            )
+            sharded_pp_offset = [
+                (0, global_layer_offset, num_layers)
+            ]  # PP sharding offset for ShardedTensors
+            layer_sharded_state_dict = layer.sharded_state_dict(prefix=state_dict_prefix, sharded_offsets=sharded_pp_offset)
+            replace_prefix_for_sharding(layer_sharded_state_dict, state_dict_prefix, layer_prefix)
+            sharded_state_dict.update(layer_sharded_state_dict)
 
         if self.post_process and self.post_layer_norm:
             state_dict = self.state_dict(keep_vars=True)

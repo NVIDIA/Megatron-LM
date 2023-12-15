@@ -49,8 +49,7 @@ def erf_gelu(x):
 
 def make_sharded_tensors_for_checkpoint(
     state_dict: StateDict,
-    state_dict_prefix: str,
-    sharded_key_prefix: Optional[str] = None,
+    prefix: str,
     tensor_parallel_layers_axis_map: Optional[Dict[str, int]] = None,
     sharded_offsets: Iterable[Tuple[int, int, int]] = (),
     extra_state_suffix: str = '_extra_state',
@@ -64,8 +63,7 @@ def make_sharded_tensors_for_checkpoint(
 
     Args:
         state_dict (StateDict): state_dict to convert
-        state_dict_prefix (str): prefix appended to keys in final state dict
-        sharded_key_prefix (str, optional): prefix appended to ShardedTensor keys
+        prefix (str): prefix appended to keys in final state dict
         tensor_parallel_layers_axis_map (Dict[str, int], optional): dict mapping layer
             names to the axis for TP sharding
         sharded_offsets (Iterable[Tuple[int, int, int]], optional): sharding already
@@ -74,8 +72,6 @@ def make_sharded_tensors_for_checkpoint(
             suffix will be wrapped with ShardedObject instead of ShardedTensor.
 
     """
-    if sharded_key_prefix is None:
-        sharded_key_prefix = state_dict_prefix
 
     if tensor_parallel_layers_axis_map is None:
         tensor_parallel_layers_axis_map = {}
@@ -83,23 +79,22 @@ def make_sharded_tensors_for_checkpoint(
     sharded_state_dict = {}
     for layer_name in state_dict.keys():
         tensor = state_dict[layer_name]
-        layer_key = f'{state_dict_prefix}{layer_name}'
-        sharded_key = f'{sharded_key_prefix}{layer_name}'
+        layer_key = f'{prefix}{layer_name}'
 
         if layer_name.endswith(extra_state_suffix):
             sharded_state_dict[layer_key] = make_sharded_object_for_checkpoint(
-                tensor, sharded_key, sharded_offsets
+                tensor, layer_key, sharded_offsets
             )
 
         elif layer_name in tensor_parallel_layers_axis_map:
             tp_axis = tensor_parallel_layers_axis_map[layer_name]
             sharded_state_dict[layer_key] = make_tp_sharded_tensor_for_checkpoint(
-                tensor, sharded_key, tp_axis, prepend_offsets=sharded_offsets,
+                tensor, layer_key, tp_axis, prepend_offsets=sharded_offsets,
             )
 
         else:
             sharded_state_dict[layer_key] = make_sharded_tensor_for_checkpoint(
-                tensor, sharded_key, prepend_offsets=sharded_offsets,
+                tensor, layer_key, prepend_offsets=sharded_offsets,
             )
 
     return sharded_state_dict

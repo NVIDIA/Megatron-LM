@@ -757,11 +757,11 @@ class ColumnParallelLinear(torch.nn.Module):
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
-    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
+    def sharded_state_dict(self, prefix='', sharded_offsets=()):
         """ Sharding along axis 0, bias sharded """
         state_dict = self.state_dict(prefix='', keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, sharded_key_prefix, {'weight': 0, 'bias': 0}, sharded_offsets
+            state_dict, prefix, {'weight': 0, 'bias': 0}, sharded_offsets
         )
 
 
@@ -932,9 +932,9 @@ class RowParallelLinear(torch.nn.Module):
             output_bias = self.bias
         return output, output_bias
 
-    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
+    def sharded_state_dict(self, prefix='', sharded_offsets=()):
         """ Sharding along axis 1, bias not sharded """
         state_dict = self.state_dict(prefix='', keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, sharded_key_prefix, {'weight': 1}, sharded_offsets
+            state_dict, prefix, {'weight': 1}, sharded_offsets
         )

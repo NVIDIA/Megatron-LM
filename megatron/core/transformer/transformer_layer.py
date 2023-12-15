@@ -6,13 +6,11 @@ from typing import Union
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from megatron.core.utils import make_viewless_tensor
 
 
@@ -216,17 +214,3 @@ class TransformerLayer(MegatronModule):
         )
 
         return output, context
-
-    def sharded_state_dict(self, prefix=''):
-        offset = self._get_layer_offset()
-        num_layers = self.config.num_layers
-
-        global_layer_offset = self.layer_number - 1  # self.layer_number starts at 1
-        state_dict_prefix = (
-            f'{prefix}{global_layer_offset - offset}.'  # module list index in TransformerBlock
-        )
-        sharded_pp_offset = [
-            (0, global_layer_offset, num_layers)
-        ]  # PP sharding offset for ShardedTensors
-
-        return self._intermediate_sharded_state_dict(state_dict_prefix, prefix, sharded_pp_offset)
