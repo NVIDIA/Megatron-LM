@@ -13,6 +13,7 @@ from megatron.core.tensor_parallel.random import (
     get_data_parallel_rng_tracker_name,
 )
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.moe_utils import switch_load_balancing_loss_func, z_loss_func
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -29,20 +30,19 @@ class Router(ABC, MegatronModule):
         super().__init__(config)
         self.config = config
         self.num_experts = self.config.num_moe_experts
-
         # Token dispatcher for exchange tokens between experts.
         self.token_dispatcher = None
-
         # Initialize the gate weights.
         self.gate = torch.nn.Linear(
             self.config.hidden_size, self.config.num_moe_experts, bias=False
         )
+        # Initialize the aux losses.
+        self.moe_aux_loss_func = None
+
+        # Initialize the gate weights.
         with get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
             config.init_method(self.gate.weight)
         setattr(self.gate.weight, 'sequence_parallel', config.sequence_parallel)
-
-        self.fp32_router = False
-        self.input_jitter = None
 
     def gating(self, input: torch.Tensor):
         """
@@ -75,7 +75,7 @@ class Router(ABC, MegatronModule):
         raise NotImplementedError
 
     def restore(
-        self, expert_output: torch.Tensor, gating: torch.Tensor, indicies: torch.Tensor,
+        self, expert_output: torch.Tensor, scores: torch.Tensor, indicies: torch.Tensor,
     ):
         raise NotImplementedError
 
@@ -106,39 +106,53 @@ class Router(ABC, MegatronModule):
             input (torch.Tensor): Input tensor.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: gating and indices.
+            Tuple[torch.Tensor, torch.Tensor]: scores and indices.
         """
         self.hidden = input.shape[-1]
 
-        if self.fp32_router:
-            if self.gate.weight.dtype != torch.float32:
-                self.gate.weight.data = self.gate.weight.data.float()
-                assert hasattr(self.gate.weight, 'sequence_parallel')
-            input = input.float()
+        logits = self.gating(input)
+        logits = logits.view(-1, self.config.num_moe_experts)
 
-        route = self.gating(input)
-        route = route.view(-1, self.config.num_moe_experts)
+        scores, indices = self.routing(logits)
 
-        gating, indices = self.routing(route)
+        return scores, indices
 
-        return gating, indices
+    def apply_aux_loss(self, loss_func, scores, indicies):
+        mask = torch.nn.functional.one_hot(indicies, num_classes=self.num_experts).sum(dim=1)
+        aux_loss = loss_func(scores, mask)
+        scores = MoEAuxLossAutoScaler.apply(scores, aux_loss)
+        return scores
+
+    def apply_z_loss(self, logits):
+        """Encourages the router's logits to remain small to enhance stability.
+        Please refer to the ST-MoE paper (https://arxiv.org/pdf/2202.08906.pdf) for details.
+        
+        Args:
+            logits (torch.Tensor): The logits of the router.
+        
+        Returns:
+            torch.Tensor: The logits after applying the z-loss.
+        """
+
+        z_loss = z_loss_func(logits)
+        logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
+        return logits
 
     def switch_transformer_load_balancing_loss(self, gates, mask):
-        """
-        Calculate the auxiliary loss for better load balacing. 
+        """Calculate the auxiliary loss for better load balacing. 
         Please refer to the Switch Transformer paper (https://arxiv.org/abs/2101.03961) for details.
 
         Args:
-            route (torch.Tensor): The gates tensor.
-            mask (torch.Tensor): The mask tensor.
+            gates (torch.Tensor): The gates tensor representing the routing probabilities for each expert.
+            mask (torch.Tensor): The 2D mask tensor indicating which experts are selected.
 
         Returns:
-            torch.Tensor: The auxiliary loss.
+            torch.Tensor: The auxiliary loss for load balancing.
         """
         gates_mean = gates.mean(dim=0)
         selection_mean = mask.float().mean(dim=0)
         aux_loss = torch.sum(gates_mean * selection_mean) * self.num_experts
-        aux_loss *= self.config.moe_loss_coeff
+        aux_loss *= self.config.aux_loss_coeff
         return aux_loss
 
 
@@ -169,14 +183,14 @@ class MoETokenDispatcher:
         raise NotImplementedError
 
     def restore(
-        self, expert_output: torch.Tensor, gating: torch.Tensor, indices: torch.Tensor,
+        self, expert_output: torch.Tensor, scores: torch.Tensor, indices: torch.Tensor,
     ):
         """
         Restores the expert output to its original ordering.
 
         Args:
             expert_output (torch.Tensor): The output tensor from the expert models.
-            gating (torch.Tensor): The gating tensor used to route the inputs to the experts.
+            scores (torch.Tensor): Each token's score with each expert.
             indices (torch.Tensor): The indices used to reorder the expert output.
 
         Returns:
@@ -187,7 +201,7 @@ class MoETokenDispatcher:
 
 class MoEZeroDropTokenDispatcher(MoETokenDispatcher):
     """
-    ZeroDrop Token Dispatcher
+    Token dispatcher without token dropping.
     """
 
     def __init__(self, num_local_experts, local_expert_indices, config: TransformerConfig) -> None:
@@ -289,7 +303,7 @@ class MoEZeroDropTokenDispatcher(MoETokenDispatcher):
         permuted_local_hidden_states = torch.gather(local_hidden_states, 0, indices)
         return permuted_local_hidden_states, tokens_per_expert, local_probs, indices, global_local_map
 
-    def restore(self, hidden_states, gating, indices, global_local_map=None, bias=None):
+    def restore(self, hidden_states, scores, indices, global_local_map=None, bias=None):
         """
         Reverse process of `dispatch()` which permutes the ouput of local
         experts locallay and across expert parallel rank into the original order to
@@ -309,14 +323,14 @@ class MoEZeroDropTokenDispatcher(MoETokenDispatcher):
             with shape of [SeqLen/TP, MBS, HiddenSize]
         """
         # Stage1: unpermute the tokens and bias locally respectively.
-        gating = gating.to(dtype=hidden_states.dtype)
+        scores = scores.to(dtype=hidden_states.dtype)
         unpermuted_local_hidden = torch.zeros_like(hidden_states)
         assert indices.shape == hidden_states.shape
         unpermuted_local_hidden = unpermuted_local_hidden.scatter(0, indices, hidden_states)
 
         # Scale the expert output prior to reduction and subsequent to local unpermutation if k > 1.
         if self.k > 1:
-            unpermuted_local_hidden = unpermuted_local_hidden * gating
+            unpermuted_local_hidden = unpermuted_local_hidden * scores
 
         unpermuted_local_bias = None
         if self.add_bias:
@@ -325,7 +339,7 @@ class MoEZeroDropTokenDispatcher(MoETokenDispatcher):
             assert indices.shape == bias.shape
             unpermuted_local_bias = unpermuted_local_bias.scatter(0, indices, bias)
             if self.k > 1:
-                unpermuted_local_bias = unpermuted_local_bias * gating
+                unpermuted_local_bias = unpermuted_local_bias * scores
 
         output_total = unpermuted_local_hidden
         output_bias_total = None
@@ -363,12 +377,12 @@ class MoEZeroDropTokenDispatcher(MoETokenDispatcher):
                     output_bias_total / parallel_state.get_tensor_model_parallel_world_size()
                 )
         if self.k == 1:
-            output_total = output_total * gating
+            output_total = output_total * scores
         output_total = output_total.view(self.hidden_shape)
         if self.add_bias:
             assert output_bias_total is not None
             if self.k == 1:
-                output_bias_total = output_bias_total * gating
+                output_bias_total = output_bias_total * scores
             output_bias_total = output_bias_total.view(self.hidden_shape)
         else:
             output_bias_total = None
@@ -378,7 +392,7 @@ class MoEZeroDropTokenDispatcher(MoETokenDispatcher):
 
 class ZeroDropSinkhornRouter(Router):
     """
-    ZeroDrop Sinkhorn Router
+    Sinkhorn Router without token dropping.
     """
 
     def __init__(self, num_local_experts, local_expert_indices, config: TransformerConfig) -> None:
@@ -388,10 +402,10 @@ class ZeroDropSinkhornRouter(Router):
         super().__init__(config=config)
         self.route_algo = self.sinkhorn
         self.router_activation = torch.sigmoid
-        self.moe_aux_loss = self.switch_transformer_load_balancing_loss
         self.token_dispatcher = MoEZeroDropTokenDispatcher(
             num_local_experts, local_expert_indices, config
         )
+        self.k = 1
 
     def sinkhorn(self, cost, tol=0.0001):
         "Sinkhorn based MoE routing function"
@@ -409,13 +423,7 @@ class ZeroDropSinkhornRouter(Router):
             d1_old = d1
         return d1 * cost * d0.unsqueeze(1)
 
-    def moe_loss(self, gatings, indicies):
-        mask = torch.nn.functional.one_hot(indicies, num_classes=self.num_experts).sum(dim=1)
-        aux_loss = self.moe_aux_loss(gatings, mask)
-        gatings = MoEAuxLossAutoScaler.apply(gatings, aux_loss)
-        return gatings
-
-    def routing(self, route: torch.Tensor):
+    def routing(self, logits: torch.Tensor):
         """
         Get the routing results.
 
@@ -425,24 +433,21 @@ class ZeroDropSinkhornRouter(Router):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Tuple of tensors representing max probs and the indices.
         """
-        route = route.view(-1, self.config.num_moe_experts)
-        k = 1  # TODO: self.config.top_k
+        logits = logits.view(-1, self.config.num_moe_experts)
 
         if self.training:
             with torch.no_grad():
-                norm_route = self.route_algo(
-                    route.detach().to(dtype=torch.float32)
+                norm_logits = self.route_algo(
+                    logits.to(dtype=torch.float32)
                 )  # explicit fp32 conversion for stability
-                _, indices = torch.topk(norm_route, k=k, dim=1)
-            route = self.router_activation(route)
-            gatings = torch.gather(route, 1, indices)
+                _, indices = torch.topk(norm_logits, k=self.k, dim=1)
+            logits = self.router_activation(logits)
+            scores = torch.gather(logits, 1, indices)
         else:
-            route = self.router_activation(route)
-            gatings, indices = torch.topk(route, k=k, dim=1)
+            logits = self.router_activation(logits)
+            scores, indices = torch.topk(logits, k=self.k, dim=1)
 
-        # gatings = self.moe_loss(gatings, indices)
-
-        return gatings, indices
+        return scores, indices
 
 
 class MoEAuxLossAutoScaler(torch.autograd.Function):

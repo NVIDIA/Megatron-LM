@@ -18,8 +18,27 @@ class BaseMoELayer(MegatronModule, ABC):
         super(BaseMoELayer, self).__init__(config)
         self.config = config
         self.expert_parallel_size = parallel_state.get_expert_model_parallel_world_size()
-
         assert self.config.num_moe_experts % self.expert_parallel_size == 0
+        self.router = None
+        self.experts = None
+
+    @abstractmethod
+    def initialize_experts(self):
+        pass
+
+    @abstractmethod
+    def initialize_router(self):
+        pass
+
+    @abstractmethod
+    def forward(self, hidden_states):
+        pass
+
+
+class BaseSwitchMLPLayer(BaseMoELayer):
+    def __init__(self, config: TransformerConfig, submodules: MLPSubmodules):
+        self.submodules = submodules
+        super(BaseSwitchMLPLayer, self).__init__(config=config)
         self.num_local_experts = self.config.num_moe_experts // self.expert_parallel_size
         local_expert_indices_offset = (
             parallel_state.get_expert_model_parallel_rank() * self.num_local_experts
@@ -27,41 +46,33 @@ class BaseMoELayer(MegatronModule, ABC):
         self.local_expert_indices = [
             local_expert_indices_offset + i for i in range(self.num_local_experts)
         ]
-
         self.router = self.initialize_router()
         self.experts = self.initialize_experts()
 
-    def initialize_experts(self):
-        pass
-
-    def initialize_router(self):
-        pass
-
     def forward(self, hidden_states):
         # process MoE
-        gatings, indices = self.router(hidden_states)
+        scores, indices = self.router(hidden_states)
         (
             dispatched_input,
             tokens_per_expert,
-            probs,
+            scores,
             indices,
             global_local_map,
-        ) = self.router.token_dispatcher.dispatch(hidden_states, gatings, indices)
+        ) = self.router.token_dispatcher.dispatch(hidden_states, scores, indices)
         expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
         output, mlp_bias = self.router.token_dispatcher.restore(
-            expert_output, probs, indices, global_local_map, mlp_bias
+            expert_output, scores, indices, global_local_map, mlp_bias
         )
 
         if mlp_bias is None:
             mlp_bias = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
 
-        # output = output.reshape(hidden_states.shape)
         return output, mlp_bias
 
 
-class GroupedGemmMoELayer(BaseMoELayer):
+class GroupedGemmMoELayer(BaseSwitchMLPLayer):
     def __init__(self, config: TransformerConfig):
-        super(GroupedGemmMoELayer, self).__init__(config=config)
+        super(GroupedGemmMoELayer, self).__init__(config=config,)
 
     def initialize_experts(self):
         experts = GroupedMLP(self.num_local_experts, self.config)
@@ -74,10 +85,9 @@ class GroupedGemmMoELayer(BaseMoELayer):
         return router
 
 
-class SwitchMLPLayer(BaseMoELayer):
+class SwitchMLPLayer(BaseSwitchMLPLayer):
     def __init__(self, config: TransformerConfig, submodules: MLPSubmodules):
-        self.submodules = submodules
-        super(SwitchMLPLayer, self).__init__(config=config)
+        super(SwitchMLPLayer, self).__init__(config=config, submodules=submodules)
 
     def initialize_experts(self):
         experts = SwitchMLP(self.num_local_experts, self.config, self.submodules)

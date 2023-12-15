@@ -130,7 +130,7 @@ class TransformerConfig(ModelParallelConfig):
 
     # MoE related
     moe_grouped_gemm: bool = False
-    moe_loss_coeff: float = 0.01
+    moe_aux_loss_coeff: float = 0.01
 
     def __post_init__(self):
         """ Python dataclass method that is used to modify attributes after initialization.

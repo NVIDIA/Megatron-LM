@@ -1419,7 +1419,9 @@ def _add_moe_args(parser):
                        'launch to improve the utilization and performance by '
                        'leveraging the Grouped GEMM feature introduced since '
                        'CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).')
-    group.add_argument('--moe-loss-coeff', type=float, default=0.01,
+    group.add_argument('--moe-aux-loss-coeff', type=float, default=1e-2,
+                       help='Scaling coefficient for adding MoE loss to model loss')
+    group.add_argument('--moe-z-loss-coeff', type=float, default=1e-3,
                        help='Scaling coefficient for adding MoE loss to model loss')
     group.add_argument('--moe-router-type', type=str, default='top1',
                        help='Options for router type, support top1 and ec')
