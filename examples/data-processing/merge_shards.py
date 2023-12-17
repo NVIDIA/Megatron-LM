@@ -70,6 +70,7 @@ def group_shards(shard_dict, shard_size_limit):
         curr_group.append(shard_name)
         if curr_group_size > shard_size_limit:
             curr_group_size -= size_in_byte
+            curr_group.pop()
             groups.append((curr_group_size,copy.deepcopy(curr_group)))
             curr_group = [shard_name]
             curr_group_size = size_in_byte
@@ -93,7 +94,7 @@ def remote_submit_jobs(args, groups):
         command += f"{idx:03}.jsonl\""
         for shard in shards:
             command += f" \\\n\"{shard}\""
-        print(f"[{idx}][{args.prefix_name}{idx:03}.jsonl] {size/1000000000} GB")
+        print(f"[{idx}][{args.prefix_name}{idx:03}.jsonl][{size/1000000000:.2f}GB] {command}")
         if not args.dry_run:
             data['command'] = command
             data['code'] = "../"

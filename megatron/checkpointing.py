@@ -383,27 +383,29 @@ def fix_query_key_value_ordering(model, checkpoint_version):
                      " checkpoint version {}".format(checkpoint_version))
 
 
-def _load_base_checkpoint(load_dir, rank0=False):
+def _load_base_checkpoint(load_dir, iter_num=None, rank0=False):
     """ Load the base state_dict from the given directory
 
     If rank0 is true, just loads rank 0 checkpoint, ignoring arguments.
     """
+    if iter_num is None:
+        # Read the tracker file and set the iteration.
+        tracker_filename = get_checkpoint_tracker_filename(load_dir)
 
-    # Read the tracker file and set the iteration.
-    tracker_filename = get_checkpoint_tracker_filename(load_dir)
+        # If no tracker file, return nothing
+        if not os.path.isfile(tracker_filename):
+            if not rank0:
+                print_rank_0('WARNING: could not find the metadata file {} '.format(
+                    tracker_filename))
+                print_rank_0('    will not load any checkpoints and will start from '
+                            'random')
+            return None, "", False
 
-    # If no tracker file, return nothing
-    if not os.path.isfile(tracker_filename):
-        if not rank0:
-            print_rank_0('WARNING: could not find the metadata file {} '.format(
-                tracker_filename))
-            print_rank_0('    will not load any checkpoints and will start from '
-                         'random')
-        return None, "", False
-
-    # Otherwise, read the tracker file and either set the iteration or
-    # mark it as a release checkpoint.
-    iteration, release = read_metadata(tracker_filename)
+        # Otherwise, read the tracker file and either set the iteration or
+        # mark it as a release checkpoint.
+        iteration, release = read_metadata(tracker_filename)
+    else:
+        iteration, release = iter_num, False
 
     # Checkpoint.
     if rank0:
@@ -533,7 +535,9 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
 
     model = unwrap_model(model)
 
-    state_dict, checkpoint_name, release = _load_base_checkpoint(load_dir, rank0=False)
+    state_dict, checkpoint_name, release = _load_base_checkpoint(load_dir, 
+                                                    iter_num=args.load_iteration,
+                                                    rank0=False)
 
     # Checkpoint not loaded.
     if state_dict is None:

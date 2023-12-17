@@ -53,8 +53,8 @@ def get_args() -> argparse.Namespace:
             print("Overloading config args from  --az-sample-yaml-job-file")
             args.az_configs['az-sample-yaml-job-file'] = args.az_sample_yaml_job_file
 
-    if not args.bin_idx_folder_path.endswith("/"):
-        args.bin_idx_folder_path += '/'
+    if args.input_folder_path.endswith("/"): args.input_folder_path = args.input_folder_path.rstrip('/\\')
+    if not args.bin_idx_folder_path.endswith("/"): args.bin_idx_folder_path += '/'
 
     return args
 

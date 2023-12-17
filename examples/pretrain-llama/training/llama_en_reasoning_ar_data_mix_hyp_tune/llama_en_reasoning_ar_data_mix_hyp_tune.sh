@@ -109,7 +109,7 @@ python examples/data-processing/data_ratio_from_file.py \
 
 source examples/pretrain-llama/training/llama_en_reasoning_ar_data_mix_hyp_tune/iterator_selection_prob.sh
 
-# $BIN_IDX_PATH/$BIN_IDX_PATH/torchrun ${\DISTRIBUTED_ARGS[@]}\ pretrain_gpt.py\ \
+# $BIN_IDX_PATH/$BIN_IDX_PATH/torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
 python pretrain_gpt.py \
     ${GPT_MODEL_ARGS[@]} \
     ${LOGISTICS_ARGS[@]} \

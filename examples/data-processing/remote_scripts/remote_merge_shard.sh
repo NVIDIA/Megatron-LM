@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e 
 
 # Validate the number of arguments
 if [ "$#" -lt 5 ]; then
