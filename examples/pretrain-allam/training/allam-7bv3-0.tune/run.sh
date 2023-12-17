@@ -1,4 +1,3 @@
-
 PRETRAINED_MODEL_PATH=$1
 TOKENIZER_MODEL=$2
 BIN_IDX_PATH=$3
@@ -9,15 +8,15 @@ ENG_TOK=$7
 
 LR_RATE=3.0e-05
 LR_WARMUP_ITERS=0
-TRAIN_ITER=5000
+TRAIN_ITER=2500
 GLOBAL_BATCH_SIZE=1024
 
-SAVE_INTERVAL=200
+SAVE_INTERVAL=250
 LOG_INTERVAL=10
 EVAL_INTERVAL=0
 EVAL_ITER=0
 SPLIT_INFO='998,1,1'
-TOTAL_NUM_TOKENS=20_000_000_000
+TOTAL_NUM_TOKENS=10_000_000_000
 
 # DISTRIBUTED_ARGS=(
 #     --nproc_per_node $GPUS_PER_NODE 
@@ -54,6 +53,8 @@ GPT_MODEL_ARGS=(
 
 LOGISTICS_ARGS=(
     --save $CHECKPOINT_DIR 
+    --load $PRETRAINED_MODEL_PATH
+    --load-iteration 120000
     --tokenizer-model $TOKENIZER_MODEL
     --split $SPLIT_INFO
     --log-interval $LOG_INTERVAL
@@ -69,8 +70,8 @@ LOGISTICS_ARGS=(
 
 TRAINING_ARGS=(
     --micro-batch-size 1
-    --global-batch-size 1024
-    --train-iters 120000
+    --global-batch-size $GLOBAL_BATCH_SIZE
+    --train-iters $TRAIN_ITER
     --lr $LR_RATE
     --lr-decay-style cosine 
     --weight-decay 0.1 
