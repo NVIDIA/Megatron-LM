@@ -20,6 +20,8 @@ def get_args():
     parser.add_argument("--output-folder-path", type = str, help="Azure blob folder path to output folder for bin and idx", required=True)
     parser.add_argument("--shard-size", type = int, help="Estimated size of the each merged shard. (TODO: Fix to exact size)", required=True)
     parser.add_argument("--prefix-name", type = str, help="Prefix of the output file name.", required=True)
+    parser.add_argument("--use-file-input", action='store_true', help="Send the merge shard names in a file instead of arguments. "
+                        "This is required when you merge too many small files.", required=True)
     
     group = parser.add_argument_group(title='Misc. params.')
     parser.add_argument("--compute-target", type = str, default='azure', choices=['local', 'azure'], help="Conpute targets. Both --input-folder-path and --output-folder-path should use same compute target. TODO: Enable cross compute.")
@@ -92,8 +94,15 @@ def remote_submit_jobs(args, groups):
     for idx, (size, shards) in enumerate(groups):
         command = prefix_command
         command += f"{idx:03}.jsonl\""
-        for shard in shards:
-            command += f" \\\n\"{shard}\""
+        if args.use_file_input:
+            input_file_path = f"input_{args.prefix_name}{idx:03}.txt"
+            with open(input_file_path, 'w') as wrt_ptr:
+                for shard in shards:
+                    wrt_ptr.write(f"{shard}\n")
+            command += " " + input_file_path
+        else:
+            for shard in shards:
+                command += f" \\\n\"{shard}\""
         print(f"[{idx}][{args.prefix_name}{idx:03}.jsonl][{size/1000000000:.2f}GB] {command}")
         if not args.dry_run:
             data['command'] = command
@@ -122,8 +131,15 @@ def local_submit_job(args, groups):
     for idx, (size, shards) in enumerate(groups):
         command = prefix_command
         command += f"{idx:03}.jsonl\""
-        for shard in shards:
-            command += f" \\\n\"{shard}\""
+        if args.use_file_input:
+            input_file_path = f"input_{args.prefix_name}{idx:03}.txt"
+            with open(input_file_path, 'w') as wrt_ptr:
+                for shard in shards:
+                    wrt_ptr.write(f"{shard}\n")
+            command += " " + input_file_path
+        else:
+            for shard in shards:
+                command += f" \\\n\"{shard}\""
         print(f"[{args.prefix_name}][{idx}] {size/1000000000} GB")
         if not args.dry_run:
             try:
