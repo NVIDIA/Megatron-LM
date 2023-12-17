@@ -55,7 +55,6 @@ def azcopy_list(path, sas_token):
     out = subprocess.check_output(cmd, shell=True)
     out = out.decode('utf-8')
     for line in out.split("\n"):
-        print(line)
         if line.strip() == "": continue
         pre_shard_dt = json.loads(line)
         message = pre_shard_dt['MessageContent']
