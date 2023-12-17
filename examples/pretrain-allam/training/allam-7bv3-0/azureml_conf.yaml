@@ -10,9 +10,9 @@ command: >-
    ${{outputs.checkpoint_dir}} \
    ${{outputs.checkpoint_dir}}
 
-display_name: allam-7bv3.0_dolma
+display_name: allam-7bv3-0-dolma
 
-experiment_name: 7b_v3.0
+experiment_name: pretrain-7bv3-0
 code: ../../../../
 environment: azureml:Megatron-LLaMA:7
 environment_variables:
