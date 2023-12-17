@@ -76,7 +76,7 @@ MODEL_PARALLEL_ARGS=(
 
 source examples/pretrain-allam/training/allam-7bv3-0/iterator_prob.sh
 
-# torchrun ${\DISTRIBUTED_ARGS[@]}\ pretrain_gpt.py\ \
+# torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py\ \
 python pretrain_gpt.py \
     ${GPT_MODEL_ARGS[@]} \
     ${LOGISTICS_ARGS[@]} \
