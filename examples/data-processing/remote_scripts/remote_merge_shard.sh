@@ -79,8 +79,8 @@ IFS=$OLD_IFS
 
 if [ "$compute_target" = "local" ]; then
     echo "Your file is merged as $output_file"
-    echo "Moving $output_file to $output_folder_name"
-    mv $output_file $output_folder_name
+    echo "Moving $output_file to $output_folder_name/"
+    mv $output_file $output_folder_name/
 elif [ "$compute_target" = "azure" ]; then
     echo "Copying merged file $output_file to Azure Blob Storage."
     echo "Running azcopy copy \"$output_file\" \"${output_folder_name}/?${sas_token}\""
