@@ -44,7 +44,7 @@ class GroupedMLP(BaseMoELayer):
         gg.assert_grouped_gemm_is_available()
         assert (
             config.add_bias_linear == False
-        ), "bias in the expert layer is not supported in Grouped GEMM yet."
+        ), "bias in the expert layer is not supported in Grouped GEMM yet, please set '--disable-bias-linear' instead."
 
         self.expert_parallel = config.expert_model_parallel_size > 1
         self.gradient_scale = 1 / parallel_state.get_tensor_and_expert_parallel_world_size()

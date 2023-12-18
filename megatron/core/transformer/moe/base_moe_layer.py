@@ -163,11 +163,10 @@ class BaseMoELayer(ABC, MegatronModule):
             tokens_per_expert = tokens_per_expert.cpu().to(torch.long)
 
         # Stage2: permute the tokens locally so that they are grouped by their expert assignment
-        permuted_local_hidden_states = torch.index_select(local_hidden_states, 0, indices.view(-1))
         # Reshape indices to be compatible with Tensor.gather
         indices = indices.view(-1, 1).expand(-1, hidden_states.shape[-1])
-
         permuted_local_hidden_states = torch.gather(local_hidden_states, 0, indices)
+
         return permuted_local_hidden_states, tokens_per_expert, indices, global_local_map
 
     def token_unpermutation(self, hidden_states, indices, global_local_map=None, bias=None):
