@@ -54,7 +54,8 @@ TRAINING_ARGS=(
     --micro-batch-size 1
     --global-batch-size 1024
     --train-iters 120000
-    --lr 3.0e-04 
+    --override-opt_param-scheduler
+    --lr 3.0e-05 
     --lr-decay-style cosine 
     --weight-decay 0.1 
     --adam-beta1 0.9 
@@ -62,7 +63,7 @@ TRAINING_ARGS=(
     --init-method-std 0.01
     --clip-grad 1.0 
     --min-lr 3.0e-05
-    --lr-warmup-iters 2000
+    --lr-warmup-iters 0
     --use-flash-attn
     --bf16
 )

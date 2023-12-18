@@ -32,11 +32,11 @@ inputs:
   tokenizer_model_path:
     type: uri_file
     mode: ro_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llm_data/paths/dolma/dolma_tokenize_by_v5tok.improved/tokenizer_v5_improved/ar_en.model
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llm_data/paths/data_repo/tokenize_by_v5_improved/tokenizer/ar_en.model
   bin_idx_data_dir:
     type: uri_folder
     mode: ro_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llm_data/paths/dolma/dolma_tokenize_by_v5tok.improved/meglm_tok_v5_improved_bin_idx/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llm_data/paths/data_repo/tokenize_by_v5_improved/meglm_tok_v5_improved_bin_idx/
 outputs:
   data_cache:
     type: uri_folder
