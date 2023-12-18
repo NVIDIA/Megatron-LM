@@ -54,18 +54,25 @@ We recommend using docker environment to run the code.
 ### Docker image
 
 
-We provide a docker build file in [tools/retro/examples/Dockerfile](tools/retro/examples/Dockerfile) for the reproduction. The docker image is based on `nvcr.io/nvidia/pytorch:23.09-py3`.
+We provide a docker build file in [tools/retro/examples/Dockerfile](examples/Dockerfile) for the reproduction. The docker image is based on `nvcr.io/nvidia/pytorch:23.09-py3`.
 
 
 ### Install dependencies
 
-If docker is not available, we recommend starting from a clean conda environment, including:
+Clone the Megatron repo:
+
+```bash
+git clone --branch InstructRetro https://github.com/NVIDIA/Megatron-LM.git
+```
+
+If docker is not available, we recommend starting from a clean conda environment with the following runtime dependencies:
+
 - Python 3.10
 - NVIDIA CUDA® 12.2.1
 - NVIDIA cuBLAS 12.2.5.6
 - NVIDIA cuDNN 8.9.5
 - NVIDIA NCCL 2.18.5
-- 2.1.0a0+32f93b1
+- PyTorch 2.1.0a0+32f93b1
 
 Then install Retro-specific dependencies, including:
 ```bash
@@ -78,12 +85,11 @@ pip install -U einops
 ```
 
 
-
 ## Step 1: Build retrieval database
 
 In this step, we build a large-scale retrieval database for InstructRetro through [Faiss](https://github.com/facebookresearch/faiss) to retrieve from trillions of tokens, and preprocess (and save) the retrieval neighbors for the pretraining step.
 
-Please refer to [tools/retro/build_db.md](tools/retro/build_db.md) for more details.
+Please refer to [tools/retro/build_db.md](build_db.md) for more details.
 
 ## Step 2: Pretraining
 
@@ -91,7 +97,7 @@ Please refer to [tools/retro/build_db.md](tools/retro/build_db.md) for more deta
 
 In the pretraining step, we support both pretraining from scratch and continued pretraining from a pretrained GPT model.
 
-We provide a template pretraining script to pretrain 843M Retro from scratch. Prepare your own arguments and update our templates in [tools/retro/examples/pretrain_model.sh](tools/retro/examples/pretrain_model.sh). Please note that the data path should be exactly matching the one used in Step 1 to make sure the preprocessed retrieval neighbors match the pretraining corpus.
+We provide a template pretraining script to pretrain 843M Retro from scratch. Prepare your own arguments and update our templates in [tools/retro/examples/pretrain_model.sh](examples/pretrain_model.sh). Please note that the data path should be exactly matching the one used in Step 1 to make sure the preprocessed retrieval neighbors match the pretraining corpus.
 
 [//]: # (Take the example of the Wikipedia corpus)
 
@@ -137,7 +143,7 @@ Refer to the paper links above for more details about each instruction tuning da
 *We note that the provided instruction tuning dataset is all from open-source instruction tuning datasets. It is slightly different from what we use in [InstructRetro](https://arxiv.org/abs/2310.07713), which contains private and proprietary datasets. Thus a 1-2% accuracy difference in downstream tasks may be expected.*  
 
 ### Instruction tuning script
-Download the [blended instruction tuning dataset](https://drive.google.com/file/d/1nzKwwYf8lYb9gN3P4YO8pFNU_B2nMYe1/view?usp=sharing) in your data home directory `$DATA_HOME` and update our templates in [tools/retro/sft/sft_retro_lm.sh`](tools/retro/sft/sft_retro_lm.sh).
+Download the [blended instruction tuning dataset](https://drive.google.com/file/d/1nzKwwYf8lYb9gN3P4YO8pFNU_B2nMYe1/view?usp=sharing) in your data home directory `$DATA_HOME` and update our templates in [tools/retro/sft/sft_retro_lm.sh`](sft/sft_retro_lm.sh).
 
 An example command to run instruction tuning on 843M Retro is as follows:
 ```bash
@@ -145,7 +151,7 @@ An example command to run instruction tuning on 843M Retro is as follows:
 bash tools/retro/sft/sft_retro_lm.sh       open_inst               843m            128    5e-6  <path/to/pretrained/retro>  
 ```
 
-The `blend_dataset_name` argument will blend all the datasets within the `$DATA_HOME` following the weights and configurations specified in the `${blend_dataset_name}.sh` (`open_inst.sh` in the example above).
+The `blend_dataset_name` argument will blend all the datasets within the `$DATA_HOME` following the weights and configurations specified in the `${blend_dataset_name}.sh` ([open_inst.sh](sft/open_inst.sh) in the example above).
 The checkpoints will be saved in the `--save` directory. For example, it will be saved to 
 `<SFT_HOME>/checkpoints/applications/retro-sft_pp1_same_format_ctx1_843m_128_5e-6`. 
 
