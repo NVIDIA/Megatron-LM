@@ -70,8 +70,11 @@ class ModelParallelConfig:
 
     tp_comm_split_ag (bool, default=True): If true, allows All-Gather overlap with Fprop GEMM. Don't care if tp_comm_overlap 
         is False.
-
+    tp_comm_atomic_ag (bool, default=True): If true, allows All-Gather overlap with Fprop GEMM. Don't care if tp_comm_overlap 
+        is False.
     tp_comm_split_rs (bool, default=True): If true, allows Reduce-Scatter overlap with Fprop GEMM. Don't care if 
+        tp_comm_overlap is False.
+    tp_comm_atomic_rs (bool, default=True): If true, allows Reduce-Scatter overlap with Fprop GEMM. Don't care if 
         tp_comm_overlap is False.
 
     tp_comm_bulk_dgrad (bool, default=True): If true, allows All-Gather overlap with Bprop activation gradient GEMM. Don't 
@@ -168,7 +171,9 @@ class ModelParallelConfig:
 
     # Debug Options
     tp_comm_split_ag: bool = True
+    tp_comm_atomic_ag: bool = True
     tp_comm_split_rs: bool = True
+    tp_comm_atomic_rs: bool = True
     tp_comm_bulk_wgrad: bool = True
     tp_comm_bulk_dgrad: bool = True
 
