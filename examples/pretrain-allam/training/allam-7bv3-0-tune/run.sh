@@ -11,8 +11,8 @@ GLOBAL_BATCH_SIZE=1024
 
 SAVE_INTERVAL=250
 LOG_INTERVAL=10
-EVAL_INTERVAL=2500
-EVAL_ITER=0
+EVAL_INTERVAL=250
+EVAL_ITER=10
 TOTAL_NUM_TOKENS=10_000_000_000
 
 # DISTRIBUTED_ARGS=(
@@ -53,7 +53,7 @@ LOGISTICS_ARGS=(
     --load $PRETRAINED_MODEL_PATH
     --load-iteration 120000
     --tokenizer-model $TOKENIZER_MODEL
-    --split 998,1,1
+    --split 99996,2,2 
     --log-interval $LOG_INTERVAL
     --save-interval $SAVE_INTERVAL 
     --eval-interval $EVAL_INTERVAL
@@ -108,8 +108,8 @@ python examples/data-processing/data_ratio_from_file.py \
 --prefix-for-file-path "\$BIN_IDX_PATH/" \
 --export-script "examples/pretrain-allam/training/allam-7bv3-0-tune/iterator_prob.sh"
 
-source "examples/pretrain-allam/training/allam-7bv3-0-tune/iterator_prob.sh"
-
+source examples/pretrain-allam/training/allam-7bv3-0-tune/iterator_prob.sh
+echo ${DATA_PATH[@]}
 # torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
 python pretrain_gpt.py \
     ${GPT_MODEL_ARGS[@]} \
