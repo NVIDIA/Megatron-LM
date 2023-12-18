@@ -6,8 +6,6 @@ CHECKPOINT_DIR=$5
 TENSORBOARD_LOGS_PATH=$6
 ENG_TOK=$7
 
-LR_RATE=3.0e-05
-LR_WARMUP_ITERS=0
 TRAIN_ITER=2500
 GLOBAL_BATCH_SIZE=1024
 
@@ -72,14 +70,14 @@ TRAINING_ARGS=(
     --micro-batch-size 1
     --global-batch-size $GLOBAL_BATCH_SIZE
     --train-iters $TRAIN_ITER
-    --lr $LR_RATE
+    --lr 3.0e-04 
     --lr-decay-style cosine 
     --weight-decay 0.1 
     --adam-beta1 0.9 
     --adam-beta2 0.95 
     --init-method-std 0.01
     --clip-grad 1.0 
-    --min-lr $LR_RATE
+    --min-lr 3.0e-05
     --lr-warmup-iters 2000
     --use-flash-attn
     --bf16
