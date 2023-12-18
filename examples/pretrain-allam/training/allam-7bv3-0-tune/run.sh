@@ -106,10 +106,10 @@ python examples/data-processing/data_ratio_from_file.py \
 --total-token $TOTAL_NUM_TOKENS \
 --exclude-iterator-json "examples/pretrain-allam/training/allam-7bv3-0-tune/exclude_iterator.json" \
 --prefix-for-file-path "\$BIN_IDX_PATH/" \
---export-script "examples/pretrain-allam/training/allam-7bv3-0-tune/iterator_prob.sh"
+--export-script "examples/pretrain-allam/training/allam-7bv3-0-tune/iterator_prob_$RANK.sh"
 
-source examples/pretrain-allam/training/allam-7bv3-0-tune/iterator_prob.sh
-echo ${DATA_PATH[@]}
+source examples/pretrain-allam/training/allam-7bv3-0-tune/iterator_prob_$RANK.sh
+
 # torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
 python pretrain_gpt.py \
     ${GPT_MODEL_ARGS[@]} \
