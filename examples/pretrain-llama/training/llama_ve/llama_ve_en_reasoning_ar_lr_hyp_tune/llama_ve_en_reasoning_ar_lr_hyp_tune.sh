@@ -5,6 +5,7 @@ BIN_IDX_PATH=$3
 DATA_CACHE=$4
 CHECKPOINT_DIR=$5
 TENSORBOARD_LOGS_PATH=$6
+LR_RATE=$7
 
 # DISTRIBUTED_ARGS=(
 #     --nproc_per_node $GPUS_PER_NODE 
@@ -54,12 +55,14 @@ TRAINING_ARGS=(
     --adam-beta2 0.95 
     --init-method-std 0.006 
     --clip-grad 1.0 
-    --lr 1.0e-5
-    --min-lr 1.0e-5
+    --lr $LR_RATE
+    --min-lr $LR_RATE
     --lr-warmup-iters 1000
     --lr-decay-style cosine 
     --use-flash-attn
     --bf16
+    --attention-dropout 0.0
+    --hidden-dropout 0.0
 )
 # --use-mcore-models
 

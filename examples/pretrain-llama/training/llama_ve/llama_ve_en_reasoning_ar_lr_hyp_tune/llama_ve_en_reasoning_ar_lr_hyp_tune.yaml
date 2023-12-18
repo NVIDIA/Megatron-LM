@@ -3,15 +3,16 @@
 $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
 command: >-
-  bash examples/pretrain-llama/training/llama_ve_en_reasoning_ar/llama_ve_en_reasoning_ar.sh \
+  bash examples/pretrain-llama/training/llama_ve_en_reasoning_ar_lr_hyp_tune/llama_ve_en_reasoning_ar_lr_hyp_tune.sh \
    ${{inputs.pretrained_llama_model}} \
    ${{inputs.tokenizer_model_path}} \
    ${{inputs.bin_idx_data_dir}} \
    ${{outputs.data_cache}} \
    ${{outputs.checkpoint_dir}} \
-   ${{outputs.tensorboard_dir}}
+   ${{outputs.tensorboard_dir}} \
+   ${{lr_rate}}
 
-display_name: LLaMa-VE-Allam-Reasoning-Data-with-Ar
+display_name: LLaMa-VE-Allam-Reasoning-Data-with-Ar-Lr-Hyp-Tune
 
 experiment_name: Vocab-Expansion
 code: ../../../../
@@ -64,5 +65,5 @@ distribution:
   process_count_per_instance: 8
 
 resources:
-  instance_count: 16
+  instance_count: 8
   shm_size: 1250g
