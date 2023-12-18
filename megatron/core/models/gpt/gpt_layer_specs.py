@@ -89,14 +89,11 @@ def _get_mlp_module_spec(
                 linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
             ),
         )
-    elif moe_grouped_gemm:
-        # GroupedMLP based MoE with modules in megatron core.
-        return GroupedGemmMoELayer
     else:
         # SwitchMLP based MoE with modules in megatron core.
         return ModuleSpec(
             module=SwitchMLPLayer,
-            submodules=MLPSubmodules(
-                linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear,
-            ),
+            submodules=MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear,)
+            if not moe_grouped_gemm
+            else None,
         )

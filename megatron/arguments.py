@@ -1417,14 +1417,16 @@ def _add_moe_args(parser):
                        help='When there are multiple experts per rank, compress '
                        'multiple local (potentially small) gemms in a single kernel '
                        'launch to improve the utilization and performance by '
-                       'leveraging the Grouped GEMM feature introduced since '
+                       'leveraging the Grouped GEMM feature introduced since ' 
                        'CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).')
     group.add_argument('--moe-aux-loss-coeff', type=float, default=1e-2,
                        help='Scaling coefficient for adding MoE loss to model loss')
     group.add_argument('--moe-z-loss-coeff', type=float, default=1e-3,
                        help='Scaling coefficient for adding MoE loss to model loss')
-    group.add_argument('--moe-router-type', type=str, default='top1',
+    group.add_argument('--moe-router-type', type=str, default='sinkhorn',
                        help='Options for router type, support top1 and ec')
+    group.add_argument('--moe-token-dropping',action='store_true',
+                       help='Drop or pad selected tokens for each expert as GShard, Swtich-Transformer and DeepSpeed-MoE.')
     # zero token drop moe arguments
     
     # token drop moe arugments

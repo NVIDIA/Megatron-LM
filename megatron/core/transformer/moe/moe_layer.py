@@ -35,10 +35,10 @@ class BaseMoELayer(MegatronModule, ABC):
         pass
 
 
-class BaseSwitchMLPLayer(BaseMoELayer):
-    def __init__(self, config: TransformerConfig, submodules: MLPSubmodules):
+class SwitchMLPLayer(BaseMoELayer):
+    def __init__(self, config: TransformerConfig, submodules: MLPSubmodules = None):
         self.submodules = submodules
-        super(BaseSwitchMLPLayer, self).__init__(config=config)
+        super(SwitchMLPLayer, self).__init__(config=config)
         self.num_local_experts = self.config.num_moe_experts // self.expert_parallel_size
         local_expert_indices_offset = (
             parallel_state.get_expert_model_parallel_rank() * self.num_local_experts
@@ -69,28 +69,12 @@ class BaseSwitchMLPLayer(BaseMoELayer):
 
         return output, mlp_bias
 
-
-class GroupedGemmMoELayer(BaseSwitchMLPLayer):
-    def __init__(self, config: TransformerConfig):
-        super(GroupedGemmMoELayer, self).__init__(config=config,)
-
     def initialize_experts(self):
-        experts = GroupedMLP(self.num_local_experts, self.config)
-        return experts
-
-    def initialize_router(self):
-        router = ZeroDropSinkhornRouter(
-            self.num_local_experts, self.local_expert_indices, self.config
-        )
-        return router
-
-
-class SwitchMLPLayer(BaseSwitchMLPLayer):
-    def __init__(self, config: TransformerConfig, submodules: MLPSubmodules):
-        super(SwitchMLPLayer, self).__init__(config=config, submodules=submodules)
-
-    def initialize_experts(self):
-        experts = SwitchMLP(self.num_local_experts, self.config, self.submodules)
+        if self.config.moe_grouped_gemm:
+            experts = GroupedMLP(self.num_local_experts, self.config)
+        else:
+            assert isinstance(self.submodules, MLPSubmodules)
+            experts = SwitchMLP(self.num_local_experts, self.config, self.submodules)
         return experts
 
     def initialize_router(self):

@@ -130,7 +130,10 @@ class TransformerConfig(ModelParallelConfig):
 
     # MoE related
     moe_grouped_gemm: bool = False
-    moe_aux_loss_coeff: float = 0.01
+    moe_aux_loss_coeff: float = 0  # 1e-2 would be a good start value for load balance loss.
+    moe_z_loss_coeff: float = 0  # 1e-3 would be a good start value for z-loss
+    moe_token_dropping: bool = False  # TODO: Support token dropping.
+    moe_router_type: str = "sinkhorn"
 
     def __post_init__(self):
         """ Python dataclass method that is used to modify attributes after initialization.
