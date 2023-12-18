@@ -1,0 +1,29 @@
+{
+    "ar" : {
+        "Allam-books": 3, 
+        "Allam-encyclopedias": 3, 
+        "Allam-news": 2, 
+        "Allam-others": 2, 
+        "Allam-transcribed": 2.5, 
+        "Allam-web": 1
+    },
+    "en" : {
+        "Pile-DM-Mathematics":3,
+        "Pile-FreeLaw":3,
+        "Pile-OpenSubtitles":1,
+        "Pile-OpenWebText2":1,
+        "Pile-PubMed-Abstracts":2,
+        "Pile-PubMed-Central":2,
+        "Pile-StackExchange":2,
+        "Pile-USPTO-Backgrounds":2,
+        "Pile-books2-books3-pgtbrg":3,
+        "Pile-enron-hn-nexpt-phil-ubuntu-yt-ep":2,
+        "dolma-c4": 3, 
+        "dolma-common-crawl": 1, 
+        "dolma-gutenberg-books":3,
+        "dolma-peS2o": 3, 
+        "dolma-stack-code": 1,
+        "dolma-wiki-en-simple": 1,
+        "openwebmath": 3
+    }
+}
