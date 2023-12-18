@@ -13,7 +13,6 @@ SAVE_INTERVAL=250
 LOG_INTERVAL=10
 EVAL_INTERVAL=2500
 EVAL_ITER=0
-SPLIT_INFO='99996,2,2'
 TOTAL_NUM_TOKENS=10_000_000_000
 
 # DISTRIBUTED_ARGS=(
@@ -54,7 +53,7 @@ LOGISTICS_ARGS=(
     --load $PRETRAINED_MODEL_PATH
     --load-iteration 120000
     --tokenizer-model $TOKENIZER_MODEL
-    --split $SPLIT_INFO
+    --split 998,1,1
     --log-interval $LOG_INTERVAL
     --save-interval $SAVE_INTERVAL 
     --eval-interval $EVAL_INTERVAL
