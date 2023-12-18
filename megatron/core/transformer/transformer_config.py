@@ -51,6 +51,8 @@ class TransformerConfig(ModelParallelConfig):
             fp8_amax_history_len (int): The length of the amax history window used for scaling factor computation.
             fp8_amax_compute_algo (str): Algorithm used for choosing the `amax` value for the scaling factor computation. There are 2 predefined choices: `max` chooses the largest `amax` in the history window, while `most_recent` always chooses the most recently seen value.
             fp8_wgrad (bool): When set to False, override FP8 config options and do the wgrad computation in higher precision. Defaults to True.
+            cpu_offloading (bool): When set to True, all the activations are offloaded to the CPU asynchronously
+            cpu_offloading_num_layers (int): Tells the number of transformer layers for which activations has to be offloaded.
             clone_scatter_output_in_embedding (bool): When set to true, clone the output of scatter_to_sequence_parallel_region in embedding layer to facilitate garbage collection of input.
             normalization (str): Swtich b/w `LayerNorm` and `RMSNorm` as normalization layers. For now, these are primarily used by Transformer-Engine's layers like `LayerNormLinear`. Default value is `LayerNorm`.
     """
