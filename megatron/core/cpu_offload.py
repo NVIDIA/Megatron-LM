@@ -86,8 +86,6 @@ class CpuOffloadHookWithOffloadHandler(CpuOffloadSavedTensorHook):
             tensor,
             **self.handler_extra_kwargs 
         )
-        if self.debug:
-           logging.info(f"On save tensor shape {tensor.shape} parameter {type(tensor)}, offload_handler returns identifier {retrieve_identifier}")
         return retrieve_identifier
     
     def on_get_saved_tensor(self, retrieve_identifier: Any) -> torch.Tensor:
@@ -95,8 +93,6 @@ class CpuOffloadHookWithOffloadHandler(CpuOffloadSavedTensorHook):
             retrieve_identifier, 
             **self.handler_extra_kwargs
         )
-        if self.debug:
-           logging.info(f"On get tensor, from identifier {retrieve_identifier} get tensor shape {tensor.shape}")
         return tensor
 
 class OffloadHandler:
@@ -157,9 +153,6 @@ class SynchronizedGroupOffloadHandler(OffloadHandler):
         self.tensor_tag_to_state = dict()
     
     def on_group_commit_forward(self):
-        if self.debug:
-            logging.info(f"on_group_commit_forward current_group: {self.current_group}")
-        
         # finishing up with updating current group and tensor count
         self.current_group += 1             # increment
         self.tensor_count_current_group = 0 # reset
@@ -167,9 +160,6 @@ class SynchronizedGroupOffloadHandler(OffloadHandler):
     def on_group_commit_backward(self):
         self.current_group -= 1
         assert self.current_group >= 0
-
-        if self.debug:
-            logging.info(f"on_group_commit_backward current_group: {self.current_group}")
 
     @staticmethod
     def offload(src_tensor, pin_memory=True):
@@ -192,9 +182,6 @@ class SynchronizedGroupOffloadHandler(OffloadHandler):
     def tensor_push(self, tensor: torch.Tensor, **kwargs):
         # obtain a unique tensor tag
         tensor_tag = (self.current_group, self.tensor_count_current_group)
-        if self.debug:
-            logging.info("tensor_push", tensor_tag, tensor.shape, type(tensor), 
-                         "need_offloading ?", self.tensor_need_offloading_checker(tensor))
         self.tensor_count_current_group += 1
         assert not (tensor_tag in self.tensor_tag_to_state)
         if self.current_group < self.num_offload_group and self.tensor_need_offloading_checker(tensor):
@@ -206,8 +193,6 @@ class SynchronizedGroupOffloadHandler(OffloadHandler):
     
     def tensor_pop(self, tensor_tag, **kwargs):
         assert tensor_tag in self.tensor_tag_to_state
-        if self.debug:
-            logging.info("tensor_pop", tensor_tag)
         state = self.tensor_tag_to_state.pop(tensor_tag)
         if isinstance(state, tuple):
             tensor = SynchronizedGroupOffloadHandler.reload(state)
@@ -262,8 +247,6 @@ class AsyncDoubleBufferGroupOffloadHandler(SynchronizedGroupOffloadHandler):
 
         if allocate_new_buf:
             # supposed to only execute once
-            if self.debug:
-                logging.info(f"Allocating tensor_buf for group {group_id} tensor {tensor_id} size {tensor.size()}")
             id_buf_map[tensor_id] = torch.empty(tensor.size(),
                                                 dtype=tensor.dtype,
                                                 layout=tensor.layout,
@@ -274,8 +257,6 @@ class AsyncDoubleBufferGroupOffloadHandler(SynchronizedGroupOffloadHandler):
     def tensor_push(self, tensor: torch.Tensor, **kwargs) -> Any:
         # obtain a unique tensor tag
         tensor_tag = (self.current_group, self.tensor_count_current_group)
-        if self.debug:
-            logging.info("tensor_push", tensor_tag, tensor.shape, type(tensor), "need_offloading ?", self.tensor_need_offloading_checker(tensor))
         self.tensor_count_current_group += 1
         assert not (tensor_tag in self.tensor_tag_to_state)
         
@@ -291,8 +272,6 @@ class AsyncDoubleBufferGroupOffloadHandler(SynchronizedGroupOffloadHandler):
     
     def tensor_pop(self, tensor_tag, **kwargs):
         assert tensor_tag in self.tensor_tag_to_state
-        if self.debug:
-            logging.info("tensor_pop", tensor_tag)
         tensor = self.tensor_tag_to_state.pop(tensor_tag)
         # the tensor should have been copied back in on_group_commit_backward() which invokes bulk_reload_group
         assert not isinstance(tensor, tuple) 
@@ -364,17 +343,12 @@ class AsyncDoubleBufferGroupOffloadHandler(SynchronizedGroupOffloadHandler):
         self.current_group -= 1
         assert self.current_group >= 0
 
-        if self.debug:
-            logging.info(f"on_group_commit_backward current_group: {self.current_group}")
-
         # decide the range of group to prefetch
         should_prefetch_until_group = self.current_group - self.num_prefetch_group
         if should_prefetch_until_group < 0:
             should_prefetch_until_group = 0
         
         # do prefetch
-        if self.debug:
-            logging.info(f"num_prefetch_group = {self.num_prefetch_group} num_offload_group = {self.num_offload_group} fetch from {self.next_group_to_fetch} to {should_prefetch_until_group}")
         for group_num_to_prefetch in range(self.next_group_to_fetch, should_prefetch_until_group - 1, -1):
             # record the event in the compute stream, for h2d to wait
             torch.cuda.current_stream().record_event(self.compute_stream_bwd_start_events[group_num_to_prefetch])
@@ -397,7 +371,7 @@ class AsyncDoubleBufferGroupOffloadHandler(SynchronizedGroupOffloadHandler):
 def get_cpu_offload_context(cpu_offloading, cpu_offloading_num_layers):
 
    def tensor_need_offloading_checker(tensor):
-      return (not isinstance(tensor, torch.nn.Parameter))
+      return not hasattr(tensor,"avoid_offloading")
 
    cpu_offload_handler = AsyncDoubleBufferGroupOffloadHandler(
                          num_offload_group=cpu_offloading_num_layers,
