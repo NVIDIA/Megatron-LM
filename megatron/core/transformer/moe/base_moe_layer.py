@@ -134,10 +134,10 @@ class BaseMoELayer(ABC, MegatronModule):
                 global_local_map = (global_indices >= self.local_expert_indices[0]) & (
                     global_indices <= self.local_expert_indices[-1]
                 )
-                local_indices = global_indices[global_local_map]
+                local_indices = global_indices.masked_select(global_local_map)
                 if self.k > 1:  # k > 1
                     global_probs = self.gather_indices(max_prob)
-                    local_probs = global_probs[global_local_map]
+                    local_probs = global_probs.masked_select(global_local_map)
                 else:
                     local_probs = max_prob
                 # Reshape global_local_map to be compatible with Tensor.gather
