@@ -94,6 +94,13 @@ MODEL_PARALLEL_ARGS=(
 
 echo "{\"en\": $ENG_TOK,\"ar\": $AR_TOK}" > examples/pretrain-allam/training/allam-7bv3-0.tune/lang_prob.json
 
+if [ ! -f "examples/pretrain-allam/training/allam-7bv3-0.tune/data.json" ]; then
+    python examples/data-processing/remote_list.py \
+    --az-configs "examples/configs/azure_login_configs.json" \
+    --input-folder-path "https://allamllmuksstandard.blob.core.windows.net/llm-data/data_repo/tokenize_by_v5_improved/meglm_tok_v5_improved_bin_idx/" \
+    --export-data-signature "examples/pretrain-allam/training/allam-7bv3-0.tune/data.json"
+fi
+
 python examples/data-processing/data_ratio_from_file.py \
 --prefix-paths-from-json "examples/pretrain-allam/training/allam-7bv3-0.tune/data.json" \
 --domain-ratio-from-json "examples/pretrain-allam/training/allam-7bv3-0.tune/data_ratio.json" \
