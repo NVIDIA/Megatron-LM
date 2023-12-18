@@ -11,7 +11,7 @@ GLOBAL_BATCH_SIZE=1024
 
 SAVE_INTERVAL=250
 LOG_INTERVAL=10
-EVAL_INTERVAL=0
+EVAL_INTERVAL=2500
 EVAL_ITER=0
 SPLIT_INFO='998,1,1'
 TOTAL_NUM_TOKENS=10_000_000_000
@@ -50,7 +50,7 @@ GPT_MODEL_ARGS=(
 )
 
 LOGISTICS_ARGS=(
-    --save $CHECKPOINT_DIR 
+    --save $CHECKPOINT_DIR/$ENG_TOK-$AR_TOK
     --load $PRETRAINED_MODEL_PATH
     --load-iteration 120000
     --tokenizer-model $TOKENIZER_MODEL
@@ -69,8 +69,9 @@ LOGISTICS_ARGS=(
 TRAINING_ARGS=(
     --micro-batch-size 1
     --global-batch-size $GLOBAL_BATCH_SIZE
-    --train-iters $TRAIN_ITER
-    --lr 3.0e-04 
+    --train-iters $TRAIN_ITER    
+    --override-opt_param-scheduler
+    --lr 3.0e-05
     --lr-decay-style cosine 
     --weight-decay 0.1 
     --adam-beta1 0.9 
@@ -78,7 +79,7 @@ TRAINING_ARGS=(
     --init-method-std 0.01
     --clip-grad 1.0 
     --min-lr 3.0e-05
-    --lr-warmup-iters 2000
+    --lr-warmup-iters 0
     --use-flash-attn
     --bf16
 )
