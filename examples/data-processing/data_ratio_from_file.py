@@ -35,8 +35,9 @@ def get_args():
     return args
 
 def normalize(in_json):
+    total = sum(in_json.values())
     for k, v in in_json.items():
-        in_json[k] = v/sum(in_json.values())
+        in_json[k] = v/total
     return in_json
 
 if __name__ == "__main__":
