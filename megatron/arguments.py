@@ -397,6 +397,19 @@ def validate_args(args, defaults={}):
     # MoE Spec check
     if args.num_experts is not None:
         assert args.spec is None, "Model Spec must be None when using MoEs"
+        if args.moe_router_type.lower().startswith("top"):
+            try:
+                k = int(args.moe_router_type[3:])
+                assert k > 0, "Invalid topk router name: {}, please ensure k > 0.".format(
+                    args.moe_router_type
+                )
+            except:
+                raise RuntimeError(
+                    "Invalid `topk` router name: `{}`. Please use the format `topk`, where `k` must be an integer.".format(
+                        args.moe_router_type
+                    )
+                )
+            
 
     # Expert parallelism check
     if args.expert_model_parallel_size  > 1:
@@ -1409,27 +1422,43 @@ def _add_vision_args(parser):
 
 def _add_moe_args(parser):
     group = parser.add_argument_group(title="moe")
-
     # general moe arguements
-    group.add_argument('--num-experts', type=int, default=None,
-                       help='Number of Experts in MoE (None means no MoE)')
-    group.add_argument('--moe-grouped-gemm', action='store_true',
-                       help='When there are multiple experts per rank, compress '
-                       'multiple local (potentially small) gemms in a single kernel '
-                       'launch to improve the utilization and performance by '
-                       'leveraging the Grouped GEMM feature introduced since ' 
-                       'CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).')
-    group.add_argument('--moe-aux-loss-coeff', type=float, default=1e-2,
-                       help='Scaling coefficient for adding MoE loss to model loss')
-    group.add_argument('--moe-z-loss-coeff', type=float, default=1e-3,
-                       help='Scaling coefficient for adding MoE loss to model loss')
-    group.add_argument('--moe-router-type', type=str, default='sinkhorn',
-                       help='Options for router type, support top1 and ec')
-    group.add_argument('--moe-token-dropping',action='store_true',
-                       help='Drop or pad selected tokens for each expert as GShard, Swtich-Transformer and DeepSpeed-MoE.')
+    group.add_argument(
+        '--num-experts', type=int, default=None, help='Number of Experts in MoE (None means no MoE)'
+    )
+    group.add_argument(
+        '--moe-grouped-gemm',
+        action='store_true',
+        help='When there are multiple experts per rank, compress '
+        'multiple local (potentially small) gemms in a single kernel '
+        'launch to improve the utilization and performance by '
+        'leveraging the Grouped GEMM feature introduced since '
+        'CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).',
+    )
+    group.add_argument(
+        '--moe-aux-loss-coeff',
+        type=float,
+        default=0.0,
+        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.',
+    )
+    group.add_argument(
+        '--moe-z-loss-coeff',
+        type=float,
+        default=0.0,
+        help='Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended.',
+    )
+    group.add_argument(
+        '--moe-router-type',
+        type=str,
+        default='sinkhorn',
+        help='Options for router type. Currently supports sinkhorn and topk router.',
+    )
+    group.add_argument(
+        '--moe-token-dropping',
+        action='store_true',
+        help='Currently unsupported. This feature involves selectively dropping and padding tokens for each expert to achieve a specified capacity, similar to to GShard, Switch-Transformer, and DeepSpeed-MoE.',
+    )
     # zero token drop moe arguments
-    
-    # token drop moe arugments
 
     return parser
 

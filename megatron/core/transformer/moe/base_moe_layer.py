@@ -138,23 +138,6 @@ class Router(ABC, MegatronModule):
         logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
         return logits
 
-    def switch_transformer_load_balancing_loss(self, gates, mask):
-        """Calculate the auxiliary loss for better load balacing. 
-        Please refer to the Switch Transformer paper (https://arxiv.org/abs/2101.03961) for details.
-
-        Args:
-            gates (torch.Tensor): The gates tensor representing the routing probabilities for each expert.
-            mask (torch.Tensor): The 2D mask tensor indicating which experts are selected.
-
-        Returns:
-            torch.Tensor: The auxiliary loss for load balancing.
-        """
-        gates_mean = gates.mean(dim=0)
-        selection_mean = mask.float().mean(dim=0)
-        aux_loss = torch.sum(gates_mean * selection_mean) * self.num_experts
-        aux_loss *= self.config.aux_loss_coeff
-        return aux_loss
-
 
 class MoETokenDispatcher:
     """
@@ -204,14 +187,16 @@ class MoEZeroDropTokenDispatcher(MoETokenDispatcher):
     Token dispatcher without token dropping.
     """
 
-    def __init__(self, num_local_experts, local_expert_indices, config: TransformerConfig) -> None:
+    def __init__(
+        self, num_local_experts, local_expert_indices, k, config: TransformerConfig
+    ) -> None:
         """
         Initialize the zero token dropping router.
         """
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
         self.local_expert_indices = local_expert_indices
-        self.k = 1
+        self.k = k
         self.add_bias = config.add_bias_linear
 
     def gather_indices(self, local_indices):
@@ -301,7 +286,13 @@ class MoEZeroDropTokenDispatcher(MoETokenDispatcher):
         # Reshape indices to be compatible with Tensor.gather
         indices = indices.view(-1, 1).expand(-1, hidden_states.shape[-1])
         permuted_local_hidden_states = torch.gather(local_hidden_states, 0, indices)
-        return permuted_local_hidden_states, tokens_per_expert, local_probs, indices, global_local_map
+        return (
+            permuted_local_hidden_states,
+            tokens_per_expert,
+            local_probs,
+            indices,
+            global_local_map,
+        )
 
     def restore(self, hidden_states, scores, indices, global_local_map=None, bias=None):
         """
@@ -330,7 +321,7 @@ class MoEZeroDropTokenDispatcher(MoETokenDispatcher):
 
         # Scale the expert output prior to reduction and subsequent to local unpermutation if k > 1.
         if self.k > 1:
-            unpermuted_local_hidden = unpermuted_local_hidden * scores
+            unpermuted_local_hidden = unpermuted_local_hidden * scores.view(-1, 1)
 
         unpermuted_local_bias = None
         if self.add_bias:
@@ -339,7 +330,7 @@ class MoEZeroDropTokenDispatcher(MoETokenDispatcher):
             assert indices.shape == bias.shape
             unpermuted_local_bias = unpermuted_local_bias.scatter(0, indices, bias)
             if self.k > 1:
-                unpermuted_local_bias = unpermuted_local_bias * scores
+                unpermuted_local_bias = unpermuted_local_bias * scores.view(-1, 1)
 
         output_total = unpermuted_local_hidden
         output_bias_total = None
@@ -400,12 +391,14 @@ class ZeroDropSinkhornRouter(Router):
         Initialize the zero token dropping router.
         """
         super().__init__(config=config)
+        assert config.moe_token_dropping == False
+        assert config.moe_router_type == "sinkhorn"
         self.route_algo = self.sinkhorn
         self.router_activation = torch.sigmoid
-        self.token_dispatcher = MoEZeroDropTokenDispatcher(
-            num_local_experts, local_expert_indices, config
-        )
         self.k = 1
+        self.token_dispatcher = MoEZeroDropTokenDispatcher(
+            num_local_experts, local_expert_indices, self.k, config
+        )
 
     def sinkhorn(self, cost, tol=0.0001):
         "Sinkhorn based MoE routing function"
@@ -446,6 +439,51 @@ class ZeroDropSinkhornRouter(Router):
         else:
             logits = self.router_activation(logits)
             scores, indices = torch.topk(logits, k=self.k, dim=1)
+
+        return scores, indices
+
+
+class ZeroDropTopKRouter(Router):
+    """
+    Sinkhorn Router without token dropping.
+    """
+
+    def __init__(self, num_local_experts, local_expert_indices, config: TransformerConfig) -> None:
+        """
+        Initialize the zero token dropping router.
+        """
+        super().__init__(config=config)
+        assert config.moe_token_dropping == False
+        assert config.moe_router_type.startswith("top")
+        # extract k from config.moe_router_type
+        self.k = int(config.moe_router_type[3:])
+        self.token_dispatcher = MoEZeroDropTokenDispatcher(
+            num_local_experts, local_expert_indices, self.k, config
+        )
+        self.moe_aux_loss_func = switch_load_balancing_loss_func
+
+    def routing(self, logits: torch.Tensor):
+        """
+        Get the routing results.
+
+        Args:
+            logits (torch.Tensor): Logits tensor.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: Tuple of tensors representing max probs and the indices.
+        """
+        logits = logits.view(-1, self.config.num_moe_experts)
+        logits = logits.to(dtype=torch.float32)
+
+        if self.config.moe_z_loss_coeff > 0:
+            # Apply Z-Loss
+            logits = self.apply_z_loss(logits)
+
+        scores, indices = torch.topk(logits, k=self.k, dim=1)
+
+        if self.config.moe_aux_loss_coeff > 0:
+            # Apply load balancing loss
+            scores = self.apply_aux_loss(self.moe_aux_loss_func, scores, indices)
 
         return scores, indices
 

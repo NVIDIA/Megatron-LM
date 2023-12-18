@@ -7,7 +7,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.moe.base_moe_layer import ZeroDropSinkhornRouter
+from megatron.core.transformer.moe.base_moe_layer import ZeroDropSinkhornRouter, ZeroDropTopKRouter
 from megatron.core.transformer.moe.grouped_mlp import GroupedMLP
 from megatron.core.transformer.moe.switch_mlp import SwitchMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -36,6 +36,14 @@ class BaseMoELayer(MegatronModule, ABC):
 
 
 class SwitchMLPLayer(BaseMoELayer):
+    """
+    Top-K Mixture of Experts Layer Without Token Dropping.
+    Currently supports Sinkhorn-based expert routing (Top-1 only) and a generalized Top-k routing with Z loss and auxiliary loss.
+
+    Args:
+        BaseMoELayer (MegatronModule): Base class for MoE layers
+    """
+
     def __init__(self, config: TransformerConfig, submodules: MLPSubmodules = None):
         self.submodules = submodules
         super(SwitchMLPLayer, self).__init__(config=config)
@@ -48,6 +56,7 @@ class SwitchMLPLayer(BaseMoELayer):
         ]
         self.router = self.initialize_router()
         self.experts = self.initialize_experts()
+        assert config.moe_token_dropping is False
 
     def forward(self, hidden_states):
         # process MoE
@@ -78,7 +87,14 @@ class SwitchMLPLayer(BaseMoELayer):
         return experts
 
     def initialize_router(self):
-        router = ZeroDropSinkhornRouter(
-            self.num_local_experts, self.local_expert_indices, self.config
-        )
+        if self.config.moe_router_type.lower().startswith("top"):
+            router = ZeroDropTopKRouter(
+                self.num_local_experts, self.local_expert_indices, self.config
+            )
+        elif self.config.moe_router_type.lower() == "sinkhorn":
+            router = ZeroDropSinkhornRouter(
+                self.num_local_experts, self.local_expert_indices, self.config
+            )
+        else:
+            raise NotImplementedError(f"Routing method {self.config.moe_router_type} not supported")
         return router

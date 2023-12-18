@@ -60,6 +60,10 @@ class TransformerConfig(ModelParallelConfig):
             window_size ((int,int) or None): If not None, then will use sliding window attention. The size of the window is specified by the numbers inside the tuple; -1 is special value meaning "infinite window size".
             moe_grouped_gemm (bool): When there are multiple experts per rank, compress multiple local (potentially small)
             gemms in a single kernel launch to improve the utilization and performance by leveraging the Grouped GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
+            moe_aux_loss_coeff (float): Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.
+            moe_z_loss_coeff (float): Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended.
+            moe_router_type (str): Options for router type. Currently supports sinkhorn and topk router.
+            moe_token_dropping (bool): Currently unsupported. This feature involves selectively dropping and padding tokens for each expert to achieve a specified capacity, similar to to GShard, Switch-Transformer, and DeepSpeed-MoE.,
     """
 
     # model architecture
