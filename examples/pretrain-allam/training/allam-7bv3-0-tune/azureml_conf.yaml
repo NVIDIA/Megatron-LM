@@ -12,9 +12,9 @@ command: >-
    ${{outputs.checkpoint_dir}} \
    ${{ENG_TOK}}
 
-display_name: allam-7bv3.0_dolma.tune
+display_name: allam-7bv3-0_dolma-tune
 
-experiment_name: 7b_v3.0
+experiment_name: 7b_v3-0-tune
 code: ../../../../
 environment: azureml:Megatron-LLaMA:7
 environment_variables:

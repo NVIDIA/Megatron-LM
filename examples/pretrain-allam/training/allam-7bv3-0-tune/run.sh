@@ -92,25 +92,25 @@ MODEL_PARALLEL_ARGS=(
     --no-async-tensor-model-parallel-allreduce
 )
 
-echo "{\"en\": $ENG_TOK,\"ar\": $AR_TOK}" > examples/pretrain-allam/training/allam-7bv3-0.tune/lang_prob.json
+echo "{\"en\": $ENG_TOK,\"ar\": $AR_TOK}" > examples/pretrain-allam/training/allam-7bv3-0-tune/lang_prob.json
 
-if [ ! -f "examples/pretrain-allam/training/allam-7bv3-0.tune/data.json" ]; then
+if [ ! -f "examples/pretrain-allam/training/allam-7bv3-0-tune/data.json" ]; then
     python examples/data-processing/remote_list.py \
     --az-configs "examples/configs/azure_login_configs.json" \
     --input-folder-path "https://allamllmuksstandard.blob.core.windows.net/llm-data/data_repo/tokenize_by_v5_improved/meglm_tok_v5_improved_bin_idx/" \
-    --export-data-signature "examples/pretrain-allam/training/allam-7bv3-0.tune/data.json"
+    --export-data-signature "examples/pretrain-allam/training/allam-7bv3-0-tune/data.json"
 fi
 
 python examples/data-processing/data_ratio_from_file.py \
---prefix-paths-from-json "examples/pretrain-allam/training/allam-7bv3-0.tune/data.json" \
---domain-ratio-from-json "examples/pretrain-allam/training/allam-7bv3-0.tune/data_ratio.json" \
---lang-select-prob-json "examples/pretrain-allam/training/allam-7bv3-0.tune/lang_prob.json" \
+--prefix-paths-from-json "examples/pretrain-allam/training/allam-7bv3-0-tune/data.json" \
+--domain-ratio-from-json "examples/pretrain-allam/training/allam-7bv3-0-tune/data_ratio.json" \
+--lang-select-prob-json "examples/pretrain-allam/training/allam-7bv3-0-tune/lang_prob.json" \
 --total-token $TOTAL_NUM_TOKENS \
---exclude-iterator-json "examples/pretrain-allam/training/allam-7bv3-0.tune/exclude_iterator.json" \
+--exclude-iterator-json "examples/pretrain-allam/training/allam-7bv3-0-tune/exclude_iterator.json" \
 --prefix-for-file-path "\$BIN_IDX_PATH/" \
---export-script "examples/pretrain-allam/training/allam-7bv3-0.tune/iterator_selection_prob.sh"
+--export-script "examples/pretrain-allam/training/allam-7bv3-0-tune/iterator_prob.sh"
 
-source "examples/pretrain-allam/training/allam-7bv3-0.tune/iterator_selection_prob.sh"
+source "examples/pretrain-allam/training/allam-7bv3-0-tune/iterator_prob.sh"
 
 # torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
 python pretrain_gpt.py \
