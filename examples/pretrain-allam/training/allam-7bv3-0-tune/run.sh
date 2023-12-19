@@ -6,15 +6,6 @@ CHECKPOINT_DIR=$5
 TENSORBOARD_LOGS_PATH=$6
 ENG_TOK=$7
 
-TRAIN_ITER=2500
-GLOBAL_BATCH_SIZE=1024
-
-SAVE_INTERVAL=250
-LOG_INTERVAL=10
-EVAL_INTERVAL=250
-EVAL_ITER=10
-TOTAL_NUM_TOKENS=10_000_000_000
-
 # DISTRIBUTED_ARGS=(
 #     --nproc_per_node $GPUS_PER_NODE 
 #     --nnodes $NUM_NODES 
@@ -55,12 +46,12 @@ LOGISTICS_ARGS=(
     --dataloader-type reset-single
     --tokenizer-model $TOKENIZER_MODEL
     --split 99996,2,2 
-    --log-interval $LOG_INTERVAL
-    --save-interval $SAVE_INTERVAL 
-    --eval-interval $EVAL_INTERVAL
-    --eval-iters $EVAL_ITER
+    --log-interval 10
+    --save-interval 250 
+    --eval-interval 250
+    --eval-iters 10
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
-    --tensorboard-log-interval $LOG_INTERVAL
+    --tensorboard-log-interval 10
     --data-cache-path $DATA_CACHE
     --log-validation-ppl-to-tensorboard 
     --seed 1234
@@ -68,8 +59,8 @@ LOGISTICS_ARGS=(
 
 TRAINING_ARGS=(
     --micro-batch-size 1
-    --global-batch-size $GLOBAL_BATCH_SIZE
-    --train-iters $TRAIN_ITER    
+    --global-batch-size 1024
+    --train-iters 122500
     --override-opt_param-scheduler
     --lr 3.0e-05
     --lr-decay-style cosine 
