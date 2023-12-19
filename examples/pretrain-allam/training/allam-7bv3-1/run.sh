@@ -54,7 +54,7 @@ LOGISTICS_ARGS=(
 TRAINING_ARGS=(
     --micro-batch-size 1
     --global-batch-size 1024
-    --train-iters 120000
+    --train-iters 240000
     --override-opt_param-scheduler
     --lr 3.0e-05 
     --lr-decay-style cosine 
