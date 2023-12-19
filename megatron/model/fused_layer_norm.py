@@ -81,7 +81,7 @@ class MixedFusedLayerNorm(torch.nn.Module):
     if self.no_persist_layer_norm:
         assert FusedLayerNormAffineFunction is not None, \
             "FusedLayerNormAffineFunction is not available, please install apex from https://github.com/NVIDIA/apex"
-        return FusedLayerNormAffineFunction.apply(input, weight, self.bias, self.normalized_shape, self.eps)
+        return FusedLayerNormAffineFunction.apply(input, weight, self.bias, self.normalized_shape, self.eps, False)
     else:
         output = FastLayerNormFN.apply(input, weight, self.bias, self.eps)
 
