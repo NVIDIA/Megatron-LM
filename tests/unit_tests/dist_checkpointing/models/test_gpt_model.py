@@ -71,6 +71,7 @@ class TestGPTModelReconfiguration:
             Utils.initialize_model_parallel(*src_tp_pp)
             gpt_model_A = initialize_gpt_model(1)
             save(gpt_model_A.sharded_state_dict(), ckpt_dir_A)
+            regular_state_dict_A = gpt_model_A.state_dict()
             Utils.destroy_model_parallel()
 
             # Load checkpoint A with different TP/PP and save as checkpoint B
@@ -79,14 +80,25 @@ class TestGPTModelReconfiguration:
             state_dict = load(gpt_model_B.sharded_state_dict(), ckpt_dir_A)
             gpt_model_B.load_state_dict(state_dict)
             save(gpt_model_B.sharded_state_dict(), ckpt_dir_B)
+            regular_state_dict_B = gpt_model_A.state_dict()
             Utils.destroy_model_parallel()
 
             # Test both checkpoints are equal
             Utils.initialize_model_parallel(1, 1)
-            state_dict_A = load_plain_tensors(ckpt_dir_A)
-            state_dict_B = load_plain_tensors(ckpt_dir_B)
-            diffs = diff(state_dict_A, state_dict_B)
+            plain_state_dict_A = load_plain_tensors(ckpt_dir_A)
+            plain_state_dict_B = load_plain_tensors(ckpt_dir_B)
+            diffs = diff(plain_state_dict_A, plain_state_dict_B)
             assert not any(map(bool, diffs)), diffs
+
+            # Test both regular state dicts are equal, turning FP8 states to bytes first
+            regular_state_dict_A = {k: v.read() if k.endswith('_extra_state') else v
+                                    for k, v in regular_state_dict_A.items()}
+            regular_state_dict_B = {k: v.read() if k.endswith('_extra_state') else v
+                                    for k, v in regular_state_dict_B.items()}
+            diffs = diff(regular_state_dict_A, regular_state_dict_B)
+            assert not any(map(bool, diffs)), diffs
+            Utils.destroy_model_parallel()
+
 
     def test_state_dict_comparison(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(2, 4)
