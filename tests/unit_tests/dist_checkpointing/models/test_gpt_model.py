@@ -14,11 +14,11 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.models.gpt.gpt_layer_specs import \
-    get_gpt_layer_with_transformer_engine_spec, get_gpt_layer_local_spec, \
+    get_gpt_layer_with_transformer_engine_spec as gpt_te_spec, get_gpt_layer_local_spec as gpt_local_spec, \
     gpt_layer_with_transformer_engine_spec_moe, gpt_layer_local_spec_moe
 
 
-def initialize_gpt_model(seed, layer_spec_fn=get_gpt_layer_with_transformer_engine_spec, **config_kwargs):
+def initialize_gpt_model(seed, layer_spec_fn=gpt_te_spec, **config_kwargs):
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
 
@@ -37,19 +37,19 @@ def initialize_gpt_model(seed, layer_spec_fn=get_gpt_layer_with_transformer_engi
 
 
 class TestGPTModel:
-    @pytest.mark.parametrize('layer_spec_fn', [
-        get_gpt_layer_with_transformer_engine_spec,
-        get_gpt_layer_local_spec,
-    ])
-    def test_sharded_state_dict_save_load(self, layer_spec_fn, tmp_path_dist_ckpt):
+    @pytest.mark.parametrize('src_layer_spec_fn', [gpt_te_spec, gpt_local_spec])
+    @pytest.mark.parametrize('dst_layer_spec_fn', [gpt_te_spec, gpt_local_spec])
+    def test_sharded_state_dict_save_load(self, tmp_path_dist_ckpt,
+                                          src_layer_spec_fn, dst_layer_spec_fn):
         Utils.initialize_model_parallel(2,4)
-        gpt_model = initialize_gpt_model(1, layer_spec_fn)
+        gpt_model = initialize_gpt_model(1, src_layer_spec_fn)
         with TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model') as ckpt_dir:
             # Save
             sharded_state_dict = gpt_model.sharded_state_dict()
             save(sharded_state_dict, ckpt_dir)
 
             # Load
+            gpt_model = initialize_gpt_model(2, dst_layer_spec_fn)
             sharded_state_dict = gpt_model.sharded_state_dict()
             state_dict = load(sharded_state_dict, ckpt_dir)
             gpt_model.load_state_dict(state_dict)
@@ -57,26 +57,30 @@ class TestGPTModel:
 
 
 class TestGPTModelReconfiguration:
-    @pytest.mark.parametrize("src_tp_pp,dest_tp_pp", [
-        ((2, 4), (4, 2)),
-        ((1, 8), (8, 1)),
-        ((2, 1), (1, 8)),
-        ((1, 1), (2, 2)),
+    @pytest.mark.parametrize("src_tp_pp,dest_tp_pp,src_layer_spec_fn,dst_layer_spec_fn", [
+        ((2, 4), (4, 2), gpt_te_spec, gpt_te_spec),
+        ((1, 8), (8, 1), gpt_te_spec, gpt_te_spec),
+        ((2, 1), (1, 8), gpt_te_spec, gpt_te_spec),
+        ((1, 1), (2, 2), gpt_te_spec, gpt_te_spec),
+        ((2, 1), (1, 8), gpt_local_spec, gpt_local_spec),
+        ((1, 1), (2, 4), gpt_te_spec, gpt_local_spec),
+        ((1, 8), (2, 1), gpt_local_spec, gpt_te_spec),
     ])
-    def test_parallel_reconfiguration_e2e(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp):
+    def test_parallel_reconfiguration_e2e(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp,
+                                          src_layer_spec_fn, dst_layer_spec_fn):
         """ Test model saving and loading with different TP/PP """
         with TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_A') as ckpt_dir_A, \
              TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_B') as ckpt_dir_B:
             # Save checkpoint A
             Utils.initialize_model_parallel(*src_tp_pp)
-            gpt_model_A = initialize_gpt_model(1)
+            gpt_model_A = initialize_gpt_model(1, src_layer_spec_fn)
             save(gpt_model_A.sharded_state_dict(), ckpt_dir_A)
             regular_state_dict_A = gpt_model_A.state_dict()
             Utils.destroy_model_parallel()
 
             # Load checkpoint A with different TP/PP and save as checkpoint B
             Utils.initialize_model_parallel(*dest_tp_pp)
-            gpt_model_B = initialize_gpt_model(2)
+            gpt_model_B = initialize_gpt_model(2, dst_layer_spec_fn)
             state_dict = load(gpt_model_B.sharded_state_dict(), ckpt_dir_A)
             gpt_model_B.load_state_dict(state_dict)
             save(gpt_model_B.sharded_state_dict(), ckpt_dir_B)
@@ -91,10 +95,10 @@ class TestGPTModelReconfiguration:
             assert not any(map(bool, diffs)), diffs
 
             # Test both regular state dicts are equal, turning FP8 states to bytes first
-            regular_state_dict_A = {k: v.read() if k.endswith('_extra_state') else v
-                                    for k, v in regular_state_dict_A.items()}
-            regular_state_dict_B = {k: v.read() if k.endswith('_extra_state') else v
-                                    for k, v in regular_state_dict_B.items()}
+            regular_state_dict_A = {k: v for k, v in regular_state_dict_A.items()
+                                    if not k.endswith('_extra_state')}
+            regular_state_dict_B = {k: v for k, v in regular_state_dict_B.items()
+                                    if not k.endswith('_extra_state')}
             diffs = diff(regular_state_dict_A, regular_state_dict_B)
             assert not any(map(bool, diffs)), diffs
             Utils.destroy_model_parallel()

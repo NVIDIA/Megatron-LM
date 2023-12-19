@@ -3,10 +3,11 @@
 # Parts of the code here are adapted from PyTorch
 # repo: https://github.com/pytorch/pytorch
 
+import io
 import math
 import os
 import warnings
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -710,6 +711,9 @@ class ColumnParallelLinear(torch.nn.Module):
             self.sequence_parallel or self.expert_parallel
         )
 
+        # Hook adding a default empty _extra_state for state dict
+        self._register_load_state_dict_pre_hook(lambda state_dict, prefix, *args, **kwargs: state_dict.setdefault(f'{prefix}_extra_state'))
+
     def forward(self, input_: torch.Tensor, weight: Optional[torch.Tensor] = None):
         """Forward of ColumnParallelLinear
 
@@ -781,6 +785,15 @@ class ColumnParallelLinear(torch.nn.Module):
         return make_sharded_tensors_for_checkpoint(
             state_dict, prefix, {'weight': 0, 'bias': 0}, sharded_offsets
         )
+
+    def set_extra_state(self, state: Any):
+        """ Extra state is ignored """
+
+    def get_extra_state(self) -> Any:
+        """ Keep compatibility with TE state dict. """
+        state_serialized = io.BytesIO()
+        torch.save(None, state_serialized)
+        return state_serialized
 
 
 class RowParallelLinear(torch.nn.Module):
@@ -904,6 +917,9 @@ class RowParallelLinear(torch.nn.Module):
             self.sequence_parallel or self.expert_parallel
         )
 
+        # Hook adding a default empty _extra_state for state dict
+        self._register_load_state_dict_pre_hook(lambda state_dict, *args, **kwargs: print('%' * 100) or state_dict.setdefault('_extra_state'))
+
     def forward(self, input_):
         """Forward of RowParallelLinear
 
@@ -956,3 +972,12 @@ class RowParallelLinear(torch.nn.Module):
         return make_sharded_tensors_for_checkpoint(
             state_dict, prefix, {'weight': 1}, sharded_offsets
         )
+
+    def set_extra_state(self, state: Any):
+        """ Extra state is ignored """
+
+    def get_extra_state(self) -> Any:
+        """ Keep compatibility with TE state dict. """
+        state_serialized = io.BytesIO()
+        torch.save(None, state_serialized)
+        return state_serialized

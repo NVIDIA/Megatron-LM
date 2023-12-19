@@ -1,11 +1,13 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-from dataclasses import dataclass
-from typing import Union
+from dataclasses import dataclass, field
+from typing import Union, Dict
 
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.module import MegatronModule
@@ -28,6 +30,9 @@ class TransformerLayerSubmodules:
     mlp: Union[ModuleSpec, type] = IdentityOp
     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
+    # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
+    sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
+
 
 class TransformerLayer(MegatronModule):
     """A single transformer layer.
@@ -44,6 +49,7 @@ class TransformerLayer(MegatronModule):
         hidden_dropout: float = None,
     ):
         super().__init__(config=config)
+        self.submodules_config = submodules
 
         self.layer_number = layer_number + self._get_layer_offset()
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
@@ -214,3 +220,11 @@ class TransformerLayer(MegatronModule):
         )
 
         return output, context
+
+    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()) -> ShardedStateDict:
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets)
+        prefixed_map = {f'{prefix}{k}': f'{prefix}{v}'
+                        for k, v in self.submodules_config.sharded_state_dict_keys_map.items()}
+        if prefixed_map:
+            apply_prefix_mapping(sharded_state_dict, prefixed_map)
+        return sharded_state_dict
