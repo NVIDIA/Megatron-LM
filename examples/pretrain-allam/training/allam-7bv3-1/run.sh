@@ -37,6 +37,7 @@ GPT_MODEL_ARGS=(
 LOGISTICS_ARGS=(
     --save $CHECKPOINT_DIR 
     --load $PRETRAINED_MODEL_PATH
+    --dataloader-type reset-single
     --tokenizer-model $TOKENIZER_MODEL
     --split 99996,2,2 
     --log-interval 100
