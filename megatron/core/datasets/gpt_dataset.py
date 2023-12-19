@@ -88,14 +88,14 @@ class GPTDataset(MegatronDataset):
         """
         return self.sample_index.shape[0] - 1
 
-    def __getitem__(self, idx: int) -> Dict[str, Union[torch.Tensor, numpy.ndarray]]:
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """Abstract method implementation
 
         Args:
             idx (int): The index into the dataset
 
         Returns:
-            Dict[str, numpy.ndarray]: The text ids wrapped in a dictionary
+            Dict[str, torch.Tensor]: The text ids wrapped in a dictionary
         """
         text, _ = self._query_document_sample_shuffle_indices(idx)
 
@@ -106,13 +106,20 @@ class GPTDataset(MegatronDataset):
         tokens = tokens_[:-1].contiguous()
 
         attention_mask, loss_mask, position_ids = _get_ltor_masks_and_position_ids(
-         tokens,
-         self.config.eod_id,
-         self.config.reset_position_ids,
-         self.config.reset_attention_mask,
-         self.config.eod_mask_loss)
+            tokens,
+            self.config.eod_id,
+            self.config.reset_position_ids,
+            self.config.reset_attention_mask,
+            self.config.eod_mask_loss,
+        )
 
-        return {"tokens": tokens,"labels": labels,"attention_mask": attention_mask,"loss_mask": loss_mask,"position_ids": position_ids}
+        return {
+            "tokens": tokens,
+            "labels": labels,
+            "attention_mask": attention_mask,
+            "loss_mask": loss_mask,
+            "position_ids": position_ids,
+        }
 
     @staticmethod
     def is_multimodal() -> bool:
@@ -487,11 +494,14 @@ def _build_shuffle_index(
 
     return numpy.concatenate((shuffle_idx_first, shuffle_idx_last))
 
-def _get_ltor_masks_and_position_ids(data: torch.Tensor,
-                                     eod_token: int,
-                                     reset_position_ids: bool,
-                                     reset_attention_mask: bool,
-                                     eod_mask_loss: bool):
+
+def _get_ltor_masks_and_position_ids(
+    data: torch.Tensor,
+    eod_token: int,
+    reset_position_ids: bool,
+    reset_attention_mask: bool,
+    eod_mask_loss: bool,
+):
     """Build masks and position id for left to right model.
 
     Args:
@@ -506,18 +516,20 @@ def _get_ltor_masks_and_position_ids(data: torch.Tensor,
         eod_mask_loss (bool): Switch to enable the EOD mask loss
 
     Returns:
-        attention_mask (torch.Tensor) : Attention mask needed to be used for Attention
+        torch.Tensor : Attention mask needed to be used for Attention
 
-        loss_mask (torch.Tensor) : The mask used for loss value during training
+        torch.Tensor : The mask used for loss value during training
 
-        position_ids (torch.Tensor) : The position ID's of the token
+        torch.Tensor : The position ID's of the token
 
     """
 
     # Extract batch size and sequence length.
     seq_length = data.numel()
 
-    attention_mask = torch.tril(torch.ones((seq_length, seq_length),device=data.device)).unsqueeze(0)
+    attention_mask = torch.tril(torch.ones((seq_length, seq_length), device=data.device)).unsqueeze(
+        0
+    )
 
     # Loss mask.
     loss_mask = torch.ones(seq_length, dtype=torch.float, device=data.device)
@@ -525,8 +537,7 @@ def _get_ltor_masks_and_position_ids(data: torch.Tensor,
         loss_mask[data == eod_token] = 0.0
 
     # Position ids.
-    position_ids = torch.arange(seq_length, dtype=torch.long,
-                                device=data.device)
+    position_ids = torch.arange(seq_length, dtype=torch.long, device=data.device)
     # We need to clone as the ids will be modifed based on batch index.
     if reset_position_ids:
         position_ids = position_ids.clone()
@@ -545,13 +556,13 @@ def _get_ltor_masks_and_position_ids(data: torch.Tensor,
             i = eod_index[j]
             # Mask attention loss.
             if reset_attention_mask:
-                attention_mask[ 0, (i + 1):, :(i + 1)] = 0
+                attention_mask[0, (i + 1) :, : (i + 1)] = 0
             # Reset positions.
             if reset_position_ids:
-                position_ids[ (i + 1):] -= (i + 1 - prev_index)
+                position_ids[(i + 1) :] -= i + 1 - prev_index
                 prev_index = i + 1
 
     # Convert attention mask to binary:
-    attention_mask = (attention_mask < 0.5)
+    attention_mask = attention_mask < 0.5
 
     return attention_mask, loss_mask, position_ids
