@@ -866,8 +866,9 @@ def _add_training_args(parser):
                        default=False, 
                        help='freezes the model in place and just updates optimizer states')
     group.add_argument('--dataloader-type', type=str, default=None,
-                       choices=['single', 'cyclic'],
-                       help='Single pass vs multiple pass data loader')
+                       choices=['single', 'cyclic', 'reset-single'],
+                       help='Single pass vs multiple pass data loader. reset-single is used when continuing '
+                       'training on a new dataset (resets consumed samples to 0)')
     group.add_argument('--no-async-tensor-model-parallel-allreduce',
                        action='store_false',
                        help='Disable asynchronous execution of '
