@@ -52,6 +52,7 @@ LOGISTICS_ARGS=(
     --save $CHECKPOINT_DIR/$ENG_TOK-$AR_TOK
     --load $PRETRAINED_MODEL_PATH
     --load-iteration 120000
+    --dataloader-type reset-single
     --tokenizer-model $TOKENIZER_MODEL
     --split 99996,2,2 
     --log-interval $LOG_INTERVAL
