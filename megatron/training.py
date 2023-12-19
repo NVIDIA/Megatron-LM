@@ -1101,22 +1101,22 @@ def build_train_valid_test_data_iterators(
 
     # Build iterators.
     dl_type = args.dataloader_type
-    assert dl_type in ['single', 'cyclic']
+    assert dl_type in ['single', 'cyclic', 'reset-single']
 
     if train_dataloader is not None:
-        train_data_iterator = iter(train_dataloader) if dl_type == 'single' \
+        train_data_iterator = iter(train_dataloader) if dl_type in ['single', 'reset-single'] \
                               else iter(cyclic_iter(train_dataloader))
     else:
         train_data_iterator = None
 
     if valid_dataloader is not None:
-        valid_data_iterator = iter(valid_dataloader) if dl_type == 'single' \
+        valid_data_iterator = iter(valid_dataloader) if dl_type in ['single', 'reset-single'] \
                               else iter(cyclic_iter(valid_dataloader))
     else:
         valid_data_iterator = None
 
     if test_dataloader is not None:
-        test_data_iterator = iter(test_dataloader) if dl_type == 'single' \
+        test_data_iterator = iter(test_dataloader) if dl_type in ['single', 'reset-single'] \
                              else iter(cyclic_iter(test_dataloader))
     else:
         test_data_iterator = None
