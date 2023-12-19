@@ -1,6 +1,6 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
-from typing import Tuple, Dict
+from typing import Dict, Tuple
 
 from .dict_utils import dict_list_map_inplace, extract_matching_values
 from .mapping import (
@@ -60,6 +60,7 @@ def replace_prefix_for_sharding(
     Returns:
         None: state dict is modified in place
     """
+
     def _replace_prefix(x):
         if isinstance(x, (ShardedTensor, ShardedTensorFactory, ShardedObject)):
             if not x.key.startswith(old_prefix):
@@ -80,12 +81,15 @@ def apply_prefix_mapping(sharded_state_dict: ShardedStateDict, prefix_map: Dict[
     Returns:
         None: state dict is modified in place
     """
+
     def _replace_prefixes(x):
         if not isinstance(x, (ShardedTensor, ShardedTensorFactory, ShardedObject)):
             return x
         for old_prefix, new_prefix in prefix_map.items():
             if x.key.startswith(old_prefix):
-                x.key = f'{new_prefix}{x.key[len(old_prefix):]}'  # str.removeprefix in Python >= 3.9
+                x.key = (
+                    f'{new_prefix}{x.key[len(old_prefix):]}'  # str.removeprefix in Python >= 3.9
+                )
                 break
         return x
 

@@ -70,7 +70,7 @@ def get_gpt_layer_local_spec() -> ModuleSpec:
             sharded_state_dict_keys_map={
                 'input_layernorm.': 'self_attention.linear_qkv.layer_norm_',
                 'pre_mlp_layernorm.': 'mlp.linear_fc1.layer_norm_',
-            }
+            },
         ),
     )
 

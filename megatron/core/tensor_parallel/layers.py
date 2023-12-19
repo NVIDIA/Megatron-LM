@@ -712,7 +712,11 @@ class ColumnParallelLinear(torch.nn.Module):
         )
 
         # Hook adding a default empty _extra_state for state dict
-        self._register_load_state_dict_pre_hook(lambda state_dict, prefix, *args, **kwargs: state_dict.setdefault(f'{prefix}_extra_state'))
+        self._register_load_state_dict_pre_hook(
+            lambda state_dict, prefix, *args, **kwargs: state_dict.setdefault(
+                f'{prefix}_extra_state'
+            )
+        )
 
     def forward(self, input_: torch.Tensor, weight: Optional[torch.Tensor] = None):
         """Forward of ColumnParallelLinear
@@ -918,7 +922,10 @@ class RowParallelLinear(torch.nn.Module):
         )
 
         # Hook adding a default empty _extra_state for state dict
-        self._register_load_state_dict_pre_hook(lambda state_dict, *args, **kwargs: print('%' * 100) or state_dict.setdefault('_extra_state'))
+        self._register_load_state_dict_pre_hook(
+            lambda state_dict, *args, **kwargs: print('%' * 100)
+            or state_dict.setdefault('_extra_state')
+        )
 
     def forward(self, input_):
         """Forward of RowParallelLinear
