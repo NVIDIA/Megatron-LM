@@ -1,10 +1,9 @@
 set -e 
 TOTAL_NUM_TOKENS=10_000_000_000
-for ENG_TOK in {2..9}
+for ENG_TOK in {3..9}
 do
-    
     AR_TOK=$((10 - $ENG_TOK))
-
+    
     echo "{\"en\": $ENG_TOK,\"ar\": $AR_TOK}" > examples/pretrain-allam/training/allam-7bv3-0-tune/lang_prob.json
 
     if [ ! -f "examples/pretrain-allam/training/allam-7bv3-0-tune/data.json" ]; then
@@ -25,9 +24,11 @@ do
 
     sed "s/\${{ENG_TOK}}/$ENG_TOK/g; s/allam-7bv3-0_dolma-tune/allam-7bv3-0_dolma-tune_en-$ENG_TOK"_ar-"$AR_TOK/g" examples/pretrain-allam/training/allam-7bv3-0-tune/azureml_conf.yaml > examples/pretrain-allam/training/allam-7bv3-0-tune/temp.yaml
     cat examples/pretrain-allam/training/allam-7bv3-0-tune/temp.yaml
+    sleep 3
     az ml job create --subscription c7209a17-0d9f-41df-8e45-e0172343698d \
      --resource-group LLM-Test \
      --workspace-name Provisioning-Test \
      --file examples/pretrain-allam/training/allam-7bv3-0-tune/temp.yaml
     rm examples/pretrain-allam/training/allam-7bv3-0-tune/temp.yaml
+    sleep 3
 done
