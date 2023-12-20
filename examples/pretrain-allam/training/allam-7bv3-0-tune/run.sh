@@ -52,7 +52,7 @@ LOGISTICS_ARGS=(
     --eval-iters 0
     --tensorboard-dir $TENSORBOARD_LOGS_PATH/en$ENG_TOK-ar$AR_TOK 
     --tensorboard-log-interval 10
-    --data-cache-path $DATA_CACHE
+    --data-cache-path $DATA_CACHE/en$ENG_TOK-ar$AR_TOK 
     --log-validation-ppl-to-tensorboard 
     --seed 1234
 )
