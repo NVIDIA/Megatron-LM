@@ -10,12 +10,12 @@ command: >-
    ${{outputs.data_cache}} \
    ${{outputs.checkpoint_dir}} \
    ${{outputs.tensorboard_dir}} \
-   1e-5
+   1e-6
 
 display_name: LLaMa-VE-Allam-Reasoning-Data-with-Ar-Lr-Hyp-Tune
 
 experiment_name: Vocab-Expansion
-code: ../../../../
+code: ../../../../../
 environment: azureml:Megatron-LLaMA:7
 environment_variables:
   HYDRA_FULL_ERROR: '1'

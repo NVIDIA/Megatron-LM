@@ -6,5 +6,5 @@ do
     --resource-group LLM-Test \
     --workspace-name Provisioning-Test \
     --file "examples/pretrain-llama/training/llama_ve/llama_ve_en_reasoning_ar_lr_hyp_tune/temp.yaml"
-    rm examples/pretrain-llama/training/llama_en_reasoning_ar_data_mix_hyp_tune/temp.yaml
+    rm examples/pretrain-llama/training/llama_ve/llama_ve_en_reasoning_ar_lr_hyp_tune/temp.yaml
 done
