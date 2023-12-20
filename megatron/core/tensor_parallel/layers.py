@@ -921,7 +921,9 @@ class RowParallelLinear(torch.nn.Module):
 
         # Hook adding a default empty _extra_state for state dict
         self._register_load_state_dict_pre_hook(
-            lambda state_dict, *args, **kwargs: state_dict.setdefault('_extra_state')
+            lambda state_dict, prefix, *args, **kwargs: state_dict.setdefault(
+                f'{prefix}_extra_state'
+            )
         )
 
     def forward(self, input_):
