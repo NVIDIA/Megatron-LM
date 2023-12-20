@@ -1,5 +1,8 @@
-for ENG_TOK in {0..10}
+set -e 
+TOTAL_NUM_TOKENS=10_000_000_000
+for ENG_TOK in {2..9}
 do
+    
     AR_TOK=$((10 - $ENG_TOK))
 
     echo "{\"en\": $ENG_TOK,\"ar\": $AR_TOK}" > examples/pretrain-allam/training/allam-7bv3-0-tune/lang_prob.json

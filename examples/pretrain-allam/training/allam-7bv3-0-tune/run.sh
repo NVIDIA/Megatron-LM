@@ -40,7 +40,7 @@ GPT_MODEL_ARGS=(
 )
 
 LOGISTICS_ARGS=(
-    --save $CHECKPOINT_DIR/$ENG_TOK-$AR_TOK
+    --save $CHECKPOINT_DIR/en$ENG_TOK-ar$AR_TOK
     --load $PRETRAINED_MODEL_PATH
     --load-iteration 120000
     --dataloader-type reset-single
@@ -50,7 +50,7 @@ LOGISTICS_ARGS=(
     --save-interval 250 
     --eval-interval 250
     --eval-iters 10
-    --tensorboard-dir $TENSORBOARD_LOGS_PATH 
+    --tensorboard-dir $TENSORBOARD_LOGS_PATH/en$ENG_TOK-ar$AR_TOK 
     --tensorboard-log-interval 10
     --data-cache-path $DATA_CACHE
     --log-validation-ppl-to-tensorboard 
