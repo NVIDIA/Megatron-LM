@@ -2,21 +2,11 @@
     "en" : {
         "dolma-gutenberg-books": 2,
         "dolma-peS2o": 3,
-        "dolma-wiki-en-simple": 3,
         "dolma-c4": 2,
         "dolma-stack-code": 1,
-        "dolma-common-crawl": 1,
         "openwebmath": 3,
         "Pile-DM-Mathematics": 3,
-        "Pile-FreeLaw": 1,
-        "Pile-OpenSubtitles": 1,
-        "Pile-OpenWebText2": 2,
-        "Pile-PubMed-Abstracts": 2,
-        "Pile-PubMed-Central": 2,
-        "Pile-StackExchange": 2,
-        "Pile-USPTO-Backgrounds": 1,
-        "Pile-books2-books3-pgtbrg": 2,
-        "Pile-enron-hn-nexpt-phil-ubuntu-yt-ep": 1
+        "Pile-books2-books3-pgtbrg": 2
     },
     "ar" : {
         "Allam-books": 3, 
