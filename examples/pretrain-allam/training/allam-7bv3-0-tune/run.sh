@@ -45,11 +45,11 @@ LOGISTICS_ARGS=(
     --load-iteration 120000
     --dataloader-type reset-single
     --tokenizer-model $TOKENIZER_MODEL
-    --split 99996,2,2 
+    --split 1,0,0
     --log-interval 10
     --save-interval 250 
     --eval-interval 250
-    --eval-iters 10
+    --eval-iters 0
     --tensorboard-dir $TENSORBOARD_LOGS_PATH/en$ENG_TOK-ar$AR_TOK 
     --tensorboard-log-interval 10
     --data-cache-path $DATA_CACHE
