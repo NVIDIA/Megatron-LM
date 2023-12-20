@@ -10,7 +10,7 @@ command: >-
    ${{outputs.data_cache}} \
    ${{outputs.checkpoint_dir}} \
    ${{outputs.tensorboard_dir}} \
-   ${{lr_rate}}
+   1e-5
 
 display_name: LLaMa-VE-Allam-Reasoning-Data-with-Ar-Lr-Hyp-Tune
 

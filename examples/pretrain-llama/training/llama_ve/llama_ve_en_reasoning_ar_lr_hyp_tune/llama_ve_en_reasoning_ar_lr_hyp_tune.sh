@@ -29,14 +29,14 @@ GPT_MODEL_ARGS=(
 )
 
 LOGISTICS_ARGS=(
-    --save $CHECKPOINT_DIR 
+    --save $CHECKPOINT_DIR/'lr_rate-'$LR_RATE
     --load $PRETRAINED_LLAMA_MODEL_PATH 
     --tokenizer-model $TOKENIZER_MODEL
-    --split 9998,1,1 
+    --split 1000,0,0 
     --log-interval 10
     --save-interval 500 
     --eval-interval 500
-    --eval-iters 10
+    --eval-iters 0
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     --tensorboard-log-interval 10
     --data-cache-path $DATA_CACHE
@@ -49,7 +49,7 @@ TRAINING_ARGS=(
     --no-load-rng
     --micro-batch-size 1 
     --global-batch-size 1024
-    --train-iters 160_000
+    --train-iters 2_500
     --weight-decay 0.1 
     --adam-beta1 0.9 
     --adam-beta2 0.95 
