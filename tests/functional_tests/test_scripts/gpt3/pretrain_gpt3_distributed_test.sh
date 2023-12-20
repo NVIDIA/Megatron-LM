@@ -42,6 +42,7 @@ if [[ $USE_TE -eq 1 ]]; then
        echo "Running with TransformerEngine ..."
        TRANSFORMER_IMPL=transformer_engine
        TRAINING_DTYPE=bf16
+       ADDITIONAL_PARAMS+=" --attention-softmax-in-fp32"
 else
        echo "Running with local transformer implementation ..."
 fi
