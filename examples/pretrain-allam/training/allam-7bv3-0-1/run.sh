@@ -39,11 +39,11 @@ LOGISTICS_ARGS=(
     --load $PRETRAINED_MODEL_PATH
     --dataloader-type reset-single
     --tokenizer-model $TOKENIZER_MODEL
-    --split 99996,2,2 
+    --split 1,0,0 
     --log-interval 100
     --save-interval 5000 
     --eval-interval 1000 
-    --eval-iters 50
+    --eval-iters 0
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     --tensorboard-log-interval 100
     --data-cache-path $DATA_CACHE
