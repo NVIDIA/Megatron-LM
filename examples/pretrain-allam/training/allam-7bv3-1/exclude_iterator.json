@@ -1,5 +1,10 @@
 {
     "exclude_iterator_name":[
+        "en_Pile-books2-books3-pgtbrg_0000_text_document_dc=169830_sc=169830_tc=23873854486.bin",
+        "en_Pile-books2-books3-pgtbrg_0000_text_document_dc=169830_sc=169830_tc=23873854486.idx",
+        "en_Pile-books2-books3-pgtbrg_0001_text_document_dc=169832_sc=169832_tc=24223332514.bin",
+        "en_Pile-books2-books3-pgtbrg_0001_text_document_dc=169832_sc=169832_tc=24223332514.idx",
+
         "en_dolma-c4_000_text_document_dc=38478822_sc=38478822_tc=19955375141.bin",
         "en_dolma-c4_000_text_document_dc=38478822_sc=38478822_tc=19955375141.idx",
         "en_dolma-c4_002_text_document_dc=38478741_sc=38478741_tc=19951366447.bin",
