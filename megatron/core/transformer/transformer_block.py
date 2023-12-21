@@ -57,7 +57,7 @@ class TransformerBlock(MegatronModule):
         #     coeff = self.layer_number
         #     self.norm_factor *= coeff
         def build_layer(layer_number):
-            layer = TransformerLayer(
+            layer = transformer_layer_spec.module(
                 config=self.config,
                 submodules=transformer_layer_spec.submodules,
                 layer_number=layer_number,
