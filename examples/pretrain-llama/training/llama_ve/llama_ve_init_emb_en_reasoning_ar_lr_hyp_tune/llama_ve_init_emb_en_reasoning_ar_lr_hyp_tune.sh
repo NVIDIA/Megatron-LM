@@ -72,9 +72,9 @@ MODEL_PARALLEL_ARGS=(
     --no-async-tensor-model-parallel-allreduce
 )
 
-source examples/pretrain-llama/training/llama_ve/llama_ve_en_reasoning_ar_lr_hyp_tune/iterator_prob.sh
+source examples/pretrain-llama/training/llama_ve/llama_ve_init_emb_en_reasoning_ar_lr_hyp_tune/iterator_prob.sh
 
-# $BIN_IDX_PATH/$BIN_IDX_PATH/torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py\ \
+# $BIN_IDX_PATH/$BIN_IDX_PATH/torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
 python pretrain_gpt.py \
     ${GPT_MODEL_ARGS[@]} \
     ${LOGISTICS_ARGS[@]} \
