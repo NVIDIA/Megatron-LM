@@ -50,11 +50,11 @@ def azcopy_list(path: str, sas_token: str) -> Dict[str, int]:
     out = subprocess.check_output(cmd, shell=True)
     out = out.decode('utf-8')
     for line in out.split("\n"):
-        print(line)
         if line.strip() == "": continue
         pre_shard_dt = json.loads(line)
         message = pre_shard_dt['MessageContent']
         if message.strip() == "": continue
+        if message.startswith("INFO: azcopy"): continue
         pre_shard_name = message.rsplit(";", 1)[0].replace("INFO: ", "")
         pre_shard_size = int(message.rsplit(";", 1)[1].replace("Content Length: ", ""))
         shard_dict[pre_shard_name] = pre_shard_size
