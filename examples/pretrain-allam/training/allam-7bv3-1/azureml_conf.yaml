@@ -40,11 +40,11 @@ outputs:
   data_cache:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/allam_index_mapped_data_allamllmuksstandard/paths/allam-7bv3-1/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/allam_index_mapped_data_allamllmuksstandard/paths/allam-7bv3-1-fixed/
   checkpoint_dir:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/allam_checkpoints_allamllmuksstandard/paths/allam-7bv3-1/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/allam_checkpoints_allamllmuksstandard/paths/allam-7bv3-1-fixed/
 
 
 services:
