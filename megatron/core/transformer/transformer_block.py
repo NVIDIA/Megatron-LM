@@ -17,7 +17,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
-from megatron.core.cpu_offload import get_cpu_offload_context
+from megatron.core.transformer.custom_layers.transformer_engine import get_cpu_offload_context
 
 
 def get_num_layers_to_build(config: TransformerConfig) -> int:
@@ -106,10 +106,13 @@ class TransformerBlock(MegatronModule):
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
 
-        self.offload_context, self.group_prefetch_offload_commit_async = get_cpu_offload_context(
-                                                                         self.config.cpu_offloading,
-                                                                         self.config.cpu_offloading_num_layers
-                                                                         )
+        if get_cpu_offload_context is not None:
+            self.offload_context, self.group_prefetch_offload_commit_async = get_cpu_offload_context(
+                                                                             self.config.cpu_offloading,
+                                                                             self.config.cpu_offloading_num_layers
+                                                                             )
+        else:
+            self.offload_context, self.group_prefetch_offload_commit_async = nullcontext(), None
 
     def _build_layers(self):
         # Transformer layers.
@@ -325,7 +328,7 @@ class TransformerBlock(MegatronModule):
                             inference_params=inference_params,
                         )
  
-                    if torch.is_grad_enabled() and self.config.cpu_offloading:
+                    if torch.is_grad_enabled() and self.config.cpu_offloading and self.group_prefetch_offload_commit_async is not None:
                        hidden_states = self.group_prefetch_offload_commit_async(hidden_states) 
 
         # Final layer norm.

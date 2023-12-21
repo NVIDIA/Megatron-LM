@@ -1,6 +1,5 @@
 import megatron.core.tensor_parallel
 import megatron.core.utils
-import megatron.core.cpu_offload
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.inference_params import InferenceParams
