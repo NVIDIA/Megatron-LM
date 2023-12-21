@@ -1,7 +1,7 @@
 if [ ! -f "examples/pretrain-allam/training/allam-7bv3-0-1/data.json" ]; then
     python examples/data-processing/remote_list.py \
     --az-configs "examples/configs/azure_login_configs.json" \
-    --input-folder-path "https://allamllmuksstandard.blob.core.windows.net/llm-data/dolma/dolma_tokenize_by_v5tok.improved/meglm_tok_v5_improved_bin_idx/" \
+    --input-folder-path "https://allamllmuksstandard.blob.core.windows.net/llm-data/data_repo/tokenize_by_v5_improved/meglm_tok_v5_improved_bin_idx/" \
     --export-data-signature "examples/pretrain-allam/training/allam-7bv3-0-1/data.json"
 fi
 
