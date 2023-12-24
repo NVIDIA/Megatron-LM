@@ -14,7 +14,7 @@ command: >-
 display_name: LLaMa-VE-init-Emb-Allam-Reasoning-Data-with-Ar-Data-Mix-Hyp-Tune
 
 experiment_name: Vocab-Expansion
-code: ../../../../
+code: ../../../../../
 environment: azureml:Megatron-LLaMA:7
 environment_variables:
   HYDRA_FULL_ERROR: '1'
@@ -27,28 +27,28 @@ inputs:
   pretrained_llama_model:
     type: uri_folder
     mode: ro_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/megatronlm_models/Llama-2-7b-hf-default-tp2_pp2/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/megatronlm_models/Meg-LM-Llama-2-7b-hf-ExpTok-32K_10M_init_VE_with_llama_avg/
   tokenizer_model_path:
     type: uri_file
     mode: ro_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/tokenized_data/allam_data_2-1_splits-llama2-indexed_data/tokenizer/tokenizer.model
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llm_data_west_europe/paths/data_repo/tokenize_by_llama2-ve/tokenizer/tokenizer.model
   bin_idx_data_dir:
     type: uri_folder
     mode: ro_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/tokenized_data/allam_data_2-1_splits-llama2-indexed_data/llama2_bin_idx/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llm_data_west_europe/paths/data_repo/tokenize_by_llama2-ve/meglm_llama2-ve_bin_idx/
 outputs:
   data_cache:
     type: uri_folder
     mode: rw_mount
-    path:  azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/new_experiments/LLaMa-Allam-Reasoning-Data-with-Ar-data-mix-hyp-tune/cache/
+    path:  azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/new_experiments/LLaMa-VE-init-Emb-Allam-Reasoning-Data-with-Ar-Data-Mix-Hyp-Tune/cache/
   checkpoint_dir:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/new_experiments/LLaMa-Allam-Reasoning-Data-with-Ar-data-mix-hyp-tune
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/new_experiments/LLaMa-VE-init-Emb-Allam-Reasoning-Data-with-Ar-Data-Mix-Hyp-Tune
   tensorboard_dir:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/new_experiments/LLaMa-Allam-Reasoning-Data-with-Ar-data-mix-hyp-tune/tensorboard
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/new_experiments/LLaMa-VE-init-Emb-Allam-Reasoning-Data-with-Ar-Data-Mix-Hyp-Tune/tensorboard
 
 services:
   my_jupyterlab:

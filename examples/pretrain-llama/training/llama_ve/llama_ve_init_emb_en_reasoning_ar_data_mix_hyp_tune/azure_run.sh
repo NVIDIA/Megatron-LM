@@ -34,5 +34,5 @@ do
 
     rm examples/pretrain-llama/training/llama_ve/llama_ve_init_emb_en_reasoning_ar_data_mix_hyp_tune/iter_prob.sh
     rm examples/pretrain-llama/training/llama_ve/llama_ve_init_emb_en_reasoning_ar_data_mix_hyp_tune/lang_prob.json
-
+    break
 done
