@@ -28,7 +28,7 @@ do
     az ml job create --subscription c7209a17-0d9f-41df-8e45-e0172343698d \
     --resource-group LLM-Test \
     --workspace-name Provisioning-Test \
-    --file "examples/pretrain-llama/training/llama_ve/llama_ve_init_emb_en_reasoning_ar_data_mix_hyp_tune/llama_ve_en_reasoning_ar_data_mix_hyp_tune.yaml"
+    --file "examples/pretrain-llama/training/llama_ve/llama_ve_init_emb_en_reasoning_ar_data_mix_hyp_tune/llama_ve_init_emb_en_reasoning_ar_data_mix_hyp_tune.yaml"
 
     sleep 2
 
