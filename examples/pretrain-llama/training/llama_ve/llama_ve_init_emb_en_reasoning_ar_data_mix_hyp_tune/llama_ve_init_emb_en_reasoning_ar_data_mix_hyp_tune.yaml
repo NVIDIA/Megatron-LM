@@ -9,7 +9,8 @@ command: >-
    ${{inputs.bin_idx_data_dir}} \
    ${{outputs.data_cache}} \
    ${{outputs.checkpoint_dir}} \
-   ${{outputs.tensorboard_dir}} 
+   ${{outputs.tensorboard_dir}} \
+   ${{ENG_TOK}}
 
 display_name: LLaMa-VE-init-Emb-Allam-Reasoning-Data-with-Ar-Data-Mix-Hyp-Tune
 
