@@ -516,9 +516,9 @@ class _Llama2Tokenizer(_SentencePieceTokenizer):
 
         # BOS / EOS token IDs
         self.n_words: int = self.tokenizer.vocab_size()
-        self.bos_id: int = self.tokenizer.bos_id()
-        self.eos_id: int = self.tokenizer.eos_id()
-        self.pad_id: int = self.tokenizer.pad_id()
+        self._bos_id: int = self.tokenizer.bos_id()
+        self._eos_id: int = self.tokenizer.eos_id()
+        self._pad_id: int = self.tokenizer.pad_id()
         assert self.tokenizer.vocab_size() == self.tokenizer.get_piece_size()
 
     def tokenize(self, s: str, bos=True, eos=False):
@@ -526,9 +526,9 @@ class _Llama2Tokenizer(_SentencePieceTokenizer):
         assert type(s) is str
         t = self.tokenizer.encode(s)
         if bos:
-            t = [self.bos_id] + t
+            t = [self._bos_id] + t
         if eos:
-            t = t + [self.eos_id]
+            t = t + [self._eos_id]
         return t
 
     def detokenize(self, ids):
@@ -548,7 +548,7 @@ class _Llama2Tokenizer(_SentencePieceTokenizer):
 
     @property
     def eod(self):
-        return self.eos_id
+        return self._eos_id
 
     @property
     def additional_special_tokens_ids(self):
