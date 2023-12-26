@@ -505,6 +505,8 @@ class ZeroDropTopKRouter(Router):
             logits = self.apply_z_loss(logits)
 
         scores, indices = torch.topk(logits, k=self.k, dim=1)
+        
+        scores /= scores.sum(dim=-1, keepdim=True)
 
         # Apply load balancing loss
         if self.config.moe_aux_loss_coeff > 0:
