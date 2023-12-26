@@ -1,7 +1,7 @@
 import torch
 
 
-def switch_load_balancing_loss_func(config, gates, mask):
+def switch_load_balancing_loss_func(gates, mask, moe_aux_loss_coeff):
     """Calculate the auxiliary loss for better load balacing. 
     Please refer to the Switch Transformer paper (https://arxiv.org/abs/2101.03961) for details.
 
@@ -12,12 +12,11 @@ def switch_load_balancing_loss_func(config, gates, mask):
     Returns:
         torch.Tensor: The auxiliary loss for load balancing.
     """
-    num_experts = mask.size(1)
-    assert num_experts == config.num_moe_experts
+    num_experts = mask.size(-1)
     gates_mean = gates.mean(dim=0)
     selection_mean = mask.float().mean(dim=0)
     aux_loss = torch.sum(gates_mean * selection_mean) * num_experts
-    aux_loss *= config.aux_loss_coeff
+    aux_loss *= moe_aux_loss_coeff
     return aux_loss
 
 

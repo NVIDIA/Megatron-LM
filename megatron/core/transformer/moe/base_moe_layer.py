@@ -117,11 +117,11 @@ class Router(ABC, MegatronModule):
 
         return scores, indices
 
-    def apply_aux_loss(self, loss_func, scores, indicies):
-        mask = torch.nn.functional.one_hot(indicies, num_classes=self.num_experts).sum(dim=1)
-        aux_loss = loss_func(scores, mask)
-        scores = MoEAuxLossAutoScaler.apply(scores, aux_loss)
-        return scores
+    def apply_aux_loss(self, loss_func, probs, indices):
+        mask = torch.nn.functional.one_hot(indices, num_classes=self.num_experts).sum(dim=1)
+        aux_loss = loss_func(probs, mask, self.config.moe_aux_loss_coeff)
+        indices = MoEAuxLossAutoScaler.apply(indices, aux_loss)
+        return indices
 
     def apply_z_loss(self, logits):
         """Encourages the router's logits to remain small to enhance stability.
@@ -500,19 +500,19 @@ class ZeroDropTopKRouter(Router):
         """
         logits = logits.view(-1, self.config.num_moe_experts)
         logits = logits.to(dtype=torch.float32)
-        logits = torch.softmax(logits, dim=-1)
+        probs = torch.softmax(logits, dim=-1)
 
         # Apply Z-Loss
         if self.config.moe_z_loss_coeff > 0:
-            logits = self.apply_z_loss(logits)
+            probs = self.apply_z_loss(probs)
 
-        scores, indices = torch.topk(logits, k=self.k, dim=1)
+        scores, indices = torch.topk(probs, k=self.k, dim=1)
 
         scores /= scores.sum(dim=-1, keepdim=True)
 
         # Apply load balancing loss
         if self.config.moe_aux_loss_coeff > 0:
-            scores = self.apply_aux_loss(self.moe_aux_loss_func, scores, indices)
+            indices = self.apply_aux_loss(self.moe_aux_loss_func, probs, indices)
 
         return scores, indices
 
