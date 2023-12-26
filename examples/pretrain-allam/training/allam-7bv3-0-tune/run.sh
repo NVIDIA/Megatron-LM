@@ -43,7 +43,8 @@ LOGISTICS_ARGS=(
     --save $CHECKPOINT_DIR/en$ENG_TOK-ar$AR_TOK
     --load $PRETRAINED_MODEL_PATH
     --load-iteration 120000
-    --dataloader-type reset-single
+    --dataloader-type single
+    --override-dataloader-consumed-samples 0
     --tokenizer-model $TOKENIZER_MODEL
     --split 1,0,0
     --log-interval 10

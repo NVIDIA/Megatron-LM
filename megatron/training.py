@@ -1062,7 +1062,8 @@ def build_train_valid_test_data_loaders(
             build_train_valid_test_datasets_provider)
         # Build dataloders.
         train_dataloader = build_pretraining_data_loader(
-            train_ds, args.consumed_train_samples)
+            train_ds, args.consumed_train_samples if args.override_dataloader_consumed_samples is None
+                else  args.override_dataloader_consumed_samples)
         if args.skip_train:
             valid_dataloader = build_pretraining_data_loader(valid_ds, 0)
         else:
@@ -1101,22 +1102,22 @@ def build_train_valid_test_data_iterators(
 
     # Build iterators.
     dl_type = args.dataloader_type
-    assert dl_type in ['single', 'cyclic', 'reset-single']
+    assert dl_type in ['single', 'cyclic']
 
     if train_dataloader is not None:
-        train_data_iterator = iter(train_dataloader) if dl_type in ['single', 'reset-single'] \
+        train_data_iterator = iter(train_dataloader) if dl_type == 'single' \
                               else iter(cyclic_iter(train_dataloader))
     else:
         train_data_iterator = None
 
     if valid_dataloader is not None:
-        valid_data_iterator = iter(valid_dataloader) if dl_type in ['single', 'reset-single'] \
+        valid_data_iterator = iter(valid_dataloader) if dl_type == 'single' \
                               else iter(cyclic_iter(valid_dataloader))
     else:
         valid_data_iterator = None
 
     if test_dataloader is not None:
-        test_data_iterator = iter(test_dataloader) if dl_type in ['single', 'reset-single'] \
+        test_data_iterator = iter(test_dataloader) if dl_type == 'single' \
                              else iter(cyclic_iter(test_dataloader))
     else:
         test_data_iterator = None
