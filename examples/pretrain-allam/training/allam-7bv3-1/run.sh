@@ -37,8 +37,9 @@ GPT_MODEL_ARGS=(
 LOGISTICS_ARGS=(
     --save $CHECKPOINT_DIR 
     --load $CHECKPOINT_DIR
+    --load-iteration 190000
     --dataloader-type single 
-    --override-dataloader-consumed-samples 71680000 # 194560000 - 122880000
+    --override-dataloader-consumed-samples 71680000 # 190000*1024 - 120000*1024
     --tokenizer-model $TOKENIZER_MODEL
     --split 1,0,0 
     --log-interval 100

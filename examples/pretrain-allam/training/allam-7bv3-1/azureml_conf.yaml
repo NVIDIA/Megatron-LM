@@ -3,7 +3,7 @@
 $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
 command: >-
-  bash examples/pretrain-allam/training/allam-7bv3-1/run_cont.sh \
+  bash examples/pretrain-allam/training/allam-7bv3-1/run.sh \
    ${{inputs.pretrained_model_path}} \
    ${{inputs.tokenizer_model_path}} \
    ${{inputs.bin_idx_data_dir}} \
