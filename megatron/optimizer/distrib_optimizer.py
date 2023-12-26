@@ -6,6 +6,7 @@
 from apex.optimizers import FusedAdam as Adam
 import math
 import torch
+import torch.nn.functional as F
 
 from megatron import get_args
 from megatron import get_timers
@@ -789,6 +790,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                  f"{len(gbuf_range_map_for_all_buckets)} buckets) from checkpoint; "
                                  f"checkpoint only has {len(world_tensor_for_all_buckets)} bucket(s)")
                             world_tensor = world_tensor_for_all_buckets[bucket_idx]
+                            if world_tensor.numel() != gbuf_world_numel:
+                                print_rank_0(f" pad optimizer state of distrib_optim.pt from {world_tensor.numel()} to {gbuf_world_numel}.")
+                                padding_size = gbuf_world_numel - world_tensor.numel()
+                                world_tensor = F.pad(world_tensor, (0, padding_size), 'constant', 0)
+                                
                             gbuf_start_idxs = \
                                 list(range(0, gbuf_world_numel, gbuf_local_numel))
                             send_tensors = [world_tensor[i:(i+gbuf_local_numel)]
