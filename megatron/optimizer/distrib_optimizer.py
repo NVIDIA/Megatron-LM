@@ -455,32 +455,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.param_buffers = []
         for gbuf_index, grad_buffer in enumerate(self.grad_buffers):
             size_ratio = torch.finfo(grad_buffer.dtype).bits // torch.finfo(params_dtype).bits
+            assert size_ratio >= 1, "param_dtype size should be smaller than or equal to grad_dtype size"
             current_param_buffers = []
             for bucket in grad_buffer.buckets:
-
-                # Handle older/newer method for getting untyped storage.
-                try:
-                    storage = bucket.data.untyped_storage()
-                except:
-                    try:
-                        storage = bucket.data.storage()._untyped()
-                    except:
-                        storage = bucket.data.storage().untyped()
-
-                # Typed param buffer.
-                param_buffer = torch.tensor(storage, dtype=params_dtype, device=bucket.data.device)
-
-                # .storage() ignores views / slices, so param_buffer now points to the start
-                # of the grad_buffer instead of to the start of each bucket. As a result,
-                # add bucket.offset to make sure param_buffers point to the right region of
-                # memory.
-                # Since we want the start of each bucket's param_buffer to coincide with the
-                # start of the same bucket's grad_buffer (this ensures that zeroing the grad
-                # buffer does not zero out params in the param_buffer before they are copied
-                # into the model_params), multiply the offset by the size ratio of grads and
-                # params.
-                offset = bucket.offset * size_ratio
-                param_buffer = param_buffer[offset : offset + bucket.data.numel()]
+                param_buffer = bucket.data.view(dtype=params_dtype)
+                param_buffer = param_buffer[:bucket.data.numel()]
                 assert (
                     param_buffer.data_ptr() == bucket.data.data_ptr()
                 ), "param_buffer and grad_buffer for same bucket should start at the same byte address"
