@@ -756,9 +756,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             loaded_state = torch.load(filename)
             if "per_bucket_numel" in loaded_state:
                 per_bucket_numel_in_checkpoint = loaded_state["per_bucket_numel"]
-                assert self.per_bucket_numel == per_bucket_numel_in_checkpoint, \
-                    (f"Number of elements in each bucket need to be the same in current run "
-                     f"({self.per_bucket_numel}) and checkpoint ({per_bucket_numel_in_checkpoint})")
+                if self.per_bucket_numel != per_bucket_numel_in_checkpoint:
+                    print_rank_0(
+                        " the 'per_bucket_numel' will be modified:\n"
+                        f"  previous value (from checkpoint): {per_bucket_numel_in_checkpoint}\n"
+                        f"  new value: {self.per_bucket_numel}")
+
 
         # Scatter tensors to all DP ranks.
         for model_idx, gbuf_range_maps in enumerate(self.model_gbuf_ranges):
@@ -790,8 +793,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                  f"{len(gbuf_range_map_for_all_buckets)} buckets) from checkpoint; "
                                  f"checkpoint only has {len(world_tensor_for_all_buckets)} bucket(s)")
                             world_tensor = world_tensor_for_all_buckets[bucket_idx]
+                            # Pad world_tensor to meet new data parallelism size.
                             if world_tensor.numel() != gbuf_world_numel:
-                                print_rank_0(f" pad optimizer state of distrib_optim.pt from {world_tensor.numel()} to {gbuf_world_numel}.")
+                                print_rank_0(f" pad optimizer state {key} from " 
+                                             f"{world_tensor.numel()} to {gbuf_world_numel}.")
                                 padding_size = gbuf_world_numel - world_tensor.numel()
                                 world_tensor = F.pad(world_tensor, (0, padding_size), 'constant', 0)
                                 
