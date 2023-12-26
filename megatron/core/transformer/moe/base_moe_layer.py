@@ -266,10 +266,18 @@ class MoEZeroDropTokenDispatcher(MoETokenDispatcher):
                 global_local_map = global_local_map.view(-1, 1).expand(-1, hidden_states.shape[-1])
             local_hidden_states = torch.gather(global_hidden_states, 0, global_local_map)
         else:
-            local_indices = max_ind
-            local_probs = max_prob
-            local_hidden_states = hidden_states
-            global_local_map = None
+            if self.k > 1:
+                global_local_map = torch.ones_like(max_ind).bool()
+                local_indices = max_ind.masked_select(global_local_map)
+                local_probs = max_prob.masked_select(global_local_map)
+                global_local_map = global_local_map.nonzero()[:, 0]
+                global_local_map = global_local_map.view(-1, 1).expand(-1, hidden_states.shape[-1])
+                local_hidden_states = torch.gather(hidden_states, 0, global_local_map)
+            else:
+                local_indices = max_ind
+                local_probs = max_prob
+                local_hidden_states = hidden_states
+                global_local_map = None
 
         with torch.no_grad():
             # The indices of local_indices that give its sorted order along dim 0.
@@ -367,6 +375,22 @@ class MoEZeroDropTokenDispatcher(MoETokenDispatcher):
                 output_bias_total = (
                     output_bias_total / parallel_state.get_tensor_model_parallel_world_size()
                 )
+        else:
+            if self.k > 1:
+                global_num_tokens = self.hidden_shape[0] * self.hidden_shape[1]
+                global_hidden_shape = [global_num_tokens, hidden_states.shape[-1]]
+                unpermuted_global_hidden = torch.zeros(
+                    global_hidden_shape, dtype=hidden_states.dtype, device=torch.cuda.current_device()
+                )
+                output_total = unpermuted_global_hidden.scatter_add(
+                    0, global_local_map, unpermuted_local_hidden
+                )
+                if self.add_bias:
+                    unpermuted_global_bias = torch.zeros_like(unpermuted_global_hidden)
+                    output_bias_total = unpermuted_global_bias.scatter_add(
+                        0, global_local_map, unpermuted_local_bias
+                    )
+                
         if self.k == 1:
             output_total = output_total * scores
         output_total = output_total.view(self.hidden_shape)
@@ -474,15 +498,16 @@ class ZeroDropTopKRouter(Router):
         """
         logits = logits.view(-1, self.config.num_moe_experts)
         logits = logits.to(dtype=torch.float32)
-
+        logits = torch.softmax(logits, dim=-1)
+        
+        # Apply Z-Loss
         if self.config.moe_z_loss_coeff > 0:
-            # Apply Z-Loss
             logits = self.apply_z_loss(logits)
 
         scores, indices = torch.topk(logits, k=self.k, dim=1)
 
+        # Apply load balancing loss
         if self.config.moe_aux_loss_coeff > 0:
-            # Apply load balancing loss
             scores = self.apply_aux_loss(self.moe_aux_loss_func, scores, indices)
 
         return scores, indices
