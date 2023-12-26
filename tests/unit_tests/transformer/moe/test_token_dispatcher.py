@@ -54,6 +54,14 @@ class TestZeroDropDispatcher:
             global_local_map,
         ) = self.token_dispatcher.dispatch(hidden_states, scores, indices)
         probs = torch.ones_like(local_probs) / 2
-        restored_hidden_states, restored_bias = self.token_dispatcher.restore(permuted_local_hidden_states, probs, revert_indices, global_local_map, bias=torch.zeros_like(permuted_local_hidden_states))
-        
-        assert torch.allclose(restored_hidden_states, hidden_states), "Restored hidden states do not match original hidden states"
+        restored_hidden_states, restored_bias = self.token_dispatcher.restore(
+            permuted_local_hidden_states,
+            probs,
+            revert_indices,
+            global_local_map,
+            bias=torch.zeros_like(permuted_local_hidden_states),
+        )
+
+        assert torch.allclose(
+            restored_hidden_states, hidden_states
+        ), "Restored hidden states do not match original hidden states"

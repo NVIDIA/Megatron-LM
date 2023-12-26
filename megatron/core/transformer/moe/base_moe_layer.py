@@ -380,7 +380,9 @@ class MoEZeroDropTokenDispatcher(MoETokenDispatcher):
                 global_num_tokens = self.hidden_shape[0] * self.hidden_shape[1]
                 global_hidden_shape = [global_num_tokens, hidden_states.shape[-1]]
                 unpermuted_global_hidden = torch.zeros(
-                    global_hidden_shape, dtype=hidden_states.dtype, device=torch.cuda.current_device()
+                    global_hidden_shape,
+                    dtype=hidden_states.dtype,
+                    device=torch.cuda.current_device(),
                 )
                 output_total = unpermuted_global_hidden.scatter_add(
                     0, global_local_map, unpermuted_local_hidden
@@ -390,7 +392,7 @@ class MoEZeroDropTokenDispatcher(MoETokenDispatcher):
                     output_bias_total = unpermuted_global_bias.scatter_add(
                         0, global_local_map, unpermuted_local_bias
                     )
-                
+
         if self.k == 1:
             output_total = output_total * scores
         output_total = output_total.view(self.hidden_shape)
@@ -499,13 +501,13 @@ class ZeroDropTopKRouter(Router):
         logits = logits.view(-1, self.config.num_moe_experts)
         logits = logits.to(dtype=torch.float32)
         logits = torch.softmax(logits, dim=-1)
-        
+
         # Apply Z-Loss
         if self.config.moe_z_loss_coeff > 0:
             logits = self.apply_z_loss(logits)
 
         scores, indices = torch.topk(logits, k=self.k, dim=1)
-        
+
         scores /= scores.sum(dim=-1, keepdim=True)
 
         # Apply load balancing loss
