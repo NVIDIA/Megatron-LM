@@ -20,7 +20,6 @@ from transformer_engine.pytorch import RMSNorm
 allam_layer_with_transformer_engine_spec = ModuleSpec(
     module=AllamTransformerLayer,
     submodules=TransformerLayerSubmodules(
-        input_layernorm=TENorm,
         self_attention=ModuleSpec(
             module=SelfAttention,
             params={"attn_mask_type": AttnMaskType.causal},
