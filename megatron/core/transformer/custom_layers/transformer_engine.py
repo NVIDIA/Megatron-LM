@@ -169,7 +169,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         # Only Transformer-Engine version >= 0.11.0 supports `RMSNorm`
         te_version = packaging.version.Version(version("transformer-engine"))
         if te_version >= packaging.version.Version("0.11.0"):
-            kwargs["normalization"] = self.config.normalization
+            extra_kwargs["normalization"] = self.config.normalization
 
         if te_version >= packaging.version.Version("0.8.0"):
             extra_kwargs["ub_bulk_wgrad"] = (
