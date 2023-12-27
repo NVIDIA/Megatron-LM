@@ -1,4 +1,4 @@
-
+# tests showed a 1s/it reduction using mcore
 TOKENIZER_MODEL=$1
 BIN_IDX_PATH=$2
 DATA_CACHE=$3
@@ -24,7 +24,6 @@ TRANSFORMER_ENG_ARGS=(
 
 GPT_MODEL_ARGS=(
     --use-mcore-models
-    --transformer-impl transformer_engine
     --model-spec megatron.core.models.gpt.allam_layer_specs allam_layer_with_transformer_engine_spec
     --seq-length 2048 
     --max-position-embeddings 2048 
