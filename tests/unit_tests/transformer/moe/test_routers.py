@@ -75,3 +75,11 @@ class TestDroplessTop2Router:
         out = self.switch_mlp(hidden_states)[0]
         out.sum().mul_(0).backward()
         assert self.switch_mlp.router.gate.weight.grad.abs().sum() > 0
+        
+        # With Z loss
+        self.transformer_config.moe_aux_loss_coeff = 0
+        self.transformer_config.moe_z_loss_coeff = 1
+        self.switch_mlp.router.gate.weight.grad.fill_(0)
+        out = self.switch_mlp(hidden_states)[0]
+        out.sum().mul_(0).backward()
+        assert self.switch_mlp.router.gate.weight.grad.abs().sum() > 0
