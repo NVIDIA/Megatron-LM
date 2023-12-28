@@ -117,11 +117,23 @@ class Router(ABC, MegatronModule):
 
         return scores, indices
 
-    def apply_aux_loss(self, loss_func, probs, indices):
+    def apply_aux_loss(self, loss_func, probs, indices, activation):
+        """
+        Applies auxiliary loss to the MoE layer.
+
+        Args:
+            loss_func (callable): The loss function to be used.
+            probs (torch.Tensor): The probabilities output by the MoE layer.
+            indices (torch.Tensor): The indices of the selected experts.
+            activation (torch.Tensor): The activation tensor to attach the gradient function to.
+
+        Returns:
+            torch.Tensor: The activation tensor with the attached gradient function.
+        """
         mask = torch.nn.functional.one_hot(indices, num_classes=self.num_experts).sum(dim=1)
         aux_loss = loss_func(probs, mask, self.config.moe_aux_loss_coeff)
-        indices = MoEAuxLossAutoScaler.apply(indices, aux_loss)
-        return indices
+        activation = MoEAuxLossAutoScaler.apply(activation, aux_loss)
+        return activation
 
     def apply_z_loss(self, logits):
         """Encourages the router's logits to remain small to enhance stability.
@@ -182,7 +194,7 @@ class MoETokenDispatcher:
         raise NotImplementedError
 
 
-class MoEZeroDropTokenDispatcher(MoETokenDispatcher):
+class MoEDroplessTokenDispatcher(MoETokenDispatcher):
     """
     Token dispatcher without token dropping.
     """
@@ -341,7 +353,7 @@ class MoEZeroDropTokenDispatcher(MoETokenDispatcher):
                 unpermuted_local_bias = unpermuted_local_bias * scores.view(-1, 1)
 
         output_total = unpermuted_local_hidden
-        output_bias_total = None
+        output_bias_total = unpermuted_local_bias
 
         # Unpermute the tokens across expert parallel devices.
         if self.config.sequence_parallel or (self.config.expert_model_parallel_size > 1):
@@ -407,7 +419,7 @@ class MoEZeroDropTokenDispatcher(MoETokenDispatcher):
         return output_total, output_bias_total
 
 
-class ZeroDropSinkhornRouter(Router):
+class DroplessSinkhornRouter(Router):
     """
     Sinkhorn Router without token dropping.
     """
@@ -422,7 +434,7 @@ class ZeroDropSinkhornRouter(Router):
         self.route_algo = self.sinkhorn
         self.router_activation = torch.sigmoid
         self.k = 1
-        self.token_dispatcher = MoEZeroDropTokenDispatcher(
+        self.token_dispatcher = MoEDroplessTokenDispatcher(
             num_local_experts, local_expert_indices, self.k, config
         )
 
@@ -469,7 +481,7 @@ class ZeroDropSinkhornRouter(Router):
         return scores, indices
 
 
-class ZeroDropTopKRouter(Router):
+class DroplessTopKRouter(Router):
     """
     Sinkhorn Router without token dropping.
     """
@@ -483,7 +495,7 @@ class ZeroDropTopKRouter(Router):
         assert config.moe_router_type.startswith("top")
         # extract k from config.moe_router_type
         self.k = int(config.moe_router_type[3:])
-        self.token_dispatcher = MoEZeroDropTokenDispatcher(
+        self.token_dispatcher = MoEDroplessTokenDispatcher(
             num_local_experts, local_expert_indices, self.k, config
         )
         self.moe_aux_loss_func = switch_load_balancing_loss_func
@@ -512,7 +524,7 @@ class ZeroDropTopKRouter(Router):
 
         # Apply load balancing loss
         if self.config.moe_aux_loss_coeff > 0:
-            indices = self.apply_aux_loss(self.moe_aux_loss_func, probs, indices)
+            scores = self.apply_aux_loss(self.moe_aux_loss_func, probs, indices, activation=scores)
 
         return scores, indices
 
@@ -532,6 +544,7 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
         (aux_loss,) = ctx.saved_tensors
         aux_loss_backward_scale = MoEAuxLossAutoScaler.main_loss_backward_scale
         scaled_aux_loss_grad = torch.ones_like(aux_loss) * aux_loss_backward_scale
+        print("233333, trigger backward!")
         return grad_output, scaled_aux_loss_grad
 
     @staticmethod

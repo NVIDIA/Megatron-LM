@@ -4,13 +4,13 @@ import pytest
 
 import torch
 
-from megatron.core.transformer.moe.base_moe_layer import Router, ZeroDropTopKRouter
+from megatron.core.transformer.moe.base_moe_layer import Router, DroplessTopKRouter
 from megatron.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-class TestZeroDropDispatcher:
+class TestDroplessDispatcher:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         _set_random_seed(seed_=123, data_parallel_random_init=False)
@@ -24,7 +24,7 @@ class TestZeroDropDispatcher:
             use_cpu_initialization=True,
             moe_router_type="top2",
         )
-        self.router = ZeroDropTopKRouter(
+        self.router = DroplessTopKRouter(
             num_local_experts=num_moe_experts,
             local_expert_indices=range(num_moe_experts),
             config=transformer_config,

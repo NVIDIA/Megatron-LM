@@ -7,7 +7,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.moe.base_moe_layer import ZeroDropSinkhornRouter, ZeroDropTopKRouter
+from megatron.core.transformer.moe.base_moe_layer import DroplessSinkhornRouter, DroplessTopKRouter
 from megatron.core.transformer.moe.grouped_mlp import GroupedMLP
 from megatron.core.transformer.moe.switch_mlp import SwitchMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -88,11 +88,11 @@ class SwitchMLPLayer(BaseMoELayer):
 
     def initialize_router(self):
         if self.config.moe_router_type.lower().startswith("top"):
-            router = ZeroDropTopKRouter(
+            router = DroplessTopKRouter(
                 self.num_local_experts, self.local_expert_indices, self.config
             )
         elif self.config.moe_router_type.lower() == "sinkhorn":
-            router = ZeroDropSinkhornRouter(
+            router = DroplessSinkhornRouter(
                 self.num_local_experts, self.local_expert_indices, self.config
             )
         else:

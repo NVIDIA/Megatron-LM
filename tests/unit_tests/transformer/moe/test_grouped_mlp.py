@@ -7,8 +7,7 @@ import torch.nn.functional as F
 
 from megatron.arguments import parse_args
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.transformer.moe.grouped_mlp import GroupedMLP
-from megatron.core.transformer.moe.switch_mlp import SwitchMLP
+from megatron.core.transformer.moe.moe_layer import SwitchMLPLayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.initialize import _set_random_seed
 from megatron.model import Float16Module
@@ -39,8 +38,8 @@ class TestParallelGroupedMLP:
             num_layers=num_layers, hidden_size=self.hidden_size, num_attention_heads=4,
             num_moe_experts=self.num_experts, use_cpu_initialization=self.use_cpu_initialization,
             add_bias_linear=False, gated_linear_unit=self.gated_linear_unit,
-            bias_activation_fusion=False,
-            bf16=True, params_dtype=torch.bfloat16)
+            bias_gelu_fusion=False,
+            bf16=True, params_dtype=torch.bfloat16, moe_router_type="sinkhorn")
 
         self.fc1_ffn_hidden_size = tf_config.ffn_hidden_size
         self.fc2_ffn_hidden_size = tf_config.ffn_hidden_size
@@ -53,7 +52,7 @@ class TestParallelGroupedMLP:
         _set_random_seed(seed_=123, data_parallel_random_init=False)
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             self.num_experts, moe_grouped_gemm=False)
-        self.switch_mlp_smm = SwitchMLP(tf_config,
+        self.switch_mlp_smm = SwitchMLPLayer(tf_config,
             transformer_layer_spec.submodules.mlp.submodules)
 
         self.args = parse_args(ignore_unknown_args=True)
@@ -66,7 +65,8 @@ class TestParallelGroupedMLP:
 
         ## Grouped GEMM
         _set_random_seed(seed_=123, data_parallel_random_init=False)
-        self.switch_mlp_gmm = GroupedMLP(tf_config)
+        tf_config.moe_grouped_gemm = True
+        self.switch_mlp_gmm = SwitchMLPLayer(tf_config)
         self.switch_mlp_gmm = Float16Module(self.switch_mlp_gmm, self.args).module
         print("done intializing for grouped gemm")
 
@@ -74,8 +74,8 @@ class TestParallelGroupedMLP:
         Utils.destroy_model_parallel()
 
     def test_constructor(self):
-        assert isinstance(self.switch_mlp_smm, SwitchMLP)
-        assert isinstance(self.switch_mlp_gmm, GroupedMLP)
+        assert isinstance(self.switch_mlp_smm, SwitchMLPLayer)
+        assert isinstance(self.switch_mlp_gmm, SwitchMLPLayer)
 
         num_weights_smm = sum([p.numel() for p in self.switch_mlp_smm.parameters()])
         num_weights_gmm = sum([p.numel() for p in self.switch_mlp_gmm.parameters()])
