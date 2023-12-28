@@ -898,7 +898,7 @@ def _add_training_args(parser):
                        help='Optimizer function')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic'],
-                       help='Single pass vs multiple pass data loader')
+                       help='Single pass vs multiple pass data loader.')
     group.add_argument('--no-async-tensor-model-parallel-allreduce',
                        action='store_false',
                        help='Disable asynchronous execution of '
@@ -1019,6 +1019,11 @@ def _add_checkpointing_args(parser):
                        help='Do not save current rng state.')
     group.add_argument('--load', type=str, default=None,
                        help='Directory containing a model checkpoint.')
+    group.add_argument('--load-iteration', type=int, default=None,
+                       help="Specify checkpoint iteration to load, defaults to last." )
+    group.add_argument('--override-dataloader-consumed-samples', type=int, default=None,
+                       help='When loading from checkpoint and using a new dataset, override the consumed training '
+                       'samples in the dataloader.')
     group.add_argument('--no-load-optim', action='store_true', default=None,
                        help='Do not load optimizer when loading checkpoint.')
     group.add_argument('--no-load-rng', action='store_true', default=None,

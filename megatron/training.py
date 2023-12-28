@@ -1109,7 +1109,8 @@ def build_train_valid_test_data_loaders(
             build_train_valid_test_datasets_provider)
         # Build dataloders.
         train_dataloader = build_pretraining_data_loader(
-            train_ds, args.consumed_train_samples)
+            train_ds, args.consumed_train_samples if args.override_dataloader_consumed_samples is None
+                else  args.override_dataloader_consumed_samples)
         if args.skip_train:
             valid_dataloader = build_pretraining_data_loader(valid_ds, 0)
         else:
