@@ -202,6 +202,9 @@ class VocabParallelEmbedding(torch.nn.Module):
                 _initialize_affine_weight_gpu(self.weight, init_method, partition_dim=0, stride=1)
 
     def forward(self, input_):
+        assert not torch.any(
+            (input_ < 0) | (input_ >= self.num_embeddings)
+        ), "An input token is out of bounds of the embedding table"
         if self.tensor_model_parallel_size > 1:
             # Build the mask.
             input_mask = (input_ < self.vocab_start_index) | (input_ >= self.vocab_end_index)
@@ -224,7 +227,7 @@ class LinearWithFrozenWeight(torch.autograd.Function):
     """Linear operator that does not calculate gradient for weight.
     This op and LinearWithGradAccumulationAndAsyncCommunication performs 
     mathematically-identical forward and DGRAD. 
-    
+
     Conceptually this op is the same as torch.nn.functional.linear with
     weight.requires_grad==False, but in experiments they are not identical 
     mathematically. """
@@ -412,12 +415,20 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 # are all run on the main backprop thread to prevent deadlocks. Setup
                 # dummy grad_weight tensor to prevent backward hooks from being run
                 # in a background thread.
-                grad_weight = torch.empty(
-                    weight.main_grad.shape,
-                    dtype=input.dtype,
-                    device=torch.cuda.current_device(),
-                    requires_grad=False,
-                )
+                if getattr(weight, 'zero_out_wgrad', False):
+                    grad_weight = torch.zeros(
+                        weight.main_grad.shape,
+                        dtype=input.dtype,
+                        device=torch.cuda.current_device(),
+                        requires_grad=False,
+                    )
+                else:
+                    grad_weight = torch.empty(
+                        weight.main_grad.shape,
+                        dtype=input.dtype,
+                        device=torch.cuda.current_device(),
+                        requires_grad=False,
+                    )
                 weight.grad_added_to_main_grad = True
             else:
                 grad_weight = None
@@ -534,32 +545,19 @@ class ColumnParallelLinear(torch.nn.Module):
     The linear layer is defined as Y = XA + b. A is parallelized along
     its second dimension as A = [A_1, ..., A_p].
 
-    Arguments:
+    Args:
         input_size: first dimension of matrix A.
         output_size: second dimension of matrix A.
-
-    Keyword Arguments
         bias: If true, add bias
-        gather_output: If true, call all-gather on output and make Y available
-                       to all GPUs, otherwise, every GPU will have its output
-                       which is Y_i = XA_i
-        init_method: method to initialize weights. Note that bias is always set
-                     to zero.
+        gather_output: If true, call all-gather on output and make Y available to all GPUs, otherwise, every GPU will have its output which is Y_i = XA_i
+        init_method: method to initialize weights. Note that bias is always set to zero.
         stride: For the strided linear layers.
-        keep_master_weight_for_test: This was added for testing and should be
-                                     set to False. It returns the master weights
-                                     used for initialization.
-        skip_bias_add: If True, do not add the bias term, instead
-                       return it to be added by the caller. This
-                       enables performance optimations where bias can
-                       be fused with other elementwise operations.
-        skip_weight_param_allocation: If True, weight parameter is not allocated and must be passed
-                                      as a keyword argument `weight` during the forward pass. Note
-                                      that this does not affect bias, which will be allocated if
-                                      bias is True. Defaults to False.
+        keep_master_weight_for_test: This was added for testing and should be set to False. It returns the master weights used for initialization.
+        skip_bias_add: If True, do not add the bias term, instead return it to be added by the caller. This enables performance optimations where bias can be fused with other elementwise operations.
+        skip_weight_param_allocation: If True, weight parameter is not allocated and must be passed as a keyword argument `weight` during the forward pass. Note that this does not affect bias, which will be allocated if bias is True. Defaults to False.
         is_expert: If True, the layer is treated as an MoE expert layer.
         config: ModelParallelConfig object
-
+        tp_comm_buffer_name: Communication buffer name is not used in non-Transformer-Engine modules.
     """
 
     def __init__(
@@ -576,6 +574,7 @@ class ColumnParallelLinear(torch.nn.Module):
         skip_bias_add=False,
         skip_weight_param_allocation: bool = False,
         is_expert: bool = False,
+        tp_comm_buffer_name: str = None,  # Not used
     ):
         super(ColumnParallelLinear, self).__init__()
 
@@ -761,35 +760,20 @@ class ColumnParallelLinear(torch.nn.Module):
 class RowParallelLinear(torch.nn.Module):
     """Linear layer with row parallelism.
 
-    The linear layer is defined as Y = XA + b. A is parallelized along
-    its first dimension and X along its second dimension as:
-               -   -
-              | A_1 |
-              | .   |
-          A = | .   |        X = [X_1, ..., X_p]
-              | .   |
-              | A_p |
-               -   -
-    Arguments:
+    The linear layer is defined as Y = XA + b. A is parallelized along its first dimension and X along its second dimension. A = transpose([A_1 .. A_p]) X = [X_1, ..., X_p]
+
+    Args:
         input_size: first dimension of matrix A.
         output_size: second dimension of matrix A.
-
-    Keyword Arguments:
         bias: If true, add bias. Note that bias is not parallelized.
-        input_is_parallel: If true, we assume that the input is already
-                           split across the GPUs and we do not split
-                           again.
-        init_method: method to initialize weights. Note that bias is always set
-                     to zero.
+        input_is_parallel: If true, we assume that the input is already split across the GPUs and we do not split again.
+        init_method: method to initialize weights. Note that bias is always set to zero.
         stride: For the strided linear layers.
-        keep_master_weight_for_test: This was added for testing and should be
-                                     set to False. It returns the master weights
-                                     used for initialization.
-        skip_bias_add: If True, do not add the bias term, instead
-                       return it to be added by the caller. This
-                       enables performance optimations where bias can
-                       be fused with other elementwise operations.
+        keep_master_weight_for_test: This was added for testing and should be set to False. It returns the master weights used for initialization.
+        skip_bias_add: If True, do not add the bias term, instead return it to be added by the caller. This enables performance optimations where bias can be fused with other elementwise operations.
         is_expert: If True, the layer is treated as an MoE expert layer
+        tp_comm_buffer_name: Communication buffer name. Not used in
+                             non-Transformer-Engine modules.
         config: ModelParallelConfig object
 
     """
@@ -801,12 +785,13 @@ class RowParallelLinear(torch.nn.Module):
         *,
         config: ModelParallelConfig,
         init_method: Callable,
-        bias: bool = True,
-        input_is_parallel: bool = False,
+        bias: bool,
+        input_is_parallel: bool,
+        skip_bias_add: bool,
         stride: int = 1,
         keep_master_weight_for_test: bool = False,
-        skip_bias_add: bool = False,
         is_expert: bool = False,
+        tp_comm_buffer_name: str = None,  # Not used
     ):
         super(RowParallelLinear, self).__init__()
 

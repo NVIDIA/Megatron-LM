@@ -184,14 +184,6 @@ class MegatronOptimizer(ABC):
         pass
 
 
-    def gather_model_params(self, args, timers):
-        """
-        For the case of a non-distributed-optimizer, there is nothing to
-        do here.
-        """
-        pass
-
-
 
 class MixedPrecisionOptimizer(MegatronOptimizer):
     """Base class for both the float-16 and the distributed optimizer.
@@ -246,7 +238,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         # Note that we keep this for the cases that grad scaler is none.
         # We still record nan/inf if we have a bfloat16 with a grad scaler.
         if self.grad_scaler:
-            self.found_inf = torch.cuda.FloatTensor([0.0])
+            self.found_inf = torch.tensor([0.0], dtype=torch.float, device='cuda')
 
         # Dummy tensor needed for apex multi-apply tensor.
         # For bfloat, we don't have multi-tensor apply and for now
@@ -254,11 +246,11 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if bf16:
             self._dummy_overflow_buf = None
         else:
-            self._dummy_overflow_buf = torch.cuda.IntTensor([0])
+            self._dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
 
         # In case grad scaler is not passed, define the unity scale.
         if self.grad_scaler is None:
-            self._scale_one = torch.cuda.FloatTensor([1.0])
+            self._scale_one = torch.tensor([1.0], dtype=torch.float, device='cuda')
 
 
     def get_loss_scale(self):
@@ -336,19 +328,12 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         num_zeros_in_grad = self.count_zeros() if \
                             self.log_num_zeros_in_grad else None
         timers('optimizer-count-zeros').stop()
-        # save the model weights
-        if args.warmup_optimizer_states:
-            model_groups_copy, main_groups_copy = self._get_model_and_main_params_groups_copy()
-        
+
         # Step the optimizer.
         timers('optimizer-inner-step', log_level=1).start(
             barrier=args.barrier_with_L1_time)
         self.optimizer.step()
         timers('optimizer-inner-step').stop()
-
-        # if < 100 steps, copy the model weights
-        if args.warmup_optimizer_states:
-            self._set_model_and_main_params_groups(model_groups_copy, main_groups_copy)
 
         # Update params from main params.
         timers('optimizer-copy-main-to-model-params', log_level=1).start(
@@ -488,30 +473,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         
         return main_grads
 
-    def _get_model_and_main_params_groups_copy(self):
-        model_groups = []
-        main_groups = []
-        for model_group, main_group in zip(self.float16_groups,
-                                           self.fp32_from_float16_groups):
-            model_data = []
-            main_data = []
-            for model_param, main_param in zip(model_group, main_group):
-                model_data.append(model_param.data.clone().detach())
-                main_data.append(main_param.data.clone().detach())
-            model_groups.append(model_data)
-            main_groups.append(main_data)
-        return model_groups, main_groups
-    
-    def _set_model_and_main_params_groups(self, model_groups_copy, main_groups_copy):
-        for model_group, main_group, model_group_copy, main_group_copy in zip(self.float16_groups,
-                                           self.fp32_from_float16_groups, 
-                                           model_groups_copy, main_groups_copy):
-            for model_param, main_param, model_param_copy, main_param_copy in zip(model_group, main_group,
-                                                                                model_group_copy, 
-                                                                                main_group_copy):
-                model_param.data = model_param_copy.data
-                main_param.data = main_param_copy.data
-    
+
     def _get_model_and_main_params_data_float16(self):
         model_data = []
         main_data = []
@@ -615,7 +577,7 @@ class FP32Optimizer(MegatronOptimizer):
             check_for_nan_in_grad, params_have_main_grad,
             models)
 
-        self._scale = torch.cuda.FloatTensor([1.0])
+        self._scale = torch.tensor([1.0], dtype=torch.float, device='cuda')
 
 
     def zero_grad(self, set_to_none=True):

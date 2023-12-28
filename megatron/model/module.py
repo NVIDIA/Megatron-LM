@@ -57,6 +57,10 @@ class MegatronModule(torch.nn.Module):
         # when we are using pipeline parallelism. Nothing to do if we aren't
         # using pipeline parallelism.
         if args.pipeline_model_parallel_size == 1:
+            # Zero out wgrad if sharing embeddings between two layers on same
+            # pipeline stage to make sure grad accumulation into main_grad is
+            # correct and does not include garbage values (e.g., from torch.empty).
+            self.shared_embedding_or_output_weight().zero_out_wgrad = True
             return
 
         # Parameters are shared between the word embeddings layers, and the

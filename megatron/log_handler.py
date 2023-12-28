@@ -3,6 +3,8 @@
 import sys
 from logging import LogRecord, StreamHandler
 
+BLACKLISTED_MODULES = ["torch.distributed"]
+
 
 class CustomHandler(StreamHandler):
     """
@@ -14,8 +16,9 @@ class CustomHandler(StreamHandler):
         super().__init__(stream=sys.stdout)
 
     def filter(self, record: LogRecord) -> bool:
-        # Let log entries that come from MCore through,
-        # filter out all others (e.g., from PyTorch Distributed).
-        if record.name.startswith("megatron.core"):
-            return True
-        return False
+        # Prevent log entries that come from the blacklisted modules
+        # through (e.g., PyTorch Distributed).
+        for blacklisted_module in BLACKLISTED_MODULES:
+            if record.name.startswith(blacklisted_module):
+                return False
+        return True

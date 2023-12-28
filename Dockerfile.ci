@@ -1,0 +1,4 @@
+ARG FROM_IMAGE_NAME
+FROM ${FROM_IMAGE_NAME}
+
+COPY . megatron-lm

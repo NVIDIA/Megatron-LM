@@ -13,7 +13,7 @@ from megatron import get_tokenizer
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.blended_megatron_dataset_config import GPTDatasetConfig
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.gpt_dataset import GPTDataset
 import megatron.model
 from megatron.core.models.gpt import GPTModel
@@ -26,7 +26,7 @@ from megatron.utils import (
 )
 from megatron.arguments import core_transformer_config_from_args
 from megatron.core.models.gpt.gpt_layer_specs import (
-    gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_with_transformer_engine_spec,
     gpt_layer_with_transformer_engine_spec_moe
 )
 
@@ -49,11 +49,11 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
     config = core_transformer_config_from_args(get_args())
 
     if args.use_mcore_models:
-        if args.model_spec is not None:
-            transformer_layer_spec = import_module(args.model_spec)
+        if args.spec is not None:
+            transformer_layer_spec = import_module(args.spec)
         else:
             if args.num_experts is None:
-                transformer_layer_spec = gpt_layer_with_transformer_engine_spec
+                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec()
             else:
                 transformer_layer_spec = gpt_layer_with_transformer_engine_spec_moe
 
@@ -197,7 +197,6 @@ def core_gpt_dataset_config_from_args(args):
         blend_per_split=[args.train_data_path, args.valid_data_path, args.test_data_path],
         split=args.split,
         path_to_cache=args.data_cache_path,
-        return_document_ids=args.retro_return_doc_ids
     )
 
 

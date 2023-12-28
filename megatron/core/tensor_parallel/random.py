@@ -25,6 +25,7 @@ from .utils import gather_split_1d_tensor, split_tensor_into_1d_equal_chunks
 # Default name for the model parallel rng tracker.
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
 _EXPERT_PARALLEL_RNG_TRACKER_NAME = 'expert-parallel-rng'
+_DATA_PARALLEL_RNG_TRACKER_NAME = 'data-parallel-rng'
 
 
 def _set_cuda_rng_state(new_state, device=-1):
@@ -64,6 +65,11 @@ def _set_cuda_rng_state(new_state, device=-1):
 def get_expert_parallel_rng_tracker_name():
     global _EXPERT_PARALLEL_RNG_TRACKER_NAME
     return _EXPERT_PARALLEL_RNG_TRACKER_NAME
+
+
+def get_data_parallel_rng_tracker_name():
+    global _DATA_PARALLEL_RNG_TRACKER_NAME
+    return _DATA_PARALLEL_RNG_TRACKER_NAME
 
 
 class CudaRNGStatesTracker:
@@ -154,14 +160,8 @@ def model_parallel_cuda_manual_seed(seed):
     after this function. Basically, this is replacement for that
     function.
     Two set of RNG states are tracked:
-        default state: This is for data parallelism and is the same among a
-                       set of model parallel GPUs but different across
-                       different model paralle groups. This is used for
-                       example for dropout in the non-tensor-model-parallel regions.
-        tensor-model-parallel state: This state is different among a set of model
-                              parallel GPUs, but the same across data parallel
-                              groups. This is used for example for dropout in
-                              model parallel regions.
+    default state: This is for data parallelism and is the same among a set of model parallel GPUs but different across different model paralle groups. This is used for example for dropout in the non-tensor-model-parallel regions.
+    tensor-model-parallel state: This state is different among a set of model parallel GPUs, but the same across data parallel groups. This is used for example for dropout in model parallel regions.
     """
     # 2718 is just for fun and any POSITIVE value will work.
     offset = seed + 2718
@@ -172,21 +172,23 @@ def model_parallel_cuda_manual_seed(seed):
     _CUDA_RNG_STATE_TRACKER.reset()
     # Set the default state.
     torch.cuda.manual_seed(data_parallel_seed)
+    _CUDA_RNG_STATE_TRACKER.add(_DATA_PARALLEL_RNG_TRACKER_NAME, data_parallel_seed)
+
     # and model parallel state.
     _CUDA_RNG_STATE_TRACKER.add(_MODEL_PARALLEL_RNG_TRACKER_NAME, tensor_model_parallel_seed)
 
     expert_parallel_seed = (
-        seed + 100 * get_expert_model_parallel_rank() + get_tensor_model_parallel_rank()
+        seed + 1024 + 100 * get_expert_model_parallel_rank() + get_tensor_model_parallel_rank()
     )
     _CUDA_RNG_STATE_TRACKER.add(_EXPERT_PARALLEL_RNG_TRACKER_NAME, expert_parallel_seed)
 
 
 class CheckpointFunction(torch.autograd.Function):
-    """This function is adapted from torch.utils.checkpoint with
-       two main changes:
-           1) torch.cuda.set_rng_state is replaced with `_set_cuda_rng_state`
-           2) the states in the model parallel tracker are also properly
-              tracked/set/reset.
+    """Checkpoint Function 
+
+    This function is adapted from torch.utils.checkpoint with two main changes:
+    1) torch.cuda.set_rng_state is replaced with `_set_cuda_rng_state`
+    2) the states in the model parallel tracker are also properly tracked/set/reset.
     """
 
     @staticmethod
@@ -250,6 +252,9 @@ class CheckpointFunction(torch.autograd.Function):
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
+
+        # filter out non tensor outputs for backward pass
+        outputs, args = zip(*filter(lambda x: torch.is_tensor(x[0]), zip(outputs, args)))
         torch.autograd.backward(outputs, args)
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs)
         return (None, None) + grads

@@ -1,6 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import math
 from contextlib import contextmanager
 from typing import Dict
 
@@ -76,7 +75,6 @@ class DistributedDataParallel(MegatronModule):
 
         # Group parameters by their gradient type.
         grad_dtype_to_params = {}
-        grad_dtype_to_numel = {}
         param_to_name = {}
         for name, param in self.module.named_parameters():
             if param.requires_grad and getattr(param, 'allreduce', True):
@@ -88,24 +86,11 @@ class DistributedDataParallel(MegatronModule):
                 params.append(param)
                 grad_dtype_to_params[dtype] = params
 
-                # Calculate number of elements per dtype.
-                grad_dtype_to_numel[dtype] = (
-                    grad_dtype_to_numel.get(dtype, 0) + param.data.nelement()
-                )
-
         # Allocate the grad buffers and map the grads.
         # The grad buffer under the hood creates buckets as appropriate based on bucket_size.
-        data_parallel_world_size = torch.distributed.get_world_size(group=data_parallel_group)
+        self.data_parallel_world_size = torch.distributed.get_world_size(group=data_parallel_group)
         for dtype, params in grad_dtype_to_params.items():
-            # Pad so size is divisible by the data parallel size.
-            numel = grad_dtype_to_numel[dtype]
-            numel_padded = (
-                int(math.ceil(numel / data_parallel_world_size)) * data_parallel_world_size
-            )
-
             self.grad_buffers[dtype] = GradBuffer(
-                numel,
-                numel_padded,
                 dtype,
                 params,
                 data_parallel_group,
@@ -114,26 +99,14 @@ class DistributedDataParallel(MegatronModule):
                 self.overlap_grad_reduce,
                 self.use_distributed_optimizer,
             )
-
-            # Parameters are laid out in the corresponding grad_buffer in reverse
-            # order, so count indices from the back.
-            index = grad_dtype_to_numel[dtype]
+            self.grad_buffer_param_index_map[dtype] = self.grad_buffers[dtype].param_index_map
             for param in params:
                 self.param_to_grad_buffer[param] = self.grad_buffers[dtype]
-                if dtype not in self.grad_buffer_param_index_map:
-                    self.grad_buffer_param_index_map[dtype] = {}
 
-                index -= param.data.nelement()
-                # Store the indices / bucket of each param.
-                self.grad_buffer_param_index_map[dtype][param] = (
-                    index,
-                    index + param.data.nelement(),
-                    self.grad_buffers[dtype].param_to_bucket_index[param],
-                )
-
-        # Allocate discreate buffer for MoE params' grads
+        # Allocate separate buffer for MoE params' grads.
         for param in self.module.parameters():
             if param.requires_grad and not getattr(param, 'allreduce', True):
+                param.grad_added_to_main_grad = False
                 dtype = torch.float if accumulate_allreduce_grads_in_fp32 else param.dtype
                 param.main_grad = torch.zeros(
                     param.data.shape,
@@ -175,7 +148,9 @@ class DistributedDataParallel(MegatronModule):
                     assert (
                         param.grad is not None
                     ), 'param.grad being None is not safe when overlap_grad_reduce is True'
-                if param.grad is not None and not param.grad_added_to_main_grad:
+                if param.grad is not None and (
+                    not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
+                ):
                     param.main_grad.add_(param.grad.data)
                 param.grad = None
                 if self.overlap_grad_reduce:
@@ -220,16 +195,21 @@ class DistributedDataParallel(MegatronModule):
         for grad_buffer in self.grad_buffers.values():
             grad_buffer.finish_grad_sync()
 
-    def zero_grad_buffer(self):
+        for expert_grad in self.expert_grads:
+            expert_grad /= self.data_parallel_world_size
+
+    def zero_grad_buffer(self, zero_buffer):
         """
         Zeros out all grad buffers. Needs to be called at the beginning of each
         training iteration.
+
+        When zero_buffer is set to True, the underlying grad buffer is zeroed out.
         """
         for param in self.module.parameters():
             if param.requires_grad:
                 param.grad_added_to_main_grad = False
         for grad_buffer in self.grad_buffers.values():
-            grad_buffer.reset()
+            grad_buffer.reset(zero_buffer)
         for expert_grad in self.expert_grads:
             expert_grad.zero_()
 

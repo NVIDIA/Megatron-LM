@@ -65,7 +65,6 @@ ARGS=" \
     --log-params-norm \
     --log-num-zeros-in-grad \
     --bf16 \
-    --DDP-impl local \
 "
 
 ######## Retro. ########
