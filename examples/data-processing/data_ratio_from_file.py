@@ -118,9 +118,8 @@ if __name__ == "__main__":
         lang_token[lang] += total_token_to_be_sampled
         if args.verbose:
             print(f"\t{prob} {os.path.basename(iterator_name)} {total_token_to_be_sampled:_} {total_token_exists:_} {total_token_to_be_sampled/total_token_exists}")
-        else:
-            __output_format = os.path.basename(iterator_name).replace('=', '\\=')
-            print(f"\t{prob} {args.prefix_for_file_path}/{__output_format}")
+        __output_format = os.path.basename(iterator_name).replace('=', '\\=')
+        print(f"\t{prob} {args.prefix_for_file_path}/{__output_format}")
         if args.export_script is not None:
             out_file_ptr.write(f"\n{prob} {args.prefix_for_file_path}/{__output_format}")
     if args.export_script is not None:

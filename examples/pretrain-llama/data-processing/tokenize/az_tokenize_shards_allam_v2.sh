@@ -1,7 +1,7 @@
-TOK_MODEL="https://allamllmuksstandard.blob.core.windows.net/llm-data/dolma/dolma_tokenize_by_llama2/tokenizer/tokenizer.model"
+TOK_MODEL="https://allamllmuksstandard.blob.core.windows.net/llm-data/allam-v2-data/allam_v2_tokenize_by_llama2/tokenizer/tokenizer.model"
 TOK_TYPE="Llama2Tokenizer"
-INPUT_FOLDER_PATH="https://allamllmuksstandard.blob.core.windows.net/llm-data/dolma/dolma_merged_shards/"
-BIN_IDX_PATH="https://allamllmuksstandard.blob.core.windows.net/llm-data/dolma/dolma_tokenize_by_llama2/meglm_llama2_bin_idx/"
+INPUT_FOLDER_PATH="https://allamllmuksstandard.blob.core.windows.net/llm-data/allam-v2-data/merged_shards/"
+BIN_IDX_PATH="https://allamllmuksstandard.blob.core.windows.net/llm-data/allam-v2-data/allam_v2_tokenize_by_llama2/meglm_llama2_bin_idx/"
 AZJOB_FILE="examples/pretrain-llama/data-processing/tokenize/tokenize.yaml"
 MATCHING_PREFIX_NAME=""
 AZ_LOGIN_CONFIG="examples/configs/azure_login_configs.json"
@@ -18,10 +18,10 @@ python examples/data-processing/tokenize_shards.py \
 --az-configs $AZ_LOGIN_CONFIG \
 --az-sample-yaml-job-file $AZJOB_FILE
 
-TOK_MODEL="https://allamllmuksstandard.blob.core.windows.net/llm-data/dolma/dolma_tokenize_by_llama2-ve/tokenizer/tokenizer.model"
+TOK_MODEL="https://allamllmuksstandard.blob.core.windows.net/llm-data/allam-v2-data/allam_v2_tokenize_by_llama2-ve/tokenizer/tokenizer.model"
 TOK_TYPE="Llama2Tokenizer"
-INPUT_FOLDER_PATH="https://allamllmuksstandard.blob.core.windows.net/llm-data/dolma/dolma_merged_shards/"
-BIN_IDX_PATH="https://allamllmuksstandard.blob.core.windows.net/llm-data/dolma/dolma_tokenize_by_llama2-ve/meglm_llama2-ve_bin_idx/"
+INPUT_FOLDER_PATH="https://allamllmuksstandard.blob.core.windows.net/llm-data/allam-v2-data/merged_shards/"
+BIN_IDX_PATH="https://allamllmuksstandard.blob.core.windows.net/llm-data/allam-v2-data/allam_v2_tokenize_by_llama2-ve/meglm_llama2-ve_bin_idx/"
 AZJOB_FILE="examples/pretrain-llama/data-processing/tokenize/tokenize.yaml"
 MATCHING_PREFIX_NAME=""
 AZ_LOGIN_CONFIG="examples/configs/azure_login_configs.json"

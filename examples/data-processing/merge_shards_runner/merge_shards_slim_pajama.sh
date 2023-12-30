@@ -1,28 +1,41 @@
+PATH_TO_SLIM_PAJAMA='../RAW_DATA_FOLDER/SlimPajama-627B'
+mkdir -p ../RAW_DATA_FOLDER/
+GIT_LFS_SKIP_SMUDGE=1 git clone https://huggingface.co/datasets/cerebras/SlimPajama-627B $PATH_TO_SLIM_PAJAMA
+cd $PATH_TO_SLIM_PAJAMA
+git lfs pull
+rm -rf .git
 
-NUM_SIZE=4348654387
 
-bash examples/data-processing/merge_shards_runner/slim_pajama_process.sh
+rm -rf ../RAW_DATA_FOLDER/SlimPajama-627B/export/
+mkdir -p $PATH_TO_SLIM_PAJAMA/export/
 
-azcopy copy "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/SlimPajama-627B/export/?sv=2023-01-03&ss=btqf&srt=sco&st=2023-12-02T21%3A07%3A05Z&se=2023-12-03T21%3A07%3A05Z&sp=rwdxftlacup&sig=xaz92d%2B4V7bJO8jcDhm1BbybLMsA4j%2FL6S0XO4XJgoA%3D" ../RAW_DATA_FOLDER/SlimPajama-627B/ --recursive --overwrite=false
+find $PATH_TO_SLIM_PAJAMA/train -type f -name '*.jsonl' | sort | xargs -I {} cat {} >> $PATH_TO_SLIM_PAJAMA/export/train.jsonl
+find $PATH_TO_SLIM_PAJAMA/validation -type f -name '*.jsonl' | sort | xargs -I {} cat {} >> $PATH_TO_SLIM_PAJAMA/export/validation.jsonl
+find $PATH_TO_SLIM_PAJAMA/test -type f -name '*.jsonl' | sort | xargs -I {} cat {} >> $PATH_TO_SLIM_PAJAMA/export/test.jsonl
 
-SLIM_PAJAMA_ROOT="../RAW_DATA_FOLDER/SlimPajama-627B"
+split --line-bytes=43G --additional-suffix=.jsonl -d -a 4 $PATH_TO_SLIM_PAJAMA/export/train.jsonl $PATH_TO_SLIM_PAJAMA/export/train_
 
-mkdir -p "$SLIM_PAJAMA_ROOT/data_by_domain"
+azcopy copy ../RAW_DATA_FOLDER/SlimPajama-627B "https://allamllmuksstandard.blob.core.windows.net/llm-data/?sv=2023-01-03&ss=btqf&srt=sco&st=2023-12-03T21%3A43%3A17Z&se=2025-05-30T21%3A43%3A00Z&sp=rwdxftlacup&sig=51chDeU9Xqnk7GrTSA3u2gEfdgCUQIq9SDAJEQCPQxE%3D"  --recursive --overwrite=false
+
+PATH_TO_SLIM_PAJAMA="../RAW_DATA_FOLDER/SlimPajama-627B"
+
+mkdir -p "$PATH_TO_SLIM_PAJAMA/data_by_domain"
 python examples/data-processing/sample_json_data_from_meta.py \
---input-folder-path "$SLIM_PAJAMA_ROOT/export/" \
---output-folder-path "$SLIM_PAJAMA_ROOT/data_by_domain" \
+--input-folder-path "$PATH_TO_SLIM_PAJAMA/export/" \
+--output-folder-path "$PATH_TO_SLIM_PAJAMA/data_by_domain" \
 --meta-keys 'meta' 'redpajama_set_name'
 
-cd $SLIM_PAJAMA_ROOT/data_by_domain
-split --line-bytes=85G --additional-suffix=.jsonl -d -a 4 RedPajamaCommonCrawl.jsonl ../merged_shards/RedPajamaC4_
+cd $PATH_TO_SLIM_PAJAMA/data_by_domain
+split --line-bytes=85G --additional-suffix=.jsonl -d -a 4 RedPajamaC4.jsonl ../merged_shards/RedPajamaC4_
+split --line-bytes=85G --additional-suffix=.jsonl -d -a 4 RedPajamaStackexchange.jsonl ../merged_shards/RedPajamaStackexchange_
 split --line-bytes=70G --additional-suffix=.jsonl -d -a 4 RedPajamaGithub.jsonl ../merged_shards/RedPajamaGithub_
 split --line-bytes=70G --additional-suffix=.jsonl -d -a 4 RedPajamaWikipedia.jsonl ../merged_shards/RedPajamaWikipedia_
 split --line-bytes=70G --additional-suffix=.jsonl -d -a 4 RedPajamaBook.jsonl ../merged_shards/RedPajamaBook_
 split --line-bytes=85G --additional-suffix=.jsonl -d -a 4 RedPajamaCommonCrawl.jsonl ../merged_shards/RedPajamaCommonCrawl_
 
-cp RedPajamaArXiv.jsonl $SLIM_PAJAMA_ROOT/merged_shards/RedPajamaArXiv_0001.jsonl
+cp RedPajamaArXiv.jsonl $PATH_TO_SLIM_PAJAMA/merged_shards/RedPajamaArXiv_0000.jsonl
 
-cd $SLIM_PAJAMA_ROOT/merged_shards
+cd $PATH_TO_SLIM_PAJAMA/merged_shards
 ls -l | awk '{print $9}' | xargs -I {} mv {} en_{}
 
 azcopy copy SlimPajama-627B "https://allamllmuksstandard.blob.core.windows.net/llm-data/?sv=2023-01-03&ss=btqf&srt=sco&st=2023-12-03T21%3A43%3A17Z&se=2025-05-30T21%3A43%3A00Z&sp=rwdxftlacup&sig=51chDeU9Xqnk7GrTSA3u2gEfdgCUQIq9SDAJEQCPQxE%3D" --recursive --overwrite=false
