@@ -49,7 +49,7 @@ command: >-
 display_name: MegatronLM-Allam-V2-data_VE
 
 experiment_name: MegatronLM-Vocab-Expansion
-code: ../../../
+code: ../../../../../
 environment: azureml:Megatron-LLaMA:4
 environment_variables:
   HYDRA_FULL_ERROR: '1'
