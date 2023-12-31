@@ -50,7 +50,7 @@ command: >-
 display_name: MegatronLM-Wikipedia_Ar_En_Experiment_tp2_pp2_seq2048_bs1920
 
 experiment_name: MegatronLM-Vocab-Expansion
-code: ../../../
+code: ../../../../../
 environment: azureml:Megatron-LLaMA:4
 environment_variables:
   HYDRA_FULL_ERROR: '1'
