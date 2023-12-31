@@ -21,7 +21,7 @@ services:
     log_dir: ${{outputs.tensorboard_dir}}
 
 experiment_name: Vocab-Expansion
-code: ../../../../
+code: ../../../../../
 environment: azureml:Megatron-LLaMA:7
 environment_variables:
   HYDRA_FULL_ERROR: '1'

@@ -15,7 +15,7 @@ command: >-
 display_name: LLaMa-Allam-Reasoning-Data-with-Ar-data-mix-hyp-tune
 
 experiment_name: Vocab-Expansion
-code: ../../../../
+code: ../../../../../
 environment: azureml:Megatron-LLaMA:7
 environment_variables:
   HYDRA_FULL_ERROR: '1'
