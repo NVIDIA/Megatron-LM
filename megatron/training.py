@@ -41,6 +41,8 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
 
+import axonn
+from axonn import axonn as ax
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -450,6 +452,8 @@ def train_step(forward_step_func, data_iterator,
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
     timers('optimizer').stop()
 
+    axonn.intra_layer.clear_weights_cache()
+
     # Gather params.
     if update_successful:
         optimizer.gather_model_params(args, timers)
@@ -646,6 +650,11 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             total_loss_dict[skipped_iters_key])
         log_string += ' number of nan iterations: {:3d} |'.format(
             total_loss_dict[nan_iters_key])
+        log_string += ' theoretical FLOP/s: {:.3f} TFLOP/s | '.format(get_flops(elapsed_time_per_iteration))
+        log_string += ' model size: {:.3f} B params | '.format(get_params())
+        curr, peak = get_mem()
+        log_string += ' memory used by tensors {:.3f} GB ( peak {:.3f} GB)'.format(curr, peak)
+
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
@@ -658,6 +667,33 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
 
     return report_memory_flag
 
+
+def get_flops(batch_time):
+    args = get_args() 
+    batch_size = args.global_batch_size
+    seq_length = args.seq_length
+    num_layers = args.num_layers
+    hidden_size = args.hidden_size
+    vocab_size = args.padded_vocab_size
+    num_gpus = torch.distributed.get_world_size()
+    teraflop_in_batch = 96*batch_size*seq_length*num_layers*(hidden_size**2)*(1+seq_length/(6*hidden_size)+(vocab_size)/(16*num_layers*hidden_size))/(1e12)
+    return teraflop_in_batch/batch_time/num_gpus
+
+
+def get_params():
+    args = get_args() 
+    batch_size = args.global_batch_size
+    seq_length = args.seq_length
+    num_layers = args.num_layers
+    hidden_size = args.hidden_size
+    vocab_size = args.padded_vocab_size
+    params = 12 * num_layers * (hidden_size ** 2)* ( 1 + 13/(12*hidden_size) + (vocab_size + seq_length)/(12 * num_layers * hidden_size)) / 1e9
+    return params
+   
+def get_mem():
+    curr =  torch.cuda.memory_allocated() / 1024 / 1024 / 1024
+    peak =  torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024
+    return curr, peak
 
 def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler):
     timers = get_timers()
@@ -706,9 +742,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
            torch.distributed.get_rank() in args.profile_ranks:
             torch.cuda.cudart().cudaProfilerStart()
             torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
-
+        
         update_num_microbatches(args.consumed_train_samples)
         args.curr_iteration = iteration
+
+        torch.cuda.nvtx.range_push(f"Iteration {iteration}")
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
             train_step(forward_step_func,
                        train_data_iterator,
@@ -716,6 +754,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                        optimizer,
                        opt_param_scheduler,
                        config)
+        torch.cuda.nvtx.range_pop()
         iteration += 1
         args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
                                        args.micro_batch_size * \
@@ -969,6 +1008,7 @@ def build_train_valid_test_data_loaders(
                 args.eval_iters * args.global_batch_size
 
     # Data loader only on rank 0 of each model parallel group.
+    
     if mpu.get_tensor_model_parallel_rank() == 0:
 
         # Build datasets.

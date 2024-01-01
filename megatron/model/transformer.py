@@ -47,6 +47,7 @@ except ImportError:
         hyperparameters: transformer hyperparameters
 """
 
+
 class DropPath(MegatronModule):
     """Drop paths (Stochastic Depth) per sample
     (when applied in main path of residual blocks).
@@ -77,11 +78,12 @@ class ParallelMLP(MegatronModule):
     state back into h hidden dimension.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, layer_number):
         super(ParallelMLP, self).__init__()
         args = get_args()
 
         self.add_bias = config.add_bias_linear
+        self.cache_weights_in_all_gather = (layer_number <= args.num_layers_for_caching_weights_in_depth_tensor_parallel_all_gather)
 
         ffn_hidden_size = config.ffn_hidden_size
         if config.gated_linear_unit:
@@ -126,9 +128,10 @@ class ParallelMLP(MegatronModule):
         )
 
     def forward(self, hidden_states):
-
+        torch.cuda.nvtx.range_push(f"MLP Block")
         # [s, b, 4hp]
-        intermediate_parallel, bias_parallel = self.dense_h_to_4h(hidden_states, scatter_input=False, gather_output=False)
+        intermediate_parallel, bias_parallel = self.dense_h_to_4h(hidden_states, scatter_input=False, gather_output=False, 
+                                                                  cache_weights_in_all_gather = self.cache_weights_in_all_gather)
 
         if self.bias_gelu_fusion:
             assert self.add_bias is True
@@ -140,7 +143,9 @@ class ParallelMLP(MegatronModule):
             intermediate_parallel = self.activation_func(intermediate_parallel)
 
         # [s, b, h]
-        output, output_bias = self.dense_4h_to_h(intermediate_parallel, scatter_input=False, gather_output=False)
+        output, output_bias = self.dense_4h_to_h(intermediate_parallel, scatter_input=False, gather_output=False, 
+                                                                  cache_weights_in_all_gather = self.cache_weights_in_all_gather)
+        torch.cuda.nvtx.range_pop()
         return output, output_bias
 
 
@@ -412,6 +417,7 @@ class ParallelAttention(MegatronModule):
         self.attn_mask_type = attn_mask_type
         self.params_dtype = config.params_dtype
         self.sequence_parallel = config.sequence_parallel
+        self.cache_weights_in_all_gather = (self.layer_number <= args.num_layers_for_caching_weights_in_depth_tensor_parallel_all_gather)
 
         self.group_query_attention = args.group_query_attention
         self.num_query_groups = args.num_query_groups
@@ -541,6 +547,7 @@ class ParallelAttention(MegatronModule):
         # =================================================
         # Pre-allocate memory for key-values for inference.
         # =================================================
+        torch.cuda.nvtx.range_push(f"Attention Block")
         is_first_step = False
         if inference_params:
             if self.layer_number not in inference_params.key_value_memory_dict:
@@ -566,7 +573,8 @@ class ParallelAttention(MegatronModule):
         if self.attention_type == AttnType.self_attn:
 
             # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
-            mixed_x_layer, _ = self.query_key_value(hidden_states, scatter_input=False, gather_output=False)
+            mixed_x_layer, _ = self.query_key_value(hidden_states, scatter_input=False, gather_output=False, 
+                                                    cache_weights_in_all_gather=self.cache_weights_in_all_gather)
 
             # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
             new_tensor_shape = mixed_x_layer.size()[:-1] + (
@@ -671,14 +679,16 @@ class ParallelAttention(MegatronModule):
         # ==================================
 
         # expand the key_layer and value_layer [sk, b, ng, hn] -> [sk, b, np, hn]
-        key_layer = key_layer.repeat_interleave(
-            self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
-            dim = 2
-        )
-        value_layer = value_layer.repeat_interleave(
-            self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
-            dim = 2
-        )
+        repeats = self.num_attention_heads_per_partition // self.num_query_groups_per_partition
+        if repeats > 1:
+            key_layer = key_layer.repeat_interleave(
+                repeats,
+                dim = 2
+            )
+            value_layer = value_layer.repeat_interleave(
+                repeats,
+                dim = 2
+            )
 
         # apply relative positional encoding (rotary embedding)
         if rotary_pos_emb is not None:
@@ -711,7 +721,8 @@ class ParallelAttention(MegatronModule):
         # Output. [sq, b, h]
         # =================
 
-        output, bias = self.dense(context_layer, scatter_input=False, gather_output=False)
+        output, bias = self.dense(context_layer, scatter_input=False, gather_output=False, cache_weights_in_all_gather=self.cache_weights_in_all_gather)
+        torch.cuda.nvtx.range_pop()
         return output, bias
 
 
@@ -812,7 +823,7 @@ class ParallelTransformerLayer(MegatronModule):
         if args.num_experts is not None:
             self.mlp = SwitchMLP(config)
         else:
-            self.mlp = ParallelMLP(config)
+            self.mlp = ParallelMLP(config, self.layer_number)
 
         # Set bias+dropout+add fusion grad_enable execution handler.
         TORCH_MAJOR = int(torch.__version__.split('.')[0])
@@ -1053,10 +1064,10 @@ class ParallelTransformerLayer(MegatronModule):
                 inference_params=None,
                 rotary_pos_emb=None):
         # hidden_states: [s, b, h]
-
+        torch.cuda.nvtx.range_push(f"Transformer Layer {self.layer_number}")
         # Layer norm at the beginning of the transformer layer.
-        if self.is_first_layer:
-            hidden_states = drop(hidden_states, batch_dim=1)
+        #if self.is_first_layer:
+        #    hidden_states = drop(hidden_states, batch_dim=1, skip_batch=False)
         norm_output = self.input_norm(hidden_states)
 
         # Self attention.
@@ -1173,11 +1184,12 @@ class ParallelTransformerLayer(MegatronModule):
                                               training=self.training)
             output = residual + self.drop_path(out)
 
+        torch.cuda.nvtx.range_pop()
         if self.layer_type == LayerType.retro_decoder_with_retriever:
             return output, retriever_output
         else:
-            if self.is_last_layer:
-                output = gather(output, batch_dim=1)
+            #if self.is_last_layer:
+            #    output = gather(output, batch_dim=1, skip_batch=False)
             return output
 
 
@@ -1491,7 +1503,11 @@ class ParallelTransformer(MegatronModule):
 
         if self.post_process and self.post_norm:
             # Final layer norm before output.
+            original_hidden_size = config.hidden_size
+            config.hidden_size = core.utils.divide(original_hidden_size, 
+                                                   args.column_tensor_model_parallel_size)
             self.final_norm = get_norm(config)
+            config.hidden_size = original_hidden_size
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
@@ -1522,6 +1538,7 @@ class ParallelTransformer(MegatronModule):
             l = 0
             while l < self.num_layers:
                 if self.transformer_impl == 'transformer_engine':
+                    raise NotImplementedError
                     hidden_states = transformer_engine.pytorch.checkpoint(
                         custom(l, l + self.recompute_num_layers),
                         self.distribute_saved_activations,
@@ -1533,6 +1550,7 @@ class ParallelTransformer(MegatronModule):
                     hidden_states = tensor_parallel.checkpoint(
                         custom(l, l + self.recompute_num_layers),
                         self.distribute_saved_activations,
+                        torch.nn.ModuleList([self._get_layer(index) for index in range(l, l+self.recompute_num_layers)]),
                         hidden_states, attention_mask,
                         encoder_output, enc_dec_attn_mask,
                         None, None, None, None, rotary_pos_emb)
@@ -1543,6 +1561,7 @@ class ParallelTransformer(MegatronModule):
             # Checkpoint the input activation of only a set number of individual
             # Transformer layers and skip the rest.
             # A method fully use the device memory removing redundant re-computation.
+            raise NotImplementedError
             for l in range(self.num_layers):
                 if l < self.recompute_num_layers:
                     if self.transformer_impl == 'transformer_engine':
@@ -1603,6 +1622,7 @@ class ParallelTransformer(MegatronModule):
             # See set_input_tensor()
             hidden_states = self.input_tensor
 
+        hidden_states = drop(hidden_states, batch_dim=1, skip_batch=False)
         # Viewless tensor.
         # - We only need to create a viewless tensor in the case of micro batch
         #   size (mbs) == 1, since in this case, 'hidden_states.transpose()'
@@ -1654,6 +1674,7 @@ class ParallelTransformer(MegatronModule):
                                                                rotary_pos_emb,
                                                                is_first_microbatch)
                 else:
+                    raise NotImplementedError
                     forward_kwargs = {
                         'encoder_output': encoder_output,
                         'enc_dec_attn_mask': enc_dec_attn_mask,
@@ -1695,6 +1716,7 @@ class ParallelTransformer(MegatronModule):
         if self.post_process and self.post_norm:
             hidden_states = self.final_norm(hidden_states)
 
+        hidden_states = gather(hidden_states, batch_dim=1, skip_batch=False)
         return hidden_states
 
     def load_state_dict(self, state_dict, strict=True):

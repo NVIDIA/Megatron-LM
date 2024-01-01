@@ -13,6 +13,11 @@ from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import p2p_communication
 from megatron.core.utils import get_attr_wrapped_model, get_model_config, get_model_type
 
+from axonn.intra_layer import optimize_communication, sync_gradients
+from megatron import get_args
+from contextlib import nullcontext
+from functools import partial
+
 # Types
 Shape = Union[List[int], torch.Size]
 
@@ -324,6 +329,27 @@ def forward_backward_no_pipelining(
 
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
+  
+    args=get_args()
+    #ctx = nullcontext()
+    if args.overlap_axonn_comm:
+        ctx = partial(optimize_communication, 
+                      overlap_all_reduce=True, 
+                      overlap_reduce_scatter=args.overlap_axonn_reduce_scatter, 
+                      overlap_all_gather=args.overlap_axonn_all_gather, 
+                      model_object_for_overlapping_allgathers=model
+                      )
+    else:
+        ctx = nullcontext
+
+    def post_process():
+        if args.overlap_axonn_reduce_scatter:
+            for param in model.parameters():
+                if param.requires_grad:
+                    if param.grad is not None and not param.grad_added_to_main_grad:
+                        param.main_grad.add_(param.grad.data)
+                    param.grad = None
+
     with no_sync_func():
         for i in range(num_microbatches - 1):
             output_tensor = forward_step(
@@ -336,11 +362,17 @@ def forward_backward_no_pipelining(
                 config,
                 collect_non_loss_data,
             )
+
             if not forward_only:
-                backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+                with ctx():
+                    backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+                
+            if not forward_only:
+                post_process() # need to call this because of the grad hook in megatron-lm
 
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).
+    #with ctx():#axonn.intra_layer.optimize_communication(False):
     output_tensor = forward_step(
         forward_step_func,
         data_iterator,
@@ -353,7 +385,15 @@ def forward_backward_no_pipelining(
     )
 
     if not forward_only:
-        backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+        with ctx():    
+            backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+ 
+    sync_gradients(model.module.module.language_model.encoder, 
+                   gradient_attr_name="main_grad",
+                   vectorize=False)
+    # for some reason vectorize does not work with torch.float16
+    if not forward_only:
+        post_process() # need to call this because of the grad hook in megatron-lm
 
     return forward_data_store
 

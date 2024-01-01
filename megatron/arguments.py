@@ -178,6 +178,7 @@ def validate_args(args, defaults={}):
 
     # Overlapping grad reduce only supported without pipeline parallelism right now.
     if args.overlap_grad_reduce:
+        raise ValueError(f"Megatron-AxoNN does not support --overlap-grad-reduce")
         assert args.pipeline_model_parallel_size == 1
 
     if args.dataloader_type is None:
@@ -997,6 +998,15 @@ def _add_distributed_args(parser):
                        help='Degree of tensor model parallelism.')
     group.add_argument('--depth-tensor-model-parallel-size', type=int, default=1,
                        help='Degree of tensor model parallelism.')
+    group.add_argument('--overlap-axonn-comm', action='store_true', default=False,
+                       help='Overlap all-reduces in backward pass of AxoNN\'s tensor parallelism')
+    group.add_argument('--overlap-axonn-reduce-scatter', action='store_true', default=False,
+                       help='Overlap reduce scatters in backward pass of AxoNN\'s tensor parallelism')
+    group.add_argument('--num-layers-for-caching-weights-in-depth-tensor-parallel-all-gather', type=int, default=0,
+                       help='number of layers to cache weights during the first all-gather for a batch')
+    group.add_argument('--overlap-axonn-all-gather', action='store_true', default=False,
+                       help='Overlap all-gathers in forward pass of AxoNN\'s tensor parallelism')
+    
     group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
                        help='Degree of pipeline model parallelism.')
     group.add_argument('--pipeline-model-parallel-split-rank',

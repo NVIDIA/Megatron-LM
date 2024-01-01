@@ -18,6 +18,8 @@ from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
 from megatron.arguments import core_transformer_config_from_args
 
+from axonn.intra_layer import drop
+
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
     args = get_args()
@@ -43,19 +45,20 @@ def get_batch(data_iterator):
     # Items and their type.
     keys = ['text']
     datatype = torch.int64
-
     # Broadcast data.
     if data_iterator is not None:
         data = next(data_iterator)
     else:
         data = None
+
     data_b = tensor_parallel.broadcast_data(keys, data, datatype)
+    
 
     # Unpack.
     tokens_ = data_b['text'].long()
     labels = tokens_[:, 1:].contiguous()
     tokens = tokens_[:, :-1].contiguous()
-
+    
     # Get the masks and postition ids.
     attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
         tokens,
@@ -96,9 +99,22 @@ def forward_step(data_iterator, model):
     tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
         data_iterator)
     timers('batch-generator').stop()
-
-    output_tensor = model(tokens, position_ids, attention_mask,
-                          labels=labels)
+    
+    from axonn.intra_layer import optimize_communication
+    from contextlib import nullcontext
+    
+    if args.overlap_axonn_comm:
+        ctx = partial(optimize_communication, 
+                      overlap_all_reduce=True, 
+                      overlap_reduce_scatter=args.overlap_axonn_reduce_scatter, 
+                      overlap_all_gather=args.overlap_axonn_all_gather, 
+                      model_object_for_overlapping_allgathers=model
+                      )
+    else:
+        ctx = nullcontext
+    with ctx():
+        output_tensor = model(tokens, position_ids, attention_mask,
+                              labels=labels)
 
     return output_tensor, partial(loss_func, loss_mask)
 
@@ -155,6 +171,7 @@ def set_device_and_init_torch_dist():
 
 if __name__ == "__main__":
     set_device_and_init_torch_dist()
+    #torch.cuda.set_per_process_memory_fraction(0.5) # 40GB
     pretrain(train_valid_test_datasets_provider,
              model_provider,
              ModelType.encoder_or_decoder,

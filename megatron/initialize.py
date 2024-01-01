@@ -117,8 +117,8 @@ def _compile_dependencies():
     # Custom kernel constraints check.
     seq_len = args.seq_length
     attn_batch_size = (
-        args.num_attention_heads / args.tensor_model_parallel_size
-    ) * args.micro_batch_size
+        args.num_attention_heads / args.row_tensor_model_parallel_size
+    ) * args.micro_batch_size / args.depth_tensor_model_parallel_size
     # Constraints on sequence length and attn_batch_size to enable warp based
     # optimization and upper triangular optimization (for causal mask)
     custom_kernel_constraint = (
@@ -222,7 +222,7 @@ def _initialize_distributed():
                 args.tensor_model_parallel_size * args.pipeline_model_parallel_size
             )
 
-            assert args.pipeline_model_parallel_size == 1
+            #assert args.pipeline_model_parallel_size == 1
 
             ax.init(
                 G_inter=args.pipeline_model_parallel_size,
@@ -231,6 +231,36 @@ def _initialize_distributed():
                 G_intra_c = args.column_tensor_model_parallel_size,
                 G_intra_d = args.depth_tensor_model_parallel_size,
             )
+
+
+            
+            def test_bw(pg):
+                SZ = int(16 * 2048 * 4096 * 10)
+                msg = torch.rand(SZ, 1, dtype=torch.half, device="cuda")
+                st, en = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+
+                times = []
+                for _ in range(20):
+                    st.record()
+                    torch.distributed.all_reduce(msg, group=pg)
+                    en.record()
+                    torch.cuda.synchronize()
+                    times.append(st.elapsed_time(en))
+                    #print(times[-1]/2)
+
+                size = SZ * 2  ## bytes
+                g = torch.distributed.get_world_size(group=pg)
+                bw = 2 * (g - 1) / g * size / 1e9 / np.mean(times[-10:]) * 1000
+                if torch.distributed.get_rank() == 0:
+                    print(
+                        f"All-reduce bus bw for {g} GPUs is {bw:.3f} GBPS for message size {size/1e9:.3f} GB"
+                    )
+                    print(f"time = {np.mean(times[-10:])} ms")
+
+            test_bw(ax.comm_handle.inner_intra_layer_parallel_group)
+            test_bw(ax.comm_handle.outer_intra_layer_parallel_group)
+            test_bw(ax.comm_handle.depth_intra_layer_parallel_group)
+           
 
             if args.rank == 0:
                 print(
@@ -318,15 +348,15 @@ def _warmup_jit_function():
 
     # Warmup fused bias+gelu
     bias = torch.rand(
-        args.ffn_hidden_size // args.tensor_model_parallel_size,
+        args.ffn_hidden_size // args.row_tensor_model_parallel_size,
         dtype=dtype,
         device="cuda",
     )
     input = torch.rand(
         (
             args.seq_length,
-            args.micro_batch_size,
-            args.ffn_hidden_size // args.tensor_model_parallel_size,
+            args.micro_batch_size // args.depth_tensor_model_parallel_size,
+            args.ffn_hidden_size // args.row_tensor_model_parallel_size,
         ),
         dtype=dtype,
         device="cuda",
@@ -341,20 +371,22 @@ def _warmup_jit_function():
 
     # Warmup fused bias+dropout+add
     if args.sequence_parallel:
+        raise NotImplementedError
         seq_length = args.seq_length // mpu.get_tensor_model_parallel_world_size()
     else:
         seq_length = args.seq_length
     input = torch.rand(
-        (seq_length, args.micro_batch_size, args.hidden_size),
+        (seq_length, args.micro_batch_size // args.depth_tensor_model_parallel_size, 
+         args.hidden_size // args.column_tensor_model_parallel_size),
         dtype=dtype,
         device="cuda",
     )
     residual = torch.rand(
-        (seq_length, args.micro_batch_size, args.hidden_size),
+        (seq_length, args.micro_batch_size // args.depth_tensor_model_parallel_size, args.hidden_size // args.column_tensor_model_parallel_size),
         dtype=dtype,
         device="cuda",
     )
-    bias = torch.rand((args.hidden_size), dtype=dtype, device="cuda").expand_as(
+    bias = torch.rand((args.hidden_size // args.column_tensor_model_parallel_size), dtype=dtype, device="cuda").expand_as(
         residual
     )
     dropout_rate = 0.1

@@ -21,6 +21,8 @@ from megatron.core.utils import safely_set_viewless_tensor_data
 
 from .utils import gather_split_1d_tensor, split_tensor_into_1d_equal_chunks
 
+from axonn.intra_layer import overlap_all_gathers_for_checkpointed_forward
+
 # Default name for the model parallel rng tracker.
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
 
@@ -178,9 +180,10 @@ class CheckpointFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, run_function, distribute_saved_activations, *args):
+    def forward(ctx, run_function, distribute_saved_activations,  checkpointed_model, *args):
         ctx.run_function = run_function
         ctx.distribute_saved_activations = distribute_saved_activations
+        ctx.checkpointed_model = checkpointed_model
 
         # Copy the rng states.
         ctx.fwd_cpu_rng_state = torch.get_rng_state()
@@ -229,7 +232,8 @@ class CheckpointFunction(torch.autograd.Function):
         # Compute the forward pass.
         detached_inputs = detach_variable(inputs)
         with torch.enable_grad():
-            outputs = ctx.run_function(*detached_inputs)
+            with overlap_all_gathers_for_checkpointed_forward(ctx.checkpointed_model):
+                outputs = ctx.run_function(*detached_inputs)
 
         # Set the states back to what it was at the start of this function.
         torch.set_rng_state(bwd_cpu_rng_state)
@@ -240,10 +244,10 @@ class CheckpointFunction(torch.autograd.Function):
             outputs = (outputs,)
         torch.autograd.backward(outputs, args)
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs)
-        return (None, None) + grads
+        return (None, None, None) + grads
 
 
-def checkpoint(function, distribute_saved_activations, *args):
+def checkpoint(function, distribute_saved_activations, checkpointed_model, *args):
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint."""
-    return CheckpointFunction.apply(function, distribute_saved_activations, *args)
+    return CheckpointFunction.apply(function, distribute_saved_activations, checkpointed_model, *args)

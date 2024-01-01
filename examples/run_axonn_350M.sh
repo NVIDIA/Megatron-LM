@@ -29,31 +29,28 @@ MERGE_FILE="${DATA_DIR}/gpt2-merges.txt"
 DATA_PATH="${DATA_DIR}/BookCorpusDataset_text_document"
 
 ## ARCHITECTURE DETAILS
-NUM_LAYERS=32
-NUM_HEADS=56
-HIDDEN_SIZE=7168 
+NUM_LAYERS=24
+HIDDEN_SIZE=1024
+NUM_HEADS=16
 
 ## PARALLELISM DETAILS
-COLUMN_TENSOR_PARR=1
-ROW_TENSOR_PARR=4
-DEPTH_TENSOR_PARR=4
+COLUMN_TENSOR_PARR=2
+ROW_TENSOR_PARR=2
+DEPTH_TENSOR_PARR=2
 PIPE_PARR=1
-CACHE_LAYERS=32
-OVERLAP=True
-
-NSYS_PROFILE=False
+CACHE_LAYERS=12
 
 ## BATCH SIZES
 MICRO_BATCH_SIZE=16
 GLOBAL_BATCH_SIZE=16
-SEQUENCE_LENGTH=2048
-TRAIN_ITERS=1000
+SEQUENCE_LENGTH=1024
+
+OVERLAP="True"
 
 GPT_ARGS="
     --row-tensor-model-parallel-size ${ROW_TENSOR_PARR} \
     --column-tensor-model-parallel-size ${COLUMN_TENSOR_PARR} \
     --depth-tensor-model-parallel-size ${DEPTH_TENSOR_PARR} \
-    --pipeline-model-parallel-size ${PIPE_PARR} \
     --num-layers ${NUM_LAYERS} \
     --hidden-size ${HIDDEN_SIZE} \
     --num-attention-heads ${NUM_HEADS} \
@@ -62,7 +59,7 @@ GPT_ARGS="
     --micro-batch-size ${MICRO_BATCH_SIZE} \
     --global-batch-size ${GLOBAL_BATCH_SIZE} \
     --lr 0.00015 \
-    --train-iters ${TRAIN_ITERS} \
+    --train-iters 500000 \
     --lr-decay-iters 320000 \
     --lr-decay-style cosine \
     --min-lr 1.0e-5 \
@@ -70,11 +67,15 @@ GPT_ARGS="
     --lr-warmup-fraction .01 \
     --clip-grad 1.0 \
     --bf16 \
-    --use-flash-attn \
     --recompute-granularity full \
     --recompute-method uniform \
     --recompute-num-layers 1 \
 "
+
+
+    #--loss-scale 2048
+
+
 if [[ $OVERLAP == "True" ]]
 then
 	GPT_ARGS="${GPT_ARGS} \
@@ -83,6 +84,7 @@ then
 		--overlap-axonn-all-gather\
 		--num-layers-for-caching-weights-in-depth-tensor-parallel-all-gather ${CACHE_LAYERS}"
 fi
+
 
 
 DATA_ARGS="
@@ -96,38 +98,20 @@ OUTPUT_ARGS="
     --log-interval 1 \
     --save-interval 10000 \
     --eval-interval 1000 \
-    --eval-iters 1
+    --eval-iters 10
 "
-
-
 
 SCRIPT="python -u pretrain_gpt.py \
     $GPT_ARGS \
     $DATA_ARGS \
     $OUTPUT_ARGS \
     --distributed-backend nccl \
+    --save $CHECKPOINT_PATH \
+    --load $CHECKPOINT_PATH
 "
 
-if [[ ${NSYS_PROFILE} == "True" ]]
-then
-	echo "profiling with nsys"
-	SCRIPT="nsys profile -s none \
-		-t nvtx,cuda -o test.qdrep \
-		--force-overwrite=true  \
-		--capture-range=cudaProfilerApi \
-		--capture-range-end=stop \
-		${SCRIPT} \
-		--profile-step-start 5 \
-		--profile-step-end 10 \
-		--profile
-		"
-fi
 
-# add these args if you want to save and load checkpoints
-#--save $CHECKPOINT_PATH \
-# --load $CHECKPOINT_PATH
-
-run_cmd="srun -C gpu -N ${NNODES} -n ${GPUS} -c 32 --cpu-bind=cores --gpus-per-node=4 ${SCRIPT}" 
+run_cmd="srun -C gpu -N ${NNODES} -n ${GPUS} -c 32 --cpu-bind=cores --gpus-per-node=4 ${SCRIPT}"
 
 echo ${run_cmd}
 eval ${run_cmd}

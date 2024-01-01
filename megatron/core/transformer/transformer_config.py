@@ -190,10 +190,11 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.num_attention_heads % self.tensor_model_parallel_size != 0:
-            raise ValueError(
-                f"num_attention_heads ({self.num_attention_heads}) must be a multiple of "
-                f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
-            )
+            pass # this will be caught later
+            #raise ValueError(
+            #    f"num_attention_heads ({self.num_attention_heads}) must be a multiple of "
+            #    f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
+            #)
 
         if self.ffn_hidden_size is None:
             self.ffn_hidden_size = 4 * self.hidden_size
@@ -205,10 +206,11 @@ class TransformerConfig(ModelParallelConfig):
             self.num_query_groups = self.num_attention_heads
 
         if self.num_query_groups % self.tensor_model_parallel_size != 0:
-            raise ValueError(
-                f"num_query_groups ({self.num_query_groups}) must be a multiple of "
-                f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
-            )
+            pass # this will be caught later
+            #raise ValueError(
+            #    f"num_query_groups ({self.num_query_groups}) must be a multiple of "
+            #    f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
+            #)
 
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True

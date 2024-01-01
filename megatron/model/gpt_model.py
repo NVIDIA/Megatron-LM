@@ -12,6 +12,7 @@ from .enums import AttnMaskType
 from .language_model import parallel_lm_logits
 from .language_model import get_language_model
 
+from axonn.intra_layer import drop
 
 def post_language_model_processing(lm_output, labels, logit_weights,
                                    parallel_output,
@@ -78,6 +79,9 @@ class GPTModel(MegatronModule):
                 retriever_position_ids=None,
                 retriever_attn_mask=None,
                 labels=None, tokentype_ids=None, inference_params=None):
+
+        for func_arg in  [retriever_input_ids, retriever_position_ids, retriever_attn_mask, tokentype_ids, inference_params]:
+            assert func_arg is None, func_arg
 
         lm_output = self.language_model(
             input_ids,
