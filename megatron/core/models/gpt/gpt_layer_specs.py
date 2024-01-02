@@ -7,6 +7,7 @@ from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubm
 from megatron.core.transformer.custom_layers.transformer_engine import (
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
+    TENorm,
     TERowParallelLinear,
 )
 from megatron.core.transformer.dot_product_attention import DotProductAttention
@@ -39,7 +40,7 @@ def get_gpt_layer_with_transformer_engine_spec(
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=FusedLayerNorm if num_experts else IdentityOp,
+            pre_mlp_layernorm=TENorm if num_experts else IdentityOp,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
         ),
