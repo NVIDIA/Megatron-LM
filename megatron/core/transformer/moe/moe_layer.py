@@ -14,6 +14,12 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 class BaseMoELayer(MegatronModule, ABC):
+    """Base class for a mixture of experts layer.
+
+    Args:
+        config (TransformerConfig): Configuration object for the transformer model.
+    """
+
     def __init__(self, config: TransformerConfig):
         super(BaseMoELayer, self).__init__(config)
         self.config = config
@@ -36,9 +42,8 @@ class BaseMoELayer(MegatronModule, ABC):
 
 
 class SwitchMLPLayer(BaseMoELayer):
-    """
-    Top-K Mixture of Experts Layer Without Token Dropping.
-    Currently supports Sinkhorn-based expert routing (Top-1 only) and a generalized Top-k routing with Z loss and auxiliary loss.
+    """Top-K Mixture of Experts Layer **Without Token Dropping**.
+    Currently supports Sinkhorn-based routing (Top-1) and generalized Top-k routing with auxiliary loss.
 
     Args:
         BaseMoELayer (MegatronModule): Base class for MoE layers

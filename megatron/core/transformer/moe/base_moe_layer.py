@@ -2,6 +2,7 @@
 
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
+from typing import List
 
 import torch
 
@@ -45,8 +46,7 @@ class Router(ABC, MegatronModule):
         setattr(self.gate.weight, 'sequence_parallel', config.sequence_parallel)
 
     def gating(self, input: torch.Tensor):
-        """
-        Forward pass of the router gate.
+        """Forward pass of the router gate.
 
         Args:
             input (torch.Tensor): Input tensor.
@@ -58,8 +58,7 @@ class Router(ABC, MegatronModule):
         return logits
 
     def routing(self, logits: torch.Tensor):
-        """
-        Get the routing results.
+        """Routing function.
 
         Args:
             logits (torch.Tensor): Logits tensor.
@@ -69,19 +68,8 @@ class Router(ABC, MegatronModule):
         """
         raise NotImplementedError
 
-    def dispatch(
-        self, tokens: torch.Tensor, indices: torch.Tensor,
-    ):
-        raise NotImplementedError
-
-    def restore(
-        self, expert_output: torch.Tensor, scores: torch.Tensor, indicies: torch.Tensor,
-    ):
-        raise NotImplementedError
-
     def apply_input_jitter(self, input, eps=1e-2):
-        """
-        Add noise to the input tensor.
+        """Add noise to the input tensor.
         Refer to https://arxiv.org/abs/2101.03961.
 
         Args:
@@ -118,8 +106,7 @@ class Router(ABC, MegatronModule):
         return scores, indices
 
     def apply_aux_loss(self, loss_func, probs, indices, activation):
-        """
-        Applies auxiliary loss to the MoE layer.
+        """Applies auxiliary loss to the MoE layer.
 
         Args:
             loss_func (callable): The loss function to be used.
@@ -165,8 +152,7 @@ class MoETokenDispatcher:
     def dispatch(
         self, tokens: torch.Tensor, indices: torch.Tensor,
     ):
-        """
-        Dispatch tokens to experts.
+        """Dispatch tokens to experts.
 
         Args:
             tokens (torch.Tensor): Input tokens.
@@ -180,8 +166,7 @@ class MoETokenDispatcher:
     def restore(
         self, expert_output: torch.Tensor, scores: torch.Tensor, indices: torch.Tensor,
     ):
-        """
-        Restores the expert output to its original ordering.
+        """Restores the expert output to its original ordering.
 
         Args:
             expert_output (torch.Tensor): The output tensor from the expert models.
@@ -420,14 +405,11 @@ class MoEDroplessTokenDispatcher(MoETokenDispatcher):
 
 
 class DroplessSinkhornRouter(Router):
-    """
-    Sinkhorn Router without token dropping.
+    """Sinkhorn Router without token dropping.
     """
 
     def __init__(self, num_local_experts, local_expert_indices, config: TransformerConfig) -> None:
-        """
-        Initialize the zero token dropping router.
-        """
+        """Initialize the dropless sinkhorn router."""
         super().__init__(config=config)
         assert config.moe_token_dropping == False
         assert config.moe_router_type == "sinkhorn"
@@ -439,7 +421,7 @@ class DroplessSinkhornRouter(Router):
         )
 
     def sinkhorn(self, cost, tol=0.0001):
-        "Sinkhorn based MoE routing function"
+        """Sinkhorn based MoE routing function"""
         cost = torch.exp(cost)
         d0 = torch.ones(cost.size(0), device=cost.device, dtype=cost.dtype)
         d1 = torch.ones(cost.size(1), device=cost.device, dtype=cost.dtype)
@@ -455,14 +437,13 @@ class DroplessSinkhornRouter(Router):
         return d1 * cost * d0.unsqueeze(1)
 
     def routing(self, logits: torch.Tensor):
-        """
-        Get the routing results.
+        """Get the routing results.
 
         Args:
             logits (torch.Tensor): Logits tensor.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Tuple of tensors representing max probs and the indices.
+            Tuple[torch.Tensor, torch.Tensor]: Tuple of tensors representing the routing scores and indices.
         """
         logits = logits.view(-1, self.config.num_moe_experts)
 
@@ -482,13 +463,22 @@ class DroplessSinkhornRouter(Router):
 
 
 class DroplessTopKRouter(Router):
-    """
-    Sinkhorn Router without token dropping.
+    """Sinkhorn Router without token dropping.
+
+    This class represents a router that applies the Sinkhorn algorithm for load balancing without dropping any tokens.
+    
     """
 
-    def __init__(self, num_local_experts, local_expert_indices, config: TransformerConfig) -> None:
-        """
-        Initialize the zero token dropping router.
+    def __init__(
+        self, num_local_experts: int, local_expert_indices: List[int], config: TransformerConfig
+    ) -> None:
+        """Initialize the zero token dropping router.
+
+        Args:
+            num_local_experts (int): The number of local experts.
+            local_expert_indices (List[int]): The indices of the local experts.
+            config (TransformerConfig): The configuration for the transformer model.
+            
         """
         super().__init__(config=config)
         assert config.moe_token_dropping == False
@@ -501,14 +491,13 @@ class DroplessTopKRouter(Router):
         self.moe_aux_loss_func = switch_load_balancing_loss_func
 
     def routing(self, logits: torch.Tensor):
-        """
-        Get the routing results.
+        """Top-k routing function
 
         Args:
             logits (torch.Tensor): Logits tensor.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Tuple of tensors representing max probs and the indices.
+            Tuple[torch.Tensor, torch.Tensor]: Probs and the indices tensor.
         """
         logits = logits.view(-1, self.config.num_moe_experts)
         logits = logits.to(dtype=torch.float32)
@@ -530,23 +519,46 @@ class DroplessTopKRouter(Router):
 
 
 class MoEAuxLossAutoScaler(torch.autograd.Function):
+    """A AutoScaler that compute and scales the grad of auxiliary loss.
+
+    """
+
     main_loss_backward_scale = 1
 
     @staticmethod
     def forward(ctx, output, aux_loss):
-        # Preserve the aux_loss by storing it in the context to avoid garbage collection.
+        """Preserve the aux_loss by storing it in the context to avoid garbage collection.
+        
+        Args:
+            output (torch.Tensor): The output tensor.
+            aux_loss (torch.Tensor): The auxiliary loss tensor.
+
+        Returns:
+            torch.Tensor: The output tensor.
+        """
         ctx.save_for_backward(aux_loss)
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        # Scale the auxiliary loss.
+        """Trigger the backward pass of the auxiliary loss as well as it scaling.
+
+        Args:
+            grad_output (torch.Tensor): The gradient of the output.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: The gradient of the output, scaled auxiliary loss gradient.
+        """
         (aux_loss,) = ctx.saved_tensors
         aux_loss_backward_scale = MoEAuxLossAutoScaler.main_loss_backward_scale
         scaled_aux_loss_grad = torch.ones_like(aux_loss) * aux_loss_backward_scale
         return grad_output, scaled_aux_loss_grad
 
     @staticmethod
-    def set_loss_scale(scale):
-        # Scale the aux loss in the same way as the main loss.
+    def set_loss_scale(scale: int):
+        """set the scale of the aux loss.
+        
+        Args:
+            scale (int): The scale value to set. Please ensure that the scale passed in matches the scale of the main_loss.
+        """
         MoEAuxLossAutoScaler.main_loss_backward_scale = scale
