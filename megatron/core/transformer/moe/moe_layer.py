@@ -63,7 +63,7 @@ class SwitchMLPLayer(BaseMoELayer):
         self.experts = self.initialize_experts()
         assert config.moe_token_dropping is False
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.Tensor):
         # process MoE
         scores, indices = self.router(hidden_states)
         (

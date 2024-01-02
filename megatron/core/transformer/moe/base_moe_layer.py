@@ -68,7 +68,7 @@ class Router(ABC, MegatronModule):
         """
         raise NotImplementedError
 
-    def apply_input_jitter(self, input, eps=1e-2):
+    def apply_input_jitter(self, input: torch.Tensor, eps: float = 1e-2):
         """Add noise to the input tensor.
         Refer to https://arxiv.org/abs/2101.03961.
 
@@ -105,7 +105,13 @@ class Router(ABC, MegatronModule):
 
         return scores, indices
 
-    def apply_aux_loss(self, loss_func, probs, indices, activation):
+    def apply_aux_loss(
+        self,
+        loss_func: function,
+        probs: torch.Tensor,
+        indices: torch.Tensor,
+        activation: torch.Tensor,
+    ):
         """Applies auxiliary loss to the MoE layer.
 
         Args:
@@ -185,7 +191,11 @@ class MoEDroplessTokenDispatcher(MoETokenDispatcher):
     """
 
     def __init__(
-        self, num_local_experts, local_expert_indices, k, config: TransformerConfig
+        self,
+        num_local_experts: int,
+        local_expert_indices: List[int],
+        k: int,
+        config: TransformerConfig,
     ) -> None:
         """
         Initialize the zero token dropping router.
@@ -196,7 +206,7 @@ class MoEDroplessTokenDispatcher(MoETokenDispatcher):
         self.k = k
         self.add_bias = config.add_bias_linear
 
-    def gather_indices(self, local_indices):
+    def gather_indices(self, local_indices: torch.Tensor):
         """ Gather tensors and concatenate along the first dimension."""
         group = get_tensor_and_expert_parallel_group()
         world_size = torch.distributed.get_world_size(group=group)
@@ -214,7 +224,7 @@ class MoEDroplessTokenDispatcher(MoETokenDispatcher):
         torch.distributed._all_gather_base(output, local_indices.contiguous(), group=group)
         return output
 
-    def dispatch(self, hidden_states, max_prob, max_ind):
+    def dispatch(self, hidden_states: torch.Tensor, max_prob: torch.Tensor, max_ind: torch.Tensor):
         """Dispatch tokens to local experts. It's composed of two stages:
         (1) Permute the tokens across the expert parallel devices. After this stage,
         each device receives all of the tokens assigned to its local set of experts
@@ -299,7 +309,14 @@ class MoEDroplessTokenDispatcher(MoETokenDispatcher):
             global_local_map,
         )
 
-    def restore(self, hidden_states, scores, indices, global_local_map=None, bias=None):
+    def restore(
+        self,
+        hidden_states: torch.Tensor,
+        scores: torch.Tensor,
+        indices: torch.Tensor,
+        global_local_map: torch.Tensor = None,
+        bias: torch.Tensor = None,
+    ):
         """
         Reverse process of `dispatch()` which permutes the ouput of local
         experts locallay and across expert parallel rank into the original order to
@@ -408,7 +425,9 @@ class DroplessSinkhornRouter(Router):
     """Sinkhorn Router without token dropping.
     """
 
-    def __init__(self, num_local_experts, local_expert_indices, config: TransformerConfig) -> None:
+    def __init__(
+        self, num_local_experts: int, local_expert_indices: List[int], config: TransformerConfig,
+    ) -> None:
         """Initialize the dropless sinkhorn router."""
         super().__init__(config=config)
         assert config.moe_token_dropping == False
@@ -420,7 +439,7 @@ class DroplessSinkhornRouter(Router):
             num_local_experts, local_expert_indices, self.k, config
         )
 
-    def sinkhorn(self, cost, tol=0.0001):
+    def sinkhorn(self, cost: torch.Tensor, tol: float = 0.0001):
         """Sinkhorn based MoE routing function"""
         cost = torch.exp(cost)
         d0 = torch.ones(cost.size(0), device=cost.device, dtype=cost.dtype)
@@ -523,10 +542,10 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
 
     """
 
-    main_loss_backward_scale = 1
+    main_loss_backward_scale: int = 1
 
     @staticmethod
-    def forward(ctx, output, aux_loss):
+    def forward(ctx, output: torch.Tensor, aux_loss: torch.Tensor):
         """Preserve the aux_loss by storing it in the context to avoid garbage collection.
         
         Args:
@@ -540,7 +559,7 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
         return output
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output: torch.Tensor):
         """Trigger the backward pass of the auxiliary loss as well as it scaling.
 
         Args:
