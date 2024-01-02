@@ -13,6 +13,8 @@ from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.custom_layers.transformer_engine import TELinear, TELayerNormColumnParallelLinear
+
 from megatron.core.utils import divide
 
 from .enums import AttnMaskType
@@ -218,6 +220,7 @@ class Attention(MegatronModule, ABC):
         key_value_states=None,
         inference_params=None,
         rotary_pos_emb=None,
+        is_first_microbatch=None,
     ):
         # hidden_states: [sq, b, h]
 
@@ -230,7 +233,8 @@ class Attention(MegatronModule, ABC):
         # =====================
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
-        query, key, value = self.get_query_key_value_tensors(hidden_states, key_value_states)
+        query, key, value = self.get_query_key_value_tensors(
+            hidden_states, key_value_states, is_first_microbatch)
 
         # ===================================================
         # Adjust key, value, and rotary_pos_emb for inference
@@ -267,8 +271,10 @@ class Attention(MegatronModule, ABC):
         # =================
         # Output. [sq, b, h]
         # =================
-
-        output, bias = self.linear_proj(core_attn_out)
+        if isinstance(self.linear_proj, TELinear):
+            output, bias = self.linear_proj(core_attn_out, is_first_microbatch)
+        else:
+            output, bias = self.linear_proj(core_attn_out)
 
         return output, bias
 
@@ -308,12 +314,16 @@ class SelfAttention(Attention):
             tp_comm_buffer_name='qkv',
         )
 
-    def get_query_key_value_tensors(self, hidden_states, key_value_states=None):
+    def get_query_key_value_tensors(self, hidden_states, key_value_states=None,
+                                    is_first_microbatch=None):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
         """
         # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
-        mixed_qkv, _ = self.linear_qkv(hidden_states)
+        if isinstance(self.linear_qkv, TELayerNormColumnParallelLinear):
+            mixed_qkv, _ = self.linear_qkv(hidden_states, is_first_microbatch)
+        else:
+            mixed_qkv, _ = self.linear_qkv(hidden_states)
 
         # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
         new_tensor_shape = mixed_qkv.size()[:-1] + (

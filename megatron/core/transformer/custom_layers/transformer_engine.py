@@ -132,8 +132,8 @@ class TELinear(te.pytorch.Linear):
             **extra_kwargs,
         )
 
-    def forward(self, x):
-        out = super().forward(x)
+    def forward(self, x, is_first_microbatch):
+        out = super().forward(x, is_first_microbatch)
 
         # TE only returns a tuple when return_bias is True, otherwise
         # it returns a single Tensor, we always want to return two
@@ -223,8 +223,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             **extra_kwargs,
         )
 
-    def forward(self, x):
-        out = super().forward(x)
+    def forward(self, x, is_first_microbatch):
+        out = super().forward(x, is_first_microbatch)
 
         # TE only returns a tuple when return_bias is True, otherwise
         # it returns a single Tensor, we always want to return two

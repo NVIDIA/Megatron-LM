@@ -140,6 +140,7 @@ class TransformerLayer(MegatronModule):
         context_mask=None,
         rotary_pos_emb=None,
         inference_params=None,
+        is_first_microbatch=None,
     ):
         # hidden_states: [s, b, h]
 
@@ -155,6 +156,7 @@ class TransformerLayer(MegatronModule):
             attention_mask=attention_mask,
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
+            is_first_microbatch=is_first_microbatch,
         )
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
@@ -195,7 +197,7 @@ class TransformerLayer(MegatronModule):
         pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
         # MLP.
-        mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
+        mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, is_first_microbatch)
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?

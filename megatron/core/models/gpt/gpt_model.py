@@ -133,6 +133,7 @@ class GPTModel(LanguageModule):
         decoder_input: Tensor = None,
         labels: Tensor = None,
         inference_params: InferenceParams = None,
+        is_first_microbatch: bool = None,
         extra_block_kwargs: dict = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
@@ -168,6 +169,7 @@ class GPTModel(LanguageModule):
             attention_mask=attention_mask,
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
+            is_first_microbatch=is_first_microbatch,
             **(extra_block_kwargs or {}),
         )
 

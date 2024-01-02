@@ -237,6 +237,7 @@ class TransformerBlock(MegatronModule):
         context_mask: Tensor = None,
         rotary_pos_emb: Tensor = None,
         inference_params: InferenceParams = None,
+        is_first_microbatch: bool = None,
     ):
         # hidden_states (float): [s, b, h]
         # attention_mask (bool): [1, 1, s, s]
@@ -315,6 +316,7 @@ class TransformerBlock(MegatronModule):
                         context_mask=context_mask,
                         rotary_pos_emb=rotary_pos_emb,
                         inference_params=inference_params,
+                        is_first_microbatch=is_first_microbatch,
                     )
 
         # Final layer norm.
