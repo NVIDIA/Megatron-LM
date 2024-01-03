@@ -84,43 +84,14 @@ class ScriptArguments:
         },
     )
 
-
-def extract_anthropic_prompt(prompt_and_response):
-    """Extract the anthropic prompt from a prompt and response pair."""
-    search_term = "\n\nAssistant:"
-    search_term_idx = prompt_and_response.rfind(search_term)
-    assert search_term_idx != -1, f"Prompt and response does not contain '{search_term}'"
-    return prompt_and_response[: search_term_idx + len(search_term)]
-
-
-def get_hh(split: str, sanity_check: bool = False, silent: bool = False, cache_dir: str = None) -> Dataset:
-    """Load the Anthropic Helpful-Harmless dataset from Hugging Face and convert it to the necessary format.
-
-    The dataset is converted to a dictionary with the following structure:
-    {
-        'prompt': List[str],
-        'chosen': List[str],
-        'rejected': List[str],
-    }
-
-    Prompts should be structured as follows:
-      \n\nHuman: <prompt>\n\nAssistant:
-    Multiple turns are allowed, but the prompt should always start with \n\nHuman: and end with \n\nAssistant:.
-    """
-    dataset = load_dataset("Anthropic/hh-rlhf", split=split, cache_dir=cache_dir)
+def get_dataset(dataset_path: str, split: str, sanity_check: bool = False, silent: bool = False, cache_dir: str = None) -> Dataset:
+    
+    dataset = load_dataset(dataset_path, split=split, cache_dir=cache_dir)
+    
     if sanity_check:
         dataset = dataset.select(range(min(len(dataset), 1000)))
 
-    def split_prompt_and_responses(sample) -> Dict[str, str]:
-        prompt = extract_anthropic_prompt(sample["chosen"])
-        return {
-            "prompt": prompt,
-            "chosen": sample["chosen"][len(prompt) :],
-            "rejected": sample["rejected"][len(prompt) :],
-        }
-
-    return dataset.map(split_prompt_and_responses)
-
+    return dataset
 
 if __name__ == "__main__":
     parser = HfArgumentParser(ScriptArguments)
@@ -142,10 +113,10 @@ if __name__ == "__main__":
         tokenizer.pad_token = tokenizer.eos_token
 
     # 2. Load the Anthropic Helpful-Harmless dataset
-    train_dataset = get_hh("train", sanity_check=script_args.sanity_check)
+    train_dataset = load_dataset("train", sanity_check=script_args.sanity_check)
 
     # 3. Load evaluation dataset
-    eval_dataset = get_hh("test", sanity_check=script_args.sanity_check)
+    eval_dataset = load_dataset("test", sanity_check=script_args.sanity_check)
 
     # 4. initialize training arguments:
     training_args = TrainingArguments(
