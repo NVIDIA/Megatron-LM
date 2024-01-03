@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
-from typing import List
+from typing import Callable, List
 
 import torch
 
@@ -107,7 +107,7 @@ class Router(ABC, MegatronModule):
 
     def apply_aux_loss(
         self,
-        loss_func: function,
+        loss_func: Callable,
         probs: torch.Tensor,
         indices: torch.Tensor,
         activation: torch.Tensor,
