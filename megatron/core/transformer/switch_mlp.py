@@ -89,7 +89,7 @@ class SwitchMLP(MegatronModule):
         torch.distributed._all_gather_base(output, local_indices.contiguous(), group=group)
         return output
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, is_first_microbatch=None):
         hidden_shape = hidden_states.shape
         route = self.router(hidden_states)
         route = route.view(-1, self.config.num_moe_experts)

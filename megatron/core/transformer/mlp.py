@@ -92,7 +92,8 @@ class MLP(MegatronModule):
         # [s, b, 4 * h/p]
         if isinstance(self.linear_fc1, TELayerNormColumnParallelLinear):
             intermediate_parallel, bias_parallel = self.linear_fc1(
-                hidden_states, is_first_microbatch)
+                hidden_states, is_first_microbatch
+            )
         else:
             intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
 

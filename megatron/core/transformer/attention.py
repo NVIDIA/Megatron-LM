@@ -13,7 +13,10 @@ from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.custom_layers.transformer_engine import TELinear, TELayerNormColumnParallelLinear
+from megatron.core.transformer.custom_layers.transformer_engine import (
+    TELinear, 
+    TELayerNormColumnParallelLinear
+)
 
 from megatron.core.utils import divide
 
@@ -207,7 +210,7 @@ class Attention(MegatronModule, ABC):
         return key, value, rotary_pos_emb, attn_mask_type
 
     @abstractmethod
-    def get_query_key_value_tensors(self, hidden_states, key_value_states):
+    def get_query_key_value_tensors(self, hidden_states, key_value_states, is_first_microbatch):
         """
         This method needs to be implemented based on whether the derived class
         is "self-attn" or "cross-attn".
@@ -234,7 +237,8 @@ class Attention(MegatronModule, ABC):
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         query, key, value = self.get_query_key_value_tensors(
-            hidden_states, key_value_states, is_first_microbatch)
+            hidden_states, key_value_states, is_first_microbatch
+        )
 
         # ===================================================
         # Adjust key, value, and rotary_pos_emb for inference
@@ -314,8 +318,9 @@ class SelfAttention(Attention):
             tp_comm_buffer_name='qkv',
         )
 
-    def get_query_key_value_tensors(self, hidden_states, key_value_states=None,
-                                    is_first_microbatch=None):
+    def get_query_key_value_tensors(
+        self, hidden_states, key_value_states=None, is_first_microbatch=None
+    ):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
         """
@@ -422,7 +427,7 @@ class CrossAttention(Attention):
             is_expert=False,
         )
 
-    def get_query_key_value_tensors(self, hidden_states, key_value_states):
+    def get_query_key_value_tensors(self, hidden_states, key_value_states, is_first_microbatch):
         """
         Derives `query` tensor from `hidden_states`, and `key`/`value` tensors
         from `key_value_states`.
