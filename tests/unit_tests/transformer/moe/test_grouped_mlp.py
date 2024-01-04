@@ -89,30 +89,30 @@ class TestParallelGroupedMLP:
             self.hidden_size * (self.fc1_ffn_hidden_size + self.fc2_ffn_hidden_size) * self.num_experts
         assert num_weights_smm == expected_num_weights
 
-        assert torch.equal(self.switch_mlp_smm.router.weight, self.switch_mlp_gmm.router.weight)
+        assert torch.equal(self.switch_mlp_smm.router.gate.weight, self.switch_mlp_gmm.router.gate.weight)
 
         # weight1: [h, num_experts*4h]
         # weight2: [num_experts*4h, h]
-        assert self.switch_mlp_gmm.weight1.shape[0] == self.hidden_size
-        assert self.switch_mlp_gmm.weight1.shape[1] == self.num_experts * self.fc1_ffn_hidden_size
+        assert self.switch_mlp_gmm.experts.weight1.shape[0] == self.hidden_size
+        assert self.switch_mlp_gmm.experts.weight1.shape[1] == self.num_experts * self.fc1_ffn_hidden_size
         if self.gated_linear_unit:
-            assert self.switch_mlp_gmm.weight2.shape[0] == self.num_experts * self.fc2_ffn_hidden_size
-            assert self.switch_mlp_gmm.weight2.shape[1] == self.hidden_size
+            assert self.switch_mlp_gmm.experts.weight2.shape[0] == self.num_experts * self.fc2_ffn_hidden_size
+            assert self.switch_mlp_gmm.experts.weight2.shape[1] == self.hidden_size
         else:
-            assert self.switch_mlp_gmm.weight1.shape == self.switch_mlp_gmm.weight2.t().shape
+            assert self.switch_mlp_gmm.experts.weight1.shape == self.switch_mlp_gmm.weight2.t().shape
 
     def test_weight_init_value_the_same(self):
-        gmm_w1 = self.switch_mlp_gmm.weight1.view(self.num_experts, -1, self.hidden_size)
-        gmm_w2 = self.switch_mlp_gmm.weight2.view(self.num_experts, self.hidden_size, -1)
+        gmm_w1 = self.switch_mlp_gmm.experts.weight1.view(self.num_experts, -1, self.hidden_size)
+        gmm_w2 = self.switch_mlp_gmm.experts.weight2.view(self.num_experts, self.hidden_size, -1)
         gmm_expert1_fc1 = gmm_w1[0]
         gmm_expert1_fc2 = gmm_w2[0]
         gmm_expert2_fc1 = gmm_w1[1]
         gmm_expert2_fc2 = gmm_w2[1]
 
-        smm_expert1_fc1 = self.switch_mlp_smm.local_experts[0].linear_fc1.weight
-        smm_expert1_fc2 = self.switch_mlp_smm.local_experts[0].linear_fc2.weight
-        smm_expert2_fc1 = self.switch_mlp_smm.local_experts[1].linear_fc1.weight
-        smm_expert2_fc2 = self.switch_mlp_smm.local_experts[1].linear_fc2.weight
+        smm_expert1_fc1 = self.switch_mlp_smm.experts.local_experts[0].linear_fc1.weight
+        smm_expert1_fc2 = self.switch_mlp_smm.experts.local_experts[0].linear_fc2.weight
+        smm_expert2_fc1 = self.switch_mlp_smm.experts.local_experts[1].linear_fc1.weight
+        smm_expert2_fc2 = self.switch_mlp_smm.experts.local_experts[1].linear_fc2.weight
 
         assert torch.equal(gmm_expert1_fc1, smm_expert1_fc1)
         if not self.use_cpu_initialization:
