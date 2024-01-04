@@ -39,7 +39,8 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
         bias=bias,
         gradient_accumulation_fusion=args.gradient_accumulation_fusion,
         async_grad_allreduce=async_grad_allreduce,
-        sequence_parallel=args.sequence_parallel)
+        sequence_parallel=args.sequence_parallel,
+        for_embedding_and_clf_layer=True)
     # Gather if needed.
 
     if parallel_output:
@@ -233,6 +234,7 @@ class Embedding(MegatronModule):
 
         # Dropout.
         if self.sequence_parallel:
+            raise NotImplementedError
             embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
             with tensor_parallel.get_cuda_rng_tracker().fork():
                 embeddings = self.embedding_dropout(embeddings)

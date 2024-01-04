@@ -66,7 +66,7 @@ GPT_ARGS="
     --weight-decay 1e-2 \
     --lr-warmup-fraction .01 \
     --clip-grad 1.0 \
-    --bf16 \
+    --fp16 \
     --recompute-granularity full \
     --recompute-method uniform \
     --recompute-num-layers 1 \

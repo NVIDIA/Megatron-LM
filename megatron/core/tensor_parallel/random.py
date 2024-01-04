@@ -25,6 +25,7 @@ from axonn.intra_layer import overlap_all_gathers_for_checkpointed_forward
 
 # Default name for the model parallel rng tracker.
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
+_EMB_MODEL_PARALLEL_RNG_TRACKER_NAME = 'emb-model-parallel-rng'
 
 
 def _set_cuda_rng_state(new_state, device=-1):
@@ -159,8 +160,11 @@ def model_parallel_cuda_manual_seed(seed):
                               model parallel regions.
     """
     # 2718 is just for fun and any POSITIVE value will work.
-    offset = seed + 2718
+    offset = seed + 7862
     tensor_model_parallel_seed = offset + get_tensor_model_parallel_rank()
+
+    offset = seed + 2718
+    emb_tensor_model_parallel_seed = offset + get_tensor_model_parallel_rank(for_embedding_and_clf_layer=True)
     # Data parallel gets the original seed.
     data_parallel_seed = seed
 
@@ -169,6 +173,7 @@ def model_parallel_cuda_manual_seed(seed):
     torch.cuda.manual_seed(data_parallel_seed)
     # and model parallel state.
     _CUDA_RNG_STATE_TRACKER.add(_MODEL_PARALLEL_RNG_TRACKER_NAME, tensor_model_parallel_seed)
+    _CUDA_RNG_STATE_TRACKER.add(_EMB_MODEL_PARALLEL_RNG_TRACKER_NAME, emb_tensor_model_parallel_seed)
 
 
 class CheckpointFunction(torch.autograd.Function):

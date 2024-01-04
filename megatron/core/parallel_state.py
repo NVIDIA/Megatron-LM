@@ -9,6 +9,8 @@ import torch
 
 from .utils import GlobalMemoryBuffer
 
+from axonn import axonn as ax
+
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
 # Inter-layer model parallel group that the current rank belongs to.
@@ -314,14 +316,17 @@ def get_model_parallel_group():
     return _MODEL_PARALLEL_GROUP
 
 
-def get_tensor_model_parallel_group(check_initialized=True):
+def get_tensor_model_parallel_group(check_initialized=True, for_embedding_and_clf_layer=False):
     """Get the tensor model parallel group the caller rank belongs to."""
-    if check_initialized:
-        assert (
-            _TENSOR_MODEL_PARALLEL_GROUP is not None
-        ), 'tensor model parallel group is not initialized'
-    return _TENSOR_MODEL_PARALLEL_GROUP
-
+    if not for_embedding_and_clf_layer:
+        if check_initialized:
+            assert (
+                _TENSOR_MODEL_PARALLEL_GROUP is not None
+            ), 'tensor model parallel group is not initialized'
+        return _TENSOR_MODEL_PARALLEL_GROUP
+    else:
+        return ax.comm_handle.outer_inner_intra_layer_parallel_group
+        
 
 def get_pipeline_model_parallel_group():
     """Get the pipeline model parallel group the caller rank belongs to."""
@@ -379,13 +384,17 @@ def set_virtual_pipeline_model_parallel_world_size(world_size):
     _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = world_size
 
 
-def get_tensor_model_parallel_world_size():
+def get_tensor_model_parallel_world_size(for_embedding_and_clf_layer=False):
     """Return world size for the tensor model parallel group."""
-    global _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
-    if _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE is not None:
-        return _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
-    return torch.distributed.get_world_size(group=get_tensor_model_parallel_group())
 
+    if not for_embedding_and_clf_layer:
+        global _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
+        if _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE is not None:
+            return _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
+        return torch.distributed.get_world_size(group=get_tensor_model_parallel_group())
+    else:
+        group = get_tensor_model_parallel_group(for_embedding_and_clf_layer=True)
+        return torch.distributed.get_world_size(group=group)
 
 def get_pipeline_model_parallel_world_size():
     """Return world size for the pipeline model parallel group."""
@@ -413,12 +422,17 @@ def set_pipeline_model_parallel_split_rank(rank):
     _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = rank
 
 
-def get_tensor_model_parallel_rank():
+def get_tensor_model_parallel_rank(for_embedding_and_clf_layer=False):
     """Return my rank for the tensor model parallel group."""
-    global _MPU_TENSOR_MODEL_PARALLEL_RANK
-    if _MPU_TENSOR_MODEL_PARALLEL_RANK is not None:
-        return _MPU_TENSOR_MODEL_PARALLEL_RANK
-    return torch.distributed.get_rank(group=get_tensor_model_parallel_group())
+    if not for_embedding_and_clf_layer:
+        global _MPU_TENSOR_MODEL_PARALLEL_RANK
+        if _MPU_TENSOR_MODEL_PARALLEL_RANK is not None:
+            return _MPU_TENSOR_MODEL_PARALLEL_RANK
+        return torch.distributed.get_rank(group=get_tensor_model_parallel_group())
+    else:
+        group = get_tensor_model_parallel_group(for_embedding_and_clf_layer=True)
+        return torch.distributed.get_rank(group=group)
+
 
 
 def get_pipeline_model_parallel_rank():

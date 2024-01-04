@@ -58,6 +58,7 @@ class GPTModel(MegatronModule):
         self.post_process = post_process
         self.fp16_lm_cross_entropy = args.fp16_lm_cross_entropy
         self.untie_embeddings_and_output_weights = args.untie_embeddings_and_output_weights
+        assert not self.untie_embeddings_and_output_weights, "Megatron-AxoNN doesn't support untied embedding yet"
 
         self.language_model, self._language_model_key = get_language_model(
             config=config,

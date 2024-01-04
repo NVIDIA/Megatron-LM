@@ -680,15 +680,14 @@ class ParallelAttention(MegatronModule):
 
         # expand the key_layer and value_layer [sk, b, ng, hn] -> [sk, b, np, hn]
         repeats = self.num_attention_heads_per_partition // self.num_query_groups_per_partition
-        if repeats > 1:
-            key_layer = key_layer.repeat_interleave(
-                repeats,
-                dim = 2
-            )
-            value_layer = value_layer.repeat_interleave(
-                repeats,
-                dim = 2
-            )
+        key_layer = key_layer.repeat_interleave(
+            repeats,
+            dim = 2
+        )
+        value_layer = value_layer.repeat_interleave(
+            repeats,
+            dim = 2
+        )
 
         # apply relative positional encoding (rotary embedding)
         if rotary_pos_emb is not None:
@@ -1622,7 +1621,7 @@ class ParallelTransformer(MegatronModule):
             # See set_input_tensor()
             hidden_states = self.input_tensor
 
-        hidden_states = drop(hidden_states, batch_dim=1, skip_batch=False)
+
         # Viewless tensor.
         # - We only need to create a viewless tensor in the case of micro batch
         #   size (mbs) == 1, since in this case, 'hidden_states.transpose()'
@@ -1643,6 +1642,8 @@ class ParallelTransformer(MegatronModule):
             requires_grad=True,
             keep_graph=True,
         )
+
+        hidden_states = drop(hidden_states, batch_dim=1, skip_batch=True)
 
         # RNG context.
         if self.sequence_parallel:
@@ -1716,7 +1717,8 @@ class ParallelTransformer(MegatronModule):
         if self.post_process and self.post_norm:
             hidden_states = self.final_norm(hidden_states)
 
-        hidden_states = gather(hidden_states, batch_dim=1, skip_batch=False)
+        hidden_states = gather(hidden_states, batch_dim=1, skip_batch=True)
+
         return hidden_states
 
     def load_state_dict(self, state_dict, strict=True):

@@ -18,7 +18,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         # Maximum value along vocab dimension across all GPUs.
         logits_max = torch.max(vocab_parallel_logits, dim=-1)[0]
         torch.distributed.all_reduce(
-            logits_max, op=torch.distributed.ReduceOp.MAX, group=get_tensor_model_parallel_group()
+            logits_max, op=torch.distributed.ReduceOp.MAX, group=get_tensor_model_parallel_group(for_embedding_and_clf_layer=True)
         )
         # Subtract the maximum value.
         vocab_parallel_logits = vocab_parallel_logits - logits_max.unsqueeze(dim=-1)
@@ -26,8 +26,8 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         # Get the partition's vocab indecies
         get_vocab_range = VocabUtility.vocab_range_from_per_partition_vocab_size
         partition_vocab_size = vocab_parallel_logits.size()[-1]
-        rank = get_tensor_model_parallel_rank()
-        world_size = get_tensor_model_parallel_world_size()
+        rank = get_tensor_model_parallel_rank(for_embedding_and_clf_layer=True)
+        world_size = get_tensor_model_parallel_world_size(for_embedding_and_clf_layer=True)
         vocab_start_index, vocab_end_index = get_vocab_range(partition_vocab_size, rank, world_size)
 
         # Create a mask of valid vocab ids (1 means it needs to be masked).
@@ -49,7 +49,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         torch.distributed.all_reduce(
             predicted_logits,
             op=torch.distributed.ReduceOp.SUM,
-            group=get_tensor_model_parallel_group(),
+            group=get_tensor_model_parallel_group(for_embedding_and_clf_layer=True),
         )
 
         # Sum of exponential of logits along vocab dimension across all GPUs.
@@ -59,7 +59,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         torch.distributed.all_reduce(
             sum_exp_logits,
             op=torch.distributed.ReduceOp.SUM,
-            group=get_tensor_model_parallel_group(),
+            group=get_tensor_model_parallel_group(for_embedding_and_clf_layer=True),
         )
 
         # Loss = log(sum(exp(logits))) - predicted-logit.

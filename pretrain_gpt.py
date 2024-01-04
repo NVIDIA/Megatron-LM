@@ -19,6 +19,10 @@ from megatron.utils import average_losses_across_data_parallel_group
 from megatron.arguments import core_transformer_config_from_args
 
 from axonn.intra_layer import drop
+from axonn.intra_layer import optimize_communication
+from axonn.intra_layer.communication import ForwardAllReduce
+from axonn import axonn as ax
+from contextlib import nullcontext
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
@@ -72,8 +76,14 @@ def get_batch(data_iterator):
 def loss_func(loss_mask, output_tensor):
     losses = output_tensor.float()
     loss_mask = loss_mask.view(-1).float()
-    loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
+    #loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
+    loss_mask_sum = loss_mask.sum()
+    loss = torch.sum(losses.view(-1) * loss_mask)
 
+    group = ax.comm_handle.depth_intra_layer_parallel_group
+    torch.distributed.all_reduce(loss_mask_sum, group=group)
+    loss = ForwardAllReduce.apply(loss, group)
+    loss = loss / loss_mask_sum
     # Check individual rank losses are not NaN prior to DP all-reduce.
     args = get_args()
     if args.check_for_nan_in_loss_and_grad:
@@ -99,9 +109,17 @@ def forward_step(data_iterator, model):
     tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
         data_iterator)
     timers('batch-generator').stop()
-    
-    from axonn.intra_layer import optimize_communication
-    from contextlib import nullcontext
+
+    tokens = drop(tokens, skip_channels=True)
+    labels = drop(labels, skip_channels=True)
+    loss_mask = drop(loss_mask, skip_channels=True)
+    position_ids = drop(position_ids, skip_channels=True)
+        #print(tokens.shape)
+        #print(labels.shape)
+        #print(loss_mask.shape)
+        #print(attention_mask.shape)
+        #print(position_ids.shape)
+        #exit()
     
     if args.overlap_axonn_comm:
         ctx = partial(optimize_communication, 

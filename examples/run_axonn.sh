@@ -29,25 +29,26 @@ MERGE_FILE="${DATA_DIR}/gpt2-merges.txt"
 DATA_PATH="${DATA_DIR}/BookCorpusDataset_text_document"
 
 ## ARCHITECTURE DETAILS
-NUM_LAYERS=32
-NUM_HEADS=56
-HIDDEN_SIZE=7168 
+NUM_LAYERS=30
+NUM_HEADS=40
+HIDDEN_SIZE=5120
 
 ## PARALLELISM DETAILS
 COLUMN_TENSOR_PARR=1
-ROW_TENSOR_PARR=4
-DEPTH_TENSOR_PARR=4
+ROW_TENSOR_PARR=1
+DEPTH_TENSOR_PARR=8
 PIPE_PARR=1
-CACHE_LAYERS=32
+CACHE_LAYERS=0
 OVERLAP=True
 
 NSYS_PROFILE=False
+PROFILE_NAME="test_10B_16x1"
 
 ## BATCH SIZES
-MICRO_BATCH_SIZE=16
+MICRO_BATCH_SIZE=8
 GLOBAL_BATCH_SIZE=16
 SEQUENCE_LENGTH=2048
-TRAIN_ITERS=1000
+TRAIN_ITERS=10
 
 GPT_ARGS="
     --row-tensor-model-parallel-size ${ROW_TENSOR_PARR} \
@@ -112,7 +113,7 @@ if [[ ${NSYS_PROFILE} == "True" ]]
 then
 	echo "profiling with nsys"
 	SCRIPT="nsys profile -s none \
-		-t nvtx,cuda -o test.qdrep \
+		-t nvtx,cuda -o ${PROFILE_NAME} \
 		--force-overwrite=true  \
 		--capture-range=cudaProfilerApi \
 		--capture-range-end=stop \

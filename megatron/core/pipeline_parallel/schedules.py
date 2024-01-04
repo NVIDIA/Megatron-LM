@@ -388,7 +388,7 @@ def forward_backward_no_pipelining(
         with ctx():    
             backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
  
-    sync_gradients(model.module.module.language_model.encoder, 
+    sync_gradients(model.module, 
                    gradient_attr_name="main_grad",
                    vectorize=False)
     # for some reason vectorize does not work with torch.float16

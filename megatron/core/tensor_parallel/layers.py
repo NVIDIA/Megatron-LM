@@ -30,8 +30,10 @@ from .mappings import (
     reduce_scatter_to_sequence_parallel_region,
     scatter_to_tensor_model_parallel_region,
 )
-from .random import get_cuda_rng_tracker
+from .random import get_cuda_rng_tracker, _EMB_MODEL_PARALLEL_RNG_TRACKER_NAME
 from .utils import VocabUtility, divide, split_tensor_along_last_dim
+
+from axonn.intra_layer.communication import ForwardAllReduce
 
 _grad_accum_fusion_available = True
 try:
@@ -80,15 +82,19 @@ def copy_tensor_model_parallel_attributes(destination_tensor, source_tensor):
         maybe_copy(attribute)
 
 
-def _initialize_affine_weight_gpu(weight, init_method, partition_dim, stride=1):
+def _initialize_affine_weight_gpu(weight, init_method, partition_dim, stride=1, for_embedding_and_clf_layer=True):
     """Initialize affine weight for model parallel on GPU."""
 
     set_tensor_model_parallel_attributes(
         tensor=weight, is_parallel=True, dim=partition_dim, stride=stride
     )
-
-    with get_cuda_rng_tracker().fork():
-        init_method(weight)
+    
+    if for_embedding_and_clf_layer:
+        with get_cuda_rng_tracker().fork(_EMB_MODEL_PARALLEL_RNG_TRACKER_NAME):
+            init_method(weight)
+    else:
+        with get_cuda_rng_tracker().fork():
+            init_method(weight)
 
 
 def _initialize_affine_weight_cpu(
@@ -156,18 +162,19 @@ class VocabParallelEmbedding(torch.nn.Module):
         # Keep the input dimensions.
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
-        self.tensor_model_parallel_size = get_tensor_model_parallel_world_size()
+        self.tensor_model_parallel_size = get_tensor_model_parallel_world_size(for_embedding_and_clf_layer=True)
         # Divide the weight matrix along the vocaburaly dimension.
         (
             self.vocab_start_index,
             self.vocab_end_index,
         ) = VocabUtility.vocab_range_from_global_vocab_size(
-            self.num_embeddings, get_tensor_model_parallel_rank(), self.tensor_model_parallel_size
+            self.num_embeddings, get_tensor_model_parallel_rank(for_embedding_and_clf_layer=True), self.tensor_model_parallel_size
         )
         self.num_embeddings_per_partition = self.vocab_end_index - self.vocab_start_index
 
         # Allocate weights and initialize.
         if config.use_cpu_initialization:
+            raise NotImplementedError
             self.weight = Parameter(
                 torch.empty(
                     self.num_embeddings_per_partition, self.embedding_dim, dtype=config.params_dtype
@@ -193,7 +200,7 @@ class VocabParallelEmbedding(torch.nn.Module):
                 )
             )
             if config.perform_initialization:
-                _initialize_affine_weight_gpu(self.weight, init_method, partition_dim=0, stride=1)
+                _initialize_affine_weight_gpu(self.weight, init_method, partition_dim=0, stride=1, for_embedding_and_clf_layer=True)
 
     def forward(self, input_):
         if self.tensor_model_parallel_size > 1:
@@ -210,7 +217,8 @@ class VocabParallelEmbedding(torch.nn.Module):
         if self.tensor_model_parallel_size > 1:
             output_parallel[input_mask, :] = 0.0
         # Reduce across all the model parallel GPUs.
-        output = reduce_from_tensor_model_parallel_region(output_parallel)
+        output = ForwardAllReduce.apply(output_parallel, get_tensor_model_parallel_group(for_embedding_and_clf_layer=True))
+
         return output
 
 
@@ -304,12 +312,14 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         gradient_accumulation_fusion,
         async_grad_allreduce,
         sequence_parallel,
+        for_embedding_and_clf_layer
     ):
         ctx.save_for_backward(input, weight)
         ctx.use_bias = bias is not None
         ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
         ctx.async_grad_allreduce = async_grad_allreduce
         ctx.sequence_parallel = sequence_parallel
+        ctx.for_embedding_and_clf_layer = for_embedding_and_clf_layer
 
         if sequence_parallel:
             world_size = get_tensor_model_parallel_world_size()
@@ -371,7 +381,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         if ctx.async_grad_allreduce:
             # Asynchronous all-reduce
             handle = torch.distributed.all_reduce(
-                grad_input, group=get_tensor_model_parallel_group(), async_op=True
+                grad_input, group=get_tensor_model_parallel_group(for_embedding_and_clf_layer=ctx.for_embedding_and_clf_layer), async_op=True
             )
             # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
             # all-reduce is scheduled before the weight gradient computation
@@ -426,7 +436,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         if ctx.async_grad_allreduce:
             handle.wait()
 
-        return grad_input, grad_weight, grad_bias, None, None, None
+        return grad_input, grad_weight, grad_bias, None, None, None, None
 
 
 def linear_with_grad_accumulation_and_async_allreduce(
@@ -436,6 +446,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
     gradient_accumulation_fusion: bool,
     async_grad_allreduce: bool,
     sequence_parallel: bool,
+    for_embedding_and_clf_layer:bool = False
 ) -> torch.Tensor:
     """Linear layer execution with asynchronous communication and
     gradient accumulation fusion in backprop.
@@ -496,6 +507,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
         gradient_accumulation_fusion,
         async_grad_allreduce,
         sequence_parallel,
+        for_embedding_and_clf_layer
     ]
 
     if not linear_with_grad_accumulation_and_async_allreduce.warned:

@@ -17,7 +17,7 @@ from .mappings import (
     scatter_to_sequence_parallel_region,
     scatter_to_tensor_model_parallel_region,
 )
-from .random import checkpoint, get_cuda_rng_tracker, model_parallel_cuda_manual_seed
+from .random import checkpoint, get_cuda_rng_tracker, model_parallel_cuda_manual_seed, _EMB_MODEL_PARALLEL_RNG_TRACKER_NAME
 from .utils import (
     gather_split_1d_tensor,
     split_tensor_along_last_dim,

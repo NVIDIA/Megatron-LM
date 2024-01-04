@@ -26,7 +26,6 @@ from megatron.model import DistributedDataParallel as DDP
 from megatron.model import Float16Module
 from megatron.model.module import param_is_not_shared
 
-
 ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, Float16Module)
 
 
