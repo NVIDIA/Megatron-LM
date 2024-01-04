@@ -1072,6 +1072,9 @@ def _add_mixed_precision_args(parser):
     group.add_argument('--apply-query-key-layer-scaling', action='store_true',
                        help='Scale Q * K^T by 1 / layer-number. '
                        'Useful for fp16 training.')
+    group.add_argument('--no-query-key-layer-scaling', action='store_false',
+                       help='Do not scale Q * K^T by 1 / layer-number.',
+                       dest='apply_query_key_layer_scaling')
     group.add_argument('--attention-softmax-in-fp32', action='store_true',
                        help='Run attention masking and softmax in fp32. '
                        'This flag is ignored unless '

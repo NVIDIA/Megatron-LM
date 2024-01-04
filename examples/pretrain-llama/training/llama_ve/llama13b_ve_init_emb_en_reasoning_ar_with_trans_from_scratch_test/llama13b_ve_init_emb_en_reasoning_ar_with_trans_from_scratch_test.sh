@@ -51,7 +51,7 @@ TRAINING_ARGS=(
     --no-load-rng
     --micro-batch-size 1 
     --global-batch-size 1024
-    --train-iters 500
+    --train-iters 200
     --weight-decay 0.1 
     --adam-beta1 0.9 
     --adam-beta2 0.95 
@@ -59,7 +59,7 @@ TRAINING_ARGS=(
     --clip-grad 1.0 
     --lr 3.0e-5
     --min-lr 3.0e-5
-    --lr-warmup-iters 1000
+    --lr-warmup-iters 20
     --lr-decay-style cosine 
     --use-flash-attn
     --bf16
