@@ -5,6 +5,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
+from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     _initialize_affine_weight_gpu,
@@ -178,3 +179,43 @@ class SequentialMLP(MegatronModule):
                 output_bias_local[start:end, :] = output_bias
 
         return output_local, output_bias_local
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=()):
+        """ Maps local expert to global experts. """
+        sharded_state_dict = {}
+        num_global_experts = (
+            parallel_state.get_expert_model_parallel_world_size() * self.num_local_experts
+        )
+        local_expert_indices_offset = (
+            parallel_state.get_expert_model_parallel_rank() * self.num_local_experts
+        )
+
+        expert_sharded_prefix = f'{prefix}experts.'
+        for expert_local_idx, expert in enumerate(self.local_experts):
+            expert_global_idx = local_expert_indices_offset + expert_local_idx
+            expert_state_dict_prefix = f'{prefix}local_experts.{expert_local_idx}.'
+            expert_sharded_offsets = (
+                *sharded_offsets,
+                (len(sharded_offsets), expert_global_idx, num_global_experts),
+            )
+
+            expert_state_dict = expert.sharded_state_dict(
+                expert_state_dict_prefix, expert_sharded_offsets
+            )
+            # Remove expert layers indexing from sharded keys
+            replace_prefix_for_sharding(
+                expert_state_dict, expert_state_dict_prefix, expert_sharded_prefix
+            )
+            # Adjust replica ids - replication along DP modulo EP
+            for k, sh_ten in expert_state_dict.items():
+                replica_id = sh_ten.replica_id
+                assert (
+                    len(replica_id) == 3
+                ), f'Expected replica_id for {k} to be in (PP, TP, DP) format, got: {replica_id}'
+                sh_ten.replica_id = (
+                    *replica_id[:2],
+                    parallel_state.get_data_modulo_expert_parallel_rank(),
+                )
+
+            sharded_state_dict.update(expert_state_dict)
+        return sharded_state_dict
