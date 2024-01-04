@@ -10,11 +10,15 @@ from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
+from megatron.core.transformer.custom_layers.transformer_engine import (
+    TELayerNormColumnParallelLinear,
+    TELinear,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
-from megatron.core.transformer.custom_layers.transformer_engine import TELinear, TELayerNormColumnParallelLinear
+
 
 @dataclass
 class MLPSubmodules:

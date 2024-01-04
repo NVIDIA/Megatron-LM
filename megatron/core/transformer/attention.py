@@ -8,16 +8,15 @@ import torch
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.common.embeddings.rotary_pos_embedding import apply_rotary_pos_emb
+from megatron.core.transformer.custom_layers.transformer_engine import (
+    TELayerNormColumnParallelLinear,
+    TELinear,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.custom_layers.transformer_engine import (
-    TELinear, 
-    TELayerNormColumnParallelLinear
-)
-
 from megatron.core.utils import divide
 
 from .enums import AttnMaskType
