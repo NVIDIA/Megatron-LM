@@ -162,7 +162,7 @@ class MLP(MegatronModule):
                     *sharded_offsets,
                     offset_w,
                     replica_id=replica_id,
-                    prepend_axis_num=1,
+                    prepend_axis_num=prepend_axis_num,
                 ),
                 ShardedTensor.from_rank_offsets(
                     key,
@@ -170,7 +170,7 @@ class MLP(MegatronModule):
                     *sharded_offsets,
                     offset_v,
                     replica_id=replica_id,
-                    prepend_axis_num=1,
+                    prepend_axis_num=prepend_axis_num,
                 ),
             ]
 
