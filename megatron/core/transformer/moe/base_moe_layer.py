@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import math
 from abc import ABC, abstractmethod
-from contextlib import nullcontext
 from typing import Callable, List
 
 import torch
@@ -33,17 +33,16 @@ class Router(ABC, MegatronModule):
         self.num_experts = self.config.num_moe_experts
         # Token dispatcher for exchange tokens between experts.
         self.token_dispatcher = None
-        # Initialize the gate weights.
-        self.gate = torch.nn.Linear(
-            self.config.hidden_size, self.config.num_moe_experts, bias=False
-        )
-        # Initialize the aux losses.
         self.moe_aux_loss_func = None
 
         # Initialize the gate weights.
+        self.weight = torch.nn.Parameter(
+            torch.empty((self.config.num_moe_experts, self.config.hidden_size))
+        )
+        torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         with get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
-            config.init_method(self.gate.weight)
-        setattr(self.gate.weight, 'sequence_parallel', config.sequence_parallel)
+            config.init_method(self.weight)
+        setattr(self.weight, 'sequence_parallel', config.sequence_parallel)
 
     def gating(self, input: torch.Tensor):
         """Forward pass of the router gate.
@@ -54,9 +53,10 @@ class Router(ABC, MegatronModule):
         Returns:
             torch.Tensor: Logits tensor.
         """
-        logits = self.gate(input)
+        logits = torch.nn.functional.linear(input, self.weight)
         return logits
 
+    @abstractmethod
     def routing(self, logits: torch.Tensor):
         """Routing function.
 
@@ -66,7 +66,7 @@ class Router(ABC, MegatronModule):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Tuple of tensors representing max probs and the indices.
         """
-        raise NotImplementedError
+        raise NotImplementedError("Routing function not implemented.")
 
     def apply_input_jitter(self, input: torch.Tensor, eps: float = 1e-2):
         """Add noise to the input tensor.
@@ -155,6 +155,7 @@ class MoETokenDispatcher:
         """
         self.config = config
 
+    @abstractmethod
     def dispatch(
         self, tokens: torch.Tensor, indices: torch.Tensor,
     ):
@@ -167,8 +168,9 @@ class MoETokenDispatcher:
         Returns:
             torch.Tensor: Tokens tensor.
         """
-        raise NotImplementedError
+        raise NotImplementedError("Dispatch function not implemented.")
 
+    @abstractmethod
     def restore(
         self, expert_output: torch.Tensor, scores: torch.Tensor, indices: torch.Tensor,
     ):
@@ -182,7 +184,7 @@ class MoETokenDispatcher:
         Returns:
         None
         """
-        raise NotImplementedError
+        raise NotImplementedError("Restore function not implemented.")
 
 
 class MoEDroplessTokenDispatcher(MoETokenDispatcher):
