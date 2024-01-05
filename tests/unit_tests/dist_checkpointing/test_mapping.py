@@ -38,10 +38,10 @@ class TestShardedTensor:
 
 class TestShardedTensorFactory:
     def test_build_and_merge(self):
-        def build_fn(key, tensor):
+        def build_fn(key, tensor, replica_id):
             return {
-                'level2_a': ShardedTensor.from_rank_offsets(key + 'part1', tensor + 1),
-                'level2_b': ShardedTensor.from_rank_offsets(key + 'part2', tensor + 2)
+                'level2_a': ShardedTensor.from_rank_offsets(key + 'part1', tensor + 1, replica_id=replica_id),
+                'level2_b': ShardedTensor.from_rank_offsets(key + 'part2', tensor + 2, replica_id=replica_id)
             }
 
         # state_dict will be modified in-place

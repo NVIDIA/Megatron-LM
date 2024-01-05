@@ -192,11 +192,11 @@ class TestSerialization:
     def test_can_mix_sharded_tensors_and_factories(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(1, 1)
 
-        def _build_fn(key, tensor):
+        def _build_fn(key, tensor, replica_id):
             return [
-                ShardedTensor.from_rank_offsets(key + 'part1', tensor, replica_id=Utils.rank),
-                ShardedTensor.from_rank_offsets(key + 'part2', tensor, replica_id=Utils.rank),
-                ShardedTensor.from_rank_offsets(key + 'part3', tensor, replica_id=Utils.rank),
+                ShardedTensor.from_rank_offsets(key + 'part1', tensor, replica_id=replica_id),
+                ShardedTensor.from_rank_offsets(key + 'part2', tensor, replica_id=replica_id),
+                ShardedTensor.from_rank_offsets(key + 'part3', tensor, replica_id=replica_id),
             ]
 
         # state dict can be modified by dist_checkpointing.save, so two copies
@@ -205,7 +205,7 @@ class TestSerialization:
                 ShardedTensor.from_rank_offsets('A', torch.arange(2) + base, replica_id=Utils.rank),
                 ShardedTensor.from_rank_offsets('B', torch.arange(3) + base, replica_id=Utils.rank),
                 ShardedTensor.from_rank_offsets('C', torch.arange(4) + base, replica_id=Utils.rank),
-                ShardedTensorFactory('D', torch.arange(5) + base, _build_fn, sum),
+                ShardedTensorFactory('D', torch.arange(5) + base, _build_fn, sum, replica_id=Utils.rank),
             ]}
 
         with TempNamedDir(tmp_path_dist_ckpt / 'test_can_mix_sharded_tensors_and_factories') as ckpt_dir:

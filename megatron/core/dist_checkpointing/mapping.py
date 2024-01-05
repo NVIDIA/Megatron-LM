@@ -245,9 +245,10 @@ class ShardedTensorFactory:
     data: torch.Tensor
     build_fn: Callable[[str, torch.Tensor], ShardedStateDict]
     merge_fn: Callable[[StateDict], torch.Tensor]
+    replica_id: ReplicaId = 0
 
     def build(self):
-        return self.build_fn(self.key, self.data)
+        return self.build_fn(self.key, self.data, self.replica_id)
 
 
 def apply_factories(sharded_state_dict: ShardedStateDict):
