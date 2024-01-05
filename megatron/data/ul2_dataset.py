@@ -229,24 +229,48 @@ class UL2Dataset(torch.utils.data.Dataset):
                 self.denoisers, self.mean_span_lengths,
                 self.mask_ratios, self.scale_normal_std, self.like_ul2r,
                 np_rng, self.bos_id, self.eos_id, self.sentinel_tokens)
+
             if is_decoder_only(self.model_type):
-                maybe_lens = update_samples_dict_decoder_only(
-                    samples_dict,
-                    result_sample,
-                    self.max_seq_length,
-                    prev_len,
-                    self.pad_id,
-                )
+                text_dec = result_sample['text']
+                if (
+                        text_dec[0] == self.sep_id and text_dec[1] == self.pad_id
+                        or text_dec[0] == self.pad_id
+                ):
+                    # It could happen that we truncate an already small
+                    # sequence to length 0 because of possibly low
+                    # `seq_length` values. In that case, we just break
+                    # instead of skipping because it's almost certain that
+                    # we'd just end up discarding the next sample because
+                    # it's too long.
+                    break
+                else:
+                    maybe_lens = update_samples_dict_decoder_only(
+                        samples_dict,
+                        result_sample,
+                        self.max_seq_length,
+                        prev_len,
+                        self.pad_id,
+                    )
             else:
-                maybe_lens = update_samples_dict(
-                    samples_dict,
-                    result_sample,
-                    self.max_seq_length,
-                    self.max_seq_length_dec,
-                    prev_len,
-                    prev_len_dec,
-                    self.pad_id,
-                )
+                text_dec = result_sample['text_dec']
+                if text_dec[0] == self.bos_id and text_dec[1] == self.pad_id:
+                    # See above about truncation of small sequences.
+                    # Here we just check the decoder input since it is
+                    # the only relevant part. We mask the BOS token for
+                    # loss calculation anyway, so it doesn't give us
+                    # anything to keep it and throw away the next sample
+                    # instead.
+                    break
+                else:
+                    maybe_lens = update_samples_dict(
+                        samples_dict,
+                        result_sample,
+                        self.max_seq_length,
+                        self.max_seq_length_dec,
+                        prev_len,
+                        prev_len_dec,
+                        self.pad_id,
+                    )
             if maybe_lens is None:
                 # We are exceeding our sequence length already.
                 break
