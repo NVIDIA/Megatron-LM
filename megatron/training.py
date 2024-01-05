@@ -91,7 +91,8 @@ def pretrain(train_valid_test_dataset_provider,
              process_non_loss_data_func=None,
              extra_args_provider=None,
              args_defaults={},
-             data_post_process=None):
+             data_post_process=None,
+             external_args={}):
     """Main training program.
 
     This function will run the followings in the order provided:
@@ -123,7 +124,7 @@ def pretrain(train_valid_test_dataset_provider,
 
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(extra_args_provider=extra_args_provider,
-                        args_defaults=args_defaults)
+                        args_defaults=args_defaults, external_args=external_args)
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     if get_accelerator().device_name() == 'cuda':
         set_jit_fusion_options()
