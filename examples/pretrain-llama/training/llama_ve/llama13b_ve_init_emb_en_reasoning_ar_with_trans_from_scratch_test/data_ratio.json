@@ -1,0 +1,25 @@
+{
+    "en" : {
+        "dolma-gutenberg-books": 2,
+        "dolma-peS2o": 3,
+        "dolma-c4": 2,
+        "dolma-stack-code": 1,
+        "openwebmath": 3,
+        "Pile-DM-Mathematics": 3,
+        "Pile-books2-books3-pgtbrg": 2
+    },
+    "ar" : {
+        "Allam-books": 3, 
+        "Allam-encyclopedias": 3, 
+        "Allam-news": 1, 
+        "Allam-others": 1, 
+        "Allam-transcribed": 2, 
+        "Allam-web": 1
+    },
+    "trans-ar" : {
+        "books": 3, 
+        "c4": 2, 
+        "peS20": 2, 
+        "wiki": 1
+    }
+}
