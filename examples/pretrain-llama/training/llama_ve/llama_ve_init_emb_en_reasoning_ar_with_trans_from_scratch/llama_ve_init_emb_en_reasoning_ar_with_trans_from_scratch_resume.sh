@@ -45,6 +45,8 @@ LOGISTICS_ARGS=(
 
 TRAINING_ARGS=(
     --no-initialization
+    --no-load-optim
+    --no-load-rng
     --micro-batch-size 1 
     --global-batch-size 1024
     --train-iters 600_000
@@ -61,6 +63,7 @@ TRAINING_ARGS=(
     --bf16
     --attention-dropout 0.0
     --hidden-dropout 0.0
+    --num-workers 8
 )
 # --use-mcore-models
 
