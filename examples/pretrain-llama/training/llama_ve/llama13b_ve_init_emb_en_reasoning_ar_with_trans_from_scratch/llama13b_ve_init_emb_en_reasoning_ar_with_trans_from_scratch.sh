@@ -34,8 +34,8 @@ LOGISTICS_ARGS=(
     --tokenizer-model $TOKENIZER_MODEL
     --split 100,0,0 
     --log-interval 100
-    --save-interval 1500 
-    --eval-interval 1500
+    --save-interval 3000 
+    --eval-interval 3000
     --eval-iters 0
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     --tensorboard-log-interval 100
@@ -47,9 +47,9 @@ TRAINING_ARGS=(
     --no-initialization
     --no-load-optim
     --no-load-rng
-    --micro-batch-size 2 
+    --micro-batch-size 1 
     --global-batch-size 1024
-    --train-iters 200
+    --train-iters 600_000
     --weight-decay 0.1 
     --adam-beta1 0.9 
     --adam-beta2 0.95 
