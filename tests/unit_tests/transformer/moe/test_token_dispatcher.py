@@ -27,6 +27,8 @@ class TestDroplessDispatcher:
         self.router = DroplessTopKRouter(
             num_local_experts=num_moe_experts,
             local_expert_indices=range(num_moe_experts),
+            k=2,
+            routing_type="top",
             config=transformer_config,
         )
         self.token_dispatcher = self.router.token_dispatcher

@@ -1450,8 +1450,8 @@ def _add_moe_args(parser):
     group.add_argument(
         '--moe-router-type',
         type=str,
-        default='sinkhorn',
-        help='Options for router type. Currently supports sinkhorn and topk router.',
+        default='sinkhorn1',
+        help='Options for router type. Currently supports sinkhornK and topK router, where K represents the number of routers each token selects. The default is sinkhorn1.',
     )
     group.add_argument(
         '--moe-token-dropping',

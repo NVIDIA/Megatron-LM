@@ -8,7 +8,7 @@ from megatron.core.transformer.moe.base_moe_layer import Router
 from megatron.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.moe.moe_layer import SwitchMLPLayer
+from megatron.core.transformer.moe.moe_layer import DroplessMoELayer
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 
 
@@ -30,7 +30,7 @@ class TestDroplessTop2Router:
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=num_moe_experts, moe_grouped_gemm=False
         )
-        self.switch_mlp = SwitchMLPLayer(
+        self.switch_mlp = DroplessMoELayer(
             self.transformer_config, transformer_layer_spec.submodules.mlp.submodules
         )
         self.router = self.switch_mlp.router
