@@ -484,7 +484,7 @@ class DroplessSinkhornRouter(Router):
 
 
 class DroplessTopKRouter(Router):
-    """Sinkhorn Router without token dropping.
+    """TopK Router without token dropping.
 
     This class represents a router that applies the Sinkhorn algorithm for load balancing without dropping any tokens.
     
@@ -522,11 +522,10 @@ class DroplessTopKRouter(Router):
         """
         logits = logits.view(-1, self.config.num_moe_experts)
         logits = logits.to(dtype=torch.float32)
-        probs = torch.softmax(logits, dim=-1)
-
         # Apply Z-Loss
         if self.config.moe_z_loss_coeff > 0:
-            probs = self.apply_z_loss(probs)
+            logits = self.apply_z_loss(logits)
+        probs = torch.softmax(logits, dim=-1)
 
         scores, indices = torch.topk(probs, k=self.k, dim=1)
 
