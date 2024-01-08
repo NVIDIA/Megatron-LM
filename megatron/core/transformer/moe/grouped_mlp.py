@@ -16,6 +16,18 @@ from .base_moe_layer import BaseMoELayer
 
 
 class ScaleGradient(torch.autograd.Function):
+    """ When running MoE layer with T tokens per device and E experts on N devices
+        with pure data parallelism (no expert model parallelism), each device
+        calculates the average gradient for its local T tokens and then averages over
+        the N devices, so the gradient is effectively scaled by 1 / (T * N) for
+        each expert weights.
+
+        If you're instead running with N-way expert model parallelism, there is
+        no final gradient all reduce for the expert weights so the gradient
+        is scaled by 1 / tokens. Thus We scale by 1 / expert_parallel_world_size
+        = 1 / N to correct this so that the two settings match.
+    """
+
     @staticmethod
     @torch.cuda.amp.custom_fwd
     def forward(ctx, x, scale):
