@@ -26,6 +26,10 @@ class ScaleGradient(torch.autograd.Function):
         no final gradient all reduce for the expert weights so the gradient
         is scaled by 1 / tokens. Thus We scale by 1 / expert_parallel_world_size
         = 1 / N to correct this so that the two settings match.
+
+        Note: this is necessary to keep the grouped_gemm implementation (https://github.com/tgale96/grouped_gemm)
+        works as expected compared to our SwitchMLP baseline.
+        TODO: We will remove this module in our own developed grouped-gemm kernels.
     """
 
     @staticmethod
