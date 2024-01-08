@@ -24,7 +24,6 @@ TRANSFORMER_ENG_ARGS=(
     # --spec megatron.core.models.gpt.allam_layer_specs allam_layer_with_transformer_engine_spec
 GPT_MODEL_ARGS=(
     --use-mcore-models
-    --spec megatron.core.models.gpt.gpt_layer_specs get_gpt_layer_with_transformer_engine_spec
     --seq-length 2048 
     --max-position-embeddings 2048 
     --num-layers 24
