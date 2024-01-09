@@ -432,6 +432,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         else:
             return super().forward(query, key, value, attention_mask)
 
+
 try:
 
    from transformer_engine.pytorch.attention import _SplitAlongDim
@@ -442,4 +443,3 @@ except ImportError:
 
    SplitAlongDim = None
    get_cpu_offload_context = None
-

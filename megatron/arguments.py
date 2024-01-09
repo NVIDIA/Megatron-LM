@@ -170,6 +170,8 @@ def validate_args(args, defaults={}):
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer, \
             '--overlap-param-gather only supported with distributed optimizer'
+        assert args.overlap_grad_reduce, \
+            '--overlap-grad-reduce should be turned on when using --overlap-param-gather'
 
     # Parameters dtype.
     args.params_dtype = torch.float

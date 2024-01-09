@@ -4,7 +4,7 @@ import hashlib
 import json
 from abc import ABC, abstractmethod, abstractstaticmethod
 from collections import OrderedDict
-from typing import Dict, List
+from typing import Dict, List, Union
 
 import numpy
 import torch
@@ -80,14 +80,14 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
         pass
 
     @abstractmethod
-    def __getitem__(self, idx: int) -> Dict[str, numpy.ndarray]:
+    def __getitem__(self, idx: int) -> Dict[str, Union[torch.Tensor, numpy.ndarray]]:
         """Return from the dataset
 
         Args:
             idx (int): The index into the dataset
 
         Returns:
-            Dict[str, numpy.ndarray]: See abstract implementation
+            Dict[str, Union[torch.Tensor, numpy.ndarray]]: See abstract implementation
         """
         pass
 
