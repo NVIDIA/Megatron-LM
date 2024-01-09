@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Union
 
 import numpy
 import torch
@@ -20,9 +20,25 @@ logger = logging.getLogger(__name__)
 @dataclass
 class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Configuration object for Megatron Core GPT datasets
+
+       Attributes:
+           return_document_ids (bool): Whether to return the document ids when querying the dataset.
+          
+           reset_position_ids (bool): Option to reset the position IDs in the dataset at an interval
+
+           reset_attention_mask (bool): Option to reset the attention mask from the dataset
+
+           eod_mask_loss (bool): Option to enable the EOD mask loss
+
+           eod_id (int): Has the identity of the end of document
+      
     """
 
-    pass
+    return_document_ids: bool = False
+    reset_position_ids: bool = False
+    reset_attention_mask: bool = False
+    eod_mask_loss: bool = False
+    eod_id: int = 0
 
 
 class GPTDataset(MegatronDataset):
@@ -79,7 +95,7 @@ class GPTDataset(MegatronDataset):
             idx (int): The index into the dataset
 
         Returns:
-            Dict[str, numpy.ndarray]: The text ids wrapped in a dictionary
+            Dict[str, torch.Tensor]: The text ids wrapped in a dictionary
         """
         text, _ = self._query_document_sample_shuffle_indices(idx)
 
@@ -90,16 +106,20 @@ class GPTDataset(MegatronDataset):
         tokens = tokens_[:-1].contiguous()
 
         attention_mask, loss_mask, position_ids = _get_ltor_masks_and_position_ids(
-         tokens,
-         getattr(self.config,"eod_id"),
-         getattr(self.config,"reset_position_ids"),
-         getattr(self.config,"reset_attention_mask"),
-         getattr(self.config,"eod_mask_loss"))
+            tokens,
+            self.config.eod_id,
+            self.config.reset_position_ids,
+            self.config.reset_attention_mask,
+            self.config.eod_mask_loss,
+        )
 
-        if getattr(self.config, "return_document_ids"):
-            return {"tokens": tokens,"labels": labels,"attention_mask": attention_mask,"loss_mask": loss_mask,"position_ids": position_ids}
-        else:
-            return {"tokens": tokens,"labels": labels,"attention_mask": attention_mask,"loss_mask": loss_mask,"position_ids": position_ids}
+        return {
+            "tokens": tokens,
+            "labels": labels,
+            "attention_mask": attention_mask,
+            "loss_mask": loss_mask,
+            "position_ids": position_ids,
+        }
 
     @staticmethod
     def is_multimodal() -> bool:
@@ -474,17 +494,42 @@ def _build_shuffle_index(
 
     return numpy.concatenate((shuffle_idx_first, shuffle_idx_last))
 
-def _get_ltor_masks_and_position_ids(data,
-                                     eod_token,
-                                     reset_position_ids,
-                                     reset_attention_mask,
-                                     eod_mask_loss):
-    """Build masks and position id for left to right model."""
+
+def _get_ltor_masks_and_position_ids(
+    data: torch.Tensor,
+    eod_token: int,
+    reset_position_ids: bool,
+    reset_attention_mask: bool,
+    eod_mask_loss: bool,
+):
+    """Build masks and position id for left to right model.
+
+    Args:
+        data (torch.Tensor): The data tenor that holds the tokens from the dataset
+
+        eod_token (int): ID of the token to that is considered the EOD
+
+        reset_position_ids (bool): Switch to reset the document position ID's
+
+        reset_attention_mask (bool): Switch to reset the attention mask
+
+        eod_mask_loss (bool): Switch to enable the EOD mask loss
+
+    Returns:
+        torch.Tensor : Attention mask needed to be used for Attention
+
+        torch.Tensor : The mask used for loss value during training
+
+        torch.Tensor : The position ID's of the token
+
+    """
 
     # Extract batch size and sequence length.
     seq_length = data.numel()
 
-    attention_mask = torch.tril(torch.ones((seq_length, seq_length),device=data.device)).unsqueeze(0)
+    attention_mask = torch.tril(torch.ones((seq_length, seq_length), device=data.device)).unsqueeze(
+        0
+    )
 
     # Loss mask.
     loss_mask = torch.ones(seq_length, dtype=torch.float, device=data.device)
@@ -492,8 +537,7 @@ def _get_ltor_masks_and_position_ids(data,
         loss_mask[data == eod_token] = 0.0
 
     # Position ids.
-    position_ids = torch.arange(seq_length, dtype=torch.long,
-                                device=data.device)
+    position_ids = torch.arange(seq_length, dtype=torch.long, device=data.device)
     # We need to clone as the ids will be modifed based on batch index.
     if reset_position_ids:
         position_ids = position_ids.clone()
@@ -512,13 +556,13 @@ def _get_ltor_masks_and_position_ids(data,
             i = eod_index[j]
             # Mask attention loss.
             if reset_attention_mask:
-                attention_mask[ 0, (i + 1):, :(i + 1)] = 0
+                attention_mask[0, (i + 1) :, : (i + 1)] = 0
             # Reset positions.
             if reset_position_ids:
-                position_ids[ (i + 1):] -= (i + 1 - prev_index)
+                position_ids[(i + 1) :] -= i + 1 - prev_index
                 prev_index = i + 1
 
     # Convert attention mask to binary:
-    attention_mask = (attention_mask < 0.5)
+    attention_mask = attention_mask < 0.5
 
     return attention_mask, loss_mask, position_ids
