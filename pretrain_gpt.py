@@ -20,8 +20,8 @@ from megatron.core.models.gpt import GPTModel
 from megatron.training import pretrain
 from megatron.core.transformer.spec_utils import import_module
 from megatron.utils import (
-    get_ltor_masks_and_position_ids,
     get_batch_on_this_cp_rank,
+    get_batch_on_this_tp_rank,
     average_losses_across_data_parallel_group
 )
 from megatron.arguments import core_transformer_config_from_args
@@ -91,40 +91,9 @@ def get_batch(data_iterator):
     if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
         return None, None, None, None, None
 
-    args = get_args()
-    tokenizer = get_tokenizer()
+    # get batches based on the TP rank you are on
+    batch = get_batch_on_this_tp_rank(data_iterator) 
 
-    # Items and their type.
-    keys = ['text']
-    datatype = torch.int64
-
-    # Broadcast data.
-    if data_iterator is not None:
-        data = next(data_iterator)
-    else:
-        data = None
-    data_b = tensor_parallel.broadcast_data(keys, data, datatype)
-
-    # Unpack.
-    tokens_ = data_b['text'].long()
-    labels = tokens_[:, 1:].contiguous()
-    tokens = tokens_[:, :-1].contiguous()
-
-    # Get the masks and postition ids.
-    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
-        tokens,
-        tokenizer.eod,
-        args.reset_position_ids,
-        args.reset_attention_mask,
-        args.eod_mask_loss)
-
-    batch = {
-        'tokens': tokens,
-        'labels': labels,
-        'loss_mask': loss_mask,
-        'attention_mask': attention_mask,
-        'position_ids': position_ids
-    }
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
 
@@ -197,6 +166,11 @@ def core_gpt_dataset_config_from_args(args):
         blend_per_split=[args.train_data_path, args.valid_data_path, args.test_data_path],
         split=args.split,
         path_to_cache=args.data_cache_path,
+        return_document_ids=args.retro_return_doc_ids,
+        reset_position_ids=args.reset_position_ids,
+        reset_attention_mask=args.reset_attention_mask,
+        eod_mask_loss=args.eod_mask_loss,
+        eod_id=get_tokenizer().eod
     )
 
 
