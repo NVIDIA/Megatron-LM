@@ -15,38 +15,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from .base_moe_layer import BaseMoELayer
 
 
-class ScaleGradient(torch.autograd.Function):
-    """ When running MoE layer with T tokens per device and E experts on N devices
-        with pure data parallelism (no expert model parallelism), each device
-        calculates the average gradient for its local T tokens and then averages over
-        the N devices, so the gradient is effectively scaled by 1 / (T * N) for
-        each expert weights.
-
-        If you're instead running with N-way expert model parallelism, there is
-        no final gradient all reduce for the expert weights so the gradient
-        is scaled by 1 / tokens. Thus We scale by 1 / expert_parallel_world_size
-        = 1 / N to correct this so that the two settings match.
-
-        Note: this is necessary to keep the grouped_gemm implementation (https://github.com/tgale96/grouped_gemm)
-        works as expected compared to our SwitchMLP baseline.
-        TODO: We will remove this module in our own developed grouped-gemm kernels.
-    """
-
-    @staticmethod
-    @torch.cuda.amp.custom_fwd
-    def forward(ctx, x, scale):
-        ctx.scale = scale
-        return x
-
-    @staticmethod
-    @torch.cuda.amp.custom_bwd
-    def backward(ctx, grad):
-        return grad * ctx.scale, None
-
-
-scale_gradient = ScaleGradient.apply
-
-
 class GroupedMLP(BaseMoELayer):
     """
     Top-1 Mixture of Experts Layer with Grouped GEMM. Routes input to one of N MLP "experts"
@@ -63,7 +31,6 @@ class GroupedMLP(BaseMoELayer):
         ), "bias in the expert layer is not supported in Grouped GEMM yet, please set '--disable-bias-linear' instead."
 
         self.expert_parallel = config.expert_model_parallel_size > 1
-        self.gradient_scale = 1 / parallel_state.get_tensor_and_expert_parallel_world_size()
         if self.config.gated_linear_unit:
 
             def glu(x):
@@ -158,11 +125,6 @@ class GroupedMLP(BaseMoELayer):
         setattr(self.weight1, 'allreduce', not self.expert_parallel)
         setattr(self.weight2, 'allreduce', not self.expert_parallel)
 
-    def scale_grad(self, w):
-        if self.gradient_scale is None:
-            return w
-        return scale_gradient(w, self.gradient_scale)
-
     def forward(self, hidden_states):
         # Permutation of tokens
         (
@@ -172,10 +134,9 @@ class GroupedMLP(BaseMoELayer):
             global_local_map,
         ) = self.token_permutation(hidden_states)
 
-        w1, w2 = (self.scale_grad(self.weight1), self.scale_grad(self.weight2))
         # Reshape the weights for the grouped GEMMs.
-        w1 = w1.view(self.num_local_experts, self.config.hidden_size, -1)
-        w2 = w2.view(self.num_local_experts, -1, self.config.hidden_size)
+        w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
+        w2 = self.weight2.view(self.num_local_experts, -1, self.config.hidden_size)
 
         fc1_output = gg.ops.gmm(permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False)
 
