@@ -89,21 +89,6 @@ class BlendedMegatronDatasetConfig:
             log_single_rank(logger, logging.INFO, f"Let split_matrix = {self.split_matrix}")
 
 
-@dataclass
-class GPTDatasetConfig(BlendedMegatronDatasetConfig):
-    """Configuration object for megatron-core blended and megatron GPT datasets
-
-    Attributes:
-        return_document_ids (bool): Whether to return the document ids when querying the dataset.
-    """
-
-    return_document_ids: bool = False
-    reset_position_ids: bool = False
-    reset_attention_mask: bool = False
-    eod_mask_loss: bool = False
-    eod_id: int = 0
-
-
 def parse_and_normalize_split(split: str) -> List[float]:
     """Parse the dataset split ratios from a string
 
