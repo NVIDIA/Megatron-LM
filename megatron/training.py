@@ -773,6 +773,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         gc.disable()
         gc.collect()
 
+    num_microbatches = get_num_microbatches()
     while iteration < args.train_iters:
         if args.profile and \
            iteration == args.profile_step_start and \
@@ -780,7 +781,19 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             torch.cuda.cudart().cudaProfilerStart()
             torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
 
-        update_num_microbatches(args.consumed_train_samples)
+        # Update number of microbatches first without consistency check to decide if a
+        # checkpoint should be saved. If the number of microbatches is different
+        # from the previous iteration, save a checkpoint. Then run consistency check
+        # to make sure training configuration is still valid.
+        update_num_microbatches(args.consumed_train_samples, consistency_check=False)
+        if get_num_microbatches() != num_microbatches and iteration != 0:
+            assert get_num_microbatches() > num_microbatches, \
+                "number of microbatches should be increasing due to batch size rampup"
+            save_checkpoint_and_time(iteration, model, optimizer,
+                                     opt_param_scheduler)
+        num_microbatches = get_num_microbatches()
+        update_num_microbatches(args.consumed_train_samples, consistency_check=True)
+
         args.curr_iteration = iteration
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
             train_step(forward_step_func,
