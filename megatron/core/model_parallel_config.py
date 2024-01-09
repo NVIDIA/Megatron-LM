@@ -68,14 +68,13 @@ class ModelParallelConfig:
         communication collectives like AllGather/ReduceScatter. Overlapping is done for the linear layers wherever possible
         during the forward and the backward pass.  Defaults to False.
 
-    tp_comm_split_ag (bool, default=True): If true, allows All-Gather overlap with Fprop GEMM. Don't care if tp_comm_overlap 
-        is False.
-    tp_comm_atomic_ag (bool, default=True): If true, allows All-Gather overlap with Fprop GEMM. Don't care if tp_comm_overlap 
-        is False.
-    tp_comm_split_rs (bool, default=True): If true, allows Reduce-Scatter overlap with Fprop GEMM. Don't care if 
-        tp_comm_overlap is False.
-    tp_comm_atomic_rs (bool, default=True): If true, allows Reduce-Scatter overlap with Fprop GEMM. Don't care if 
-        tp_comm_overlap is False.
+    tp_comm_split_ag (bool, default=True): If true, allows All-Gather overlap with Fprop GEMM by pipelining the GEMM and All-Gather splits. Don't care if tp_comm_overlap is False.
+
+    tp_comm_atomic_ag (bool, default=True): If true, allows All-Gather overlap with Fprop GEMM by pipelining the GEMM and All-Gather both done atomically. Don't care if tp_comm_overlap is False.
+
+    tp_comm_split_rs (bool, default=True): If true, allows Reduce-Scatter overlap with Fprop GEMM by pipelining the GEMM and Reduce-Scatter splits. Don't care if tp_comm_overlap is False.
+
+    tp_comm_atomic_rs (bool, default=True): If true, allows Reduce-Scatter overlap with Fprop GEMM by pipelining the GEMM and Reduce-Scatter both done atomically. Don't care if tp_comm_overlap is False.
 
     tp_comm_bulk_dgrad (bool, default=True): If true, allows All-Gather overlap with Bprop activation gradient GEMM. Don't 
         care if tp_comm_overlap is False.
