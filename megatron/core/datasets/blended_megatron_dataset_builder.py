@@ -2,7 +2,7 @@
 
 import logging
 import math
-from typing import Any, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, List, Optional, Tuple, Type, Union
 
 import numpy
 import torch
@@ -15,7 +15,9 @@ from megatron.core.datasets.utils import Split, normalize
 
 logger = logging.getLogger(__name__)
 
-DistributedDataset = Union[BlendedDataset, MegatronDataset, MMapIndexedDataset]
+DistributedDataset = Union[
+    BlendedDataset, MegatronDataset, MMapIndexedDataset, torch.utils.data.Dataset
+]
 
 
 class BlendedMegatronDatasetBuilder(object):
@@ -65,9 +67,9 @@ class BlendedMegatronDatasetBuilder(object):
             MegatronDataset or BlendedDataset (or None) per split
         """
 
-        if getattr(self.config, "blend"):
-            blend = getattr(self.config, "blend")
-            split = getattr(self.config, "split_vector")
+        if self.config.blend:
+            blend = self.config.blend
+            split = self.config.split_matrix
 
             # Blend consists of a single prefix
             if len(blend) == 1:
@@ -97,14 +99,15 @@ class BlendedMegatronDatasetBuilder(object):
             for i in range(len(megatron_datasets)):
                 is_none = map(lambda _: _ is None, megatron_datasets[i])
 
-                if split[i] == 0.0:
+                if split[i] is None:
                     assert all(is_none)
                     blended_datasets.append(None)
                 else:
                     assert all(is_none) or not any(is_none)
                     blended_datasets.append(
-                        self._build_generic_dataset(
+                        self.build_generic_dataset(
                             BlendedDataset,
+                            self.config.is_built_on_rank,
                             megatron_datasets[i],
                             weight_per_dataset,
                             size_per_split[i],
@@ -117,15 +120,15 @@ class BlendedMegatronDatasetBuilder(object):
         else:
             blended_datasets = []
             for i in range(len(Split)):
-                blend = getattr(self.config, "blend_per_split")[i]
+                blend = self.config.blend_per_split[i]
 
                 # Blend is not provided
                 if not blend:
                     blended_datasets.append(None)
                     continue
 
-                split_spoof = [0.0] * len(Split)
-                split_spoof[i] = 1.0
+                split_spoof = [None] * len(Split)
+                split_spoof[i] = (0.0, 1.0)
                 sizes_spoof = [0] * len(Split)
                 sizes_spoof[i] = self.sizes[i]
 
@@ -154,8 +157,9 @@ class BlendedMegatronDatasetBuilder(object):
                     size_per_split = list(map(sum, zip(*sizes_per_dataset)))
 
                     blended_datasets.append(
-                        self._build_generic_dataset(
+                        self.build_generic_dataset(
                             BlendedDataset,
+                            self.config.is_built_on_rank,
                             megatron_datasets,
                             weight_per_dataset,
                             size_per_split[i],
@@ -173,53 +177,58 @@ class BlendedMegatronDatasetBuilder(object):
         Args:
             path_prefix (str): The MMapIndexedDataset .bin and .idx file prefix
 
-            split (List[float]): The dataset split ratios (must sum to 1.00)
+            split (List[Tuple[float, float]]): The dataset split matrix
 
             sizes (List[int]): The number of total samples to draw from each split
 
         Returns:
             List[Optional[MegatronDataset]]: The MegatronDatset (or None) per split
         """
-        indexed_dataset = self._build_generic_dataset(
-            MMapIndexedDataset, path_prefix, self.cls.is_multimodal()
+        indexed_dataset = self.build_generic_dataset(
+            MMapIndexedDataset, self.config.is_built_on_rank, path_prefix, self.cls.is_multimodal(),
         )
 
         if indexed_dataset is not None:
             if self.cls.is_split_by_sequence():
-                split_idx_bounds = _get_split_indices(
-                    split, indexed_dataset.sequence_lengths.shape[0]
-                )
+                num_elements = indexed_dataset.sequence_lengths.shape[0]
             else:
-                split_idx_bounds = _get_split_indices(
-                    split, indexed_dataset.document_indices.shape[0] - 1
-                )
-            split_indices = [
-                numpy.arange(
-                    start=split_idx_bounds[i],
-                    stop=split_idx_bounds[i + 1],
-                    step=1,
-                    dtype=numpy.int32,
-                )
-                for i, _ in enumerate(Split)
-            ]
+                num_elements = indexed_dataset.document_indices.shape[0] - 1
+
+            split_indices = []
+            for i, _ in enumerate(Split):
+                if split[i] is not None:
+                    beg = int(round(split[i][0] * float(num_elements)))
+                    end = int(round(split[i][1] * float(num_elements)))
+                    split_indices.append(
+                        numpy.arange(start=beg, stop=end, step=1, dtype=numpy.int32)
+                    )
+                else:
+                    split_indices.append(None)
         else:
             split_indices = [None for _ in Split]
 
         megatron_datasets = []
         for i, _split in enumerate(Split):
-            if split[i] == 0.0:
+            if split[i] is None:
                 megatron_datasets.append(None)
             else:
                 megatron_datasets.append(
-                    self._build_generic_dataset(
-                        self.cls, indexed_dataset, split_indices[i], sizes[i], _split, self.config
+                    self.build_generic_dataset(
+                        self.cls,
+                        self.config.is_built_on_rank,
+                        indexed_dataset,
+                        split_indices[i],
+                        sizes[i],
+                        _split,
+                        self.config,
                     )
                 )
 
         return megatron_datasets
 
-    def _build_generic_dataset(
-        self, cls: Type[DistributedDataset], *args: Any,
+    @staticmethod
+    def build_generic_dataset(
+        cls: Type[DistributedDataset], is_built_on_rank: Callable, *args: Any
     ) -> Optional[DistributedDataset]:
         """Build the DistributedDataset
 
@@ -244,7 +253,7 @@ class BlendedMegatronDatasetBuilder(object):
             dataset = None
 
             # First, build on rank 0
-            if rank == 0 and getattr(self.config, "is_built_on_rank")():
+            if rank == 0 and is_built_on_rank():
                 try:
                     dataset = cls(*args)
                 except OSError as err:
@@ -259,38 +268,12 @@ class BlendedMegatronDatasetBuilder(object):
             torch.distributed.barrier()
 
             # After, build on other ranks
-            if rank != 0 and getattr(self.config, "is_built_on_rank")():
+            if rank != 0 and is_built_on_rank():
                 dataset = cls(*args)
 
             return dataset
 
         return cls(*args)
-
-
-def _get_split_indices(split: List[float], num_elements: int) -> List[int]:
-    """Determine the document index bounds per split
-
-    Args:
-        split (List[float]): The dataset split ratios (must sum to 1.00)
-
-        num_elements (int): The number of elements, e.g. sequences or documents, available for
-        the split
-
-    Returns:
-        List[int]: The indices for all three splits e.g. [0, 900, 990, 1000] for a 1000-document
-        set and a [90.0, 9.0, 1.0] split
-    """
-    split_indices = [0]
-    for split_pct in split:
-        split_indices.append(split_indices[-1] + int(round(split_pct * float(num_elements))))
-    split_indices[1:] = list(
-        map(lambda _: _ - (split_indices[-1] - num_elements), split_indices[1:])
-    )
-
-    assert len(split_indices) == len(split) + 1
-    assert split_indices[-1] == num_elements
-
-    return split_indices
 
 
 def _get_prefixes_weights_and_sizes_for_blend(

@@ -2,6 +2,7 @@
 
 """Transformer."""
 from contextlib import nullcontext
+import os
 import math
 import numpy as np
 import torch
@@ -1058,7 +1059,6 @@ class ParallelTransformerLayer(MegatronModule):
         if self.layer_type == LayerType.retro_decoder_with_retriever:
             first_ns = ns % self.retro_chunk_length
             if first_ns > 0:
-                raise Exception("test this case.")
                 first_chunk, rest_chunk = \
                     norm_output[:first_ns], norm_output[first_ns:]
                 first_chunk = torch.nn.functional.pad(
@@ -1126,7 +1126,9 @@ class ParallelTransformerLayer(MegatronModule):
                 norm_input,
                 (0, 0, 0, 0, pad, 0),
                 'constant', 0)[:ns] # [ns, b, d]
-            norm_input = norm_input + residual
+            # TODO: better redesign with inference param
+            args = get_args()
+            norm_input = args.retro_attention_gate * norm_input + residual
 
         # Layer norm post the decoder attention
         norm_output = self.post_inter_attention_norm(norm_input)
@@ -1140,6 +1142,16 @@ class ParallelTransformerLayer(MegatronModule):
                 retriever_attn_mask=None,
                 inference_params=None,
                 rotary_pos_emb=None):
+
+        # Update the params in case the retro param changes during inference
+        # TODO: better redesign with inference param
+        args = get_args()
+        if args.retro_add_retriever:
+            retro_args = get_retro_args()
+            self.retro_num_neighbors = args.retro_num_neighbors
+            self.retro_chunk_length = retro_args.retro_gpt_chunk_length
+            self.retro_retrieved_length = retro_args.retro_gpt_retrieved_length
+
         # hidden_states: [s, b, h]
 
         # Layer norm at the beginning of the transformer layer.
@@ -1486,6 +1498,10 @@ class ParallelTransformer(MegatronModule):
                     extra_transformer_engine_kwargs["activation"] = "swiglu" if args.swiglu else "gelu"
                 if self.transformer_engine_v_0_11:
                     extra_transformer_engine_kwargs["normalization"] = args.normalization
+                assert config.attention_softmax_in_fp32, "TransformerEngine only supports softmax compute in FP32."
+                assert (
+                    (bool(int(os.getenv("NVTE_APPLY_QK_LAYER_SCALING", "0"))) and args.fp16) == config.apply_query_key_layer_scaling
+                ), "Unsupported config for apply_query_key_layer_scaling in TransformerEngine."
                 return transformer_engine.pytorch.TransformerLayer(
                     config.hidden_size,
                     config.ffn_hidden_size,
@@ -1501,8 +1517,6 @@ class ParallelTransformer(MegatronModule):
                     tp_group=mpu.get_tensor_model_parallel_group(),
                     get_rng_state_tracker=tensor_parallel.get_cuda_rng_tracker,
                     fuse_wgrad_accumulation=config.gradient_accumulation_fusion,
-                    apply_query_key_layer_scaling=config.apply_query_key_layer_scaling,
-                    attention_softmax_in_fp32=config.attention_softmax_in_fp32,
                     seq_length=args.seq_length,
                     micro_batch_size=args.micro_batch_size,
                     sequence_parallel=config.sequence_parallel,

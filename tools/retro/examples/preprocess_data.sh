@@ -11,10 +11,17 @@ RETRO_WORKDIR="<path/to/retro/data/directory>"
 
 ######## Task (e.g., db, index, query). ########
 
-RETRO_TASKS="db-build"
-# RETRO_TASKS="index-train"
-# RETRO_TASKS="index-add"
-# RETRO_TASKS="query-pretraining-neighbors"
+# This script takes a single argument, which specifies the retro task to be performed.
+# The available tasks are: db-build, index-train, index-add, and query-pretraining-neighbors.
+
+# RETRO_TASKS="db-build"                      # Build the retrieval database
+# RETRO_TASKS="index-train"                   # Train the index
+# RETRO_TASKS="index-add"                     # Add data to the index
+# RETRO_TASKS="query-pretraining-neighbors"   # Perform query pretraining for neighbors
+
+# You can also provide the task as a command-line argument when executing the script.
+# Example: ./preprocess_data.sh index-add
+RETRO_TASKS=$1
 
 ######## Data. ########
 
@@ -64,6 +71,7 @@ ARGS=" \
     --load <path/to/bert/checkpoint> \
     --exit-on-missing-checkpoint \
     --no-load-optim \
+    --no-load-rng \
     --data-path ${RETRO_GPT_DATA_PATH} \
     --tokenizer-type BertWordPieceLowerCase \
     --vocab-file <path/to/bert/vocab> \
@@ -80,7 +88,6 @@ ARGS=" \
     --eval-interval ${RETRO_GPT_EVAL_INTERVAL} \
     --eval-iters ${RETRO_GPT_EVAL_ITERS} \
     --fp16 \
-    --DDP-impl local \
     --dataloader-type ${RETRO_GPT_DATALOADER_TYPE} \
     --no-data-sharding \
     --no-gradient-accumulation-fusion \

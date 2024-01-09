@@ -1,9 +1,10 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import functools
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import torch
 
@@ -39,8 +40,10 @@ class BlendedMegatronDatasetConfig:
         when drawing samples from a single distribution. Not to be used with 'blend_per_split'.
         Defaults to None.
 
-        split_vector: (Optional[List[float]]): The split string, parsed and normalized post-
-        initialization. Not to be passed to the constructor.
+        split_matrix (Optional[List[Tuple[float, float]]]): The split matrix consisting of
+        non-overlapping book-ends of each split in order. For more information, refer to
+        'convert_split_vector_to_split_matrix'. Created automatically from 'split'. Not to be
+        passed in to the constructor.
 
         path_to_cache (str): Where all re-useable dataset indices are to be cached.
     """
@@ -57,14 +60,11 @@ class BlendedMegatronDatasetConfig:
 
     split: Optional[str] = None
 
-    split_vector: Optional[List[float]] = field(init=False, default=None)
+    split_matrix: Optional[List[Tuple[float, float]]] = field(init=False, default=None)
 
     path_to_cache: str = None
 
     def __post_init__(self):
-        """Python dataclass method that is used to modify attributes after initialization. See
-        https://docs.python.org/3/library/dataclasses.html#post-init-processing for more details.
-        """
         if torch.distributed.is_initialized():
             gb_rank = torch.distributed.get_rank()
             vp_rank = get_virtual_pipeline_model_parallel_rank()
@@ -84,29 +84,19 @@ class BlendedMegatronDatasetConfig:
         else:
             assert self.blend is not None, "one of either blend or blend_per_split must be provided"
             assert self.split is not None, "both blend and split must be provided"
-            self.split_vector = _parse_and_normalize_split(self.split)
-            log_single_rank(logger, logging.INFO, f"Let split_vector = {self.split_vector}")
+            split_vector = parse_and_normalize_split(self.split)
+            self.split_matrix = convert_split_vector_to_split_matrix(split_vector)
+            log_single_rank(logger, logging.INFO, f"Let split_matrix = {self.split_matrix}")
 
 
-@dataclass
-class GPTDatasetConfig(BlendedMegatronDatasetConfig):
-    """Configuration object for megatron-core blended and megatron GPT datasets
-
-    Attributes:
-        return_document_ids (bool): Whether to return the document ids when querying the dataset.
-    """
-
-    return_document_ids: bool = False
-
-
-def _parse_and_normalize_split(split: str) -> List[float]:
+def parse_and_normalize_split(split: str) -> List[float]:
     """Parse the dataset split ratios from a string
 
     Args:
         split (str): The train valid test split string e.g. "99,1,0"
 
     Returns:
-        List[float]: The trian valid test split ratios e.g. [99.0, 1.0, 0.0]
+        List[float]: The trian valid test split ratios e.g. [0.99, 0.01, 0.0]
     """
     split = list(map(float, re.findall(r"[.0-9]+", split)))
     split = split + [0.0 for _ in range(len(Split) - len(split))]
@@ -117,3 +107,49 @@ def _parse_and_normalize_split(split: str) -> List[float]:
     split = normalize(split)
 
     return split
+
+
+def convert_split_vector_to_split_matrix(
+    vector_a: List[float], vector_b: Optional[List[float]] = None
+) -> List[Optional[Tuple[float, float]]]:
+    """Build the split matrix from one or optionally two contributing split vectors.
+
+    Ex. a standard conversion:
+
+    [0.99, 0.01, 0.0] -> [(0, 0.99), (0.99, 1.0), None]
+
+    Ex. a conversion for Retro when Retro pretraining uses a [0.99, 0.01, 0.0] split and Retro
+    preprocessing used a [0.98, 0.02, 0.0] split:
+
+    [0.99, 0.01, 0.0], [0.98, 0.02, 0.0] -> [(0, 0.98), (0.99, 1.0), None]
+
+    Args:
+        vector_a (List[float]): The primary split vector
+
+        vector_b (Optional[List[float]]): An optional secondary split vector which constrains the
+        primary split vector. Defaults to None.
+
+    Returns:
+        List[Tuple[float, float]]: The split matrix consisting of book-ends of each split in order
+    """
+    if vector_b is None:
+        vector_b = vector_a
+
+    # [.900, .090, .010] -> [0.00, .900, .990, 100]
+    expansion_a = functools.reduce(lambda a, b: a + [a[len(a) - 1] + b], [[0], *vector_a])
+    expansion_b = functools.reduce(lambda a, b: a + [a[len(a) - 1] + b], [[0], *vector_b])
+
+    # [0.00, .900, .990, 100.0] -> [(0.00, .900), (.900, .990), (.990, 100)]
+    bookends_a = list(zip(expansion_a[:-1], expansion_a[1:]))
+    bookends_b = list(zip(expansion_b[:-1], expansion_b[1:]))
+
+    # gather per-split overlap or None
+    matrix = []
+    for bookend_a, bookend_b in zip(bookends_a, bookends_b):
+        if min(bookend_a[1], bookend_b[1]) <= max(bookend_a[0], bookend_b[0]):
+            overlap = None
+        else:
+            overlap = (max(bookend_a[0], bookend_b[0]), min(bookend_a[1], bookend_b[1]))
+        matrix.append(overlap)
+
+    return matrix

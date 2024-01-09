@@ -191,7 +191,7 @@ def read_metadata(tracker_filename):
 
     # Get the max iteration retrieved across the ranks.
     if torch.distributed.is_initialized():
-        iters_cuda = torch.cuda.LongTensor([iteration])
+        iters_cuda = torch.tensor([iteration], dtype=torch.long, device='cuda')
         torch.distributed.all_reduce(iters_cuda, op=torch.distributed.ReduceOp.MAX)
         max_iter = iters_cuda[0].item()
 
@@ -580,6 +580,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         print_rank_0('could not find arguments in the checkpoint ...')
 
     # Model.
+    strict = False if args.retro_add_retriever or args.transformer_impl == 'transformer_engine' else strict
     if len(model) == 1:
         model[0].load_state_dict(state_dict['model'], strict=strict)
     else:

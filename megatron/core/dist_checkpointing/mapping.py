@@ -29,25 +29,18 @@ class ShardedTensor:
     Global tensor is assumed to consist of many local tensors distributed
     between different processes.
 
-    Attributes:
+    Args:
         key: unique identifier of a global tensor
         data: local tensor data. Can be None only for consistency validation
         dtype: tensor dtype
         local_shape: local tensor shape
         global_shape: global tensor shape
-        global_offset: offset of a local tensor in a global tensor, specified
-            in number of tensor elements
+        global_offset: offset of a local tensor in a global tensor, specified in number of tensor elements
         axis_fragmentations: global tensor fragmentation of each axis
-        replica_id: indicates given local tensor's replication wrt. local
-            tensors in different processes
-        prepend_axis_num: number of axes prepended to the local tensor
-            to reflect global tensor shape.
-            The behavior is similar to unsqueezing the local tensor.
-        allow_shape_mismatch: if True, during loading, the global shape of a
-            stored tensor does not have to match the expected global shape.
-            Useful for representing tensors with flexible shape, e.g. padded.
-        flattened_range: specifies a slice that should be applied to a flattened
-            tensor with `local_shape` in order to get the tensor stored as `data`
+        replica_id: indicates given local tensor's replication wrt. local tensors in different processes
+        prepend_axis_num: number of axes prepended to the local tensor to reflect global tensor shape. The behavior is similar to unsqueezing the local tensor.
+        allow_shape_mismatch: if True, during loading, the global shape of a stored tensor does not have to match the expected global shape. Useful for representing tensors with flexible shape, e.g. padded.
+        flattened_range: specifies a slice that should be applied to a flattened tensor with `local_shape` in order to get the tensor stored as `data`
     """
 
     key: str
@@ -131,13 +124,11 @@ class ShardedTensor:
         allow_shape_mismatch: bool = False,
     ):
         """Allows to construct the ShardedTensor given offset specified in process ranks.
-        Arguments:
+
+        Args:
             key: unique key
             data: local tensor data
-            rank_offsets: each tuple (axis, axis_rank_offset, axis_fragm)
-                says that if global tensor is divided into `axis_fragm`
-                 fragment along `axis` axis, then local tensor data
-                 corresponds to the `axis_rank_offset` chunk.
+            rank_offsets: each tuple (axis, axis_rank_offset, axis_fragm) says that if global tensor is divided into `axis_fragm` fragment along `axis` axis, then local tensor data corresponds to the `axis_rank_offset` chunk.
             replica_id: see ShardedTensor
             prepend_axis_num: see ShardedTensor
             allow_shape_mismatch: see ShardedTensor
@@ -214,14 +205,12 @@ class ShardedObject:
     sharding. Conceptually, ShardedObject is a fully-sharded ShardedTensor
     with atomic arbitrary typed elements.
 
-    Attributes:
+    Args:
         key: unique identifier of a global tensor
         data: local object data. Can be None only for consistency validation
         global_shape: global object shape
-        global_offset: offset of a local object in a global object, specified
-            in number of shards
-        replica_id: indicates local object replication wrt. local
-            objects in different processes
+        global_offset: offset of a local object in a global object, specified in number of shards
+        replica_id: indicates local object replication wrt. local objects in different processes
     """
 
     key: str

@@ -41,6 +41,20 @@ unit_tests:
   rules:
     - when: always
 
+docs_build_test:
+  stage: test
+  tags:
+    - docker_local_runner
+  script:
+    - cd ..
+    - rm -rf documentation && git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab-master.nvidia.com/nemo-megatron-core-tme/documentation.git
+    - mv megatron-lm/ documentation/
+    - cd documentation/
+    - ./repo docs
+  allow_failure: true
+  except:
+    - main
+
 formatting:
   image: nvcr.io/nvidia/pytorch:23.04-py3
   tags:
@@ -71,7 +85,7 @@ formatting:
       when: always
     - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
       when: always
-    - if: '$CI_MERGE_REQUEST_LABELS == "READY FOR REVIEW" && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED'
+    - if: '$CI_MERGE_REQUEST_LABELS =~ "READY FOR REVIEW" && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED'
       when: always
   allow_failure: false
   retry: 2
@@ -94,7 +108,7 @@ formatting:
       when: always
     - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
       when: always
-    - if: '$CI_MERGE_REQUEST_LABELS == "READY FOR REVIEW" && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED'
+    - if: '$CI_MERGE_REQUEST_LABELS =~ "READY FOR REVIEW" && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED'
       when: always
   allow_failure: false
   retry: 2
@@ -486,6 +500,23 @@ train.gpt3_core.345m_cp2_tp2_pp1_1node_50steps:
     PYTORCH_IMAGE: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron/pytorch_23.10_flash_attn_1.0.9_context_parallelism.sqsh"
     ADDITIONAL_PARAMS: "--context-parallel-size 2 --sequence-parallel --hidden-dropout 0.0 --attention-dropout 0.0"
 
+train.gpt3_core.345m_cp2_tp2_pp2_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 2
+    PP_SIZE: 2
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 1
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: MR_TESTS
+    METADATA: "context_parallelism_cp2"
+    PYTORCH_IMAGE: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron/pytorch_23.10_flash_attn_1.0.9_context_parallelism.sqsh"
+    ADDITIONAL_PARAMS: "--context-parallel-size 2 --sequence-parallel --hidden-dropout 0.0 --attention-dropout 0.0"
+
 # Note: Core MoE models currently will run TE by default
 train.te_core_moe_gpt3.345m_tp2_pp2_2experts_1node_50steps:
   <<: *selene-test-launcher
@@ -756,7 +787,7 @@ train.t5_core.220m_te_tp1_pp1_1node_100steps:
     NUM_NODES: 1
     MAX_STEPS: 100
     TIME_LIMIT: "30:00"
-    TEST_LEVEL: NIGHTLY_TESTS
+    TEST_LEVEL: MR_TESTS
     PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
 
 train.t5_core.220m_te_tp2_pp1_1node_100steps:

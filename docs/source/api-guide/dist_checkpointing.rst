@@ -15,7 +15,7 @@ Submodules
 dist\_checkpointing.core module
 -------------------------------
 
-.. automodule:: dist_checkpointing.core
+.. automodule:: core.dist_checkpointing.core
    :members:
    :undoc-members:
    :show-inheritance:
@@ -23,7 +23,7 @@ dist\_checkpointing.core module
 dist\_checkpointing.dict\_utils module
 --------------------------------------
 
-.. automodule:: dist_checkpointing.dict_utils
+.. automodule:: core.dist_checkpointing.dict_utils
    :members:
    :undoc-members:
    :show-inheritance:
@@ -31,7 +31,7 @@ dist\_checkpointing.dict\_utils module
 dist\_checkpointing.mapping module
 ----------------------------------
 
-.. automodule:: dist_checkpointing.mapping
+.. automodule:: core.dist_checkpointing.mapping
    :members:
    :undoc-members:
    :show-inheritance:
@@ -39,7 +39,7 @@ dist\_checkpointing.mapping module
 dist\_checkpointing.optimizer module
 ------------------------------------
 
-.. automodule:: dist_checkpointing.optimizer
+.. automodule:: core.dist_checkpointing.optimizer
    :members:
    :undoc-members:
    :show-inheritance:
@@ -47,7 +47,7 @@ dist\_checkpointing.optimizer module
 dist\_checkpointing.serialization module
 ----------------------------------------
 
-.. automodule:: dist_checkpointing.serialization
+.. automodule:: core.dist_checkpointing.serialization
    :members:
    :undoc-members:
    :show-inheritance:
@@ -55,7 +55,7 @@ dist\_checkpointing.serialization module
 dist\_checkpointing.utils module
 --------------------------------
 
-.. automodule:: dist_checkpointing.utils
+.. automodule:: core.dist_checkpointing.utils
    :members:
    :undoc-members:
    :show-inheritance:
@@ -63,7 +63,7 @@ dist\_checkpointing.utils module
 Module contents
 ---------------
 
-.. automodule:: dist_checkpointing
+.. automodule:: core.dist_checkpointing
    :members:
    :undoc-members:
    :show-inheritance:

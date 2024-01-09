@@ -122,7 +122,9 @@ def pretrain(train_valid_test_dataset_provider,
     # This will be closer to what scheduler will see (outside of
     # image ... launches.
     global _TRAIN_START_TIME
-    start_time_tensor = torch.cuda.DoubleTensor([_TRAIN_START_TIME])
+    start_time_tensor = torch.tensor([_TRAIN_START_TIME],
+                                     dtype=torch.double,
+                                     device='cuda')
     torch.distributed.all_reduce(start_time_tensor,
                                  op=torch.distributed.ReduceOp.MIN)
     _TRAIN_START_TIME = start_time_tensor.item()
@@ -525,7 +527,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     for key in loss_dict:
         if not skipped_iter:
             total_loss_dict[key] = total_loss_dict.get(
-                key, torch.cuda.FloatTensor([0.0])) + loss_dict[key]
+                key, torch.tensor([0.0], dtype=torch.float, device='cuda')) + loss_dict[key]
         else:
             value = loss_dict[key].float().sum().item()
             is_nan = value == float('inf') or \
@@ -679,7 +681,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                       float(max(1, total_loss_dict[advanced_iters_key]))
                 if avg > 0.0:
                     log_string += ' {}: {:.6E} |'.format(key, avg)
-                total_loss_dict[key] = torch.cuda.FloatTensor([0.0])
+                total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
         log_string += ' loss scale: {:.1f} |'.format(loss_scale)
         if grad_norm is not None:
             log_string += ' grad norm: {:.3f} |'.format(grad_norm)
@@ -848,8 +850,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         # Exiting based on duration
         if args.exit_duration_in_mins:
             train_time = (time.time() - _TRAIN_START_TIME) / 60.0
-            done_cuda = torch.cuda.IntTensor(
-                [train_time > args.exit_duration_in_mins])
+            done_cuda = torch.tensor(
+                [train_time > args.exit_duration_in_mins],
+                dtype=torch.int, device='cuda')
             torch.distributed.all_reduce(
                 done_cuda, op=torch.distributed.ReduceOp.MAX)
             done = done_cuda.item()
@@ -953,14 +956,15 @@ def evaluate(forward_step_func,
                 for loss_dict in loss_dicts:
                     for key in loss_dict:
                         total_loss_dict[key] = total_loss_dict.get(
-                            key, torch.cuda.FloatTensor([0.0])) + loss_dict[key]
+                            key, torch.tensor([0.0], dtype=torch.float, device='cuda')) + loss_dict[key]
 
             args.consumed_valid_samples += eval_batch_size
 
             if args.exit_duration_in_mins:
                 train_time = (time.time() - _TRAIN_START_TIME) / 60.0
-                done_cuda = torch.cuda.IntTensor(
-                    [train_time > args.exit_duration_in_mins])
+                done_cuda = torch.tensor(
+                    [train_time > args.exit_duration_in_mins],
+                    dtype=torch.int, device='cuda')
                 torch.distributed.all_reduce(
                     done_cuda, op=torch.distributed.ReduceOp.MAX)
                 done = done_cuda.item()
@@ -1117,10 +1121,11 @@ def build_train_valid_test_data_loaders(
         do_train = train_dataloader is not None and args.train_iters > 0
         do_valid = valid_dataloader is not None and args.eval_iters > 0
         do_test = test_dataloader is not None and args.eval_iters > 0
-        flags = torch.cuda.LongTensor(
-            [int(do_train), int(do_valid), int(do_test)])
+        flags = torch.tensor(
+            [int(do_train), int(do_valid), int(do_test)],
+            dtype=torch.long, device='cuda')
     else:
-        flags = torch.cuda.LongTensor([0, 0, 0])
+        flags = torch.tensor([0, 0, 0], dtype=torch.long, device='cuda')
 
     torch.distributed.broadcast(flags, 0)
 
