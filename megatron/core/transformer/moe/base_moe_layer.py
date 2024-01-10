@@ -497,15 +497,15 @@ class DroplessTopKRouter(Router):
             logits = self.apply_z_loss(logits)
 
         if self.routing_type == "sinkhorn":
-            # sinkhorn routing
+            # Sinkhorn routing.
             scores, indices = self.apply_sinkhorn(logits)
         elif self.routing_type == "top":
-            # topK routing
-            probs = torch.softmax(logits.to(dtype=torch.float32), dim=-1)
-            scores, indices = torch.topk(probs, k=self.k, dim=1)
-            scores /= scores.sum(dim=-1, keepdim=True)
+            # TopK routing.
+            top_logits, indices = torch.topk(logits, k=self.k, dim=1)
+            scores = torch.softmax(top_logits, dim=-1, dtype=torch.float32).type_as(logits)
             # Apply load balancing loss
             if self.config.moe_aux_loss_coeff > 0:
+                probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
                 scores = self.apply_aux_loss(
                     self.moe_aux_loss_func, probs, indices, activation=scores
                 )
