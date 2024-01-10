@@ -1,3 +1,5 @@
+bash scripts/envs/env_vars.sh
+
 DATASET_PATH="../RAW_DATA_FOLDER/MathPile/"
 GIT_LFS_SKIP_SMUDGE=1 git clone https://huggingface.co/datasets/GAIR/MathPile $DATASET_PATH
 cd $DATASET_PATH
