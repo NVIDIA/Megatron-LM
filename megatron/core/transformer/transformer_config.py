@@ -2,7 +2,7 @@
 
 import types
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, ContextManager
 
 import torch
 import torch.nn.functional as F
@@ -53,6 +53,9 @@ class TransformerConfig(ModelParallelConfig):
             fp8_wgrad (bool): When set to False, override FP8 config options and do the wgrad computation in higher precision. Defaults to True.
             cpu_offloading (bool): When set to True, all the activations are offloaded to the CPU asynchronously
             cpu_offloading_num_layers (int): Tells the number of transformer layers for which activations has to be offloaded.
+            cpu_offloading_context (ContextManager): Holds the context manager from TE which is supposed to add PyT hooks for offload/reload of data from CPU.
+            cpu_offloading_activations (bool): If True, offloads the activations to CPU
+            cpu_offloading_weights (bool): If True, offloads the weights to CPU
             clone_scatter_output_in_embedding (bool): When set to true, clone the output of scatter_to_sequence_parallel_region in embedding layer to facilitate garbage collection of input.
             normalization (str): Swtich b/w `LayerNorm` and `RMSNorm` as normalization layers. For now, these are primarily used by Transformer-Engine's layers like `LayerNormLinear`. Default value is `LayerNorm`.
     """
@@ -111,6 +114,9 @@ class TransformerConfig(ModelParallelConfig):
     # cpu offload
     cpu_offloading: bool = False
     cpu_offloading_num_layers: int = 0
+    cpu_offloading_context: ContextManager = None
+    cpu_offloading_activations: bool = True
+    cpu_offloading_weights: bool = True
 
     # miscellaneous
     clone_scatter_output_in_embedding: bool = True

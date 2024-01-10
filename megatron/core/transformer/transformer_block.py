@@ -103,16 +103,22 @@ class TransformerBlock(MegatronModule):
 
         self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
 
-        self._build_layers()
-        self.num_layers_per_pipeline_rank = len(self.layers)
-
         if get_cpu_offload_context is not None:
             self.offload_context, self.group_prefetch_offload_commit_async = get_cpu_offload_context(
                                                                              self.config.cpu_offloading,
-                                                                             self.config.cpu_offloading_num_layers
+                                                                             self.config.cpu_offloading_num_layers,
+                                                                             self.config.cpu_offloading_activations,
+                                                                             self.config.cpu_offloading_weights
                                                                              )
+            self.config.cpu_offloading_context = self.offload_context if self.config.cpu_offloading else None
         else:
+            assert self.config.cpu_offloading == False, "CPU Offloading is enabled when TE is not present"
+ 
             self.offload_context, self.group_prefetch_offload_commit_async = nullcontext(), None
+            self.config.cpu_offloading_context = None
+
+        self._build_layers()
+        self.num_layers_per_pipeline_rank = len(self.layers)
 
     def _build_layers(self):
         # Transformer layers.
