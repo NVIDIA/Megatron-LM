@@ -6,7 +6,6 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
     TERowParallelLinear,
-    TENorm
 )
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
@@ -14,7 +13,7 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.switch_mlp import SwitchMLP
 from megatron.core.transformer.transformer_layer import AllamTransformerLayer, TransformerLayerSubmodules
-from transformer_engine.pytorch import RMSNorm
+
 
 # Use this spec to use lower level Transformer Engine modules (required for fp8 training)
 allam_layer_with_transformer_engine_spec = ModuleSpec(
@@ -25,7 +24,7 @@ allam_layer_with_transformer_engine_spec = ModuleSpec(
             params={"attn_mask_type": AttnMaskType.causal},
             submodules=SelfAttentionSubmodules(
                 linear_qkv=TELayerNormColumnParallelLinear,
-                dot_product_attention=TEDotProductAttention,
+                core_attention=TEDotProductAttention,
                 linear_proj=TERowParallelLinear,
             ),
         ),
