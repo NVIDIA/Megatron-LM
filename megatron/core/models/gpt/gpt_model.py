@@ -239,3 +239,8 @@ class GPTModel(LanguageModule):
                 sharded_state_dict[output_layer_key] = sharded_output_layer_tensor
 
         return sharded_state_dict
+
+    def set_is_first_microbatch(self):
+        for m in self.modules():
+            if hasattr(m, "is_first_microbatch"):
+                m.is_first_microbatch = True

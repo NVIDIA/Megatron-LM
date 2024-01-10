@@ -156,6 +156,7 @@ def forward_step(
     config,
     collect_non_loss_data=False,
     checkpoint_activations_microbatch=None,
+    is_first_microbatch=False,
 ):
     """Forward step for passed-in model.
 
@@ -165,6 +166,9 @@ def forward_step(
     Returns output tensor."""
     if config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
+
+    if is_first_microbatch and hasattr(model, 'set_is_first_microbatch'):
+        model.set_is_first_microbatch()
 
     unwrap_output_tensor = False
     if not isinstance(input_tensor, list):
@@ -280,6 +284,13 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     return input_tensor_grad
 
 
+def check_first_val_step(first_val_step, forward_only, cond):
+    if (first_val_step is not None) and forward_only:
+        return first_val_step and cond
+    else:
+        return cond
+
+
 def forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -291,6 +302,7 @@ def forward_backward_no_pipelining(
     decoder_seq_length: int = None,  # unused
     forward_only: bool = False,
     collect_non_loss_data: bool = False,
+    first_val_step: bool = None,
 ):
     """Run forward and backward passes with no pipeline parallelism
     (no inter-stage communication).
@@ -333,6 +345,7 @@ def forward_backward_no_pipelining(
                 forward_data_store,
                 config,
                 collect_non_loss_data,
+                is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
             )
             if not forward_only:
                 backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
@@ -348,6 +361,9 @@ def forward_backward_no_pipelining(
         forward_data_store,
         config,
         collect_non_loss_data,
+        is_first_microbatch=check_first_val_step(
+            first_val_step, forward_only, num_microbatches == 1
+        ),
     )
 
     if not forward_only:
@@ -375,6 +391,7 @@ def forward_backward_pipelining_with_interleaving(
     decoder_seq_length: int = None,
     forward_only: bool = False,
     collect_non_loss_data: bool = False,
+    first_val_step: bool = None,
 ):
     """Run interleaved 1F1B schedule (model split into model chunks), with
     communication between pipeline stages as needed.
@@ -560,6 +577,7 @@ def forward_backward_pipelining_with_interleaving(
             if len(input_tensors[model_chunk_id]) == len(output_tensors[model_chunk_id]):
                 input_tensors[model_chunk_id].append(None)
         input_tensor = input_tensors[model_chunk_id][-1]
+
         output_tensor = forward_step(
             forward_step_func,
             data_iterator[model_chunk_id],
@@ -570,6 +588,9 @@ def forward_backward_pipelining_with_interleaving(
             config,
             collect_non_loss_data,
             checkpoint_activations_microbatch,
+            check_first_val_step(
+                first_val_step, forward_only, is_first_microbatch_for_model_chunk(microbatch_id),
+            ),
         )
         output_tensors[model_chunk_id].append(output_tensor)
 
@@ -1060,6 +1081,7 @@ def forward_backward_pipelining_without_interleaving(
     decoder_seq_length: int = None,
     forward_only: bool = False,
     collect_non_loss_data: bool = False,
+    first_val_step: bool = None,
 ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages.
@@ -1179,6 +1201,7 @@ def forward_backward_pipelining_without_interleaving(
             config,
             collect_non_loss_data,
             checkpoint_activations_microbatch,
+            check_first_val_step(first_val_step, forward_only, i == 0),
         )
         send_forward(output_tensor, send_tensor_shapes, config)
 
@@ -1215,6 +1238,9 @@ def forward_backward_pipelining_without_interleaving(
             config,
             collect_non_loss_data,
             checkpoint_activations_microbatch,
+            check_first_val_step(
+                first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
+            ),
         )
 
         if forward_only:

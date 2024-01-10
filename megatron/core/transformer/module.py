@@ -155,3 +155,7 @@ class Float16Module(MegatronModule):
 
     def load_state_dict(self, state_dict, strict=True):
         self.module.load_state_dict(state_dict, strict=strict)
+
+    def set_is_first_microbatch(self):
+        if hasattr(self.module, 'set_is_first_microbatch'):
+            self.module.set_is_first_microbatch()
