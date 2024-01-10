@@ -192,8 +192,12 @@ class TransformerConfig(ModelParallelConfig):
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
-        if self.bias_activation_fusion and self.activation_func == F.gelu:
-            if not self.add_bias_linear:
+        if self.bias_activation_fusion:
+            if self.activation_func not in [F.gelu, F.silu]:
+                raise ValueError(
+                    "When bias_activation_fusion is True, activation function should be either gelu or swiglu"
+                )
+            if self.activation_func == F.gelu and not self.add_bias_linear:
                 raise ValueError(
                     "When bias_activation_fusion is True and activation function is gelu, add_bias_linear must also be True."
                 )

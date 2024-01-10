@@ -3,13 +3,7 @@
 import torch
 import torch.nn.functional as F
 
-###### BIAS GELU FUSION/ NO AUTOGRAD ################
-# 1/sqrt(2*pi)-> 0.3989423
-# 1/sqrt(2)   -> 0.70710678
-# sqrt(2/pi)  -> 0.79788456
-# this function is tanh approximation of gelu
-# actual gelu is:
-# x * 0.5 * (1.0 + torch.erf(x * 0.70710678))
+###### BIAS SWIGLU FUSION/ NO AUTOGRAD ################
 
 
 @torch.jit.script
