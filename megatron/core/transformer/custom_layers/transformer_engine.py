@@ -133,7 +133,7 @@ class TELinear(te.pytorch.Linear):
         )
 
     def forward(self, x):
-        out = super().forward(x, self.is_first_microbatch)
+        out = super().forward(x, is_first_microbatch=self.is_first_microbatch)
         self.is_first_microbatch = False
 
         # TE only returns a tuple when return_bias is True, otherwise
@@ -225,7 +225,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         )
 
     def forward(self, x):
-        out = super().forward(x, self.is_first_microbatch)
+        out = super().forward(x, is_first_microbatch=self.is_first_microbatch)
         self.is_first_microbatch = False
 
         # TE only returns a tuple when return_bias is True, otherwise
