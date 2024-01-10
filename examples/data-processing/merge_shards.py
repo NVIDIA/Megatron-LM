@@ -21,7 +21,7 @@ def get_args():
     parser.add_argument("--shard-size", type = int, help="Estimated size of the each merged shard. (TODO: Fix to exact size)", required=True)
     parser.add_argument("--prefix-name", type = str, help="Prefix of the output file name.", required=True)
     parser.add_argument("--use-file-input", action='store_true', help="Send the merge shard names in a file instead of arguments. "
-                        "This is required when you merge too many small files.", required=True)
+                        "This is required when you merge too many small files.")
     
     group = parser.add_argument_group(title='Misc. params.')
     parser.add_argument("--compute-target", type = str, default='azure', choices=['local', 'azure'], help="Conpute targets. Both --input-folder-path and --output-folder-path should use same compute target. TODO: Enable cross compute.")
