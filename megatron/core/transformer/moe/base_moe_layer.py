@@ -468,6 +468,7 @@ class DroplessTopKRouter(Router):
         Returns:
             torch.Tensor: The logits tensor after applying sinkhorn routing.
         """
+        assert self.config.moe_aux_loss_coeff == 0, "Sinkhorn routing does not support aux loss."
         router_activation = torch.sigmoid
         if self.training:
             with torch.no_grad():
@@ -514,7 +515,7 @@ class DroplessTopKRouter(Router):
 
 
 class MoEAuxLossAutoScaler(torch.autograd.Function):
-    """A AutoScaler that compute and scales the grad of auxiliary loss.
+    """An AutoScaler that compute and scales the grad for auxiliary loss.
 
     """
 
@@ -536,7 +537,7 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        """Trigger the backward pass of the auxiliary loss as well as it scaling.
+        """Compute and scale the gradient for auxiliary loss..
 
         Args:
             grad_output (torch.Tensor): The gradient of the output.
