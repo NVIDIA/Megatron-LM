@@ -19,7 +19,7 @@ python examples/data-processing/tokenize_shards.py \
 TOK_MODEL="https://allamllmuksstandard.blob.core.windows.net/llm-data/MathPile/MathPile_tokenize_by_llama2-ve/tokenizer/tokenizer.model"
 TOK_TYPE="Llama2Tokenizer"
 INPUT_FOLDER_PATH="https://allamllmuksstandard.blob.core.windows.net/llm-data/MathPile/mathpile_merged_shards/"
-BIN_IDX_PATH="https://allamllmuksstandard.blob.core.windows.net/llm-data/MathPile/MathPile_tokenize_by_v5tok.improved/meglm_tok_v5_improved_bin_idx/"
+BIN_IDX_PATH="https://allamllmuksstandard.blob.core.windows.net/llm-data/MathPile/MathPile_tokenize_by_llama2-ve/meglm_llama2-ve_bin_idx/"
 AZJOB_FILE="examples/data-processing/az_templates/template_nemo_tokenize.yaml"
 MATCHING_PREFIX_NAME=""
 
