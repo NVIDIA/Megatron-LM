@@ -47,9 +47,9 @@ TRAINING_ARGS=(
     --no-initialization
     --no-load-optim
     --no-load-rng
-    --micro-batch-size 1 
+    --micro-batch-size 2 
     --global-batch-size 1024
-    --train-iters 55_000
+    --train-iters 200_000
     --weight-decay 0.1 
     --adam-beta1 0.9 
     --adam-beta2 0.95 
