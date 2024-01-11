@@ -402,8 +402,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
         if config.window_size is not None:
             # Check version
-            assert (
-                te_version >= packaging.version.Version("1.2.0")
+            assert te_version >= packaging.version.Version(
+                "1.2.0"
             ), f"Transformer-Engine version ({str(te_version)}) must be >= 1.2.0 to support sliding window attention."
             extra_kwargs['window_size'] = config.window_size
 
