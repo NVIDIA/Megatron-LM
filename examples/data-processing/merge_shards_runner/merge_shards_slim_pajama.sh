@@ -28,15 +28,13 @@ python examples/data-processing/sample_json_data_from_meta.py \
 cd $PATH_TO_SLIM_PAJAMA/data_by_domain
 mkdir -p ../merged_shards
 
-split --line-bytes=85G --additional-suffix=.jsonl -d -a 4 RedPajamaC4.jsonl ../merged_shards/RedPajamaC4_
-split --line-bytes=85G --additional-suffix=.jsonl -d -a 4 RedPajamaStackExchange.jsonl ../merged_shards/RedPajamaStackExchange_
-split --line-bytes=70G --additional-suffix=.jsonl -d -a 4 RedPajamaGithub.jsonl ../merged_shards/RedPajamaGithub_
-split --line-bytes=70G --additional-suffix=.jsonl -d -a 4 RedPajamaWikipedia.jsonl ../merged_shards/RedPajamaWikipedia_
-split --line-bytes=70G --additional-suffix=.jsonl -d -a 4 RedPajamaBook.jsonl ../merged_shards/RedPajamaBook_
-split --line-bytes=85G --additional-suffix=.jsonl -d -a 4 RedPajamaCommonCrawl.jsonl ../merged_shards/RedPajamaCommonCrawl_
-split --line-bytes=85G --additional-suffix=.jsonl -d -a 4 RedPajamaArXiv.jsonl ../merged_shards/RedPajamaArXiv_
-
-# cp RedPajamaArXiv.jsonl $PATH_TO_SLIM_PAJAMA/merged_shards/RedPajamaArXiv_0000.jsonl
+split --line-bytes=85G --additional-suffix=.jsonl -d -a 4 RedPajamaC4.jsonl ../merged_shards/en_SlimPajamaC4_
+split --line-bytes=85G --additional-suffix=.jsonl -d -a 4 RedPajamaStackExchange.jsonl ../merged_shards/en_SlimPajamaStackExchange_
+split --line-bytes=70G --additional-suffix=.jsonl -d -a 4 RedPajamaGithub.jsonl ../merged_shards/en_SlimPajamaGithub_
+split --line-bytes=70G --additional-suffix=.jsonl -d -a 4 RedPajamaWikipedia.jsonl ../merged_shards/en_SlimPajamaWikipedia_
+split --line-bytes=70G --additional-suffix=.jsonl -d -a 4 RedPajamaBook.jsonl ../merged_shards/en_SlimPajamaBook_
+split --line-bytes=85G --additional-suffix=.jsonl -d -a 4 RedPajamaCommonCrawl.jsonl ../merged_shards/en_SlimPajamaCommonCrawl_
+split --line-bytes=85G --additional-suffix=.jsonl -d -a 4 RedPajamaArXiv.jsonl ../merged_shards/en_SlimPajamaArXiv_
 
 cd $PATH_TO_SLIM_PAJAMA/merged_shards
 ls -l | awk '{print $9}' | xargs -I {} mv {} en_{}
