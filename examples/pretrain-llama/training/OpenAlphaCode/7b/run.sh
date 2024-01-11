@@ -34,8 +34,8 @@ LOGISTICS_ARGS=(
     --tokenizer-model $TOKENIZER_MODEL
     --split 100,0,0 
     --log-interval 100
-    --save-interval 1500 
-    --eval-interval 1500
+    --save-interval 5000 
+    --eval-interval 5000
     --eval-iters 0
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     --tensorboard-log-interval 100
@@ -63,6 +63,7 @@ TRAINING_ARGS=(
     --bf16
     --attention-dropout 0.0
     --hidden-dropout 0.0
+    --sequence-parallel
 )
 # --use-mcore-models
 

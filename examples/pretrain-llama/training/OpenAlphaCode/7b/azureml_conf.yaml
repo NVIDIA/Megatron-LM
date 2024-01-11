@@ -40,15 +40,15 @@ outputs:
   data_cache:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/OpenAlphaCode/paths/experiments/LLaMa2-7b-Reasoning-Data/cache
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/OpenAlphaCode/experiments/LLaMa2-7b-Reasoning/cache
   checkpoint_dir:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/OpenAlphaCode/paths/experiments/LLaMa2-7b-Reasoning-Data/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/OpenAlphaCode/experiments/LLaMa2-7b-Reasoning/
   tensorboard_dir:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/OpenAlphaCode/paths/experiments/LLaMa2-7b-Reasoning-Data/tensorboard
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/OpenAlphaCode/experiments/LLaMa2-7b-Reasoning/tensorboard
 
 services:
   my_jupyterlab:
