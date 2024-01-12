@@ -10,8 +10,8 @@ import importlib
 
 from .builder import get_default_compute_capabilities, OpBuilder
 import sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../../..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 
 # Do not remove, required for abstract accelerator to detect if we have a deepspeed or 3p op_builder
 __deepspeed__ = True
