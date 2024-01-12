@@ -88,6 +88,9 @@ def get_forward_backward_func():
 
     collect_non_loss_data (optional, bool, default=False): TODO
 
+    first_val_step (bool, optional): Is the first step of the validation phase. Used by
+        Transformer Engine modules to only update their fp8 weights only on the first validation step.
+
     """
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     if pipeline_model_parallel_size > 1:
@@ -158,6 +161,7 @@ def forward_step(
     checkpoint_activations_microbatch=None,
     is_first_microbatch=False,
 ):
+
     """Forward step for passed-in model.
 
     If first stage, input tensor is obtained from data_iterator, otherwise
