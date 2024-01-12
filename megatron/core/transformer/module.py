@@ -70,6 +70,12 @@ class MegatronModule(torch.nn.Module):
             dict: dictionary of state dict keys mapped to ShardedTensors
         """
         sharded_state_dict = {}
+        # Save parameters
+        self._save_to_state_dict(sharded_state_dict, '', keep_vars=True)
+        sharded_state_dict = make_sharded_tensors_for_checkpoint(
+            sharded_state_dict, prefix, sharded_offsets=sharded_offsets
+        )
+        # Recurse into submodules
         for name, module in self.named_children():
             sharded_state_dict.update(
                 sharded_state_dict_default(module, f'{prefix}{name}.', sharded_offsets)
