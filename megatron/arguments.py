@@ -1052,6 +1052,9 @@ def _add_checkpointing_args(parser):
                        help="If '--load' is set, but checkpoint is not found "
                        "(e.g., path typo), then exit instead of random "
                        "initialization.")
+    group.add_argument('--repadding-bucket-elements', action='store_true',
+                       help='Override any command line arguments with arguments '
+                       'from the checkpoint')
 
     return parser
 

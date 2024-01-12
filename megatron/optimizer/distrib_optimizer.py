@@ -749,12 +749,35 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
         data_parallel_group_gloo = mpu.get_data_parallel_group_gloo(with_context_parallel=True)
         data_parallel_global_ranks = list(mpu._DATA_PARALLEL_GLOBAL_RANKS_WITH_CP)
-
+        args=get_args()
         # Load on DP rank 0.
         if data_parallel_rank == 0:
             loaded_state = torch.load(filename)
             if "per_bucket_numel" in loaded_state:
                 per_bucket_numel_in_checkpoint = loaded_state["per_bucket_numel"]
+                if args.repadding_bucket_elements and self.per_bucket_numel != per_bucket_numel_in_checkpoint:
+                    print_rank_0(f"Number of elements in each bucket need to be the same in current run "
+                     f"({self.per_bucket_numel}) and checkpoint ({per_bucket_numel_in_checkpoint}), re-padding them...")
+                    # remove padding
+                    param_nopad=[tensor[tensor != 0] for tensor in loaded_state[0][torch.float32]['param']]
+                    exp_avg_nopad=[tensor[tensor != 0] for tensor in loaded_state[0][torch.float32]['exp_avg']]
+                    exp_avg_sq_nopad=[tensor[tensor != 0] for tensor in loaded_state[0][torch.float32]['exp_avg_sq']]
+                    # re padding
+                    loaded_state[0][torch.float32]['param'] = [torch.nn.functional.pad(tensor, (0, max_size - tensor.size(0)))
+                                    if tensor.size(0) < max_size else tensor
+                                    for tensor, max_size in zip(param_nopad, self.per_bucket_numel[0][torch.float32])]
+
+                    loaded_state[0][torch.float32]['exp_avg'] = [torch.nn.functional.pad(tensor, (0, max_size - tensor.size(0)))
+                                    if tensor.size(0) < max_size else tensor
+                                    for tensor, max_size in zip(exp_avg_nopad, self.per_bucket_numel[0][torch.float32])]
+
+                    loaded_state[0][torch.float32]['exp_avg_sq']=[torch.nn.functional.pad(tensor, (0, max_size - tensor.size(0)))
+                                    if tensor.size(0) < max_size else tensor
+                                    for tensor, max_size in zip(exp_avg_sq_nopad, self.per_bucket_numel[0][torch.float32])]
+                    # re assign
+                    loaded_state["per_bucket_numel"]=self.per_bucket_numel
+                    per_bucket_numel_in_checkpoint=self.per_bucket_numel
+
                 assert self.per_bucket_numel == per_bucket_numel_in_checkpoint, \
                     (f"Number of elements in each bucket need to be the same in current run "
                      f"({self.per_bucket_numel}) and checkpoint ({per_bucket_numel_in_checkpoint})")
