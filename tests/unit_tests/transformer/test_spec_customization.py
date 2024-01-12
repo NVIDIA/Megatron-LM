@@ -1,10 +1,13 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import sys
 from dataclasses import dataclass, fields
+from importlib.metadata import version
 
 import pytest
 import torch
 import transformer_engine as te
+from pkg_resources import packaging
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -15,12 +18,12 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
     TENorm,
     TERowParallelLinear,
 )
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module, import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
-from megatron.core.transformer.dot_product_attention import DotProductAttention
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -130,6 +133,13 @@ class TestSpecCustomization:
 
 
     def test_sliding_window_attention(self):
+        te_version = packaging.version.Version(version("transformer-engine"))
+        if te_version < packaging.version.Version(
+                "1.2.0"
+        ):
+           print("SWA not tested because TE version is not >= 1.2.0", file=sys.stderr)
+           return
+
         config = TransformerConfig(
             num_layers=2,
             hidden_size=12,
