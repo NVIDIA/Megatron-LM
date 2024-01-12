@@ -171,7 +171,7 @@ def validate_args(args, defaults={}):
     # If we use quantizer for weights or gradients, we need to use distributed optimizer.
     if args.quantized_weights or args.quantized_gradients:
         assert args.use_distributed_optimizer is True
-        print('using quantizaiton during training, bucket size = {}.'.format(args.quantized_bucket_size),
+        print('using quantizaiton during training, weight quantization group size = {}, gradient quantization group size = {}.'.format(args.wq_group_size, args.gq_group_size),
               flush=True)
         
     if args.overlap_param_gather:
@@ -1165,11 +1165,16 @@ def _add_quantize_args(parser):
     group = parser.add_argument_group(title='quantized training')
     group.add_argument('--quantized-weights', action='store_true',
                        help='Quantize weights before all gather distributed weights. Only effecitve with distributed optimizer')
+    group.add_argument('--weight-quantization-bits', type=int, default=4,
+                       help='Weight quantization bits, only support 8 and 4 bits.')
+    group.add_argument('--wq-group-size', type=int, default=2048,
+                       help='Group size for weight quantization.')
     group.add_argument('--quantized-gradients', action='store_true',
                        help='Quantize gradients before reduce scatter gradients. Only effecitve with distributed optimizer')
-    group.add_argument('--quantized-bucket-size', type=int, default=2048,
-                       help='Buckted size for quantization.')
-
+    group.add_argument('--gradeint-quantization-bits', type=int, default=8,
+                       help='Gradients quantization bits, only support 8 and 4 bits, 4 bits gradients may have an accuracy drop.')
+    group.add_argument('--gq-group-size', type=int, default=2048,
+                       help='Group size for gradient quantization.')
     return parser
 
 def _add_validation_args(parser):
