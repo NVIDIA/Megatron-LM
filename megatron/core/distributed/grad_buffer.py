@@ -3,10 +3,12 @@
 import math
 from logging import getLogger
 from typing import Dict, List
+from functools import reduce
 
 import torch
 
 from .. import parallel_state
+from ...quantization_helper import QuantizationHelper
 
 logger = getLogger(__name__)
 
@@ -51,6 +53,7 @@ class Bucket:
         data_parallel_world_size: int,
         overlap_grad_reduce: bool,
         use_distributed_optimizer: bool,
+        quantization_helper: QuantizationHelper,
     ):
         # State for bookkeeping: params is the set of parameters this bucket is
         # responsible for, params_with_grad is the set of parameters with grads
@@ -68,7 +71,7 @@ class Bucket:
         self.data_parallel_rank = torch.distributed.get_rank(group=data_parallel_group)
         self.overlap_grad_reduce = overlap_grad_reduce
         self.use_distributed_optimizer = use_distributed_optimizer
-
+        self.quantization_helper = quantization_helper
         self.reset()
 
     def reset(self):
@@ -173,6 +176,7 @@ class GradBuffer:
         param_to_name: Dict[torch.nn.Parameter, str],
         overlap_grad_reduce: bool,
         use_distributed_optimizer: bool,
+        quantization_helper = QuantizationHelper
     ):
 
         # Check that params are unique.
@@ -190,6 +194,7 @@ class GradBuffer:
         )
         self.overlap_grad_reduce = overlap_grad_reduce
         self.use_distributed_optimizer = use_distributed_optimizer
+        self.quantization_helper = quantization_helper
         self.is_last_microbatch = True
 
         # Data structures to store underlying buckets and relevant indexing data.
@@ -197,7 +202,27 @@ class GradBuffer:
         self.param_to_bucket = {}  # Param -> bucket mapping.
         self.param_index_map = {}  # Param -> location in buffer mapping (used in dist. optimizer).
 
+
+
         def _pad_if_needed(data_index: int):
+            bucket_size_divisible_by = 1
+            if use_distributed_optimizer and quantization_helper is not None and (quantization_helper.quantized_weights or quantization_helper.quantized_gradients):
+                def least_common_multiple(divisors):
+                    """Find least common multiple of a list of numbers."""
+                    lcm_value = reduce(lambda x, y: x * y // math.gcd(x, y), divisors)
+                    return lcm_value
+                weight_quantization_pad = 1
+                gradient_quantization_pad = 1
+                if quantization_helper.quantized_weights:
+                    # Qantized weight requires the number of weights be a multiple of 8
+                    weight_quantization_pad = quantization_helper.wq_group_size * 8
+                if quantization_helper.quantized_gradients:
+                    gradient_quantization_pad = quantization_helper.gq_group_size
+                bucket_size_divisible_by = least_common_multiple([weight_quantization_pad, gradient_quantization_pad]) * self.data_parallel_world_size
+                return (
+                    int(math.ceil(data_index / bucket_size_divisible_by))
+                    * bucket_size_divisible_by
+                )
             """Pads data indices if using distributed optimizer (to ensure uniform sharding)."""
             if use_distributed_optimizer:
                 return (
@@ -352,6 +377,7 @@ class GradBuffer:
             data_parallel_world_size=self.data_parallel_world_size,
             overlap_grad_reduce=self.overlap_grad_reduce,
             use_distributed_optimizer=self.use_distributed_optimizer,
+            quantization_helper=self.quantization_helper,
         )
         self.buckets.append(bucket)
         for bucket_param in bucket_params:

@@ -48,7 +48,7 @@ from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
-
+from .quantization_helper import QuantizationHelper
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -323,6 +323,15 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if args.fp16 or args.bf16:
         model = [Float16Module(model_module, args) for model_module in model]
 
+    quantize_helper = None
+    if args.quantized_weights or args.quantized_gradients:
+        quantize_helper = QuantizationHelper(quantized_weights=args.quantized_weights, 
+                                                    weight_quantization_bits=args.weight_quantization_bits, 
+                                                    wq_group_size=args.wq_group_size, 
+                                                    quantized_gradients=args.quantized_gradients, 
+                                                    gradeint_quantization_bits=args.gradeint_quantization_bits,
+                                                    gq_group_size=args.gq_group_size)
+
     if wrap_with_ddp:
         config = get_model_config(model[0])
         model = [DDP(config,
@@ -333,7 +342,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                      use_distributed_optimizer=args.use_distributed_optimizer,
                      # Turn off bucketing for model_chunk 2 onwards, since communication for these
                      # model chunks is overlapped with compute anyway.
-                     disable_bucketing=(model_chunk_idx > 0))
+                     disable_bucketing=(model_chunk_idx > 0),
+                     quantization_helper=quantize_helper)
                  for (model_chunk_idx, model_chunk) in enumerate(model)]
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
