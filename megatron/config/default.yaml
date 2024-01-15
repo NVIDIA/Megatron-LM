@@ -1,0 +1,11 @@
+enable_one_logger: True
+
+wandb:
+  host: https://api.wandb.ai
+  api_key: ${oc.env:WANDB_API_KEY}
+  entity: zshao
+  project: MNIST
+  name: one-logger-megatron-test
+  tags:
+    - e2e_metrics_enabled
+    - e2e_metrics_testing
