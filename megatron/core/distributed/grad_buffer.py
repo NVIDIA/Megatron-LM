@@ -98,6 +98,10 @@ class Bucket:
             stream = torch.cuda.Stream()
         else:
             stream = torch.cuda.default_stream()
+        
+        event = torch.cuda.Event()
+        self.communication_event = event
+        self.communication_issued = True
         with torch.cuda.stream(stream):
             self.data /= self.data_parallel_world_size
             # Use async_op only when overlap_grad_reduce is True.
@@ -105,20 +109,20 @@ class Bucket:
                 local_data_view = shard_buffer(self.data, self.data_parallel_world_size)[
                     self.data_parallel_rank
                 ]
-                torch.distributed._reduce_scatter_base(
-                    local_data_view,
-                    self.data,
-                    group=self.data_parallel_group,
-                    async_op=False,
-                )
+                if self.quantization_helper and self.quantization_helper.quantized_gradients:
+                    local_data_view.copy_(self.quantization_helper.quantize_reduce_gradients(self.data))
+                else:
+                    torch.distributed._reduce_scatter_base(
+                        local_data_view,
+                        self.data,
+                        group=self.data_parallel_group,
+                        async_op=False,
+                    )
             else:
                 torch.distributed.all_reduce(
                     self.data, group=self.data_parallel_group, async_op=False
                 )
-            event = torch.cuda.Event()
             event.record()
-            self.communication_event = event
-            self.communication_issued = True
         if not self.overlap_grad_reduce:
             self.communication_event.synchronize()
             self.communication_event = None
