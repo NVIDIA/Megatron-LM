@@ -888,12 +888,25 @@ def get_context_parallel_rank():
 
 
 def get_expert_model_parallel_world_size():
-    """Return my rank for the expert parallel group"""
+    """Return world size for the expert model parallel group"""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         tensor_and_expert_parallel_world_size = torch.distributed.get_world_size(
             group=get_tensor_and_expert_parallel_group()
         )
         return tensor_and_expert_parallel_world_size // get_tensor_model_parallel_world_size()
+    else:
+        return 0
+
+
+def get_tensor_and_expert_parallel_world_size():
+    """Return world size for the expert model parallel group times model parallel group.
+       Currently, each expert will also be distributed across TP group by default.
+    """
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        tensor_and_expert_parallel_world_size = torch.distributed.get_world_size(
+            group=get_tensor_and_expert_parallel_group()
+        )
+        return tensor_and_expert_parallel_world_size
     else:
         return 0
 

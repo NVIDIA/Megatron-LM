@@ -291,6 +291,11 @@ def validate_args(args, defaults={}):
         assert args.fp16 or args.bf16, \
             'residual connection in fp32 only supported when using fp16 or bf16.'
 
+    if args.moe_grouped_gemm:
+        assert args.bf16, 'Currently GroupedGEMM for MoE only supports bf16 dtype.'
+        dc = torch.cuda.get_device_capability()
+        assert dc[0] >= 8, "Unsupported compute capability for GroupedGEMM kernels."
+
     if args.weight_decay_incr_style == 'constant':
         assert args.start_weight_decay is None
         assert args.end_weight_decay is None
@@ -652,6 +657,12 @@ def _add_network_size_args(parser):
                        dest='bert_binary_head')
     group.add_argument('--num-experts', type=int, default=None,
                        help='Number of Experts in Switch Transformer (None means no Switch)')
+    group.add_argument('--moe-grouped-gemm', action='store_true',
+                       help='When there are multiple experts per rank, compress '
+                       'multiple local (potentially small) gemms in a single kernel '
+                       'launch to improve the utilization and performance by '
+                       'leveraging the Grouped GEMM feature introduced since '
+                       'CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).')
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
                        help='Untie embeddings and output weights.'),
     return parser

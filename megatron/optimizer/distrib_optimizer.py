@@ -388,9 +388,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Model grad buffer ranges.
         self.model_gbuf_ranges = []
         self.per_bucket_numel = []
+        self.per_bucket_numel_unpadded = []
         for _, model_chunk in enumerate(self.models):
             self.per_bucket_numel.append(
                 {dtype: [bucket.data.numel() for bucket in model_chunk.grad_buffers[dtype].buckets]
+                 for dtype in model_chunk.grad_buffers})
+            self.per_bucket_numel_unpadded.append(
+                {dtype: [bucket.numel_unpadded for bucket in model_chunk.grad_buffers[dtype].buckets]
                  for dtype in model_chunk.grad_buffers})
             self.model_gbuf_ranges.append(self.build_model_gbuf_range_map(model_chunk))
         self.model_param_gbuf_map = \
@@ -654,7 +658,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_global_ranks = list(mpu._DATA_PARALLEL_GLOBAL_RANKS_WITH_CP)
 
         # Collect param states.
-        state = {"per_bucket_numel": self.per_bucket_numel}
+        state = {"per_bucket_numel": self.per_bucket_numel,
+                 "per_bucket_numel_unpadded": self.per_bucket_numel_unpadded}
         for model_idx, gbuf_range_maps in enumerate(self.model_gbuf_ranges):
 
             # Iterate grad buffers (by data type).
@@ -753,11 +758,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Load on DP rank 0.
         if data_parallel_rank == 0:
             loaded_state = torch.load(filename)
-            if "per_bucket_numel" in loaded_state:
-                per_bucket_numel_in_checkpoint = loaded_state["per_bucket_numel"]
-                assert self.per_bucket_numel == per_bucket_numel_in_checkpoint, \
-                    (f"Number of elements in each bucket need to be the same in current run "
-                     f"({self.per_bucket_numel}) and checkpoint ({per_bucket_numel_in_checkpoint})")
+            if "per_bucket_numel_unpadded" in loaded_state:
+                per_bucket_numel_unpadded_in_checkpoint = loaded_state["per_bucket_numel_unpadded"]
+                assert self.per_bucket_numel_unpadded == per_bucket_numel_unpadded_in_checkpoint, \
+                    (f"Number of unpadded elements in each bucket need to be the same in current run "
+                     f"({self.per_bucket_numel_unpadded}) and checkpoint "
+                     f"({per_bucket_numel_unpadded_in_checkpoint})")
 
         # Scatter tensors to all DP ranks.
         for model_idx, gbuf_range_maps in enumerate(self.model_gbuf_ranges):
@@ -767,6 +773,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     # Compute local DP contiguous shard's size.
                     model = self.models[model_idx]
                     gbuf_world_numel = model.grad_buffers[dtype].buckets[bucket_idx].data.numel()
+                    assert gbuf_world_numel == self.per_bucket_numel[model_idx][dtype][bucket_idx]
                     assert gbuf_world_numel % data_parallel_world_size == 0
                     gbuf_local_numel = gbuf_world_numel // data_parallel_world_size
 
@@ -788,7 +795,35 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 (f"Trying to load state for bucket_id {bucket_idx} (out of "
                                  f"{len(gbuf_range_map_for_all_buckets)} buckets) from checkpoint; "
                                  f"checkpoint only has {len(world_tensor_for_all_buckets)} bucket(s)")
+                            # This tensor might be bigger or smaller than expected (depending on
+                            # relative sizes of per_bucket_numel_in_checkpoint and self.per_bucket_numel).
                             world_tensor = world_tensor_for_all_buckets[bucket_idx]
+                            if "per_bucket_numel" in loaded_state:
+                                numel_in_checkpoint = \
+                                    loaded_state["per_bucket_numel"][model_idx][dtype][bucket_idx]
+                                numel = self.per_bucket_numel[model_idx][dtype][bucket_idx]
+                                numel_unpadded = self.per_bucket_numel_unpadded[model_idx][dtype][bucket_idx]
+                                assert world_tensor.numel() == numel_in_checkpoint
+                                assert numel_unpadded <= world_tensor.numel(), \
+                                    ("True number of elements should be fewer than number of elements in "
+                                     "checkpoint tensor")
+                                if world_tensor.numel() > numel:
+                                    # Truncate extra values, which are padding anyway.
+                                    print_rank_0(f"Truncating extra values from checkpoint (numel_in_checkpoint={numel_in_checkpoint}, "
+                                                 f"numel={numel}, numel_unpadded={numel_unpadded})")
+                                    world_tensor = world_tensor[:numel]
+                                elif world_tensor.numel() < numel:
+                                    # In this case, numel > world_tensor.numel() (which is numel_in_checkpoint).
+                                    # Create new tensor with right number of values, then copy and use new tensor.
+                                    print_rank_0(f"Expanding tensor from checkpoint (numel_in_checkpoint={numel_in_checkpoint}, "
+                                                 f"numel={numel}, numel_unpadded={numel_unpadded})")
+                                    world_tensor_reshaped = torch.empty((numel,),
+                                                                        dtype=world_tensor.dtype,
+                                                                        device=world_tensor.device)
+                                    world_tensor_reshaped[:numel_in_checkpoint].copy_(world_tensor)
+                                    world_tensor = world_tensor_reshaped
+                            else:
+                                print_rank_0("***WARNING*** Using older checkpoint so skipping padding checks")
                             gbuf_start_idxs = \
                                 list(range(0, gbuf_world_numel, gbuf_local_numel))
                             send_tensors = [world_tensor[i:(i+gbuf_local_numel)]
