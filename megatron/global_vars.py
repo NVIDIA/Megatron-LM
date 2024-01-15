@@ -17,6 +17,7 @@ _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
 _GLOBAL_TOKENIZER = None
 _GLOBAL_TENSORBOARD_WRITER = None
 _GLOBAL_WANDB_WRITER = None
+_GLOBAL_ONE_LOGGER = None
 _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
 _GLOBAL_SIGNAL_HANDLER = None
@@ -63,6 +64,12 @@ def get_wandb_writer():
     return _GLOBAL_WANDB_WRITER
 
 
+def get_one_logger():
+    """Return one logger. It can be None so no need
+    to check if it is initialized."""
+    return _GLOBAL_ONE_LOGGER
+
+
 def get_adlr_autoresume():
     """ADLR autoresume object. It can be None so no need
     to check if it is initialized."""
@@ -100,6 +107,7 @@ def set_global_variables(args, build_tokenizer=True):
         _ = _build_tokenizer(args)
     _set_tensorboard_writer(args)
     _set_wandb_writer(args)
+    _set_one_logger(args)
     _set_adlr_autoresume(args)
     _set_timers(args)
 
@@ -183,6 +191,16 @@ def _set_wandb_writer(args):
         os.makedirs(wandb_kwargs['dir'], exist_ok=True)
         wandb.init(**wandb_kwargs)
         _GLOBAL_WANDB_WRITER = wandb
+
+
+def _set_one_logger(args):
+    global _GLOBAL_ONE_LOGGER
+    _ensure_var_is_not_initialized(_GLOBAL_ONE_LOGGER, 'one logger')
+
+    if args.enable_onelogger and args.rank == (args.world_size - 1):
+        from one_logger.core import OneLogger
+        one_logger = OneLogger()
+        _GLOBAL_ONE_LOGGER = one_logger
 
 
 def _set_adlr_autoresume(args):

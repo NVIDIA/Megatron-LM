@@ -38,6 +38,7 @@ class BlendedMegatronDatasetBuilder(object):
         self.cls = cls
         self.sizes = sizes
         self.config = config
+        self.config.path_to_cache = '/lustre/fsw/portfolios/hwinf/users/zshao/onelogger-test/Megatron-LM/data_cache'
 
     def build(self) -> List[Optional[Union[BlendedDataset, MegatronDataset]]]:
         """Build all dataset splits according to the provided blend(s)

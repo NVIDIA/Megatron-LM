@@ -722,6 +722,8 @@ def _add_logging_args(parser):
                        help='The wandb experiment name.')
     group.add_argument('--wandb-save-dir', type=str, default='',
                        help='Path to save the wandb results locally.')
+    group.add_argument('--enable-onelogger', action='store_false',
+                       help='If set, use one_logger to track e2e metrics')
     return parser
 
 
