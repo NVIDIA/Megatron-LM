@@ -21,6 +21,7 @@ from megatron import get_signal_handler
 from megatron import get_timers
 from megatron import get_tensorboard_writer
 from megatron import get_wandb_writer
+from megatron import get_one_logger
 from megatron import get_current_global_batch_size
 from megatron import get_num_microbatches
 from megatron import is_last_rank
@@ -135,10 +136,17 @@ def pretrain(train_valid_test_dataset_provider,
     args = get_args()
     timers = get_timers()
 
+    one_logger = get_one_logger()
+    if one_logger:
+        one_logger.log_metrics({
+            'train_iterations_warmup': args.lr_warmup_iters,
+        })
+
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
         model_provider, model_type)
+
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate '
                    'scheduler are built')
@@ -206,6 +214,7 @@ def pretrain(train_valid_test_dataset_provider,
                                    test_data_iterator, model,
                                    iteration, process_non_loss_data_func, config,
                                    verbose=True, write_to_tensorboard=not args.skip_train)
+
 
 
 def update_train_iters(args):
@@ -650,6 +659,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     if iteration % args.log_interval == 0:
         elapsed_time = timers('interval-time').elapsed(barrier=True)
         elapsed_time_per_iteration = elapsed_time / total_iterations
+
         throughput = num_floating_point_operations(args, batch_size) / (
             elapsed_time_per_iteration * 10**12 * args.world_size)
         if args.log_timers_to_tensorboard:
@@ -738,6 +748,17 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
     # Iterations.
     iteration = args.iteration
+    one_logger = get_one_logger()
+    if one_logger:
+        iteration_start = iteration
+        train_samples_start = args.consumed_train_samples
+        train_samples_target = args.train_samples
+        one_logger.log_metrics({
+            'train_iterations_start': iteration,
+            'train_samples_start': args.consumed_train_samples,
+            'train_samples_target': train_samples_target,
+            'train_iterations_target': args.train_iters,
+        })
 
     # Setup some training config params
     config.grad_scale_func = optimizer.scale_loss
@@ -774,6 +795,29 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         gc.collect()
 
     num_microbatches = get_num_microbatches()
+    eval_duration = 0.0
+    eval_iterations = 0
+    def track_e2e_metrics():
+        # Nested function to track a bunch of E2E APP metrics
+        if one_logger:
+            train_duration = timers('interval-time').active_time()  # overall_elapsed
+            train_samples = args.consumed_train_samples - train_samples_start
+            train_iterations = iteration - iteration_start
+            train_iterations_time_msecs_avg = train_duration*1000.0 / train_iterations
+            if eval_iterations:
+                validation_iterations_time_msecs_avg = eval_duration*1000.0 / eval_iterations
+            else:
+                validation_iterations_time_msecs_avg = None
+
+            one_logger.log_metrics({
+                'train_iterations_end': iteration,
+                'train_samples_end': args.consumed_train_samples,
+                'train_iterations': train_iterations,
+                'train_samples': train_samples,
+                'train_iterations_time_msecs_avg': train_iterations_time_msecs_avg,
+                'validation_iterations_time_msecs_avg': validation_iterations_time_msecs_avg
+            })
+
     while iteration < args.train_iters:
         if args.profile and \
            iteration == args.profile_step_start and \
@@ -818,6 +862,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                           report_memory_flag, skipped_iter,
                                           grad_norm, params_norm, num_zeros_in_grad)
 
+        if iteration % args.log_interval == 0:
+            track_e2e_metrics()
+
         # Autoresume
         if args.adlr_autoresume and \
            (iteration % args.adlr_autoresume_interval == 0):
@@ -832,10 +879,14 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 # Collect all objects.
                 gc.collect()
             prefix = 'iteration {}'.format(iteration)
+            timers('eval-time', log_level=0).start(barrier=True)
             evaluate_and_print_results(prefix, forward_step_func,
                                        valid_data_iterator, model,
                                        iteration, process_non_loss_data_func,
                                        config, False)
+            eval_duration += timers('eval-time').elapsed()
+            eval_iterations += args.eval_iters
+            timers('eval-time').stop()
             if args.manual_gc and args.manual_gc_eval:
                 # Collect only the objects created and used in evaluation.
                 gc.collect(generation=0)
@@ -895,6 +946,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if args.manual_gc:
             if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:
                 gc.collect()
+
+    track_e2e_metrics()
 
     # Flush TensorBoard and WandB writers.
     writer = get_tensorboard_writer()
