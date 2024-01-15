@@ -79,7 +79,7 @@ class Bucket:
         Reset metadata in bucket in preparation for the next iteration of training.
         """
         self.params_with_grad = set()
-        self.communication_handle = None
+        self.communication_event: torch.cuda.Event = None
         self.communication_issued = False
 
     def start_grad_sync(self):
@@ -92,26 +92,36 @@ class Bucket:
         synchronous call.
         """
         assert (
-            self.communication_handle is None and not self.communication_issued
+            self.communication_event is None and not self.communication_issued
         ), 'Should not have multiple communication calls in flight at once'
-
-        self.data /= self.data_parallel_world_size
-        # Use async_op only when overlap_grad_reduce is True.
-        if self.use_distributed_optimizer:
-            local_data_view = shard_buffer(self.data, self.data_parallel_world_size)[
-                self.data_parallel_rank
-            ]
-            self.communication_handle = torch.distributed._reduce_scatter_base(
-                local_data_view,
-                self.data,
-                group=self.data_parallel_group,
-                async_op=self.overlap_grad_reduce,
-            )
+        if self.overlap_grad_reduce:
+            stream = torch.cuda.Stream()
         else:
-            self.communication_handle = torch.distributed.all_reduce(
-                self.data, group=self.data_parallel_group, async_op=self.overlap_grad_reduce
-            )
-        self.communication_issued = True
+            stream = torch.cuda.default_stream()
+        with torch.cuda.stream(stream):
+            self.data /= self.data_parallel_world_size
+            # Use async_op only when overlap_grad_reduce is True.
+            if self.use_distributed_optimizer:
+                local_data_view = shard_buffer(self.data, self.data_parallel_world_size)[
+                    self.data_parallel_rank
+                ]
+                torch.distributed._reduce_scatter_base(
+                    local_data_view,
+                    self.data,
+                    group=self.data_parallel_group,
+                    async_op=False,
+                )
+            else:
+                torch.distributed.all_reduce(
+                    self.data, group=self.data_parallel_group, async_op=False
+                )
+            event = torch.cuda.Event()
+            event.record()
+            self.communication_event = event
+            self.communication_issued = True
+        if not self.overlap_grad_reduce:
+            self.communication_event.synchronize()
+            self.communication_event = None
 
     def finish_grad_sync(self):
         """
@@ -125,11 +135,12 @@ class Bucket:
         if not self.overlap_grad_reduce:
             self.start_grad_sync()
             return
-        assert self.communication_handle is not None and self.communication_issued, (
+        assert self.communication_event is not None and self.communication_issued, (
             f'Communication call has not been issued for this bucket '
             f'({len(self.params_with_grad)}/{len(self.params)} params have grad available)'
         )
-        self.communication_handle.wait()
+        self.communication_event.synchronize()
+        self.communication_event = None
 
     def register_grad_ready(self, param: torch.nn.Parameter):
         """
