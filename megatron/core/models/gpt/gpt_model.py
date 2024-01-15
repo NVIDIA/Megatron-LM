@@ -216,7 +216,7 @@ class GPTModel(LanguageModule):
                     last_stage_word_emb_replica_id = (
                         1,  # copy of first stage embedding
                         0,
-                        parallel_state.get_data_parallel_rank(),
+                        parallel_state.get_data_parallel_rank(with_context_parallel=True),
                     )
 
                     sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(

@@ -14,8 +14,7 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.models.gpt.gpt_layer_specs import \
-    get_gpt_layer_with_transformer_engine_spec as gpt_te_spec, get_gpt_layer_local_spec as gpt_local_spec, \
-    gpt_layer_with_transformer_engine_spec_moe, gpt_layer_local_spec_moe
+    get_gpt_layer_with_transformer_engine_spec as gpt_te_spec, get_gpt_layer_local_spec as gpt_local_spec
 
 
 def initialize_gpt_model(seed, layer_spec_fn=gpt_te_spec, **config_kwargs):
