@@ -72,24 +72,6 @@ class Router(ABC, MegatronModule):
         """
         raise NotImplementedError("Routing function not implemented.")
 
-    def apply_input_jitter(self, input: torch.Tensor, eps: float = 1e-2):
-        """Add noise to the input tensor.
-        Refer to https://arxiv.org/abs/2101.03961.
-
-        Args:
-            input (Tensor): Input tensor.
-            eps (float, optional): Defaults to 1e-2.
-
-        Returns:
-            Tensor: Jittered input.
-        """
-        if self.input_jitter is None:
-            self.input_jitter = torch.distributions.uniform.Uniform(
-                torch.tensor(1.0 - eps, device=input.device),
-                torch.tensor(1.0 + eps, device=input.device),
-            ).rsample
-        return input * self.input_jitter(input.shape)
-
     def forward(self, input: torch.Tensor):
         """
         Forward pass of the router.
@@ -185,8 +167,8 @@ class MoETokenDispatcher:
             scores (torch.Tensor): Each token's score with each expert.
             indices (torch.Tensor): The indices used to reorder the expert output.
 
-        Returns:
-        None
+        Returns: 
+            (torch.Tensor, torch.Tensor): Unpermuted activation and optional bias.            
         """
         raise NotImplementedError("Restore function not implemented.")
 

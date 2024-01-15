@@ -25,6 +25,13 @@ class BaseMoELayer(MegatronModule, ABC):
         self.config = config
         self.expert_parallel_size = parallel_state.get_expert_model_parallel_world_size()
         assert self.config.num_moe_experts % self.expert_parallel_size == 0
+        self.num_local_experts = self.config.num_moe_experts // self.expert_parallel_size
+        local_expert_indices_offset = (
+            parallel_state.get_expert_model_parallel_rank() * self.num_local_experts
+        )
+        self.local_expert_indices = [
+            local_expert_indices_offset + i for i in range(self.num_local_experts)
+        ]
         self.router = None
         self.experts = None
 
@@ -52,13 +59,6 @@ class DroplessMoELayer(BaseMoELayer):
     def __init__(self, config: TransformerConfig, submodules: MLPSubmodules = None):
         self.submodules = submodules
         super(DroplessMoELayer, self).__init__(config=config)
-        self.num_local_experts = self.config.num_moe_experts // self.expert_parallel_size
-        local_expert_indices_offset = (
-            parallel_state.get_expert_model_parallel_rank() * self.num_local_experts
-        )
-        self.local_expert_indices = [
-            local_expert_indices_offset + i for i in range(self.num_local_experts)
-        ]
         self.router = self.initialize_router()
         self.experts = self.initialize_experts()
         assert config.moe_token_dropping is False
