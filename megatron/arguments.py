@@ -403,7 +403,7 @@ def validate_args(args, defaults={}):
         assert args.num_experts % args.expert_model_parallel_size == 0, \
             "Number of experts should be a multiple of expert model parallel_size."
         assert not args.use_distributed_optimizer, \
-            "Expert parallelism is not suppored with distributed optimizer."
+            "Expert parallelism is not supported with distributed optimizer."
         assert not args.fp16, \
             "Expert parallelism is not supported with fp16 training."
         if args.tensor_model_parallel_size > 1:
