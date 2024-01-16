@@ -400,6 +400,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 self.config.context_parallel_size == 1
             ), "Only Transformer-Engine version >= 1.0.0 supports context parallelism!"
 
+        if config.window_size is not None:
+            # Check version
+            assert te_version >= packaging.version.Version(
+                "1.2.0"
+            ), f"Transformer-Engine version ({str(te_version)}) must be >= 1.2.0 to support sliding window attention."
+            extra_kwargs['window_size'] = config.window_size
+
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
             kv_channels=self.config.kv_channels,

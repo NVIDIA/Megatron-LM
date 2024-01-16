@@ -2,7 +2,7 @@
 
 import types
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -53,6 +53,7 @@ class TransformerConfig(ModelParallelConfig):
             fp8_wgrad (bool): When set to False, override FP8 config options and do the wgrad computation in higher precision. Defaults to True.
             clone_scatter_output_in_embedding (bool): When set to true, clone the output of scatter_to_sequence_parallel_region in embedding layer to facilitate garbage collection of input.
             normalization (str): Swtich b/w `LayerNorm` and `RMSNorm` as normalization layers. For now, these are primarily used by Transformer-Engine's layers like `LayerNormLinear`. Default value is `LayerNorm`.
+            window_size ((int,int) or None): If not None, then will use sliding window attention. The size of the window is specified by the numbers inside the tuple; -1 is special value meaning "infinite window size".
             moe_grouped_gemm (bool): When there are multiple experts per rank, compress multiple local (potentially small)
             gemms in a single kernel launch to improve the utilization and performance by leveraging the Grouped GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
     """
@@ -76,6 +77,7 @@ class TransformerConfig(ModelParallelConfig):
     gated_linear_unit: bool = False
     activation_func: Callable = F.gelu
     num_moe_experts: int = None
+    window_size: Optional[Tuple[int, int]] = None
 
     # initialization
     init_method: Callable = None
