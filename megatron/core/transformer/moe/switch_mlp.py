@@ -24,9 +24,6 @@ class SwitchMLP(MegatronModule):
             self.local_experts.append(expert)
 
     def forward(self, permuted_local_hidden_states, tokens_per_expert):
-        # global_hidden_states, global_indices = self.token_permutation(hidden_states)
-        # permuted_local_hidden_states, tokens_per_expert = self.token_permutation(hidden_states)
-
         output_local = torch.zeros_like(permuted_local_hidden_states)
         output_bias_local = None
         if self.add_bias:
@@ -46,8 +43,5 @@ class SwitchMLP(MegatronModule):
             if self.add_bias:
                 output_bias = output_bias.expand_as(output)
                 output_bias_local[start:end, :] = output_bias
-
-        # Un-permutation of tokens.
-        # output_total, output_bias_total = self.token_unpermutation(output_local, output_bias_local)
 
         return output_local, output_bias_local

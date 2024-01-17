@@ -92,24 +92,21 @@ class DroplessMoELayer(BaseMoELayer):
         return experts
 
     def initialize_router(self):
+        routing_type = None
         if self.config.moe_router_type.lower().startswith("top"):
             k = int(self.config.moe_router_type[3:])
-            router = DroplessTopKRouter(
-                self.num_local_experts,
-                self.local_expert_indices,
-                k=k,
-                routing_type="top",
-                config=self.config,
-            )
+            routing_type = "top"
         elif self.config.moe_router_type.lower().startswith("sinkhorn"):
             k = int(self.config.moe_router_type[8:])
-            router = DroplessTopKRouter(
-                self.num_local_experts,
-                self.local_expert_indices,
-                k=k,
-                routing_type="sinkhorn",
-                config=self.config,
-            )
+            routing_type = "sinkhorn"
         else:
             raise NotImplementedError(f"Routing method {self.config.moe_router_type} not supported")
+
+        router = DroplessTopKRouter(
+            self.num_local_experts,
+            self.local_expert_indices,
+            k=k,
+            routing_type=routing_type,
+            config=self.config,
+        )
         return router

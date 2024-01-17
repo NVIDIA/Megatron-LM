@@ -126,9 +126,6 @@ class GroupedMLP(MegatronModule):
         setattr(self.weight2, 'allreduce', not self.expert_parallel)
 
     def forward(self, permuted_local_hidden_states, tokens_per_expert):
-        # Permutation of tokens
-        # permuted_local_hidden_states, tokens_per_expert = self.token_permutation(hidden_states)
-
         # Reshape the weights for the grouped GEMMs.
         w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
         w2 = self.weight2.view(self.num_local_experts, -1, self.config.hidden_size)
@@ -138,8 +135,5 @@ class GroupedMLP(MegatronModule):
         intermediate_parallel = self.activation_func(fc1_output)
 
         fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
-
-        # Un-permutation of tokens.
-        # output_total, _ = self.token_unpermutation(fc2_output)
 
         return fc2_output, None
