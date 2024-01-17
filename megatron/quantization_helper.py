@@ -83,14 +83,14 @@ class QuantizationHelper:
         )
         intra_idx = int(this_rank / local_world_size)
         inter_idx = this_rank % local_world_size
-        print(f"global world size: {global_world_size}, local_world_size: {local_world_size}, num_nodes: {num_nodes}, intra quant group: {intra_quant_group}, rank: {this_rank},  intra_idx: {intra_idx}, inter_idx: {inter_idx}")
+        # print(f"global world size: {global_world_size}, local_world_size: {local_world_size}, num_nodes: {num_nodes}, intra quant group: {intra_quant_group}, rank: {this_rank},  intra_idx: {intra_idx}, inter_idx: {inter_idx}")
 
         quantizer_module = self.gradient_quantization_module
 
         first_quant, intra_q_scales = quantizer_module.swizzle_quant(tensor, intra_quant_group, self.gradeint_quantization_bits,
                                                                             quantizer_module.Symmetric, 1, num_nodes,
                                                                             local_world_size)
-        print(f"tensor shape: {tensor.shape}, intra_quant_int4 shape: {first_quant.shape}, intra_quant_type: {first_quant.dtype}, intra_q_scales shape: {intra_q_scales.shape}")
+        # print(f"tensor shape: {tensor.shape}, intra_quant_int4 shape: {first_quant.shape}, intra_quant_type: {first_quant.dtype}, intra_q_scales shape: {intra_q_scales.shape}")
 
         local_output = torch.empty_like(first_quant)
         scale_output = torch.empty_like(intra_q_scales)
