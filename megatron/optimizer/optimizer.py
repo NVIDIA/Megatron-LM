@@ -7,6 +7,7 @@ from abc import abstractmethod
 from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
 import torch
+import math
 
 from megatron import get_timers
 from megatron import print_rank_0
@@ -56,8 +57,7 @@ class MegatronOptimizer(ABC):
     def __init__(self, optimizer, clip_grad,
                  log_num_zeros_in_grad,
                  check_for_nan_in_grad,
-                 params_have_main_grad,
-                 models):
+                 params_have_main_grad):
 
         """Input optimizer is the base optimizer for example Adam."""
         self.optimizer = optimizer
@@ -67,10 +67,6 @@ class MegatronOptimizer(ABC):
         self.log_num_zeros_in_grad = log_num_zeros_in_grad
         self.check_for_nan_in_grad = check_for_nan_in_grad
         self.params_have_main_grad = params_have_main_grad
-
-        # 'models' are retained for access to the contiguous grad buffers.
-        # (see distributed optimizer)
-        self.models = models
 
 
     def get_parameters(self):
@@ -211,18 +207,15 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             use any loss scale. Note that for `bf16 = True`, we can have
             a constnat gradient scaler. Also for `bf16 = False`, we
             always require a grad scaler.
-        models: list of models (i.e., the virtual pipelining models). This
-            is used by the distributed optimizer for mapping parameters.
     """
 
     def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
                  check_for_nan_in_grad, params_have_main_grad,
-                 fp16, bf16, params_dtype, grad_scaler, models):
+                 fp16, bf16, params_dtype, grad_scaler):
 
         super().__init__(
             optimizer, clip_grad, log_num_zeros_in_grad,
-            check_for_nan_in_grad, params_have_main_grad,
-            models)
+            check_for_nan_in_grad, params_have_main_grad)
 
         self.fp16 = fp16
         self.bf16 = bf16
@@ -370,18 +363,16 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             use any loss scale. Note that for `bf16 = True`, we can have
             a constnat gradient scaler. Also for `bf16 = False`, we
             always require a grad scaler.
-        models: list of models (i.e., the virtual pipelining models). This
-            is used by the distributed optimizer for mapping parameters.
     """
 
     def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
                  check_for_nan_in_grad, params_have_main_grad, fp16, bf16,
-                 params_dtype, grad_scaler, models):
+                 params_dtype, grad_scaler):
 
         super().__init__(
             optimizer, clip_grad, log_num_zeros_in_grad,
             check_for_nan_in_grad, params_have_main_grad,
-            fp16, bf16, params_dtype, grad_scaler, models)
+            fp16, bf16, params_dtype, grad_scaler)
 
         # ======================
         # main parameter stuff
@@ -569,13 +560,11 @@ class FP32Optimizer(MegatronOptimizer):
     def __init__(self, optimizer, clip_grad,
                  log_num_zeros_in_grad,
                  check_for_nan_in_grad,
-                 params_have_main_grad,
-                 models):
+                 params_have_main_grad):
 
         super(FP32Optimizer, self).__init__(
             optimizer, clip_grad, log_num_zeros_in_grad,
-            check_for_nan_in_grad, params_have_main_grad,
-            models)
+            check_for_nan_in_grad, params_have_main_grad)
 
         self._scale = torch.tensor([1.0], dtype=torch.float, device='cuda')
 
@@ -642,3 +631,105 @@ class FP32Optimizer(MegatronOptimizer):
 
     def load_state_dict(self, state_dict):
         self.optimizer.load_state_dict(state_dict)
+
+
+class ChainedOptimizer(MegatronOptimizer):
+    """ChainedOptimizer is designed for chain of multiple optimizers.
+    
+    These optimizers are responsible for different parts of multiple models for
+    a training task and will be executed one by one when the model is updated.
+
+    Args:
+        chained_optimizers: a list of optimizers.
+    """
+
+    # Remove these attributes which inherits from MegatronOptimizer.
+    state = None
+    param_groups = None
+
+    def __init__(self, chained_optimizers):
+        self.chained_optimizers = chained_optimizers
+        self.param_groups = []
+        for optimizer in self.chained_optimizers:
+            self.param_groups += optimizer.param_groups
+    
+    def zero_grad(self, set_to_none=True):
+        for optimizer in self.chained_optimizers:
+            optimizer.zero_grad(set_to_none)
+
+    def get_loss_scale(self):
+        return self.chained_optimizers[0].get_loss_scale()
+    
+    def reload_model_params(self):
+        for optimizer in self.chained_optimizers:
+            optimizer.reload_model_params()
+
+    def state_dict(self):
+        return [optimizer.state_dict() for optimizer in self.chained_optimizers]
+    
+    def load_state_dict(self, state_dict):
+        for optimizer, state in zip(self.chained_optimizers, state_dict):
+            optimizer.load_state_dict(state)
+    
+    def step(self, args, timers):
+        """ChainedOptimizer will step all optimizers one by one.
+
+        Args:
+            args (argparse.Namespace): command-line arguments.
+            timers (Timers): timers used for profiling.
+        """
+
+        update_successful, grad_norm, num_zeros_in_grad = True, 0, 0
+        grad_norms = []
+        for optimizer in self.chained_optimizers:
+            _update_successful, _grad_norm, _num_zeros_in_grad = optimizer.step(args, timers)
+            update_successful &= _update_successful
+            grad_norms += [_grad_norm if _grad_norm else 0.]
+            num_zeros_in_grad += _num_zeros_in_grad if _num_zeros_in_grad else 0
+        grad_norm = math.sqrt(sum([x**2 for x in grad_norms]))
+
+        return update_successful, grad_norm, num_zeros_in_grad
+
+    def save_parameter_state(self, filename):
+        """Save the distributed parameter states of all optimizers to a file.
+
+        Args:
+            filename (str): path to save parameter state to.
+        """
+        data_parallel_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
+
+        states = []
+        for optimizer in self.chained_optimizers:
+            if hasattr(optimizer, 'get_parameter_state'):
+                states.append(optimizer.get_parameter_state())
+            else:
+                states.append(None)
+
+        if data_parallel_rank == 0:
+            torch.save(states, filename)
+
+    def load_parameter_state(self, filename):
+        """Load the distributed parameter states of all optimizers from a file.
+
+        Args:
+            filename (str): path to load parameter state from.
+        """
+        data_parallel_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
+        num_of_optimizers = len(self.chained_optimizers)
+        if data_parallel_rank == 0:
+            states = torch.load(filename)
+        else:
+            states = [None] * num_of_optimizers
+
+        assert len(states) == num_of_optimizers, "Number of optimizers in "\
+            "checkpoint does not match number of optimizers in model."
+
+        for optimizer, state in zip(self.chained_optimizers, states):
+            if hasattr(optimizer, 'load_parameter_state_from_state_dict'):
+                optimizer.load_parameter_state_from_state_dict(state)
+
+    def finish_param_sync(self, model_index):
+        """Finish parameter synchronization for all optimizers.
+        """
+        for optimizer in self.chained_optimizers:
+            optimizer.finish_param_sync(model_index)
