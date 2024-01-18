@@ -33,7 +33,7 @@ LOGISTICS_ARGS=(
     --load $PRETRAINED_LLAMA_MODEL_PATH 
     --tokenizer-model $TOKENIZER_MODEL
     --split 100,0,0 
-    --log-interval 10
+    --log-interval 100
     --save-interval 3000 
     --eval-interval 3000
     --eval-iters 0
