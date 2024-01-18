@@ -16,6 +16,7 @@ variables: &VARS
   TEST_REGEX_ON_THIS_COMMIT:  NONE #https://github.com/google/re2/wiki/Syntax (Can define regex as in this spec) e.g /.*gpt3.*/
   DISPLAY_OUTPUT: "True" # Set to true for new tests to copy the logs for creating golden truth file
   TIME_LIMIT: "10:00" # Default time limit for all jobs
+  MOE_GROUPED_GEMM: 0 # Set to 1 to enable grouped gemm for MoE
  
 
 include:
@@ -32,6 +33,7 @@ unit_tests:
     - pip install nltk
     - pip install wrapt
     - pip install zarr "tensorstore==0.1.45"  # for distributed checkpointing tests
+    - pip install git+https://github.com/fanshiqing/grouped_gemm@main  # for grouped gemm tests
     - torchrun --nproc_per_node=8 -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/unit_tests
   coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
   artifacts:
@@ -97,7 +99,7 @@ formatting:
   script: &selene-test-launcher-script
     - echo "Running selene test"
     - pwd
-    - run_cmd="bash tests/functional_tests/shell_test_utils/run_selene_test_launcher_script.sh RUN_MODEL=$RUN_MODEL TP_SIZE=$TP_SIZE PP_SIZE=$PP_SIZE VP_SIZE=$VP_SIZE NUM_NODES=$NUM_NODES SELENE_ADLR_CI_PATH=$SELENE_ADLR_CI_PATH CI_PIPELINE_ID=$CI_PIPELINE_ID RUN_NAME=$RUN_NAME MAX_STEPS=$MAX_STEPS PYTORCH_IMAGE=$PYTORCH_IMAGE DATA_DIR=$DATA_DIR USE_CORE=$USE_CORE USE_TE=$USE_TE TIME_LIMIT=$TIME_LIMIT"
+    - run_cmd="bash tests/functional_tests/shell_test_utils/run_selene_test_launcher_script.sh RUN_MODEL=$RUN_MODEL TP_SIZE=$TP_SIZE PP_SIZE=$PP_SIZE VP_SIZE=$VP_SIZE NUM_NODES=$NUM_NODES SELENE_ADLR_CI_PATH=$SELENE_ADLR_CI_PATH CI_PIPELINE_ID=$CI_PIPELINE_ID RUN_NAME=$RUN_NAME MAX_STEPS=$MAX_STEPS PYTORCH_IMAGE=$PYTORCH_IMAGE DATA_DIR=$DATA_DIR USE_CORE=$USE_CORE USE_TE=$USE_TE MOE_GROUPED_GEMM=$MOE_GROUPED_GEMM TIME_LIMIT=$TIME_LIMIT"
     - echo "$run_cmd"
     - ${run_cmd}
     - echo "Completed the job"
@@ -562,6 +564,22 @@ train.te_core_moe_gpt3.345m_tp2_pp1_8experts2parallel_1node_50steps:
     TEST_LEVEL: MR_TESTS
     METADATA: "te_8experts2parallel"
     ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 8 --expert-model-parallel-size 2"
+
+train.te_core_moe_gpt3.345m_tp2_pp1_8experts2parallel_groupedGEMM_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 2
+    PP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 1
+    MOE_GROUPED_GEMM: 1
+    TEST_LEVEL: MR_TESTS
+    METADATA: "te_8experts2parallel_groupedGEMM"
+    ADDITIONAL_PARAMS: "--moe-grouped-gemm --disable-bias-linear --sequence-parallel --num-experts 8 --expert-model-parallel-size 2"
 
 train.moe_gpt3.345m_tp2_pp2_4experts_1node_50steps:
   <<: *selene-test-launcher

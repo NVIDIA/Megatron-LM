@@ -1,10 +1,13 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import sys
 from dataclasses import dataclass, fields
+from importlib.metadata import version
 
 import pytest
 import torch
 import transformer_engine as te
+from pkg_resources import packaging
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -15,6 +18,7 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
     TENorm,
     TERowParallelLinear,
 )
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module, import_module
@@ -125,3 +129,70 @@ class TestSpecCustomization:
         # Check BiasDropoutAdd
         bda_op = build_module(self.bda_spec)
         assert id(bda_op) == id(get_bias_dropout_add)
+
+
+
+    def test_sliding_window_attention(self):
+        te_version = packaging.version.Version(version("transformer-engine"))
+        if te_version < packaging.version.Version(
+                "1.2.0"
+        ):
+           print("SWA not tested because TE version is not >= 1.2.0", file=sys.stderr)
+           return
+
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            window_size=[10,0]
+        )
+        # Make sure DotProductAttention throws (swa unsupported).
+        threw = False
+        try:
+            attn = DotProductAttention(
+                config,
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+                attention_type='self'
+            )
+        except:
+            threw = True
+        finally:
+            assert threw, 'Expected DotProductAttention to throw exception for SWA'
+
+        # Test TEDotProductAttention
+        attn = TEDotProductAttention(
+            config,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type='self'
+        )
+        # Make sure window-size is what we expect.
+        assert attn.window_size == config.window_size
+
+        # Single integer window-size unsupported, make sure it throws
+        threw = False
+        try:
+            config.window_size = 11
+            attn = TEDotProductAttention(
+                config,
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+                attention_type='self'
+            )
+        except:
+            threw = True
+        finally:
+            assert threw, "Expected TEDotProductAttention to throw for integer window-size"
+
+        # `None` makes this causal.
+        config.window_size = None
+        attn = TEDotProductAttention(
+            config,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type='self'
+        )
+        # Make sure it's causal.
+        assert attn.window_size == (-1, 0)
