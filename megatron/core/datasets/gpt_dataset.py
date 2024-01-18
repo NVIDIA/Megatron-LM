@@ -23,7 +23,7 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
 
        Attributes:
            return_document_ids (bool): Whether to return the document ids when querying the dataset.
-          
+
            reset_position_ids (bool): Option to reset the position IDs in the dataset at an interval
 
            reset_attention_mask (bool): Option to reset the attention mask from the dataset
@@ -31,7 +31,7 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
            eod_mask_loss (bool): Option to enable the EOD mask loss
 
            eod_id (int): Has the identity of the end of document
-      
+
     """
 
     return_document_ids: bool = False
@@ -69,7 +69,7 @@ class GPTDataset(MegatronDataset):
 
     def _finalize(self) -> None:
         """Abstract method implementation
-        
+
         Load or build/cache the document, sample, and shuffle indices
         """
         assert isinstance(self.config, GPTDatasetConfig)
@@ -196,7 +196,7 @@ class GPTDataset(MegatronDataset):
         self,
     ) -> Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]:
         """Build the document index, the sample index, and the shuffle index
-        
+
         The document index:
             -- 1-D
             -- An ordered array of document ids
@@ -545,7 +545,7 @@ def _get_ltor_masks_and_position_ids(
     if reset_position_ids or reset_attention_mask:
 
         # Find indecies where EOD token is.
-        eod_index = position_ids[data[b] == eod_token]
+        eod_index = position_ids[data == eod_token]
         # Detach indecies from positions if going to modify positions.
         if reset_position_ids:
             eod_index = eod_index.clone()
