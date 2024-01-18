@@ -1015,7 +1015,10 @@ class ParallelTransformerLayer(MegatronModule):
 
         # MLP
         if args.num_experts is not None:
-            self.mlp = SwitchMLP(config)
+            if args.moe_type == "mixtral":
+                self.mlp = MixtralSparseMoeBlock(config)
+            else:
+                self.mlp = SwitchMLP(config)
         else:
             self.mlp = ParallelMLP(config)
 
