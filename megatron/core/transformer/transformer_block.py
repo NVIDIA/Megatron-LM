@@ -10,14 +10,16 @@ from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
-from megatron.core.transformer.custom_layers.transformer_engine import TENorm
+from megatron.core.transformer.custom_layers.transformer_engine import (
+    TENorm,
+    get_cpu_offload_context,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
-from megatron.core.transformer.custom_layers.transformer_engine import get_cpu_offload_context
 
 
 def get_num_layers_to_build(config: TransformerConfig) -> int:
@@ -104,16 +106,23 @@ class TransformerBlock(MegatronModule):
         self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
 
         if get_cpu_offload_context is not None:
-            self.offload_context, self.group_prefetch_offload_commit_async = get_cpu_offload_context(
-                                                                             self.config.cpu_offloading,
-                                                                             self.config.cpu_offloading_num_layers,
-                                                                             self.config.cpu_offloading_activations,
-                                                                             self.config.cpu_offloading_weights
-                                                                             )
-            self.config.cpu_offloading_context = self.offload_context if self.config.cpu_offloading else None
+            (
+                self.offload_context,
+                self.group_prefetch_offload_commit_async,
+            ) = get_cpu_offload_context(
+                self.config.cpu_offloading,
+                self.config.cpu_offloading_num_layers,
+                self.config.cpu_offloading_activations,
+                self.config.cpu_offloading_weights,
+            )
+            self.config.cpu_offloading_context = (
+                self.offload_context if self.config.cpu_offloading else None
+            )
         else:
-            assert self.config.cpu_offloading == False, "CPU Offloading is enabled when TE is not present"
- 
+            assert (
+                self.config.cpu_offloading == False
+            ), "CPU Offloading is enabled when TE is not present"
+
             self.offload_context, self.group_prefetch_offload_commit_async = nullcontext(), None
             self.config.cpu_offloading_context = None
 
@@ -333,9 +342,13 @@ class TransformerBlock(MegatronModule):
                             rotary_pos_emb=rotary_pos_emb,
                             inference_params=inference_params,
                         )
- 
-                    if torch.is_grad_enabled() and self.config.cpu_offloading and self.group_prefetch_offload_commit_async is not None:
-                       hidden_states = self.group_prefetch_offload_commit_async(hidden_states) 
+
+                    if (
+                        torch.is_grad_enabled()
+                        and self.config.cpu_offloading
+                        and self.group_prefetch_offload_commit_async is not None
+                    ):
+                        hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
