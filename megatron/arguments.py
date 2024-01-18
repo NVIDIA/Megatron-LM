@@ -736,7 +736,11 @@ def _add_logging_args(parser):
     group.add_argument('--wandb-save-dir', type=str, default='',
                        help='Path to save the wandb results locally.')
     group.add_argument('--enable-one-logger', action='store_true',
-                       help='If set, use one_logger to track e2e metrics')
+                       help='If set, use one_logger to track E2E metrics'
+                       'For installation, please try command: `pip install '
+                       '--index-url=https://sc-hw-artf.nvidia.com/api/pypi/hwinf-ml-pypi/simple'
+                       ' one_logger` or go to https://gitlab-master.nvidia.com/hwinf-dcm/onelogger '
+                       'for more details')
     return parser
 
 
