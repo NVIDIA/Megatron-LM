@@ -198,9 +198,15 @@ def _set_one_logger(args):
     _ensure_var_is_not_initialized(_GLOBAL_ONE_LOGGER, 'one logger')
 
     if args.enable_onelogger and args.rank == (args.world_size - 1):
-        from one_logger.core import OneLogger
-        one_logger = OneLogger()
-        _GLOBAL_ONE_LOGGER = one_logger
+        try:
+            from one_logger.core import OneLogger
+            one_logger = OneLogger()
+            _GLOBAL_ONE_LOGGER = one_logger
+        except BaseException:
+            print('WARNING: one_logger package is required to enable e2e metrics '
+                  'tracking. Try pip install '
+                  '--index-url=https://sc-hw-artf.nvidia.com/api/pypi/hwinf-ml-pypi/simple'
+                  ' one_logger to install it')
 
 
 def _set_adlr_autoresume(args):
