@@ -803,9 +803,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             train_duration = timers('interval-time').active_time()  # overall_elapsed
             train_samples = args.consumed_train_samples - train_samples_start
             train_iterations = iteration - iteration_start
-            train_iterations_time_msecs_avg = train_duration*1000.0 / train_iterations
+            train_iterations_time_msecs_avg = (train_duration * 1000.0) / train_iterations
             if eval_iterations:
-                validation_iterations_time_msecs_avg = eval_duration*1000.0 / eval_iterations
+                validation_iterations_time_msecs_avg = (eval_duration * 1000.0) / eval_iterations
             else:
                 validation_iterations_time_msecs_avg = None
 
