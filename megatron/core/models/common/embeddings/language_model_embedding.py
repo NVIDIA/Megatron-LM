@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import math
 from typing import Literal, Optional
 
 import torch
@@ -34,6 +35,13 @@ class LanguageModelEmbedding(MegatronModule):
         max_sequence_length: int,
         position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
         num_tokentypes: int = 0,
+        embedding_noise=False,
+        embedding_noise_mean=0.0,
+        embedding_noise_std=0.001,
+        embedding_noise_type='uniform',
+        neft=False,
+        neft_alpha=5.0,
+        noise_positonal_embedding=False,
     ):
         super().__init__(config=config)
 
@@ -42,6 +50,14 @@ class LanguageModelEmbedding(MegatronModule):
         self.max_sequence_length: int = max_sequence_length
         self.add_position_embedding: bool = position_embedding_type == 'learned_absolute'
         self.num_tokentypes = num_tokentypes
+
+        self.embedding_noise = embedding_noise
+        self.embedding_noise_mean = embedding_noise_mean
+        self.embedding_noise_std = embedding_noise_std
+        self.embedding_noise_type = embedding_noise_type
+        self.neft = neft
+        self.neft_alpha = neft_alpha
+        self.noise_positonal_embedding = noise_positonal_embedding
 
         # Word embeddings (parallel).
         self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
@@ -84,6 +100,26 @@ class LanguageModelEmbedding(MegatronModule):
             self.tokentype_embeddings.weight.data.fill_(0)
             self.tokentype_embeddings.weight.shared = True
 
+    def _noise(self, embeddings):
+        if self.training:
+            if self.embedding_noise and not self.neft:
+                    if self.embedding_noise_type == 'uniform':
+                        noise = torch.empty_like(embeddings).uniform_(self.embedding_noise_mean, self.embedding_noise_std).detach()
+                    elif self.embedding_noise_type == 'normal':
+                        noise = torch.empty_like(embeddings).normal_(self.embedding_noise_mean, self.embedding_noise_std).detach()
+                    else:
+                        raise NotImplementedError(f"embedding noise type {self.embedding_noise_type} not implemented")
+
+                    original_norm = torch.norm(embeddings, p=2, dim=1, keepdim=True)
+                    embeddings = embeddings + noise
+                    noisy_norm = torch.norm(embeddings, p=2, dim=1, keepdim=True)
+                    embeddings = embeddings * (original_norm / noisy_norm)
+            elif self.neft:
+                    epsilon = torch.empty_like(embeddings).uniform_(-1, 1).detach()
+                    scaled_noise = (self.neft_alpha / math.sqrt(embeddings.shape[0] * embeddings.shape[-1])) * epsilon
+                    embeddings = embeddings + scaled_noise
+        return embeddings
+
     def forward(self, input_ids: Tensor, position_ids: Tensor, tokentype_ids: int = None) -> Tensor:
         """Forward pass of the embedding module
         Args:
@@ -95,12 +131,18 @@ class LanguageModelEmbedding(MegatronModule):
             Tensor: The output embeddings
         """
         word_embeddings = self.word_embeddings(input_ids)
+
+        if not self.noise_positonal_embedding:
+            word_embeddings = self._noise(word_embeddings)
+
         if self.add_position_embedding:
             position_embeddings = self.position_embeddings(position_ids)
             embeddings = word_embeddings + position_embeddings
         else:
             embeddings = word_embeddings
 
+        if self.noise_positonal_embedding:
+            embeddings = self._noise(embeddings)
         # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
         embeddings = embeddings.transpose(0, 1).contiguous()
 

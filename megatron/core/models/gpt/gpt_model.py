@@ -34,6 +34,13 @@ class GPTModel(LanguageModule):
         rotary_percent (float, optional): Percent of rotary dimension to use for rotary position embeddings. Ignored unless position_embedding_type is 'rope'. Defaults to 1.0.
         rotary_base (int, optional): Base period for rotary position embeddings. Ignored unless position_embedding_type is 'rope'. Defaults to 10000.
         seq_len_interpolation_factor (Optional[float], optional): scale of linearly interpolating RoPE for longer sequences. The value must be a float larger than 1.0. Defaults to None.
+        embedding_noise (bool, optional): Add noise to embedding layer. Defaults to False.
+        embedding_noise_mean (float, optional): Mean of embedding noise. Defaults to 0.0.
+        embedding_noise_std (float, optional): Standard deviation of embedding noise. Defaults to 0.001.
+        embedding_noise_type (str, optional): Type of embedding noise. Defaults to 'uniform'.
+        neft (bool, optional): Use NEFT. Defaults to False.
+        neft_alpha (float, optional): NEFT alpha. Defaults to 5.0.
+        noise_positonal_embedding (bool, optional): Add noise to positional embedding. Defaults to False.
     """
 
     def __init__(
@@ -51,6 +58,13 @@ class GPTModel(LanguageModule):
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
         seq_len_interpolation_factor: Optional[float] = None,
+        embedding_noise=False,
+        embedding_noise_mean=0.0,
+        embedding_noise_std=0.001,
+        embedding_noise_type='uniform',
+        neft=False,
+        neft_alpha=5.0,
+        noise_positonal_embedding=False,
     ) -> None:
         super().__init__(config=config)
 
@@ -63,6 +77,14 @@ class GPTModel(LanguageModule):
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
+
+        self.embedding_noise = embedding_noise
+        self.embedding_noise_mean = embedding_noise_mean
+        self.embedding_noise_std = embedding_noise_std
+        self.embedding_noise_type = embedding_noise_type
+        self.neft = neft
+        self.neft_alpha = neft_alpha
+        self.noise_positonal_embedding = noise_positonal_embedding
 
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
