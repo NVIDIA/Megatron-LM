@@ -372,7 +372,7 @@ class MixtralSparseMoeBlock(MegatronModule):
         )
 
     def forward(self, hidden_states: torch.Tensor):
-        b, s, h = hidden_states.shape
+        s, b, h = hidden_states.shape
         hidden_states = hidden_states.view(-1, h)
 
         # route: (batch * sequence_length, n_experts)
@@ -405,7 +405,7 @@ class MixtralSparseMoeBlock(MegatronModule):
             current_hidden_states = expert_layer(hidden_states[column]) * routing_weights[column, row, None]
             output_total[column] = output_total[column] + current_hidden_states.to(hidden_states.dtype)
 
-        output_total = output_total.reshape(b, s, h)
+        output_total = output_total.view(s, b, h).contiguous()
 
         return output_total, None
 
