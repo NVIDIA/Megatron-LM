@@ -899,9 +899,8 @@ def _add_training_args(parser):
     group.add_argument('--no-bias-gelu-fusion', action='store_false',
                        help='Disable bias and gelu fusion.',
                        dest='bias_gelu_fusion')
-    group.add_argument('--no-bias-swiglu-fusion', action='store_false',
-                       help='Disable bias and swiglu fusion.',
-                       dest='bias_swiglu_fusion')
+    group.add_argument('--bias-swiglu-fusion', action='store_true',
+                       help='enable bias and swiglu fusion.')
     group.add_argument('--no-bias-dropout-fusion', action='store_false',
                        help='Disable bias and dropout fusion.',
                        dest='bias_dropout_fusion')
