@@ -3,16 +3,18 @@
 import torch
 import torch.nn.functional as F
 
+from megatron.core.jit import jit_fuser
+
 ###### BIAS SWIGLU FUSION/ NO AUTOGRAD ################
 
 
-@torch.jit.script
+@jit_fuser
 def swiglu(y):
     y_1, y_2 = torch.chunk(y, 2, -1)
     return F.silu(y_1) * y_2
 
 
-@torch.jit.script
+@jit_fuser
 def bias_swiglu(y, bias):
     y = y + bias
     return swiglu(y)
@@ -21,7 +23,7 @@ def bias_swiglu(y, bias):
 # gradient of tanh approximation of gelu
 # gradient of actual gelu is:
 # 0.5 * (1. + torch.erf(x * 0.70710678)) + 0.3989423 * x * torch.exp(-0.5 * x * x)
-@torch.jit.script
+@jit_fuser
 def swiglu_back(g, y):
     y_1, y_2 = torch.chunk(y, 2, -1)
     return torch.cat(
@@ -29,7 +31,7 @@ def swiglu_back(g, y):
     )
 
 
-@torch.jit.script
+@jit_fuser
 def bias_swiglu_back(g, y, bias):
     y = y + bias
     return swiglu_back(g, y)
