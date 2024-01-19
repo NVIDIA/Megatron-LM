@@ -96,6 +96,13 @@ class GPTModel(LanguageModule):
                 vocab_size=self.vocab_size,
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type=position_embedding_type,
+                embedding_noise=self.embedding_noise,
+                embedding_noise_mean=self.embedding_noise_mean,
+                embedding_noise_std=self.embedding_noise_std,
+                embedding_noise_type=self.embedding_noise_type,
+                neft=self.neft,
+                neft_alpha=self.neft_alpha,
+                noise_positonal_embedding=self.noise_positonal_embedding,
             )
 
         if self.position_embedding_type == 'rope':
