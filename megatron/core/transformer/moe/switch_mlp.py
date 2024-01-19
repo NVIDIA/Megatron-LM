@@ -10,8 +10,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 class SwitchMLP(MegatronModule):
     """
-    Top-1 Mixture of Experts Layer. Routes input to one of N MLP "experts"
-    Curently supports Sinkhorn based expert routing.
+    Mixture of Experts Layer. Routes input to one of N MLP "experts"
     """
 
     def __init__(self, num_local_experts, config: TransformerConfig, submodules: MLPSubmodules):

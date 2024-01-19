@@ -124,9 +124,9 @@ class Router(ABC, MegatronModule):
         Returns:
             torch.Tensor: The logits after applying the z-loss.
         """
-
-        z_loss = z_loss_func(logits)
-        logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
+        if self.config.moe_z_loss_coeff is not None:
+            z_loss = z_loss_func(logits)
+            logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
         return logits
 
 
@@ -409,7 +409,7 @@ class MoEDroplessTokenDispatcher(MoETokenDispatcher):
         return output_total, output_bias_total
 
 
-class DroplessTopKRouter(Router):
+class TopKRouter(Router):
     """TopK Router without token dropping.
     """
 
@@ -417,8 +417,6 @@ class DroplessTopKRouter(Router):
         self,
         num_local_experts: int,
         local_expert_indices: List[int],
-        k: int,
-        routing_type: str,
         config: TransformerConfig,
     ) -> None:
         """Initialize the zero token dropping router.
@@ -426,22 +424,18 @@ class DroplessTopKRouter(Router):
         Args:
             num_local_experts (int): The number of local experts.
             local_expert_indices (List[int]): The indices of the local experts.
-            k: The number of experts to route to.
-            routing_type (str): The routing type to use. Currently supports sinkhorn and top.
             config (TransformerConfig): The configuration for the transformer model.
-            
         """
         super().__init__(config=config)
         assert config.moe_token_dropping == False
-        assert routing_type in ["sinkhorn", "top"], f"Routing type {routing_type} not supported."
-        self.k = k
-        self.routing_type = routing_type
+        self.topk = self.config.moe_router_topk
+        self.routing_type = self.config.moe_router_load_balancing_type
         self.token_dispatcher = MoEDroplessTokenDispatcher(
-            num_local_experts, local_expert_indices, self.k, config
+            num_local_experts, local_expert_indices, self.topk, config
         )
         self.moe_aux_loss_func = switch_load_balancing_loss_func
 
-    def apply_sinkhorn(self, logits: torch.Tensor):
+    def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
 
         Args:
@@ -457,12 +451,30 @@ class DroplessTopKRouter(Router):
                 norm_logits = sinkhorn(
                     logits.to(dtype=torch.float32)
                 )  # explicit fp32 conversion for stability
-                _, indices = torch.topk(norm_logits, k=self.k, dim=1)
+                _, indices = torch.topk(norm_logits, k=self.topk, dim=1)
             logits = router_activation(logits)
             scores = torch.gather(logits, 1, indices)
         else:
             logits = router_activation(logits)
-            scores, indices = torch.topk(logits, k=self.k, dim=1)
+            scores, indices = torch.topk(logits, k=self.topk, dim=1)
+        return scores, indices
+    
+    def aux_loss_load_balancing(self, logits: torch.Tensor):
+        """Apply loss-based load balancing to the logits tensor.
+
+        Args:
+            logits (torch.Tensor): The logits tensor.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: The scores and the indices tensor after applying load balancing.
+        """
+        top_logits, indices = torch.topk(logits, k=self.topk, dim=1)
+        scores = torch.softmax(top_logits, dim=-1, dtype=torch.float32).type_as(logits)
+        # Apply load balancing loss
+        probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
+        scores = self.apply_aux_loss(
+            self.moe_aux_loss_func, probs, indices, activation=scores
+        )
         return scores, indices
 
     def routing(self, logits: torch.Tensor):
@@ -476,22 +488,16 @@ class DroplessTopKRouter(Router):
         """
         logits = logits.view(-1, self.config.num_moe_experts)
         # Apply Z-Loss
-        if self.config.moe_z_loss_coeff > 0:
-            logits = self.apply_z_loss(logits)
+        logits = self.apply_z_loss(logits)
 
         if self.routing_type == "sinkhorn":
-            # Sinkhorn routing.
-            scores, indices = self.apply_sinkhorn(logits)
-        elif self.routing_type == "top":
-            # TopK routing.
+            scores, indices = self.sinkhorn_load_balancing(logits)
+        elif self.routing_type == "aux_loss":
+            scores, indices = self.aux_loss_load_balancing(logits)
+        elif self.routing_type is None:
+            # A naive top-k routing without load balancing
             top_logits, indices = torch.topk(logits, k=self.k, dim=1)
             scores = torch.softmax(top_logits, dim=-1, dtype=torch.float32).type_as(logits)
-            # Apply load balancing loss
-            if self.config.moe_aux_loss_coeff > 0:
-                probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
-                scores = self.apply_aux_loss(
-                    self.moe_aux_loss_func, probs, indices, activation=scores
-                )
 
         return scores, indices
 

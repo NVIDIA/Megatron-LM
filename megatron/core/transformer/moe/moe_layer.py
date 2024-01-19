@@ -8,7 +8,7 @@ from megatron.core import parallel_state
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.grouped_mlp import GroupedMLP
-from megatron.core.transformer.moe.router import DroplessTopKRouter
+from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.switch_mlp import SwitchMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -92,21 +92,9 @@ class DroplessMoELayer(BaseMoELayer):
         return experts
 
     def initialize_router(self):
-        routing_type = None
-        if self.config.moe_router_type.lower().startswith("top"):
-            k = int(self.config.moe_router_type[3:])
-            routing_type = "top"
-        elif self.config.moe_router_type.lower().startswith("sinkhorn"):
-            k = int(self.config.moe_router_type[8:])
-            routing_type = "sinkhorn"
-        else:
-            raise NotImplementedError(f"Routing method {self.config.moe_router_type} not supported")
-
-        router = DroplessTopKRouter(
+        router = TopKRouter(
             self.num_local_experts,
             self.local_expert_indices,
-            k=k,
-            routing_type=routing_type,
             config=self.config,
         )
         return router

@@ -16,8 +16,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 class GroupedMLP(MegatronModule):
     """
-    Top-1 Mixture of Experts Layer with Grouped GEMM. Routes input to one of N MLP "experts"
-    Curently supports Sinkhorn based expert routing.
+    Experts Layer with Grouped GEMM. Routes input to one of N MLP "experts"
     """
 
     def __init__(self, num_local_experts: int, config: TransformerConfig):

@@ -4,7 +4,7 @@ import pytest
 
 import torch
 
-from megatron.core.transformer.moe.router import Router, DroplessTopKRouter
+from megatron.core.transformer.moe.router import Router, TopKRouter
 from megatron.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -24,7 +24,7 @@ class TestDroplessDispatcher:
             use_cpu_initialization=True,
             moe_router_type="top2",
         )
-        self.router = DroplessTopKRouter(
+        self.router = TopKRouter(
             num_local_experts=num_moe_experts,
             local_expert_indices=range(num_moe_experts),
             k=2,

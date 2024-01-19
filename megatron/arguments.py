@@ -397,19 +397,6 @@ def validate_args(args, defaults={}):
     # MoE Spec check
     if args.num_experts is not None:
         assert args.spec is None, "Model Spec must be None when using MoEs"
-        if args.moe_router_type.lower().startswith("top"):
-            try:
-                k = int(args.moe_router_type[3:])
-                assert k > 0, "Invalid topk router name: {}, please ensure k > 0.".format(
-                    args.moe_router_type
-                )
-            except:
-                raise RuntimeError(
-                    "Invalid `topk` router name: `{}`. Please use the format `topk`, where `k` must be an integer.".format(
-                        args.moe_router_type
-                    )
-                )
-            
 
     # Expert parallelism check
     if args.expert_model_parallel_size  > 1:
@@ -1427,6 +1414,19 @@ def _add_moe_args(parser):
         '--num-experts', type=int, default=None, help='Number of Experts in MoE (None means no MoE)'
     )
     group.add_argument(
+        '--moe-router-load-balancing-type',
+        type=str,
+        choices=['aux_loss', 'sinkhorn', None],
+        default='aux_loss',
+        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "None" implies no load balancing. The default is "aux_loss".',
+    )
+    group.add_argument(
+        '--moe-router-topk',
+        type=int,
+        default=2,
+        help='Number of experts to route to for each token. The default is 2.',
+    )
+    group.add_argument(
         '--moe-grouped-gemm',
         action='store_true',
         help='When there are multiple experts per rank, compress '
@@ -1444,19 +1444,13 @@ def _add_moe_args(parser):
     group.add_argument(
         '--moe-z-loss-coeff',
         type=float,
-        default=0.0,
+        default=None,
         help='Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended.',
-    )
-    group.add_argument(
-        '--moe-router-type',
-        type=str,
-        default='sinkhorn1',
-        help='Options for router type. Currently supports sinkhornK and topK router, where K represents the number of routers each token selects. The default is sinkhorn1.',
     )
     group.add_argument(
         '--moe-token-dropping',
         action='store_true',
-        help='Currently unsupported. This feature involves selectively dropping and padding tokens for each expert to achieve a specified capacity, similar to to GShard, Switch-Transformer, and DeepSpeed-MoE.',
+        help='This feature involves selectively dropping and padding tokens for each expert to achieve a specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note: Currently unsupported.',
     )
     # zero token drop moe arguments
 
