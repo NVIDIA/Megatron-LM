@@ -17,7 +17,7 @@ class TestParallelSwitchMLP:
         model_parallel_cuda_manual_seed(123)
         print("done intializing")
         num_moe_experts = 2
-        transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, num_moe_experts=num_moe_experts, use_cpu_initialization=True, moe_router_type="sinkhorn1")
+        transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, num_moe_experts=num_moe_experts, use_cpu_initialization=True, moe_router_load_balancing_type="sinkhorn", moe_router_topk=1)
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=num_moe_experts, moe_grouped_gemm=False)
         self.switch_mlp = DroplessMoELayer(transformer_config, transformer_layer_spec.submodules.mlp.submodules)

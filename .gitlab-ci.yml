@@ -533,7 +533,7 @@ train.te_core_moe_gpt3.345m_tp2_pp2_2experts_1node_50steps:
     USE_CORE: 1
     TEST_LEVEL: NIGHTLY_TESTS
     METADATA: "te_2experts"
-    ADDITIONAL_PARAMS: "--num-experts 2"
+    ADDITIONAL_PARAMS: "--num-experts 2 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"
 
 train.te_core_moe_gpt3.345m_tp2_pp2_4experts2parallel_1node_50steps:
   <<: *selene-test-launcher
@@ -548,7 +548,7 @@ train.te_core_moe_gpt3.345m_tp2_pp2_4experts2parallel_1node_50steps:
     USE_CORE: 1
     TEST_LEVEL: NIGHTLY_TESTS
     METADATA: "te_4experts2parallel"
-    ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 4 --expert-model-parallel-size 2"
+    ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 4 --expert-model-parallel-size 2 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"
 
 train.te_core_moe_gpt3.345m_tp2_pp1_8experts2parallel_1node_50steps:
   <<: *selene-test-launcher
@@ -563,7 +563,7 @@ train.te_core_moe_gpt3.345m_tp2_pp1_8experts2parallel_1node_50steps:
     USE_CORE: 1
     TEST_LEVEL: MR_TESTS
     METADATA: "te_8experts2parallel"
-    ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 8 --expert-model-parallel-size 2"
+    ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"
 
 train.te_core_moe_gpt3.345m_tp2_pp1_8experts2parallel_groupedGEMM_1node_50steps:
   <<: *selene-test-launcher
@@ -579,7 +579,7 @@ train.te_core_moe_gpt3.345m_tp2_pp1_8experts2parallel_groupedGEMM_1node_50steps:
     MOE_GROUPED_GEMM: 1
     TEST_LEVEL: MR_TESTS
     METADATA: "te_8experts2parallel_groupedGEMM"
-    ADDITIONAL_PARAMS: "--moe-grouped-gemm --disable-bias-linear --sequence-parallel --num-experts 8 --expert-model-parallel-size 2"
+    ADDITIONAL_PARAMS: "--moe-grouped-gemm --disable-bias-linear --sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"
 
 train.te_core_moe_gpt3.345m_tp2_pp1_8experts2parallel_top2_1node_50steps:
   <<: *selene-test-launcher
@@ -595,7 +595,7 @@ train.te_core_moe_gpt3.345m_tp2_pp1_8experts2parallel_top2_1node_50steps:
     MOE_GROUPED_GEMM: 1
     TEST_LEVEL: MR_TESTS
     METADATA: "te_8experts2parallel_top2router"
-    ADDITIONAL_PARAMS: "--disable-bias-linear --sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --moe-router-type top2 --moe-aux-loss-coeff 1e-2"
+    ADDITIONAL_PARAMS: "--disable-bias-linear --sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --moe-router-load-balancing-type "aux_loss" --moe-router-topk 2 --moe-aux-loss-coeff 1e-2"
 
 train.moe_gpt3.345m_tp2_pp2_4experts_1node_50steps:
   <<: *selene-test-launcher
@@ -610,7 +610,7 @@ train.moe_gpt3.345m_tp2_pp2_4experts_1node_50steps:
     USE_CORE: 0
     TEST_LEVEL: NIGHTLY_TESTS
     METADATA: "4experts"
-    ADDITIONAL_PARAMS: "--num-experts 4"
+    ADDITIONAL_PARAMS: "--num-experts 4 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"
 
 train.bert.345m_tp4_pp1_1node_50steps:
   <<: *selene-test-launcher

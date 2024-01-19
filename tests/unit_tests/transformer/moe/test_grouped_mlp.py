@@ -39,7 +39,7 @@ class TestParallelGroupedMLP:
             num_moe_experts=self.num_experts, use_cpu_initialization=self.use_cpu_initialization,
             add_bias_linear=False, gated_linear_unit=self.gated_linear_unit,
             bias_gelu_fusion=False,
-            bf16=True, params_dtype=torch.bfloat16, moe_router_type="sinkhorn1")
+            bf16=True, params_dtype=torch.bfloat16, moe_router_load_balancing_type="sinkhorn", moe_router_topk=1)
 
         self.fc1_ffn_hidden_size = tf_config.ffn_hidden_size
         self.fc2_ffn_hidden_size = tf_config.ffn_hidden_size

@@ -410,14 +410,10 @@ class MoEDroplessTokenDispatcher(MoETokenDispatcher):
 
 
 class TopKRouter(Router):
-    """TopK Router without token dropping.
-    """
+    """Route each token to the top-k experts."""
 
     def __init__(
-        self,
-        num_local_experts: int,
-        local_expert_indices: List[int],
-        config: TransformerConfig,
+        self, num_local_experts: int, local_expert_indices: List[int], config: TransformerConfig,
     ) -> None:
         """Initialize the zero token dropping router.
 
@@ -458,7 +454,7 @@ class TopKRouter(Router):
             logits = router_activation(logits)
             scores, indices = torch.topk(logits, k=self.topk, dim=1)
         return scores, indices
-    
+
     def aux_loss_load_balancing(self, logits: torch.Tensor):
         """Apply loss-based load balancing to the logits tensor.
 
@@ -472,9 +468,7 @@ class TopKRouter(Router):
         scores = torch.softmax(top_logits, dim=-1, dtype=torch.float32).type_as(logits)
         # Apply load balancing loss
         probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
-        scores = self.apply_aux_loss(
-            self.moe_aux_loss_func, probs, indices, activation=scores
-        )
+        scores = self.apply_aux_loss(self.moe_aux_loss_func, probs, indices, activation=scores)
         return scores, indices
 
     def routing(self, logits: torch.Tensor):

@@ -92,9 +92,5 @@ class DroplessMoELayer(BaseMoELayer):
         return experts
 
     def initialize_router(self):
-        router = TopKRouter(
-            self.num_local_experts,
-            self.local_expert_indices,
-            config=self.config,
-        )
+        router = TopKRouter(self.num_local_experts, self.local_expert_indices, config=self.config,)
         return router

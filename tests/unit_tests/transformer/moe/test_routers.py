@@ -24,7 +24,8 @@ class TestDroplessTop2Router:
             num_attention_heads=4,
             num_moe_experts=num_moe_experts,
             use_cpu_initialization=True,
-            moe_router_type="top2",
+            moe_router_load_balancing_type="aux_loss",
+            moe_router_topk=2,
             moe_aux_loss_coeff=0,
         )
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(

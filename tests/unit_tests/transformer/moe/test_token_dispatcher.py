@@ -22,13 +22,12 @@ class TestDroplessDispatcher:
             num_attention_heads=4,
             num_moe_experts=num_moe_experts,
             use_cpu_initialization=True,
-            moe_router_type="top2",
+            moe_router_load_balancing_type="aux_loss",
+            moe_router_topk=2,
         )
         self.router = TopKRouter(
             num_local_experts=num_moe_experts,
             local_expert_indices=range(num_moe_experts),
-            k=2,
-            routing_type="top",
             config=transformer_config,
         )
         self.token_dispatcher = self.router.token_dispatcher
