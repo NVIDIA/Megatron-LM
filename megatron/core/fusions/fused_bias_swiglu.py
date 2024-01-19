@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import torch
 import torch.nn.functional as F
@@ -62,6 +62,7 @@ class SwiGLUFunction(torch.autograd.Function):
         tmp = swiglu_back(grad_output, input[0])
         return tmp
 
+
 def bias_swiglu_impl(input, bias):
     shape = input.shape
     input = input.view(-1, shape[2])
@@ -71,5 +72,6 @@ def bias_swiglu_impl(input, bias):
         output = SwiGLUFunction.apply(input)
     return output.view(shape[0], shape[1], -1)
 
-#bias_swiglu_impl = BiasSwiGLUFunction.apply
-#swiglu_impl = SwiGLUFunction.apply
+
+# bias_swiglu_impl = BiasSwiGLUFunction.apply
+# swiglu_impl = SwiGLUFunction.apply

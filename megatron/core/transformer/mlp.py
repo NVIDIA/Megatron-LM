@@ -89,7 +89,7 @@ class MLP(MegatronModule):
             if self.activation_func == F.gelu:
                 assert self.config.add_bias_linear is True
                 intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
-            elif self.activation_func == F.silu:
+            elif self.activation_func == F.silu and self.config.gated_linear_unit:
                 intermediate_parallel = bias_swiglu_impl(intermediate_parallel, bias_parallel)
             else:
                 raise ValueError("Only support fusion of gelu and swiglu")
@@ -97,9 +97,11 @@ class MLP(MegatronModule):
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
             if self.config.gated_linear_unit:
+
                 def glu(x):
                     x = torch.chunk(x, 2, dim=-1)
                     return self.config.activation_func(x[0]) * x[1]
+
                 intermediate_parallel = glu(intermediate_parallel)
             else:
                 intermediate_parallel = self.activation_func(intermediate_parallel)
