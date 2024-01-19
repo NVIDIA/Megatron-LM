@@ -12,7 +12,10 @@ from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
-from megatron.core.transformer.custom_layers.transformer_engine import TENorm
+from megatron.core.transformer.custom_layers.transformer_engine import (
+    TENorm,
+    get_cpu_offload_context,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -104,6 +107,27 @@ class TransformerBlock(MegatronModule):
         self.input_tensor = None
 
         self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
+
+        if get_cpu_offload_context is not None:
+            (
+                self.offload_context,
+                self.group_prefetch_offload_commit_async,
+            ) = get_cpu_offload_context(
+                self.config.cpu_offloading,
+                self.config.cpu_offloading_num_layers,
+                self.config.cpu_offloading_activations,
+                self.config.cpu_offloading_weights,
+            )
+            self.config._cpu_offloading_context = (
+                self.offload_context if self.config.cpu_offloading else None
+            )
+        else:
+            assert (
+                self.config.cpu_offloading == False
+            ), "CPU Offloading is enabled when TE is not present"
+
+            self.offload_context, self.group_prefetch_offload_commit_async = nullcontext(), None
+            self.config._cpu_offloading_context = None
 
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
@@ -311,14 +335,23 @@ class TransformerBlock(MegatronModule):
                 )
             else:
                 for layer in self.layers:
-                    hidden_states, context = layer(
-                        hidden_states=hidden_states,
-                        attention_mask=attention_mask,
-                        context=context,
-                        context_mask=context_mask,
-                        rotary_pos_emb=rotary_pos_emb,
-                        inference_params=inference_params,
-                    )
+
+                    with self.offload_context:
+                        hidden_states, context = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            context=context,
+                            context_mask=context_mask,
+                            rotary_pos_emb=rotary_pos_emb,
+                            inference_params=inference_params,
+                        )
+
+                    if (
+                        torch.is_grad_enabled()
+                        and self.config.cpu_offloading
+                        and self.group_prefetch_offload_commit_async is not None
+                    ):
+                        hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:

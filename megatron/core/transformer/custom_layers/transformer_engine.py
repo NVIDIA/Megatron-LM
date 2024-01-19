@@ -452,3 +452,11 @@ try:
 except ImportError:
 
     SplitAlongDim = None
+
+try:
+
+    from transformer_engine.pytorch.cpu_offload import get_cpu_offload_context
+
+except ImportError:
+
+    get_cpu_offload_context = None
