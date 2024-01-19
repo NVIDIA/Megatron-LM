@@ -920,12 +920,37 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 stream = torch.cuda.default_stream()
 
             with torch.cuda.stream(stream):
-                torch.distributed._all_gather_base(
-                    pbuf,
-                    pbuf_views[data_parallel_rank],
-                    group = data_parallel_group,
-                    async_op = False
-                )
+                if self.quantize_helper is not None and self.quantize_helper.quantized_weights:
+                    data_parallel_world_size = mpu.get_data_parallel_world_size()
+                    quantized_shard, scales = self.quantize_helper.quantize_gather_weights(pbuf_views[data_parallel_rank])
+                    pbuf_int8_view = pbuf.view(torch.int8).contiguous()
+                    quantized_buffer_view = pbuf_int8_view[:quantized_shard.numel() * data_parallel_world_size]
+
+                    # All-gather for quantized parameters
+                    torch.distributed._all_gather_base(
+                        quantized_buffer_view,
+                        quantized_shard,
+                        group=data_parallel_group
+                    )
+
+                    # Prepare buffer for all-gathered scales
+                    all_scales = torch.empty(data_parallel_world_size * scales.numel(), dtype=scales.dtype, device=scales.device)
+
+                    # All-gather for scales
+                    torch.distributed._all_gather_base(
+                        all_scales,
+                        scales,
+                        group=data_parallel_group
+                    )
+                    # Dequantize the gathered buffer and update the parameters
+                    self.quantize_helper.dequantize_gather_weights(quantized_buffer_view, all_scales, pbuf)
+                else:
+                    torch.distributed._all_gather_base(
+                        pbuf,
+                        pbuf_views[data_parallel_rank],
+                        group = data_parallel_group,
+                        async_op = False
+                    )
                 event.record()
             if not self.overlap_param_gather:
                 self.all_gather_events[-1].synchronize()

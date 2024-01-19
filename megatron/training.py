@@ -420,6 +420,8 @@ def setup_model_and_optimizer(model_provider_func,
 
     optimizer = get_megatron_optimizer(model, no_wd_decay_cond,
                                        scale_lr_cond, lr_mult)
+    if hasattr(model[0], 'quantization_helper'):
+        optimizer.quantize_helper = model[0].quantization_helper
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     if args.load is not None:

@@ -61,7 +61,7 @@ class QuantizationHelper:
             self.cuda_quantizer = CUDAQuantizer()
             self.cuda_quantizer.target_group_size = self.wq_group_size
         if received_buffer is not None:
-            received_buffer.data = self.cuda_quantizer.dequantize(quantized_weight_tensor, scale, quantization_bits=self.weight_quantization_bits)
+            received_buffer.copy_(self.cuda_quantizer.dequantize(quantized_weight_tensor, scale, quantization_bits=self.weight_quantization_bits))
             return received_buffer
         else:
             return self.cuda_quantizer.dequantize(quantized_weight_tensor, scale, quantization_bits=self.weight_quantization_bits)
