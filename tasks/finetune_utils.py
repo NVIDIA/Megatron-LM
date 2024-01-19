@@ -11,6 +11,7 @@ from megatron import print_rank_0
 from megatron import get_timers
 from megatron.core import mpu
 from megatron.core.enums import ModelType
+from megatron.core.utils import get_model_config
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.training import evaluate_and_print_results
@@ -146,7 +147,8 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
     """Train the model."""
     args = get_args()
     timers = get_timers()
-
+    config = get_model_config(model[0])
+    
     assert get_num_microbatches() == 1, "finetuning with gradient accumulation doesn't currently work"
 
     # Turn on training mode which enables dropout.
@@ -182,7 +184,7 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
             start_iteration = 0
 
             # Train for one step.
-            out = train_step(forward_step, batch, model, optimizer, opt_param_scheduler)
+            out = train_step(forward_step, batch, model, optimizer, opt_param_scheduler, config)
 
             losses_dict, skipped_iter, grad_norm, num_zeros_in_grad = out
             iteration += 1
@@ -216,7 +218,7 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
                 prefix = 'iteration {}'.format(iteration)
                 evaluate_and_print_results(prefix, forward_step,
                                            valid_dataloader, model,
-                                           iteration, None, False)
+                                           iteration, None, config)
 
             # Exiting based on iterations
             if args.exit_interval and iteration % args.exit_interval == 0:

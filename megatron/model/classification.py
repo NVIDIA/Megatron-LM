@@ -28,7 +28,8 @@ class Classification(MegatronModule):
         self.num_classes = num_classes
         self.pre_process = pre_process
         self.post_process = post_process
-
+        if config.init_method is None:
+            config.init_method = init_method_normal(config.init_method_std)
         self.language_model, self._language_model_key = get_language_model(
             config=config,
             num_tokentypes=num_tokentypes,
@@ -42,7 +43,7 @@ class Classification(MegatronModule):
             self.classification_dropout = torch.nn.Dropout(args.hidden_dropout)
             self.classification_head = get_linear_layer(args.hidden_size,
                                                         self.num_classes,
-                                                        init_method)
+                                                        config.init_method)
             self._classification_head_key = 'classification_head'
 
     def set_input_tensor(self, input_tensor):

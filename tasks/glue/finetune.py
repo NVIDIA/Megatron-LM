@@ -29,7 +29,7 @@ def glue_classification(num_classes, Dataset,
     def model_provider(pre_process=True, post_process=True):
         """Build the model."""
         args = get_args()
-        config = core_transformer_config_from_args()
+        config = core_transformer_config_from_args(args)
 
         print_rank_0('building classification model for {} ...'.format(
             args.task))
