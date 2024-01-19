@@ -452,7 +452,9 @@ def core_transformer_config_from_args(args):
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
-        kw_args['bias_gelu_fusion'] = False
+        kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
+    else:
+        kw_args['bias_activation_fusion'] = args.bias_gelu_fusion
     if args.squared_relu:
         assert not args.swiglu
         def squared_relu(x):
@@ -895,9 +897,17 @@ def _add_training_args(parser):
     group.add_argument('--no-bias-gelu-fusion', action='store_false',
                        help='Disable bias and gelu fusion.',
                        dest='bias_gelu_fusion')
+    group.add_argument('--no-bias-swiglu-fusion', action='store_false',
+                       help='Disable bias and swiglu fusion, the fusion is '
+                       'available only when using megatron-core.',
+                       dest='bias_swiglu_fusion')
     group.add_argument('--no-bias-dropout-fusion', action='store_false',
                        help='Disable bias and dropout fusion.',
                        dest='bias_dropout_fusion')
+    group.add_argument('--no-rope-fusion', action='store_false',
+                       help='Disable rope fusion, the fusion is available '
+                       'only when using megatron-core.',
+                       dest='apply_rope_fusion')
     group.add_argument('--use-flash-attn', action='store_true',
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')

@@ -94,6 +94,8 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        --transformer-impl $TRANSFORMER_IMPL \
        --tensor-model-parallel-size $TP_SIZE \
        --pipeline-model-parallel-size $PP_SIZE \
+       --no-bias-swiglu-fusion \
+       --no-rope-fusion \
        ${VP_SIZE:+--num-layers-per-virtual-pipeline-stage "$VP_SIZE"} \
        ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
        ${USE_MCORE:+--use-mcore-models} \

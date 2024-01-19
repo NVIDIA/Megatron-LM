@@ -95,10 +95,11 @@ class TransformerConfig(ModelParallelConfig):
     # communication
 
     # fusion
-    bias_gelu_fusion: bool = False  # TODO: this should be bias_activation_fusion ?
+    bias_activation_fusion: bool = False
     masked_softmax_fusion: bool = False
     persist_layer_norm: bool = False
     bias_dropout_fusion: bool = False  # TODO: this should be bias_dropout_add_fusion?
+    apply_rope_fusion: bool = False
 
     # activation recomputation
     recompute_granularity: str = None
@@ -223,14 +224,15 @@ class TransformerConfig(ModelParallelConfig):
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
-        if self.bias_gelu_fusion:
-            if not self.add_bias_linear:
+        if self.bias_activation_fusion:
+            if self.activation_func not in [F.gelu, F.silu]:
                 raise ValueError(
-                    "When bias_gelu_fusion is True, add_bias_linear must also be True."
+                    "When bias_activation_fusion is True, activation function should be either gelu or swiglu"
                 )
-
-            if self.activation_func != F.gelu:
-                raise ValueError(f'When bias_gelu_fusion is True, activation_func must be F.gelu.')
+            if self.activation_func == F.gelu and not self.add_bias_linear:
+                raise ValueError(
+                    "When bias_activation_fusion is True and activation function is gelu, add_bias_linear must also be True."
+                )
 
         if self.init_method is None:
             self.init_method = init_method_normal(self.init_method_std)

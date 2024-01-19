@@ -361,6 +361,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
     ):
         self.config = config
         self.te_forward_mask_type = False
+        self.qkv_format = 'sbhd'
 
         if self.config.apply_query_key_layer_scaling != bool(
             int(os.getenv('NVTE_APPLY_QK_LAYER_SCALING', '0'))
@@ -390,6 +391,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
         if te_version > packaging.version.Version("0.12.0"):
             self.te_forward_mask_type = True
+
+        if self.config.apply_rope_fusion and te_version > packaging.version.Version("0.13.0"):
+            extra_kwargs["qkv_format"] = self.qkv_format = 'bshd'
 
         # Only Transformer-Engine version >= 1.0.0 supports context parallelism
         if te_version >= packaging.version.Version("1.0.0"):
@@ -435,12 +439,20 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         attention_mask: Tensor,
         attn_mask_type: AttnMaskType,
     ):
+        if self.config.apply_rope_fusion and self.qkv_format == 'bshd':
+            query, key, value = [x.transpose(0, 1).contiguous() for x in (query, key, value)]
+
         if self.te_forward_mask_type:
-            return super().forward(
+            core_attn_out = super().forward(
                 query, key, value, attention_mask, attn_mask_type=attn_mask_type.name
             )
         else:
-            return super().forward(query, key, value, attention_mask)
+            core_attn_out = super().forward(query, key, value, attention_mask)
+
+        if self.config.apply_rope_fusion and self.qkv_format == 'bshd':
+            return core_attn_out.transpose(0, 1)
+        else:
+            return core_attn_out
 
 
 try:

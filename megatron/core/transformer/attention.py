@@ -1,10 +1,24 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from importlib.metadata import version
 from typing import Union
 
+from pkg_resources import packaging
+
+logger = logging.getLogger(__name__)
+
 import torch
+
+try:
+    from apex.transformer.functional import fused_apply_rotary_pos_emb
+
+    HAVE_APPLY_ROPE_FUSION = True
+except:
+    HAVE_APPLY_ROPE_FUSION = False
+
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.common.embeddings.rotary_pos_embedding import apply_rotary_pos_emb
@@ -69,6 +83,13 @@ class Attention(MegatronModule, ABC):
         )
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
+
+        if self.config.apply_rope_fusion and not HAVE_APPLY_ROPE_FUSION:
+            self.config.apply_rope_fusion = False
+            logger.warning(
+                "set apply_rope_fusion to false because its implementation"
+                " is not included in Apex. Try upgrading to the latest version"
+            )
 
         self.core_attention = build_module(
             submodules.core_attention,
@@ -238,14 +259,17 @@ class Attention(MegatronModule, ABC):
         key, value, rotary_pos_emb, attn_mask_type = self._adjust_key_value_for_inference(
             inference_params, key, value, rotary_pos_emb
         )
-
         # ================================================
         # relative positional embedding (rotary embedding)
         # ================================================
         if rotary_pos_emb is not None:
             q_pos_emb, k_pos_emb = rotary_pos_emb
-            query = apply_rotary_pos_emb(query, q_pos_emb)
-            key = apply_rotary_pos_emb(key, k_pos_emb)
+            if self.config.apply_rope_fusion:
+                query = fused_apply_rotary_pos_emb(query, q_pos_emb, transpose_output_memory=True)
+                key = fused_apply_rotary_pos_emb(key, k_pos_emb, transpose_output_memory=True)
+            else:
+                query = apply_rotary_pos_emb(query, q_pos_emb)
+                key = apply_rotary_pos_emb(key, k_pos_emb)
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
