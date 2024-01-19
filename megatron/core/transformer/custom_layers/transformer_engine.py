@@ -238,11 +238,11 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             return out
         return out, None
 
-    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
+    def sharded_state_dict(self, prefix='', sharded_offsets=()):
         """ Sharding along axis 0, bias sharded """
         state_dict = self.state_dict(prefix='', keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, sharded_key_prefix, {'weight': 0, 'bias': 0}, sharded_offsets
+            state_dict, prefix, {'weight': 0, 'bias': 0}, sharded_offsets
         )
 
 
@@ -284,11 +284,11 @@ class TEColumnParallelLinear(TELinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
         )
 
-    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
+    def sharded_state_dict(self, prefix='', sharded_offsets=()):
         """ Sharding along axis 0, bias sharded """
         state_dict = self.state_dict(prefix='', keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, sharded_key_prefix, {'weight': 0, 'bias': 0}, sharded_offsets
+            state_dict, prefix, {'weight': 0, 'bias': 0}, sharded_offsets
         )
 
 
@@ -331,11 +331,11 @@ class TERowParallelLinear(TELinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
         )
 
-    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
+    def sharded_state_dict(self, prefix='', sharded_offsets=()):
         """ Sharding along axis 1, bias not sharded """
         state_dict = self.state_dict(prefix='', keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, sharded_key_prefix, {'weight': 1}, sharded_offsets
+            state_dict, prefix, {'weight': 1}, sharded_offsets
         )
 
 

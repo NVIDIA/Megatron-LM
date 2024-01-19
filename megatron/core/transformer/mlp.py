@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict, ShardedTensorFactory
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -106,19 +106,14 @@ class MLP(MegatronModule):
 
         return output, output_bias
 
-    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
-        sharded_key_prefix = prefix if sharded_key_prefix is None else sharded_key_prefix
+    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()) -> ShardedStateDict:
         sharded_state_dict = {}
         for name, module in self._modules.items():
             if name == 'linear_fc1' and self.config.gated_linear_unit:
-                sub_sd = self._sharded_state_dict_for_glu(
-                    name, module, prefix, sharded_key_prefix, sharded_offsets
-                )
+                sub_sd = self._sharded_state_dict_for_glu(name, module, prefix, sharded_offsets)
             else:
                 sub_sd = module.sharded_state_dict(
-                    prefix=f'{prefix}{name}.',
-                    sharded_key_prefix=f'{sharded_key_prefix}{name}.',
-                    sharded_offsets=sharded_offsets,
+                    prefix=f'{prefix}{name}.', sharded_offsets=sharded_offsets,
                 )
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
@@ -128,14 +123,11 @@ class MLP(MegatronModule):
         module_name: str,
         module: torch.nn.Module,
         prefix: str,
-        sharded_key_prefix: str,
         sharded_offsets: Tuple[Tuple[int, int, int]],
     ):
         assert module_name == 'linear_fc1', module_name
         sharded_state_dict = module.sharded_state_dict(
-            prefix=f'{prefix}{module_name}.',
-            sharded_key_prefix=f'{sharded_key_prefix}{module_name}.',
-            sharded_offsets=sharded_offsets,
+            prefix=f'{prefix}{module_name}.', sharded_offsets=sharded_offsets,
         )
         weight_key = f'{prefix}{module_name}.weight'
         prev_sh_ten = sharded_state_dict[weight_key]

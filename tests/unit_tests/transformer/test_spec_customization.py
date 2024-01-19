@@ -77,6 +77,7 @@ class TestSpecCustomization:
         noop_transformer_layer = [
             build_module(getattr(self.transformer_layer_spec, field.name))
             for field in fields(self.transformer_layer_spec)
+            if field.name != 'sharded_state_dict_keys_map'
         ]
 
         x = random_input
