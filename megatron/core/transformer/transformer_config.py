@@ -53,7 +53,6 @@ class TransformerConfig(ModelParallelConfig):
             fp8_wgrad (bool): When set to False, override FP8 config options and do the wgrad computation in higher precision. Defaults to True.
             cpu_offloading (bool): When set to True, all the activations are offloaded to the CPU asynchronously
             cpu_offloading_num_layers (int): Tells the number of transformer layers for which activations has to be offloaded.
-            cpu_offloading_context (ContextManager): Holds the context manager from TE which is supposed to add PyT hooks for offload/reload of data from CPU.
             cpu_offloading_activations (bool): If True, offloads the activations to CPU
             cpu_offloading_weights (bool): If True, offloads the weights to CPU
             clone_scatter_output_in_embedding (bool): When set to true, clone the output of scatter_to_sequence_parallel_region in embedding layer to facilitate garbage collection of input.
@@ -118,7 +117,7 @@ class TransformerConfig(ModelParallelConfig):
     # cpu offload
     cpu_offloading: bool = False
     cpu_offloading_num_layers: int = 0
-    cpu_offloading_context: ContextManager = None
+    _cpu_offloading_context: ContextManager = None  # Used for internal use only, not to be set by the user. TODO: Need to move to the 'right' place when possible.
     cpu_offloading_activations: bool = True
     cpu_offloading_weights: bool = True
 
