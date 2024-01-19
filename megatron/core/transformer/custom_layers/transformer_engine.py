@@ -98,7 +98,7 @@ class TELinear(te.pytorch.Linear):
         # ourselves. This way our forward always returns two values
         # and we don't have to deal with the zero length Tensor.
         self.te_return_bias = skip_bias_add and bias
-
+        self.is_first_microbatch = True
         if skip_weight_param_allocation:
             raise ValueError(
                 'Transformer Engine linear layers do not support skip_weight_param_allocation'
@@ -135,7 +135,8 @@ class TELinear(te.pytorch.Linear):
         )
 
     def forward(self, x):
-        out = super().forward(x)
+        out = super().forward(x, is_first_microbatch=self.is_first_microbatch)
+        self.is_first_microbatch = False
 
         # TE only returns a tuple when return_bias is True, otherwise
         # it returns a single Tensor, we always want to return two
@@ -184,7 +185,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         # ourselves. This way our forward always returns two values
         # and we don't have to deal with the zero length Tensor.
         self.te_return_bias = skip_bias_add and bias
-
+        self.is_first_microbatch = True
         extra_kwargs = _get_extra_te_kwargs(config)
 
         # Only Transformer-Engine version >= 0.11.0 supports `RMSNorm`
@@ -227,7 +228,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         )
 
     def forward(self, x):
-        out = super().forward(x)
+        out = super().forward(x, is_first_microbatch=self.is_first_microbatch)
+        self.is_first_microbatch = False
 
         # TE only returns a tuple when return_bias is True, otherwise
         # it returns a single Tensor, we always want to return two
@@ -402,6 +404,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             assert (
                 self.config.context_parallel_size == 1
             ), "Only Transformer-Engine version >= 1.0.0 supports context parallelism!"
+
+        if config.window_size is not None:
+            # Check version
+            assert te_version >= packaging.version.Version(
+                "1.2.0"
+            ), f"Transformer-Engine version ({str(te_version)}) must be >= 1.2.0 to support sliding window attention."
+            extra_kwargs['window_size'] = config.window_size
 
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
