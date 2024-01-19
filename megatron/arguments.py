@@ -899,11 +899,17 @@ def _add_training_args(parser):
     group.add_argument('--no-bias-gelu-fusion', action='store_false',
                        help='Disable bias and gelu fusion.',
                        dest='bias_gelu_fusion')
-    group.add_argument('--bias-swiglu-fusion', action='store_true',
-                       help='enable bias and swiglu fusion.')
+    group.add_argument('--no-bias-swiglu-fusion', action='store_false',
+                       help='Disable bias and swiglu fusion, the fusion is '
+                       'available only when using megatron-core.',
+                       dest='bias_swiglu_fusion')
     group.add_argument('--no-bias-dropout-fusion', action='store_false',
                        help='Disable bias and dropout fusion.',
                        dest='bias_dropout_fusion')
+    group.add_argument('--no-rope-fusion', action='store_false',
+                       help='Disable rope fusion, the fusion is available '
+                       'only when using megatron-core.',
+                       dest='apply_rope_fusion')
     group.add_argument('--use-flash-attn', action='store_true',
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
