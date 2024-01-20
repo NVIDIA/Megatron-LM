@@ -140,7 +140,7 @@ class GroupedMLP(MegatronModule):
         return fc2_output, None
 
 
-class SwitchMLP(MegatronModule):
+class SequentialMLP(MegatronModule):
     """
     Mixture of Experts Layer. Routes input to one of N MLP "experts"
     """

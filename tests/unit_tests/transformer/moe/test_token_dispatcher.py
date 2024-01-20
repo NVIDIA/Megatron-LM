@@ -56,9 +56,9 @@ class TestDroplessDispatcher:
             local_probs,
             revert_indices,
             global_local_map,
-        ) = self.token_dispatcher.dispatch(hidden_states, scores, indices)
+        ) = self.token_dispatcher.token_permutation(hidden_states, scores, indices)
         probs = torch.ones_like(local_probs) / 2
-        restored_hidden_states, restored_bias = self.token_dispatcher.restore(
+        restored_hidden_states, restored_bias = self.token_dispatcher.token_unpermutation(
             permuted_local_hidden_states,
             probs,
             revert_indices,

@@ -7,7 +7,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.moe.experts import GroupedMLP, SwitchMLP
+from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import MoEDroplessTokenDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -58,7 +58,7 @@ class MoELayer(BaseMoELayer):
             self.experts = GroupedMLP(self.num_local_experts, self.config)
         else:
             assert isinstance(self.submodules, MLPSubmodules)
-            self.experts = SwitchMLP(self.num_local_experts, self.config, self.submodules)
+            self.experts = SequentialMLP(self.num_local_experts, self.config, self.submodules)
         self.token_dispatcher = MoEDroplessTokenDispatcher(
             self.num_local_experts, self.local_expert_indices, config=self.config
         )
@@ -73,9 +73,9 @@ class MoELayer(BaseMoELayer):
             scores,
             indices,
             global_local_map,
-        ) = self.token_dispatcher.dispatch(hidden_states, scores, indices)
+        ) = self.token_dispatcher.token_permutation(hidden_states, scores, indices)
         expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
-        output, mlp_bias = self.token_dispatcher.restore(
+        output, mlp_bias = self.token_dispatcher.token_unpermutation(
             expert_output, scores, indices, global_local_map, mlp_bias
         )
 

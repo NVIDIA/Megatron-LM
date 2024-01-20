@@ -20,7 +20,7 @@ class MoETokenDispatcher:
         self.config = config
 
     @abstractmethod
-    def dispatch(
+    def token_permutation(
         self, tokens: torch.Tensor, indices: torch.Tensor,
     ):
         """Dispatch tokens to experts.
@@ -35,7 +35,7 @@ class MoETokenDispatcher:
         raise NotImplementedError("Dispatch function not implemented.")
 
     @abstractmethod
-    def restore(
+    def token_unpermutation(
         self, expert_output: torch.Tensor, scores: torch.Tensor, indices: torch.Tensor,
     ):
         """Restores the expert output to its original ordering.
@@ -86,7 +86,9 @@ class MoEDroplessTokenDispatcher(MoETokenDispatcher):
         torch.distributed._all_gather_base(output, local_indices.contiguous(), group=group)
         return output
 
-    def dispatch(self, hidden_states: torch.Tensor, max_prob: torch.Tensor, max_ind: torch.Tensor):
+    def token_permutation(
+        self, hidden_states: torch.Tensor, max_prob: torch.Tensor, max_ind: torch.Tensor
+    ):
         """Dispatch tokens to local experts. It's composed of two stages:
         (1) Permute the tokens across the expert parallel devices. After this stage,
         each device receives all of the tokens assigned to its local set of experts
@@ -171,7 +173,7 @@ class MoEDroplessTokenDispatcher(MoETokenDispatcher):
             global_local_map,
         )
 
-    def restore(
+    def token_unpermutation(
         self,
         hidden_states: torch.Tensor,
         scores: torch.Tensor,
