@@ -50,3 +50,49 @@ def sinkhorn(cost: torch.Tensor, tol: float = 0.0001):
         error = torch.mean(torch.abs(d1_old - d1))
         d1_old = d1
     return d1 * cost * d0.unsqueeze(1)
+
+
+class MoEAuxLossAutoScaler(torch.autograd.Function):
+    """An AutoScaler that compute and scales the grad for auxiliary loss.
+
+    """
+
+    main_loss_backward_scale: int = 1
+
+    @staticmethod
+    def forward(ctx, output: torch.Tensor, aux_loss: torch.Tensor):
+        """Preserve the aux_loss by storing it in the context to avoid garbage collection.
+        
+        Args:
+            output (torch.Tensor): The output tensor.
+            aux_loss (torch.Tensor): The auxiliary loss tensor.
+
+        Returns:
+            torch.Tensor: The output tensor.
+        """
+        ctx.save_for_backward(aux_loss)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """Compute and scale the gradient for auxiliary loss..
+
+        Args:
+            grad_output (torch.Tensor): The gradient of the output.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: The gradient of the output, scaled auxiliary loss gradient.
+        """
+        (aux_loss,) = ctx.saved_tensors
+        aux_loss_backward_scale = MoEAuxLossAutoScaler.main_loss_backward_scale
+        scaled_aux_loss_grad = torch.ones_like(aux_loss) * aux_loss_backward_scale
+        return grad_output, scaled_aux_loss_grad
+
+    @staticmethod
+    def set_loss_scale(scale: int):
+        """set the scale of the aux loss.
+        
+        Args:
+            scale (int): The scale value to set. Please ensure that the scale passed in matches the scale of the main_loss.
+        """
+        MoEAuxLossAutoScaler.main_loss_backward_scale = scale

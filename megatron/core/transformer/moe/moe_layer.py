@@ -7,9 +7,9 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.moe.grouped_mlp import GroupedMLP
+from megatron.core.transformer.moe.experts import GroupedMLP, SwitchMLP
 from megatron.core.transformer.moe.router import TopKRouter
-from megatron.core.transformer.moe.switch_mlp import SwitchMLP
+from megatron.core.transformer.moe.token_dispatcher import MoEDroplessTokenDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -34,23 +34,15 @@ class BaseMoELayer(MegatronModule, ABC):
         ]
         self.router = None
         self.experts = None
-
-    @abstractmethod
-    def initialize_experts(self):
-        pass
-
-    @abstractmethod
-    def initialize_router(self):
-        pass
+        self.token_dispatcher = None
 
     @abstractmethod
     def forward(self, hidden_states):
         pass
 
 
-class DroplessMoELayer(BaseMoELayer):
-    """Top-K Mixture of Experts Layer **Without Token Dropping**.
-    Currently supports Sinkhorn-based routing (Top-k based) and generalized Top-k routing with auxiliary loss.
+class MoELayer(BaseMoELayer):
+    """Mixture of experts Layer **currently only supports no token dropping**.
 
     Args:
         BaseMoELayer (MegatronModule): Base class for MoE layers
@@ -58,9 +50,18 @@ class DroplessMoELayer(BaseMoELayer):
 
     def __init__(self, config: TransformerConfig, submodules: MLPSubmodules = None):
         self.submodules = submodules
-        super(DroplessMoELayer, self).__init__(config=config)
-        self.router = self.initialize_router()
-        self.experts = self.initialize_experts()
+        super(MoELayer, self).__init__(config=config)
+        self.router = TopKRouter(
+            self.num_local_experts, self.local_expert_indices, config=self.config
+        )
+        if self.config.moe_grouped_gemm:
+            self.experts = GroupedMLP(self.num_local_experts, self.config)
+        else:
+            assert isinstance(self.submodules, MLPSubmodules)
+            self.experts = SwitchMLP(self.num_local_experts, self.config, self.submodules)
+        self.token_dispatcher = MoEDroplessTokenDispatcher(
+            self.num_local_experts, self.local_expert_indices, config=self.config
+        )
         assert config.moe_token_dropping is False
 
     def forward(self, hidden_states: torch.Tensor):
@@ -72,9 +73,9 @@ class DroplessMoELayer(BaseMoELayer):
             scores,
             indices,
             global_local_map,
-        ) = self.router.token_dispatcher.dispatch(hidden_states, scores, indices)
+        ) = self.token_dispatcher.dispatch(hidden_states, scores, indices)
         expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
-        output, mlp_bias = self.router.token_dispatcher.restore(
+        output, mlp_bias = self.token_dispatcher.restore(
             expert_output, scores, indices, global_local_map, mlp_bias
         )
 
@@ -82,15 +83,3 @@ class DroplessMoELayer(BaseMoELayer):
             mlp_bias = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
 
         return output, mlp_bias
-
-    def initialize_experts(self):
-        if self.config.moe_grouped_gemm:
-            experts = GroupedMLP(self.num_local_experts, self.config)
-        else:
-            assert isinstance(self.submodules, MLPSubmodules)
-            experts = SwitchMLP(self.num_local_experts, self.config, self.submodules)
-        return experts
-
-    def initialize_router(self):
-        router = TopKRouter(self.num_local_experts, self.local_expert_indices, config=self.config,)
-        return router

@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from megatron.core.transformer.moe.router import Router, TopKRouter
+from megatron.core.transformer.moe.token_dispatcher import MoEDroplessTokenDispatcher
 from megatron.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -30,7 +31,9 @@ class TestDroplessDispatcher:
             local_expert_indices=range(num_moe_experts),
             config=transformer_config,
         )
-        self.token_dispatcher = self.router.token_dispatcher
+        self.token_dispatcher = MoEDroplessTokenDispatcher(
+            num_moe_experts, range(num_moe_experts), config=transformer_config
+        )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
