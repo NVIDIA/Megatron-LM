@@ -504,6 +504,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 (gbuf_index, dtype, bucket_index)
             )
             all_gather_handle_index = len(self.all_gather_handle_index_to_bucket_index_map) - 1
+            self.all_gather_handles.append(None)
 
             # Store all all_gather_handle_indices.
             model_idx = self.gbuf_idx_to_model_idx_map[gbuf_index]
@@ -519,12 +520,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.num_all_gather_handles = len(self.all_gather_handle_index_to_bucket_index_map)
 
         self.overlap_param_gather = get_args().overlap_param_gather
+        self.remove_pre_hook_handle = None
         if self.overlap_param_gather:
-            self.remove_pre_hook_handle = torch.nn.modules.module.register_module_forward_pre_hook(
-                self._make_forward_pre_hook()
-            )
-        else:
-            self.remove_pre_hook_handle = None
+            self.enable_pre_hook()
 
         self.update_successful = False
 
@@ -533,6 +531,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         #   recast preexisting per-param state tensors.
         self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
         self.optimizer.load_state_dict(self.optimizer.state_dict())
+
+    def disable_pre_hook(self):
+        assert self.remove_pre_hook_handle is not None
+        self.remove_pre_hook_handle.remove()
+        self.remove_pre_hook_handle = None
+
+        # Make sure all-gathers are completed as needed.
+        self._reset_metadata_and_sync_gather_all_model_params(force_sync=True)
+
+    def enable_pre_hook(self):
+        assert self.remove_pre_hook_handle is None
+        self.remove_pre_hook_handle = torch.nn.modules.module.register_module_forward_pre_hook(
+            self._make_forward_pre_hook()
+        )
 
     def get_model_param_range_map(self, param):
         """
@@ -981,7 +993,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         return view_items
 
-    def _dispatch_gather_model_params(self, all_gather_handle_index):
+    def _dispatch_gather_model_params(self, all_gather_handle_index, force_sync=False):
         """
         All-gather updated model params.
 
@@ -989,6 +1001,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         tensors are dynamically allocated. After the all-gather, the params
         can be copied from the param buffer to the param.
         """
+        async_op = self.overlap_param_gather and not force_sync
         if self.update_successful:
             data_parallel_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
             data_parallel_group = mpu.get_data_parallel_group(with_context_parallel=True)
@@ -1001,22 +1014,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             (gbuf_index, dtype, bucket_index, pbuf, pbuf_views) = self.pbuf_view_items[
                 all_gather_handle_index
             ]
-            assert all_gather_handle_index == len(self.all_gather_handles)
+            assert all_gather_handle_index < len(self.all_gather_handles)
             all_gather_handle = torch.distributed._all_gather_base(
-                pbuf,
-                pbuf_views[data_parallel_rank],
-                group=data_parallel_group,
-                async_op=self.overlap_param_gather,
+                pbuf, pbuf_views[data_parallel_rank], group=data_parallel_group, async_op=async_op,
             )
-            self.all_gather_handles.append(all_gather_handle)
+            self.all_gather_handles[all_gather_handle_index] = all_gather_handle
             assert self.all_gather_handle_index_to_bucket_index_map[all_gather_handle_index] == (
                 gbuf_index,
                 dtype,
                 bucket_index,
             )
-            self.param_buffer_copied.append(False)
 
-        if not self.overlap_param_gather:
+        if not async_op:
             self._copy_params_from_param_buffer(all_gather_handle_index)
 
     def _make_forward_pre_hook(self):
@@ -1062,9 +1071,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # First check if there is an outstanding all-gather handle for this param.
         # If so, wait on the handle to ensure the communication is finished.
-        if all_gather_handle_index >= len(self.all_gather_handles):
-            return
-
+        assert all_gather_handle_index < len(self.all_gather_handles)
         all_gather_handle = self.all_gather_handles[all_gather_handle_index]
         if all_gather_handle is not None:
             all_gather_handle.wait()
@@ -1221,20 +1228,29 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
         copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)
 
+    def _reset_metadata_and_sync_gather_all_model_params(self, force_sync):
+        # Reset metadata needed to track results of all-gathers.
+        self.all_gather_handles = [None for _ in range(len(self.all_gather_handles))]
+        self.param_buffer_copied = [False for _ in range(len(self.param_buffer_copied))]
+
+        # Launch synchronous all-gather if --overlap-param-gather is turned on or if force_sync
+        # is explicitly set to True (e.g., if we are going to turn off all-gather overlapping for
+        # validation / test iterations).
+        if not self.overlap_param_gather or force_sync:
+            for all_gather_handle_index in range(self.num_all_gather_handles):
+                self._dispatch_gather_model_params(all_gather_handle_index, force_sync=force_sync)
+
     @torch.no_grad()
     def step(self, args, timers):
         self.update_successful, grad_norm, num_zeros_in_grad = super().step(args, timers)
 
-        # Reset metadata needed to track results of all-gathers.
-        self.all_gather_handles = []
-        self.param_buffer_copied = []
-
         # If not overlapping all-gather for parameters, launch synchronous all-gather
-        # communication calls here.
-        if not self.overlap_param_gather:
-            timers('params-all-gather', log_level=1).start(barrier=args.barrier_with_L1_time)
-            for all_gather_handle_index in range(self.num_all_gather_handles):
-                self._dispatch_gather_model_params(all_gather_handle_index)
-            timers('params-all-gather').stop()
+        # communication calls here. If overlapping all-gather for parameters, the following
+        # call to _gather_all_model_params is a no-op: the first all-gather is launched
+        # asynchronously in the next optimizer.zero_grad() call and subsequent all-gathers
+        # are launched in the forward pre-hook.
+        timers('params-all-gather', log_level=1).start(barrier=args.barrier_with_L1_time)
+        self._reset_metadata_and_sync_gather_all_model_params(force_sync=False)
+        timers('params-all-gather').stop()
 
         return self.update_successful, grad_norm, num_zeros_in_grad
