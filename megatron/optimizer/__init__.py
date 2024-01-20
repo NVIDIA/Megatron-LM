@@ -14,10 +14,7 @@ from .optimizer import (
 )
 
 
-def get_param_groups(model_chunks,
-                     no_weight_decay_cond,
-                     scale_lr_cond,
-                     lr_mult):
+def get_param_groups(model_chunks, no_weight_decay_cond, scale_lr_cond, lr_mult):
     """Create parameter groups for optimizer.
 
     Creates parameter groups based on weight decay condition (regularized vs
@@ -81,7 +78,12 @@ def get_param_groups(model_chunks,
         if len(params) == 0:
             continue
         param_groups.append(
-            {'params': params, 'wd_mult': wd_mult, 'lr_mult': lr_mult, 'is_expert_parallel': is_expert_parallel}
+            {
+                'params': params,
+                'wd_mult': wd_mult,
+                'lr_mult': lr_mult,
+                'is_expert_parallel': is_expert_parallel,
+            }
         )
 
     return param_groups
@@ -100,19 +102,19 @@ def get_megatron_optimizer_based_on_param_groups(param_groups, grad_buffers=None
     args = get_args()
 
     if args.optimizer == 'adam':
-        optimizer = Adam(param_groups,
-                         lr=args.lr,
-                         weight_decay=args.weight_decay,
-                         betas=(args.adam_beta1, args.adam_beta2),
-                         eps=args.adam_eps)
+        optimizer = Adam(
+            param_groups,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            betas=(args.adam_beta1, args.adam_beta2),
+            eps=args.adam_eps,
+        )
     elif args.optimizer == 'sgd':
-        optimizer = SGD(param_groups,
-                        lr=args.lr,
-                        weight_decay=args.weight_decay,
-                        momentum=args.sgd_momentum)
+        optimizer = SGD(
+            param_groups, lr=args.lr, weight_decay=args.weight_decay, momentum=args.sgd_momentum
+        )
     else:
-        raise Exception('{} optimizer is not supported.'.format(
-            args.optimizer))
+        raise Exception('{} optimizer is not supported.'.format(args.optimizer))
 
     # Determine whether the params have main-grad field.
     params_have_main_grad = True
@@ -151,7 +153,8 @@ def get_megatron_optimizer_based_on_param_groups(param_groups, grad_buffers=None
                     growth_factor=2.0,
                     backoff_factor=0.5,
                     growth_interval=args.loss_scale_window,
-                    hysteresis=args.hysteresis)
+                    hysteresis=args.hysteresis,
+                )
 
         optimizer_args = [
             optimizer,
@@ -172,16 +175,18 @@ def get_megatron_optimizer_based_on_param_groups(param_groups, grad_buffers=None
         return optimizer
 
     # FP32.
-    return FP32Optimizer(optimizer, args.clip_grad,
-                         args.log_num_zeros_in_grad,
-                         args.check_for_nan_in_loss_and_grad,
-                         params_have_main_grad)
+    return FP32Optimizer(
+        optimizer,
+        args.clip_grad,
+        args.log_num_zeros_in_grad,
+        args.check_for_nan_in_loss_and_grad,
+        params_have_main_grad,
+    )
 
 
-def get_megatron_optimizer(model_chunks,
-                           no_weight_decay_cond=None,
-                           scale_lr_cond=None,
-                           lr_mult=1.0):
+def get_megatron_optimizer(
+    model_chunks, no_weight_decay_cond=None, scale_lr_cond=None, lr_mult=1.0
+):
     """Retrieve the Megatron optimizer for model chunks.
 
     We use separate optimizers for expert parameters and non-expert parameters.
@@ -209,7 +214,9 @@ def get_megatron_optimizer(model_chunks,
     moe_param_groups = list(filter(lambda g: g['is_expert_parallel'], param_groups))
 
     # Create optimizers.
-    optimizers = [get_megatron_optimizer_based_on_param_groups(dense_param_groups, per_model_grad_buffers)]
+    optimizers = [
+        get_megatron_optimizer_based_on_param_groups(dense_param_groups, per_model_grad_buffers)
+    ]
     if len(moe_param_groups):
         optimizers.append(get_megatron_optimizer_based_on_param_groups(moe_param_groups))
 
