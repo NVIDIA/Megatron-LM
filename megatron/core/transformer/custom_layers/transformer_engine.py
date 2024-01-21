@@ -444,10 +444,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
         if self.te_forward_mask_type:
             core_attn_out = super().forward(
-                query, key, value, attention_mask, attn_mask_type=attn_mask_type.name
+                query, key, value, attention_mask, attn_mask_type=attn_mask_type.name, core_attention_bias_type=self.config.core_attention_bias_type
             )
         else:
-            core_attn_out = super().forward(query, key, value, attention_mask)
+            return super().forward(query, key, value, attention_mask, core_attention_bias_type=self.config.core_attention_bias_type)
 
         if self.config.apply_rope_fusion and self.qkv_format == 'bshd':
             return core_attn_out.transpose(0, 1)
