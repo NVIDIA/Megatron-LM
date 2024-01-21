@@ -72,6 +72,10 @@ class Bucket:
         self.overlap_grad_reduce = overlap_grad_reduce
         self.use_distributed_optimizer = use_distributed_optimizer
         self.quantization_helper = quantization_helper
+        if self.overlap_grad_reduce:
+            self.comm_stream = torch.cuda.Stream()
+        else:
+            self.comm_stream = torch.cuda.default_stream()
         self.reset()
 
     def reset(self):
@@ -94,35 +98,37 @@ class Bucket:
         assert (
             self.communication_event is None and not self.communication_issued
         ), 'Should not have multiple communication calls in flight at once'
-        if self.overlap_grad_reduce:
-            stream = torch.cuda.Stream()
-        else:
-            stream = torch.cuda.default_stream()
+
+        stream = self.comm_stream
         
         event = torch.cuda.Event()
         self.communication_event = event
         self.communication_issued = True
-        with torch.cuda.stream(stream):
-            self.data /= self.data_parallel_world_size
-            # Use async_op only when overlap_grad_reduce is True.
-            if self.use_distributed_optimizer:
-                local_data_view = shard_buffer(self.data, self.data_parallel_world_size)[
-                    self.data_parallel_rank
-                ]
-                if self.quantization_helper and self.quantization_helper.quantized_gradients:
+        self.data /= self.data_parallel_world_size
+        # Use async_op only when overlap_grad_reduce is True.
+        if self.use_distributed_optimizer:
+            local_data_view = shard_buffer(self.data, self.data_parallel_world_size)[
+                self.data_parallel_rank
+            ]
+            if self.quantization_helper and self.quantization_helper.quantized_gradients:
+                with torch.cuda.stream(stream):
                     local_data_view.copy_(self.quantization_helper.quantize_reduce_gradients(self.data))
-                else:
+                    event.record()
+            else:
+                with torch.cuda.stream(stream):
                     torch.distributed._reduce_scatter_base(
                         local_data_view,
                         self.data,
                         group=self.data_parallel_group,
                         async_op=False,
                     )
-            else:
+                    event.record()
+        else:
+            with torch.cuda.stream(stream):
                 torch.distributed.all_reduce(
                     self.data, group=self.data_parallel_group, async_op=False
                 )
-            event.record()
+                event.record()
         if not self.overlap_grad_reduce:
             self.communication_event.synchronize()
             self.communication_event = None

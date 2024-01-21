@@ -914,11 +914,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
             event = torch.cuda.Event()
             self.all_gather_events.append(event)
-            if self.overlap_param_gather:
-                stream = torch.cuda.Stream()
-            else:
-                stream = torch.cuda.default_stream()
-
+            stream = self.models[model_index].grad_buffers[dtype].buckets[bucket_index].comm_stream
             with torch.cuda.stream(stream):
                 if self.quantize_helper is not None and self.quantize_helper.quantized_weights:
                     data_parallel_world_size = mpu.get_data_parallel_world_size()
