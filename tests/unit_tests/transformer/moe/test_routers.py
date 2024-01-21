@@ -12,7 +12,7 @@ from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 
 
-class TestDroplessTop2Router:
+class TestTop2Router:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         _set_random_seed(seed_=123, data_parallel_random_init=False)

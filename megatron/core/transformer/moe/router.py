@@ -105,7 +105,7 @@ class TopKRouter(Router):
             config (TransformerConfig): The configuration for the transformer model.
         """
         super().__init__(config=config)
-        assert config.moe_token_dropping == False
+        assert config.moe_token_dropping is False
         self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type
         self.moe_aux_loss_func = switch_load_balancing_loss_func

@@ -62,7 +62,6 @@ class MoELayer(BaseMoELayer):
         self.token_dispatcher = MoEDroplessTokenDispatcher(
             self.num_local_experts, self.local_expert_indices, config=self.config
         )
-        assert config.moe_token_dropping is False
 
     def forward(self, hidden_states: torch.Tensor):
         # process MoE
@@ -78,8 +77,4 @@ class MoELayer(BaseMoELayer):
         output, mlp_bias = self.token_dispatcher.token_unpermutation(
             expert_output, scores, indices, global_local_map, mlp_bias
         )
-
-        if mlp_bias is None:
-            mlp_bias = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
-
         return output, mlp_bias

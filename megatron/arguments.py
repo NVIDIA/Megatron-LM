@@ -1157,8 +1157,6 @@ def _add_distributed_args(parser):
                        'affects the encoder embedding.)')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
-    group.add_argument('--expert-model-parallel-size', type=int, default=1,
-                       help='Degree of expert model parallelism.')
     group.add_argument('--context-parallel-size', type=int, default=1,
                        help='Degree of context parallelism.')
     group.add_argument('--nccl-communicator-config-path', type=str, default=None,
@@ -1375,7 +1373,6 @@ def _add_vision_args(parser):
     group.add_argument('--swin-backbone-type', type=str, default='tiny',
                        choices=['tiny', 'base', 'h3'],
                        help='pretraining objectives')
-
     # inpainting arguments
     group.add_argument('--mask-type', type=str, default='random',
                        choices=['random', 'row'],
@@ -1409,50 +1406,24 @@ def _add_vision_args(parser):
 
 def _add_moe_args(parser):
     group = parser.add_argument_group(title="moe")
-    # general moe arguements
-    group.add_argument(
-        '--num-experts', type=int, default=None, help='Number of Experts in MoE (None means no MoE)'
-    )
-    group.add_argument(
-        '--moe-router-load-balancing-type',
-        type=str,
-        choices=['aux_loss', 'sinkhorn', None],
-        default='aux_loss',
-        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "None" implies no load balancing. The default is "aux_loss".',
-    )
-    group.add_argument(
-        '--moe-router-topk',
-        type=int,
-        default=2,
-        help='Number of experts to route to for each token. The default is 2.',
-    )
-    group.add_argument(
-        '--moe-grouped-gemm',
-        action='store_true',
-        help='When there are multiple experts per rank, compress '
-        'multiple local (potentially small) gemms in a single kernel '
-        'launch to improve the utilization and performance by '
-        'leveraging the Grouped GEMM feature introduced since '
-        'CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).',
-    )
-    group.add_argument(
-        '--moe-aux-loss-coeff',
-        type=float,
-        default=0.0,
-        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.',
-    )
-    group.add_argument(
-        '--moe-z-loss-coeff',
-        type=float,
-        default=None,
-        help='Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended.',
-    )
-    group.add_argument(
-        '--moe-token-dropping',
-        action='store_true',
-        help='This feature involves selectively dropping and padding tokens for each expert to achieve a specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note: Currently unsupported.',
-    )
-    # zero token drop moe arguments
+    group.add_argument('--expert-model-parallel-size', type=int, default=1,
+                       help='Degree of expert model parallelism.')
+    group.add_argument('--num-experts', type=int, default=None,
+                       help='Number of Experts in MoE (None means no MoE)')
+    group.add_argument('--moe-router-load-balancing-type', type=str,
+                       choices=['aux_loss', 'sinkhorn', None],
+                       default='aux_loss',
+                       help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "None" implies no load balancing. The default is "aux_loss".')
+    group.add_argument('--moe-router-topk', type=int, default=2,
+                       help='Number of experts to route to for each token. The default is 2.')
+    group.add_argument('--moe-grouped-gemm', action='store_true',
+                       help='When there are multiple experts per rank, compress multiple local (potentially small) gemms in a single kernel launch to improve the utilization and performance by leveraging the Grouped GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).')
+    group.add_argument('--moe-aux-loss-coeff', type=float, default=0.0,
+                       help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
+    group.add_argument('--moe-z-loss-coeff', type=float, default=None,
+                       help='Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended.')
+    group.add_argument('--moe-token-dropping', action='store_true',
+                       help='This feature involves selectively dropping and padding tokens for each expert to achieve a specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note: Currently unsupported.')
 
     return parser
 

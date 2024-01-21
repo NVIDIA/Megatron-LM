@@ -17,8 +17,9 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 class GroupedMLP(MegatronModule):
-    """
-    Experts Layer with Grouped GEMM. Routes input to one of N MLP "experts"
+    """An efficient implementation of the Experts layer using CUTLASS GroupedGEMM.
+    
+    This class is designed to execute multiple experts in parallel, thereby maximizing computational efficiency.
     """
 
     def __init__(self, num_local_experts: int, config: TransformerConfig):
@@ -141,8 +142,9 @@ class GroupedMLP(MegatronModule):
 
 
 class SequentialMLP(MegatronModule):
-    """
-    Mixture of Experts Layer. Routes input to one of N MLP "experts"
+    """An implementation of the Experts layer using a sequence of MLP layers.
+    
+    This class executes each expert sequentially.
     """
 
     def __init__(self, num_local_experts, config: TransformerConfig, submodules: MLPSubmodules):
