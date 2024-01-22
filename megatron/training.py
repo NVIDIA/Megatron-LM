@@ -175,7 +175,13 @@ def pretrain(train_valid_test_dataset_provider,
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(extra_args_provider=extra_args_provider,
                         args_defaults=args_defaults)
-    append_to_progress_log("Starting job")
+
+    args = get_args()
+    timers = get_timers()
+
+    if args.log_progress:
+        append_to_progress_log("Starting job")
+
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     set_jit_fusion_options()
 
@@ -192,9 +198,6 @@ def pretrain(train_valid_test_dataset_provider,
     print_rank_0('time to initialize megatron (seconds): {:.3f}'.format(
         time.time() - _TRAIN_START_TIME))
     print_datetime('after megatron is initialized')
-
-    args = get_args()
-    timers = get_timers()
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
@@ -810,6 +813,7 @@ def compute_throughputs_and_append_to_progress_log(iteration,
 
 def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
                              num_floating_point_operations_so_far):
+    args = get_args()
     timers = get_timers()
     # Extra barrier is added to make sure all ranks report the max time.
     timers('save-checkpoint', log_level=0).start(barrier=True)
@@ -818,8 +822,9 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
     timers('save-checkpoint').stop(barrier=True)
     timers.log(['save-checkpoint'])
 
-    compute_throughputs_and_append_to_progress_log(iteration,
-                                                   num_floating_point_operations_so_far)
+    if args.log_progress:
+        compute_throughputs_and_append_to_progress_log(iteration,
+                                                       num_floating_point_operations_so_far)
 
 
 def train(forward_step_func, model, optimizer, opt_param_scheduler,
