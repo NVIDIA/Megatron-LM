@@ -140,10 +140,11 @@ def calculate_correct_answers(name, model, dataloader,
             args.micro_batch_size = actual_batch_size * sample_multiplier
             args.global_batch_size = actual_batch_size * sample_multiplier * num_micro_batches
 
-            loss_dicts = forward_backward_func(correct_answers_forward_step, batch, model,
-                                                args.global_batch_size/args.micro_batch_size,
-                                                args.seq_length,
-                                                args.micro_batch_size,
+            loss_dicts = forward_backward_func(forward_step_func=correct_answers_forward_step, 
+                                               data_iterator=batch, model=model,
+                                                num_microbatches=args.global_batch_size//args.micro_batch_size,
+                                                seq_length=args.seq_length,
+                                                micro_batch_size=args.micro_batch_size,
                                                 forward_only=True)
 
             for loss_dict in loss_dicts:
