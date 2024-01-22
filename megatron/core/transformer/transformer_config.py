@@ -2,7 +2,7 @@
 
 import types
 from dataclasses import dataclass
-from typing import Callable, ContextManager, Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F

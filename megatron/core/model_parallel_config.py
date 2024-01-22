@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, ContextManager, Optional
 
 import torch
 
@@ -210,7 +210,7 @@ class ModelParallelConfig:
     param_sync_func: Callable = None
     pipeline_model_parallel_split_rank: Optional[int] = None
 
-    #CPU Offloading
+    # CPU Offloading
     cpu_offloading: bool = False
     cpu_offloading_num_layers: int = 0
     _cpu_offloading_context: ContextManager = None  # Used for internal use only, not to be set by the user. TODO: Need to move to the 'right' place when possible.
