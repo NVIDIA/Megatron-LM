@@ -29,7 +29,7 @@ def sinkhorn(cost, tol=0.0001):
 
 
 def get_router_linear_layer(config):
-    router = torch.nn.Linear(config.hidden_size, config.num_moe_experts, bias=False)
+    router = torch.nn.Linear(config.hidden_size, config.num_moe_experts, bias=False, dtype=config.params_dtype)
     with get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
         config.init_method(router.weight)
     setattr(router.weight, 'sequence_parallel', config.sequence_parallel)
