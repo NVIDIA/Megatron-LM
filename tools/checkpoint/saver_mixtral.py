@@ -18,8 +18,6 @@ import os
 import sys
 
 import torch
-# TODO delete in megatron repository
-import torch_npu
 
 
 def add_arguments(parser):
@@ -46,8 +44,6 @@ def save_model_checkpoint(queue, args):
         sys.path.insert(0, args.megatron_path)
 
     try:
-        # TODO delete in megatron repository
-        from ascendspeed import megatron_adaptor
         from megatron.arguments import (parse_args, validate_args)
         from megatron.checkpointing import save_checkpoint
         from megatron.global_vars import set_global_variables, get_args
