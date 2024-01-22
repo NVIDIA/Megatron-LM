@@ -6,6 +6,7 @@ import gc
 from datetime import datetime
 import math
 import logging
+import os
 import sys
 from .log_handler import CustomHandler
 # Make default logging level INFO, but filter out all log messages not from MCore.
@@ -76,6 +77,65 @@ def num_floating_point_operations(args, batch_size):
     )
 
 
+def append_to_progress_log(string):
+    args = get_args()
+    if args.save is None:
+        return
+    progress_log_filename = os.path.join(args.save, "progress.txt")
+    torch.distributed.barrier()
+    if torch.distributed.get_rank() == 0:
+        with open(progress_log_filename, 'a') as f:
+            job_id = os.getenv('SLURM_JOB_ID', '')
+            num_gpus = args.world_size
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\tJob ID: {job_id}\t"
+                    f"# GPUs: {num_gpus}\t{string}\n")
+
+
+def get_start_time_from_progress_log():
+    """
+    Gets start time of earliest job with same world size. Also returns the number
+    of floating-point operations completed in last saved checkpoint.
+    """
+    args = get_args()
+    assert args.save is not None
+    progress_log_filename = os.path.join(args.save, "progress.txt")
+
+    # start_time is time when job with same world size started.
+    # start_num_floating_point_operations is the number of floating-point operations
+    # completed when this job started.
+    # latest_num_floating_point_operations is the number of floating-point operations
+    # completed in most recent saved checkpoint.
+    start_time = None
+    start_num_floating_point_operations = None
+    latest_num_floating_point_operations = 0
+
+    def _get_field(string, type):
+        return type(string.split(': ')[1])
+
+    with open(progress_log_filename, 'r') as f:
+        for line in f:
+            line = line.strip()
+            line_tokens = line.split('\t')
+            world_size_in_line = _get_field(line_tokens[2], int)
+            if line_tokens[3] == "Saved checkpoint":
+                latest_num_floating_point_operations = \
+                    _get_field(line_tokens[7], float)
+            if world_size_in_line != args.world_size:
+                # Re-start search if we see a different world size.
+                start_time = None
+                start_num_floating_point_operations = None
+                continue
+            if line_tokens[3] == "Starting job":
+                if start_time is None:
+                    start_time = line_tokens[0]
+                    start_num_floating_point_operations = \
+                        latest_num_floating_point_operations
+    assert start_time is not None and start_num_floating_point_operations is not None, \
+        "Should have seen at least one 'Starting job' entry with same world_size"
+    return datetime.strptime(start_time, '%Y-%m-%d %H:%M:%S'), \
+        start_num_floating_point_operations
+
+
 def pretrain(train_valid_test_dataset_provider,
              model_provider,
              model_type,
@@ -115,6 +175,13 @@ def pretrain(train_valid_test_dataset_provider,
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(extra_args_provider=extra_args_provider,
                         args_defaults=args_defaults)
+
+    args = get_args()
+    timers = get_timers()
+
+    if args.log_progress:
+        append_to_progress_log("Starting job")
+
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     set_jit_fusion_options()
 
@@ -131,9 +198,6 @@ def pretrain(train_valid_test_dataset_provider,
     print_rank_0('time to initialize megatron (seconds): {:.3f}'.format(
         time.time() - _TRAIN_START_TIME))
     print_datetime('after megatron is initialized')
-
-    args = get_args()
-    timers = get_timers()
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
@@ -179,15 +243,17 @@ def pretrain(train_valid_test_dataset_provider,
 
         iteration = 0
         if args.do_train and args.train_iters > 0:
-            iteration = train(forward_step_func,
-                              model, optimizer, opt_param_scheduler,
-                              train_data_iterator, valid_data_iterator,
-                              process_non_loss_data_func, config)
+            iteration, num_floating_point_operations_so_far = train(
+                forward_step_func,
+                model, optimizer, opt_param_scheduler,
+                train_data_iterator, valid_data_iterator,
+                process_non_loss_data_func, config)
 
         print_datetime('after training is done')
 
         if args.save and iteration != 0:
-            save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
+            save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
+                            num_floating_point_operations_so_far)
     else:
         print_rank_0('skipping training (--skip-train is on) ...')
 
@@ -412,11 +478,13 @@ def setup_model_and_optimizer(model_provider_func,
     if args.load is not None:
         timers = get_timers()
         timers('load-checkpoint', log_level=0).start(barrier=True)
-        args.iteration = load_checkpoint(model, optimizer, opt_param_scheduler)
+        args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
+            model, optimizer, opt_param_scheduler)
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
     else:
         args.iteration = 0
+        args.num_floating_point_operations_so_far = 0
 
     # get model without FP16 and/or DDP wrappers
     if args.iteration == 0 and len(unwrapped_model) == 1 \
@@ -709,14 +777,54 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     return report_memory_flag
 
 
-def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler):
+def compute_throughputs_and_append_to_progress_log(iteration,
+                                                   num_floating_point_operations_so_far):
+    args = get_args()
+    if args.save is None:
+        return
+
+    # Compute job throughput.
+    # args.num_floating_point_operations_so_far keeps track of floating-point operations
+    # completed at the start of job.
+    global _TRAIN_START_TIME
+    job_throughput = \
+        (num_floating_point_operations_so_far -
+         args.num_floating_point_operations_so_far) / (
+            (time.time() - _TRAIN_START_TIME) * 10**12 * args.world_size)
+
+    # Compute cumulative throughput since jobs of this world size were launched.
+    # `get_start_time_from_progress_log` returns start time and number of floating-point
+    # operations of first job of this world size.
+    start_time, start_num_floating_point_operations = get_start_time_from_progress_log()
+    elapsed_time = (datetime.now() - start_time).total_seconds()
+    cumulative_throughput = \
+        (num_floating_point_operations_so_far -
+         start_num_floating_point_operations) / (
+            elapsed_time * 10**12 * args.world_size)
+
+    tokens_so_far = args.consumed_train_samples * args.seq_length
+
+    append_to_progress_log(f"Saved checkpoint\tIteration: {iteration}\t"
+                           f"Job throughput: {job_throughput:.1f} TFLOP/s/GPU\t"
+                           f"Cumulative throughput: {cumulative_throughput:.1f} TFLOP/s/GPU\t"
+                           f"Floating-point operations: {num_floating_point_operations_so_far:.2e}\t"
+                           f"Tokens (in billions): {tokens_so_far / 10**9:.2f}")
+
+
+def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
+                             num_floating_point_operations_so_far):
+    args = get_args()
     timers = get_timers()
-    # Extra barrier is added to make sure
-    # all ranks report the max time.
+    # Extra barrier is added to make sure all ranks report the max time.
     timers('save-checkpoint', log_level=0).start(barrier=True)
-    save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
+    save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
+                    num_floating_point_operations_so_far)
     timers('save-checkpoint').stop(barrier=True)
     timers.log(['save-checkpoint'])
+
+    if args.log_progress:
+        compute_throughputs_and_append_to_progress_log(iteration,
+                                                       num_floating_point_operations_so_far)
 
 
 def train(forward_step_func, model, optimizer, opt_param_scheduler,
@@ -738,6 +846,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
     # Iterations.
     iteration = args.iteration
+    num_floating_point_operations_so_far = args.num_floating_point_operations_so_far
 
     # Setup some training config params
     config.grad_scale_func = optimizer.scale_loss
@@ -803,9 +912,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                        opt_param_scheduler,
                        config)
         iteration += 1
-        args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
-                                       args.micro_batch_size * \
-                                       get_num_microbatches()
+        batch_size = mpu.get_data_parallel_world_size() * \
+                     args.micro_batch_size * \
+                     get_num_microbatches()
+        args.consumed_train_samples += batch_size
+        num_floating_point_operations_so_far += num_floating_point_operations(args, batch_size)
 
         # Logging.
         loss_scale = optimizer.get_loss_scale().item()
@@ -847,7 +958,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             signal_handler = get_signal_handler()
             if any(signal_handler.signals_received()):
                 save_checkpoint_and_time(iteration, model, optimizer,
-                                         opt_param_scheduler)
+                                         opt_param_scheduler,
+                                         num_floating_point_operations_so_far)
                 print_datetime('exiting program after receiving SIGTERM.')
                 exit = True
                 break
@@ -856,7 +968,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
            iteration % args.save_interval == 0:
             timers('interval-time').stop()
             save_checkpoint_and_time(iteration, model, optimizer,
-                                     opt_param_scheduler)
+                                     opt_param_scheduler,
+                                     num_floating_point_operations_so_far)
             saved_checkpoint = True
             timers('interval-time', log_level=0).start(barrier=True)
 
@@ -872,7 +985,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             if done:
                 if not saved_checkpoint:
                     save_checkpoint_and_time(iteration, model, optimizer,
-                                             opt_param_scheduler)
+                                             opt_param_scheduler,
+                                             num_floating_point_operations_so_far)
                 print_datetime('exiting program after {} minutes'.format(train_time))
                 exit = True
                 break
@@ -881,7 +995,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if args.exit_interval and iteration % args.exit_interval == 0:
             if args.save and not saved_checkpoint:
                 save_checkpoint_and_time(iteration, model, optimizer,
-                                         opt_param_scheduler)
+                                         opt_param_scheduler,
+                                         num_floating_point_operations_so_far)
             torch.distributed.barrier()
             print_datetime('exiting program at iteration {}'.format(iteration))
             exit = True
@@ -908,7 +1023,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     if exit:
         sys.exit()
 
-    return iteration
+    return iteration, num_floating_point_operations_so_far
 
 
 def evaluate(forward_step_func,
