@@ -186,6 +186,27 @@ class TopKRouter(Router):
             z_loss = z_loss_func(logits, self.config.moe_z_loss_coeff)
             logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
         return logits
+    
+    def apply_input_jitter(self, input: torch.Tensor):
+        """Add noise to the input tensor.
+        Refer to https://arxiv.org/abs/2101.03961.
+
+        Args:
+            input (Tensor): Input tensor.
+
+        Returns:
+            Tensor: Jittered input.
+        """
+        if self.config.moe_input_jitter_eps is not None:
+            eps = self.config.moe_input_jitter_eps
+            if self.input_jitter is None:
+                self.input_jitter = torch.distributions.uniform.Uniform(
+                    torch.tensor(1.0 - eps, device=input.device),
+                    torch.tensor(1.0 + eps, device=input.device),
+                ).rsample
+            return input * self.input_jitter(input.shape)
+        else:
+            return input
 
     def routing(self, logits: torch.Tensor):
         """Top-k routing function
@@ -197,8 +218,11 @@ class TopKRouter(Router):
             Tuple[torch.Tensor, torch.Tensor]: Probs and the indices tensor.
         """
         logits = logits.view(-1, self.config.num_moe_experts)
+        
         # Apply Z-Loss
         logits = self.apply_z_loss(logits)
+        # Apply input jitter
+        logits = self.apply_input_jitter(logits)
 
         if self.routing_type == "sinkhorn":
             scores, indices = self.sinkhorn_load_balancing(logits)

@@ -64,6 +64,7 @@ class TransformerConfig(ModelParallelConfig):
             gemms in a single kernel launch to improve the utilization and performance by leveraging the Grouped GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
             moe_aux_loss_coeff (float): Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.
             moe_z_loss_coeff (float): Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended.
+            moe_input_jitter_eps (float): Add noise to the input tensor by applying jitter with a specified epsilon value.
             moe_token_dropping (bool): This feature involves selectively dropping and padding tokens for each expert to achieve a specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note: Currently unsupported.
     """
 
@@ -139,6 +140,7 @@ class TransformerConfig(ModelParallelConfig):
     moe_grouped_gemm: bool = False
     moe_aux_loss_coeff: float = 0  # 1e-2 would be a good start value for load balance loss.
     moe_z_loss_coeff: float = None  # 1e-3 would be a good start value for z-loss
+    moe_input_jitter_eps: float = None 
     moe_token_dropping: bool = False  # TODO: Support token dropping.
 
     def __post_init__(self):
