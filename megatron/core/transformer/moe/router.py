@@ -42,7 +42,6 @@ class Router(ABC, MegatronModule):
         self.weight = torch.nn.Parameter(
             torch.empty((self.config.num_moe_experts, self.config.hidden_size))
         )
-        torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         with get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
             config.init_method(self.weight)
         setattr(self.weight, 'sequence_parallel', config.sequence_parallel)
@@ -184,7 +183,7 @@ class TopKRouter(Router):
             torch.Tensor: The logits after applying the z-loss.
         """
         if self.config.moe_z_loss_coeff is not None:
-            z_loss = z_loss_func(logits)
+            z_loss = z_loss_func(logits, self.config.moe_z_loss_coeff)
             logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
         return logits
 

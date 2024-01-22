@@ -595,7 +595,7 @@ train.te_core_moe_gpt3.345m_tp2_pp1_8experts2parallel_top2_1node_50steps:
     MOE_GROUPED_GEMM: 1
     TEST_LEVEL: MR_TESTS
     METADATA: "te_8experts2parallel_top2router"
-    ADDITIONAL_PARAMS: "--disable-bias-linear --sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --moe-router-load-balancing-type "aux_loss" --moe-router-topk 2 --moe-aux-loss-coeff 1e-2"
+    ADDITIONAL_PARAMS: "--disable-bias-linear --sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --moe-router-load-balancing-type aux_loss --moe-router-topk 2 --moe-aux-loss-coeff 1e-2"
 
 train.moe_gpt3.345m_tp2_pp2_4experts_1node_50steps:
   <<: *selene-test-launcher

@@ -20,7 +20,7 @@ def switch_load_balancing_loss_func(gates, mask, moe_aux_loss_coeff):
     return aux_loss
 
 
-def z_loss_func(logits):
+def z_loss_func(logits, z_loss_coeff):
     """Encourages the router's logits to remain small to enhance stability.
     Please refer to the ST-MoE paper (https://arxiv.org/pdf/2202.08906.pdf) for details.
     
@@ -31,7 +31,7 @@ def z_loss_func(logits):
         torch.Tensor: The logits after applying the z-loss.
     """
 
-    z_loss = torch.mean(torch.square(torch.logsumexp(logits, dim=-1)))
+    z_loss = torch.mean(torch.square(torch.logsumexp(logits, dim=-1))) * z_loss_coeff
     return z_loss
 
 
