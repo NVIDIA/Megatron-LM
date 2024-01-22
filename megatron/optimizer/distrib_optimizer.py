@@ -915,6 +915,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             event = torch.cuda.Event()
             self.all_gather_events.append(event)
             stream = self.models[model_index].grad_buffers[dtype].buckets[bucket_index].comm_stream
+            torch.cuda.synchronize()
             with torch.cuda.stream(stream):
                 if self.quantize_helper is not None and self.quantize_helper.quantized_weights:
                     data_parallel_world_size = mpu.get_data_parallel_world_size()
@@ -1005,7 +1006,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         all_gather_event = self.all_gather_events[all_gather_event_index]
         if all_gather_event is not None:
+            (model_index, dtype, bucket_index, pbuf, pbuf_views) = self.pbuf_view_items[all_gather_event_index]
+            stream = self.models[model_index].grad_buffers[dtype].buckets[bucket_index].comm_stream
             all_gather_event.synchronize()
+            stream.synchronize()
             self.all_gather_events[all_gather_event_index] = None
 
             # Launch the all-gather for the next bucket now.

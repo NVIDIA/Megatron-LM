@@ -111,10 +111,12 @@ class Bucket:
                 self.data_parallel_rank
             ]
             if self.quantization_helper and self.quantization_helper.quantized_gradients:
+                torch.cuda.synchronize()
                 with torch.cuda.stream(stream):
                     local_data_view.copy_(self.quantization_helper.quantize_reduce_gradients(self.data))
                     event.record()
             else:
+                torch.cuda.synchronize()
                 with torch.cuda.stream(stream):
                     torch.distributed._reduce_scatter_base(
                         local_data_view,
@@ -124,6 +126,7 @@ class Bucket:
                     )
                     event.record()
         else:
+            torch.cuda.synchronize()
             with torch.cuda.stream(stream):
                 torch.distributed.all_reduce(
                     self.data, group=self.data_parallel_group, async_op=False
@@ -131,6 +134,7 @@ class Bucket:
                 event.record()
         if not self.overlap_grad_reduce:
             self.communication_event.synchronize()
+            self.comm_stream.synchronize()
             self.communication_event = None
 
     def finish_grad_sync(self):
@@ -150,6 +154,7 @@ class Bucket:
             f'({len(self.params_with_grad)}/{len(self.params)} params have grad available)'
         )
         self.communication_event.synchronize()
+        self.comm_stream.synchronize()
         self.communication_event = None
 
     def register_grad_ready(self, param: torch.nn.Parameter):
