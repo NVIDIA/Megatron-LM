@@ -6,7 +6,7 @@ command: >-
   bash examples/pretrain-llama/training/llama_ve/llama70b_ve_init_emb_en_reasoning_ar_with_trans_from_scratch_test/llama70b_ve_init_emb_en_reasoning_ar_with_trans_from_scratch_test.sh \
    ${{inputs.pretrained_llama_model}} \
    ${{inputs.tokenizer_model_path}} \
-   ${{inputs.bin_idx_data_dir}} \
+   /eph/nvme0/allam/bin_idx_data/meglm_llama2-ve_bin_idx/\
    ${{outputs.data_cache}} \
    ${{outputs.checkpoint_dir}} \
    ${{outputs.tensorboard_dir}} \
@@ -28,28 +28,24 @@ inputs:
   pretrained_llama_model:
     type: uri_folder
     mode: ro_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/megatronlm_models/Meg-LM-Llama-2-13b-hf-ExpTok-32K_10M_VE_with_llama_avg_tp${{TP}}_pp${{PP}}/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/megatronlm_models/Meg-LM-Llama-2-70b-hf-ExpTok-32K_10M_VE_with_llama_avg_tp${{TP}}_pp${{PP}}/
   tokenizer_model_path:
     type: uri_file
     mode: ro_mount
     path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llm_data/paths/data_repo/tokenize_by_llama2-ve/tokenizer/tokenizer.model
-  bin_idx_data_dir:
-    type: uri_folder
-    mode: ro_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llm_data/paths/data_repo/tokenize_by_llama2-ve/meglm_llama2-ve_bin_idx/
 outputs:
   data_cache:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/LLaMa-VE-13B-init-Emb-Allam-Reasoning-Data-with-Ar-Translation/cache
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/LLaMa-VE-70B-init-Emb-Allam-Reasoning-Data-with-Ar-Translation/cache
   checkpoint_dir:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/LLaMa-VE-13B-init-Emb-Allam-Reasoning-Data-with-Ar-Translation
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/LLaMa-VE-70B-init-Emb-Allam-Reasoning-Data-with-Ar-Translation
   tensorboard_dir:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/LLaMa-VE-13B-init-Emb-Allam-Reasoning-Data-with-Ar-Translation/tensorboard
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/LLaMa-VE-70B-init-Emb-Allam-Reasoning-Data-with-Ar-Translation/tensorboard
 
 services:
   my_jupyterlab:
@@ -58,12 +54,13 @@ services:
     type: tensor_board
     log_dir: ${{outputs.tensorboard_dir}}
 
-compute: azureml:NCAI-A100-LLMv3
+compute: azureml:NCAI-A100-LLMv5
 
 distribution:
   type: pytorch
   process_count_per_instance: 8
 
 resources:
-  instance_count: 64
+  instance_count: 32
   shm_size: 1250g
+  docker_args: "--volume=/home/azureuser/allamlustre/tokenize_by_llama2-ve:/eph/nvme0/allam/bin_idx_data"
