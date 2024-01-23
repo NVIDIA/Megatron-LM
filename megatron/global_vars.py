@@ -200,7 +200,12 @@ def _set_one_logger(args):
     if args.enable_onelogger and args.rank == (args.world_size - 1):
         try:
             from one_logger.core import OneLogger
-            one_logger = OneLogger()
+            config = {
+               'project': args.one_logger_project,
+               'entity': args.one_logger_entity,
+               'name': args.one_logger_name
+            }
+            one_logger = OneLogger(config=config)
             _GLOBAL_ONE_LOGGER = one_logger
         except BaseException:
             print('WARNING: one_logger package is required to enable e2e metrics '
