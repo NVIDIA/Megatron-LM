@@ -71,6 +71,7 @@ TRAINING_ARGS=(
 MODEL_PARALLEL_ARGS=(
 	--tensor-model-parallel-size $TP
     --pipeline-model-parallel-size $PP
+    --sequence-parallel
     --no-async-tensor-model-parallel-allreduce
 )
 
