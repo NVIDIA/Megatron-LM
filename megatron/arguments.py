@@ -737,6 +737,7 @@ def _add_logging_args(parser):
                        help='Path to save the wandb results locally.')
     group.add_argument('--enable-one-logger', action='store_true',
                        help='If set, use one_logger to track E2E metrics'
+                       'Note that one_logger is an internal tool and not available externally. '
                        'For installation, please try command: `pip install '
                        '--index-url=https://sc-hw-artf.nvidia.com/api/pypi/hwinf-ml-pypi/simple'
                        ' one_logger` or go to https://gitlab-master.nvidia.com/hwinf-dcm/onelogger '
