@@ -244,7 +244,7 @@ def finetune(train_valid_datasets_provider, model_provider,
              forward_step=_cross_entropy_forward_step,
              end_of_epoch_callback_provider=None,
              task_collate_fn=None,
-             eval_callback=None):
+             eval_callback_provider=None):
     """Main finetune function used across all tasks."""
     args = get_args()
     timers = get_timers()
@@ -267,6 +267,9 @@ def finetune(train_valid_datasets_provider, model_provider,
     end_of_epoch_callback = None
     if end_of_epoch_callback_provider is not None:
         end_of_epoch_callback = end_of_epoch_callback_provider()
+    eval_callback = None
+    if eval_callback_provider is not None:
+        eval_callback = eval_callback_provider()
     timers('callback function').stop()
 
     # Build model, optimizer and learning rate scheduler.
