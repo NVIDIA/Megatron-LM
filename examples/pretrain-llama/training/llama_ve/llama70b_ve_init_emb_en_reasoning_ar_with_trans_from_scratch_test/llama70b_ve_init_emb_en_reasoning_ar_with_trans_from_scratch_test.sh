@@ -26,7 +26,6 @@ GPT_MODEL_ARGS=(
     --use-rotary-position-embeddings
     --normalization RMSNorm
     --no-position-embedding
-    --no-masked-softmax-fusion
     --no-query-key-layer-scaling
 )
 
@@ -50,7 +49,7 @@ TRAINING_ARGS=(
     --no-load-optim
     --no-load-rng
     --micro-batch-size 1 
-    --global-batch-size 1024
+    --global-batch-size 64
     --train-iters 200
     --weight-decay 0.1 
     --adam-beta1 0.9 
