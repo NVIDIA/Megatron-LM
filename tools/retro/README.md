@@ -2,8 +2,8 @@
 
 Retro [(Borgeaud et al., 2022)](https://arxiv.org/abs/2112.04426) is an autoregressive decoder-only language model (LM)
 pretrained with retrieval-augmentation.
-Retro features practical scalibility to support large-scale pretraining from scratch by retrieving from trillions of
-token.
+Retro features practical scalability to support large-scale pretraining from scratch by retrieving from trillions of
+tokens.
 Pretraining with retrieval provides a more efficient storage mechanism of factual knowledge, when compared to storing
 factual knowledge implicitly within the network's parameters, thus largely reducing model parameters while achieving
 lower perplexity than standard GPT.
@@ -16,9 +16,9 @@ featuring the largest LLM pretrained with retrieval (as of December 2023).
 The obtained foundation model, Retro 48B, largely outperforms the GPT counterpart in terms of perplexity.
 With instruction tuning on Retro, InstructRetro demonstrates significant improvement over the instruction tuned GPT on
 downstream tasks in the zero-shot setting. Specifically, the average improvement of InstructRetro is 7% over its GPT
-counterpart across 8 short-form QA tasks, and 10% over GPT across 4 challenging long-form QA tasks. We also find that
-one can ablate the encoder from InstructRetro architecture and directly use the InstructRetro decoder backbone as GPT,
-while achieving comparable results.
+counterpart across 8 short-form QA tasks, 10% over GPT across 4 challenging long-form QA tasks, and 16% over GPT across
+3 summarization tasks. We also find that one can ablate the encoder from InstructRetro architecture and directly use the
+InstructRetro decoder backbone as GPT, while achieving comparable results.
 
 This README provides an end-to-end tutorial to reproduce Retro and InstructRetro.
 
@@ -63,7 +63,7 @@ We recommend using docker environment to run the code.
 ### Docker image
 
 We provide a docker build file in [tools/retro/examples/Dockerfile](examples/Dockerfile) for the reproduction. The
-docker image is based on `nvcr.io/nvidia/pytorch:23.09-py3`.
+docker image is based on the [NGC docker](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch/tags) `nvcr.io/nvidia/pytorch:23.09-py3`.
 
 ### Install dependencies
 
