@@ -361,7 +361,7 @@ class MixtralSparseMoeBlock(MegatronModule):
         self.hidden_dim = args.hidden_size
         self.ffn_dim = args.ffn_hidden_size
         self.num_experts = getattr(args, "num_experts", 8)
-        self.top_k = getattr(args, "top_k", 2)
+        self.top_k = getattr(args, "num_experts_per_tok", 2)
         self.moe_load_balancing_mode = getattr(args, "moe_load_balancing_mode", None)
 
         # gating
