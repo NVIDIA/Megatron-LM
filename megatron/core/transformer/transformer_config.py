@@ -140,7 +140,7 @@ class TransformerConfig(ModelParallelConfig):
     moe_grouped_gemm: bool = False
     moe_aux_loss_coeff: float = 0  # 1e-2 would be a good start value for load balance loss.
     moe_z_loss_coeff: float = None  # 1e-3 would be a good start value for z-loss
-    moe_input_jitter_eps: float = None 
+    moe_input_jitter_eps: float = None
     moe_token_dropping: bool = False  # TODO: Support token dropping.
 
     def __post_init__(self):

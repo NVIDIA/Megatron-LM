@@ -186,7 +186,7 @@ class TopKRouter(Router):
             z_loss = z_loss_func(logits, self.config.moe_z_loss_coeff)
             logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
         return logits
-    
+
     def apply_input_jitter(self, input: torch.Tensor):
         """Add noise to the input tensor.
         Refer to https://arxiv.org/abs/2101.03961.
@@ -218,7 +218,7 @@ class TopKRouter(Router):
             Tuple[torch.Tensor, torch.Tensor]: Probs and the indices tensor.
         """
         logits = logits.view(-1, self.config.num_moe_experts)
-        
+
         # Apply Z-Loss
         logits = self.apply_z_loss(logits)
         # Apply input jitter
