@@ -45,7 +45,7 @@ LOGISTICS_ARGS=(
 )
 
 TRAINING_ARGS=(
-    --micro-batch-size 4
+    --micro-batch-size 2
     --global-batch-size 64
     --epochs 5
 
