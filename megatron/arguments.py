@@ -666,7 +666,7 @@ def _add_network_size_args(parser):
                             ' to use for each input token in the Switch Transformer model')
     group.add_argument('--moe-type', type=str, default=None,
                        help='Extra type of MOE network to use, default None means switch transformers, Optional: mixtral')
-    group.add_argument('--moe-load-balancing-mode', type=str, default="sinkhorn",
+    group.add_argument('--moe-load-balancing-mode', default=None,
                        help="Balancing the probability of each expert's vote suppored in mixtral moe."
                             "Only sinkhorn and None supported now.")
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
