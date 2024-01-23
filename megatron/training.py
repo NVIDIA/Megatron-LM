@@ -139,7 +139,7 @@ def pretrain(train_valid_test_dataset_provider,
     one_logger = get_one_logger()
     if one_logger:
         one_logger.log_metrics({
-            'train_iterations_warmup': args.lr_warmup_iters,
+            'train_iterations_warmup': 5
         })
 
     # Model, optimizer, and learning rate.
