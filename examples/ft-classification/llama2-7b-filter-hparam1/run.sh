@@ -21,7 +21,6 @@ GPT_MODEL_ARGS=(
     --use-rotary-position-embeddings
     --normalization RMSNorm
     --no-position-embedding
-    --no-masked-softmax-fusion
     --no-query-key-layer-scaling
     --use-flash-attn
     --bf16
@@ -46,7 +45,8 @@ LOGISTICS_ARGS=(
 )
 
 TRAINING_ARGS=(
-    --micro-batch-size 8
+    --micro-batch-size 4
+    --global-batch-size 64
     --epochs 5
 
     --lr 5.0e-6

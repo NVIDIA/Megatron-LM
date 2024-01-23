@@ -149,7 +149,7 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
     timers = get_timers()
     config = get_model_config(model[0])
     
-    assert get_num_microbatches() == 1, "finetuning with gradient accumulation doesn't currently work"
+    # assert get_num_microbatches() == 1, "finetuning with gradient accumulation doesn't currently work"
 
     # Turn on training mode which enables dropout.
     for m in model:

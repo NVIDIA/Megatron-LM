@@ -38,7 +38,7 @@ def filter_classification(num_classes, Dataset, name_from_datapath_func):
         return model
 
     def metrics_func_provider():
-        """Privde metrics callback function."""
+        """Provide metrics callback function."""
         def single_dataset_provider(datapath):
             args = get_args()
             tokenizer = get_tokenizer()
