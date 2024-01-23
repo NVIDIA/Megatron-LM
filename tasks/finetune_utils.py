@@ -143,7 +143,7 @@ def _build_train_valid_dataloaders(train_dataset, valid_dataset,
 
 
 def _train(model, optimizer, opt_param_scheduler, forward_step,
-           train_dataloader, valid_dataloader, end_of_epoch_callback):
+           train_dataloader, valid_dataloader, end_of_epoch_callback, eval_callback=None):
     """Train the model."""
     args = get_args()
     timers = get_timers()
@@ -219,6 +219,8 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
                 evaluate_and_print_results(prefix, forward_step,
                                            valid_dataloader, model,
                                            iteration, None, config)
+                if eval_callback is not None:
+                    eval_callback(model, epoch)
 
             # Exiting based on iterations
             if args.exit_interval and iteration % args.exit_interval == 0:
@@ -241,7 +243,8 @@ def finetune(train_valid_datasets_provider, model_provider,
              model_type=ModelType.encoder_or_decoder,
              forward_step=_cross_entropy_forward_step,
              end_of_epoch_callback_provider=None,
-             task_collate_fn=None):
+             task_collate_fn=None,
+             eval_callback=None):
     """Main finetune function used across all tasks."""
     args = get_args()
     timers = get_timers()
@@ -297,7 +300,8 @@ def finetune(train_valid_datasets_provider, model_provider,
     # Finetune the model.
     if args.epochs > 0:
         _train(model, optimizer, opt_param_scheduler, forward_step,
-               train_dataloader, valid_dataloader, end_of_epoch_callback)
+               train_dataloader, valid_dataloader, end_of_epoch_callback, 
+               eval_callback=eval_callback)
     # Or just evaluate.
     else:
         if end_of_epoch_callback is not None:

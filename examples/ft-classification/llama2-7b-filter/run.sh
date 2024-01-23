@@ -1,8 +1,8 @@
 PRETRAINED_MODEL_PATH=$1
 TOKENIZER_MODEL=$2
 DATA_PATH=$3
-CHECKPOINT_DIR=$5
-TENSORBOARD_LOGS_PATH=$6
+CHECKPOINT_PATH=$4
+TENSORBOARD_LOGS_PATH=$5
 
 GPT_MODEL_ARGS=(
     --seq-length 4096 
@@ -30,7 +30,8 @@ GPT_MODEL_ARGS=(
 LOGISTICS_ARGS=(
     --tokenizer-type Llama2Tokenizer
     --tokenizer-model $TOKENIZER_MODEL
-    --pretrained-checkpoint $PRETRAINED_CHECKPOINT
+    --pretrained-checkpoint $PRETRAINED_MODEL_PATH
+    --load $CHECKPOINT_PATH
 
     --save-interval 5000
     --save $CHECKPOINT_PATH
@@ -45,8 +46,7 @@ LOGISTICS_ARGS=(
 )
 
 TRAINING_ARGS=(
-    --micro-batch-size 1
-    --global-batch-size 1024
+    --micro-batch-size 4
     --epochs 5
 
     --lr 5.0e-5
@@ -58,7 +58,7 @@ TRAINING_ARGS=(
     --adam-beta1 0.9 
     --adam-beta2 0.95 
     --init-method-std 0.01
-    --clip-grad 1.0 s
+    --clip-grad 1.0
 )
 
 MODEL_PARALLEL_ARGS=(

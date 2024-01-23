@@ -13,7 +13,7 @@ command: >-
 display_name: llama2-7b-filter
 
 experiment_name: ft_filter
-code: ../../../../
+code: ../../../
 environment: azureml:Allam-MegatronLM:2
 environment_variables:
   HYDRA_FULL_ERROR: '1'

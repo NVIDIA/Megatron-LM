@@ -49,7 +49,8 @@ def filter_classification(num_classes, Dataset, name_from_datapath_func):
 
     """Finetune/evaluate."""
     finetune(train_valid_datasets_provider, model_provider,
-             end_of_epoch_callback_provider=metrics_func_provider)
+             end_of_epoch_callback_provider=metrics_func_provider,
+             eval_callback=metrics_func_provider)
 
 
 def main():

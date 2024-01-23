@@ -49,7 +49,7 @@ torchrun $DISTRIBUTED_ARGS allam-megatron/tasks/main.py \
                --valid-data $VALID_DATA \
                --tokenizer-model $MODEL_FILE \
                --epochs 5 \
-               --tensor-model-parallel-size 1 \
+               --tensor-model-parallel-size 2 \
                ${GPT_MODEL_ARGS[@]} \
                --micro-batch-size 4 \
                --lr 5.0e-5 \
