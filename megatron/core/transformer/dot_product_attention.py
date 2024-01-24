@@ -8,6 +8,7 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -93,7 +94,12 @@ class DotProductAttention(MegatronModule):
         value: Tensor,
         attention_mask: Tensor,
         attn_mask_type: AttnMaskType = None,
+        packed_seq_params: PackedSeqParams = None,
     ):
+        assert packed_seq_params is None, (
+            "Packed sequence is not supported by DotProductAttention."
+            "Please use TEDotProductAttention instead."
+        )
 
         # ===================================
         # Raw attention scores. [b, n/p, s, s]
