@@ -94,6 +94,10 @@ def get_megatron_optimizer(model,
                                        eps=args.adam_eps)
     else:
         if args.optimizer == 'adam':
+            if args.ds_fused_adam:
+                global Adam
+                from deepspeed.ops.adam import FusedAdam
+                Adam = FusedAdam
             optimizer = Adam(param_groups,
                             lr=args.lr,
                             weight_decay=args.weight_decay,

@@ -919,6 +919,8 @@ def _add_training_args(parser):
                        help='Run optimizer on CPU')
     group.add_argument('--cpu_torch_adam', action='store_true',
                        help='Use Torch Adam as optimizer on CPU.')
+    group.add_argument('--ds_fused_adam', action='store_true',
+                       help='Use DeepSpeed FusedAdam as optimizer.')
     group.add_argument('--no-pipeline-parallel', action='store_true',
                        help='Disable pipeline parallelism')
     group.add_argument('--use-tutel', action='store_true',
