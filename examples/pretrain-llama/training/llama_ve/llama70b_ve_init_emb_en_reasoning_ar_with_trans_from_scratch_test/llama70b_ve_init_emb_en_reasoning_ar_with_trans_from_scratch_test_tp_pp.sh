@@ -48,7 +48,7 @@ TRAINING_ARGS=(
     --no-initialization
     --no-load-optim
     --no-load-rng
-    --micro-batch-size $MBS 
+    --micro-batch-size 1
     --global-batch-size 1024
     --train-iters 200
     --weight-decay 0.1 
