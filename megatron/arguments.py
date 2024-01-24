@@ -748,7 +748,7 @@ def _add_logging_args(parser):
     group.add_argument('--one-logger-entity', type=str, default='hwinf_dcm',
                        help='The one-logger username or team name. Will ignore if '
                        '--enable-one-logger is not set')
-    group.add_argument('--one-logger-run-name', type=str, default='',
+    group.add_argument('--one-logger-run-name', type=str, default=None,
                        help='The one-logger run name displayed. Will ignore if '
                        '--enable-one-logger is not set')
     return parser
