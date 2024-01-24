@@ -17,10 +17,12 @@ set -e
 # )
 
 pairs=(
-    "8 4"
+    "8 8"
 )
-for VP in None; do
-    for MBS in 2; do
+for VP in None; do 
+    # currently $VP is manually deactivated inside the bash script
+    # if you want to activate it, please add the --num-layers-per-virtual-pipeline-stage to the bash script linked in the yaml file.
+    for MBS in 4; do
         for pair in "${pairs[@]}"; do
             # Split the pair into TP and PP
             read TP PP <<< "$pair"

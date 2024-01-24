@@ -8,6 +8,7 @@ CHECKPOINT_DIR=$5
 TENSORBOARD_LOGS_PATH=$6
 TP=$7
 PP=$8
+MBS=$9
 
 # DISTRIBUTED_ARGS=(
 #     --nproc_per_node $GPUS_PER_NODE 
@@ -48,7 +49,7 @@ TRAINING_ARGS=(
     --no-initialization
     --no-load-optim
     --no-load-rng
-    --micro-batch-size 1
+    --micro-batch-size $MBS
     --global-batch-size 1024
     --train-iters 200
     --weight-decay 0.1 

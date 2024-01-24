@@ -10,9 +10,9 @@ command: >-
    ${{outputs.data_cache}} \
    ${{outputs.checkpoint_dir}} \
    ${{outputs.tensorboard_dir}} \
-   ${{TP}} ${{PP}}  
+   ${{TP}} ${{PP}} ${{MBS}}  
 
-display_name: tp${{TP}}-pp${{PP}}-LLaMa-VE-70B-init-Emb-Allam-Reasoning-Data-with-Ar-Translation
+display_name: tp${{TP}}-pp${{PP}}-mbs${{MBS}}-LLaMa-VE-70B-init-Emb-Allam-Reasoning-Data-with-Ar-Translation
 
 experiment_name: FlopsProfiling
 code: ../../../../../
