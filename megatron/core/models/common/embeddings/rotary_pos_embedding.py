@@ -2,16 +2,31 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.core.transformer.transformer_block import TransformerBlock
 
+import logging
+
 import torch
 from torch import Tensor, nn
 
 from megatron.core import parallel_state
+
+logger = logging.getLogger(__name__)
+
+try:
+    from apex.transformer.functional import (
+        fused_apply_rotary_pos_emb,
+        fused_apply_rotary_pos_emb_thd,
+    )
+
+    HAVE_APPLY_ROPE_FUSION = True
+except:
+    HAVE_APPLY_ROPE_FUSION = False
+
 
 __all__ = ['RotaryEmbedding', 'apply_rotary_pos_emb']
 
@@ -141,7 +156,7 @@ def _rotate_half(x: Tensor) -> Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb(t: Tensor, freqs: Tensor) -> Tensor:
+def apply_rotary_pos_emb_bshd(t: Tensor, freqs: Tensor) -> Tensor:
     """Apply rotary positional embedding to input tensor T.
 
     check https://kexue.fm/archives/8265 for detailed formulas
@@ -165,3 +180,50 @@ def apply_rotary_pos_emb(t: Tensor, freqs: Tensor) -> Tensor:
 
     t = (t * cos_) + (_rotate_half(t) * sin_)
     return torch.cat((t, t_pass), dim=-1)
+
+
+def apply_rotary_pos_emb_thd(t: Tensor, cu_seqlens: Tensor, freqs: Tensor) -> Tensor:
+    """A baseline implementation of applying RoPE for `thd` format.
+
+    Args:
+        t (Tensor): Input tensor T is of shape [t, h, d]
+        cu_seqlens(Tensor):  Cumulative sum of sequence lengths in a batch for `t`,
+        with shape [b + 1] and dtype torch.int32.
+        freqs (Tensor): Rotary Positional embedding tensor freq is of shape [max_s, 1, 1, d]
+
+    Returns:
+        Tensor: Shape [t, h, d]. The input tensor after applying RoPE.
+    """
+
+    seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+    return torch.cat(
+        [
+            apply_rotary_pos_emb_bshd(x.unsqueeze(1), freqs[: x.size(0)])
+            for x in torch.split(t, seqlens)
+        ]
+    ).squeeze(1)
+
+
+def apply_rotary_pos_emb(
+    t: Tensor, freqs: Tensor, fused: bool = False, cu_seqlens: Optional[Tensor] = None
+):
+    """
+    Reroute to the appropriate apply_rotary_pos_emb function depending on
+    fused/unfused kernels, or bshd (conventional) / thd (packed seq) format
+    """
+    if fused and not HAVE_APPLY_ROPE_FUSION:
+        fused = False
+        logger.warning(
+            "set apply_rope_fusion to false because its implementation"
+            " is not included in Apex. Try upgrading to the latest version"
+        )
+    if fused:
+        if cu_seqlens is None:
+            return fused_apply_rotary_pos_emb(t, freqs, transpose_output_memory=True)
+        else:
+            return fused_apply_rotary_pos_emb_thd(t, cu_seqlens, freqs)
+    else:
+        if cu_seqlens is None:
+            return apply_rotary_pos_emb_bshd(t, freqs)
+        else:
+            return apply_rotary_pos_emb_thd(t, cu_seqlens, freqs)

@@ -11,6 +11,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import AttnMaskType, ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -134,6 +135,7 @@ class GPTModel(LanguageModule):
         decoder_input: Tensor = None,
         labels: Tensor = None,
         inference_params: InferenceParams = None,
+        packed_seq_params: PackedSeqParams = None,
         extra_block_kwargs: dict = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
@@ -169,6 +171,7 @@ class GPTModel(LanguageModule):
             attention_mask=attention_mask,
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
+            packed_seq_params=packed_seq_params,
             **(extra_block_kwargs or {}),
         )
 

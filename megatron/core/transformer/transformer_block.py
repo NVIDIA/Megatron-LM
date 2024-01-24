@@ -12,6 +12,7 @@ from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.custom_layers.transformer_engine import (
     TENorm,
     get_cpu_offload_context,
@@ -183,12 +184,18 @@ class TransformerBlock(MegatronModule):
         context: Tensor,
         context_mask: Tensor,
         rotary_pos_emb: Tensor,
+        packed_seq_params: PackedSeqParams,
     ):
         """Forward method with activation checkpointing."""
 
         def custom(start: int, end: int):
             def custom_forward(
-                hidden_states, attention_mask, context, context_mask, rotary_pos_emb,
+                hidden_states,
+                attention_mask,
+                context,
+                context_mask,
+                rotary_pos_emb,
+                packed_seq_params,
             ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
@@ -199,6 +206,7 @@ class TransformerBlock(MegatronModule):
                         context_mask=context_mask,
                         rotary_pos_emb=rotary_pos_emb,
                         inference_params=None,
+                        packed_seq_params=packed_seq_params,
                     )
                 return hidden_states, context
 
@@ -218,6 +226,7 @@ class TransformerBlock(MegatronModule):
                     context,
                     context_mask,
                     rotary_pos_emb,
+                    packed_seq_params,
                 )
 
                 l += self.config.recompute_num_layers
@@ -236,10 +245,16 @@ class TransformerBlock(MegatronModule):
                         context,
                         context_mask,
                         rotary_pos_emb,
+                        packed_seq_params,
                     )
                 else:
                     hidden_states, context = custom(l, l + 1)(
-                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb,
+                        hidden_states,
+                        attention_mask,
+                        context,
+                        context_mask,
+                        rotary_pos_emb,
+                        packed_seq_params,
                     )
         else:
             raise ValueError("Invalid activation recompute method.")
@@ -264,6 +279,7 @@ class TransformerBlock(MegatronModule):
         context_mask: Tensor = None,
         rotary_pos_emb: Tensor = None,
         inference_params: InferenceParams = None,
+        packed_seq_params: PackedSeqParams = None,
     ):
         # hidden_states (float): [s, b, h]
         # attention_mask (bool): [1, 1, s, s]
@@ -332,10 +348,10 @@ class TransformerBlock(MegatronModule):
                     context=context,
                     context_mask=context_mask,
                     rotary_pos_emb=rotary_pos_emb,
+                    packed_seq_params=packed_seq_params,
                 )
             else:
                 for layer in self.layers:
-
                     with self.offload_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
@@ -344,6 +360,7 @@ class TransformerBlock(MegatronModule):
                             context_mask=context_mask,
                             rotary_pos_emb=rotary_pos_emb,
                             inference_params=inference_params,
+                            packed_seq_params=packed_seq_params,
                         )
 
                     if (
