@@ -939,6 +939,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if args.eval_interval and iteration % args.eval_interval == 0 and \
            args.do_valid:
             timers('interval-time').stop()
+            if args.use_distributed_optimizer and args.overlap_param_gather:
+                optimizer.disable_pre_hook()
             if args.manual_gc and args.manual_gc_eval:
                 # Collect all objects.
                 gc.collect()
@@ -950,6 +952,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             if args.manual_gc and args.manual_gc_eval:
                 # Collect only the objects created and used in evaluation.
                 gc.collect(generation=0)
+            if args.use_distributed_optimizer and args.overlap_param_gather:
+                optimizer.enable_pre_hook()
             timers('interval-time', log_level=0).start(barrier=True)
 
         # Checkpointing
@@ -1018,6 +1022,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     wandb_writer = get_wandb_writer()
     if wandb_writer:
         wandb_writer.finish()
+
+    # Close out pre-hooks if using distributed optimizer and overlapped param gather.
+    if args.use_distributed_optimizer and args.overlap_param_gather:
+        optimizer.disable_pre_hook()
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if exit:
