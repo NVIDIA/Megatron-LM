@@ -213,10 +213,12 @@ def apply_rotary_pos_emb(
     """
     if fused and not HAVE_APPLY_ROPE_FUSION:
         fused = False
-        logger.warning(
-            "set apply_rope_fusion to false because its implementation"
-            " is not included in Apex. Try upgrading to the latest version"
-        )
+        if not getattr(apply_rotary_pos_emb, "printed_fused_warning", False):
+            logger.warning(
+                "Setting apply_rope_fusion to false because its implementation"
+                " is not included in Apex. Try upgrading to the latest version"
+            )
+            apply_rotary_pos_emb.printed_fused_warning = True
     if fused:
         if cu_seqlens is None:
             return fused_apply_rotary_pos_emb(t, freqs, transpose_output_memory=True)
