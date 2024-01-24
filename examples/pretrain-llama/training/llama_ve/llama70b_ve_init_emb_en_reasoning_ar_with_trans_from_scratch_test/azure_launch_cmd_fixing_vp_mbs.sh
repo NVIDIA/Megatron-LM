@@ -19,8 +19,8 @@ set -e
 pairs=(
     "8 4"
 )
-for VP in 2 4 5 10 20 1; do
-    for MBS in 2 1; do
+for VP in None; do
+    for MBS in 2; do
         for pair in "${pairs[@]}"; do
             # Split the pair into TP and PP
             read TP PP <<< "$pair"

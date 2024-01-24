@@ -12,7 +12,7 @@ command: >-
    ${{outputs.tensorboard_dir}} \
    ${{TP}} ${{PP}}  
 
-display_name: LLaMa-VE-70B-init-Emb-Allam-Reasoning-Data-with-Ar-Translation
+display_name: tp${{TP}}-pp${{PP}}-LLaMa-VE-70B-init-Emb-Allam-Reasoning-Data-with-Ar-Translation
 
 experiment_name: FlopsProfiling
 code: ../../../../../

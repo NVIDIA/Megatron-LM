@@ -51,7 +51,7 @@ TRAINING_ARGS=(
     --no-load-optim
     --no-load-rng
     --micro-batch-size $MBS 
-    --global-batch-size 64
+    --global-batch-size 1024
     --train-iters 200
     --weight-decay 0.1 
     --adam-beta1 0.9 
@@ -74,8 +74,7 @@ MODEL_PARALLEL_ARGS=(
     --pipeline-model-parallel-size $PP
     --sequence-parallel
     --no-async-tensor-model-parallel-allreduce
-    --recompute-method uniform
-    --num-layers-per-virtual-pipeline-stage $VP
+    --recompute-activations
 )
 
 source examples/pretrain-llama/training/llama_ve/llama70b_ve_init_emb_en_reasoning_ar_with_trans_from_scratch_test/iter_prob.sh

@@ -49,7 +49,7 @@ TRAINING_ARGS=(
     --no-load-optim
     --no-load-rng
     --micro-batch-size $MBS 
-    --global-batch-size 64
+    --global-batch-size 1024
     --train-iters 200
     --weight-decay 0.1 
     --adam-beta1 0.9 

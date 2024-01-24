@@ -15,6 +15,10 @@ pairs=(
     "8 4"
     "8 8"
 )
+pairs=(
+    "8 4"
+    "8 8"
+)
 
 for pair in "${pairs[@]}"; do
     # Split the pair into TP and PP
