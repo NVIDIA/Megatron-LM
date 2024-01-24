@@ -99,6 +99,8 @@ class MoEDroplessTokenDispatcher(MoETokenDispatcher):
 
         Args:
             hidden_states: input tokens of shape [SeqLen/TP, MBS, HiddenSize]
+            max_prob: probs of token assignment to local experts.
+            max_ind: token assignment to local experts.
 
         Returns:
             permuted_local_hidden_states: Permutation of tokens to local experts group.
@@ -189,11 +191,13 @@ class MoEDroplessTokenDispatcher(MoETokenDispatcher):
         Args:
             hidden_states: 2D tensor of shape [sum_tokens_of_all_local_experts, HiddenSize],
             ouput of local experts.
+            scores: 2D tensor of the probs of token assignment to local experts.
             indices: 2D tensor of the indices of `local_indices` (which holds the un-sorted expert
             indices of tokens that local expert can process) that give its sorted order along dim 0.
             global_local_map (optional): 2D tensor, a mask of mapping between global and local tokens where each
             element is True if it's between the local_expert_indices. Only useful
-            when cross device token permutation is enabled and **AllGahter** is performed.
+            when cross device token permutation is enabled and **AllGather** is performed.
+            bias (optional): The bias tensor.
 
         Returns:
             output_total: un-permuted updated hidden states output from all local experts

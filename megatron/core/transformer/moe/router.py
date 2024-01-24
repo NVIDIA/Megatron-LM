@@ -118,18 +118,25 @@ class TopKRouter(Router):
         Returns:
             torch.Tensor: The logits tensor after applying sinkhorn routing.
         """
+
+        def _sinkhorn_activation(logits):
+            if self.topk == 1:
+                logits = torch.sigmoid(logits)
+            else:  # k > 1
+                logits = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+            return logits
+
         assert self.config.moe_aux_loss_coeff == 0, "Sinkhorn routing does not support aux loss."
-        router_activation = torch.sigmoid
         if self.training:
             with torch.no_grad():
                 norm_logits = sinkhorn(
                     logits.to(dtype=torch.float32)
                 )  # explicit fp32 conversion for stability
                 _, indices = torch.topk(norm_logits, k=self.topk, dim=1)
-            logits = router_activation(logits)
+            logits = _sinkhorn_activation(logits)
             scores = torch.gather(logits, 1, indices)
         else:
-            logits = router_activation(logits)
+            logits = _sinkhorn_activation(logits)
             scores, indices = torch.topk(logits, k=self.topk, dim=1)
         return scores, indices
 
