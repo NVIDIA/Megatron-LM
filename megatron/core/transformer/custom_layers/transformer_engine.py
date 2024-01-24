@@ -1,3 +1,4 @@
+import dataclasses
 import os
 from importlib.metadata import version
 from typing import Callable
@@ -8,6 +9,7 @@ from pkg_resources import packaging
 from torch import Tensor
 
 from megatron.core import ModelParallelConfig
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_global_ranks,
     get_context_parallel_group,
@@ -361,7 +363,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
     ):
         self.config = config
         self.te_forward_mask_type = False
-        self.qkv_format = 'sbhd'
+        self.qkv_format: str = 'sbhd'
 
         if self.config.apply_query_key_layer_scaling != bool(
             int(os.getenv('NVTE_APPLY_QK_LAYER_SCALING', '0'))
@@ -438,16 +440,32 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         value: Tensor,
         attention_mask: Tensor,
         attn_mask_type: AttnMaskType,
+        packed_seq_params: PackedSeqParams = None,
     ):
+        packed_seq_kwargs = (
+            dataclasses.asdict(packed_seq_params) if packed_seq_params is not None else {}
+        )
+        te_version = packaging.version.Version(version("transformer-engine"))
+        if te_version < packaging.version.Version("1.3.0"):
+            # TE 1.3.0 introduces precomputing max_seqlen to remove unnecessary kernels and D2H copies (#555)
+            # These two arguments did not exist prior to 1.3.0
+            packed_seq_kwargs.pop("max_seqlen_q", None)
+            packed_seq_kwargs.pop("max_seqlen_kv", None)
+
         if self.config.apply_rope_fusion and self.qkv_format == 'bshd':
             query, key, value = [x.transpose(0, 1).contiguous() for x in (query, key, value)]
 
         if self.te_forward_mask_type:
             core_attn_out = super().forward(
-                query, key, value, attention_mask, attn_mask_type=attn_mask_type.name
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=attn_mask_type.name,
+                **packed_seq_kwargs,
             )
         else:
-            core_attn_out = super().forward(query, key, value, attention_mask)
+            core_attn_out = super().forward(query, key, value, attention_mask, **packed_seq_kwargs,)
 
         if self.config.apply_rope_fusion and self.qkv_format == 'bshd':
             return core_attn_out.transpose(0, 1)
