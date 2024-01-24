@@ -28,6 +28,8 @@ GPT_MODEL_ARGS=(
     --normalization RMSNorm
     --no-position-embedding
     --no-query-key-layer-scaling
+    --use-distributed-optimizer
+    --overlap-grad-reduce
 )
 
 LOGISTICS_ARGS=(
