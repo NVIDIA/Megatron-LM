@@ -8,6 +8,8 @@ CHECKPOINT_DIR=$5
 TENSORBOARD_LOGS_PATH=$6
 TP=$7
 PP=$8
+VP=$9
+MBS=${10}
 
 # DISTRIBUTED_ARGS=(
 #     --nproc_per_node $GPUS_PER_NODE 
@@ -48,7 +50,7 @@ TRAINING_ARGS=(
     --no-initialization
     --no-load-optim
     --no-load-rng
-    --micro-batch-size 1 
+    --micro-batch-size $MBS 
     --global-batch-size 64
     --train-iters 200
     --weight-decay 0.1 
@@ -72,6 +74,8 @@ MODEL_PARALLEL_ARGS=(
     --pipeline-model-parallel-size $PP
     --sequence-parallel
     --no-async-tensor-model-parallel-allreduce
+    --recompute-method uniform
+    --num-layers-per-virtual-pipeline-stage $VP
 )
 
 source examples/pretrain-llama/training/llama_ve/llama70b_ve_init_emb_en_reasoning_ar_with_trans_from_scratch_test/iter_prob.sh
