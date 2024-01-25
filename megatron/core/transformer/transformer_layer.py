@@ -145,6 +145,7 @@ class TransformerLayer(MegatronModule):
         context_mask=None,
         rotary_pos_emb=None,
         inference_params=None,
+        packed_seq_params=None,
     ):
         # hidden_states: [s, b, h]
 
@@ -160,6 +161,7 @@ class TransformerLayer(MegatronModule):
             attention_mask=attention_mask,
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
+            packed_seq_params=packed_seq_params,
         )
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself

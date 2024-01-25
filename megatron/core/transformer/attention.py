@@ -1,24 +1,11 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
-
-import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from importlib.metadata import version
 from typing import Union
 
-from pkg_resources import packaging
-
-logger = logging.getLogger(__name__)
-
 import torch
-
-try:
-    from apex.transformer.functional import fused_apply_rotary_pos_emb
-
-    HAVE_APPLY_ROPE_FUSION = True
-except:
-    HAVE_APPLY_ROPE_FUSION = False
-
+from pkg_resources import packaging
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.common.embeddings.rotary_pos_embedding import apply_rotary_pos_emb
@@ -84,13 +71,6 @@ class Attention(MegatronModule, ABC):
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
-        if self.config.apply_rope_fusion and not HAVE_APPLY_ROPE_FUSION:
-            self.config.apply_rope_fusion = False
-            logger.warning(
-                "set apply_rope_fusion to false because its implementation"
-                " is not included in Apex. Try upgrading to the latest version"
-            )
-
         self.core_attention = build_module(
             submodules.core_attention,
             config=self.config,
@@ -116,7 +96,14 @@ class Attention(MegatronModule, ABC):
         )
 
     def _checkpointed_attention_forward(
-        self, query, key, value, attention_mask, rotary_pos_emb=None, attn_mask_type=None
+        self,
+        query,
+        key,
+        value,
+        attention_mask,
+        rotary_pos_emb=None,
+        attn_mask_type=None,
+        packed_seq_params=None,
     ):
         """Forward method with selective activation checkpointing."""
 
@@ -128,7 +115,12 @@ class Attention(MegatronModule, ABC):
             attn_mask_type = inputs[5]
             attn_mask_type = AttnMaskType(attn_mask_type.item())
             output_ = self.core_attention(
-                query, key, value, attention_mask, attn_mask_type=attn_mask_type
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=attn_mask_type,
+                packed_seq_params=packed_seq_params,
             )
             return output_
 
@@ -136,7 +128,14 @@ class Attention(MegatronModule, ABC):
             attn_mask_type = self.attn_mask_type
         attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
         hidden_states = tensor_parallel.checkpoint(
-            custom_forward, False, query, key, value, attention_mask, rotary_pos_emb, attn_mask_type
+            custom_forward,
+            False,
+            query,
+            key,
+            value,
+            attention_mask,
+            rotary_pos_emb,
+            attn_mask_type,
         )
 
         return hidden_states
@@ -239,6 +238,7 @@ class Attention(MegatronModule, ABC):
         key_value_states=None,
         inference_params=None,
         rotary_pos_emb=None,
+        packed_seq_params=None,
     ):
         # hidden_states: [sq, b, h]
 
@@ -259,17 +259,29 @@ class Attention(MegatronModule, ABC):
         key, value, rotary_pos_emb, attn_mask_type = self._adjust_key_value_for_inference(
             inference_params, key, value, rotary_pos_emb
         )
+
+        if packed_seq_params is not None:
+            query = query.squeeze(1)
+            key = key.squeeze(1)
+            value = value.squeeze(1)
+
         # ================================================
         # relative positional embedding (rotary embedding)
         # ================================================
         if rotary_pos_emb is not None:
             q_pos_emb, k_pos_emb = rotary_pos_emb
-            if self.config.apply_rope_fusion:
-                query = fused_apply_rotary_pos_emb(query, q_pos_emb, transpose_output_memory=True)
-                key = fused_apply_rotary_pos_emb(key, k_pos_emb, transpose_output_memory=True)
+
+            if packed_seq_params is not None:
+                cu_seqlens_q = packed_seq_params.cu_seqlens_q
+                cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
             else:
-                query = apply_rotary_pos_emb(query, q_pos_emb)
-                key = apply_rotary_pos_emb(key, k_pos_emb)
+                cu_seqlens_q = cu_seqlens_kv = None
+            query = apply_rotary_pos_emb(
+                query, q_pos_emb, fused=self.config.apply_rope_fusion, cu_seqlens=cu_seqlens_q
+            )
+            key = apply_rotary_pos_emb(
+                key, k_pos_emb, fused=self.config.apply_rope_fusion, cu_seqlens=cu_seqlens_kv
+            )
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
@@ -281,12 +293,29 @@ class Attention(MegatronModule, ABC):
 
         if self.checkpoint_core_attention:
             core_attn_out = self._checkpointed_attention_forward(
-                query, key, value, attention_mask, attn_mask_type=attn_mask_type
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=attn_mask_type,
+                packed_seq_params=packed_seq_params,
             )
         else:
             core_attn_out = self.core_attention(
-                query, key, value, attention_mask, attn_mask_type=attn_mask_type
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=attn_mask_type,
+                packed_seq_params=packed_seq_params,
             )
+
+        if packed_seq_params is not None:
+            # reshape to same output shape as unpacked case
+            # (t, np, hn) -> (t, b=1, h=np*hn)
+            # t is the pack size = sum (sq_i)
+            # note that batch is a dummy dimension in the packed case
+            core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
 
         # =================
         # Output. [sq, b, h]
