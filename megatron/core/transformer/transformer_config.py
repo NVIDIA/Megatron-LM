@@ -127,6 +127,7 @@ class TransformerConfig(ModelParallelConfig):
 
     # experimental section (TODO: move to apt. section above once stable)
     normalization: bool = "LayerNorm"  # alt value supported by TE: "RMSNorm"
+    core_attention_bias_type: str = 'no_bias'
     # MoE related
     moe_grouped_gemm: bool = False
 
