@@ -31,7 +31,7 @@ class TransformerConfig(ModelParallelConfig):
             add_bias_linear (bool): Include a bias term in all linear layers (QKV projections, after core attention, and two in MLP layer). Default is True.
             gated_linear_unit (bool): Use a gated linear unit for the first linear layer in the MLP. Defaults to False.
             activation_func (Callable): Activation function to use for the non-linearity in the MLP. Defaults to F.gelu.
-            num_moe_experts (int): Number of experts to use for Mixture of Experts. When set, it replaces MLP with Switch MLP. Defaults to None (no MoE).
+            num_moe_experts (int): Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Defaults to None (no MoE).
             init_method (Callable): Method to initialize weights. Note that bias is always set to zero. Should be a function that takes a single Tensor and initializes it. Defaults to megatron.core.utils.init_method_normal(init_method_std) which is torch nn init normal with mean=0.0 and std=init_method_Std.
             output_layer_init_method (Callable): Method to initialize weights of the output layer of both attention and MLP blocks. Defaults to megatron.core.utils.scaled_init_method_normal(init_method_std) which is torch nn init normal with mean=0.0 and std=init_method_std / math.sqrt(2.0 * num_layers).
             init_method_std (float): Standard deviation of the zero mean normal for the default initialization method, not used if init_method and output_layer_init_method are provided. Defaults to 0.02.
@@ -54,8 +54,14 @@ class TransformerConfig(ModelParallelConfig):
             clone_scatter_output_in_embedding (bool): When set to true, clone the output of scatter_to_sequence_parallel_region in embedding layer to facilitate garbage collection of input.
             normalization (str): Swtich b/w `LayerNorm` and `RMSNorm` as normalization layers. For now, these are primarily used by Transformer-Engine's layers like `LayerNormLinear`. Default value is `LayerNorm`.
             window_size ((int,int) or None): If not None, then will use sliding window attention. The size of the window is specified by the numbers inside the tuple; -1 is special value meaning "infinite window size".
+            moe_router_load_balancing_type (str): Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "None" implies no load balancing. The default is "aux_loss".
+            moe_router_topk (int): Number of experts to route to for each token. The default is 2.
             moe_grouped_gemm (bool): When there are multiple experts per rank, compress multiple local (potentially small)
             gemms in a single kernel launch to improve the utilization and performance by leveraging the Grouped GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
+            moe_aux_loss_coeff (float): Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.
+            moe_z_loss_coeff (float): Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended.
+            moe_input_jitter_eps (float): Add noise to the input tensor by applying jitter with a specified epsilon value.
+            moe_token_dropping (bool): This feature involves selectively dropping and padding tokens for each expert to achieve a specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note: Currently unsupported.
     """
 
     # model architecture
@@ -116,8 +122,15 @@ class TransformerConfig(ModelParallelConfig):
 
     # experimental section (TODO: move to apt. section above once stable)
     normalization: bool = "LayerNorm"  # alt value supported by TE: "RMSNorm"
+
     # MoE related
+    moe_router_load_balancing_type: str = "aux_loss"
+    moe_router_topk: int = 2
     moe_grouped_gemm: bool = False
+    moe_aux_loss_coeff: float = 0  # 1e-2 would be a good start value for load balance loss.
+    moe_z_loss_coeff: float = None  # 1e-3 would be a good start value for z-loss
+    moe_input_jitter_eps: float = None
+    moe_token_dropping: bool = False  # TODO: Support token dropping.
 
     def __post_init__(self):
         """ Python dataclass method that is used to modify attributes after initialization.

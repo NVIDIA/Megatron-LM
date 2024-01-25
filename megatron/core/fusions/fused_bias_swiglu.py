@@ -66,13 +66,15 @@ class SwiGLUFunction(torch.autograd.Function):
 
 
 def bias_swiglu_impl(input, bias):
-    shape = input.shape
-    input = input.view(-1, shape[2])
+    ori_shape = input.shape
+    assert len(ori_shape) in [2, 3]
+    input = input.view(-1, ori_shape[-1])
     if bias is not None:
         output = BiasSwiGLUFunction.apply(input, bias)
     else:
         output = SwiGLUFunction.apply(input)
-    return output.view(shape[0], shape[1], -1)
+
+    return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 
 
 # bias_swiglu_impl = BiasSwiGLUFunction.apply
