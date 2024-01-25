@@ -1,6 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Literal, Optional
+from typing import Literal
 
 import torch
 from torch import Tensor
@@ -8,10 +8,6 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import (
-    make_sharded_tensor_for_checkpoint,
-    make_tp_sharded_tensor_for_checkpoint,
-)
 
 
 class LanguageModelEmbedding(MegatronModule):
@@ -130,34 +126,3 @@ class LanguageModelEmbedding(MegatronModule):
             embeddings = self.embedding_dropout(embeddings)
 
         return embeddings
-
-    def sharded_state_dict(self, prefix=''):
-
-        sharded_state_dict = {}
-
-        word_embeddings_prefix = f'{prefix}word_embeddings.'
-        word_embeddings_state_dict = self.word_embeddings.state_dict(
-            prefix=word_embeddings_prefix, keep_vars=True
-        )
-
-        sharded_word_embeddings_key = f'{word_embeddings_prefix}weight'
-        sharded_word_embeddings_tensor = make_tp_sharded_tensor_for_checkpoint(
-            tensor=word_embeddings_state_dict[sharded_word_embeddings_key],
-            key=sharded_word_embeddings_key,
-            allow_shape_mismatch=True,
-        )
-        sharded_state_dict[sharded_word_embeddings_key] = sharded_word_embeddings_tensor
-
-        if self.add_position_embedding:
-            position_embeddings_prefix = f'{prefix}position_embeddings.'
-            position_embeddings_state_dict = self.position_embeddings.state_dict(
-                prefix=position_embeddings_prefix, keep_vars=True
-            )
-            sharded_position_embeddings_key = f'{position_embeddings_prefix}weight'
-            sharded_position_embeddings_tensor = make_sharded_tensor_for_checkpoint(
-                tensor=position_embeddings_state_dict[sharded_position_embeddings_key],
-                key=sharded_position_embeddings_key,
-            )
-            sharded_state_dict[sharded_position_embeddings_key] = sharded_position_embeddings_tensor
-
-        return sharded_state_dict

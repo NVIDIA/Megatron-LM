@@ -64,6 +64,8 @@ torchrun $DISTRIBUTED_ARGS \
        --tensor-model-parallel-size $TP_SIZE \
        --pipeline-model-parallel-size $PP_SIZE \
        --no-gradient-accumulation-fusion \
+       --no-bias-swiglu-fusion \
+       --no-rope-fusion \
        --fp16
 
 echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt

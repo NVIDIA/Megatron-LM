@@ -1,3 +1,4 @@
+import dataclasses
 import os
 from importlib.metadata import version
 from typing import Callable
@@ -8,6 +9,7 @@ from pkg_resources import packaging
 from torch import Tensor
 
 from megatron.core import ModelParallelConfig
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_global_ranks,
     get_context_parallel_group,
@@ -98,7 +100,7 @@ class TELinear(te.pytorch.Linear):
         # ourselves. This way our forward always returns two values
         # and we don't have to deal with the zero length Tensor.
         self.te_return_bias = skip_bias_add and bias
-
+        self.is_first_microbatch = True
         if skip_weight_param_allocation:
             raise ValueError(
                 'Transformer Engine linear layers do not support skip_weight_param_allocation'
@@ -110,7 +112,9 @@ class TELinear(te.pytorch.Linear):
         if te_version >= packaging.version.Version("0.8.0"):
             if self.config.tp_comm_overlap:
                 extra_kwargs["ub_split_ag"] = self.config.tp_comm_split_ag
+                extra_kwargs["ub_atomic_gemm_ag"] = self.config.tp_comm_atomic_ag
                 extra_kwargs["ub_split_rs"] = self.config.tp_comm_split_rs
+                extra_kwargs["ub_atomic_gemm_rs"] = self.config.tp_comm_atomic_rs
                 if te_version > packaging.version.Version("1.0.0"):
                     assert (
                         tp_comm_buffer_name is not None
@@ -133,7 +137,8 @@ class TELinear(te.pytorch.Linear):
         )
 
     def forward(self, x):
-        out = super().forward(x)
+        out = super().forward(x, is_first_microbatch=self.is_first_microbatch)
+        self.is_first_microbatch = False
 
         # TE only returns a tuple when return_bias is True, otherwise
         # it returns a single Tensor, we always want to return two
@@ -182,7 +187,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         # ourselves. This way our forward always returns two values
         # and we don't have to deal with the zero length Tensor.
         self.te_return_bias = skip_bias_add and bias
-
+        self.is_first_microbatch = True
         extra_kwargs = _get_extra_te_kwargs(config)
 
         # Only Transformer-Engine version >= 0.11.0 supports `RMSNorm`
@@ -198,6 +203,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             if self.config.tp_comm_overlap:
                 extra_kwargs["ub_bulk_wgrad"] = self.config.tp_comm_bulk_wgrad
                 extra_kwargs["ub_bulk_dgrad"] = self.config.tp_comm_bulk_dgrad
+                extra_kwargs["ub_atomic_gemm_ag"] = self.config.tp_comm_atomic_ag
                 extra_kwargs["ub_split_ag"] = self.config.tp_comm_split_ag
                 if te_version > packaging.version.Version("1.0.0"):
                     assert (
@@ -224,7 +230,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         )
 
     def forward(self, x):
-        out = super().forward(x)
+        out = super().forward(x, is_first_microbatch=self.is_first_microbatch)
+        self.is_first_microbatch = False
 
         # TE only returns a tuple when return_bias is True, otherwise
         # it returns a single Tensor, we always want to return two
@@ -233,11 +240,11 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             return out
         return out, None
 
-    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
+    def sharded_state_dict(self, prefix='', sharded_offsets=()):
         """ Sharding along axis 0, bias sharded """
         state_dict = self.state_dict(prefix='', keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, sharded_key_prefix, {'weight': 0, 'bias': 0}, sharded_offsets
+            state_dict, prefix, {'weight': 0, 'bias': 0}, sharded_offsets
         )
 
 
@@ -279,11 +286,11 @@ class TEColumnParallelLinear(TELinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
         )
 
-    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
+    def sharded_state_dict(self, prefix='', sharded_offsets=()):
         """ Sharding along axis 0, bias sharded """
         state_dict = self.state_dict(prefix='', keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, sharded_key_prefix, {'weight': 0, 'bias': 0}, sharded_offsets
+            state_dict, prefix, {'weight': 0, 'bias': 0}, sharded_offsets
         )
 
 
@@ -326,11 +333,11 @@ class TERowParallelLinear(TELinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
         )
 
-    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
+    def sharded_state_dict(self, prefix='', sharded_offsets=()):
         """ Sharding along axis 1, bias not sharded """
         state_dict = self.state_dict(prefix='', keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, sharded_key_prefix, {'weight': 1}, sharded_offsets
+            state_dict, prefix, {'weight': 1}, sharded_offsets
         )
 
 
@@ -356,6 +363,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
     ):
         self.config = config
         self.te_forward_mask_type = False
+        self.qkv_format: str = 'sbhd'
 
         if self.config.apply_query_key_layer_scaling != bool(
             int(os.getenv('NVTE_APPLY_QK_LAYER_SCALING', '0'))
@@ -386,6 +394,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         if te_version > packaging.version.Version("0.12.0"):
             self.te_forward_mask_type = True
 
+        if self.config.apply_rope_fusion and te_version > packaging.version.Version("0.13.0"):
+            extra_kwargs["qkv_format"] = self.qkv_format = 'bshd'
+
         # Only Transformer-Engine version >= 1.0.0 supports context parallelism
         if te_version >= packaging.version.Version("1.0.0"):
             if getattr(TEDotProductAttention, "cp_stream") is None:
@@ -399,6 +410,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             assert (
                 self.config.context_parallel_size == 1
             ), "Only Transformer-Engine version >= 1.0.0 supports context parallelism!"
+
+        if config.window_size is not None:
+            # Check version
+            assert te_version >= packaging.version.Version(
+                "1.2.0"
+            ), f"Transformer-Engine version ({str(te_version)}) must be >= 1.2.0 to support sliding window attention."
+            extra_kwargs['window_size'] = config.window_size
 
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
@@ -422,13 +440,37 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         value: Tensor,
         attention_mask: Tensor,
         attn_mask_type: AttnMaskType,
+        packed_seq_params: PackedSeqParams = None,
     ):
+        packed_seq_kwargs = (
+            dataclasses.asdict(packed_seq_params) if packed_seq_params is not None else {}
+        )
+        te_version = packaging.version.Version(version("transformer-engine"))
+        if te_version < packaging.version.Version("1.3.0"):
+            # TE 1.3.0 introduces precomputing max_seqlen to remove unnecessary kernels and D2H copies (#555)
+            # These two arguments did not exist prior to 1.3.0
+            packed_seq_kwargs.pop("max_seqlen_q", None)
+            packed_seq_kwargs.pop("max_seqlen_kv", None)
+
+        if self.config.apply_rope_fusion and self.qkv_format == 'bshd':
+            query, key, value = [x.transpose(0, 1).contiguous() for x in (query, key, value)]
+
         if self.te_forward_mask_type:
-            return super().forward(
-                query, key, value, attention_mask, attn_mask_type=attn_mask_type.name
+            core_attn_out = super().forward(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=attn_mask_type.name,
+                **packed_seq_kwargs,
             )
         else:
-            return super().forward(query, key, value, attention_mask)
+            core_attn_out = super().forward(query, key, value, attention_mask, **packed_seq_kwargs,)
+
+        if self.config.apply_rope_fusion and self.qkv_format == 'bshd':
+            return core_attn_out.transpose(0, 1)
+        else:
+            return core_attn_out
 
 
 try:
@@ -440,3 +482,11 @@ try:
 except ImportError:
 
     SplitAlongDim = None
+
+try:
+
+    from transformer_engine.pytorch.cpu_offload import get_cpu_offload_context
+
+except ImportError:
+
+    get_cpu_offload_context = None

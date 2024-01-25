@@ -8,6 +8,7 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -45,6 +46,10 @@ class DotProductAttention(MegatronModule):
         assert (
             self.config.context_parallel_size == 1
         ), "Context parallelism is only supported by TEDotProductAttention!"
+
+        assert (
+            self.config.window_size is None
+        ), "Sliding Window Attention is only supported by TEDotProductAttention!"
 
         self.layer_number = max(1, layer_number)
         self.attn_mask_type = attn_mask_type
@@ -89,7 +94,12 @@ class DotProductAttention(MegatronModule):
         value: Tensor,
         attention_mask: Tensor,
         attn_mask_type: AttnMaskType = None,
+        packed_seq_params: PackedSeqParams = None,
     ):
+        assert packed_seq_params is None, (
+            "Packed sequence is not supported by DotProductAttention."
+            "Please use TEDotProductAttention instead."
+        )
 
         # ===================================
         # Raw attention scores. [b, n/p, s, s]

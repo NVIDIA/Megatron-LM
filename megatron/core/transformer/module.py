@@ -1,12 +1,18 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 """Megatron Module."""
+from typing import Tuple
 
 import torch
 from torch.autograd import Variable
 from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import (
+    make_sharded_tensors_for_checkpoint,
+    sharded_state_dict_default,
+)
 
 _FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
 _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
@@ -46,18 +52,43 @@ class MegatronModule(torch.nn.Module):
 
         return self.state_dict(prefix=prefix, keep_vars=keep_vars)
 
-    def sharded_state_dict(self, prefix: str = ''):
-        """Override sharded state dict with Dist Checkpointing.
+    def sharded_state_dict(
+        self, prefix: str = '', sharded_offsets: Tuple[Tuple[int, int, int]] = ()
+    ) -> ShardedStateDict:
+        """Default implementation for sharded state dict for distributed checkpointing.
 
-        Override sharded_state_dict when using distributed checkpointing. keep_vars must always be set to True so that optimizer states can be sharded.
+        General definition of sharded_state_dict simply calls `sharded_state_dict_default`
+        (which call sharded_state_dict method if possible or a default implementation otherwise)
+        recursively on all submodules.
 
         Args:
-            prefix (str, optional): _description_. Defaults to ''.
+            prefix (str): prefix for the state dict keys
+            sharded_offsets (Tuple[Tuple[int, int, int]], optional): sharding already
+                applied (e.g. PP related) by sup-modules. Passed along to ShardedTensor
 
         Returns:
-            _type_: _description_
+            dict: dictionary of state dict keys mapped to ShardedTensors
         """
-        return self.state_dict(prefix=prefix, keep_vars=True)
+        sharded_state_dict = {}
+        # Save parameters
+        self._save_to_state_dict(sharded_state_dict, '', keep_vars=True)
+        sharded_state_dict = make_sharded_tensors_for_checkpoint(
+            sharded_state_dict, prefix, sharded_offsets=sharded_offsets
+        )
+        # Recurse into submodules
+        for name, module in self.named_children():
+            sharded_state_dict.update(
+                sharded_state_dict_default(module, f'{prefix}{name}.', sharded_offsets)
+            )
+        return sharded_state_dict
+
+    def set_is_first_microbatch(self):
+        """Sets the is_first_microbatch flag if it exists. When this flag is set, TE modules will update their fp8 parameter cache.
+        
+        """
+        for m in self.modules():
+            if hasattr(m, "is_first_microbatch"):
+                m.is_first_microbatch = True
 
 
 def conversion_helper(val, conversion):
@@ -146,12 +177,9 @@ class Float16Module(MegatronModule):
         """Retrieve state_dict from the module being wrapped."""
         return self.module.state_dict_for_save_checkpoint(prefix=prefix, keep_vars=keep_vars)
 
-    def sharded_state_dict(self, prefix=''):
-        """Retrieve state_dict from the module being wrapped.
-
-        When using distributed checkpointing, keep_vars must always be set to True.
-        """
-        return self.module.sharded_state_dict(prefix=prefix)
+    def sharded_state_dict(self, prefix='', *args, **kwargs):
+        """Retrieve sharded_state_dict from the module being wrapped."""
+        return self.module.sharded_state_dict(prefix, *args, **kwargs)
 
     def load_state_dict(self, state_dict, strict=True):
         self.module.load_state_dict(state_dict, strict=strict)

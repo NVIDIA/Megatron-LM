@@ -1,10 +1,11 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
-
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from importlib.metadata import version
 from typing import Union
 
 import torch
+from pkg_resources import packaging
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.common.embeddings.rotary_pos_embedding import apply_rotary_pos_emb
@@ -18,7 +19,6 @@ from megatron.core.utils import divide
 
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
-from .utils import make_sharded_tensors_for_checkpoint
 
 
 @dataclass
@@ -96,7 +96,14 @@ class Attention(MegatronModule, ABC):
         )
 
     def _checkpointed_attention_forward(
-        self, query, key, value, attention_mask, rotary_pos_emb=None, attn_mask_type=None
+        self,
+        query,
+        key,
+        value,
+        attention_mask,
+        rotary_pos_emb=None,
+        attn_mask_type=None,
+        packed_seq_params=None,
     ):
         """Forward method with selective activation checkpointing."""
 
@@ -108,7 +115,12 @@ class Attention(MegatronModule, ABC):
             attn_mask_type = inputs[5]
             attn_mask_type = AttnMaskType(attn_mask_type.item())
             output_ = self.core_attention(
-                query, key, value, attention_mask, attn_mask_type=attn_mask_type
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=attn_mask_type,
+                packed_seq_params=packed_seq_params,
             )
             return output_
 
@@ -116,7 +128,14 @@ class Attention(MegatronModule, ABC):
             attn_mask_type = self.attn_mask_type
         attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
         hidden_states = tensor_parallel.checkpoint(
-            custom_forward, False, query, key, value, attention_mask, rotary_pos_emb, attn_mask_type
+            custom_forward,
+            False,
+            query,
+            key,
+            value,
+            attention_mask,
+            rotary_pos_emb,
+            attn_mask_type,
         )
 
         return hidden_states
@@ -219,6 +238,7 @@ class Attention(MegatronModule, ABC):
         key_value_states=None,
         inference_params=None,
         rotary_pos_emb=None,
+        packed_seq_params=None,
     ):
         # hidden_states: [sq, b, h]
 
@@ -240,13 +260,28 @@ class Attention(MegatronModule, ABC):
             inference_params, key, value, rotary_pos_emb
         )
 
+        if packed_seq_params is not None:
+            query = query.squeeze(1)
+            key = key.squeeze(1)
+            value = value.squeeze(1)
+
         # ================================================
         # relative positional embedding (rotary embedding)
         # ================================================
         if rotary_pos_emb is not None:
             q_pos_emb, k_pos_emb = rotary_pos_emb
-            query = apply_rotary_pos_emb(query, q_pos_emb)
-            key = apply_rotary_pos_emb(key, k_pos_emb)
+
+            if packed_seq_params is not None:
+                cu_seqlens_q = packed_seq_params.cu_seqlens_q
+                cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+            else:
+                cu_seqlens_q = cu_seqlens_kv = None
+            query = apply_rotary_pos_emb(
+                query, q_pos_emb, fused=self.config.apply_rope_fusion, cu_seqlens=cu_seqlens_q
+            )
+            key = apply_rotary_pos_emb(
+                key, k_pos_emb, fused=self.config.apply_rope_fusion, cu_seqlens=cu_seqlens_kv
+            )
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
@@ -258,12 +293,29 @@ class Attention(MegatronModule, ABC):
 
         if self.checkpoint_core_attention:
             core_attn_out = self._checkpointed_attention_forward(
-                query, key, value, attention_mask, attn_mask_type=attn_mask_type
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=attn_mask_type,
+                packed_seq_params=packed_seq_params,
             )
         else:
             core_attn_out = self.core_attention(
-                query, key, value, attention_mask, attn_mask_type=attn_mask_type
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=attn_mask_type,
+                packed_seq_params=packed_seq_params,
             )
+
+        if packed_seq_params is not None:
+            # reshape to same output shape as unpacked case
+            # (t, np, hn) -> (t, b=1, h=np*hn)
+            # t is the pack size = sum (sq_i)
+            # note that batch is a dummy dimension in the packed case
+            core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
 
         # =================
         # Output. [sq, b, h]
@@ -349,21 +401,6 @@ class SelfAttention(Attention):
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
 
         return query, key, value
-
-    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
-        sharded_key_prefix = prefix if sharded_key_prefix is None else sharded_key_prefix
-        sharded_state_dict = {}
-        for name, module in (
-            ('linear_qkv', self.linear_qkv),
-            ('linear_proj', self.linear_proj),
-        ):
-            sub_sd = module.sharded_state_dict(
-                prefix=f'{prefix}{name}.',
-                sharded_key_prefix=f'{sharded_key_prefix}{name}.',
-                sharded_offsets=sharded_offsets,
-            )
-            sharded_state_dict.update(sub_sd)
-        return sharded_state_dict
 
 
 class CrossAttention(Attention):

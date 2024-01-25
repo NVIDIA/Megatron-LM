@@ -3,10 +3,11 @@
 # Parts of the code here are adapted from PyTorch
 # repo: https://github.com/pytorch/pytorch
 
+import io
 import math
 import os
 import warnings
-from typing import Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -22,6 +23,9 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 
+from ..dist_checkpointing.mapping import ShardedStateDict
+from ..transformer.utils import make_sharded_tensors_for_checkpoint
+from ..utils import make_tp_sharded_tensor_for_checkpoint
 from .mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
@@ -221,6 +225,22 @@ class VocabParallelEmbedding(torch.nn.Module):
         # Reduce across all the model parallel GPUs.
         output = reduce_from_tensor_model_parallel_region(output_parallel)
         return output
+
+    def sharded_state_dict(
+        self, prefix: str = '', sharded_offsets: Tuple[Tuple[int, int, int]] = ()
+    ) -> ShardedStateDict:
+        """ Non-default implementation for embeddings due to `allow_shape_mismatch` param """
+        state_dict = self.state_dict(prefix='', keep_vars=True)
+
+        weight_prefix = f'{prefix}weight'
+        return {
+            weight_prefix: make_tp_sharded_tensor_for_checkpoint(
+                tensor=state_dict['weight'],
+                key=weight_prefix,
+                allow_shape_mismatch=True,
+                prepend_offsets=sharded_offsets,
+            )
+        }
 
 
 class LinearWithFrozenWeight(torch.autograd.Function):
@@ -692,6 +712,13 @@ class ColumnParallelLinear(torch.nn.Module):
             self.sequence_parallel or self.expert_parallel
         )
 
+        # Hook adding a default empty _extra_state for state dict
+        self._register_load_state_dict_pre_hook(
+            lambda state_dict, prefix, *args, **kwargs: state_dict.setdefault(
+                f'{prefix}_extra_state'
+            )
+        )
+
     def forward(self, input_: torch.Tensor, weight: Optional[torch.Tensor] = None):
         """Forward of ColumnParallelLinear
 
@@ -721,6 +748,12 @@ class ColumnParallelLinear(torch.nn.Module):
                     f"supplied weight's shape is {tuple(weight.shape)}, "
                     f"not {expected_shape} as expected"
                 )
+
+        if self.config._cpu_offloading_context is not None:
+            if self.config._cpu_offloading_context.inside_context == True:
+                assert (
+                    self.config.cpu_offloading == False
+                ), "CPU Offloading cannot be enabled while using non-TE modules"
 
         bias = self.bias if not self.skip_bias_add else None
 
@@ -756,6 +789,20 @@ class ColumnParallelLinear(torch.nn.Module):
             output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=()):
+        """ Sharding along axis 0, bias sharded """
+        state_dict = self.state_dict(prefix='', keep_vars=True)
+        return make_sharded_tensors_for_checkpoint(
+            state_dict, prefix, {'weight': 0, 'bias': 0}, sharded_offsets
+        )
+
+    def set_extra_state(self, state: Any):
+        """ Extra state is ignored """
+
+    def get_extra_state(self) -> None:
+        """ Keep compatibility with TE state dict. """
+        return None
 
 
 class RowParallelLinear(torch.nn.Module):
@@ -879,6 +926,13 @@ class RowParallelLinear(torch.nn.Module):
             self.sequence_parallel or self.expert_parallel
         )
 
+        # Hook adding a default empty _extra_state for state dict
+        self._register_load_state_dict_pre_hook(
+            lambda state_dict, prefix, *args, **kwargs: state_dict.setdefault(
+                f'{prefix}_extra_state'
+            )
+        )
+
     def forward(self, input_):
         """Forward of RowParallelLinear
 
@@ -889,6 +943,13 @@ class RowParallelLinear(torch.nn.Module):
             - output
             - bias
         """
+
+        if self.config._cpu_offloading_context is not None:
+            if self.config._cpu_offloading_context.inside_context == True:
+                assert (
+                    self.config.cpu_offloading == False
+                ), "CPU Offloading cannot be enabled while using non-TE modules"
+
         # Set up backprop all-reduce.
         if self.input_is_parallel:
             input_parallel = input_
@@ -924,3 +985,17 @@ class RowParallelLinear(torch.nn.Module):
             output = output_
             output_bias = self.bias
         return output, output_bias
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=()):
+        """ Sharding along axis 1, bias not sharded """
+        state_dict = self.state_dict(prefix='', keep_vars=True)
+        return make_sharded_tensors_for_checkpoint(
+            state_dict, prefix, {'weight': 1}, sharded_offsets
+        )
+
+    def set_extra_state(self, state: Any):
+        """ Extra state is ignored """
+
+    def get_extra_state(self) -> None:
+        """ Keep compatibility with TE state dict. """
+        return None
