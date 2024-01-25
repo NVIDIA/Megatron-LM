@@ -591,7 +591,11 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             # Get app_tag ID
             app_tag_id = [hashlib.md5(i.encode('utf-8')).hexdigest() for i in app_tag]
 
-        one_logger.log_metrics({'app_tag': app_tag, 'app_tag_id': app_tag_id})
+        one_logger.log_metrics({
+            'app_tag': app_tag,
+            'app_tag_id': app_tag_id,
+            'app_tag_count': len(app_tag)
+        })
 
     total_iterations = total_loss_dict[advanced_iters_key] + \
                        total_loss_dict[skipped_iters_key]
