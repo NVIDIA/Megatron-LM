@@ -1051,9 +1051,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         async_op = False
                     )
                 self.all_gather_events[all_gather_event_index].record()
-            if not async_op:
-                self.all_gather_events[-1].synchronize()
-                self.all_gather_events[-1] = None
+            if not async_op and self.all_gather_events[all_gather_event_index] is not None:
+                self.all_gather_events[all_gather_event_index].synchronize()
+                self.all_gather_events[all_gather_event_index] = None
+                stream.synchronize()
             assert self.all_gather_event_index_to_bucket_index_map[all_gather_event_index] == \
                 (gbuf_index, dtype, bucket_index)
             self.param_buffer_copied.append(False)
