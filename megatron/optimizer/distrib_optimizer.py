@@ -491,33 +491,33 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.param_buffers.append(current_param_buffers)
 
         # Now construct data structures to manage all-gather handles.
-        self.all_gather_handles = []
-        self.all_gather_handle_index_to_bucket_index_map = []
-        self.model_index_to_all_gather_handle_index_map = {}
+        self.all_gather_events = []
+        self.all_gather_event_index_to_bucket_index_map = []
+        self.model_index_to_all_gather_event_index_map = {}
         self.all_gather_handle_indices = []
-        self.param_to_all_gather_handle_index_map = {}
+        self.param_to_all_gather_event_index_map = {}
         self.param_buffer_copied = []
 
         self.pbuf_view_items = self.get_model_param_buffer_dp_views()
         for (gbuf_index, dtype, bucket_index, _, _) in self.pbuf_view_items:
-            self.all_gather_handle_index_to_bucket_index_map.append(
+            self.all_gather_event_index_to_bucket_index_map.append(
                 (gbuf_index, dtype, bucket_index)
             )
-            all_gather_handle_index = len(self.all_gather_handle_index_to_bucket_index_map) - 1
-            self.all_gather_handles.append(None)
+            all_gather_event_index = len(self.all_gather_event_index_to_bucket_index_map) - 1
+            self.all_gather_events.append(None)
 
             # Store all all_gather_handle_indices.
             model_idx = self.gbuf_idx_to_model_idx_map[gbuf_index]
-            if model_idx not in self.model_index_to_all_gather_handle_index_map:
-                self.model_index_to_all_gather_handle_index_map[model_idx] = []
-            self.model_index_to_all_gather_handle_index_map[model_idx].append(
-                all_gather_handle_index
+            if model_idx not in self.model_index_to_all_gather_event_index_map:
+                self.model_index_to_all_gather_event_index_map[model_idx] = []
+            self.model_index_to_all_gather_event_index_map[model_idx].append(
+                all_gather_event_index
             )
 
             for param in self.grad_buffers[gbuf_index].buckets[bucket_index].params_list:
-                self.param_to_all_gather_handle_index_map[param] = all_gather_handle_index
+                self.param_to_all_gather_event_index_map[param] = all_gather_event_index
             self.param_buffer_copied.append(False)
-        self.num_all_gather_handles = len(self.all_gather_handle_index_to_bucket_index_map)
+        self.num_all_gather_events = len(self.all_gather_event_index_to_bucket_index_map)
 
         self.overlap_param_gather = get_args().overlap_param_gather
         self.remove_pre_hook_handle = None
@@ -955,7 +955,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # kernels don't head-of-line block the compute kernels since we run with
         # CUDA_DEVICE_MAX_CONNECTIONS=1 to support sequence parallelism).
         if self.overlap_param_gather:
-            self._dispatch_gather_model_params(all_gather_handle_index=0)
+            self._dispatch_gather_model_params(all_gather_event_index=0)
 
     def get_model_param_buffer_dp_views(self):
         """
@@ -977,9 +977,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Add in reverse order in each model chunk since buckets start from the end of the model but we want
         # all-gathers to run first for the start of the model (same order as forward pass).
         # We keep the view_items in model chunk order since we want to still first run all_gather and
-        # all_gather_handle.wait() for the first model chunk.
-        # In all cases, we want all_gather and all_gather_handle.wait() to be called in the same order,
-        # and all_gather_handle.wait() needs to be called just before the corresponding forward pass.
+        # all_gather_event.wait() for the first model chunk.
+        # In all cases, we want all_gather and all_gather_event.wait() to be called in the same order,
+        # and all_gather_event.wait() needs to be called just before the corresponding forward pass.
         view_items = []
         for gbuf_index, buffers in enumerate(self.param_buffers):
             view_items_per_model_chunk = []
@@ -993,7 +993,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         return view_items
 
-    def _dispatch_gather_model_params(self, all_gather_handle_index, force_sync=False):
+    def _dispatch_gather_model_params(self, all_gather_event_index, force_sync=False):
         """
         All-gather updated model params.
 
@@ -1011,22 +1011,54 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # across all data-parallel ranks, due to padding (done in grad_buffer.py),
             # and extended to the param_bufs. Thus, all sub-views will have consistent
             # start / end indexes across data-parallel ranks.
-            (gbuf_index, dtype, bucket_index, pbuf, pbuf_views) = self.pbuf_view_items[
-                all_gather_handle_index
-            ]
-            assert all_gather_handle_index < len(self.all_gather_handles)
-            all_gather_handle = torch.distributed._all_gather_base(
-                pbuf, pbuf_views[data_parallel_rank], group=data_parallel_group, async_op=async_op,
-            )
-            self.all_gather_handles[all_gather_handle_index] = all_gather_handle
-            assert self.all_gather_handle_index_to_bucket_index_map[all_gather_handle_index] == (
-                gbuf_index,
-                dtype,
-                bucket_index,
-            )
+            (gbuf_index, dtype, bucket_index, pbuf, pbuf_views) = self.pbuf_view_items[all_gather_event_index]
+            assert all_gather_event_index < len(self.all_gather_events)
+
+            self.all_gather_events[all_gather_event_index] = torch.cuda.Event()
+            stream = self.models[gbuf_index].grad_buffers[dtype].buckets[bucket_index].comm_stream
+            torch.cuda.synchronize()
+            with torch.cuda.stream(stream):
+                if self.quantize_helper is not None and self.quantize_helper.quantized_weights:
+                    data_parallel_world_size = mpu.get_data_parallel_world_size()
+                    quantized_shard, scales = self.quantize_helper.quantize_gather_weights(pbuf_views[data_parallel_rank])
+                    pbuf_int8_view = pbuf.view(torch.int8).contiguous()
+                    quantized_buffer_view = pbuf_int8_view[:quantized_shard.numel() * data_parallel_world_size]
+
+                    # All-gather for quantized parameters
+                    torch.distributed._all_gather_base(
+                        quantized_buffer_view,
+                        quantized_shard,
+                        group=data_parallel_group
+                    )
+
+                    # Prepare buffer for all-gathered scales
+                    all_scales = torch.empty(data_parallel_world_size * scales.numel(), dtype=scales.dtype, device=scales.device)
+
+                    # All-gather for scales
+                    torch.distributed._all_gather_base(
+                        all_scales,
+                        scales,
+                        group=data_parallel_group
+                    )
+                    # Dequantize the gathered buffer and update the parameters
+                    self.quantize_helper.dequantize_gather_weights(quantized_buffer_view, all_scales, pbuf)
+                else:
+                    torch.distributed._all_gather_base(
+                        pbuf,
+                        pbuf_views[data_parallel_rank],
+                        group = data_parallel_group,
+                        async_op = False
+                    )
+                self.all_gather_events[all_gather_event_index].record()
+            if not async_op:
+                self.all_gather_events[-1].synchronize()
+                self.all_gather_events[-1] = None
+            assert self.all_gather_event_index_to_bucket_index_map[all_gather_event_index] == \
+                (gbuf_index, dtype, bucket_index)
+            self.param_buffer_copied.append(False)
 
         if not async_op:
-            self._copy_params_from_param_buffer(all_gather_handle_index)
+            self._copy_params_from_param_buffer(all_gather_event_index)
 
     def _make_forward_pre_hook(self):
         """
@@ -1046,9 +1078,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if not param.requires_grad:
                     continue
 
-                assert param in self.param_to_all_gather_handle_index_map
-                all_gather_handle_index = self.param_to_all_gather_handle_index_map[param]
-                self._finish_param_sync_helper(all_gather_handle_index)
+                assert param in self.param_to_all_gather_event_index_map
+                all_gather_event_index = self.param_to_all_gather_event_index_map[param]
+                self._finish_param_sync_helper(all_gather_event_index)
 
         return hook
 
@@ -1056,48 +1088,51 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         Finishes all necessary param syncs for the model_index'th model chunk.
         """
-        if model_index not in self.model_index_to_all_gather_handle_index_map:
+        if model_index not in self.model_index_to_all_gather_event_index_map:
             return
 
-        all_gather_handle_indices = self.model_index_to_all_gather_handle_index_map[model_index]
-        for all_gather_handle_index in all_gather_handle_indices:
-            self._finish_param_sync_helper(all_gather_handle_index)
+        all_gather_event_indices = self.model_index_to_all_gather_event_index_map[model_index]
+        for all_gather_event_index in all_gather_event_indices:
+            self._finish_param_sync_helper(all_gather_event_index)
 
-    def _finish_param_sync_helper(self, all_gather_handle_index):
+    def _finish_param_sync_helper(self, all_gather_event_index):
         """
-        Waits on all_gather_handle if necessary, then copies params from param_buffer
+        Waits on all_gather_event if necessary, then copies params from param_buffer
         into model_params if necessary.
         """
 
         # First check if there is an outstanding all-gather handle for this param.
         # If so, wait on the handle to ensure the communication is finished.
-        assert all_gather_handle_index < len(self.all_gather_handles)
-        all_gather_handle = self.all_gather_handles[all_gather_handle_index]
-        if all_gather_handle is not None:
-            all_gather_handle.wait()
-            self.all_gather_handles[all_gather_handle_index] = None
+        assert all_gather_event_index < len(self.all_gather_events)
+        all_gather_event = self.all_gather_events[all_gather_event_index]
+        if all_gather_event is not None:
+            (model_index, dtype, bucket_index, pbuf, pbuf_views) = self.pbuf_view_items[all_gather_event_index]
+            stream = self.models[model_index].grad_buffers[dtype].buckets[bucket_index].comm_stream
+            all_gather_event.synchronize()
+            stream.synchronize()
+            self.all_gather_events[all_gather_event_index] = None
 
             # Launch the all-gather for the next bucket now.
             # We can't pre-launch all-gathers for all buckets at once since we don't
             # want to head-of-line block the compute kernels with communication kernels
             # (since we run with CUDA_DEVICE_MAX_CONNECTIONS=1 to support sequence
             # parallelism).
-            next_all_gather_handle_index = all_gather_handle_index + 1
-            if next_all_gather_handle_index < self.num_all_gather_handles:
-                self._dispatch_gather_model_params(next_all_gather_handle_index)
+            next_all_gather_event_index = all_gather_event_index + 1
+            if next_all_gather_event_index < self.num_all_gather_events:
+                self._dispatch_gather_model_params(next_all_gather_event_index)
 
         # Also check if we have already copied from the param buffer for this
         # handle; if not, complete the copy and mark as such.
-        if not self.param_buffer_copied[all_gather_handle_index]:
-            self._copy_params_from_param_buffer(all_gather_handle_index)
-            self.param_buffer_copied[all_gather_handle_index] = True
+        if not self.param_buffer_copied[all_gather_event_index]:
+            self._copy_params_from_param_buffer(all_gather_event_index)
+            self.param_buffer_copied[all_gather_event_index] = True
 
-    def _copy_params_from_param_buffer(self, all_gather_handle_index):
+    def _copy_params_from_param_buffer(self, all_gather_event_index):
         """
         Copy params from param_buffer to model_params.
         """
-        (gbuf_index, dtype, bucket_index) = self.all_gather_handle_index_to_bucket_index_map[
-            all_gather_handle_index
+        (gbuf_index, dtype, bucket_index) = self.all_gather_event_index_to_bucket_index_map[
+            all_gather_event_index
         ]
         grad_buffer = self.grad_buffers[gbuf_index]
 

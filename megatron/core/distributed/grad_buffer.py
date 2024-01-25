@@ -3,10 +3,12 @@
 import math
 from logging import getLogger
 from typing import Dict, List
+from functools import reduce
 
 import torch
 
 from .. import parallel_state
+from ...quantization_helper import QuantizationHelper
 
 logger = getLogger(__name__)
 
@@ -53,6 +55,7 @@ class Bucket:
         data_parallel_world_size: int,
         overlap_grad_reduce: bool,
         use_distributed_optimizer: bool,
+        quantization_helper: QuantizationHelper,
     ):
         # State for bookkeeping: params is the set of parameters this bucket is
         # responsible for, params_with_grad is the set of parameters with grads
@@ -71,7 +74,11 @@ class Bucket:
         self.data_parallel_rank = torch.distributed.get_rank(group=data_parallel_group)
         self.overlap_grad_reduce = overlap_grad_reduce
         self.use_distributed_optimizer = use_distributed_optimizer
-
+        self.quantization_helper = quantization_helper
+        if self.overlap_grad_reduce:
+            self.comm_stream = torch.cuda.Stream()
+        else:
+            self.comm_stream = torch.cuda.default_stream()
         self.reset()
 
     def reset(self):
@@ -79,7 +86,7 @@ class Bucket:
         Reset metadata in bucket in preparation for the next iteration of training.
         """
         self.params_with_grad = set()
-        self.communication_handle = None
+        self.communication_event: torch.cuda.Event = None
         self.communication_issued = False
 
     def start_grad_sync(self):
@@ -92,26 +99,46 @@ class Bucket:
         synchronous call.
         """
         assert (
-            self.communication_handle is None and not self.communication_issued
+            self.communication_event is None and not self.communication_issued
         ), 'Should not have multiple communication calls in flight at once'
 
+        stream = self.comm_stream
+        
+        event = torch.cuda.Event()
+        self.communication_event = event
+        self.communication_issued = True
         self.data /= self.data_parallel_world_size
         # Use async_op only when overlap_grad_reduce is True.
         if self.use_distributed_optimizer:
             local_data_view = shard_buffer(self.data, self.data_parallel_world_size)[
                 self.data_parallel_rank
             ]
-            self.communication_handle = torch.distributed._reduce_scatter_base(
-                local_data_view,
-                self.data,
-                group=self.data_parallel_group,
-                async_op=self.overlap_grad_reduce,
-            )
+            if self.quantization_helper and self.quantization_helper.quantized_gradients:
+                torch.cuda.synchronize()
+                with torch.cuda.stream(stream):
+                    local_data_view.copy_(self.quantization_helper.quantize_reduce_gradients(self.data))
+                    event.record()
+            else:
+                torch.cuda.synchronize()
+                with torch.cuda.stream(stream):
+                    torch.distributed._reduce_scatter_base(
+                        local_data_view,
+                        self.data,
+                        group=self.data_parallel_group,
+                        async_op=False,
+                    )
+                    event.record()
         else:
-            self.communication_handle = torch.distributed.all_reduce(
-                self.data, group=self.data_parallel_group, async_op=self.overlap_grad_reduce
-            )
-        self.communication_issued = True
+            torch.cuda.synchronize()
+            with torch.cuda.stream(stream):
+                torch.distributed.all_reduce(
+                    self.data, group=self.data_parallel_group, async_op=False
+                )
+                event.record()
+        if not self.overlap_grad_reduce:
+            self.communication_event.synchronize()
+            self.comm_stream.synchronize()
+            self.communication_event = None
 
     def finish_grad_sync(self):
         """
@@ -125,11 +152,13 @@ class Bucket:
         if not self.overlap_grad_reduce:
             self.start_grad_sync()
             return
-        assert self.communication_handle is not None and self.communication_issued, (
+        assert self.communication_event is not None and self.communication_issued, (
             f'Communication call has not been issued for this bucket '
             f'({len(self.params_with_grad)}/{len(self.params)} params have grad available)'
         )
-        self.communication_handle.wait()
+        self.communication_event.synchronize()
+        self.comm_stream.synchronize()
+        self.communication_event = None
 
     def register_grad_ready(self, param: torch.nn.Parameter):
         """
@@ -176,6 +205,7 @@ class GradBuffer:
         param_to_name: Dict[torch.nn.Parameter, str],
         overlap_grad_reduce: bool,
         use_distributed_optimizer: bool,
+        quantization_helper = QuantizationHelper
     ):
 
         # Check that params are unique.
@@ -193,6 +223,7 @@ class GradBuffer:
         )
         self.overlap_grad_reduce = overlap_grad_reduce
         self.use_distributed_optimizer = use_distributed_optimizer
+        self.quantization_helper = quantization_helper
         self.is_last_microbatch = True
 
         # Data structures to store underlying buckets and relevant indexing data.
@@ -200,7 +231,27 @@ class GradBuffer:
         self.param_to_bucket = {}  # Param -> bucket mapping.
         self.param_index_map = {}  # Param -> location in buffer mapping (used in dist. optimizer).
 
+
+
         def _pad_if_needed(data_index: int):
+            bucket_size_divisible_by = 1
+            if use_distributed_optimizer and quantization_helper is not None and (quantization_helper.quantized_weights or quantization_helper.quantized_gradients):
+                def least_common_multiple(divisors):
+                    """Find least common multiple of a list of numbers."""
+                    lcm_value = reduce(lambda x, y: x * y // math.gcd(x, y), divisors)
+                    return lcm_value
+                weight_quantization_pad = 1
+                gradient_quantization_pad = 1
+                if quantization_helper.quantized_weights:
+                    # Qantized weight requires the number of weights be a multiple of 8
+                    weight_quantization_pad = quantization_helper.wq_group_size * 8
+                if quantization_helper.quantized_gradients:
+                    gradient_quantization_pad = quantization_helper.gq_group_size
+                bucket_size_divisible_by = least_common_multiple([weight_quantization_pad, gradient_quantization_pad]) * self.data_parallel_world_size
+                return (
+                    int(math.ceil(data_index / bucket_size_divisible_by))
+                    * bucket_size_divisible_by
+                )
             """Pads data indices if using distributed optimizer (to ensure uniform sharding)."""
             if use_distributed_optimizer:
                 return (
@@ -368,6 +419,7 @@ class GradBuffer:
             data_parallel_world_size=self.data_parallel_world_size,
             overlap_grad_reduce=self.overlap_grad_reduce,
             use_distributed_optimizer=self.use_distributed_optimizer,
+            quantization_helper=self.quantization_helper,
         )
         self.buckets.append(bucket)
         for bucket_param in bucket_params:

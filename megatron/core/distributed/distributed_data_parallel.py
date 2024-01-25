@@ -9,6 +9,7 @@ from .. import parallel_state
 from ..transformer.module import MegatronModule
 from ..transformer.transformer_config import TransformerConfig
 from .grad_buffer import GradBuffer
+from ...quantization_helper import QuantizationHelper
 
 
 class DistributedDataParallel(MegatronModule):
@@ -46,6 +47,7 @@ class DistributedDataParallel(MegatronModule):
         use_distributed_optimizer: bool,
         disable_bucketing: bool = False,
         bucket_size: int = 40000000,
+        quantization_helper: QuantizationHelper = None,
     ):
         super().__init__(config=config)
         self.module = module
@@ -66,6 +68,7 @@ class DistributedDataParallel(MegatronModule):
         if disable_bucketing:
             bucket_size = None
         self.bucket_size = bucket_size
+        self.quantization_helper = quantization_helper
 
         self.module = module
         self.grad_buffers = {}
@@ -98,6 +101,7 @@ class DistributedDataParallel(MegatronModule):
                 param_to_name,
                 self.overlap_grad_reduce,
                 self.use_distributed_optimizer,
+                self.quantization_helper
             )
             self.grad_buffer_param_index_map[dtype] = self.grad_buffers[dtype].param_index_map
             for param in params:
