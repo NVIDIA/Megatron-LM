@@ -19,7 +19,7 @@ from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
 from megatron.arguments import core_transformer_config_from_args
 from megatron.core.transformer.spec_utils import import_module
-from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec
+from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec, bert_layer_local_spec
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
@@ -32,10 +32,14 @@ def model_provider(pre_process=True, post_process=True):
 
     if args.use_mcore_models:
 
-        if args.spec is not None:
+        
+        if args.spec is None:
+            transformer_layer_spec = bert_layer_with_transformer_engine_spec #default spec
+        elif args.spec == 'local':
+            transformer_layer_spec = bert_layer_local_spec
+        else :
             transformer_layer_spec = import_module(args.spec)
-        else:
-            transformer_layer_spec = bert_layer_with_transformer_engine_spec 
+            
 
         model = BertModel(
             config=config,

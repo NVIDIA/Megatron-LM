@@ -725,6 +725,20 @@ train.bert_core.345m_tp2_pp2_1node_50steps:
     TIME_LIMIT: "20:00"
     TEST_LEVEL: MR_TESTS
 
+train.bert_core.345m_tp2_pp2_1node_50steps_local_spec:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 2
+    PP_SIZE: 2
+    NUM_NODES: 1
+    USE_CORE: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: MR_TESTS
+    ADDITIONAL_PARAMS: "--spec local"
+
 train.bert_core.345m_tp1_pp2_1node_50steps:
   <<: *selene-test-launcher
   variables:
