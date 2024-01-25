@@ -1015,7 +1015,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert all_gather_event_index < len(self.all_gather_events)
 
             self.all_gather_events[all_gather_event_index] = torch.cuda.Event()
-            stream = self.models[gbuf_index].grad_buffers[dtype].buckets[bucket_index].comm_stream
+            grad_buffer = self.grad_buffers[gbuf_index]
+            stream = grad_buffer.buckets[bucket_index].comm_stream
             torch.cuda.synchronize()
             with torch.cuda.stream(stream):
                 if self.quantize_helper is not None and self.quantize_helper.quantized_weights:
@@ -1106,8 +1107,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         assert all_gather_event_index < len(self.all_gather_events)
         all_gather_event = self.all_gather_events[all_gather_event_index]
         if all_gather_event is not None:
-            (model_index, dtype, bucket_index, pbuf, pbuf_views) = self.pbuf_view_items[all_gather_event_index]
-            stream = self.models[model_index].grad_buffers[dtype].buckets[bucket_index].comm_stream
+            (gbuf_index, dtype, bucket_index, pbuf, pbuf_views) = self.pbuf_view_items[all_gather_event_index]
+            grad_buffer = self.grad_buffers[gbuf_index]
+            stream = grad_buffer.buckets[bucket_index].comm_stream
             all_gather_event.synchronize()
             stream.synchronize()
             self.all_gather_events[all_gather_event_index] = None
