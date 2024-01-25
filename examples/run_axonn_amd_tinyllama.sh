@@ -1,99 +1,73 @@
 #!/bin/bash
 #SBATCH -p batch
-#SBATCH -A CSC547
-#SBATCH -t 00:20:00
+#SBATCH -A CSC569
+#SBATCH -o /lustre/orion/csc569/proj-shared/megatron-axonn-tiny-llama-1.1b/logs/test.out
 
-# Runs the "345M" parameter model
+echo "This TinyLLAMA script will work for <=512 GPUs."
 
+## loading python venv
 module load cray-python
 . /lustre/orion/scratch/ssingh37/csc547/venv_axonn_pt_2.1/bin/activate
 module load amd-mixed/5.6.0 #this should match with the rocm version your pytorch uses
 
-## these lines enable CUDA aware MPI
-#module load craype-accel-amd-gfx90a
 export MPICH_GPU_SUPPORT_ENABLED=0
-#export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${CRAY_MPICH_ROOTDIR}/gtl/lib"
-## this enables the slingshot-11 plugin for RCCL (crucial for inter-node bw)
-export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/lustre/orion/scratch/ssingh37/csc547/aws-ofi-rccl/build/lib"
-#export NCCL_DEBUG=INFO
 export FI_CXI_ATS=0
 export HSA_FORCE_FINE_GRAIN_PCIE=1
-#export NCCL_SOCKET_IFNAME=hsn
-# super important
-#export NCCL_NET_GDR_LEVEL=4
-#export NCCL_P2P_LEVEL=4
-## this improves cross node bandwidth for some cases
 export NCCL_CROSS_NIC=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+
+## point this to the AWS plugin (you should have compiled this previously)
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/lustre/orion/scratch/ssingh37/csc547/aws-ofi-rccl/build/lib"
 
 NNODES=$SLURM_JOB_NUM_NODES
 GPUS_PER_NODE=8 ## change as per your machine
 GPUS=$(( NNODES * GPUS_PER_NODE )) 
-
 export MASTER_ADDR=$(hostname)
 export MASTER_PORT=29500
 
-# data/checkpoint args
-DATA_DIR="/lustre/orion/csc547/proj-shared/parallel_deep_learning/book_corpus"
 
-CHECKPOINT_PATH="${DATA_DIR}/checkpoints"
+# these are redundant for tiny-llams, so ignore
+DATA_DIR="/lustre/orion/csc547/proj-shared/parallel_deep_learning/book_corpus"
 VOCAB_FILE="${DATA_DIR}/gpt2-vocab.json"
 MERGE_FILE="${DATA_DIR}/gpt2-merges.txt"
 DATA_PATH="${DATA_DIR}/BookCorpusDataset_text_document"
 
+# we will save and load model checkpoints here
+CHECKPOINT_PATH="/lustre/orion/csc569/proj-shared/megatron-axonn-tiny-llama-1.1b/checkpoints"
 
-## ARCHITECTURE DETAILS
+#TODO: tensorboard logging
+#TENSORBOARD_DIR="/lustre/orion/csc569/proj-shared/megatron-axonn-tiny-llama-1.1b/logs"
+#mkdir -p ${TENSORBOARD_DIR}
+
+# tiny-llama1.1B
+# https://github.com/azshue/lit-gpt-dev/blob/tiny-llama/lit_gpt/config.py
 #
-#
-# 5B
-NUM_LAYERS=24
+GLOBAL_BATCH_SIZE=512
+SEQUENCE_LENGTH=2048
+NUM_LAYERS=22
 NUM_HEADS=32
-HIDDEN_SIZE=4096
-#
-# 10B
-#NUM_LAYERS=32
-#NUM_HEADS=40
-#HIDDEN_SIZE=5120
+HIDDEN_SIZE=2048	
+FFN_HIDDEN_SIZE=5632
+NUM_QUERY_GROUPS=4
+TOKENS_IN_BILLIONS=3000
 
-# 20B
-#NUM_LAYERS=32
-#NUM_HEADS=56
-#HIDDEN_SIZE=7168
+TRAIN_ITERS=$(( TOKENS_IN_BILLIONS * 1000000000 / GLOBAL_BATCH_SIZE / SEQUENCE_LENGTH  + 100 )) 
+echo "Number of training iterations : ${TRAIN_ITERS}"
 
-# 40B
-#NUM_LAYERS=38
-#NUM_HEADS=72
-#HIDDEN_SIZE=9216
-#
-# 80B
-#NUM_LAYERS=42
-#NUM_HEADS=96
-#HIDDEN_SIZE=12288
-#
-
-# 160B
-#NUM_LAYERS=84
-#NUM_HEADS=96
-#HIDDEN_SIZE=12288
-
-## PARALLELISM DETAILS
-#
-ROW_TENSOR_PARR=2
+## AxoNN args
+## These do not affect the science
+ROW_TENSOR_PARR=1
 COLUMN_TENSOR_PARR=1
-DEPTH_TENSOR_PARR=4
+DEPTH_TENSOR_PARR=2
 PIPE_PARR=1
-CACHE_LAYERS=24
+CACHE_LAYERS=22
 OVERLAP=True
 
 
+## DERIVED ARGUMENTS (ignore)
 MP=$(( ROW_TENSOR_PARR * COLUMN_TENSOR_PARR * DEPTH_TENSOR_PARR ))
 DP=$(( GPUS / MP ))
-## BATCH SIZES
-
-GLOBAL_BATCH_SIZE=16
 MICRO_BATCH_SIZE=$(( GLOBAL_BATCH_SIZE / DP ))
-SEQUENCE_LENGTH=2048
-TRAIN_ITERS=10
 
 
 config="r-${ROW_TENSOR_PARR}-c-${COLUMN_TENSOR_PARR}-d-${DEPTH_TENSOR_PARR}-g-${GPUS}"
@@ -106,18 +80,21 @@ GPT_ARGS="
     --num-layers ${NUM_LAYERS} \
     --hidden-size ${HIDDEN_SIZE} \
     --num-attention-heads ${NUM_HEADS} \
+    --ffn-hidden-size ${FFN_HIDDEN_SIZE} \
     --seq-length ${SEQUENCE_LENGTH} \
     --max-position-embeddings ${SEQUENCE_LENGTH} \
     --micro-batch-size ${MICRO_BATCH_SIZE} \
     --global-batch-size ${GLOBAL_BATCH_SIZE} \
-    --lr 0.00015 \
+    --lr 4.0e-4 \
     --train-iters ${TRAIN_ITERS} \
     --lr-decay-iters 320000 \
     --lr-decay-style cosine \
-    --min-lr 1.0e-5 \
-    --weight-decay 1e-2 \
-    --lr-warmup-fraction .01 \
+    --min-lr 4.0e-5 \
+    --weight-decay 1e-1 \
+    --lr-warmup-iters 2000 \
     --clip-grad 1.0 \
+    --adam-beta1 0.9 \
+    --adam-beta2 0.95 \
     --bf16 \
     --no-gradient-accumulation-fusion \
     --use-amd \
@@ -125,10 +102,15 @@ GPT_ARGS="
     --recompute-method uniform \
     --recompute-num-layers 1 \
     --use-flash-attn \
+    --swiglu \
+    --use-rotary-position-embeddings \
+    --normalization RMSNorm \
+    --group-query-attention \
+    --num-query-groups ${NUM_QUERY_GROUPS}
 "
 # --no-gradient-accumulation-fusion is neede on AMD
 # --use-amd disables features incompatible with AMD
-
+# --swiglu makes ParallelMLP equivalent to LLAMAMLP
 
 if [[ $OVERLAP == "True" ]]
 then
@@ -139,33 +121,31 @@ then
 		--num-layers-for-caching-weights-in-depth-tensor-parallel-all-gather ${CACHE_LAYERS}"
 fi
 
-
+# the data-path vocab-file and marge-file args are redundant here
+# the custom-dataloader is switching to the lit gpt dataloader
 DATA_ARGS="
-    --data-path $DATA_PATH \
     --vocab-file $VOCAB_FILE \
     --merge-file $MERGE_FILE \
     --split 949,50,1 \
-
     --custom-dataloader
 "
 
 
 OUTPUT_ARGS="
     --log-interval 1 \
-    --save-interval 10000 \
+    --save-interval 1000 \
     --eval-interval 1000 \
-    --eval-iters 1
+    --eval-iters 100 \
 "
 
-SCRIPT="python -u pretrain_lit_gpt.py \
+SCRIPT="python -u pretrain_gpt.py \
     $GPT_ARGS \
     $DATA_ARGS \
     $OUTPUT_ARGS \
     --distributed-backend nccl \
+    --save $CHECKPOINT_PATH \
+    --load $CHECKPOINT_PATH
 "
-
-    #--save $CHECKPOINT_PATH \
-    #--load $CHECKPOINT_PATH
 
 
 export PYTHONPATH="$PYTHONPATH:/lustre/orion/scratch/ssingh37/csc547/lit-gpt-dev"

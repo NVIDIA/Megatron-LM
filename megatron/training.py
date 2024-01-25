@@ -121,22 +121,27 @@ def pretrain(train_valid_test_dataset_provider,
     # Data stuff.
     timers('train/valid/test-data-iterators-setup', log_level=0).start(
         barrier=True)
-    if args.virtual_pipeline_model_parallel_size is not None:
-        all_data_iterators = [
-            build_train_valid_test_data_iterators(
-                train_valid_test_dataset_provider)
-            for _ in range(len(model))
-        ]
-        train_data_iterator = [data_iterators[0]
-                               for data_iterators in all_data_iterators]
-        valid_data_iterator = [data_iterators[1]
-                               for data_iterators in all_data_iterators]
-        test_data_iterator = [data_iterators[2]
-                              for data_iterators in all_data_iterators]
+    if not args.custom_dataloader:
+        if args.virtual_pipeline_model_parallel_size is not None:
+            all_data_iterators = [
+                build_train_valid_test_data_iterators(
+                    train_valid_test_dataset_provider)
+                for _ in range(len(model))
+            ]
+            train_data_iterator = [data_iterators[0]
+                                   for data_iterators in all_data_iterators]
+            valid_data_iterator = [data_iterators[1]
+                                   for data_iterators in all_data_iterators]
+            test_data_iterator = [data_iterators[2]
+                                  for data_iterators in all_data_iterators]
+        else:
+            train_data_iterator, valid_data_iterator, test_data_iterator \
+                = build_train_valid_test_data_iterators(
+                    train_valid_test_dataset_provider)
     else:
-        train_data_iterator, valid_data_iterator, test_data_iterator \
-            = build_train_valid_test_data_iterators(
-                train_valid_test_dataset_provider)
+        assert args.virtual_pipeline_model_parallel_size is None
+        train_data_iterator, valid_data_iterator = train_valid_test_dataset_provider(0)
+        test_data_iterator = None
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
 
@@ -650,8 +655,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             total_loss_dict[skipped_iters_key])
         log_string += ' number of nan iterations: {:3d} |'.format(
             total_loss_dict[nan_iters_key])
-        log_string += ' theoretical FLOP/s: {:.3f} TFLOP/s | '.format(get_flops(elapsed_time_per_iteration))
-        log_string += ' model size: {:.3f} B params | '.format(get_params())
+        #log_string += ' theoretical FLOP/s: {:.3f} TFLOP/s | '.format(get_flops(elapsed_time_per_iteration))
+        #log_string += ' model size: {:.3f} B params | '.format(get_params())
         curr, peak = get_mem()
         log_string += ' memory used by tensors {:.3f} GB ( peak {:.3f} GB)'.format(curr, peak)
 
@@ -677,6 +682,8 @@ def get_flops(batch_time):
     vocab_size = args.padded_vocab_size
     num_gpus = torch.distributed.get_world_size()
     teraflop_in_batch = 96*batch_size*seq_length*num_layers*(hidden_size**2)*(1+seq_length/(6*hidden_size)+(vocab_size)/(16*num_layers*hidden_size))/(1e12)
+    if args.swiglu:
+        teraflop_in_batch += (2*batch_size*seq_length*4*(hidden_size**2))*4*num_layers / 1e12
     return teraflop_in_batch/batch_time/num_gpus
 
 
@@ -688,6 +695,8 @@ def get_params():
     hidden_size = args.hidden_size
     vocab_size = args.padded_vocab_size
     params = 12 * num_layers * (hidden_size ** 2)* ( 1 + 13/(12*hidden_size) + (vocab_size + seq_length)/(12 * num_layers * hidden_size)) / 1e9
+    if args.swiglu:
+        params += num_layers * 4 * hidden_size ** 2 / 1e9
     return params
    
 def get_mem():

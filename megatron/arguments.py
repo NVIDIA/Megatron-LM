@@ -1081,6 +1081,8 @@ def _add_validation_args(parser):
 def _add_data_args(parser):
     group = parser.add_argument_group(title='data and dataloader')
 
+    group.add_argument('--custom-dataloader', help="using custom dataloader, bypass megatron's"
+                       "dataset/dataloader creation", action='store_true')
     group.add_argument('--data-path', nargs='*', default=None,
                        help='Path to the training dataset. Accepted format:'
                        '1) a single data path, 2) multiple datasets in the'
