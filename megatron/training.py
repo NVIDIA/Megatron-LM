@@ -770,8 +770,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         train_samples_start = args.consumed_train_samples
         train_samples_target = args.train_samples
         one_logger.log_metrics({
-            'train_iterations_start': iteration,
             'train_samples_start': args.consumed_train_samples,
+            'train_iterations_start': iteration,
             'train_samples_target': train_samples_target,
             'train_iterations_target': args.train_iters,
         })
