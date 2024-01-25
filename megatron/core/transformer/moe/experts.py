@@ -1,10 +1,12 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+from typing import Tuple
 
 import numpy as np
 import torch
 from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
@@ -140,6 +142,11 @@ class GroupedMLP(MegatronModule):
         fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
 
         return fc2_output, None
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=()):
+        raise NotImplementedError(
+            'Currently distributed checkpointing is not supported for GroupedMLP'
+        )
 
 
 class SequentialMLP(MegatronModule):
