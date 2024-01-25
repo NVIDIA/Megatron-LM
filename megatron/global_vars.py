@@ -18,7 +18,6 @@ _GLOBAL_TOKENIZER = None
 _GLOBAL_TENSORBOARD_WRITER = None
 _GLOBAL_WANDB_WRITER = None
 _GLOBAL_ONE_LOGGER = None
-_GLOBAL_APP_TAG = []
 _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
 _GLOBAL_SIGNAL_HANDLER = None
@@ -69,11 +68,6 @@ def get_one_logger():
     """Return one logger. It can be None so no need
     to check if it is initialized."""
     return _GLOBAL_ONE_LOGGER
-
-def get_app_tag():
-    """Return app tag. It can be None so no need
-    to check if it is initialized."""
-    return _GLOBAL_APP_TAG
 
 def get_adlr_autoresume():
     """ADLR autoresume object. It can be None so no need

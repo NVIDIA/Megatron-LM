@@ -23,7 +23,6 @@ from megatron import get_timers
 from megatron import get_tensorboard_writer
 from megatron import get_wandb_writer
 from megatron import get_one_logger
-from megatron import get_app_tag
 from megatron import get_current_global_batch_size
 from megatron import get_num_microbatches
 from megatron import is_last_rank
@@ -519,7 +518,6 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     writer = get_tensorboard_writer()
     wandb_writer = get_wandb_writer()
     one_logger = get_one_logger()
-    app_tag = get_app_tag()
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
