@@ -68,7 +68,7 @@ We discard chunks that would convert to an empty Bert sequence (rare case, happe
 
 Take the Wikipedia corpus as an example to build the retrieval chunk database:
 
-Prepare the following arguments and update our templates in [tools/retro/examples/preprocess_data.sh](tools/retro/examples/preprocess_data.sh):
+Prepare the following arguments and update our templates in [tools/retro/examples/preprocess_data.sh](examples/preprocess_data.sh):
 - `--retro-workdir`: The directory in which the preprocessing pipeline saves its datasets and configuration files. 
   **This argument should remain consistent for a full pass through the pipeline, and for pretraining.**
 - `--data-path`: text corpus path to build retrieval database. In the case of Wikipedia corpus, it could be

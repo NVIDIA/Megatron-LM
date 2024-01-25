@@ -44,11 +44,11 @@ export GOTO_NUM_THREADS=2
 export OPENBLAS_NUM_THREADS=2
 
 # step 5 : CREATING A COPY OF THE SBATCH SCRIPT THAT WILL BE RUN FOR DEBUGGING
-envsubst '$BASE_DIR $PYTORCH_IMAGE $BUILD_DIR $DATA_DIR $MBS $GBS $ADDITIONAL_PARAMS $USE_TE $TP_SIZE $PP_SIZE $VP_SIZE $NUM_NODES $MAX_STEPS $USE_CORE' <$BUILD_DIR/tests/functional_tests/test_scripts/$RUN_MODEL/sbatch_${RUN_MODEL}_distributed_test.sh > $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/debug/sbatch_${RUN_MODEL}_distributed_test.sh
+envsubst '$BASE_DIR $PYTORCH_IMAGE $BUILD_DIR $DATA_DIR $MBS $GBS $MOE_GROUPED_GEMM $ADDITIONAL_PARAMS $USE_TE $TP_SIZE $PP_SIZE $VP_SIZE $NUM_NODES $MAX_STEPS $USE_CORE' <$BUILD_DIR/tests/functional_tests/test_scripts/$RUN_MODEL/sbatch_${RUN_MODEL}_distributed_test.sh > $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/debug/sbatch_${RUN_MODEL}_distributed_test.sh
 
 
 # step 6 : SUBMITTING THE JOB
-sbatch_submission=`sbatch -t $TIME_LIMIT $BUILD_DIR/tests/functional_tests/test_scripts/$RUN_MODEL/sbatch_${RUN_MODEL}_distributed_test.sh --export=BASE_DIR,BUILD_DIR,DATA_DIR,USE_TE,TP_SIZE,PP_SIZE,VP_SIZE,NUM_NODES,MAX_STEPS,MBS,GBS,PYTORCH_IMAGE,ADDITIONAL_PARAMS`
+sbatch_submission=`sbatch -t $TIME_LIMIT $BUILD_DIR/tests/functional_tests/test_scripts/$RUN_MODEL/sbatch_${RUN_MODEL}_distributed_test.sh --export=BASE_DIR,BUILD_DIR,DATA_DIR,USE_TE,TP_SIZE,PP_SIZE,VP_SIZE,NUM_NODES,MAX_STEPS,MBS,GBS,MOE_GROUPED_GEMM,PYTORCH_IMAGE,ADDITIONAL_PARAMS`
 export SLURM_JOBID=$(echo $sbatch_submission| grep 'Submitted batch job' | awk '{ print $4 }');
 
 # step 7 : WAITING FOR JOB TO COMPLETE AND PRINTING JOB INFO

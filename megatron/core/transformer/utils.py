@@ -126,7 +126,7 @@ def make_sharded_object_for_checkpoint(
         replica_id = (
             0,
             parallel_state.get_tensor_model_parallel_rank(),
-            parallel_state.get_data_parallel_rank(),
+            parallel_state.get_data_parallel_rank(with_context_parallel=True),
         )
 
     return ShardedObject(key, obj, *_get_extra_state_offsets(sharded_offsets), replica_id, **kwargs)

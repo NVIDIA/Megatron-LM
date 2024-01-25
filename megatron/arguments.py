@@ -170,6 +170,8 @@ def validate_args(args, defaults={}):
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer, \
             '--overlap-param-gather only supported with distributed optimizer'
+        assert args.overlap_grad_reduce, \
+            '--overlap-grad-reduce should be turned on when using --overlap-param-gather'
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -288,6 +290,11 @@ def validate_args(args, defaults={}):
     if args.fp32_residual_connection:
         assert args.fp16 or args.bf16, \
             'residual connection in fp32 only supported when using fp16 or bf16.'
+
+    if args.moe_grouped_gemm:
+        assert args.bf16, 'Currently GroupedGEMM for MoE only supports bf16 dtype.'
+        dc = torch.cuda.get_device_capability()
+        assert dc[0] >= 8, "Unsupported compute capability for GroupedGEMM kernels."
 
     if args.weight_decay_incr_style == 'constant':
         assert args.start_weight_decay is None
@@ -648,6 +655,12 @@ def _add_network_size_args(parser):
                        dest='bert_binary_head')
     group.add_argument('--num-experts', type=int, default=None,
                        help='Number of Experts in Switch Transformer (None means no Switch)')
+    group.add_argument('--moe-grouped-gemm', action='store_true',
+                       help='When there are multiple experts per rank, compress '
+                       'multiple local (potentially small) gemms in a single kernel '
+                       'launch to improve the utilization and performance by '
+                       'leveraging the Grouped GEMM feature introduced since '
+                       'CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).')
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
                        help='Untie embeddings and output weights.'),
     return parser
@@ -722,8 +735,22 @@ def _add_logging_args(parser):
                        help='The wandb experiment name.')
     group.add_argument('--wandb-save-dir', type=str, default='',
                        help='Path to save the wandb results locally.')
-    group.add_argument('--enable-onelogger', action='store_true',
-                       help='If set, use one_logger to track e2e metrics')
+    group.add_argument('--enable-one-logger', action='store_true',
+                       help='If set, use one_logger to track E2E metrics'
+                       'Note that one_logger is an internal tool and not available externally. '
+                       'For installation, please try command: `pip install '
+                       '--index-url=https://sc-hw-artf.nvidia.com/api/pypi/hwinf-ml-pypi/simple'
+                       ' one_logger` or go to https://gitlab-master.nvidia.com/hwinf-dcm/onelogger '
+                       'for more details')
+    group.add_argument('--one-logger-project', type=str, default='e2e-tracking',
+                       help='The one-logger project name. Will ignore if '
+                       '--enable-one-logger is not set')
+    group.add_argument('--one-logger-entity', type=str, default='hwinf_dcm',
+                       help='The one-logger username or team name. Will ignore if '
+                       '--enable-one-logger is not set')
+    group.add_argument('--one-logger-run-name', type=str, default=None,
+                       help='The one-logger run name displayed. Will ignore if '
+                       '--enable-one-logger is not set')
     return parser
 
 

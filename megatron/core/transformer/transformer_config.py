@@ -53,6 +53,8 @@ class TransformerConfig(ModelParallelConfig):
             fp8_wgrad (bool): When set to False, override FP8 config options and do the wgrad computation in higher precision. Defaults to True.
             clone_scatter_output_in_embedding (bool): When set to true, clone the output of scatter_to_sequence_parallel_region in embedding layer to facilitate garbage collection of input.
             normalization (str): Swtich b/w `LayerNorm` and `RMSNorm` as normalization layers. For now, these are primarily used by Transformer-Engine's layers like `LayerNormLinear`. Default value is `LayerNorm`.
+            moe_grouped_gemm (bool): When there are multiple experts per rank, compress multiple local (potentially small)
+            gemms in a single kernel launch to improve the utilization and performance by leveraging the Grouped GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
     """
 
     # model architecture
@@ -111,6 +113,8 @@ class TransformerConfig(ModelParallelConfig):
 
     # experimental section (TODO: move to apt. section above once stable)
     normalization: bool = "LayerNorm"  # alt value supported by TE: "RMSNorm"
+    # MoE related
+    moe_grouped_gemm: bool = False
 
     def __post_init__(self):
         """ Python dataclass method that is used to modify attributes after initialization.

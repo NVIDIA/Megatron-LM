@@ -18,6 +18,7 @@ _GLOBAL_TOKENIZER = None
 _GLOBAL_TENSORBOARD_WRITER = None
 _GLOBAL_WANDB_WRITER = None
 _GLOBAL_ONE_LOGGER = None
+_GLOBAL_APP_TAG = []
 _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
 _GLOBAL_SIGNAL_HANDLER = None
@@ -69,6 +70,14 @@ def get_one_logger():
     to check if it is initialized."""
     return _GLOBAL_ONE_LOGGER
 
+<<<<<<< HEAD
+=======
+def get_app_tag():
+    """Return app tag. It can be None so no need
+    to check if it is initialized."""
+    return _GLOBAL_APP_TAG
+
+>>>>>>> 7027a1d725215457f716ad20efe865028e99e69a
 
 def get_adlr_autoresume():
     """ADLR autoresume object. It can be None so no need
@@ -197,10 +206,28 @@ def _set_one_logger(args):
     global _GLOBAL_ONE_LOGGER
     _ensure_var_is_not_initialized(_GLOBAL_ONE_LOGGER, 'one logger')
 
+<<<<<<< HEAD
     if args.enable_onelogger and args.rank == (args.world_size - 1):
         from one_logger.core import OneLogger
         one_logger = OneLogger()
         _GLOBAL_ONE_LOGGER = one_logger
+=======
+    if args.enable_one_logger and args.rank == (args.world_size - 1):
+        try:
+            from one_logger.core import OneLogger
+            config = {
+               'project': args.one_logger_project,
+               'entity': args.one_logger_entity,
+               'name': args.one_logger_run_name
+            }
+            one_logger = OneLogger(config=config)
+            _GLOBAL_ONE_LOGGER = one_logger
+        except BaseException:
+            print('WARNING: one_logger package is required to enable e2e metrics '
+                  'tracking. Try pip install '
+                  '--index-url=https://sc-hw-artf.nvidia.com/api/pypi/hwinf-ml-pypi/simple'
+                  ' one_logger to install it')
+>>>>>>> 7027a1d725215457f716ad20efe865028e99e69a
 
 
 def _set_adlr_autoresume(args):

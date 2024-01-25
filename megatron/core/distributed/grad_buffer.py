@@ -33,6 +33,7 @@ class Bucket:
         params: List of parameters whose gradients are collated in this bucket.
         data: View in larger GradBuffer that this bucket is responsible for.
         offset: Offset of this bucket's view in the larger GradBuffer.
+        numel_unpadded: Number of unpadded elements in bucket.
         data_parallel_group: Data-parallel process group.
         data_parallel_world_size: World size using the data-parallel group group.
         overlap_grad_reduce: If true, overlap communication with backprop computation by
@@ -47,6 +48,7 @@ class Bucket:
         params: List[torch.nn.Parameter],
         data: torch.Tensor,
         offset: int,
+        numel_unpadded: int,
         data_parallel_group: torch.distributed.ProcessGroup,
         data_parallel_world_size: int,
         overlap_grad_reduce: bool,
@@ -63,6 +65,7 @@ class Bucket:
         # The distributed optimizer needs to keep track of this bucket's offset
         # within the full grad_buffer.
         self.offset = offset
+        self.numel_unpadded = numel_unpadded
         self.data_parallel_group = data_parallel_group
         self.data_parallel_world_size = data_parallel_world_size
         self.data_parallel_rank = torch.distributed.get_rank(group=data_parallel_group)
@@ -213,6 +216,7 @@ class GradBuffer:
         bucket_data_start_index = data_start_index
         bucket_params = set()
         self.bucket_indices = []
+        per_bucket_numel_unpadded = []
         bucket_id = 0
         for param in params[::-1]:
             # Iterate through parameters in reverse order to roughly follow backprop order,
@@ -242,6 +246,7 @@ class GradBuffer:
                 if (data_end_index - bucket_data_start_index) >= bucket_size and len(
                     bucket_params
                 ) > 1:
+                    per_bucket_numel_unpadded.append(data_end_index - bucket_data_start_index)
                     data_end_index = _pad_if_needed(data_end_index)
                     self.bucket_indices.append((bucket_data_start_index, data_end_index))
                     bucket_data_start_index = data_end_index
@@ -251,6 +256,7 @@ class GradBuffer:
 
         # Add remaining params to a new bucket.
         if len(bucket_params) > 0:
+            per_bucket_numel_unpadded.append(data_end_index - bucket_data_start_index)
             data_end_index = _pad_if_needed(data_end_index)
             self.bucket_indices.append((bucket_data_start_index, data_end_index))
 
@@ -275,7 +281,11 @@ class GradBuffer:
             if bucket_id != cur_bucket_id:
                 bucket_data_end_index = _pad_if_needed(data_start_index)
                 self._set_bucket(
-                    bucket_params, bucket_data_start_index, bucket_data_end_index, cur_bucket_id
+                    bucket_params=bucket_params,
+                    start_index=bucket_data_start_index,
+                    end_index=bucket_data_end_index,
+                    numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
+                    bucket_id=cur_bucket_id,
                 )
                 bucket_data_start_index = bucket_data_end_index
                 bucket_params = set()
@@ -288,7 +298,11 @@ class GradBuffer:
         if len(bucket_params) > 0:
             bucket_data_end_index = _pad_if_needed(data_end_index)
             self._set_bucket(
-                bucket_params, bucket_data_start_index, bucket_data_end_index, cur_bucket_id
+                bucket_params=bucket_params,
+                start_index=bucket_data_start_index,
+                end_index=bucket_data_end_index,
+                numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
+                bucket_id=cur_bucket_id,
             )
 
         if not overlap_grad_reduce:
@@ -328,6 +342,7 @@ class GradBuffer:
         bucket_params: List[torch.nn.Parameter],
         start_index: int,
         end_index: int,
+        numel_unpadded: int,
         bucket_id: int,
     ):
         """
@@ -348,6 +363,7 @@ class GradBuffer:
             params=bucket_params,
             data=bucket_data,
             offset=start_index,
+            numel_unpadded=numel_unpadded,
             data_parallel_group=self.data_parallel_group,
             data_parallel_world_size=self.data_parallel_world_size,
             overlap_grad_reduce=self.overlap_grad_reduce,

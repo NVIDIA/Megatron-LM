@@ -11,41 +11,24 @@ InstructRetro [(Wang et al., 2023b)](https://arxiv.org/abs/2310.07713) further s
 The obtained foundation model, Retro 48B, largely outperforms the GPT counterpart in terms of perplexity.
 With instruction tuning on Retro, InstructRetro demonstrates significant improvement over the instruction tuned GPT on downstream tasks in the zero-shot setting. Specifically, the average improvement of InstructRetro is 7% over its GPT counterpart across 8 short-form QA tasks, and 10% over GPT across 4 challenging long-form QA tasks. We also find that one can ablate the encoder from InstructRetro architecture and directly use the InstructRetro decoder backbone as GPT, while achieving comparable results.
 
-This README provides an end-to-end tutorial to reproduce Retro and InstructRetro.   
+This README provides an end-to-end tutorial to reproduce Retro and InstructRetro.
 
-## Citations
-
-See more details from our papers:
-
-[Shall we Pretrain Autoregressive Language Models with Retrieval? A Comprehensive Study.](https://arxiv.org/abs/2304.06762)
-
-_Boxin Wang, Wei Ping, Peng Xu, Lawrence McAfee, Zihan Liu, Mohammad Shoeybi, Yi Dong, Oleksii Kuchaiev, Bo Li, Chaowei Xiao, Anima Anandkumar, Bryan Catanzaro._ (EMNLP 2023)
-
-[InstructRetro: Instruction Tuning post Retrieval-Augmented Pretraining.](https://arxiv.org/abs/2310.07713) 
-
-_Boxin Wang, Wei Ping, Lawrence McAfee, Peng Xu, Bo Li, Mohammad Shoeybi, Bryan Catanzaro._ 
-
-Please cite the papers as follows if you use the data or code from this repo:
-
-```bibtex
-@inproceedings{wang2023shall,
-    title   = {Shall We Pretrain Autoregressive Language Models with Retrieval? A Comprehensive Study},
-    author  = {Boxin Wang and Wei Ping and Peng Xu and Lawrence McAfee and Zihan Liu and Mohammad Shoeybi and Yi Dong and Oleksii Kuchaiev and Bo Li and Chaowei Xiao and Anima Anandkumar and Bryan Catanzaro},
-    journal = {The 2023 Conference on Empirical Methods in Natural Language Processing},
-    year    = {2023}
-}
-
-@article{wang2023instructretro,
-    title   = {InstructRetro: Instruction Tuning post Retrieval-Augmented Pretraining},
-    author  = {Boxin Wang and Wei Ping and Lawrence McAfee and Peng Xu and Bo Li and Mohammad Shoeybi and Bryan Catanzaro},
-    year    = {2023},
-    journal = {arXiv preprint arXiv: 2310.07713}
-}
-```
+# Contents
+  * [End-to-end Reproduction Guide](#end-to-end-reproduction-guide)
+     * [Step 0: Prepare the environment](#step-0-prepare-the-environment)
+        * [Docker image](#docker-image)
+        * [Install dependencies](#install-dependencies)
+     * [Step 1: Build retrieval database](#step-1-build-retrieval-database)
+     * [Step 2: Pretraining](#step-2-pretraining)
+     * [Step 3: Perplexity evaluation](#step-3-perplexity-evaluation)
+     * [Step 4: Instruction tuning](#step-4-instruction-tuning)
+     * [Step 5: Downstream task evaluation](#step-5-downstream-task-evaluation)
+  * [Citations](#citations)
 
 # End-to-end Reproduction Guide
 
 In this README, we provide an end-to-end reproduction guide for InstructRetro, covering from large-scale retrieval construction, pretraining, perplexity evaluation, instruction tuning, to downstream task evaluation. 
+
 
 ## Step 0: Prepare the environment
 
@@ -54,18 +37,25 @@ We recommend using docker environment to run the code.
 ### Docker image
 
 
-We provide a docker build file in [tools/retro/examples/Dockerfile](tools/retro/examples/Dockerfile) for the reproduction. The docker image is based on `nvcr.io/nvidia/pytorch:23.09-py3`.
+We provide a docker build file in [tools/retro/examples/Dockerfile](examples/Dockerfile) for the reproduction. The docker image is based on `nvcr.io/nvidia/pytorch:23.09-py3`.
 
 
 ### Install dependencies
 
-If docker is not available, we recommend starting from a clean conda environment, including:
+Clone the Megatron repo:
+
+```bash
+git clone --branch InstructRetro https://github.com/NVIDIA/Megatron-LM.git
+```
+
+If docker is not available, we recommend starting from a clean conda environment with the following runtime dependencies:
+
 - Python 3.10
 - NVIDIA CUDA® 12.2.1
 - NVIDIA cuBLAS 12.2.5.6
 - NVIDIA cuDNN 8.9.5
 - NVIDIA NCCL 2.18.5
-- 2.1.0a0+32f93b1
+- PyTorch 2.1.0a0+32f93b1
 
 Then install Retro-specific dependencies, including:
 ```bash
@@ -78,12 +68,11 @@ pip install -U einops
 ```
 
 
-
 ## Step 1: Build retrieval database
 
 In this step, we build a large-scale retrieval database for InstructRetro through [Faiss](https://github.com/facebookresearch/faiss) to retrieve from trillions of tokens, and preprocess (and save) the retrieval neighbors for the pretraining step.
 
-Please refer to [tools/retro/build_db.md](tools/retro/build_db.md) for more details.
+Please refer to [tools/retro/build_db.md](build_db.md) for more details.
 
 ## Step 2: Pretraining
 
@@ -91,7 +80,7 @@ Please refer to [tools/retro/build_db.md](tools/retro/build_db.md) for more deta
 
 In the pretraining step, we support both pretraining from scratch and continued pretraining from a pretrained GPT model.
 
-We provide a template pretraining script to pretrain 843M Retro from scratch. Prepare your own arguments and update our templates in [tools/retro/examples/pretrain_model.sh](tools/retro/examples/pretrain_model.sh). Please note that the data path should be exactly matching the one used in Step 1 to make sure the preprocessed retrieval neighbors match the pretraining corpus.
+We provide a template pretraining script to pretrain 843M Retro from scratch. Prepare your own arguments and update our templates in [tools/retro/examples/pretrain_model.sh](examples/pretrain_model.sh). Please note that the data path should be exactly matching the one used in Step 1 to make sure the preprocessed retrieval neighbors match the pretraining corpus.
 
 [//]: # (Take the example of the Wikipedia corpus)
 
@@ -137,7 +126,7 @@ Refer to the paper links above for more details about each instruction tuning da
 *We note that the provided instruction tuning dataset is all from open-source instruction tuning datasets. It is slightly different from what we use in [InstructRetro](https://arxiv.org/abs/2310.07713), which contains private and proprietary datasets. Thus a 1-2% accuracy difference in downstream tasks may be expected.*  
 
 ### Instruction tuning script
-Download the [blended instruction tuning dataset](https://drive.google.com/file/d/1nzKwwYf8lYb9gN3P4YO8pFNU_B2nMYe1/view?usp=sharing) in your data home directory `$DATA_HOME` and update our templates in [tools/retro/sft/sft_retro_lm.sh`](tools/retro/sft/sft_retro_lm.sh).
+Download the [blended instruction tuning dataset](https://drive.google.com/file/d/1nzKwwYf8lYb9gN3P4YO8pFNU_B2nMYe1/view?usp=sharing) in your data home directory `$DATA_HOME` and update our templates in [tools/retro/sft/sft_retro_lm.sh](sft/sft_retro_lm.sh).
 
 An example command to run instruction tuning on 843M Retro is as follows:
 ```bash
@@ -145,7 +134,7 @@ An example command to run instruction tuning on 843M Retro is as follows:
 bash tools/retro/sft/sft_retro_lm.sh       open_inst               843m            128    5e-6  <path/to/pretrained/retro>  
 ```
 
-The `blend_dataset_name` argument will blend all the datasets within the `$DATA_HOME` following the weights and configurations specified in the `${blend_dataset_name}.sh` (`open_inst.sh` in the example above).
+The `blend_dataset_name` argument will blend all the datasets within the `$DATA_HOME` following the weights and configurations specified in the `${blend_dataset_name}.sh` ([open_inst.sh](sft/open_inst.sh) in the example above).
 The checkpoints will be saved in the `--save` directory. For example, it will be saved to 
 `<SFT_HOME>/checkpoints/applications/retro-sft_pp1_same_format_ctx1_843m_128_5e-6`. 
 
@@ -166,4 +155,34 @@ To evaluate the F1 / Exact Match (EM) scores of the generated responses, we prov
 
 ```bash
 python3 tools/retro/text_generation/evaluate.py
+```
+
+# Citations
+
+See more details from our papers:
+
+[Shall we Pretrain Autoregressive Language Models with Retrieval? A Comprehensive Study.](https://arxiv.org/abs/2304.06762)
+
+_Boxin Wang, Wei Ping, Peng Xu, Lawrence McAfee, Zihan Liu, Mohammad Shoeybi, Yi Dong, Oleksii Kuchaiev, Bo Li, Chaowei Xiao, Anima Anandkumar, Bryan Catanzaro._ (EMNLP 2023)
+
+[InstructRetro: Instruction Tuning post Retrieval-Augmented Pretraining.](https://arxiv.org/abs/2310.07713) 
+
+_Boxin Wang, Wei Ping, Lawrence McAfee, Peng Xu, Bo Li, Mohammad Shoeybi, Bryan Catanzaro._ 
+
+Please cite the papers as follows if you use the data or code from this repo:
+
+```bibtex
+@inproceedings{wang2023shall,
+    title   = {Shall We Pretrain Autoregressive Language Models with Retrieval? A Comprehensive Study},
+    author  = {Boxin Wang and Wei Ping and Peng Xu and Lawrence McAfee and Zihan Liu and Mohammad Shoeybi and Yi Dong and Oleksii Kuchaiev and Bo Li and Chaowei Xiao and Anima Anandkumar and Bryan Catanzaro},
+    journal = {The 2023 Conference on Empirical Methods in Natural Language Processing},
+    year    = {2023}
+}
+
+@article{wang2023instructretro,
+    title   = {InstructRetro: Instruction Tuning post Retrieval-Augmented Pretraining},
+    author  = {Boxin Wang and Wei Ping and Lawrence McAfee and Peng Xu and Bo Li and Mohammad Shoeybi and Bryan Catanzaro},
+    year    = {2023},
+    journal = {arXiv preprint arXiv: 2310.07713}
+}
 ```

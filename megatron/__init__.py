@@ -11,6 +11,7 @@ from .global_vars import get_tokenizer
 from .global_vars import get_tensorboard_writer
 from .global_vars import get_wandb_writer
 from .global_vars import get_one_logger
+from .global_vars import get_app_tag
 from .global_vars import get_adlr_autoresume
 from .global_vars import get_timers
 from .initialize  import initialize_megatron

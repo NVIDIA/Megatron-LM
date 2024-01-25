@@ -4,9 +4,10 @@
 
 import gc
 from datetime import datetime
+import hashlib
 import math
 import logging
-import sys
+import sys, os
 from .log_handler import CustomHandler
 # Make default logging level INFO, but filter out all log messages not from MCore.
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
@@ -22,6 +23,7 @@ from megatron import get_timers
 from megatron import get_tensorboard_writer
 from megatron import get_wandb_writer
 from megatron import get_one_logger
+from megatron import get_app_tag
 from megatron import get_current_global_batch_size
 from megatron import get_num_microbatches
 from megatron import is_last_rank
@@ -139,7 +141,7 @@ def pretrain(train_valid_test_dataset_provider,
     one_logger = get_one_logger()
     if one_logger:
         one_logger.log_metrics({
-            'train_iterations_warmup': args.lr_warmup_iters,
+            'train_iterations_warmup': 5
         })
 
     # Model, optimizer, and learning rate.
@@ -516,6 +518,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     timers = get_timers()
     writer = get_tensorboard_writer()
     wandb_writer = get_wandb_writer()
+    one_logger = get_one_logger()
+    app_tag = get_app_tag()
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
@@ -576,6 +580,22 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * \
         get_num_microbatches()
+
+    # Track app tag & app tag ID
+    if one_logger:
+        job_name = os.environ.get('SLURM_JOB_NAME', None)
+        current_app_tag = f'{job_name}_{batch_size}_{args.world_size}'
+        if current_app_tag not in app_tag:
+            app_tag.append(current_app_tag)
+        
+            # Get app_tag ID
+            app_tag_id = [hashlib.md5(i.encode('utf-8')).hexdigest() for i in app_tag]
+
+        one_logger.log_metrics({
+            'app_tag': app_tag,
+            'app_tag_id': app_tag_id,
+            'app_tag_count': len(app_tag)
+        })
 
     total_iterations = total_loss_dict[advanced_iters_key] + \
                        total_loss_dict[skipped_iters_key]
@@ -754,8 +774,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         train_samples_start = args.consumed_train_samples
         train_samples_target = args.train_samples
         one_logger.log_metrics({
-            'train_iterations_start': iteration,
             'train_samples_start': args.consumed_train_samples,
+            'train_iterations_start': iteration,
             'train_samples_target': train_samples_target,
             'train_iterations_target': args.train_iters,
         })
@@ -794,6 +814,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         gc.disable()
         gc.collect()
 
+    num_microbatches = get_num_microbatches()
     eval_duration = 0.0
     eval_iterations = 0
     def track_e2e_metrics():
@@ -802,9 +823,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             train_duration = timers('interval-time').active_time()  # overall_elapsed
             train_samples = args.consumed_train_samples - train_samples_start
             train_iterations = iteration - iteration_start
-            train_iterations_time_msecs_avg = train_duration*1000.0 / train_iterations
+            train_iterations_time_msecs_avg = (train_duration * 1000.0) / train_iterations
             if eval_iterations:
-                validation_iterations_time_msecs_avg = eval_duration*1000.0 / eval_iterations
+                validation_iterations_time_msecs_avg = (eval_duration * 1000.0) / eval_iterations
             else:
                 validation_iterations_time_msecs_avg = None
 
@@ -824,7 +845,19 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             torch.cuda.cudart().cudaProfilerStart()
             torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
 
-        update_num_microbatches(args.consumed_train_samples)
+        # Update number of microbatches first without consistency check to decide if a
+        # checkpoint should be saved. If the number of microbatches is different
+        # from the previous iteration, save a checkpoint. Then run consistency check
+        # to make sure training configuration is still valid.
+        update_num_microbatches(args.consumed_train_samples, consistency_check=False)
+        if get_num_microbatches() != num_microbatches and iteration != 0:
+            assert get_num_microbatches() > num_microbatches, \
+                "number of microbatches should be increasing due to batch size rampup"
+            save_checkpoint_and_time(iteration, model, optimizer,
+                                     opt_param_scheduler)
+        num_microbatches = get_num_microbatches()
+        update_num_microbatches(args.consumed_train_samples, consistency_check=True)
+
         args.curr_iteration = iteration
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
             train_step(forward_step_func,
