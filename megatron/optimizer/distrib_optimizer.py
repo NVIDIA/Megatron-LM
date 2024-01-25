@@ -1265,15 +1265,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
     def _reset_metadata_and_sync_gather_all_model_params(self, force_sync):
         # Reset metadata needed to track results of all-gathers.
-        self.all_gather_handles = [None for _ in range(len(self.all_gather_handles))]
+        self.all_gather_events = [None for _ in range(len(self.all_gather_events))]
         self.param_buffer_copied = [False for _ in range(len(self.param_buffer_copied))]
 
         # Launch synchronous all-gather if --overlap-param-gather is turned on or if force_sync
         # is explicitly set to True (e.g., if we are going to turn off all-gather overlapping for
         # validation / test iterations).
         if not self.overlap_param_gather or force_sync:
-            for all_gather_handle_index in range(self.num_all_gather_handles):
-                self._dispatch_gather_model_params(all_gather_handle_index, force_sync=force_sync)
+            for all_gather_event_index in range(self.num_all_gather_events):
+                self._dispatch_gather_model_params(all_gather_event_index, force_sync=force_sync)
 
     @torch.no_grad()
     def step(self, args, timers):
