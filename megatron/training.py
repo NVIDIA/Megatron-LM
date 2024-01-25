@@ -4,9 +4,10 @@
 
 import gc
 from datetime import datetime
+import hashlib
 import math
 import logging
-import sys
+import sys, os
 from .log_handler import CustomHandler
 # Make default logging level INFO, but filter out all log messages not from MCore.
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
@@ -22,6 +23,7 @@ from megatron import get_timers
 from megatron import get_tensorboard_writer
 from megatron import get_wandb_writer
 from megatron import get_one_logger
+from megatron import get_app_tag
 from megatron import get_current_global_batch_size
 from megatron import get_num_microbatches
 from megatron import is_last_rank
@@ -516,6 +518,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     timers = get_timers()
     writer = get_tensorboard_writer()
     wandb_writer = get_wandb_writer()
+    one_logger = get_one_logger()
+    app_tag = get_app_tag()
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
@@ -576,6 +580,18 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * \
         get_num_microbatches()
+
+    # Track app tag & app tag ID
+    if one_logger:
+        job_name = os.environ.get('SLURM_JOB_NAME', None)
+        current_app_tag = f'{job_name}_{batch_size}_{args.world_size}'
+        if current_app_tag not in app_tag:
+            app_tag.append(current_app_tag)
+        
+            # Get app_tag ID
+            app_tag_id = [hashlib.md5(i.encode('utf-8')).hexdigest() for i in app_tag]
+
+        one_logger.log_metrics({'app_tag': app_tag, 'app_tag_id': app_tag_id})
 
     total_iterations = total_loss_dict[advanced_iters_key] + \
                        total_loss_dict[skipped_iters_key]
