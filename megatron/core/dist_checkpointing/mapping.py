@@ -239,11 +239,18 @@ class ShardedTensorFactory:
 
     Builder creates a sub-state-dict out of a tensor before saving, and merger
     merges the corresponding state dict after loading.
+
+    Args:
+        key (str): unique identifier of the factory
+        data (torch.Tensor): original model parameter that will be further transformed by this factory
+        build_fn (callable): function that transforms the original tensor to a sharded state dict
+        merge_fn (callable): function that transforms loaded subtree back into a single tensor (inverse of `build_fn`)
+        replica_id (ReplicaId): indicates factory replication wrt. factories in different processes
     """
 
     key: str
     data: torch.Tensor
-    build_fn: Callable[[str, torch.Tensor], ShardedStateDict]
+    build_fn: Callable[[str, torch.Tensor, ReplicaId], ShardedStateDict]
     merge_fn: Callable[[StateDict], torch.Tensor]
     replica_id: ReplicaId = 0
 
