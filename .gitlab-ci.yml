@@ -656,7 +656,7 @@ train.moe_gpt3.345m_tp2_pp2_4experts_1node_50steps:
     USE_CORE: 0
     TEST_LEVEL: NIGHTLY_TESTS
     METADATA: "4experts"
-    ADDITIONAL_PARAMS: "--num-experts 4 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"
+    ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 4 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"
 
 train.bert.345m_tp4_pp1_1node_50steps:
   <<: *selene-test-launcher
