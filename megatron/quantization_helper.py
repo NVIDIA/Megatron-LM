@@ -139,3 +139,5 @@ class QuantizationHelper:
                 cur_rank.append(i + j * local_dp_size)
             all_to_all_group[f"global_{i}"] = torch.distributed.new_group(ranks=cur_rank)
         self.all2all_process_group = all_to_all_group
+    def set_gradient_quantization(self, quantize_gradients: bool):
+        self.quantized_gradients = quantize_gradients

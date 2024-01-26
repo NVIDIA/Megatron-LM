@@ -1200,6 +1200,8 @@ def _add_quantize_args(parser):
                        help='Gradients quantization bits, only support 8 and 4 bits, 4 bits gradients may have an accuracy drop.')
     group.add_argument('--gq-group-size', type=int, default=2048,
                        help='Group size for gradient quantization.')
+    group.add_argument('--gradients-quantization-start-iteration', type=int, default=0,
+                       help='Gradient quantization strat after this iteration.')
     return parser
 
 def _add_validation_args(parser):

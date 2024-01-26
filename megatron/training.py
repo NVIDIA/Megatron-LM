@@ -866,6 +866,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     # Setup some training config params
     config.grad_scale_func = optimizer.scale_loss
     config.timers = timers
+    quantize_helper:QuantizationHelper = None
+    if isinstance(model[0], DDP) and hasattr(model[0], 'quantization_helper'):
+        quantize_helper = model[0].quantization_helper
     if isinstance(model[0], DDP) and args.overlap_grad_reduce:
         assert config.no_sync_func is None, \
             ('When overlap_grad_reduce is True, config.no_sync_func must be None; '
@@ -919,6 +922,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         update_num_microbatches(args.consumed_train_samples, consistency_check=True)
 
         args.curr_iteration = iteration
+        quantize_helper.set_gradient_quantization(iteration >= args.gradients_quantization_start_iteration)
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
             train_step(forward_step_func,
                        train_data_iterator,
