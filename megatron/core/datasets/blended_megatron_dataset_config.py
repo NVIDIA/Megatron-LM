@@ -8,6 +8,7 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 
+from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
 from megatron.core.datasets.utils import Split, log_single_rank, normalize
 from megatron.core.parallel_state import get_virtual_pipeline_model_parallel_rank
 
@@ -46,6 +47,12 @@ class BlendedMegatronDatasetConfig:
         passed in to the constructor.
 
         path_to_cache (str): Where all re-useable dataset indices are to be cached.
+
+        mock (bool): Whether to bypass real data loading and validation in favor of mock data
+        generation.
+
+        tokenizer (Optional[MegatronTokenizer]): The MegatronTokenizer instance or None. Required
+        for datasets which do online tokenization.
     """
 
     is_built_on_rank: Callable
@@ -62,7 +69,11 @@ class BlendedMegatronDatasetConfig:
 
     split_matrix: Optional[List[Tuple[float, float]]] = field(init=False, default=None)
 
-    path_to_cache: str = None
+    path_to_cache: Optional[str] = None
+
+    mock: bool = False
+
+    tokenizer: Optional[MegatronTokenizer] = None
 
     def __post_init__(self):
         if torch.distributed.is_initialized():
@@ -73,20 +84,23 @@ class BlendedMegatronDatasetConfig:
                     self.is_built_on_rank()
                 ), "is_built_on_rank must return True when global rank = 0 and vp rank = 0"
 
-        if self.blend_per_split is not None and any(self.blend_per_split):
-            assert self.blend is None, "blend and blend_per_split are incompatible"
-            assert len(self.blend_per_split) == len(
-                Split
-            ), f"blend_per_split must contain {len(Split)} blends"
-            if self.split is not None:
-                self.split = None
-                log_single_rank(logger, logging.WARNING, f"Let split = {self.split}")
-        else:
-            assert self.blend is not None, "one of either blend or blend_per_split must be provided"
-            assert self.split is not None, "both blend and split must be provided"
-            split_vector = parse_and_normalize_split(self.split)
-            self.split_matrix = convert_split_vector_to_split_matrix(split_vector)
-            log_single_rank(logger, logging.INFO, f"Let split_matrix = {self.split_matrix}")
+        log_single_rank(logger, logging.INFO, f"mock = {self.mock}")
+
+        if not self.mock:
+            if self.blend_per_split is not None and any(self.blend_per_split):
+                assert self.blend is None, "blend and blend_per_split are incompatible"
+                assert self.split is None, "split and blend_per_split are incompatible"
+                assert len(self.blend_per_split) == len(
+                    Split
+                ), f"blend_per_split must contain {len(Split)} blends"
+            else:
+                assert (
+                    self.blend is not None
+                ), "one of either blend or blend_per_split must be provided"
+                assert self.split is not None, "both blend and split must be provided"
+                split_vector = parse_and_normalize_split(self.split)
+                self.split_matrix = convert_split_vector_to_split_matrix(split_vector)
+                log_single_rank(logger, logging.INFO, f"Let split_matrix = {self.split_matrix}")
 
 
 def parse_and_normalize_split(split: str) -> List[float]:
