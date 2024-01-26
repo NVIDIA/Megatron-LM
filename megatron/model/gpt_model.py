@@ -19,6 +19,7 @@ from .language_model import EmbeddingPipe
 from .transformer import ParallelTransformerLayerPipe, LMHeadPipe
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
 
+
 try:         
     from deepspeed.checkpoint import (
         VOCABULARY_PARAMETER_PATTERNS,

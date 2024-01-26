@@ -9,6 +9,7 @@ import numpy as np
 from torch.utils.data import Dataset
 from megatron import get_args
 from megatron.core import mpu
+from deepspeed.runtime.dataloader import RepeatingLoader
 
 
 def build_pretraining_data_loader(dataset, consumed_samples):
@@ -40,10 +41,13 @@ def build_pretraining_data_loader(dataset, consumed_samples):
                 args.dataloader_type))
 
     # Torch dataloader.
-    return torch.utils.data.DataLoader(dataset,
+    loader = torch.utils.data.DataLoader(dataset,
                                        batch_sampler=batch_sampler,
                                        num_workers=args.num_workers,
                                        pin_memory=True)
+    if args.repeated_dataloader:
+        loader=RepeatingLoader(loader)
+    return loader
 
 class MegatronPretrainingSampler:
 
