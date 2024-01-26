@@ -26,8 +26,8 @@ class QuantizationHelper:
         self.data_parallel_group = data_parallel_group
         self.tensor_parallel_size = tensor_parallel_size
         self.pipeline_parallel_size = pipeline_parallel_size
-        self.set_local_all_to_all_group()
         if self.quantized_gradients:
+            self.set_local_all_to_all_group()
             self.gradient_quantization_module = QuantizerBuilder().load()
     def quantize_gather_weights(self, weight_tensor):
         """
