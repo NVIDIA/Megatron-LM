@@ -979,14 +979,15 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         params_norm = None
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
+
+        if iteration % args.log_interval == 0:
+            track_e2e_metrics()
+
         report_memory_flag = training_log(loss_dict, total_loss_dict,
                                           optimizer.param_groups[0]['lr'],
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
                                           grad_norm, params_norm, num_zeros_in_grad)
-
-        if iteration % args.log_interval == 0:
-            track_e2e_metrics()
 
         # Autoresume
         if args.adlr_autoresume and \
