@@ -279,9 +279,7 @@ class Attention(MegatronModule, ABC):
             query = apply_rotary_pos_emb(
                 query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q
             )
-            key = apply_rotary_pos_emb(
-                key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv
-            )
+            key = apply_rotary_pos_emb(key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv)
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
