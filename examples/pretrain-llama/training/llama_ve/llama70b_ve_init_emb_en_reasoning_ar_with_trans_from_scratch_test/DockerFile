@@ -1,0 +1,41 @@
+FROM nvcr.io/nvidia/pytorch:23.09-py3
+# install SSH server for enabling Tensorboard & other interactive services
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-server 
+RUN pip install azureml-core
+RUN pip install azureml-mlflow azure-cli
+
+##############################################################################
+# NCCL TESTS
+##############################################################################
+ENV NCCL_TESTS_TAG=v2.11.0
+
+# NOTE: adding gencodes to support K80, M60, V100, A100
+RUN mkdir /tmp/nccltests && \
+    cd /tmp/nccltests && \
+    git clone -b ${NCCL_TESTS_TAG} https://github.com/NVIDIA/nccl-tests.git && \
+    cd nccl-tests && \
+        make \
+            MPI=1 MPI_HOME=/opt/hpcx/ompi \
+            NVCC_GENCODE="-gencode=arch=compute_50,code=sm_50 -gencode=arch=compute_60,code=sm_60 -gencode=arch=compute_61,code=sm_61 -gencode=arch=compute_70,code=sm_70 -gencode=arch=compute_80,code=sm_80" \
+            CUDA_HOME=/usr/local/cuda && \
+        cp ./build/* /usr/local/bin && \
+    rm -rf /tmp/nccltests
+
+RUN apt-get install iproute2 -y
+RUN pip install -U transformers accelerate sentencepiece deepspeed nvitop glances
+
+# for lstopo
+RUN apt update && apt install hwloc -y
+RUN pip install nltk
+
+RUN wget https://aka.ms/downloadazcopy-v10-linux
+RUN tar -xvf downloadazcopy-v10-linux
+RUN rm -f /usr/bin/azcopy
+RUN cp ./azcopy_linux_amd64_*/azcopy /usr/bin/
+RUN chmod 755 /usr/bin/azcopy
+RUN rm -f downloadazcopy-v10-linux
+RUN rm -rf ./azcopy_linux_amd64_*/
+
+RUN apt-get install git-lfs -y
+RUN apt-get install htop -y
+RUN apt-get install tmux -y
