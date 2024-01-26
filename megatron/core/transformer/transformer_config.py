@@ -40,6 +40,7 @@ class TransformerConfig(ModelParallelConfig):
             bias_gelu_fustion (bool): If true, fuses bias and gelu. Defaults to False.
             masked_softmax_fusion (bool): If true, uses softmax fusion.
             persist_layer_norm (bool): If true, uses the persistent fused layer norm kernel. This kernel only supports a fixed set of hidden sizes. Defaults to False.
+            memory_efficient_layer_norm(bool): If True, and using local layers (not from TransformerEngine), tells Apex to use the memory efficient fused LayerNorm kernel. Ignored if not using LayerNorm. Defaults to False.
             bias_dropout_fusion (bool): If true, uses bias dropout fusion.
             recompute_granularity (str): megatron-core supports 'selective' activation checkpointing where only the memory intensive part of attention is checkpointed.  These memory intensive activations are also less compute intensive which makes activation checkpointing more efficient for LLMs (20B+).  See Reducing Activation Recomputation in Large Transformer Models: https://arxiv.org/abs/2205.05198 for more details.  'full' will checkpoint the entire transformer layer.  Must be 'selective' or 'full'. 'selective' always uses all layers. Defaults to None.
             recompute_method (str): uniform will uniformly divide the total number of transformer layers in a transformer block and recompute the input activation of each divided chunk at the specified granularity.  block will recompute the input activations for only a set number of transformer layers per pipeline stage.  The rest of the layers in the pipeline stage  will not have any activations recomputed.  Must be 'uniform' or 'block'. Defaults to None.
@@ -100,6 +101,7 @@ class TransformerConfig(ModelParallelConfig):
     bias_activation_fusion: bool = False
     masked_softmax_fusion: bool = False
     persist_layer_norm: bool = False
+    memory_efficient_layer_norm: bool = False
     bias_dropout_fusion: bool = False  # TODO: this should be bias_dropout_add_fusion?
     apply_rope_fusion: bool = False
 
