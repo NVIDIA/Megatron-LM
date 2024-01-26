@@ -402,5 +402,6 @@ def save_checkpoint(queue, args):
 
         for tp_rank in range(args.target_tensor_parallel_size):
             mpu.set_tensor_model_parallel_rank(tp_rank)
-            save_checkpoint(md.iteration, [models[tp_rank]], None, None)
+            save_checkpoint(md.iteration, [models[tp_rank]], None, None,
+                            num_floating_point_operations_so_far=0)
     print("Done!")
