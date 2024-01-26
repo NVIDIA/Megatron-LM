@@ -9,7 +9,7 @@ import nltk
 import numpy
 
 from megatron.core.datasets.indexed_dataset import MMapIndexedDataset
-from tests.unit_tests.data.test_preprocess_data import dummy_jsonl, gpt2_vocab, gpt2_merge
+from tests.unit_tests.data.test_preprocess_data import dummy_jsonl, gpt2_merge, gpt2_vocab
 from tools.merge_datasets import main as merge_main
 from tools.preprocess_mmdata import Encoder
 from tools.preprocess_mmdata import get_args as build_args
@@ -22,9 +22,11 @@ def dummy_img(odir_txt, odir_img):
             length = sum(1 for _ in reader_txt)
         os.makedirs(os.path.join(odir_img, os.path.splitext(name)[0]), exist_ok=False)
         for i in range(length):
-            with open(os.path.join(odir_img, os.path.splitext(name)[0], f"{str(i).zfill(4)}.img"), "wb") as writer_img:
+            with open(
+                os.path.join(odir_img, os.path.splitext(name)[0], f"{str(i).zfill(4)}.img"), "wb"
+            ) as writer_img:
                 # 32 * 32 - 1 to induce preprocessing 0-index padding
-                writer_img.write(bytes([random.randint(0 , 255) for _ in range(32 * 32 - 1)]))
+                writer_img.write(bytes([random.randint(0, 255) for _ in range(32 * 32 - 1)]))
 
 
 def build_datasets(idir_txt, idir_img, odir, extra_args=[]):
@@ -42,7 +44,14 @@ def build_datasets(idir_txt, idir_img, odir, extra_args=[]):
 
 
 def merge_datasets(idir):
-    sys.argv = [sys.argv[0], "--input", idir, "--output-prefix", os.path.join(idir, "merge"), "--multimodal"]
+    sys.argv = [
+        sys.argv[0],
+        "--input",
+        idir,
+        "--output-prefix",
+        os.path.join(idir, "merge"),
+        "--multimodal",
+    ]
     merge_main()
 
 
@@ -72,7 +81,15 @@ def do_test_preprocess_mmdata(temp_dir, extra_args=[]):
     # merge the datasets
     merge_datasets(path_to_data)
 
-    sys.argv = [sys.argv[0], "--input", None, "--input-image", None, "--output-prefix", None,] + extra_args
+    sys.argv = [
+        sys.argv[0],
+        "--input",
+        None,
+        "--input-image",
+        None,
+        "--output-prefix",
+        None,
+    ] + extra_args
     encoder = Encoder(build_args())
     encoder.initializer()
 
@@ -119,7 +136,13 @@ def do_test_preprocess_mmdata(temp_dir, extra_args=[]):
         merged_doc_index_index += len(dataset.document_indices) - 1
 
         with open(realpath_raw_txt, "rt") as reader:
-            for json_line, image_path in zip(reader, [os.path.join(realpath_raw_img, basename) for basename in os.listdir(realpath_raw_img)]):
+            for json_line, image_path in zip(
+                reader,
+                [
+                    os.path.join(realpath_raw_img, basename)
+                    for basename in os.listdir(realpath_raw_img)
+                ],
+            ):
                 toks, image, length = encoder.encode((json_line, image_path))
 
                 raw_text = tokens_to_string(toks)
@@ -133,14 +156,14 @@ def do_test_preprocess_mmdata(temp_dir, extra_args=[]):
                 processed_image = dataset[dataset_index + 1][0]
                 assert dataset[dataset_index + 1][1] == 1
                 # reverse to account for preprocessing 0-index padding
-                processed_image = processed_image[::-1][0:raw_image.size]
+                processed_image = processed_image[::-1][0 : raw_image.size]
 
                 assert (
                     raw_text == processed_text
                 ), f"ERROR: {basename.split('_')[:-2]}: raw and processed documents (text) do not match"
 
-                assert (
-                    numpy.allclose(raw_image, processed_image)
+                assert numpy.allclose(
+                    raw_image, processed_image
                 ), f"ERROR: {basename.split('_')[:-2]}: raw and processed documents (image) do not match"
 
                 dataset_index += 2
@@ -152,14 +175,14 @@ def do_test_preprocess_mmdata(temp_dir, extra_args=[]):
                 merged_image = merged_dataset[merged_index + 1][0]
                 assert merged_dataset[merged_index + 1][1] == 1
                 # reverse to account for preprocessing 0-index padding
-                merged_image = merged_image[::-1][0:raw_image.size]
+                merged_image = merged_image[::-1][0 : raw_image.size]
 
                 assert (
                     raw_text == merged_text
                 ), f"ERROR: {basename.split('_')[:-2]}: raw and merged documents (text) do not match"
 
-                assert (
-                    numpy.allclose(raw_image, merged_image)
+                assert numpy.allclose(
+                    raw_image, merged_image
                 ), f"ERROR: {basename.split('_')[:-2]}: raw and merged documents (image) do not match"
 
                 merged_index += 2

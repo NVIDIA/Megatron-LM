@@ -3,7 +3,7 @@
 """Pretrain GPT"""
 
 import torch
-from functools import partial
+from functools import partial, reduce
 import sys, os
 
 sys.path.append(os.path.abspath(os.path.join(
@@ -14,11 +14,12 @@ from megatron import get_timers
 from megatron import get_tokenizer
 from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
+from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
-from pretrain_gpt import model_provider
-from tools.retro.sft.sft_gpt_dataset import build_train_valid_test_datasets
+from pretrain_gpt import model_provider, is_dataset_built_on_rank
+from tools.retro.sft.dataset_conv import JsonQADataset, JsonQADatasetConfig, RetroJsonQADataset, RetroJsonQADatasetConfig
 
 
 def get_tasks_args(parser):
@@ -187,12 +188,74 @@ def forward_step(data_iterator, model):
 def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build train, valid, and test datasets."""
     args = get_args()
+    retro_args = get_retro_args()
+
+    tokenizer = get_tokenizer()
+
+    def fix_and_split_blend_pair(pair):
+        weight, name = pair
+        return [
+            [weight, os.path.join(args.data_folder, name, f"{name}_QA_train.json")],
+            [weight, os.path.join(args.data_folder, name, f"{name}_QA_dev.json")],
+            None,
+        ]
+
+    blend = [args.data_path[i:i+2] for i in range(0, len(args.data_path), 2)]
+
+    if len(blend) == 1:
+        blend_per_split =  [
+            os.path.join(args.data_folder, blend[0], f"{blend[0]}_QA_train.json"),
+            os.path.join(args.data_folder, blend[0], f"{blend[0]}_QA_dev.json"),
+            None,
+        ]
+    else:
+        blend_per_split = [
+            list(
+                reduce(
+                    lambda x, y: x + y,
+                    list(zip(*map(fix_and_split_blend_pair, blend)))[0]
+                )
+            ),
+            None,
+            None,
+        ]
+
+    extra_kwargs = {}
+
+    if args.retro_add_retriever:
+        dataset_cls = RetroJsonQADataset
+        config_cls = RetroJsonQADatasetConfig
+        extra_kwargs["retro_num_neighbors"] = args.retro_num_neighbors
+        extra_kwargs["retro_gpt_retrieved_length"] = retro_args.retro_gpt_retrieved_length
+    else:
+        dataset_cls = JsonQADataset
+        config_cls = JsonQADatasetConfig
+
+    config = config_cls(
+        is_built_on_rank=is_dataset_built_on_rank,
+        random_seed=args.seed,
+        sequence_length=args.seq_length,
+        blend_per_split=blend_per_split,
+        split=args.split,
+        path_to_cache=args.data_cache_path,
+        mock=args.mock_data,
+        tokenizer=tokenizer,
+        ft_neighbours=args.ft_neighbours,
+        bert_retriever_neighbours=args.bert_retriever_neighbours,
+        longform_answer=args.longform_answer,
+        inference_only=False,
+        retrieved_neighbours=False,
+        fix_newsqa=True,
+        **extra_kwargs
+    )
 
     print_rank_0('> building train, validation, and test datasets '
                  'for GPT ...')
-    train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
-        data_prefix=args.data_path,
-        seq_length=args.seq_length)
+    train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
+        dataset_cls,
+        train_val_test_num_samples,
+        config
+    ).build()
     print_rank_0("> finished creating GPT datasets ...")
 
     return train_ds, valid_ds, test_ds
