@@ -212,7 +212,7 @@ def apply_rotary_pos_emb(
     fused/unfused kernels, or bshd (conventional) / thd (packed seq) format
     """
     if config.apply_rope_fusion and not HAVE_APPLY_ROPE_FUSION:
-        # setting apply_rope_fusion in config to False so that subsequent queries to this config also return Flase
+        # setting apply_rope_fusion in config to False so that subsequent queries to this config also return False
         config.apply_rope_fusion = False
         if not getattr(apply_rotary_pos_emb, "printed_fused_warning", False):
             logger.warning(
