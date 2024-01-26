@@ -737,6 +737,7 @@ train.bert_core.345m_tp2_pp2_1node_50steps_local_spec:
     MAX_STEPS: 50
     TIME_LIMIT: "20:00"
     TEST_LEVEL: MR_TESTS
+    METADATA: local_spec
     ADDITIONAL_PARAMS: "--spec local"
 
 train.bert_core.345m_tp1_pp2_1node_50steps:

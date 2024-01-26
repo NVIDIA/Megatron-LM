@@ -60,6 +60,8 @@ class BertModel(LanguageModule):
         if return_embeddings:
             assert self.post_process and self.add_binary_head
 
+        assert os.getenv('NVTE_ALLOW_NONDETERMINISTIC_ALGO') == '0' or os.getenv('NVTE_FLASH_ATTN') == '0', "Bert currently does not support flash attention. Please set env variable NVTE_FLASH_ATTN=0 or set NVTE_ALLOW_NONDETERMINISTIC_ALGO=0" 
+
         self.config: TransformerConfig = config
         self.transformer_layer_spec: ModuleSpec = transformer_layer_spec
         self.vocab_size = vocab_size
