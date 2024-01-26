@@ -1,0 +1,28 @@
+{
+    "Pile-DM-Mathematics": 2,
+    "Pile-FreeLaw": 2,
+    "Pile-OpenSubtitles": 2,
+    "Pile-OpenWebText2": 2,
+    "Pile-PubMed-Abstracts": 2,
+    "Pile-PubMed-Central": 2,
+    "Pile-StackExchange": 2,
+    "Pile-USPTO-Backgrounds": 1,
+    "Pile-books2-books3-pgtbrg": 2,
+    "Pile-enron-hn-nexpt-phil-ubuntu-yt-ep": 2,
+
+    "MathPile-arxiv": 1,
+    "MathPile-commoncrawl": 1,
+    "MathPile-textbooks": 1,
+    "MathPile-wiki-proofwiki-mixed": 1,
+
+    "SlimPajamaStackExchange": 1,
+
+    "dolma-c4": 1,
+    "dolma-common-crawl": 1,
+    "dolma-gutenberg-books": 1,
+    "dolma-peS2o": 1.5,
+    "dolma-stack-code": 1,
+    "dolma-wiki-en-simple": 1,
+       
+    "openwebmath": 1
+}
