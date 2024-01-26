@@ -185,7 +185,7 @@ def read_metadata(tracker_filename):
             if not release:
                 print_rank_0('ERROR: Invalid metadata file {}. Exiting'.format(
                     tracker_filename))
-                sys.exit()
+                sys.exit(1)
     assert iteration > 0 or release, 'error parsing metadata file {}'.format(
         tracker_filename)
 
@@ -370,7 +370,7 @@ def fix_query_key_value_ordering(model, checkpoint_version):
                     fixed_param = _transpose_first_dim(param.data, 3, False, model)
                 else:
                     print_rank_0(f"Invalid checkpoint version {checkpoint_version}.")
-                    sys.exit()
+                    sys.exit(1)
                 param.data.copy_(fixed_param)
             if name.endswith(('.key_value.weight', '.key_value.bias')):
                 if checkpoint_version == 0:
@@ -379,7 +379,7 @@ def fix_query_key_value_ordering(model, checkpoint_version):
                     fixed_param = _transpose_first_dim(param.data, 2, False, model)
                 else:
                     print_rank_0(f"Invalid checkpoint version {checkpoint_version}.")
-                    sys.exit()
+                    sys.exit(1)
                 param.data.copy_(fixed_param)
         print_rank_0(" succesfully fixed query-key-values ordering for"
                      " checkpoint version {}".format(checkpoint_version))
@@ -434,8 +434,7 @@ def _load_base_checkpoint(load_dir, rank0=False):
         sys.modules.pop('megatron.fp16.loss_scaler', None)
     except BaseException as e:
         print_rank_0('could not load the checkpoint')
-        print_rank_0(e)
-        sys.exit()
+        sys.exit(e)
 
     return state_dict, checkpoint_name, release
 
@@ -565,7 +564,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 print_rank_0('A metadata file exists but unable to load '
                              'iteration from checkpoint {}, exiting'.format(
                                  checkpoint_name))
-                sys.exit()
+                sys.exit(1)
     num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
 
     # Check arguments.
@@ -625,7 +624,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                          'Specify --no-load-optim or --finetune to prevent '
                          'attempting to load the optimizer state, '
                          'exiting ...'.format(checkpoint_name))
-            sys.exit()
+            sys.exit(1)
     else:
         if (args.fp16 or args.bf16) and optimizer is not None:
             optimizer.reload_model_params()
@@ -663,7 +662,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                          'Specify --no-load-rng or --finetune to prevent '
                          'attempting to load the rng state, '
                          'exiting ...'.format(checkpoint_name))
-            sys.exit()
+            sys.exit(1)
 
     # Some utilities want to load a checkpoint without distributed being initialized
     if torch.distributed.is_initialized():
