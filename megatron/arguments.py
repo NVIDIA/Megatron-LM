@@ -668,6 +668,10 @@ def _add_logging_args(parser):
                        help='If set, calculate and log the number of zeros in gradient.')
     group.add_argument('--log-throughput', action='store_true',
                        help='If set, calculate and log throughput per GPU.')
+    group.add_argument('--log-progress', action='store_true',
+                       help='If set, log progress (in terms of number of processed tokens and '
+                       'number of floating-point operations) to progress.txt file in checkpoint '
+                       'directory.')
     group.add_argument('--timing-log-level', type=int,
                        default=0, choices=range(0,3),
                        help='Granularity level to measure and report timing. '

@@ -108,6 +108,7 @@ class TopKRouter(Router):
         self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type
         self.moe_aux_loss_func = switch_load_balancing_loss_func
+        self.input_jitter = None
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.

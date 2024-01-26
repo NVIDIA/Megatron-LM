@@ -57,7 +57,7 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
 
     """
 
-    main_loss_backward_scale: int = 1
+    main_loss_backward_scale: torch.Tensor = torch.tensor(1.0)
 
     @staticmethod
     def forward(ctx, output: torch.Tensor, aux_loss: torch.Tensor):
@@ -89,10 +89,10 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
         return grad_output, scaled_aux_loss_grad
 
     @staticmethod
-    def set_loss_scale(scale: int):
+    def set_loss_scale(scale: torch.Tensor):
         """set the scale of the aux loss.
         
         Args:
-            scale (int): The scale value to set. Please ensure that the scale passed in matches the scale of the main_loss.
+            scale (torch.Tensor): The scale value to set. Please ensure that the scale passed in matches the scale of the main_loss.
         """
         MoEAuxLossAutoScaler.main_loss_backward_scale = scale

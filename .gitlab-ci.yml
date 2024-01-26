@@ -393,6 +393,21 @@ train.gpt3.345m_tp1_pp1_1node_50steps_dist_optimizer_overlap_grad_reduce:
     METADATA: dist_optimizer_overlap_grad_reduce
     ADDITIONAL_PARAMS: "--use-distributed-optimizer --overlap-grad-reduce"
 
+train.gpt3.345m_tp1_pp1_1node_50steps_dist_optimizer_overlap_grad_reduce_param_gather:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 1
+    PP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 0
+    TEST_LEVEL: NIGHTLY_TESTS
+    METADATA: dist_optimizer_overlap_grad_reduce_param_gather
+    ADDITIONAL_PARAMS: "--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather"
+
 train.gpt3.345m_tp4_pp1_1node_50steps_overlap_grad_reduce:
   <<: *selene-test-launcher
   variables:
@@ -422,6 +437,21 @@ train.gpt3.345m_tp4_pp1_1node_50steps_dist_optimizer_overlap_grad_reduce:
     TEST_LEVEL: MR_TESTS
     METADATA: dist_optimizer_overlap_grad_reduce
     ADDITIONAL_PARAMS: "--use-distributed-optimizer --overlap-grad-reduce"
+
+train.gpt3.345m_tp4_pp1_1node_50steps_dist_optimizer_overlap_grad_reduce_param_gather:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 4
+    PP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 0
+    TEST_LEVEL: MR_TESTS
+    METADATA: dist_optimizer_overlap_grad_reduce_param_gather
+    ADDITIONAL_PARAMS: "--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather"
 
 train.gpt3.345m_tp1_pp4_1node_50steps_overlap_grad_reduce:
   <<: *selene-test-launcher
@@ -469,6 +499,22 @@ train.gpt3.345m_tp1_pp4_interleaved_1node_50steps_dist_optimizer_overlap_grad_re
     TEST_LEVEL: MR_TESTS
     METADATA: dist_optimizer_overlap_grad_reduce
     ADDITIONAL_PARAMS: "--use-distributed-optimizer --overlap-grad-reduce"
+
+train.gpt3.345m_tp1_pp4_interleaved_1node_50steps_dist_optimizer_overlap_grad_reduce_param_gather:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 1
+    PP_SIZE: 4
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 0
+    TEST_LEVEL: MR_TESTS
+    METADATA: dist_optimizer_overlap_grad_reduce_param_gather
+    ADDITIONAL_PARAMS: "--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather"
 
 train.gpt3.345m_tp2_pp2_1node_50steps_overlap_grad_reduce:
   <<: *selene-test-launcher
@@ -610,7 +656,7 @@ train.moe_gpt3.345m_tp2_pp2_4experts_1node_50steps:
     USE_CORE: 0
     TEST_LEVEL: NIGHTLY_TESTS
     METADATA: "4experts"
-    ADDITIONAL_PARAMS: "--num-experts 4 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"
+    ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 4 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"
 
 train.bert.345m_tp4_pp1_1node_50steps:
   <<: *selene-test-launcher

@@ -241,7 +241,7 @@ With full global batch size of 1536 on 1024 A100 GPUs, each iteration takes arou
 
 
 Retro [(Borgeaud et al., 2022)](https://arxiv.org/abs/2112.04426) is an autoregressive decoder-only language model (LM) pretrained with retrieval-augmentation. 
-Retro features practical scalibility to support large-scale pretraining from scratch by retrieving from trillions of token.
+Retro features practical scalability to support large-scale pretraining from scratch by retrieving from trillions of tokens.
 Pretraining with retrieval provides a more efficient storage mechanism of factual knowledge, when compared to storing factual knowledge implicitly within the network's parameters, thus largely reducing model parameters while achieving lower perplexity than standard GPT. 
 Retro also provides the flexibility to update the
 knowledge stored in LMs [(Wang et al., 2023a)](https://arxiv.org/abs/2304.06762)

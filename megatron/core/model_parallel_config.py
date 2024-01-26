@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, ContextManager, Optional
 
 import torch
 
@@ -149,6 +149,14 @@ class ModelParallelConfig:
         to make sure calling barrier with their timers will not result in hangs. This can happen if for example the user
         adds a level 1 timer that is not called by all ranks. Defaults to True.
 
+    CPU Offloading
+    --------------
+
+    cpu_offloading (bool): When set to True, all the activations are offloaded to the CPU asynchronously. Defaults to True.
+    cpu_offloading_num_layers (int): Tells the number of transformer layers for which activations has to be offloaded. Defaults to 0.
+    cpu_offloading_activations (bool): If True, offloads the activations to CPU. Defaults to True.
+    cpu_offloading_weights (bool): If True, offloads the weights to CPU. Defaults to True.
+
     """
 
     # Model parallelism
@@ -201,6 +209,13 @@ class ModelParallelConfig:
     grad_sync_func: Callable = None
     param_sync_func: Callable = None
     pipeline_model_parallel_split_rank: Optional[int] = None
+
+    # CPU Offloading
+    cpu_offloading: bool = False
+    cpu_offloading_num_layers: int = 0
+    _cpu_offloading_context: ContextManager = None  # Used for internal use only, not to be set by the user. TODO: Need to move to the 'right' place when possible.
+    cpu_offloading_activations: bool = True
+    cpu_offloading_weights: bool = True
 
     # Timing
     barrier_with_L1_time: bool = True
