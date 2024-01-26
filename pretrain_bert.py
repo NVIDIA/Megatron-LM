@@ -36,6 +36,7 @@ def model_provider(pre_process=True, post_process=True):
         if args.spec is None:
             transformer_layer_spec = bert_layer_with_transformer_engine_spec #default spec
         elif args.spec[0] == 'local':
+            print_rank_0('Using Local spec for transformer layers')
             transformer_layer_spec = bert_layer_local_spec
         else :
             transformer_layer_spec = import_module(args.spec)
