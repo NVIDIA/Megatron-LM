@@ -5,13 +5,6 @@ DATA_CACHE=$4
 CHECKPOINT_DIR=$5
 TENSORBOARD_LOGS_PATH=$6
 
-# DISTRIBUTED_ARGS=(
-#     --nproc_per_node $GPUS_PER_NODE 
-#     --nnodes $NUM_NODES 
-#     --master_addr $MASTER_ADDR 
-#     --master_port $MASTER_PORT
-# )
-
 GPT_MODEL_ARGS=(
     --use-mcore-models
     --seq-length 4096 
@@ -32,8 +25,6 @@ GPT_MODEL_ARGS=(
     --normalization RMSNorm
     --no-position-embedding
     --no-query-key-layer-scaling
-    --use-distributed-optimizer
-    --overlap-grad-reduce
 )
 
 LOGISTICS_ARGS=(
@@ -60,7 +51,8 @@ TRAINING_ARGS=(
     --micro-batch-size 1
     --global-batch-size 1024
     --train-iters 953600 # ~ 4.0e12/(1024*4096)
-
+    --use-distributed-optimizer
+    --overlap-grad-reduce
     --lr 3.0e-04 
     --lr-decay-style cosine 
     --weight-decay 0.1 
@@ -84,7 +76,6 @@ MODEL_PARALLEL_ARGS=(
 
 source examples/pretrain-allam/training/allam-7bv4-X/iterator_prob.sh
 
-# torchrun ${\DISTRIBUTED_ARGS[@]}\ pretrain_gpt.py\ \
 python pretrain_gpt.py \
     ${GPT_MODEL_ARGS[@]} \
     ${LOGISTICS_ARGS[@]} \
