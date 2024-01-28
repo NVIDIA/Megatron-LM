@@ -173,6 +173,8 @@ def validate_args(args, defaults={}):
             '--overlap-param-gather only supported with distributed optimizer'
         assert args.overlap_grad_reduce, \
             '--overlap-grad-reduce should be turned on when using --overlap-param-gather'
+        assert args.use_mcore_models, \
+            '--overlap-param-gather only supported with MCore models'
 
     # Parameters dtype.
     args.params_dtype = torch.float

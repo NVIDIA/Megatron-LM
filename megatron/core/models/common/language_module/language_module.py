@@ -53,12 +53,17 @@ class LanguageModule(MegatronModule):
             self.shared_embedding_or_output_weight().zero_out_wgrad = True
             return
 
+        if self.pre_process and not self.post_process:
+            assert parallel_state.is_pipeline_first_stage()
+            self.shared_embedding_or_output_weight().shared_embedding = True
+
         if self.post_process and not self.pre_process:
             assert not parallel_state.is_pipeline_first_stage()
             # set word_embeddings weights to 0 here, then copy first
             # stage's weights using all_reduce below.
             self.output_layer.weight.data.fill_(0)
             self.output_layer.weight.shared = True
+            self.output_layer.weight.shared_embedding = True
 
         # Parameters are shared between the word embeddings layers, and the
         # heads at the end of the model. In a pipelined setup with more than
