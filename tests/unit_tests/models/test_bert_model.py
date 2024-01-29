@@ -3,6 +3,7 @@
 import pytest
 
 import torch
+import os 
 
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.bert.bert_model import BertModel
@@ -13,6 +14,7 @@ from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transform
 class TestBertModel:
 
     def setup_method(self, method):
+        os.environ['NVTE_ALLOW_NONDETERMINISTIC_ALGO'] = '0' #Bert does not support flash attention
         Utils.initialize_model_parallel(1,1)
         model_parallel_cuda_manual_seed(123)
         transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True, perform_initialization=True)
