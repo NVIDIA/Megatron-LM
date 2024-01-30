@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from megatron.arguments import parse_args
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.initialize import _set_random_seed
@@ -99,7 +100,7 @@ class TestParallelGroupedMLP:
             assert self.switch_mlp_gmm.experts.weight2.shape[0] == self.num_experts * self.fc2_ffn_hidden_size
             assert self.switch_mlp_gmm.experts.weight2.shape[1] == self.hidden_size
         else:
-            assert self.switch_mlp_gmm.experts.weight1.shape == self.switch_mlp_gmm.weight2.t().shape
+            assert self.switch_mlp_gmm.experts.weight1.shape == self.switch_mlp_gmm.experts.weight2.t().shape
 
     def test_weight_init_value_the_same(self):
         gmm_w1 = self.switch_mlp_gmm.experts.weight1.view(self.num_experts, -1, self.hidden_size)
@@ -144,6 +145,24 @@ class TestParallelGroupedMLP:
         # the same between gmm and smm (refer to test_weight_init_value_the_same.)
         # assert torch.equal(output_smm, output_gmm)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(
+        not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8, reason='GroupedGEMM kernels are not supported on this device.'
+    )
+    def test_gpu_forward_with_no_tokens_allocated(self):
+        """Test the case when no token is allocated for groupedGEMM kernels."""
+        w1 = self.switch_mlp_gmm.experts.weight1.view(self.num_experts, -1, self.hidden_size)
+        num_allocated_tokens = 0
+        tokens_per_expert = torch.zeros(self.num_experts)
+        hidden_states = torch.rand((num_allocated_tokens, self.hidden_size), dtype=torch.bfloat16)
+        hidden_states = hidden_states.cuda()
+        try:
+            gg.ops.gmm(hidden_states, w1, tokens_per_expert, trans_b=False)
+        except Exception as e:
+            print("Expected error message from groupedGEMM:", e)
+            assert str(e) == "Input batch_sizes should not be all zeros!"
+
+
 if __name__ == "__main__":
     for use_cpu_unitilization in [True, False]:
         for swiglu in [True, False]:
@@ -155,4 +174,5 @@ if __name__ == "__main__":
             GMLP_test.test_constructor()
             GMLP_test.test_weight_init_value_the_same()
             GMLP_test.test_gpu_forward()
+            GMLP_test.test_gpu_forward_with_no_tokens_allocated()
             GMLP_test.teardown_method(method=None)
