@@ -165,6 +165,16 @@ class _BertWordPieceTokenizer(MegatronTokenizer):
         return self.mask_id
 
     @property
+    def bos(self):
+        """ Id of the beginning of sentence token in the vocabulary."""
+        return self._bos_token_id
+
+    @property
+    def eos(self):
+        """ Id of the end of sentence token in the vocabulary."""
+        return self._eos_token_id
+
+    @property
     def bos_token(self):
         """ Beginning of sentence token id """
         return self._bos_token
@@ -178,16 +188,6 @@ class _BertWordPieceTokenizer(MegatronTokenizer):
     def additional_special_tokens(self):
         """ All the additional special tokens you may want to use (list of strings)."""
         return self._additional_special_tokens
-
-    @property
-    def bos_token_id(self):
-        """ Id of the beginning of sentence token in the vocabulary."""
-        return self._bos_token_id
-
-    @property
-    def eos_token_id(self):
-        """ Id of the end of sentence token in the vocabulary."""
-        return self._eos_token_id
 
     @property
     def additional_special_tokens_ids(self):
@@ -378,20 +378,12 @@ class _SentencePieceTokenizer(MegatronTokenizer):
         return self._pad_id
 
     @property
-    def bos_token_id(self):
-        return self._bos_id
-
-    @property
     def bos(self):
         return self._bos_id
 
     @property
     def eod(self):
         return self._eod_id
-
-    @property
-    def eos_token_id(self):
-        return self._eos_id
 
     @property
     def eos(self):

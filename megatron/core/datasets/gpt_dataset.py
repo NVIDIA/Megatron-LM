@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import logging
 import os
@@ -21,12 +21,12 @@ logger = logging.getLogger(__name__)
 class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Configuration object for Megatron Core GPT datasets
 
-       Attributes:          
-           reset_position_ids (bool): Option to reset the position IDs in the dataset at an interval
+    Attributes:          
+        reset_position_ids (bool): Option to reset the position IDs in the dataset at an interval
 
-           reset_attention_mask (bool): Option to reset the attention mask from the dataset
+        reset_attention_mask (bool): Option to reset the attention mask from the dataset
 
-           eod_mask_loss (bool): Option to enable the EOD mask loss
+        eod_mask_loss (bool): Option to enable the EOD mask loss
     """
 
     reset_position_ids: bool = None
@@ -35,7 +35,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
 
     eod_mask_loss: bool = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        """Do asserts and set fields post init
+        """
         super().__post_init__()
 
         assert self.tokenizer is not None
@@ -108,7 +110,7 @@ class GPTDataset(MegatronDataset):
 
         index_split (Split): The indexed_indices Split
 
-        config (GPTDatasetConfig): The GPT-specific container for all config sourced parameters
+        config (GPTDatasetConfig): The config
     """
 
     def __init__(

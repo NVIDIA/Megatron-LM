@@ -30,7 +30,7 @@ class BlendedDataset(torch.utils.data.Dataset):
 
         size (int): The number of samples to draw from the blend
 
-        config (BlendedMegatronDatasetConfig): The config object which informs dataset creation
+        config (BlendedMegatronDatasetConfig): The config
 
     Raises:
         RuntimeError: When the dataset has fewer or more samples than 'size' post-initialization

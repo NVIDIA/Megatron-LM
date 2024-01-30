@@ -31,7 +31,7 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
 
         index_split (Split): The indices Split
 
-        config (BlendedMegatronDatasetConfig): The container for all config sourced parameters
+        config (BlendedMegatronDatasetConfig): The config
     """
 
     def __init__(

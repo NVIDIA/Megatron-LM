@@ -5,25 +5,26 @@
 from functools import partial
 
 import torch
-from torch import Tensor
 
 from megatron import (
     get_args,
     get_timers,
+    get_tokenizer,
     print_rank_0
 )
-from megatron.core import tensor_parallel
+from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
-from megatron.data.dataset_utils import build_train_valid_test_datasets
 from megatron.core.models.T5 import T5Model
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
 from megatron.arguments import core_transformer_config_from_args
-from megatron.core.transformer.spec_utils import import_module
+from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.t5_dataset import T5MaskedWordPieceDataset, T5MaskedWordPieceDatasetConfig
 from megatron.core.models.T5.t5_spec import (get_t5_encoder_with_transformer_engine_block_spec,
                                             get_t5_decoder_with_transformer_engine_block_spec,
                                             get_t5_encoder_with_local_block_spec,
                                             get_t5_decoder_with_local_block_spec)
+from megatron.model import T5Model as NonCoreT5Model
 
 """
 Pipeline parallelism for T5
@@ -99,7 +100,7 @@ def model_provider(pre_process=True, post_process=True, add_encoder=True, add_de
             rotary_percent=args.rotary_percent
         )
     else:
-        model = megatron.model.T5Model(config=config,
+        model = NonCoreT5Model(config=config,
                         num_tokentypes=0,
                         parallel_output=True,
                         pre_process=pre_process,
@@ -137,12 +138,12 @@ def get_batch(data_iterator):
            enc_mask, dec_mask, enc_dec_mask
 
 
-def loss_func(loss_mask: Tensor, output_tensor: Tensor):
+def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     """Loss function.
 
     Args:
-        loss_mask (Tensor): Used to mask out some portions of the loss
-        output_tensor (Tensor): The tensor with the losses
+        loss_mask (torch.Tensor): Used to mask out some portions of the loss
+        output_tensor (torch.Tensor): The tensor with the losses
     """   
     lm_loss_ = output_tensor.float()
     lm_loss = torch.sum(
@@ -190,22 +191,50 @@ def train_valid_test_datasets_provider(train_val_test_num_samples: int):
     """
     args = get_args()
 
+    tokenizer = get_tokenizer()
+
+    config = T5MaskedWordPieceDatasetConfig(
+        is_built_on_rank=lambda: mpu.get_tensor_model_parallel_rank() == 0,
+        random_seed=args.seed,
+        sequence_length=args.encoder_seq_length,
+        sequence_length_decoder=args.decoder_seq_length,
+        blend=args.data_path,
+        blend_per_split=[
+            args.train_data_path,
+            args.valid_data_path,
+            args.test_data_path,
+        ],
+        split=args.split,
+        path_to_cache=args.data_cache_path,
+        mock=False,
+        tokenizer=tokenizer,
+        masking_probability=args.mask_prob,
+        short_sequence_probability=args.short_seq_prob,
+        masking_max_ngram=10,
+        masking_do_full_word=True,
+        masking_do_permutation=False,
+        masking_use_longer_ngrams=False,
+        masking_use_geometric_distribution=True,
+    )
+
     print_rank_0('> building train, validation, and test datasets '
                  'for T5 ...')
-    train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
-        data_prefix=args.data_path,
-        splits_string=args.split,
-        train_valid_test_num_samples=train_val_test_num_samples,
-        max_seq_length=args.encoder_seq_length,
-        max_seq_length_dec=args.decoder_seq_length,
-        seed=args.seed,
-        dataset_type='t5')
+
+    train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
+        T5MaskedWordPieceDataset,
+        train_val_test_num_samples,
+        config,
+    ).build()
+
     print_rank_0("> finished creating T5 datasets ...")
 
     return train_ds, valid_ds, test_ds
 
 
 if __name__ == "__main__":
+
+    # Temporary for transition to core datasets
+    train_valid_test_datasets_provider.is_distributed = True
 
     pretrain(train_valid_test_datasets_provider, model_provider, ModelType.encoder_and_decoder,
              forward_step, args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
