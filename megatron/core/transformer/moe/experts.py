@@ -128,15 +128,22 @@ class GroupedMLP(MegatronModule):
         setattr(self.weight2, 'allreduce', not self.expert_parallel)
 
     def forward(self, permuted_local_hidden_states, tokens_per_expert):
-        # Reshape the weights for the grouped GEMMs.
-        w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
-        w2 = self.weight2.view(self.num_local_experts, -1, self.config.hidden_size)
+        if permuted_local_hidden_states.nelement() != 0:
+            # Reshape the weights for the grouped GEMMs.
+            w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
+            w2 = self.weight2.view(self.num_local_experts, -1, self.config.hidden_size)
 
-        fc1_output = gg.ops.gmm(permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False)
+            fc1_output = gg.ops.gmm(
+                permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False
+            )
 
-        intermediate_parallel = self.activation_func(fc1_output)
+            intermediate_parallel = self.activation_func(fc1_output)
 
-        fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
+            fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
+        else:
+            # None token is allocated for local experts.
+            assert torch.count_nonzero(tokens_per_expert) == 0
+            fc2_output = permuted_local_hidden_states
 
         return fc2_output, None
 
