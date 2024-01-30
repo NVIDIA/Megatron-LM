@@ -8,11 +8,11 @@ import torch
 import torch.nn.functional as F
 
 from megatron import get_args
+from megatron import get_tokenizer
 from megatron import print_rank_0
 from megatron import get_timers
 from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
-from megatron.data.dataset_utils import build_train_valid_test_datasets
 import megatron.model
 from megatron.core.models.bert.bert_model import BertModel
 from megatron.training import pretrain
@@ -20,6 +20,9 @@ from megatron.utils import average_losses_across_data_parallel_group
 from megatron.arguments import core_transformer_config_from_args
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec
+from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.bert_dataset import BERTMaskedWordPieceDataset, BERTMaskedWordPieceDatasetConfig
+from megatron.core import mpu, tensor_parallel
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
@@ -137,21 +140,50 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build train, valid, and test datasets."""
     args = get_args()
 
+    tokenizer = get_tokenizer()
+
+    config = BERTMaskedWordPieceDatasetConfig(
+        is_built_on_rank=lambda: mpu.get_tensor_model_parallel_rank() == 0,
+        random_seed=args.seed,
+        sequence_length=args.seq_length,
+        blend=args.data_path,
+        blend_per_split=[
+            args.train_data_path,
+            args.valid_data_path,
+            args.test_data_path,
+        ],
+        split=args.split,
+        path_to_cache=args.data_cache_path,
+        mock=False,
+        tokenizer=tokenizer,
+        masking_probability=args.mask_prob,
+        short_sequence_probability=args.short_seq_prob,
+        masking_max_ngram=3,
+        masking_do_full_word=True,
+        masking_do_permutation=False,
+        masking_use_longer_ngrams=False,
+        masking_use_geometric_distribution=False,
+        classification_head=args.bert_binary_head,
+    )
+
     print_rank_0('> building train, validation, and test datasets '
                  'for BERT ...')
-    train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
-        data_prefix=args.data_path,
-        splits_string=args.split,
-        train_valid_test_num_samples=train_val_test_num_samples,
-        max_seq_length=args.seq_length,
-        seed=args.seed,
-        binary_head=args.bert_binary_head)
+
+    train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
+        BERTMaskedWordPieceDataset,
+        train_val_test_num_samples,
+        config,
+    ).build()
+
     print_rank_0("> finished creating BERT datasets ...")
 
     return train_ds, valid_ds, test_ds
 
 
 if __name__ == "__main__":
+
+    # Temporary for transition to core datasets
+    train_valid_test_datasets_provider.is_distributed = True
 
     pretrain(train_valid_test_datasets_provider, model_provider,
              ModelType.encoder_or_decoder,

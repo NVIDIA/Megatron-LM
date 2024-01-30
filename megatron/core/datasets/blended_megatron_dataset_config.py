@@ -17,8 +17,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class BlendedMegatronDatasetConfig:
-    """Configuration object for megatron-core blended and megatron datasets
-    
+    """Configuration object for Megatron Core datasets
+
     Attributes:
         is_built_on_rank (Callable): A callable which returns True if the dataset should be built
         on the current rank. It should be Megatron Core parallelism aware i.e. global rank, group
@@ -75,7 +75,9 @@ class BlendedMegatronDatasetConfig:
 
     tokenizer: Optional[MegatronTokenizer] = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        """Do asserts and set fields post init
+        """
         if torch.distributed.is_initialized():
             gb_rank = torch.distributed.get_rank()
             vp_rank = get_virtual_pipeline_model_parallel_rank()
