@@ -1,17 +1,17 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, Tuple, Union
+from typing import Dict, Tuple
 
 import numpy
 import torch
 
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.indexed_dataset import MMapIndexedDataset
-from megatron.core.datasets.megatron_dataset import MegatronDataset
+from megatron.core.datasets.megatron_dataset import MegatronDataset, MockDataset
 from megatron.core.datasets.utils import Split, log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -21,24 +21,78 @@ logger = logging.getLogger(__name__)
 class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Configuration object for Megatron Core GPT datasets
 
-       Attributes:
-           return_document_ids (bool): Whether to return the document ids when querying the dataset.
-          
-           reset_position_ids (bool): Option to reset the position IDs in the dataset at an interval
+    Attributes:          
+        reset_position_ids (bool): Option to reset the position IDs in the dataset at an interval
 
-           reset_attention_mask (bool): Option to reset the attention mask from the dataset
+        reset_attention_mask (bool): Option to reset the attention mask from the dataset
 
-           eod_mask_loss (bool): Option to enable the EOD mask loss
-
-           eod_id (int): Has the identity of the end of document
-      
+        eod_mask_loss (bool): Option to enable the EOD mask loss
     """
 
-    return_document_ids: bool = False
-    reset_position_ids: bool = False
-    reset_attention_mask: bool = False
-    eod_mask_loss: bool = False
-    eod_id: int = 0
+    reset_position_ids: bool = None
+
+    reset_attention_mask: bool = None
+
+    eod_mask_loss: bool = None
+
+    def __post_init__(self) -> None:
+        """Do asserts and set fields post init
+        """
+        super().__post_init__()
+
+        assert self.tokenizer is not None
+
+        assert self.reset_position_ids is not None
+        assert self.reset_attention_mask is not None
+        assert self.eod_mask_loss is not None
+
+
+class MockGPTDataset(MockDataset):
+    """The mock GPT dataset
+    """
+
+    def __getitem__(self, idx: int) -> Dict[str, numpy.ndarray]:
+        """Return a sequence_length + 1 token sequence consisting of the following:
+            - (1) S, the RNG length-sentinel in the range [0, sequence_length)
+            - (S) tokens
+            - (1) end of document token
+            - (sequence_length - S - 1) padding tokens
+
+        Args:
+            idx (int): The integer seed for mock data generation
+
+        Returns:
+            Dict[str, numpy.ndarray]: The mock data
+        """
+        tok = 1
+        pad = 2
+        eod = 0
+
+        rng = numpy.random.default_rng(seed=[self.split.value, idx])
+        length = rng.integers(low=0, high=self.config.sequence_length)
+        sample_toks = numpy.zeros(length) + tok
+        sample_pads = numpy.zeros(self.config.sequence_length - length - 1) + pad
+        sample = numpy.int64(numpy.concatenate([[length], sample_toks, [eod], sample_pads]))
+
+        text = torch.from_numpy(sample).long()
+        labels = text[1:].contiguous()
+        tokens = text[:-1].contiguous()
+
+        attention_mask, loss_mask, position_ids = _get_ltor_masks_and_position_ids(
+            tokens,
+            eod,
+            self.config.reset_position_ids,
+            self.config.reset_attention_mask,
+            self.config.eod_mask_loss,
+        )
+
+        return {
+            "tokens": tokens,
+            "labels": labels,
+            "attention_mask": attention_mask,
+            "loss_mask": loss_mask,
+            "position_ids": position_ids,
+        }
 
 
 class GPTDataset(MegatronDataset):
@@ -48,37 +102,69 @@ class GPTDataset(MegatronDataset):
         indexed_dataset (MMapIndexedDataset): The MMapIndexedDataset around which to build the
         MegatronDataset
 
+        dataset_path (str): The real path on disk to the dataset, for bookkeeping
+
         indexed_indices (numpy.ndarray): The set of the documents indices to expose
 
         num_samples (int): The number of samples to draw from the indexed dataset
 
         index_split (Split): The indexed_indices Split
 
-        config (GPTDatasetConfig): The GPT-specific container for all config sourced parameters
+        config (GPTDatasetConfig): The config
     """
 
     def __init__(
         self,
         indexed_dataset: MMapIndexedDataset,
+        dataset_path: str,
         indexed_indices: numpy.ndarray,
         num_samples: int,
         index_split: Split,
         config: GPTDatasetConfig,
     ) -> None:
-        super().__init__(indexed_dataset, indexed_indices, num_samples, index_split, config)
+        super().__init__(
+            indexed_dataset, dataset_path, indexed_indices, num_samples, index_split, config
+        )
 
     def _finalize(self) -> None:
         """Abstract method implementation
         
         Load or build/cache the document, sample, and shuffle indices
         """
-        assert isinstance(self.config, GPTDatasetConfig)
-
         (
             self.document_index,
             self.sample_index,
             self.shuffle_index,
         ) = self._build_document_sample_shuffle_indices()
+
+    @staticmethod
+    def numel_low_level_dataset(low_level_dataset: MMapIndexedDataset) -> int:
+        """Abstract method implementation
+
+        For GPT, the underlying MMapIndexedDataset should be split by sequence, as opposed to, say,
+        BERT, which should be split by document
+
+        Args:
+            low_level_dataset (MMapIndexedDataset): The underlying MMapIndexedDataset
+
+        Returns:
+            int: The number of unique elements in the underlying MMapIndexedDataset
+        """
+        return low_level_dataset.sequence_lengths.shape[0]
+
+    @staticmethod
+    def build_low_level_dataset(dataset_path: str, config: GPTDatasetConfig) -> MMapIndexedDataset:
+        """Abstract method implementation
+
+        Args:
+            dataset_path (str): The real path prefix to the MMapIndexedDataset .bin and .idx files
+
+            config (BlendedMegatronDatasetConfig): The dataset config
+
+        Returns:
+            MMapIndexedDataset: The underlying MMapIndexedDataset
+        """
+        return MMapIndexedDataset(dataset_path, False)
 
     def __len__(self) -> int:
         """Abstract method implementation
@@ -99,15 +185,13 @@ class GPTDataset(MegatronDataset):
         """
         text, _ = self._query_document_sample_shuffle_indices(idx)
 
-        text = torch.from_numpy(text)
-
-        tokens_ = text.long()
-        labels = tokens_[1:].contiguous()
-        tokens = tokens_[:-1].contiguous()
+        text = torch.from_numpy(text).long()
+        labels = text[1:].contiguous()
+        tokens = text[:-1].contiguous()
 
         attention_mask, loss_mask, position_ids = _get_ltor_masks_and_position_ids(
             tokens,
-            self.config.eod_id,
+            self.config.tokenizer.eod,
             self.config.reset_position_ids,
             self.config.reset_attention_mask,
             self.config.eod_mask_loss,
@@ -120,24 +204,6 @@ class GPTDataset(MegatronDataset):
             "loss_mask": loss_mask,
             "position_ids": position_ids,
         }
-
-    @staticmethod
-    def is_multimodal() -> bool:
-        """Abstract method implementation
-
-        Returns:
-            bool: False
-        """
-        return False
-
-    @staticmethod
-    def is_split_by_sequence() -> bool:
-        """Abstract method implementation
-
-        Returns:
-            bool: True
-        """
-        return True
 
     def _query_document_sample_shuffle_indices(
         self, idx: int
@@ -167,7 +233,7 @@ class GPTDataset(MegatronDataset):
 
             # Add the entire sample
             sample_parts.append(
-                self.indexed_dataset.get(
+                self.dataset.get(
                     self.document_index[doc_index_beg],
                     offset=doc_index_beg_offset,
                     length=doc_index_end_offset - doc_index_beg_offset + 1,
@@ -184,7 +250,7 @@ class GPTDataset(MegatronDataset):
                 offset = 0 if i > doc_index_beg else doc_index_beg_offset
                 length = None if i < doc_index_end else doc_index_end_offset + 1
                 sample_parts.append(
-                    self.indexed_dataset.get(self.document_index[i], offset=offset, length=length)
+                    self.dataset.get(self.document_index[i], offset=offset, length=length)
                 )
 
         return (
@@ -218,7 +284,7 @@ class GPTDataset(MegatronDataset):
         path_to_cache = self.config.path_to_cache
         if path_to_cache is None:
             path_to_cache = os.path.join(
-                self.indexed_dataset.path_prefix, "cache", f"{type(self).__name__}_indices"
+                self.dataset.path_prefix, "cache", f"{type(self).__name__}_indices"
             )
 
         get_path_to = lambda suffix: os.path.join(
@@ -304,7 +370,7 @@ class GPTDataset(MegatronDataset):
             )
             t_beg = time.time()
             document_index = _build_document_index(
-                self.indexed_indices, num_epochs, numpy_random_state, separate_final_epoch
+                self.indices, num_epochs, numpy_random_state, separate_final_epoch
             )
             numpy.save(path_to_document_index, document_index, allow_pickle=True)
             t_end = time.time()
@@ -320,9 +386,9 @@ class GPTDataset(MegatronDataset):
             from megatron.core.datasets import helpers
 
             assert document_index.dtype == numpy.int32
-            assert self.indexed_dataset.sequence_lengths.dtype == numpy.int32
+            assert self.dataset.sequence_lengths.dtype == numpy.int32
             sample_index = helpers.build_sample_idx(
-                self.indexed_dataset.sequence_lengths,
+                self.dataset.sequence_lengths,
                 document_index,
                 sequence_length,
                 num_epochs,
@@ -405,7 +471,7 @@ class GPTDataset(MegatronDataset):
         Returns:
             int: The number of tokens in a single epoch
         """
-        return int(numpy.sum(self.indexed_dataset.sequence_lengths[self.indexed_indices]))
+        return int(numpy.sum(self.dataset.sequence_lengths[self.indices]))
 
     def _get_num_epochs(self, num_tokens_per_epoch: int) -> int:
         """Calculate the number of epochs
@@ -521,10 +587,7 @@ def _get_ltor_masks_and_position_ids(
         torch.Tensor : The mask used for loss value during training
 
         torch.Tensor : The position ID's of the token
-
     """
-
-    # Extract batch size and sequence length.
     seq_length = data.numel()
 
     attention_mask = torch.tril(torch.ones((seq_length, seq_length), device=data.device)).unsqueeze(
@@ -543,14 +606,13 @@ def _get_ltor_masks_and_position_ids(
         position_ids = position_ids.clone()
 
     if reset_position_ids or reset_attention_mask:
-
-        # Find indecies where EOD token is.
-        eod_index = position_ids[data[b] == eod_token]
-        # Detach indecies from positions if going to modify positions.
+        # Find indices where EOD token is.
+        eod_index = position_ids[data == eod_token]
+        # Detach indices from positions if going to modify positions.
         if reset_position_ids:
             eod_index = eod_index.clone()
 
-        # Loop through EOD indecies:
+        # Loop through EOD indices:
         prev_index = 0
         for j in range(eod_index.numel()):
             i = eod_index[j]

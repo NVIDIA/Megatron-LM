@@ -205,21 +205,22 @@ def apply_rotary_pos_emb_thd(t: Tensor, cu_seqlens: Tensor, freqs: Tensor) -> Te
 
 
 def apply_rotary_pos_emb(
-    t: Tensor, freqs: Tensor, fused: bool = False, cu_seqlens: Optional[Tensor] = None
+    t: Tensor, freqs: Tensor, config: TransformerConfig, cu_seqlens: Optional[Tensor] = None
 ):
     """
     Reroute to the appropriate apply_rotary_pos_emb function depending on
     fused/unfused kernels, or bshd (conventional) / thd (packed seq) format
     """
-    if fused and not HAVE_APPLY_ROPE_FUSION:
-        fused = False
+    if config.apply_rope_fusion and not HAVE_APPLY_ROPE_FUSION:
+        # setting apply_rope_fusion in config to False so that subsequent queries to this config also return False
+        config.apply_rope_fusion = False
         if not getattr(apply_rotary_pos_emb, "printed_fused_warning", False):
             logger.warning(
                 "Setting apply_rope_fusion to false because its implementation"
                 " is not included in Apex. Try upgrading to the latest version"
             )
             apply_rotary_pos_emb.printed_fused_warning = True
-    if fused:
+    if config.apply_rope_fusion:
         if cu_seqlens is None:
             return fused_apply_rotary_pos_emb(t, freqs, transpose_output_memory=True)
         else:

@@ -73,6 +73,31 @@ class TestParallelAttentionWithPackedSequence:
         assert output.shape[2] == config.hidden_size
         assert bias.shape[0] == config.hidden_size
 
+    def test_fused_rope_gpu_forward(self):
+        self.parallel_attention.config.apply_rope_fusion = True
+        config = self.parallel_attention.config
+        sequence_length = 32
+        micro_batch_size = 1
+
+        self.parallel_attention.cuda()
+
+        # [sequence length, batch size, hidden size]
+        hidden_states = torch.ones((sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size))
+        hidden_states = hidden_states.cuda().to(torch.bfloat16)
+
+        attention_mask = None
+        rotary_pos_emb = torch.ones(sequence_length, 1, 1, self.parallel_attention.config.kv_channels).cuda()
+        
+        packed_seq_params = make_test_packed_seq_params(sequence_length)
+        output, bias = self.parallel_attention(hidden_states, attention_mask, packed_seq_params=packed_seq_params)
+
+        assert config.recompute_granularity is None
+        assert output.shape[0] == sequence_length
+        assert output.shape[1] == micro_batch_size
+        assert output.shape[2] == config.hidden_size
+        assert bias.shape[0] == config.hidden_size
+        self.parallel_attention.config.apply_rope_fusion = False
+
     def test_checkpointed_gpu_forward(self):
         transformer_config = self.transformer_config
         transformer_config.recompute_granularity='selective'

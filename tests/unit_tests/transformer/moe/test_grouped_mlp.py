@@ -7,8 +7,7 @@ import torch.nn.functional as F
 
 from megatron.arguments import parse_args
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.transformer.moe.grouped_mlp import GroupedMLP
-from megatron.core.transformer.moe.switch_mlp import SwitchMLP
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.initialize import _set_random_seed
 from megatron.model import Float16Module
@@ -40,7 +39,7 @@ class TestParallelGroupedMLP:
             num_moe_experts=self.num_experts, use_cpu_initialization=self.use_cpu_initialization,
             add_bias_linear=False, gated_linear_unit=self.gated_linear_unit,
             bias_activation_fusion=False,
-            bf16=True, params_dtype=torch.bfloat16)
+            bf16=True, params_dtype=torch.bfloat16, moe_router_load_balancing_type="sinkhorn", moe_router_topk=1)
 
         self.fc1_ffn_hidden_size = tf_config.ffn_hidden_size
         self.fc2_ffn_hidden_size = tf_config.ffn_hidden_size
@@ -53,7 +52,7 @@ class TestParallelGroupedMLP:
         _set_random_seed(seed_=123, data_parallel_random_init=False)
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             self.num_experts, moe_grouped_gemm=False)
-        self.switch_mlp_smm = SwitchMLP(tf_config,
+        self.switch_mlp_smm = MoELayer(tf_config,
             transformer_layer_spec.submodules.mlp.submodules)
 
         self.args = parse_args(ignore_unknown_args=True)
@@ -66,7 +65,8 @@ class TestParallelGroupedMLP:
 
         ## Grouped GEMM
         _set_random_seed(seed_=123, data_parallel_random_init=False)
-        self.switch_mlp_gmm = GroupedMLP(tf_config)
+        tf_config.moe_grouped_gemm = True
+        self.switch_mlp_gmm = MoELayer(tf_config)
         self.switch_mlp_gmm = Float16Module(self.switch_mlp_gmm, self.args).module
         print("done intializing for grouped gemm")
 
@@ -74,8 +74,8 @@ class TestParallelGroupedMLP:
         Utils.destroy_model_parallel()
 
     def test_constructor(self):
-        assert isinstance(self.switch_mlp_smm, SwitchMLP)
-        assert isinstance(self.switch_mlp_gmm, GroupedMLP)
+        assert isinstance(self.switch_mlp_smm, MoELayer)
+        assert isinstance(self.switch_mlp_gmm, MoELayer)
 
         num_weights_smm = sum([p.numel() for p in self.switch_mlp_smm.parameters()])
         num_weights_gmm = sum([p.numel() for p in self.switch_mlp_gmm.parameters()])
@@ -93,26 +93,26 @@ class TestParallelGroupedMLP:
 
         # weight1: [h, num_experts*4h]
         # weight2: [num_experts*4h, h]
-        assert self.switch_mlp_gmm.weight1.shape[0] == self.hidden_size
-        assert self.switch_mlp_gmm.weight1.shape[1] == self.num_experts * self.fc1_ffn_hidden_size
+        assert self.switch_mlp_gmm.experts.weight1.shape[0] == self.hidden_size
+        assert self.switch_mlp_gmm.experts.weight1.shape[1] == self.num_experts * self.fc1_ffn_hidden_size
         if self.gated_linear_unit:
-            assert self.switch_mlp_gmm.weight2.shape[0] == self.num_experts * self.fc2_ffn_hidden_size
-            assert self.switch_mlp_gmm.weight2.shape[1] == self.hidden_size
+            assert self.switch_mlp_gmm.experts.weight2.shape[0] == self.num_experts * self.fc2_ffn_hidden_size
+            assert self.switch_mlp_gmm.experts.weight2.shape[1] == self.hidden_size
         else:
-            assert self.switch_mlp_gmm.weight1.shape == self.switch_mlp_gmm.weight2.t().shape
+            assert self.switch_mlp_gmm.experts.weight1.shape == self.switch_mlp_gmm.weight2.t().shape
 
     def test_weight_init_value_the_same(self):
-        gmm_w1 = self.switch_mlp_gmm.weight1.view(self.num_experts, -1, self.hidden_size)
-        gmm_w2 = self.switch_mlp_gmm.weight2.view(self.num_experts, self.hidden_size, -1)
+        gmm_w1 = self.switch_mlp_gmm.experts.weight1.view(self.num_experts, -1, self.hidden_size)
+        gmm_w2 = self.switch_mlp_gmm.experts.weight2.view(self.num_experts, self.hidden_size, -1)
         gmm_expert1_fc1 = gmm_w1[0]
         gmm_expert1_fc2 = gmm_w2[0]
         gmm_expert2_fc1 = gmm_w1[1]
         gmm_expert2_fc2 = gmm_w2[1]
 
-        smm_expert1_fc1 = self.switch_mlp_smm.local_experts[0].linear_fc1.weight
-        smm_expert1_fc2 = self.switch_mlp_smm.local_experts[0].linear_fc2.weight
-        smm_expert2_fc1 = self.switch_mlp_smm.local_experts[1].linear_fc1.weight
-        smm_expert2_fc2 = self.switch_mlp_smm.local_experts[1].linear_fc2.weight
+        smm_expert1_fc1 = self.switch_mlp_smm.experts.local_experts[0].linear_fc1.weight
+        smm_expert1_fc2 = self.switch_mlp_smm.experts.local_experts[0].linear_fc2.weight
+        smm_expert2_fc1 = self.switch_mlp_smm.experts.local_experts[1].linear_fc1.weight
+        smm_expert2_fc2 = self.switch_mlp_smm.experts.local_experts[1].linear_fc2.weight
 
         assert torch.equal(gmm_expert1_fc1, smm_expert1_fc1)
         if not self.use_cpu_initialization:

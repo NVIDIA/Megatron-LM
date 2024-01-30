@@ -1,29 +1,34 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+from typing import Tuple
 
+import numpy as np
 import torch
 from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     _initialize_affine_weight_gpu,
 )
 from megatron.core.tensor_parallel.utils import divide
+from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-from .base_moe_layer import BaseMoELayer
 
-
-class GroupedMLP(BaseMoELayer):
-    """
-    Top-1 Mixture of Experts Layer with Grouped GEMM. Routes input to one of N MLP "experts"
-    Curently supports Sinkhorn based expert routing.
+class GroupedMLP(MegatronModule):
+    """An efficient implementation of the Experts layer using CUTLASS GroupedGEMM.
+    
+    This class is designed to execute multiple experts in parallel, thereby maximizing computational efficiency.
     """
 
-    def __init__(self, config: TransformerConfig):
+    def __init__(self, num_local_experts: int, config: TransformerConfig):
         super().__init__(config=config)
         self.config: TransformerConfig = config
+        self.num_local_experts = num_local_experts
 
         gg.assert_grouped_gemm_is_available()
         assert (
@@ -125,15 +130,7 @@ class GroupedMLP(BaseMoELayer):
         setattr(self.weight1, 'allreduce', not self.expert_parallel)
         setattr(self.weight2, 'allreduce', not self.expert_parallel)
 
-    def forward(self, hidden_states):
-        # Permutation of tokens
-        (
-            permuted_local_hidden_states,
-            tokens_per_expert,
-            indices,
-            global_local_map,
-        ) = self.token_permutation(hidden_states)
-
+    def forward(self, permuted_local_hidden_states, tokens_per_expert):
         # Reshape the weights for the grouped GEMMs.
         w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
         w2 = self.weight2.view(self.num_local_experts, -1, self.config.hidden_size)
@@ -144,7 +141,88 @@ class GroupedMLP(BaseMoELayer):
 
         fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
 
-        # Un-permutation of tokens.
-        output_total, _ = self.token_unpermutation(fc2_output, indices, global_local_map)
+        return fc2_output, None
 
-        return output_total, None
+    def sharded_state_dict(self, prefix='', sharded_offsets=()):
+        raise NotImplementedError(
+            'Currently distributed checkpointing is not supported for GroupedMLP'
+        )
+
+
+class SequentialMLP(MegatronModule):
+    """An implementation of the Experts layer using a sequence of MLP layers.
+    
+    This class executes each expert sequentially.
+    """
+
+    def __init__(self, num_local_experts, config: TransformerConfig, submodules: MLPSubmodules):
+        super().__init__(config=config)
+        self.add_bias = config.add_bias_linear
+        self.num_local_experts = num_local_experts
+        self.local_experts = torch.nn.ModuleList()
+        for _ in range(self.num_local_experts):
+            expert = MLP(self.config, submodules, is_expert=True)
+            self.local_experts.append(expert)
+
+    def forward(self, permuted_local_hidden_states, tokens_per_expert):
+        output_local = torch.zeros_like(permuted_local_hidden_states)
+        output_bias_local = None
+        if self.add_bias:
+            output_bias_local = torch.zeros_like(permuted_local_hidden_states)
+
+        cumsum_num_tokens = torch.cumsum(tokens_per_expert, dim=0)
+        # Insert zero at the begining for offset index's convenience
+        zero_tensor = torch.zeros(1, dtype=torch.long)
+        cumsum_num_tokens = torch.cat((zero_tensor, cumsum_num_tokens))
+        for expert_num, expert in enumerate(self.local_experts):
+            start = cumsum_num_tokens[expert_num]
+            end = cumsum_num_tokens[expert_num + 1]
+            hidden = permuted_local_hidden_states[start:end]
+            output, output_bias = expert(hidden)
+
+            output_local[start:end] = output
+            if self.add_bias:
+                output_bias = output_bias.expand_as(output)
+                output_bias_local[start:end, :] = output_bias
+
+        return output_local, output_bias_local
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=()):
+        """ Maps local expert to global experts. """
+        sharded_state_dict = {}
+        num_global_experts = (
+            parallel_state.get_expert_model_parallel_world_size() * self.num_local_experts
+        )
+        local_expert_indices_offset = (
+            parallel_state.get_expert_model_parallel_rank() * self.num_local_experts
+        )
+
+        expert_sharded_prefix = f'{prefix}experts.'
+        for expert_local_idx, expert in enumerate(self.local_experts):
+            expert_global_idx = local_expert_indices_offset + expert_local_idx
+            expert_state_dict_prefix = f'{prefix}local_experts.{expert_local_idx}.'
+            expert_sharded_offsets = (
+                *sharded_offsets,
+                (len(sharded_offsets), expert_global_idx, num_global_experts),
+            )
+
+            expert_state_dict = expert.sharded_state_dict(
+                expert_state_dict_prefix, expert_sharded_offsets
+            )
+            # Remove expert layers indexing from sharded keys
+            replace_prefix_for_sharding(
+                expert_state_dict, expert_state_dict_prefix, expert_sharded_prefix
+            )
+            # Adjust replica ids - replication along DP modulo EP
+            for k, sh_ten in expert_state_dict.items():
+                replica_id = sh_ten.replica_id
+                assert (
+                    len(replica_id) == 3
+                ), f'Expected replica_id for {k} to be in (PP, TP, DP) format, got: {replica_id}'
+                sh_ten.replica_id = (
+                    *replica_id[:2],
+                    parallel_state.get_data_modulo_expert_parallel_rank(),
+                )
+
+            sharded_state_dict.update(expert_state_dict)
+        return sharded_state_dict

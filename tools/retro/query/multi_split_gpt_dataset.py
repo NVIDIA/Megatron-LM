@@ -59,6 +59,8 @@ class MultiSplitGPTDataset(GPTDataset):
         indexed_dataset (MMapIndexedDataset): The MMapIndexedDataset around which to build the
         MegatronDataset
 
+        dataset_path (str): The real path on disk to the dataset, for bookkeeping
+
         indexed_indices (numpy.ndarray): The set of the documents indices to expose
 
         num_samples (int): The number of samples to draw from the indexed dataset
@@ -71,12 +73,13 @@ class MultiSplitGPTDataset(GPTDataset):
     def __init__(
         self,
         indexed_dataset: MMapIndexedDataset,
+        dataset_path: str,
         indexed_indices: numpy.ndarray,
         num_samples: int,
         index_split: Split,
         config: MultiSplitGPTDatasetConfig,
     ) -> None:
-        super().__init__(indexed_dataset, indexed_indices, num_samples, index_split, config)
+        super().__init__(indexed_dataset, dataset_path, indexed_indices, num_samples, index_split, config)
 
     def __getitem__(self, idx: int) -> Dict[str, numpy.ndarray]:
         """Abstract method implementation
