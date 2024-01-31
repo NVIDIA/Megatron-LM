@@ -66,6 +66,7 @@ class Timer(TimerBase):
     def __init__(self, name):
         super().__init__(name)
         self._elapsed = 0.0
+        self._active_time = 0.0
         self._started = False
         # Note that None will default to the global process group
         self._barrier_group = None
@@ -92,12 +93,15 @@ class Timer(TimerBase):
         if barrier:
             torch.distributed.barrier(group=self._barrier_group)
         torch.cuda.synchronize()
-        self._elapsed += (time.time() - self._start_time)
+        elapsed = time.time() - self._start_time
+        self._elapsed += elapsed
+        self._active_time += elapsed
         self._started = False
 
 
     def reset(self):
         """Reset timer."""
+        # Don't reset _active_time
         self._elapsed = 0.0
         self._started = False
 
@@ -117,6 +121,9 @@ class Timer(TimerBase):
         if _started:
             self.start(barrier=barrier)
         return _elapsed
+
+    def active_time(self):
+        return self._active_time
 
 
 
