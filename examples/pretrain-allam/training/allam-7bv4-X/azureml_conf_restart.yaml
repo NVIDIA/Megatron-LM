@@ -57,6 +57,6 @@ distribution:
   process_count_per_instance: 8
 
 resources:
-  instance_count: 64
+  instance_count: 32
   shm_size: 1250g
   docker_args: "--volume=/home/azureuser/allamlustre/tokenize_by_v5_improved:/eph/nvme0/allam/bin_idx_data"
