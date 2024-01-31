@@ -1,10 +1,12 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
+from typing import Optional
 
 import torch
 import torch.nn as nn
 
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.utils import get_default_causal_mask
 
 
 class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
@@ -131,7 +133,12 @@ class FusedScaleMaskSoftmax(nn.Module):
 
         assert self.scale is None or softmax_in_fp32, "softmax should be in fp32 when scaled"
 
-    def forward(self, input, mask):
+    def forward(self, input: torch.Tensor, mask: Optional[torch.Tensor]):
+        """Forward pass of softmax with masked input.
+
+        In case attn_mask_type is causal the mask is generated and None can be passed.
+        A user-defined mask is only needed when attn_mask_type is not causal.
+        """
         # [b, np, sq, sk]
         assert input.dim() == 4
 
@@ -186,6 +193,15 @@ class FusedScaleMaskSoftmax(nn.Module):
 
         if self.scale is not None:
             input = input * self.scale
+
+        # Generate causal mask if not given
+        sq, sk = input.size(2), input.size(3)
+        if self.attn_mask_type == AttnMaskType.causal and mask is None and sq > 1:
+            # If sq == 1 then either KV cache is used or one-element context is passed
+            # so keeping mask=None in this case; subsequent code should handle it
+            assert sq == sk, "causal mask is only for self attention"
+            mask = get_default_causal_mask(sq)
+
         mask_output = self.mask_func(input, mask) if mask is not None else input
         probs = torch.nn.Softmax(dim=-1)(mask_output)
 

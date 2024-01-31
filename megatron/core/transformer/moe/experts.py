@@ -1,10 +1,13 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+from typing import Tuple
 
 import numpy as np
 import torch
 from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     _initialize_affine_weight_gpu,
@@ -128,17 +131,29 @@ class GroupedMLP(MegatronModule):
         setattr(self.weight2, 'allreduce', not self.expert_parallel)
 
     def forward(self, permuted_local_hidden_states, tokens_per_expert):
-        # Reshape the weights for the grouped GEMMs.
-        w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
-        w2 = self.weight2.view(self.num_local_experts, -1, self.config.hidden_size)
+        if permuted_local_hidden_states.nelement() != 0:
+            # Reshape the weights for the grouped GEMMs.
+            w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
+            w2 = self.weight2.view(self.num_local_experts, -1, self.config.hidden_size)
 
-        fc1_output = gg.ops.gmm(permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False)
+            fc1_output = gg.ops.gmm(
+                permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False
+            )
 
-        intermediate_parallel = self.activation_func(fc1_output)
+            intermediate_parallel = self.activation_func(fc1_output)
 
-        fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
+            fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
+        else:
+            # None token is allocated for local experts.
+            assert torch.count_nonzero(tokens_per_expert) == 0
+            fc2_output = permuted_local_hidden_states
 
         return fc2_output, None
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=()):
+        raise NotImplementedError(
+            'Currently distributed checkpointing is not supported for GroupedMLP'
+        )
 
 
 class SequentialMLP(MegatronModule):
@@ -178,3 +193,43 @@ class SequentialMLP(MegatronModule):
                 output_bias_local[start:end, :] = output_bias
 
         return output_local, output_bias_local
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=()):
+        """ Maps local expert to global experts. """
+        sharded_state_dict = {}
+        num_global_experts = (
+            parallel_state.get_expert_model_parallel_world_size() * self.num_local_experts
+        )
+        local_expert_indices_offset = (
+            parallel_state.get_expert_model_parallel_rank() * self.num_local_experts
+        )
+
+        expert_sharded_prefix = f'{prefix}experts.'
+        for expert_local_idx, expert in enumerate(self.local_experts):
+            expert_global_idx = local_expert_indices_offset + expert_local_idx
+            expert_state_dict_prefix = f'{prefix}local_experts.{expert_local_idx}.'
+            expert_sharded_offsets = (
+                *sharded_offsets,
+                (len(sharded_offsets), expert_global_idx, num_global_experts),
+            )
+
+            expert_state_dict = expert.sharded_state_dict(
+                expert_state_dict_prefix, expert_sharded_offsets
+            )
+            # Remove expert layers indexing from sharded keys
+            replace_prefix_for_sharding(
+                expert_state_dict, expert_state_dict_prefix, expert_sharded_prefix
+            )
+            # Adjust replica ids - replication along DP modulo EP
+            for k, sh_ten in expert_state_dict.items():
+                replica_id = sh_ten.replica_id
+                assert (
+                    len(replica_id) == 3
+                ), f'Expected replica_id for {k} to be in (PP, TP, DP) format, got: {replica_id}'
+                sh_ten.replica_id = (
+                    *replica_id[:2],
+                    parallel_state.get_data_modulo_expert_parallel_rank(),
+                )
+
+            sharded_state_dict.update(expert_state_dict)
+        return sharded_state_dict

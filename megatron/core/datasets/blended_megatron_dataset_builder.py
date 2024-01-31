@@ -2,21 +2,24 @@
 
 import logging
 import math
-from typing import Any, Callable, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Iterable, List, Optional, Tuple, Type, Union
 
 import numpy
 import torch
 
 from megatron.core.datasets.blended_dataset import BlendedDataset
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
-from megatron.core.datasets.indexed_dataset import MMapIndexedDataset
-from megatron.core.datasets.megatron_dataset import MegatronDataset
+from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset, MockDataset
 from megatron.core.datasets.utils import Split, normalize
 
 logger = logging.getLogger(__name__)
 
+MidLevelDataset = Union[MegatronDataset, MockDataset]
+
+TopLevelDataset = Union[BlendedDataset, MidLevelDataset]
+
 DistributedDataset = Union[
-    BlendedDataset, MegatronDataset, MMapIndexedDataset, torch.utils.data.Dataset
+    TopLevelDataset, MidLevelDataset, LowLevelDataset, torch.utils.data.Dataset
 ]
 
 
@@ -33,13 +36,15 @@ class BlendedMegatronDatasetBuilder(object):
     """
 
     def __init__(
-        self, cls: Type[MegatronDataset], sizes: List[int], config: BlendedMegatronDatasetConfig,
+        self, cls: Type[MidLevelDataset], sizes: List[int], config: BlendedMegatronDatasetConfig,
     ):
         self.cls = cls
         self.sizes = sizes
         self.config = config
 
-    def build(self) -> List[Optional[Union[BlendedDataset, MegatronDataset]]]:
+        assert not self.config.mock or issubclass(self.cls, MockDataset)
+
+    def build(self) -> List[Optional[TopLevelDataset]]:
         """Build all dataset splits according to the provided blend(s)
         
         This method is distributed-aware and must be called on all ranks.
@@ -50,24 +55,28 @@ class BlendedMegatronDatasetBuilder(object):
         splits from separate distributions.
 
         Returns:
-            List[Optional[Union[BlendedDataset, MegatronDataset]]]: A list of either
-            MegatronDataset or BlendedDataset (or None) per split
+            List[Optional[TopLevelDataset]]: A list containing a dataset instance (or None) per
+            split
         """
         return self._build_blended_dataset_splits()
 
-    def _build_blended_dataset_splits(
-        self,
-    ) -> List[Optional[Union[BlendedDataset, MegatronDataset]]]:
+    def _build_blended_dataset_splits(self,) -> List[Optional[TopLevelDataset]]:
         """Build all dataset splits according to the provided blend(s)
         
         See the BlendedMegatronDatasetBuilder.build alias for more information.
 
         Returns:
-            List[Optional[Union[BlendedDataset, MegatronDataset]]]: A list of either
-            MegatronDataset or BlendedDataset (or None) per split
+            List[Optional[TopLevelDataset]]: A list containing a dataset instance (or None) per
+            split
         """
 
-        if self.config.blend:
+        # Return fake "mock" datasets
+        if self.config.mock:
+
+            return self._build_megatron_dataset_splits(None, None, self.sizes)
+
+        # All splits come from the same distribution
+        elif self.config.blend:
             blend = self.config.blend
             split = self.config.split_matrix
 
@@ -117,6 +126,7 @@ class BlendedMegatronDatasetBuilder(object):
 
             return blended_datasets
 
+        # Each split comes from a separate distribution
         else:
             blended_datasets = []
             for i in range(len(Split)):
@@ -170,30 +180,33 @@ class BlendedMegatronDatasetBuilder(object):
             return blended_datasets
 
     def _build_megatron_dataset_splits(
-        self, path_prefix: str, split: List[float], sizes: List[int],
-    ) -> List[Optional[MegatronDataset]]:
-        """Build each MegatronDataset split from a single MMapIndexedDataset
+        self, dataset_path: Optional[str], split: List[float], sizes: List[int],
+    ) -> List[Optional[MidLevelDataset]]:
+        """Build each MidLevelDataset split from a single LowLevelDataset
 
         Args:
-            path_prefix (str): The MMapIndexedDataset .bin and .idx file prefix
+            dataset_path (Optional[str]): The path on disk which defines the underlying
+            LowLevelDataset, e.g. the .bin and .idx file prefix when self.cls is of type
+            IndexedMegatronDataset or None when self.cls is of type MockDataset
 
             split (List[Tuple[float, float]]): The dataset split matrix
 
             sizes (List[int]): The number of total samples to draw from each split
 
         Returns:
-            List[Optional[MegatronDataset]]: The MegatronDatset (or None) per split
+            List[Optional[MidLevelDataset]]: The MidLevelDataset (or None) per split
         """
-        indexed_dataset = self.build_generic_dataset(
-            MMapIndexedDataset, self.config.is_built_on_rank, path_prefix, self.cls.is_multimodal(),
-        )
+        # Build the low level dataset
+        if issubclass(self.cls, MockDataset):
+            low_level_dataset = None
+        elif issubclass(self.cls, MegatronDataset):
+            low_level_dataset = self.cls.build_low_level_dataset(dataset_path, self.config)
+        else:
+            raise NotImplementedError
 
-        if indexed_dataset is not None:
-            if self.cls.is_split_by_sequence():
-                num_elements = indexed_dataset.sequence_lengths.shape[0]
-            else:
-                num_elements = indexed_dataset.document_indices.shape[0] - 1
-
+        # Build the split indices for the low level dataset
+        if low_level_dataset is not None:
+            num_elements = self.cls.numel_low_level_dataset(low_level_dataset)
             split_indices = []
             for i, _ in enumerate(Split):
                 if split[i] is not None:
@@ -207,16 +220,18 @@ class BlendedMegatronDatasetBuilder(object):
         else:
             split_indices = [None for _ in Split]
 
-        megatron_datasets = []
+        # Build the mid level dataset
+        mid_level_datasets = []
         for i, _split in enumerate(Split):
-            if split[i] is None:
-                megatron_datasets.append(None)
+            if not self.config.mock and split[i] is None:
+                mid_level_datasets.append(None)
             else:
-                megatron_datasets.append(
+                mid_level_datasets.append(
                     self.build_generic_dataset(
                         self.cls,
                         self.config.is_built_on_rank,
-                        indexed_dataset,
+                        low_level_dataset,
+                        dataset_path,
                         split_indices[i],
                         sizes[i],
                         _split,
@@ -224,19 +239,21 @@ class BlendedMegatronDatasetBuilder(object):
                     )
                 )
 
-        return megatron_datasets
+        return mid_level_datasets
 
     @staticmethod
     def build_generic_dataset(
-        cls: Type[DistributedDataset], is_built_on_rank: Callable, *args: Any
-    ) -> Optional[DistributedDataset]:
+        cls: Union[Type[DistributedDataset], Callable], is_built_on_rank: Callable, *args: Any
+    ) -> Optional[Union[DistributedDataset, Iterable]]:
         """Build the DistributedDataset
 
-        Return None if and only if the underlying MegatronDataset class is not built on the current
-        rank and torch.distributed is initialized.
+        Return None if and only if the underlying dataset class is not built on the current rank
+        and torch.distributed is initialized.
 
         Args:
-            cls (Type[DistributedDataset]): The DistributedDataset class to be built
+            cls (Union[Type[DistributedDataset], Callable]): The DistributedDataset class to be
+            built. In special cases, e.g. when we are building the low level dataset for a
+            RawMegatronDataset instance, we can accept a Callable which returns an Iterable.
 
             args (Tuple[Any]): The positional arguments used to build the provided
             DistributedDataset class
@@ -245,7 +262,8 @@ class BlendedMegatronDatasetBuilder(object):
             Exception: When the dataset constructor raises an OSError
 
         Returns:
-            Optional[DistributedDataset]: The DistributedDataset instantion or None
+            Optional[Union[DistributedDataset, Iterable]]: The DistributedDataset instantion, the
+            Iterable instantiation, or None
         """
         if torch.distributed.is_initialized():
             rank = torch.distributed.get_rank()

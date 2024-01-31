@@ -2,7 +2,7 @@
 
 import logging
 from enum import Enum
-from typing import List
+from typing import Any, List
 
 import numpy
 import torch
@@ -30,13 +30,17 @@ def compile_helpers():
         sys.exit(1)
 
 
-def log_single_rank(logger: logging.Logger, *args, rank=0, **kwargs):
+def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs: Any):
     """If torch distributed is initialized, log only on rank
 
     Args:
         logger (logging.Logger): The logger to write the logs
 
+        args (Tuple[Any]): All logging.Logger.log positional arguments
+
         rank (int, optional): The rank to write on. Defaults to 0.
+
+        kwargs (Dict[str, Any]): All logging.Logger.log keyword arguments
     """
     if torch.distributed.is_initialized():
         if torch.distributed.get_rank() == rank:

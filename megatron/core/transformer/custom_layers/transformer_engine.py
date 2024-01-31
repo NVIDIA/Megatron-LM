@@ -394,9 +394,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         if te_version > packaging.version.Version("0.12.0"):
             self.te_forward_mask_type = True
 
-        if self.config.apply_rope_fusion and te_version > packaging.version.Version("0.13.0"):
-            extra_kwargs["qkv_format"] = self.qkv_format = 'bshd'
-
         # Only Transformer-Engine version >= 1.0.0 supports context parallelism
         if te_version >= packaging.version.Version("1.0.0"):
             if getattr(TEDotProductAttention, "cp_stream") is None:
@@ -446,13 +443,19 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             dataclasses.asdict(packed_seq_params) if packed_seq_params is not None else {}
         )
         te_version = packaging.version.Version(version("transformer-engine"))
+        # overwrite self.qkv_format depending on self.config.apply_rope_fusion, which can be set after init
+        if self.config.apply_rope_fusion and te_version > packaging.version.Version("0.13.0"):
+            self.qkv_format = 'bshd'
+
+        qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
+
         if te_version < packaging.version.Version("1.3.0"):
             # TE 1.3.0 introduces precomputing max_seqlen to remove unnecessary kernels and D2H copies (#555)
             # These two arguments did not exist prior to 1.3.0
             packed_seq_kwargs.pop("max_seqlen_q", None)
             packed_seq_kwargs.pop("max_seqlen_kv", None)
 
-        if self.config.apply_rope_fusion and self.qkv_format == 'bshd':
+        if self.config.apply_rope_fusion and qkv_format == 'bshd':
             query, key, value = [x.transpose(0, 1).contiguous() for x in (query, key, value)]
 
         if self.te_forward_mask_type:
@@ -467,7 +470,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         else:
             core_attn_out = super().forward(query, key, value, attention_mask, **packed_seq_kwargs,)
 
-        if self.config.apply_rope_fusion and self.qkv_format == 'bshd':
+        if self.config.apply_rope_fusion and qkv_format == 'bshd':
             return core_attn_out.transpose(0, 1)
         else:
             return core_attn_out

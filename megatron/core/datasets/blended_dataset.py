@@ -30,7 +30,7 @@ class BlendedDataset(torch.utils.data.Dataset):
 
         size (int): The number of samples to draw from the blend
 
-        config (BlendedMegatronDatasetConfig): The config object which informs dataset creation
+        config (BlendedMegatronDatasetConfig): The config
 
     Raises:
         RuntimeError: When the dataset has fewer or more samples than 'size' post-initialization
@@ -68,7 +68,9 @@ class BlendedDataset(torch.utils.data.Dataset):
         unique_identifiers["weights"] = self.weights
         unique_identifiers["size"] = self.size
 
-        self.unique_description = json.dumps(unique_identifiers, indent=4)
+        self.unique_description = json.dumps(
+            unique_identifiers, indent=4, default=lambda obj: obj.unique_identifiers
+        )
         self.unique_description_hash = hashlib.md5(
             self.unique_description.encode("utf-8")
         ).hexdigest()
