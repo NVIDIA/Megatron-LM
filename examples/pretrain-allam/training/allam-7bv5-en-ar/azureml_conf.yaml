@@ -50,7 +50,7 @@ services:
     type: tensor_board
     log_dir: ${{outputs.checkpoint_dir}}
 
-compute: azureml:NCAI-A100-LLMv3
+compute: azureml:NCAI-A100-LLMv5
 
 distribution:
   type: pytorch

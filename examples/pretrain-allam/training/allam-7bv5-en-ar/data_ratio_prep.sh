@@ -12,4 +12,4 @@ python examples/data-processing/data_ratio_from_file.py \
  --exclude-iterator-json "examples/pretrain-allam/training/allam-7bv5-en-ar/exclude_iterator.json" \
  --total-token 1_200_000_000_000 \
  --export-script examples/pretrain-allam/training/allam-7bv5-en-ar/iterator_prob.sh \
- --prefix-for-file-path "\$BIN_IDX_PATH/" 
+ --prefix-for-file-path "\$BIN_IDX_PATH/" --verbose
