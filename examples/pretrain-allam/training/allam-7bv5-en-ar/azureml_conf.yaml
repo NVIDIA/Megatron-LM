@@ -13,7 +13,7 @@ command: >-
 
 display_name: allam-7bv5-en-ar
 
-experiment_name: pretrain
+experiment_name: pretrain-allam
 code: ../../../../
 environment: azureml:Megatron-LLaMA:7
 environment_variables:
