@@ -4,7 +4,6 @@
 
 import gc
 from datetime import datetime
-import hashlib
 import math
 import logging
 import os
