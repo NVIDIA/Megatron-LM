@@ -1,9 +1,11 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+import os
 from typing import Literal, Optional
 
 import torch
 from torch import Tensor
 
+from megatron.core import parallel_state
 from megatron.core.models.bert.bert_lm_head import BertLMHead
 from megatron.core.models.bert.pooler import Pooler
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
@@ -57,6 +59,11 @@ class BertModel(LanguageModule):
 
         if return_embeddings:
             assert self.post_process and self.add_binary_head
+
+        assert (
+            os.getenv('NVTE_ALLOW_NONDETERMINISTIC_ALGO') == '0'
+            or os.getenv('NVTE_FLASH_ATTN') == '0'
+        ), "Bert currently does not support flash attention. Please set env variable NVTE_FLASH_ATTN=0 or set NVTE_ALLOW_NONDETERMINISTIC_ALGO=0"
 
         self.config: TransformerConfig = config
         self.transformer_layer_spec: ModuleSpec = transformer_layer_spec
@@ -193,7 +200,12 @@ class BertModel(LanguageModule):
         """
         extended_attention_mask = self.bert_extended_attention_mask(attention_mask)
 
-        position_ids = self.bert_position_ids(input_ids)
+        if parallel_state.is_pipeline_first_stage():
+            input_ids = input_ids
+            position_ids = self.bert_position_ids(input_ids)
+        else:
+            position_ids = None
+            input_ids = None
 
         # Encoder embedding.
         if self.pre_process:

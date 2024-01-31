@@ -1439,10 +1439,11 @@ def _add_moe_args(parser):
 def _add_experimental_args(parser):
     group = parser.add_argument_group(title='experimental')
 
-    group.add_argument('--spec', type=str, default=None, nargs=2,
+    group.add_argument('--spec', type=str, default=None, nargs='*',
                        help='Specify the <module_location function_name> pair '
                        'that returns a spec to customize a model, transformer '
-                       'block, or transformer layer, depending on the use case. '
+                       'block, or transformer layer, depending on the use case.'
+                       'To use local spec specify local as the argument.'
                        'For more details, see the model class, '
                        '`transformer_block.py`, or `transformer_layer.py`')
 
