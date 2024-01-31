@@ -85,6 +85,8 @@ if __name__ == "__main__":
     for lang, iterator_list in  data_dist_by_lang.items():
         tot_prob_covered = 0.0
         for (iterator_tok_cnt, iterators_name) in iterator_list:
+            if lang == "en":
+                print(f"{iterators_name=} {iterator_tok_cnt=} {tot_sampled_token_by_lang[lang]=}")
             domain = iterators_name.split("_")[1]
             prob = iterator_tok_cnt/tot_sampled_token_by_lang[lang] * lang_prob_dict[lang]
             domain_multiplier = copy.deepcopy(domain_dict)
@@ -113,13 +115,13 @@ if __name__ == "__main__":
         out_file_ptr = open(f"{args.export_script}", "w")
         out_file_ptr.write("DATA_PATH=( --data-path ")
     for prob, iterator_name, total_token_to_be_sampled, total_token_exists in iterator_selection_prob:
-        if (prob-0.0) < 1e-3: continue
         lang = iterator_name.split("_")[0]
         lang_token[lang] += total_token_to_be_sampled
         if args.verbose:
             print(f"\t{prob} {os.path.basename(iterator_name)} {total_token_to_be_sampled:_} {total_token_exists:_} {total_token_to_be_sampled/total_token_exists}")
         __output_format = os.path.basename(iterator_name).replace('=', '\\=')
-        print(f"\t{prob} {args.prefix_for_file_path}/{__output_format}")
+        if not args.verbose:
+            print(f"\t{prob} {args.prefix_for_file_path}/{__output_format}")
         if args.export_script is not None:
             out_file_ptr.write(f"\n{prob} {args.prefix_for_file_path}/{__output_format}")
     if args.export_script is not None:
