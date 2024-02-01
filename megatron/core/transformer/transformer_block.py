@@ -212,14 +212,25 @@ class TransformerBlock(MegatronModule):
 
             return custom_forward
 
-        if self.config.recompute_method == 'uniform':
-            # Uniformly divide the total number of Transformer layers and checkpoint
-            # the input activation of each divided chunk.
-            # A method to further reduce memory usage reducing checkpoints.
-            l = 0
-            while l < self.num_layers_per_pipeline_rank:
-                hidden_states, context = tensor_parallel.checkpoint(
-                    custom(l, l + self.config.recompute_num_layers),
+        def checkpoint_handler(forward_func):
+            if self.config.fp8:
+                from transformer_engine.pytorch.distributed import checkpoint as te_checkpoint
+
+                return te_checkpoint(
+                    forward_func,
+                    self.config.distribute_saved_activations,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    parallel_state.get_tensor_model_parallel_group(),
+                    hidden_states,
+                    attention_mask,
+                    context,
+                    context_mask,
+                    rotary_pos_emb,
+                    packed_seq_params,
+                )
+            else:
+                return tensor_parallel.checkpoint(
+                    forward_func,
                     self.config.distribute_saved_activations,
                     hidden_states,
                     attention_mask,
@@ -227,6 +238,16 @@ class TransformerBlock(MegatronModule):
                     context_mask,
                     rotary_pos_emb,
                     packed_seq_params,
+                )
+
+        if self.config.recompute_method == 'uniform':
+            # Uniformly divide the total number of Transformer layers and checkpoint
+            # the input activation of each divided chunk.
+            # A method to further reduce memory usage reducing checkpoints.
+            l = 0
+            while l < self.num_layers_per_pipeline_rank:
+                hidden_states, context = checkpoint_handler(
+                    custom(l, l + self.config.recompute_num_layers)
                 )
 
                 l += self.config.recompute_num_layers
@@ -237,16 +258,7 @@ class TransformerBlock(MegatronModule):
             # A method fully use the device memory removing redundant re-computation.
             for l in range(self.num_layers_per_pipeline_rank):
                 if l < self.config.recompute_num_layers:
-                    hidden_states, context = tensor_parallel.checkpoint(
-                        custom(l, l + 1),
-                        self.config.distribute_saved_activations,
-                        hidden_states,
-                        attention_mask,
-                        context,
-                        context_mask,
-                        rotary_pos_emb,
-                        packed_seq_params,
-                    )
+                    hidden_states, context = checkpoint_handler(custom(l, l + 1))
                 else:
                     hidden_states, context = custom(l, l + 1)(
                         hidden_states,
