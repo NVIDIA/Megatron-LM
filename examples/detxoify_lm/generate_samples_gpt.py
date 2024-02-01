@@ -150,7 +150,7 @@ def generate_samples_conditional(model):
 
         fname = open(args.sample_input_file, "r")
         lines = fname.readlines()
-        all_raw_text = lines #[json.loads(line)['prompt']['text'] for line in lines]
+        all_raw_text = [json.loads(line)['prompt']['text'] for line in lines]
         input_count = len(all_raw_text)
         input_pos = 0
 
