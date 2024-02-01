@@ -175,6 +175,4 @@ if __name__ == "__main__":
             GMLP_test.test_weight_init_value_the_same()
             GMLP_test.test_gpu_forward()
             GMLP_test.test_gpu_forward_with_no_tokens_allocated()
-            import pdb
-            pdb.set_trace()
             GMLP_test.teardown_method(method=None)
