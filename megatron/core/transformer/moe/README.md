@@ -69,7 +69,7 @@ To train a top-2 MoE model with an auxiliary loss, include the following argumen
 --num-experts 8
 --expert-model-parallel-size 8
 --moe-grouped-gemm
---moe-router-load-balancing-type aux_loss # options: aux_loss, sinkhorn, None. Default is sinkhorn1.
+--moe-router-load-balancing-type aux_loss # options: aux_loss, sinkhorn, None. Default is aux_loss.
 --moe-router-topk 2
 --moe-aux-loss-coeff 1e-2
 --use-distributed-optimizer
