@@ -31,30 +31,30 @@ class TestParallelSequentialMLP:
         )
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=num_moe_experts, moe_grouped_gemm=False)
-        self.sequentail_mlp = MoELayer(transformer_config, transformer_layer_spec.submodules.mlp.submodules)
+        self.sequential_mlp = MoELayer(transformer_config, transformer_layer_spec.submodules.mlp.submodules)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
     def test_constructor(self):
-        assert isinstance(self.sequentail_mlp, MoELayer)
+        assert isinstance(self.sequential_mlp, MoELayer)
 
-        num_weights = sum([p.numel() for p in self.sequentail_mlp.parameters()])
+        num_weights = sum([p.numel() for p in self.sequential_mlp.parameters()])
         assert num_weights == 3696
 
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_gpu_forward(self):
-        sequentail_mlp = self.sequentail_mlp
-        sequentail_mlp.cuda()
+        sequential_mlp = self.sequential_mlp
+        sequential_mlp.cuda()
         # [sequence length, batch size, hidden size]
-        hidden_states = torch.ones((32, 2, sequentail_mlp.config.hidden_size))
+        hidden_states = torch.ones((32, 2, sequential_mlp.config.hidden_size))
         hidden_states = hidden_states.cuda()
-        output, output_bias = sequentail_mlp(hidden_states)
+        output, output_bias = sequential_mlp(hidden_states)
         assert output.shape[0] == 32
         assert output.shape[1] == 2
-        assert output.shape[2] == sequentail_mlp.config.hidden_size
-        assert output_bias.shape[2] == sequentail_mlp.config.hidden_size
+        assert output.shape[2] == sequential_mlp.config.hidden_size
+        assert output_bias.shape[2] == sequential_mlp.config.hidden_size
         assert output.dtype == torch.float32
         assert output.device.type == 'cuda'
         assert output_bias.device.type == 'cuda'

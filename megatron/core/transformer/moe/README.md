@@ -5,18 +5,17 @@
 - **Expert Parallel**
     - A specific method of parallelism for MoE models, where experts are partitioned onto different workers and each worker processes a different batch of training samples, each worker process one or more experts for each MoE layer.
 - **3D Parallel**: Data Parallel , Tensor Parallel, Pipeline Parallel, Sequence Parallel
-    - Note: When using MoE and tensor parallelism, sequence parallelism must be used.
+    - Note: When using MoE with expert parallelism and tensor parallelism, sequence parallelism must be used.
 - **Richer parallel mappings**: EP can be combined with DP/TP/PP/SP for handling larger MoE variants.
 - **Distributed optimizer.**
 
 ### Router and Load Balancing
 
 - Router type:
-    - Top-K router
+    - Top-K MLP router
     - Expert Choice router (coming soon)
 - Load Balancing algorithms:
     - Sinkhorn (S-BASE)
-    - Z-Loss
     - Aux loss / Load balancing loss
 
 ### Performance Optimizations
@@ -34,8 +33,8 @@
 
 ## Upcoming features
 
-- Enhanced GroupedGEMM kernels
-    - Less host-device syncs.
+- Enhanced cutlass GroupedGEMM kernels
+    - Reduced host-device syncs.
     - More supported dtype: fp32/bf16/fp16
     - Kernel heuristics tuned for A100/A10/L40S
     - BWD cutlass GroupedGEMM kernels supported
@@ -44,6 +43,7 @@
 - Context Parallel with MoE
 - FP8 training support
 - Enable ’--tp-comm-overlap‘ for MoE
+- Distributed optimizer for MoE params.
 
 # User Guide
 
@@ -58,6 +58,7 @@
 | moe-router-topk | Number of experts to route to for each token. The default is 2. |
 | moe-aux-loss-coeff | Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended. |
 | moe-z-loss-coeff | Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended. |
+| moe-input-jitter-eps | Add noise to the input tensor by applying jitter with a specified epsilon value. |
 | moe-token-dropping | This feature involves selectively dropping and padding tokens for each expert to achieve a specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note: Currently unsupported. |
 
 ### Example
@@ -67,9 +68,11 @@ To train a top-2 MoE model with an auxiliary loss, include the following argumen
 ```python
 --num-experts 8
 --expert-model-parallel-size 8
+--moe-grouped-gemm
 --moe-router-load-balancing-type aux_loss # options: aux_loss, sinkhorn, None. Default is sinkhorn1.
 --moe-router-topk 2
 --moe-aux-loss-coeff 1e-2
+--use-distributed-optimizer
 ```
 ## A detailed MoE script:
 <details>
