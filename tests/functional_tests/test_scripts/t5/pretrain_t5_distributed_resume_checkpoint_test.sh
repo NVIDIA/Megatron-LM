@@ -15,6 +15,7 @@ echo "---------------------------------"
 set -x
 if [[ -z $MBS ]]; then MBS=4; fi
 if [[ -z $GBS ]]; then GBS=32; fi
+if [[ -z $VOCAB_PATH ]]; then VOCAB_PATH="/workspace/data/t5_data/bert-large-cased-vocab.txt"; fi
 
 GPUS_PER_NODE=8
 # Change for multinode config
@@ -76,7 +77,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --global-batch-size ${GBS:-32} \
     --lr 0.0001 \
     --train-iters 100 \
-    --lr-decay-iters $MAX_STEPS \
+    --lr-decay-iters 100 \
     --lr-decay-style linear \
     --min-lr 0.00001 \
     --weight-decay 1e-2 \
@@ -104,6 +105,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --eval-interval 1000 \
     --eval-iters 10 \
     --distributed-backend nccl \
+   ${DATA_CACHE:+--data-cache-path "$DATA_CACHE"} \
     ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS}"
 
 command1="$command $torch_run_cmd"
@@ -133,7 +135,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --global-batch-size ${GBS:-32} \
     --lr 0.0001 \
     --train-iters 100 \
-    --lr-decay-iters $MAX_STEPS \
+    --lr-decay-iters 100 \
     --lr-decay-style linear \
     --min-lr 0.00001 \
     --weight-decay 1e-2 \
@@ -161,6 +163,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --eval-interval 1000 \
     --eval-iters 10 \
     --distributed-backend nccl \
+   ${DATA_CACHE:+--data-cache-path "$DATA_CACHE"} \
     ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS}"
 
 command2="$command $torch_run_cmd"

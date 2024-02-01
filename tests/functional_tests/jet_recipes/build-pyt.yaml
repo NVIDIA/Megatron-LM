@@ -1,0 +1,21 @@
+type: build
+format_version: 1
+maintainers: [maanug]
+spec:
+  name: pyt
+  platforms: [linux/amd64]
+  source:
+    image: nvcr.io/nvidia/pytorch:23.04-py3
+
+---
+type: build
+format_version: 1
+maintainers: [maanug]
+spec:
+  name: mcore-pyt
+  platforms: [linux/amd64]
+  parent: pyt
+  source:
+    repo: https://gitlab-master.nvidia.com/ADLR/megatron-lm.git
+    ref: main
+    dockerfile: Dockerfile.ci
