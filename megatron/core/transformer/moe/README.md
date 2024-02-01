@@ -22,9 +22,7 @@
 ### Performance Optimizations
 
 - GroupedGEMM when num local experts > 1
-    - Supported dtype: fp32/bf16/fp16
-- Token permutation / unpermutation fusion
-- Fused Sinkhorn Kernel
+    - Supported dtype: bf16
 
 ### Token Dispatch Mechanism
 
@@ -36,6 +34,13 @@
 
 ## Upcoming features
 
+- Enhanced GroupedGEMM kernels
+    - Less host-device syncs.
+    - More supported dtype: fp32/bf16/fp16
+    - Kernel heuristics tuned for A100/A10/L40S
+    - BWD cutlass GroupedGEMM kernels supported
+- Token permutation / unpermutation fusion
+- Fused Sinkhorn Kernel
 - Context Parallel with MoE
 - FP8 training support
 - Enable ’--tp-comm-overlap‘ for MoE

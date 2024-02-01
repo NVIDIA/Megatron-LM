@@ -90,7 +90,7 @@ def _get_mlp_module_spec(
             ),
         )
     else:
-        # SwitchMLP based MoE with modules in megatron core.
+        # Mixture of experts with modules in megatron core.
         return ModuleSpec(
             module=MoELayer,
             submodules=MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear,)

@@ -31,10 +31,10 @@ class TestTop2Router:
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=num_moe_experts, moe_grouped_gemm=False
         )
-        self.switch_mlp = MoELayer(
+        self.sequential_mlp = MoELayer(
             self.transformer_config, transformer_layer_spec.submodules.mlp.submodules
         )
-        self.router = self.switch_mlp.router
+        self.router = self.sequential_mlp.router
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -62,25 +62,25 @@ class TestTop2Router:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_aux_loss(self):
-        self.switch_mlp = self.switch_mlp.cuda()
+        self.sequential_mlp = self.sequential_mlp.cuda()
         
         # Without aux loss
         hidden_states = torch.randn((32, 2, self.router.config.hidden_size))
         hidden_states = hidden_states.cuda()
-        out = self.switch_mlp(hidden_states)[0]
+        out = self.sequential_mlp(hidden_states)[0]
         out.sum().mul_(0).backward()
-        assert self.switch_mlp.router.weight.grad.abs().sum() == 0
+        assert self.sequential_mlp.router.weight.grad.abs().sum() == 0
         
         # With aux loss
         self.transformer_config.moe_aux_loss_coeff = 1
-        out = self.switch_mlp(hidden_states)[0]
+        out = self.sequential_mlp(hidden_states)[0]
         out.sum().mul_(0).backward()
-        assert self.switch_mlp.router.weight.grad.abs().sum() > 0
+        assert self.sequential_mlp.router.weight.grad.abs().sum() > 0
         
         # With Z loss
         self.transformer_config.moe_aux_loss_coeff = 0
         self.transformer_config.moe_z_loss_coeff = 1
-        self.switch_mlp.router.weight.grad.fill_(0)
-        out = self.switch_mlp(hidden_states)[0]
+        self.sequential_mlp.router.weight.grad.fill_(0)
+        out = self.sequential_mlp(hidden_states)[0]
         out.sum().mul_(0).backward()
-        assert self.switch_mlp.router.weight.grad.abs().sum() > 0
+        assert self.sequential_mlp.router.weight.grad.abs().sum() > 0

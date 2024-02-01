@@ -94,7 +94,7 @@ def _allreduce_expert_grads(model: List[torch.nn.Module], config: TransformerCon
     All-reduce expert grads (for expert parallelism).
     """
 
-    # All-reduce switchmlp parameters across data modulo expert parallel nodes
+    # All-reduce MoE parameters across data modulo expert parallel nodes
     if (
         config.expert_model_parallel_size > 1
         and config.expert_model_parallel_size < parallel_state.get_data_parallel_world_size()
