@@ -41,6 +41,8 @@ class GPTModel(LanguageModule):
         neft (bool, optional): Use NEFT. Defaults to False.
         neft_alpha (float, optional): NEFT alpha. Defaults to 5.0.
         noise_positonal_embedding (bool, optional): Add noise to positional embedding. Defaults to False.
+        adversarial_training (bool, optional): Adversarial training. Defaults to False.
+        adversarial_training_epsilon (float, optional): Adversarial training scaling factor. Defaults to 0.01.
     """
 
     def __init__(
@@ -65,6 +67,8 @@ class GPTModel(LanguageModule):
         neft=False,
         neft_alpha=5.0,
         noise_positonal_embedding=False,
+        adversarial_training=False,
+        adversarial_training_epsilon=0.01,
     ) -> None:
         super().__init__(config=config)
 
@@ -85,6 +89,9 @@ class GPTModel(LanguageModule):
         self.neft = neft
         self.neft_alpha = neft_alpha
         self.noise_positonal_embedding = noise_positonal_embedding
+        
+        self.adversarial_training = adversarial_training
+        self.adversarial_training_epsilon = adversarial_training_epsilon
 
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
@@ -190,6 +197,28 @@ class GPTModel(LanguageModule):
                 inference_params, self.decoder, decoder_input, self.config
             )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+
+        if self.adversarial_training and decoder_input is not None and self.training:
+            decoder_input_clone = decoder_input.clone().detach().requires_grad_(True)
+
+            hidden_states = self.decoder(
+                hidden_states=decoder_input_clone,
+                attention_mask=attention_mask,
+                inference_params=inference_params,
+                rotary_pos_emb=rotary_pos_emb,
+                **(extra_block_kwargs or {}),
+            )
+
+            output_weight = None
+            if self.share_embeddings_and_output_weights:
+                output_weight = self.shared_embedding_or_output_weight()
+            logits, _ = self.output_layer(hidden_states, weight=output_weight)
+
+            loss = self.compute_language_model_loss(labels, logits)
+            self.zero_grad() # Ensure that the gradients are zeroed out before backpropagation
+            loss.mean().backward(retain_graph=True)
+            perturbation = self.adversarial_training_epsilon * decoder_input_clone.grad.sign()
+            decoder_input = decoder_input + perturbation.detach()
 
         # Run decoder.
         hidden_states = self.decoder(
