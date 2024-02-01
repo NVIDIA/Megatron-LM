@@ -42,7 +42,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
     args = get_args()
 
     print_rank_0('building GPT model ...')
-    config = core_transformer_config_from_args(get_args())
+    config = core_transformer_config_from_args(args)
 
     if args.use_mcore_models:
         if args.spec is not None:
