@@ -14,7 +14,8 @@ def switch_load_balancing_loss_func(gates, mask, moe_aux_loss_coeff):
     """
     num_experts = mask.size(-1)
     gates_mean = gates.mean(dim=0)
-    selection_mean = mask.float().mean(dim=0)
+    top_k = mask[0].count_nonzero()
+    selection_mean = mask.float().mean(dim=0) / top_k
     aux_loss = torch.sum(gates_mean * selection_mean) * num_experts
     aux_loss *= moe_aux_loss_coeff
     return aux_loss
