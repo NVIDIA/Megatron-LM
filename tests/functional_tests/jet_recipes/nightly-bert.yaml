@@ -1,0 +1,51 @@
+type: recipe
+format_version: 1
+maintainers: [maanug]
+loggers: [stdout]
+spec:
+  model: bert
+  variant: 345m
+  build: mcore-pyt 
+  scope: nightly
+  nodes: 1
+  gpus: 8
+  platforms: [dgx_h100]
+  steps: 50
+  use_te: False
+  use_mcore: True
+  vp_size: null
+  extra_args: null
+  micro_batch_size: 4 # MBS
+  batch_size: 128 # GBS, JET schema requires 'batch_size'
+  precision: bf16
+  time_limit: 1200
+  artifacts: {/workspace/data/bert_data: text/the_pile/bert_shard00}
+  script: |-
+    ls
+    cd /workspace/megatron-lm
+
+    ./tests/functional_tests/test_scripts/bert/pretrain_bert_distributed_test.sh \
+        DATA_PATH=/workspace/data/bert_data/my-bert_00_text_sentence \
+        CHECKPOINT_PATH=/workspace/checkpoints \
+        TENSORBOARD_DIR={assets_dir} \
+        DATA_CACHE=/workspace/data/index-cache \
+        USE_TE={"1" if use_te else "0"} \
+        TP_SIZE={tp_size} \
+        PP_SIZE={pp_size} \
+        NUM_NODES={nodes} \
+        MAX_STEPS={steps} \
+        USE_CORE={"1" if use_mcore else "0"} \
+        VP_SIZE={vp_size if vp_size is not None else '""'} \
+        MBS={micro_batch_size} \
+        GBS={batch_size} \
+        ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'} && \
+        python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py {assets_dir} "" | \
+        tee {assets_dir}/results.json
+products:
+  - {use_mcore: [True, False], tp_size: [4], pp_size: [1]}
+  - {use_mcore: [True, False], tp_size: [1], pp_size: [2,4]}
+key_segments:
+  # vp_size: vp
+  use_mcore: mcore
+  use_te: te
+  extra_args: args

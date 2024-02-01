@@ -15,6 +15,7 @@ echo "---------------------------------"
 set -x
 if [[ -z $MBS ]]; then MBS=4; fi
 if [[ -z $GBS ]]; then GBS=32; fi
+if [[ -z $VOCAB_PATH ]]; then VOCAB_PATH="/workspace/data/t5_data/bert-large-cased-vocab.txt"; fi
 
 GPUS_PER_NODE=8
 # Change for multinode config
@@ -103,6 +104,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --eval-interval 1000 \
     --eval-iters 10 \
     --distributed-backend nccl \
+    ${DATA_CACHE:+--data-cache-path "$DATA_CACHE"} \
     ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS}"
 
 command="$command $torch_run_cmd"

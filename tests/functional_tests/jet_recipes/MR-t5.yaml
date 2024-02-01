@@ -1,0 +1,50 @@
+type: recipe
+format_version: 1
+maintainers: [maanug]
+loggers: [stdout]
+spec:
+  model: t5
+  variant: 220m
+  build: mcore-pyt 
+  scope: merge-request
+  nodes: 1
+  gpus: 8
+  platforms: [dgx_h100]
+  steps: 100
+  use_te: False
+  use_mcore: True
+  vp_size: null
+  extra_args: null
+  micro_batch_size: 4 # MBS
+  batch_size: 32 # GBS, JET schema requires 'batch_size'
+  precision: bf16
+  time_limit: 1800
+  artifacts: {/workspace/data/t5_data: text/the_pile/t5_shard00}
+  script: |-
+    ls
+    cd /workspace/megatron-lm
+
+    ./tests/functional_tests/test_scripts/t5/pretrain_t5_distributed_test.sh \
+        DATA_PATH="/workspace/data/t5_data/my-t5_00_text_document" \
+        CHECKPOINT_PATH=/workspace/checkpoints \
+        TENSORBOARD_DIR={assets_dir} \
+        DATA_CACHE=/workspace/data/index-cache \
+        USE_TE={"1" if use_te else "0"} \
+        TP_SIZE={tp_size} \
+        PP_SIZE={pp_size} \
+        NUM_NODES={nodes} \
+        MAX_STEPS={steps} \
+        USE_CORE={"1" if use_mcore else "0"} \
+        VP_SIZE={vp_size if vp_size is not None else '""'} \
+        MBS={micro_batch_size} \
+        GBS={batch_size} \
+        ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'} && \
+        python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py {assets_dir} "" | \
+        tee {assets_dir}/results.json
+products:
+  - {use_te: [True], tp_size: [1],  pp_size: [1], vp_size: [1]}
+key_segments:
+  vp_size: vp
+  use_mcore: mcore
+  use_te: te
+  extra_args: args

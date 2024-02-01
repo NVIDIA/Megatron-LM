@@ -1,1 +1,0 @@
-{"lm loss": {"start_step": 0, "end_step": 40, "step_interval": 5, "values": [10.92392, 10.93645, 10.89657, 10.86919, 10.74782, 10.658, 10.15864, 10.24906]}, "num-zeros": {"start_step": 0, "end_step": 40, "step_interval": 5, "values": [1735.0, 1861.0, 2111.0, 1844.0, 1762.0, 1858.0, 1554.0, 2031.0]}, "iteration_timing_avg": 0.14889185185185186}

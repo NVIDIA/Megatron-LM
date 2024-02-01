@@ -15,6 +15,7 @@ echo "---------------------------------"
 set -x 
 if [[ -z $MBS ]]; then MBS=4; fi
 if [[ -z $GBS ]]; then GBS=128; fi
+if [[ -z $VOCAB_FILE ]]; then VOCAB_FILE="/workspace/data/bert_data/vocab.txt" ; fi
 
 # Change for multinode config
 GPUS_PER_NODE=8
@@ -58,7 +59,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        --save $CHECKPOINT_PATH \
        --load $CHECKPOINT_PATH \
        --data-path $DATA_PATH \
-       --vocab-file /workspace/data/bert_data/vocab.txt \
+       --vocab-file $VOCAB_FILE \
        --split 949,50,1 \
        --distributed-backend nccl \
        --lr 0.0001 \
@@ -74,6 +75,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        ${USE_MCORE:+--use-mcore-models} \
        ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
        --no-gradient-accumulation-fusion \
+       ${DATA_CACHE:+--data-cache-path "$DATA_CACHE"} \
        --${TRAINING_DTYPE}"
 
 if [[ "${TRAINING_DTYPE}" == "fp16" ]]; then

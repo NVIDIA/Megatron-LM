@@ -1,0 +1,122 @@
+type: recipe
+format_version: 1
+maintainers: [maanug]
+loggers: [stdout]
+spec:
+  model: gpt3
+  variant: 345m
+  build: mcore-pyt 
+  scope: merge-request
+  nodes: 1
+  gpus: 8
+  platforms: [dgx_h100]
+  steps: 50
+  use_te: False
+  use_mcore: True
+  vp_size: null
+  extra_args: null
+  micro_batch_size: 4 # MBS
+  batch_size: 32 # GBS, JET schema requires 'batch_size'
+  precision: bf16
+  time_limit: 1200
+  artifacts: {/workspace/data/gpt3_data: text/the_pile/shard00}
+  script: |-
+    ls
+    cd /workspace/megatron-lm
+
+    ./tests/functional_tests/test_scripts/gpt3/pretrain_gpt3_distributed_test.sh \
+        DATA_PATH=/workspace/data/gpt3_data/my-gpt3_00_text_document \
+        CHECKPOINT_PATH=/workspace/checkpoints \
+        TENSORBOARD_DIR={assets_dir} \
+        VOCAB_FILE=/workspace/data/gpt3_data/bpe/vocab.json \
+        MERGE_FILE=/workspace/data/gpt3_data/bpe/merges.txt \
+        DATA_CACHE=/workspace/data/index-cache \
+        USE_TE={"1" if use_te else "0"} \
+        TP_SIZE={tp_size} \
+        PP_SIZE={pp_size} \
+        NUM_NODES={nodes} \
+        MAX_STEPS={steps} \
+        USE_CORE={"1" if use_mcore else "0"} \
+        VP_SIZE={vp_size if vp_size is not None else '""'} \
+        MBS={micro_batch_size} \
+        GBS={batch_size} \
+        ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'} && \
+        python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py {assets_dir} "" | \
+        tee {assets_dir}/results.json
+products:
+  # MCore
+  - {tp_size: [2], pp_size: [2]}
+  - {tp_size: [1], pp_size: [4], vp_size: [1]}
+  - {tp_size: [1], pp_size: [2], extra_args: ['"--position-embedding-type rope"']}
+  - tp_size: [1]
+    pp_size: [4]
+    extra_args: ["--swiglu", "--disable-bias-linear",  "--untie-embeddings-and-output-weights",  "--sequence-parallel"]
+  - {tp_size: [1], pp_size: [1], extra_args: ['"--recompute-granularity full --recompute-method uniform --recompute-num-layers 1"']}
+    # - {tp_size: [2], pp_size: [1], extra_args: ['"--context-parallel-size 2 --sequence-parallel --hidden-dropout 0.0 --attention-dropout 0.0"']}  # TODO: need updated container with TE > 1.0.0
+  - {tp_size: [2], pp_size: [1], extra_args: ['"--sequence-parallel --num-experts 8 --expert-model-parallel-size 2"']}
+  # Non-MCore
+  - {use_mcore: [False], use_te: [False, True], tp_size: [2], pp_size: [2]}
+  - {use_mcore: [False], tp_size: [1], pp_size: [4], vp_size: [1]}
+  - {use_mcore: [False], tp_size: [1], pp_size: [1], extra_args: ["--use-distributed-optimizer"]}
+  - {use_mcore: [False], tp_size: [4], pp_size: [1], extra_args: ["--use-distributed-optimizer --overlap-grad-reduce"]}
+  - {use_mcore: [False], tp_size: [1], pp_size: [4], vp_size: [1], extra_args: ["--use-distributed-optimizer --overlap-grad-reduce"]}
+key_segments:
+  vp_size: vp
+  use_mcore: mcore
+  use_te: te
+  extra_args: args
+
+
+---
+### Resume from ckpt ###
+type: recipe
+format_version: 1
+maintainers: [maanug]
+loggers: [stdout]
+spec:
+  model: gpt3
+  variant: 345m
+  build: mcore-pyt
+  scope: merge-request-resume
+  nodes: 1
+  gpus: 8
+  platforms: [dgx_h100]
+  steps: 100
+  use_te: False
+  use_mcore: True
+  vp_size: null
+  extra_args: null
+  micro_batch_size: 4 # MBS
+  batch_size: 32 # GBS, JET schema requires 'batch_size'
+  precision: 16
+  time_limit: 1200
+  artifacts: {/workspace/data/gpt3_data: text/the_pile/shard00}
+  script: |-
+    ls
+    cd /workspace/megatron-lm
+
+    ./tests/functional_tests/test_scripts/gpt3/pretrain_gpt3_distributed_resume_checkpoint_test.sh \
+        DATA_PATH=/workspace/data/gpt3_data/my-gpt3_00_text_document \
+        CHECKPOINT_PATH=/workspace/checkpoints \
+        TENSORBOARD_DIR={assets_dir} \
+        VOCAB_FILE=/workspace/data/gpt3_data/bpe/vocab.json \
+        MERGE_FILE=/workspace/data/gpt3_data/bpe/merges.txt \
+        DATA_CACHE=/workspace/data/index-cache \
+        USE_TE={"1" if use_te else "0"} \
+        TP_SIZE={tp_size} \
+        PP_SIZE={pp_size} \
+        NUM_NODES={nodes} \
+        USE_CORE={"1" if use_mcore else "0"} \
+        VP_SIZE={vp_size if vp_size is not None else '""'} \
+        MBS={micro_batch_size} \
+        GBS={batch_size} \
+        ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'} && \
+        python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py {assets_dir} "" | \
+        tee {assets_dir}/results.json
+products:
+  - {use_mcore: [False], tp_size: [1], pp_size: [2]}
+key_segments:
+  vp_size: vp
+  use_mcore: mcore
+  use_te: te
+  extra_args: args

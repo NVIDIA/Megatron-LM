@@ -13,6 +13,8 @@ do
 done
 echo "---------------------------------"
 
+if [[ -z $VOCAB_FILE ]]; then VOCAB_FILE="/workspace/data/bert_data/vocab.txt" ; fi
+
 GPUS_PER_NODE=8
 # Change for multinode config
 MASTER_ADDR=localhost
@@ -48,7 +50,7 @@ torchrun $DISTRIBUTED_ARGS \
        --save $CHECKPOINT_PATH \
        --load $CHECKPOINT_PATH \
        --data-path $DATA_PATH \
-       --vocab-file /workspace/data/bert_data/vocab.txt \
+       --vocab-file $VOCAB_FILE \
        --split 949,50,1 \
        --distributed-backend nccl \
        --lr 0.0001 \
@@ -61,6 +63,7 @@ torchrun $DISTRIBUTED_ARGS \
        --tensor-model-parallel-size $TP_SIZE \
        --pipeline-model-parallel-size $PP_SIZE \
        --no-gradient-accumulation-fusion \
+       ${DATA_CACHE:+--data-cache-path "$DATA_CACHE"} \
        --fp16
 
 echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt
@@ -88,7 +91,7 @@ torchrun $DISTRIBUTED_ARGS \
        --save $CHECKPOINT_PATH \
        --load $CHECKPOINT_PATH \
        --data-path $DATA_PATH \
-       --vocab-file /workspace/data/bert_data/vocab.txt \
+       --vocab-file $VOCAB_FILE \
        --split 949,50,1 \
        --distributed-backend nccl \
        --lr 0.0001 \
@@ -101,4 +104,5 @@ torchrun $DISTRIBUTED_ARGS \
        --tensor-model-parallel-size $TP_SIZE \
        --pipeline-model-parallel-size $PP_SIZE \
        --no-gradient-accumulation-fusion \
+       ${DATA_CACHE:+--data-cache-path "$DATA_CACHE"} \
        --fp16
