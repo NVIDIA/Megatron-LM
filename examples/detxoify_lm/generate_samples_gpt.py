@@ -24,7 +24,7 @@ from typing import Union
 import megatron.model
 from megatron.core.transformer.spec_utils import import_module
 from megatron.arguments import core_transformer_config_from_args
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec, get_gpt_layer_local_spec
 
 def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.model.GPTModel]:
     """Builds the model.
@@ -45,10 +45,27 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
     config = core_transformer_config_from_args(args)
 
     if args.use_mcore_models:
-        if args.spec is not None:
-            transformer_layer_spec = import_module(args.spec)
+
+        if args.spec is None:
+            if args.transformer_impl == 'local':
+                transformer_layer_spec = get_gpt_layer_local_spec(
+                    num_experts=args.num_experts,
+                    moe_grouped_gemm=args.moe_grouped_gemm
+                )
+            elif args.transformer_impl == 'transformer_engine':
+                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                    num_experts=args.num_experts,
+                    moe_grouped_gemm=args.moe_grouped_gemm
+                )
+            else:
+                raise ValueError(f"Invalid transformer_impl {args.transformer_impl}")
+        elif args.spec[0] == 'local':
+            transformer_layer_spec = get_gpt_layer_local_spec(
+                num_experts=args.num_experts,
+                moe_grouped_gemm=args.moe_grouped_gemm
+            )
         else:
-            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm)
+            transformer_layer_spec = import_module(args.spec)
 
         model = GPTModel(
             config=config,
