@@ -15,7 +15,7 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
-def initialize_switch_mlp(seed, glu=True, **config_kwargs):
+def initialize_sequential_mlp(seed, glu=True, **config_kwargs):
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
 
@@ -39,7 +39,7 @@ def get_pp_offsets():
     return ((0, pp_rank, pp_size),)
 
 
-class TestSwitchMLPReconfiguration:
+class TestSequentialMLPReconfiguration:
     @pytest.mark.parametrize("src_tp_pp_exp,dest_tp_pp_exp,use_glu", [
         # changing PP is impossible because the number of layers must be the same
         ((2, 4, 1), (2, 4, 1), False),
@@ -59,18 +59,18 @@ class TestSwitchMLPReconfiguration:
         """ Test model saving and loading with different TP/PP/expert parallelism """
         src_tp, src_pp, src_exp = src_tp_pp_exp
         dest_tp, dest_pp, dest_exp = dest_tp_pp_exp
-        with TempNamedDir(tmp_path_dist_ckpt / 'test_switch_mlp_reconfiguration_model_A') as ckpt_dir_A, \
-             TempNamedDir(tmp_path_dist_ckpt / 'test_switch_mlp_reconfiguration_model_B') as ckpt_dir_B:
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_sequential_mlp_reconfiguration_model_A') as ckpt_dir_A, \
+             TempNamedDir(tmp_path_dist_ckpt / 'test_sequential_mlp_reconfiguration_model_B') as ckpt_dir_B:
             # Save checkpoint A
             Utils.initialize_model_parallel(src_tp, src_pp, expert_model_parallel_size=src_exp)
-            model_A = initialize_switch_mlp(1, use_glu)
+            model_A = initialize_sequential_mlp(1, use_glu)
             sharded_state_dict = model_A.sharded_state_dict(sharded_offsets=get_pp_offsets())
             save(sharded_state_dict, ckpt_dir_A)
             Utils.destroy_model_parallel()
 
             # Load checkpoint A with different TP/PP/expert and save as checkpoint B
             Utils.initialize_model_parallel(dest_tp, dest_pp, expert_model_parallel_size=dest_exp)
-            model_B = initialize_switch_mlp(2, use_glu)
+            model_B = initialize_sequential_mlp(2, use_glu)
             state_dict = load(model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_A)
             model_B.load_state_dict(state_dict)
             save(model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_B)

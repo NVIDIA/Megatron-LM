@@ -97,7 +97,7 @@ class TransformerLayer(MegatronModule):
 
         ## [Module 8: MLP block]
         # TODO how to set the gpt_layer_spec.py when we have moe_frequency > 1,
-        #      where MLP and SwitchMLP both appear alternately?
+        #      where MLP and MoE layer both appear alternately?
         self.mlp = build_module(submodules.mlp, config=self.config)
 
         ## [Module 9: BiasDropoutFusion]
