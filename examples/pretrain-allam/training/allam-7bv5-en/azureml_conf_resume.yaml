@@ -27,7 +27,7 @@ inputs:
   pretrained_model_path:
     type: uri_file
     mode: ro_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/megatronlm_models/allam-7b-alpha/megatron/combined_iter_0105000_iter_0200000_iter_0460000_iter_0615000_tp1_pp1/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/allam_checkpoints_allamllmuksstandard/paths/allam-7bv5-en/
   tokenizer_model_path:
     type: uri_file
     mode: ro_mount
