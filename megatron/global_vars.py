@@ -7,9 +7,9 @@ import sys
 import torch
 
 from megatron import dist_signal_handler
+from megatron.core import Timers
 from megatron.tokenizer import build_tokenizer
 from .microbatches import build_num_microbatches_calculator
-from .timers import Timers
 
 _GLOBAL_ARGS = None
 _GLOBAL_RETRO_ARGS = None
