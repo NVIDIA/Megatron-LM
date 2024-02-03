@@ -7,7 +7,7 @@ command: >-
    ${{inputs.pretrained_model_path}} \
    ${{inputs.tokenizer_model_path}} \
    ${{inputs.bin_idx_data_dir}} \
-   ${{inputs.data_cache}} \
+   ${{outputs.data_cache}} \
    ${{outputs.checkpoint_dir}} \
    ${{outputs.checkpoint_dir}} 
 
@@ -36,11 +36,11 @@ inputs:
     type: uri_folder
     mode: ro_mount
     path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llm_data/paths/data_repo/tokenize_by_v5_improved/meglm_tok_v5_improved_bin_idx/
+outputs:
   data_cache:
     type: uri_folder
-    mode: ro_mount
+    mode: rw_mount
     path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/allam_index_mapped_data_allamllmuksstandard/paths/allam-7bv5-en/
-outputs:
   checkpoint_dir:
     type: uri_folder
     mode: rw_mount
