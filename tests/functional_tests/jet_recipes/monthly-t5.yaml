@@ -15,6 +15,7 @@ spec:
   use_mcore: True
   vp_size: 1
   extra_args: null
+  args_meta: null
   micro_batch_size: 4 # MBS
   batch_size: 32 # GBS, JET schema requires 'batch_size'
   precision: bf16
@@ -42,16 +43,14 @@ spec:
         python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py {assets_dir} "" | \
         tee {assets_dir}/results.json
 products:
-  - { tp_size: [1,2], pp_size: [1] }
-  - use_te: [True]
-    tp_size: [2]
-    pp_size: [1]
-    extra_args: [null, "--sequence-parallel"]
+  - { tp_size: [1,2], pp_size: [1], vp_size: [1] }
+  - {use_te: [True], tp_size: [2], pp_size: [1], vp_size: [1]}
+  - {use_te: [True], tp_size: [2], pp_size: [1], vp_size: [1], extra_args: ["--sequence-parallel"], args_meta: ["sequence_parallel"]}
 key_segments:
-  # vp_size: vp
+  vp_size: vp
   use_mcore: mcore
   use_te: te
-  extra_args: args
+  args_meta: args
 
 
 ---
@@ -73,6 +72,7 @@ spec:
   use_mcore: True
   vp_size: 1
   extra_args: null
+  args_meta: null
   micro_batch_size: 4 # MBS
   batch_size: 32 # GBS, JET schema requires 'batch_size'
   precision: bf16
@@ -100,9 +100,9 @@ spec:
         python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py {assets_dir} "" | \
         tee {assets_dir}/results.json
 products:
-  - {use_te: [False, True], tp_size: [1], pp_size: [1]}
+  - {use_te: [False, True], tp_size: [1], pp_size: [1], vp_size: [1]}
 key_segments:
-  # vp_size: vp
+  vp_size: vp
   use_mcore: mcore
   use_te: te
-  extra_args: args
+  args_meta: args

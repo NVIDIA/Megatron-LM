@@ -15,6 +15,7 @@ spec:
   use_mcore: True
   vp_size: null
   extra_args: null
+  args_meta: null
   micro_batch_size: 4 # MBS
   batch_size: 128 # GBS, JET schema requires 'batch_size'
   precision: bf16
@@ -44,6 +45,7 @@ spec:
 products:
   # MCore
   - {tp_size: [2], pp_size: [2]}
+  - {tp_size: [2], pp_size: [2], extra_args: ['"--spec local"'], args_meta: ["local_spec"]}
   # Non-MCore
   - {use_mcore: [False], tp_size: [2], pp_size: [2]}
   - {use_mcore: [False], tp_size: [1], pp_size: [4], vp_size: [2]}
@@ -51,7 +53,7 @@ key_segments:
   vp_size: vp
   use_mcore: mcore
   use_te: te
-  extra_args: args
+  args_meta: args
 
 
 ---
@@ -73,6 +75,7 @@ spec:
   use_mcore: True
   vp_size: null
   extra_args: null
+  args_meta: null
   micro_batch_size: 4 # MBS
   batch_size: 128 # GBS, JET schema requires 'batch_size'
   precision: bf16
@@ -105,4 +108,4 @@ key_segments:
   vp_size: vp
   use_mcore: mcore
   use_te: te
-  extra_args: args
+  args_meta: args
