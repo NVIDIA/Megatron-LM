@@ -15,6 +15,7 @@ spec:
   use_mcore: True
   vp_size: null
   extra_args: null
+  args_meta: null
   micro_batch_size: 4 # MBS
   batch_size: 32 # GBS, JET schema requires 'batch_size'
   precision: bf16
@@ -47,4 +48,4 @@ key_segments:
   vp_size: vp
   use_mcore: mcore
   use_te: te
-  extra_args: args
+  args_meta: args

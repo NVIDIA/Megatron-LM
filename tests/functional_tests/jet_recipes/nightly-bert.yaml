@@ -15,6 +15,7 @@ spec:
   use_mcore: True
   vp_size: null
   extra_args: null
+  args_meta: null
   micro_batch_size: 4 # MBS
   batch_size: 128 # GBS, JET schema requires 'batch_size'
   precision: bf16
@@ -42,10 +43,11 @@ spec:
         python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py {assets_dir} "" | \
         tee {assets_dir}/results.json
 products:
+  - {tp_size: [1], pp_size: [4], vp_size: [2]}
   - {use_mcore: [True, False], tp_size: [4], pp_size: [1]}
-  - {use_mcore: [True, False], tp_size: [1], pp_size: [2,4]}
+  - {use_mcore: [True, False], tp_size: [1], pp_size: [2]}
 key_segments:
-  # vp_size: vp
+  vp_size: vp
   use_mcore: mcore
   use_te: te
-  extra_args: args
+  args_meta: args

@@ -15,8 +15,10 @@ spec:
   use_mcore: True
   vp_size: null
   extra_args: null
+  args_meta: null
   micro_batch_size: 4 # MBS
   batch_size: 32 # GBS, JET schema requires 'batch_size'
+  moe_grouped_gemm: 0
   precision: bf16
   time_limit: 1200
   artifacts: {/workspace/data/gpt3_data: text/the_pile/shard00}
@@ -40,6 +42,7 @@ spec:
         VP_SIZE={vp_size if vp_size is not None else '""'} \
         MBS={micro_batch_size} \
         GBS={batch_size} \
+        MOE_GROUPED_GEMM={moe_grouped_gemm} \
         ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'} && \
         python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py {assets_dir} "" | \
         tee {assets_dir}/results.json
@@ -47,24 +50,29 @@ products:
   # MCore
   - {tp_size: [2], pp_size: [2]}
   - {tp_size: [1], pp_size: [4], vp_size: [1]}
-  - {tp_size: [1], pp_size: [2], extra_args: ['"--position-embedding-type rope"']}
-  - tp_size: [1]
-    pp_size: [4]
-    extra_args: ["--swiglu", "--disable-bias-linear",  "--untie-embeddings-and-output-weights",  "--sequence-parallel"]
-  - {tp_size: [1], pp_size: [1], extra_args: ['"--recompute-granularity full --recompute-method uniform --recompute-num-layers 1"']}
-    # - {tp_size: [2], pp_size: [1], extra_args: ['"--context-parallel-size 2 --sequence-parallel --hidden-dropout 0.0 --attention-dropout 0.0"']}  # TODO: need updated container with TE > 1.0.0
-  - {tp_size: [2], pp_size: [1], extra_args: ['"--sequence-parallel --num-experts 8 --expert-model-parallel-size 2"']}
+  - {tp_size: [1], pp_size: [2], extra_args: ['"--position-embedding-type rope"'], args_meta: ["rope_embeddings"]}
+  - {tp_size: [1], pp_size: [4], extra_args: ["--swiglu"], args_meta: ["swiglu"]}
+  - {tp_size: [1], pp_size: [4], extra_args: ["--disable-bias-linear"], args_meta: ["disable_bias_linear"]}
+  - {tp_size: [1], pp_size: [4], extra_args: ["--untie-embeddings-and-output-weights"], args_meta: ["untie_embeddings_and_outputs"]}
+  - {tp_size: [1], pp_size: [4], extra_args: ["--sequence-parallel"], args_meta: ["sequence_parallel"]}
+  - {tp_size: [1], pp_size: [1], extra_args: ['"--recompute-granularity full --recompute-method uniform --recompute-num-layers 1"'], args_meta: ["uniform_full_recompute"]}
+    # - {tp_size: [2], pp_size: [1,2], extra_args: ['"--context-parallel-size 2 --sequence-parallel --hidden-dropout 0.0 --attention-dropout 0.0"']}  # TODO: need updated container with TE > 1.0.0
+  - {tp_size: [2], pp_size: [1], extra_args: ['"--sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"'], args_meta: ["te_8experts2parallel"]}
+  - {tp_size: [2], pp_size: [1], extra_args: ['"--moe-grouped-gemm --disable-bias-linear --sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"'], moe_grouped_gemm: [1], args_meta: ["te_8experts2parallel_groupedGEMM"]}
+  - {tp_size: [2], pp_size: [1], extra_args: ['"--disable-bias-linear --sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --moe-router-load-balancing-type aux_loss --moe-router-topk 2 --moe-aux-loss-coeff 1e-2"'], moe_grouped_gemm: [1], args_meta: ["te_8experts2parallel_top2router"]}
   # Non-MCore
   - {use_mcore: [False], use_te: [False, True], tp_size: [2], pp_size: [2]}
   - {use_mcore: [False], tp_size: [1], pp_size: [4], vp_size: [1]}
-  - {use_mcore: [False], tp_size: [1], pp_size: [1], extra_args: ["--use-distributed-optimizer"]}
-  - {use_mcore: [False], tp_size: [4], pp_size: [1], extra_args: ["--use-distributed-optimizer --overlap-grad-reduce"]}
-  - {use_mcore: [False], tp_size: [1], pp_size: [4], vp_size: [1], extra_args: ["--use-distributed-optimizer --overlap-grad-reduce"]}
+  - {use_mcore: [False], tp_size: [1], pp_size: [1], extra_args: ["--use-distributed-optimizer"], args_meta: ["dist_optimizer"]}
+  - {use_mcore: [False], tp_size: [4], pp_size: [1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce"'], args_meta: ["dist_optimizer_overlap_grad_reduce"]}
+  - {use_mcore: [False], tp_size: [4], pp_size: [1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather"'], args_meta: ["dist_optimizer_overlap_grad_reduce_param_gather"]}
+  - {use_mcore: [False], tp_size: [1], pp_size: [4], vp_size: [1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce"'], args_meta: ["dist_optimizer_overlap_grad_reduce"]}
+  - {use_mcore: [False], tp_size: [1], pp_size: [4], vp_size: [1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather"'], args_meta: ["dist_optimizer_overlap_grad_reduce_param_gather"]}
 key_segments:
   vp_size: vp
   use_mcore: mcore
   use_te: te
-  extra_args: args
+  args_meta: args
 
 
 ---
@@ -86,6 +94,7 @@ spec:
   use_mcore: True
   vp_size: null
   extra_args: null
+  args_meta: null
   micro_batch_size: 4 # MBS
   batch_size: 32 # GBS, JET schema requires 'batch_size'
   precision: 16
@@ -119,4 +128,4 @@ key_segments:
   vp_size: vp
   use_mcore: mcore
   use_te: te
-  extra_args: args
+  args_meta: args

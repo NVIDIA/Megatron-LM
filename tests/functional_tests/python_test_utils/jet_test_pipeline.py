@@ -5,10 +5,13 @@ from jet.utils.instance import JETInstance
 from jet.logs.queries import JETLogsQuery, Field
 
 
-def select_asset(assets, prefix):
-    for asset in assets:
-        if asset['s_name'].startswith(prefix):
-            return asset['s_url']
+def select_asset(result_obj, prefix):
+    if result_obj['obj_ci']['s_job_status'] != "skipped":
+        assets = result_obj['nested_assets']
+        for asset in assets:
+            if asset['s_name'].startswith(prefix):
+                return asset['s_url']
+    return 'not found'
 
 
 def query_results(triggering_pipeline_id):
@@ -17,7 +20,7 @@ def query_results(triggering_pipeline_id):
         JETLogsQuery()
         .filter(Field('obj_ci.obj_upstream.l_pipeline_id') == triggering_pipeline_id)
         .filter(Field('obj_workload.s_type') == 'recipe')
-        .select('l_exit_code', 'nested_assets', 'obj_workload.s_key', 'obj_workload.obj_spec', 'ts_created')
+        .select('l_exit_code', 'nested_assets', 'obj_workload.s_key', 'obj_workload.obj_spec', 'obj_ci', 'ts_created')
         .orderby('ts_created')  # increasing (least recent in case of timestamp)
     )
     return service.query(query, flatten=False)
@@ -26,25 +29,29 @@ def query_results(triggering_pipeline_id):
 def check_exitcodes(results):
     from prettytable import PrettyTable
 
+    all_keys = []
     exit_codes = {}
     log_urls = {}
     names = {}
     for result in results:
         key = result['obj_workload']['s_key']
+        all_keys.append(key)
 
-        exit_codes[key] = result['l_exit_code']
-        log_urls[key] = select_asset(result['nested_assets'], 'output_script-0.log')
+        exit_codes[key] = result.get('l_exit_code', -1)
+        log_urls[key] = select_asset(result, 'output_script-0.log')
         name = result['obj_workload']['s_key'].lstrip('recipe/')
         remove_substr = result['obj_workload']['obj_spec']['s_build'] + \
             '_' + result['obj_workload']['obj_spec']['s_scope']
         names[key] = ''.join(name.split(remove_substr))
 
     table = PrettyTable()
-    table.add_column("Job Key", list(names.values()))
-    table.add_column("Exit Code", list(exit_codes.values()))
-    table.add_column("Log URL", list(log_urls.values()))
+    table.add_column("Job Key", [names[k] for k in all_keys])
+    table.add_column("Exit Code", [exit_codes[k] for k in all_keys])
+    table.add_column("Log URL", [log_urls[k] for k in all_keys])
     exit_codes_good = [ec == 0 for ec in exit_codes.values()]
-    if not all(exit_codes_good):
+    if exit_codes_good == []:
+        raise Exception("Can't find any jobs, something went wrong.\n" + table.get_string())
+    if exit_codes_good == [] or not all(exit_codes_good):
         raise Exception("Some jobs failed to complete successfully\n" + table.get_string())
     else:
         print(table)
@@ -72,7 +79,7 @@ def check_baselines(results):
     with TemporaryDirectory() as tmpdir:
         # Download TB event logs
         for result in results:
-            event_log_url = select_asset(result['nested_assets'], 'events.out.tfevents')
+            event_log_url = select_asset(result, 'events.out.tfevents')
             target_dir = result['obj_workload']['s_key'].lstrip('recipe/')
             target_dir = os.path.join(tmpdir, target_dir)
             _download_log(event_log_url, target_dir)
@@ -86,7 +93,7 @@ def check_baselines(results):
 
 def fetch_metrics_files(results, save_dir):
     for result in results:
-        metrics_url = select_asset(result['nested_assets'], 'results.json')
+        metrics_url = select_asset(result, 'results.json')
         if metrics_url is not None:
             cfg = result['obj_workload']['s_key'].lstrip('recipe/')
             target_dir = os.path.join(save_dir, cfg)

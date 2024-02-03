@@ -62,7 +62,7 @@ jet-trigger:
 
 
 jet-functional-results:
-  extends: .jet_common
+  stage: jet
   tags:
     - docker_local_runner
   image: gitlab-master.nvidia.com:5005/dl/jet/api:latest
@@ -72,6 +72,12 @@ jet-functional-results:
   script: 
     - python -m pip install -U --no-cache-dir prettytable
     - python tests/functional_tests/python_test_utils/jet_test_pipeline.py ${CI_PIPELINE_ID} --test exit
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && ( $CI_MERGE_REQUEST_APPROVED || $CI_MERGE_REQUEST_LABELS =~ "READY FOR REVIEW" )
+      when: always
+    - if: $JET_CUSTOM_FILTER != "" && $CI_PIPELINE_SOURCE != 'merge_request_event' && $CI_PIPELINE_SOURCE != 'schedule'
+      when: always
+    - when: never
 
 jet-compare-metrics:
   extends: .jet_common
