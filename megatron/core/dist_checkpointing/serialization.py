@@ -1,5 +1,12 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
+""" Entrypoints for saving and loading the distributed checkpoints.
+
+Functions `load` and `save` are equivalents of `torch.load` and `torch.save`
+but expect torch.Tensors to be wrapped with classes from the `mapping module`.
+Additionally, `load` expects the sharded state dict argument as a guidance for loading the sharded tensors.
+"""
+
 import logging
 import os
 from collections import Counter, defaultdict
@@ -131,7 +138,15 @@ def _verify_checkpoint_and_load_strategy(
 
 
 # TODO: implement it as common torch strategy
-def load_common_state_dict(checkpoint_dir: Path):
+def load_common_state_dict(checkpoint_dir: Path) -> StateDict:
+    """ Load common (non-sharded) objects state dict from the checkpoint.
+
+    Args:
+        checkpoint_dir (Path): checkpoint directory
+
+    Returns:
+        StateDict: state dict with non-sharded objects from the checkpoint
+    """
     load_path = Path(checkpoint_dir) / COMMON_STATE_FNAME
     try:
         return torch.load(load_path, map_location='cpu')
@@ -143,6 +158,15 @@ def load_common_state_dict(checkpoint_dir: Path):
 
 
 def load_sharded_objects(sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    """ Replaces all ShardedObject from a given state dict with values loaded from the checkpoint.
+
+    Args:
+        sharded_state_dict (ShardedStateDict): sharded state dict defining what objects should be loaded.
+        checkpoint_dir (Path): checkpoint directory
+
+    Returns:
+        None: state dict is modified in place
+    """
     sharded_objects, sharded_state_dict = extract_matching_values(
         sharded_state_dict, lambda v: isinstance(v, ShardedObject)
     )
@@ -292,6 +316,22 @@ def _extract_and_save_sharded_objects(
 
 
 def validate_sharding_integrity(sharded_tensors: Iterable[ShardedTensor]):
+    """ Validate if the ShardedTensors from multiple processes define correct sharding of a global tensor.
+
+    Local ShardedTensors metadata is exchanged with `torch.distributed.all_gather_object`
+    and then process with global rank 0 checks if main replicas of the shards:
+    - cover the whole global tensors
+    - don't overlap
+
+    Args:
+        sharded_tensors (Iterable[ShardedTensor]): sharded tensors local to this process
+
+    Returns:
+        None
+
+    Raises:
+        CheckpointingException for invalid access pattern
+    """
     sharding = [ten.without_data() for ten in sharded_tensors]
     all_sharding = [None] * torch.distributed.get_world_size()
     torch.distributed.all_gather_object(all_sharding, sharding)

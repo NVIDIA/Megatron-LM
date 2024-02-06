@@ -1,6 +1,11 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
-""" Core library classes. """
+""" Core library classes for representing sharding of tensors and objects.
+
+The main expected usage is wrapping torch.Tensors in state dicts with
+ShardedTensor class (mostly with the ShardedTensor.from_rank_offsets classmethod).
+"""
+
 import logging
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -172,7 +177,21 @@ class ShardedTensor:
         return f'{self.__class__.__name__}(key=\'{self.key}\')'
 
 
-def is_main_replica(replica_id):
+def is_main_replica(replica_id: ReplicaId):
+    """ Checks if given `replica_id` is considered as main.
+
+    "Main" replica is:
+    - integer 0
+    - or an iterable with all 0 elements
+
+    It is the application responsibility to set correct replicas for sharded tensors.
+
+    Args:
+        replica_id (Union[int, Tuple[int, ...]]): replica id
+
+    Returns:
+        (bool): True for a "main" replica
+    """
     if isinstance(replica_id, int):
         return replica_id == 0
     return all(r == 0 for r in replica_id)
@@ -259,6 +278,15 @@ class ShardedTensorFactory:
 
 
 def apply_factories(sharded_state_dict: ShardedStateDict):
+    """ Turn ShardedTensorFactories into ShardedTensors *in-place*.
+
+    Args:
+        sharded_state_dict (ShardedStateDict): state dict possibly containing ShardedTensorFactory objects
+
+    Returns:
+        None: state dict is modified in place
+    """
+
     def apply(x):
         if isinstance(x, ShardedTensorFactory):
             x = x.build()
@@ -267,7 +295,20 @@ def apply_factories(sharded_state_dict: ShardedStateDict):
     dict_list_map_inplace(apply, sharded_state_dict)
 
 
-def apply_factory_merges(x1: StateDict, x2: ShardedStateDict, key: Tuple[str, ...] = ()):
+def apply_factory_merges(
+    x1: StateDict, x2: ShardedStateDict, key: Tuple[str, ...] = ()
+) -> StateDict:
+    """ Apply merges defined by ShardedTensorFactories *in-place*.
+
+    Args:
+        x1 (StateDict): state dict loaded from the checkpoint
+        x2 (ShardedStateDict): subset of `x1` (in terms of dict keys) with ShardedTensorFactory
+            as (possibly nested) values that define how to merge objects from the `x1` state dict
+        key (Tuple[str, ...]): current key in a recursive call. Used only for reporting meaningful errors
+
+    Returns:
+        StateDict: `x1` modified in-place
+    """
     if isinstance(x2, ShardedTensorFactory):
         return x2.merge_fn(x1)
 
