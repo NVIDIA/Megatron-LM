@@ -376,9 +376,9 @@ class TransformerLanguageModel(MegatronModule):
             # Wang and Komatsuzaki et al
             # https://github.com/kingoflolz/mesh-transformer-jax/
             self.rotary_pos_emb = RotaryEmbedding(
-                rotary_dim,
-                args.rotary_percent,
-                seq_len_interpolation_factor=args.rotary_seq_len_interpolation_factor
+                kv_channels=rotary_dim,
+                rotary_percent=args.rotary_percent,
+                seq_len_interpolation_factor=args.rotary_seq_len_interpolation_factor,
             )
 
         # Encoder (usually set to True, False if part of an encoder-decoder

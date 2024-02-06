@@ -388,6 +388,10 @@ def validate_args(args, defaults={}):
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
         args.position_embedding_type = 'rope'
+    if args.rotary_interleaved and args.apply_rope_fusion:
+        raise RuntimeError('--rotary-interleaved does not work with rope_fusion.')
+    if args.rotary_interleaved and not args.use_mcore_models:
+        raise RuntimeError('--rotary-interleaved only support Megatron Core, please add --use-mcore-models.')
 
     # Would just need to add 'NoPE' as a position_embedding_type to support this, but for now
     # don't allow it to keep things simple
@@ -448,8 +452,9 @@ def core_transformer_config_from_args(args):
     kw_args['layernorm_epsilon'] = args.norm_epsilon
     kw_args['deallocate_pipeline_outputs'] = True
     kw_args['pipeline_dtype'] = args.params_dtype
-    kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
+    kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm 
     kw_args['num_moe_experts'] = args.num_experts
+    kw_args['rotary_interleaved'] = args.rotary_interleaved
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
@@ -619,6 +624,8 @@ def _add_network_size_args(parser):
                        'Deprecated: use --position-embedding-type')
     group.add_argument('--rotary-percent', type=float, default=1.0,
                        help='Percent of rotary dimension to use, default 100%%')
+    group.add_argument('--rotary-interleaved', action='store_true',
+                          help='Use interleaved rotary embedding.')
     group.add_argument('--rotary-seq-len-interpolation-factor', type=int, default=None,
                        help='Sequence length interpolation factor for rotary embeddings.')
     group.add_argument('--no-position-embedding',

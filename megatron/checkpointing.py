@@ -506,6 +506,7 @@ def load_args_from_checkpoint(args, load_arg='load'):
     _set_arg('add_position_embedding', force=True)
     _set_arg('use_rotary_position_embeddings', force=True)
     _set_arg('rotary_percent', force=True)
+    _set_arg('rotary_interleaved', force=True)
     _set_arg('add_bias_linear', force=True)
     _set_arg('add_qkv_bias', force=True)
     _set_arg('swiglu', force=True)
