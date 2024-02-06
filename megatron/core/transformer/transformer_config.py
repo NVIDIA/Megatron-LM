@@ -29,6 +29,7 @@ class TransformerConfig(ModelParallelConfig):
             layernorm_epsilon (float): Layernorm epsilon. Defaults to 1e-5.
             layernorm_zero_centered_gamma (bool): if set to 'True', the LayerNorm is adjusted to center the gamma values around 0. This improves numerical stability. Defaults to False.
             add_bias_linear (bool): Include a bias term in all linear layers (QKV projections, after core attention, and two in MLP layer). Default is True.
+            add_qkv_bias (bool): Add a bias term only for QKV projections. Default is False.
             gated_linear_unit (bool): Use a gated linear unit for the first linear layer in the MLP. Defaults to False.
             activation_func (Callable): Activation function to use for the non-linearity in the MLP. Defaults to F.gelu.
             num_moe_experts (int): Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Defaults to None (no MoE).
@@ -81,6 +82,7 @@ class TransformerConfig(ModelParallelConfig):
     layernorm_epsilon: float = 1e-5
     layernorm_zero_centered_gamma: bool = False
     add_bias_linear: bool = True
+    add_qkv_bias: bool = False
     gated_linear_unit: bool = False
     activation_func: Callable = F.gelu
     num_moe_experts: int = None
