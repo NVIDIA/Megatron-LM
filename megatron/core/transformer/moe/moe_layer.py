@@ -24,6 +24,7 @@ class BaseMoELayer(MegatronModule, ABC):
         super(BaseMoELayer, self).__init__(config)
         self.config = config
         self.expert_parallel_size = parallel_state.get_expert_model_parallel_world_size()
+        assert self.expert_parallel_size > 0, "Expected non-negative expert parallel size"
         assert self.config.num_moe_experts % self.expert_parallel_size == 0
         self.num_local_experts = self.config.num_moe_experts // self.expert_parallel_size
         local_expert_indices_offset = (
@@ -32,6 +33,7 @@ class BaseMoELayer(MegatronModule, ABC):
         self.local_expert_indices = [
             local_expert_indices_offset + i for i in range(self.num_local_experts)
         ]
+        assert all(map(lambda x: x < self.config.num_moe_experts, self.local_expert_indices))
         self.router = None
         self.experts = None
         self.token_dispatcher = None
