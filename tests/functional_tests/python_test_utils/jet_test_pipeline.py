@@ -7,10 +7,11 @@ from jet.logs.queries import JETLogsQuery, Field
 
 def select_asset(result_obj, prefix):
     if result_obj['obj_ci']['s_job_status'] != "skipped":
-        assets = result_obj['nested_assets']
-        for asset in assets:
-            if asset['s_name'].startswith(prefix):
-                return asset['s_url']
+        assets = result_obj.get('nested_assets', None)
+        if assets is not None:
+            for asset in assets:
+                if asset['s_name'].startswith(prefix):
+                    return asset['s_url']
     return 'not found'
 
 
@@ -25,30 +26,37 @@ def query_results(triggering_pipeline_id):
     )
     return service.query(query, flatten=False)
 
+def dedupe_results(results):
+    deduped = {}
+    for result in results:
+        key = result['obj_workload']['s_key']
+        if key not in deduped:
+            deduped[key] = result
+        else:
+            if result['ts_created'] > deduped[key]['ts_created']:
+                deduped[key] = result
+
+    return deduped.values()
 
 def check_exitcodes(results):
     from prettytable import PrettyTable
 
-    all_keys = []
-    exit_codes = {}
-    log_urls = {}
-    names = {}
+    exit_codes = []
+    log_urls = []
+    names = []
     for result in results:
-        key = result['obj_workload']['s_key']
-        all_keys.append(key)
-
-        exit_codes[key] = result.get('l_exit_code', -1)
-        log_urls[key] = select_asset(result, 'output_script-0.log')
+        exit_codes.append(result.get('l_exit_code', -1))
+        log_urls.append(select_asset(result, 'output_script-0.log'))
         name = result['obj_workload']['s_key'].lstrip('recipe/')
         remove_substr = result['obj_workload']['obj_spec']['s_build'] + \
             '_' + result['obj_workload']['obj_spec']['s_scope']
-        names[key] = ''.join(name.split(remove_substr))
+        names.append(''.join(name.split(remove_substr)))
 
     table = PrettyTable()
-    table.add_column("Job Key", [names[k] for k in all_keys])
-    table.add_column("Exit Code", [exit_codes[k] for k in all_keys])
-    table.add_column("Log URL", [log_urls[k] for k in all_keys])
-    exit_codes_good = [ec == 0 for ec in exit_codes.values()]
+    table.add_column("Job Key", names)
+    table.add_column("Exit Code", exit_codes)
+    table.add_column("Log URL", log_urls)
+    exit_codes_good = [ec == 0 for ec in exit_codes]
     if exit_codes_good == []:
         raise Exception("Can't find any jobs, something went wrong.\n" + table.get_string())
     if exit_codes_good == [] or not all(exit_codes_good):
@@ -114,6 +122,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     results = query_results(args.pipeline_id)
+    results = dedupe_results(results)
 
     if args.download_metrics_dir:
         fetch_metrics_files(results, args.download_metrics_dir)

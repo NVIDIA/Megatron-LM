@@ -1,8 +1,9 @@
 .jet_common:
   stage: jet
   rules:
-    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && ( $CI_MERGE_REQUEST_APPROVED || $CI_MERGE_REQUEST_LABELS =~ "READY FOR REVIEW" )
-    - if: $JET_CUSTOM_FILTER != "" && $CI_PIPELINE_SOURCE != 'merge_request_event' && $CI_PIPELINE_SOURCE != 'schedule'
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_APPROVED 
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /READY FOR REVIEW/'
+    - if: $JET_CUSTOM_FILTER != "" && $CI_PIPELINE_SOURCE != 'merge_request_event'
     - when: never
 
 include:
@@ -19,7 +20,7 @@ jet-setup:
     - |
       if [[ $CI_PIPELINE_SOURCE == "merge_request_event" ]] && [[ $CI_MERGE_REQUEST_APPROVED || $CI_MERGE_REQUEST_LABELS =~ "READY FOR REVIEW" ]]; then
           JET_FILTER="type == 'build' or 'merge-request' in spec.scope"
-      elif [[ -n $JET_CUSTOM_FILTER && $CI_PIPELINE_SOURCE != 'merge_request_event' && $CI_PIPELINE_SOURCE != 'schedule' ]]; then
+      elif [[ -n $JET_CUSTOM_FILTER && $CI_PIPELINE_SOURCE != 'merge_request_event' ]]; then
         JET_FILTER=$JET_CUSTOM_FILTER
       else
         JET_FILTER="False"
@@ -73,9 +74,11 @@ jet-functional-results:
     - python -m pip install -U --no-cache-dir prettytable
     - python tests/functional_tests/python_test_utils/jet_test_pipeline.py ${CI_PIPELINE_ID} --test exit
   rules:
-    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && ( $CI_MERGE_REQUEST_APPROVED || $CI_MERGE_REQUEST_LABELS =~ "READY FOR REVIEW" )
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_APPROVED 
       when: always
-    - if: $JET_CUSTOM_FILTER != "" && $CI_PIPELINE_SOURCE != 'merge_request_event' && $CI_PIPELINE_SOURCE != 'schedule'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /READY FOR REVIEW/'
+      when: always
+    - if: $JET_CUSTOM_FILTER != "" && $CI_PIPELINE_SOURCE != 'merge_request_event'
       when: always
     - when: never
 
