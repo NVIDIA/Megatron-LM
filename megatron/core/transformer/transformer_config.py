@@ -33,6 +33,7 @@ class TransformerConfig(ModelParallelConfig):
             gated_linear_unit (bool): Use a gated linear unit for the first linear layer in the MLP. Defaults to False.
             activation_func (Callable): Activation function to use for the non-linearity in the MLP. Defaults to F.gelu.
             num_moe_experts (int): Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Defaults to None (no MoE).
+            rotary_interleaved (bool): True is rotate pairs of even and odd dimensions (RoFormer style), False is rotate pairs of first half and second half (LLaMa style). Default to False.
             init_method (Callable): Method to initialize weights. Note that bias is always set to zero. Should be a function that takes a single Tensor and initializes it. Defaults to megatron.core.utils.init_method_normal(init_method_std) which is torch nn init normal with mean=0.0 and std=init_method_Std.
             output_layer_init_method (Callable): Method to initialize weights of the output layer of both attention and MLP blocks. Defaults to megatron.core.utils.scaled_init_method_normal(init_method_std) which is torch nn init normal with mean=0.0 and std=init_method_std / math.sqrt(2.0 * num_layers).
             init_method_std (float): Standard deviation of the zero mean normal for the default initialization method, not used if init_method and output_layer_init_method are provided. Defaults to 0.02.
@@ -86,6 +87,7 @@ class TransformerConfig(ModelParallelConfig):
     gated_linear_unit: bool = False
     activation_func: Callable = F.gelu
     num_moe_experts: int = None
+    rotary_interleaved: bool = False
     window_size: Optional[Tuple[int, int]] = None
 
     # initialization
@@ -242,6 +244,8 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "When bias_activation_fusion is True and activation function is gelu, add_bias_linear must also be True."
                 )
+        if self.apply_rope_fusion and self.rotary_interleaved:
+            raise ValueError(f'rotary_interleaved does not work with apply_rope_fusion.')
 
         if self.init_method is None:
             self.init_method = init_method_normal(self.init_method_std)

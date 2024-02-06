@@ -78,7 +78,7 @@ class T5Model(LanguageModule):
         transformer_encoder_layer_spec (ModuleSpec): transformer layer customization specs for encoder
 
         transformer_decoder_layer_spec (ModuleSpec): transformer layer customization specs for decoder
-                
+
         vocab_size (int): vocabulary size
 
         max_sequence_length (int): maximum size of sequence. This is used for positional embedding
@@ -151,7 +151,10 @@ class T5Model(LanguageModule):
         # Rotary Position Embeddings
         if self.position_embedding_type == 'rope':
             self.rotary_pos_emb = RotaryEmbedding(
-                self.config.kv_channels, rotary_percent, seq_len_interpolation_factor
+                kv_channels=self.config.kv_channels,
+                rotary_percent=rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
             )
 
         # Transformer encoder
