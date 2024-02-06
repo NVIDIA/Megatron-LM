@@ -1,6 +1,10 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
-""" Utilities for operating with dicts and lists. """
+""" Utilities for operating with dicts and lists.
+
+All functions in this module handle nesting of dicts and lists.
+Other objects (e.g. tuples) are treated as atomic leaf types that cannot be traversed.
+"""
 
 from collections import defaultdict
 from typing import Any, Callable, Iterable, Optional, Tuple, Union
@@ -13,7 +17,7 @@ def extract_matching_values(
 ) -> Tuple[Union[dict, list], Union[dict, list]]:
     """ Return matching and nonmatching values. Keeps hierarchy.
 
-    Arguments:
+    Args:
         x (Union[dict, list]) : state dict to process. Top-level argument must be a dict or list
         predicate (object -> bool): determines matching values
         return_lists_as_dicts (bool): if True, matching lists will be turned
@@ -60,6 +64,21 @@ def extract_matching_values(
 
 
 def diff(x1: Any, x2: Any, prefix: Tuple = ()) -> Tuple[list, list, list]:
+    """ Recursive diff of dicts.
+
+    Args:
+        x1 (object): left dict
+        x2 (object): right dict
+        prefix (tuple): tracks recursive calls. Used for reporting differing keys.
+
+    Returns:
+        Tuple[list, list, list]: tuple of:
+            - only_left: Prefixes present only in left dict
+            - only_right: Prefixes present only in right dict
+            - mismatch: values present in both dicts but not equal across dicts.
+                For tensors equality of all elems is checked.
+                Each element is a tuple (prefix, type of left value, type of right value).
+    """
     mismatch = []
     if isinstance(x1, dict) and isinstance(x2, dict):
         only_left = [prefix + (k,) for k in x1.keys() - x2.keys()]
@@ -94,22 +113,8 @@ def diff(x1: Any, x2: Any, prefix: Tuple = ()) -> Tuple[list, list, list]:
     return only_left, only_right, mismatch
 
 
-def inspect_keys_types(d: dict, prefix: Tuple = (), indent: int = 4):
-    print_indent = lambda: print(' ' * indent * len(prefix), end='')
-    for k, v in d.items():
-        if isinstance(v, dict):
-            print_indent()
-            print(f'> {k}:')
-            inspect_keys_types(v, prefix + (k,), indent)
-        else:
-            print_indent()
-            if isinstance(v, torch.Tensor):
-                print(f'> {k}: {type(v)} of shape {v.shape}')
-            else:
-                print(f'> {k}: {type(v)}')
-
-
 def inspect_types(x: Any, prefix: Tuple = (), indent: int = 4):
+    """ Helper to print types of (nested) dict values. """
     print_indent = lambda: print(' ' * indent * len(prefix), end='')
     if isinstance(x, dict):
         print()
@@ -137,6 +142,7 @@ def inspect_types(x: Any, prefix: Tuple = (), indent: int = 4):
 
 
 def nested_values(x: Union[dict, list]):
+    """ Returns iterator over (nested) values of a given dict or list. """
     x_iter = x.values() if isinstance(x, dict) else x
     for v in x_iter:
         if isinstance(v, (dict, list)):
@@ -146,6 +152,7 @@ def nested_values(x: Union[dict, list]):
 
 
 def nested_items_iter(x: Union[dict, list]):
+    """ Returns iterator over (nested) tuples (container, key, value) of a given dict or list. """
     x_iter = x.items() if isinstance(x, dict) else enumerate(x)
     for k, v in x_iter:
         if isinstance(v, (dict, list)):
@@ -155,16 +162,19 @@ def nested_items_iter(x: Union[dict, list]):
 
 
 def dict_map(f: Callable, d: dict):
+    """ `map` equivalent for dicts. """
     for sub_d, k, v in nested_items_iter(d):
         sub_d[k] = f(v)
 
 
 def dict_map_with_key(f: Callable, d: dict):
+    """ `map` equivalent for dicts with a function that accepts tuple (key, value). """
     for sub_d, k, v in nested_items_iter(d):
         sub_d[k] = f(k, v)
 
 
 def dict_list_map_inplace(f: Callable, x: Union[dict, list]):
+    """ Maps dicts and lists *in-place* with a given function. """
     if isinstance(x, dict):
         for k, v in x.items():
             x[k] = dict_list_map_inplace(f, v)
@@ -176,6 +186,7 @@ def dict_list_map_inplace(f: Callable, x: Union[dict, list]):
 
 
 def dict_list_map_outplace(f: Callable, x: Union[dict, list]):
+    """ Maps dicts and lists *out-of-place* with a given function. """
     if isinstance(x, dict):
         return {k: dict_list_map_outplace(f, v) for k, v in x.items()}
     elif isinstance(x, list):
@@ -185,6 +196,7 @@ def dict_list_map_outplace(f: Callable, x: Union[dict, list]):
 
 
 def merge(x1: dict, x2: dict, key: Tuple[str, ...] = ()):
+    """ Merges dicts and lists recursively. """
     if isinstance(x1, dict) and isinstance(x2, dict):
         for k, v2 in x2.items():
             if k not in x1:
@@ -211,6 +223,7 @@ def map_reduce(
     value_fn: Callable = lambda x: x,
     reduce_fn: Callable = lambda x: x,
 ) -> dict:
+    """ Simple map-reduce implementation following `more_itertools.map_reduce` interface. """
     res = defaultdict(list)
     for x in xs:
         res[key_fn(x)].append(value_fn(x))
