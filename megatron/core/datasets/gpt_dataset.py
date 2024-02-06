@@ -2,6 +2,7 @@
 
 import logging
 import os
+import sys
 import time
 from dataclasses import dataclass
 from typing import Dict, Tuple
@@ -27,6 +28,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         reset_attention_mask (bool): Option to reset the attention mask from the dataset
 
         eod_mask_loss (bool): Option to enable the EOD mask loss
+
+        vocab_size (int): Size of vocabulary
+      
     """
 
     reset_position_ids: bool = None
@@ -34,6 +38,8 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     reset_attention_mask: bool = None
 
     eod_mask_loss: bool = None
+
+    vocab_size: int = sys.maxsize
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init
@@ -126,6 +132,8 @@ class GPTDataset(MegatronDataset):
             indexed_dataset, dataset_path, indexed_indices, num_samples, index_split, config
         )
 
+        self.vocab_size = config.vocab_size
+
     def _finalize(self) -> None:
         """Abstract method implementation
         
@@ -188,6 +196,10 @@ class GPTDataset(MegatronDataset):
         text = torch.from_numpy(text).long()
         labels = text[1:].contiguous()
         tokens = text[:-1].contiguous()
+
+        assert not torch.any(
+            tokens >= self.vocab_size
+        ), "An input token is out of bounds of the tokenizer vocabulary"
 
         attention_mask, loss_mask, position_ids = _get_ltor_masks_and_position_ids(
             tokens,
