@@ -353,7 +353,7 @@ class SelfAttention(Attention):
             config=self.config,
             init_method=self.config.init_method,
             gather_output=False,
-            bias=self.config.add_bias_linear,
+            bias=self.config.add_bias_linear or self.config.add_qkv_bias,
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name='qkv',
