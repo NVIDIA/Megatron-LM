@@ -210,7 +210,7 @@ def forward_step(
 
     # Set the loss scale for the auxiliary loss of the MoE layer.
     # Since we use a trick to do backward on the auxiliary loss, we need to set the scale explicitly.
-    if config.num_moe_experts is not None:
+    if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
         # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
         loss_scale = (
             config.grad_scale_func(torch.tensor(1.0, device=loss.device))
