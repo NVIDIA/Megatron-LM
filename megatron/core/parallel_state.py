@@ -687,14 +687,6 @@ def set_pipeline_model_parallel_split_rank(rank):
     _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = rank
 
 
-def get_expert_model_parallel_rank():
-    """Return my rank for the tensor model parallel group."""
-    global _MPU_EXPERT_MODEL_PARALLEL_RANK
-    if _MPU_EXPERT_MODEL_PARALLEL_RANK is not None:
-        return _MPU_EXPERT_MODEL_PARALLEL_RANK
-    return torch.distributed.get_rank(group=get_tensor_and_expert_parallel_group())
-
-
 def get_tensor_model_parallel_rank():
     """Return my rank for the tensor model parallel group."""
     global _MPU_TENSOR_MODEL_PARALLEL_RANK

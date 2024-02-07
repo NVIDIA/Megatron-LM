@@ -93,14 +93,10 @@ class Router(ABC, MegatronModule):
 class TopKRouter(Router):
     """Route each token to the top-k experts."""
 
-    def __init__(
-        self, num_local_experts: int, local_expert_indices: List[int], config: TransformerConfig,
-    ) -> None:
+    def __init__(self, config: TransformerConfig,) -> None:
         """Initialize the zero token dropping router.
 
         Args:
-            num_local_experts (int): The number of local experts.
-            local_expert_indices (List[int]): The indices of the local experts.
             config (TransformerConfig): The configuration for the transformer model.
         """
         super().__init__(config=config)
@@ -236,9 +232,11 @@ class TopKRouter(Router):
             scores, indices = self.sinkhorn_load_balancing(logits)
         elif self.routing_type == "aux_loss":
             scores, indices = self.aux_loss_load_balancing(logits)
-        elif self.routing_type is None:
+        elif self.routing_type == "none":
             # A naive top-k routing without load balancing
-            top_logits, indices = torch.topk(logits, k=self.k, dim=1)
+            top_logits, indices = torch.topk(logits, k=self.topk, dim=1)
             scores = torch.softmax(top_logits, dim=-1, dtype=torch.float32).type_as(logits)
+        else:
+            raise ValueError(f"Unsupported MoE routing type: {self.routing_type}")
 
         return scores, indices

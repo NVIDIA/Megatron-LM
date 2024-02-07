@@ -54,7 +54,7 @@
 | num-experts | Number of Experts in MoE (None means no MoE) |
 | expert-model-parallel-size | Degree of expert model parallelism. |
 | moe-grouped-gemm | When there are multiple experts per rank, compress multiple local gemms into a single kernel launch to improve the utilization and performance by leveraging the Grouped GEMM feature introduced since CUTLASS 2.8 |
-| moe-router-load-balancing-type | Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "None" implies no load balancing. The default is "aux_loss". |
+| moe-router-load-balancing-type | Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss". |
 | moe-router-topk | Number of experts to route to for each token. The default is 2. |
 | moe-aux-loss-coeff | Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended. |
 | moe-z-loss-coeff | Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended. |
@@ -69,7 +69,7 @@ To train a top-2 MoE model with an auxiliary loss, include the following argumen
 --num-experts 8
 --expert-model-parallel-size 8
 --moe-grouped-gemm
---moe-router-load-balancing-type aux_loss # options: aux_loss, sinkhorn, None. Default is aux_loss.
+--moe-router-load-balancing-type aux_loss # options: aux_loss, sinkhorn, none. Default is aux_loss.
 --moe-router-topk 2
 --moe-aux-loss-coeff 1e-2
 --use-distributed-optimizer
@@ -129,9 +129,11 @@ MODEL_ARGS=(
 
 MOE_ARGS=(
     --num-experts 8
+    --expert-model-parallel-size 4
     --moe-router-load-balancing-type aux_loss # options: aux_loss, sinkhorn, None. Default is aux_loss.
     --moe-router-topk 2
     --moe-aux-loss-coeff 1e-2
+    --moe-grouped-gemm
 )
 
 DATA_ARGS=(
@@ -158,8 +160,8 @@ TRAINING_ARGS=(
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 4
     --pipeline-model-parallel-size 1
-    --expert-model-parallel-size 4
     --sequence-parallel
+    --use-distributed-optimizer
 )
 
 LOGGING_ARGS=(
