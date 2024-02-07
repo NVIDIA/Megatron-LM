@@ -53,9 +53,7 @@ class MoELayer(BaseMoELayer):
     def __init__(self, config: TransformerConfig, submodules: MLPSubmodules = None):
         self.submodules = submodules
         super(MoELayer, self).__init__(config=config)
-        self.router = TopKRouter(
-            self.num_local_experts, self.local_expert_indices, config=self.config
-        )
+        self.router = TopKRouter(config=self.config)
         if self.config.moe_grouped_gemm:
             self.experts = GroupedMLP(self.num_local_experts, self.config)
         else:

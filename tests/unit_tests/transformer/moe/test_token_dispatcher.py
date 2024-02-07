@@ -27,8 +27,6 @@ class TestDroplessDispatcher:
             moe_router_topk=2,
         )
         self.router = TopKRouter(
-            num_local_experts=num_moe_experts,
-            local_expert_indices=range(num_moe_experts),
             config=transformer_config,
         )
         self.token_dispatcher = MoEDroplessTokenDispatcher(
