@@ -11,7 +11,7 @@ command: >-
    ${{outputs.checkpoint_dir}} \
    ${{outputs.tensorboard_dir}}
 
-display_name: LLaMa-VE-70B-init-Emb-Allam-Reasoning-Data-with-Ar-Translation
+display_name: LLaMa-VE-70B-Allam-Reasoning-Data-with-Ar-Translation
 
 experiment_name: Vocab-Expansion
 code: ../../../../../
@@ -36,15 +36,15 @@ outputs:
   data_cache:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/LLaMa-VE-70B-init-Emb-Allam-Reasoning-Data-with-Ar-Translation/cache
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/LLaMa-VE-70B-Allam-Reasoning-Data-with-Ar-Translation/cache
   checkpoint_dir:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/LLaMa-VE-70B-init-Emb-Allam-Reasoning-Data-with-Ar-Translation
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/LLaMa-VE-70B-Allam-Reasoning-Data-with-Ar-Translation
   tensorboard_dir:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/LLaMa-VE-70B-init-Emb-Allam-Reasoning-Data-with-Ar-Translation/tensorboard
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/LLaMa-VE-70B-Allam-Reasoning-Data-with-Ar-Translation/tensorboard
 
 services:
   my_jupyterlab:
