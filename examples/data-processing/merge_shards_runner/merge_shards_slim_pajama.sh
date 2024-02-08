@@ -28,18 +28,14 @@ python examples/data-processing/sample_json_data_from_meta.py \
 cd $PATH_TO_SLIM_PAJAMA/data_by_domain
 mkdir -p ../merged_shards
 
-split --line-bytes=85G --additional-suffix=.jsonl -d -a 4 RedPajamaC4.jsonl ../merged_shards/RedPajamaC4_
-split --line-bytes=85G --additional-suffix=.jsonl -d -a 4 RedPajamaStackExchange.jsonl ../merged_shards/RedPajamaStackExchange_
-split --line-bytes=70G --additional-suffix=.jsonl -d -a 4 RedPajamaGithub.jsonl ../merged_shards/RedPajamaGithub_
-split --line-bytes=70G --additional-suffix=.jsonl -d -a 4 RedPajamaWikipedia.jsonl ../merged_shards/RedPajamaWikipedia_
-split --line-bytes=70G --additional-suffix=.jsonl -d -a 4 RedPajamaBook.jsonl ../merged_shards/RedPajamaBook_
-split --line-bytes=85G --additional-suffix=.jsonl -d -a 4 RedPajamaCommonCrawl.jsonl ../merged_shards/RedPajamaCommonCrawl_
-split --line-bytes=85G --additional-suffix=.jsonl -d -a 4 RedPajamaArXiv.jsonl ../merged_shards/RedPajamaArXiv_
+split --line-bytes=85G --additional-suffix=.jsonl -d -a 4 RedPajamaC4.jsonl ../merged_shards/en_SlimPajamaC4_
+split --line-bytes=85G --additional-suffix=.jsonl -d -a 4 RedPajamaStackExchange.jsonl ../merged_shards/en_SlimPajamaStackExchange_
+split --line-bytes=70G --additional-suffix=.jsonl -d -a 4 RedPajamaGithub.jsonl ../merged_shards/en_SlimPajamaGithub_
+split --line-bytes=70G --additional-suffix=.jsonl -d -a 4 RedPajamaWikipedia.jsonl ../merged_shards/en_SlimPajamaWikipedia_
+split --line-bytes=70G --additional-suffix=.jsonl -d -a 4 RedPajamaBook.jsonl ../merged_shards/en_SlimPajamaBook_
+split --line-bytes=85G --additional-suffix=.jsonl -d -a 4 RedPajamaCommonCrawl.jsonl ../merged_shards/en_SlimPajamaCommonCrawl_
+split --line-bytes=85G --additional-suffix=.jsonl -d -a 4 RedPajamaArXiv.jsonl ../merged_shards/en_SlimPajamaArXiv_
 
-# cp RedPajamaArXiv.jsonl $PATH_TO_SLIM_PAJAMA/merged_shards/RedPajamaArXiv_0000.jsonl
-
-cd $PATH_TO_SLIM_PAJAMA/merged_shards
-ls -l | awk '{print $9}' | xargs -I {} mv {} en_{}
-
-azcopy copy SlimPajama-627B "https://allamllmuksstandard.blob.core.windows.net/llm-data/?sv=2023-01-03&ss=btqf&srt=sco&st=2023-12-03T21%3A43%3A17Z&se=2025-05-30T21%3A43%3A00Z&sp=rwdxftlacup&sig=51chDeU9Xqnk7GrTSA3u2gEfdgCUQIq9SDAJEQCPQxE%3D" --recursive --overwrite=false
+cd ../../
+azcopy copy SlimPajama-627B/merged_shards "https://allamllmuksstandard.blob.core.windows.net/llm-data/SlimPajama-627B/?sv=2023-01-03&ss=btqf&srt=sco&st=2023-12-03T21%3A43%3A17Z&se=2025-05-30T21%3A43%3A00Z&sp=rwdxftlacup&sig=51chDeU9Xqnk7GrTSA3u2gEfdgCUQIq9SDAJEQCPQxE%3D" --recursive --overwrite=false
 
