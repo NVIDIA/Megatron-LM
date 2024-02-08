@@ -3,7 +3,7 @@
 $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
 command: >-
-  bash examples/pretrain-llama/training/llama_ve/llama70b_ve_init_emb_en_reasoning_ar_with_trans_from_scratch_test/llama70b_ve_init_emb_en_reasoning_ar_with_trans_from_scratch_test_vp_mbs.sh \
+  bash examples/pretrain-llama/training/llama_ve/llama70b_ve_en_reasoning_ar_with_trans_from_scratch_test/llama70b_ve_en_reasoning_ar_with_trans_from_scratch_test_vp_mbs.sh \
    ${{inputs.pretrained_llama_model}} \
    ${{inputs.tokenizer_model_path}} \
    /eph/nvme0/allam/bin_idx_data/meglm_llama2-ve_bin_idx/\

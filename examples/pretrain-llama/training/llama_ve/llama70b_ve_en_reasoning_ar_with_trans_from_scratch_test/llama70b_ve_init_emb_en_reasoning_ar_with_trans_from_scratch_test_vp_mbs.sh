@@ -8,7 +8,8 @@ CHECKPOINT_DIR=$5
 TENSORBOARD_LOGS_PATH=$6
 TP=$7
 PP=$8
-MBS=$9
+VP=$9
+MBS=${10}
 
 # DISTRIBUTED_ARGS=(
 #     --nproc_per_node $GPUS_PER_NODE 
@@ -28,8 +29,6 @@ GPT_MODEL_ARGS=(
     --normalization RMSNorm
     --no-position-embedding
     --no-query-key-layer-scaling
-    --use-distributed-optimizer
-    --overlap-grad-reduce
 )
 
 LOGISTICS_ARGS=(
@@ -51,7 +50,7 @@ TRAINING_ARGS=(
     --no-initialization
     --no-load-optim
     --no-load-rng
-    --micro-batch-size $MBS
+    --micro-batch-size $MBS 
     --global-batch-size 1024
     --train-iters 200
     --weight-decay 0.1 
@@ -75,9 +74,10 @@ MODEL_PARALLEL_ARGS=(
     --pipeline-model-parallel-size $PP
     --sequence-parallel
     --no-async-tensor-model-parallel-allreduce
+    --recompute-activations
 )
 
-source examples/pretrain-llama/training/llama_ve/llama70b_ve_init_emb_en_reasoning_ar_with_trans_from_scratch_test/iter_prob.sh
+source examples/pretrain-llama/training/llama_ve/llama70b_ve_en_reasoning_ar_with_trans_from_scratch_test/iter_prob.sh
 
 # $BIN_IDX_PATH/torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
 python pretrain_gpt.py \
