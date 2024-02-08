@@ -3,17 +3,18 @@
 $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
 command: >-
-  bash examples/pretrain-llama/training/llama_ve/llama70b_ve_init_emb_en_reasoning_ar_with_trans_from_scratch/llama70b_ve_init_emb_en_reasoning_ar_with_trans_from_scratch.sh \
+  bash examples/pretrain-llama/training/llama_ve/llama70b_ve_en_reasoning_ar_with_trans_from_scratch_test/llama70b_ve_en_reasoning_ar_with_trans_from_scratch_test_vp_mbs.sh \
    ${{inputs.pretrained_llama_model}} \
    ${{inputs.tokenizer_model_path}} \
    /eph/nvme0/allam/bin_idx_data/meglm_llama2-ve_bin_idx/\
    ${{outputs.data_cache}} \
    ${{outputs.checkpoint_dir}} \
-   ${{outputs.tensorboard_dir}}
+   ${{outputs.tensorboard_dir}} \
+   ${{TP}} ${{PP}} ${{VP}} ${{MBS}} 
 
-display_name: LLaMa-VE-70B-init-Emb-Allam-Reasoning-Data-with-Ar-Translation
+display_name:  tp${{TP}}-pp${{PP}}-vp${{VP}}-mbs${{MBS}}-LLaMa-VE-70B-Allam-Reasoning-Data-with-Ar-Translation
 
-experiment_name: Vocab-Expansion
+experiment_name: FlopsProfiling
 code: ../../../../../
 environment: azureml:Megatron-LLaMA:7
 environment_variables:
@@ -27,7 +28,7 @@ inputs:
   pretrained_llama_model:
     type: uri_folder
     mode: ro_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/megatronlm_models/Meg-LM-Llama-2-70b-hf-ExpTok-32K_10M_VE_with_llama_avg_tp8_pp4/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/megatronlm_models/Meg-LM-Llama-2-70b-hf-ExpTok-32K_10M_VE_with_llama_avg_tp${{TP}}_pp${{PP}}/
   tokenizer_model_path:
     type: uri_file
     mode: ro_mount
@@ -36,15 +37,15 @@ outputs:
   data_cache:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/LLaMa-VE-70B-init-Emb-Allam-Reasoning-Data-with-Ar-Translation/cache
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/LLaMa-VE-70B-Emb-Allam-Reasoning-Data-with-Ar-Translation/cache
   checkpoint_dir:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/LLaMa-VE-70B-init-Emb-Allam-Reasoning-Data-with-Ar-Translation
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/LLaMa-VE-70B-Allam-Reasoning-Data-with-Ar-Translation
   tensorboard_dir:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/LLaMa-VE-70B-init-Emb-Allam-Reasoning-Data-with-Ar-Translation/tensorboard
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/LLaMa-VE-70B-Allam-Reasoning-Data-with-Ar-Translation/tensorboard
 
 services:
   my_jupyterlab:

@@ -6,10 +6,6 @@ BIN_IDX_PATH=$3
 DATA_CACHE=$4
 CHECKPOINT_DIR=$5
 TENSORBOARD_LOGS_PATH=$6
-TP=$7
-PP=$8
-VP=$9
-MBS=${10}
 
 # DISTRIBUTED_ARGS=(
 #     --nproc_per_node $GPUS_PER_NODE 
@@ -29,6 +25,8 @@ GPT_MODEL_ARGS=(
     --normalization RMSNorm
     --no-position-embedding
     --no-query-key-layer-scaling
+    --use-distributed-optimizer
+    --overlap-grad-reduce
 )
 
 LOGISTICS_ARGS=(
@@ -36,12 +34,12 @@ LOGISTICS_ARGS=(
     --load $PRETRAINED_LLAMA_MODEL_PATH 
     --tokenizer-model $TOKENIZER_MODEL
     --split 100,0,0 
-    --log-interval 10
-    --save-interval 1500 
-    --eval-interval 1500
+    --log-interval 50
+    --save-interval 1000
+    --eval-interval 1000
     --eval-iters 0
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
-    --tensorboard-log-interval 100
+    --tensorboard-log-interval 50
     --data-cache-path $DATA_CACHE
     --log-validation-ppl-to-tensorboard 
 )
@@ -50,9 +48,9 @@ TRAINING_ARGS=(
     --no-initialization
     --no-load-optim
     --no-load-rng
-    --micro-batch-size $MBS 
+    --micro-batch-size 2
     --global-batch-size 1024
-    --train-iters 200
+    --train-iters 600_000
     --weight-decay 0.1 
     --adam-beta1 0.9 
     --adam-beta2 0.95 
@@ -70,14 +68,13 @@ TRAINING_ARGS=(
 # --use-mcore-models
 
 MODEL_PARALLEL_ARGS=(
-	--tensor-model-parallel-size $TP
-    --pipeline-model-parallel-size $PP
+	--tensor-model-parallel-size 8
+    --pipeline-model-parallel-size 4
     --sequence-parallel
     --no-async-tensor-model-parallel-allreduce
-    --recompute-activations
 )
 
-source examples/pretrain-llama/training/llama_ve/llama70b_ve_init_emb_en_reasoning_ar_with_trans_from_scratch_test/iter_prob.sh
+source examples/pretrain-llama/training/llama_ve/llama70b_ve_en_reasoning_ar_with_trans_from_scratch/iter_prob.sh
 
 # $BIN_IDX_PATH/torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
 python pretrain_gpt.py \
