@@ -1,12 +1,12 @@
 import torch
 from torch import Tensor
 
-from megatron.core import tensor_parallel
+from megatron.core import tensor_parallel, parallel_state
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import erf_gelu, get_linear_layer, openai_gelu
-
+from megatron.core.transformer.utils import erf_gelu, get_linear_layer, make_sharded_tensors_for_checkpoint, openai_gelu
+from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
 class BertLMHead(MegatronModule):
     """Masked LM head for Bert
@@ -33,7 +33,7 @@ class BertLMHead(MegatronModule):
 
         self.vocab_size = vocab_size
         self.parallel_output = parallel_output
-
+        self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         # TODO: Shoudl switch this to TE ?
         self.dense = get_linear_layer(
             hidden_size, hidden_size, config.init_method, config.perform_initialization
@@ -73,3 +73,21 @@ class BertLMHead(MegatronModule):
         hidden_states = self.layernorm(hidden_states)
         logits, _ = self.output_layer(hidden_states, weight=word_embeddings_weight)
         return logits
+    
+    def sharded_state_dict(self, prefix=''):
+        sharded_state_dict = {}
+
+        dense_prefix = f'{prefix}dense.'
+        state_dict = self.dense.state_dict()
+        #TODO need to check fi this dictionary of weight and bias is required
+        dense_layer_sharded_state_dict = make_sharded_tensors_for_checkpoint(state_dict, dense_prefix,  {'weight': 0, 'bias': 0})
+        sharded_state_dict.update(dense_layer_sharded_state_dict)
+
+        output_layer_prefix = f'{prefix}output'
+
+        #if share embeddings is enabled it is stored in the bert_model class itself in sharded_state_dict function
+        if not self.share_embeddings_and_output_weights:     
+            output_layer_sharded_state_dict = self.output_layer.sharded_state_dict(prefix=output_layer_prefix)
+            sharded_state_dict.update(output_layer_sharded_state_dict)
+
+        return sharded_state_dict

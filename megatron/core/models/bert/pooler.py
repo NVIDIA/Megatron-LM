@@ -4,7 +4,7 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import get_linear_layer
+from megatron.core.transformer.utils import get_linear_layer, make_sharded_tensors_for_checkpoint
 
 
 class Pooler(MegatronModule):
@@ -49,3 +49,11 @@ class Pooler(MegatronModule):
         pooled = self.dense(pooled)
         pooled = torch.tanh(pooled)
         return pooled
+    
+    def sharded_state_dict(self, prefix=''):
+        sharded_state_dict={}
+        state_dict = self.dense.state_dict()
+        dense_prefix=f'{prefix}dense.'
+        pooler_sharded_state_dict = make_sharded_tensors_for_checkpoint(state_dict, dense_prefix, {'weight': 0, 'bias': 0})
+        sharded_state_dict.update(pooler_sharded_state_dict)    
+        return sharded_state_dict

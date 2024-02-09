@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.models.bert.bert_lm_head import BertLMHead
 from megatron.core.models.bert.pooler import Pooler
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
@@ -15,8 +16,8 @@ from megatron.core.transformer.enums import AttnMaskType, ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import get_linear_layer
-
+from megatron.core.transformer.utils import get_linear_layer, make_sharded_tensors_for_checkpoint
+from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
 class BertModel(LanguageModule):
     """Transformer language model.
@@ -217,7 +218,7 @@ class BertModel(LanguageModule):
             )
         else:
             # intermediate stage of pipeline
-            # decoder will get hidden_states from encoder.input_tensor
+            # encoder will get hidden_states from encoder.input_tensor
             encoder_input = None
 
         # Rotary positional embeddings (Why not move this into BERT/GPTEmberdding ?)
@@ -228,7 +229,7 @@ class BertModel(LanguageModule):
             )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
-        # Run decoder.
+        # Run encoder.
         hidden_states = self.encoder(
             hidden_states=encoder_input,
             attention_mask=extended_attention_mask,
@@ -273,10 +274,58 @@ class BertModel(LanguageModule):
 
         return loss, binary_logits
 
-    # TODO: add distributed checkpointing
-    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
-        pass
 
-    # TODO: add distributed checkpointing
-    def load_state_dict(self, state_dict, strict=True):
-        pass
+    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()) -> ShardedStateDict:
+        assert not sharded_offsets, "Unexpected sharded offsets"
+        sharded_state_dict = {}
+
+        if self.pre_process:
+            embedding_prefix = f'{prefix}embedding.'
+            embedding_sharded_state_dict = self.embedding.sharded_state_dict(
+                prefix=embedding_prefix
+            )
+            sharded_state_dict.update(embedding_sharded_state_dict)
+
+        encoder_prefix = f'{prefix}encoder.'
+        encoder_sharded_state_dict = self.encoder.sharded_state_dict(prefix=encoder_prefix)
+        sharded_state_dict.update(encoder_sharded_state_dict)
+
+        if self.post_process:
+            lm_head_prefix = f'{prefix}lm_head.'
+            lm_head_sharded_state_dict = self.lm_head.sharded_state_dict(prefix=lm_head_prefix)
+            sharded_state_dict.update(lm_head_sharded_state_dict)
+
+            if self.add_binary_head:
+                binary_head_prefix = f'{prefix}binary_head.'
+                state_dict = self.binary_head.state_dict()
+                #TODO need to check fi this dictionary of weight and bias is required
+                binary_head_sharded_state_dict = make_sharded_tensors_for_checkpoint(state_dict, binary_head_prefix, {'weight': 0, 'bias': 0})
+                sharded_state_dict.update(binary_head_sharded_state_dict)     
+
+                pooler_prefix =  f'{prefix}pooler.'  
+                pooler_sharded_state_dict = self.pooler.sharded_state_dict(prefix=pooler_prefix)
+                sharded_state_dict.update(pooler_sharded_state_dict) 
+ 
+            if self.share_embeddings_and_output_weights:
+                if not self.pre_process:
+                    # when sharing embeddings with last stage, we need to use the weights from the first stage
+                    # on pipeline first rank, word embeddings are saved to {prefix}embedding.word_embeddings.weight
+                    tensor = self.shared_embedding_or_output_weight()
+                    first_stage_word_emb_key = f'{prefix}embedding.word_embeddings.weight'
+                    last_stage_word_emb_replica_id = (
+                        1,  # copy of first stage embedding
+                        0,
+                        parallel_state.get_data_parallel_rank(with_context_parallel=True),
+                    )
+
+                    sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
+                        tensor=tensor,
+                        key=first_stage_word_emb_key,
+                        replica_id=last_stage_word_emb_replica_id,
+                        allow_shape_mismatch=True,
+                    )
+                    # TODO :I think bias also needs to be added. However the shared_embedding_or_output_weight returns onlyt the weights.
+                    output_layer_key = f'{prefix}binary_head.output.weight'
+                    sharded_state_dict[output_layer_key] = sharded_output_layer_tensor
+
+        return sharded_state_dict
