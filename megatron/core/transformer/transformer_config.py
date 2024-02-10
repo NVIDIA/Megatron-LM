@@ -178,7 +178,9 @@ class TransformerConfig(ModelParallelConfig):
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError(f'num_moe_experts must be non-negative.')
 
-        if self.cpu_offloading_num_layers < 0 or self.cpu_offloading_num_layers >= self.num_layers:
+        if self.cpu_offloading and (
+            self.cpu_offloading_num_layers < 0 or self.cpu_offloading_num_layers >= self.num_layers
+        ):
             raise ValueError(
                 f'CPU offloading can be done only for layers less than {self.num_layers}'
             )
