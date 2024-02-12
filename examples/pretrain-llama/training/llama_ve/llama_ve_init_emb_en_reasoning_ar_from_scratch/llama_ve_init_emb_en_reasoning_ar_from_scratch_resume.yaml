@@ -27,7 +27,7 @@ inputs:
   pretrained_llama_model:
     type: uri_folder
     mode: ro_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/megatronlm_models/Meg-LM-Llama-2-7b-hf-ExpTok-32K_10M_init_VE_with_llama_avg
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/new_experiments/LLaMa-VE-init-Emb-Allam-Reasoning-Data-En-Ar/
   tokenizer_model_path:
     type: uri_file
     mode: ro_mount
