@@ -44,9 +44,6 @@ LOGISTICS_ARGS=(
 )
 
 TRAINING_ARGS=(
-    --no-initialization
-    --no-load-optim
-    --no-load-rng
     --micro-batch-size 1 
     --global-batch-size 1024
     --train-iters 600_000
