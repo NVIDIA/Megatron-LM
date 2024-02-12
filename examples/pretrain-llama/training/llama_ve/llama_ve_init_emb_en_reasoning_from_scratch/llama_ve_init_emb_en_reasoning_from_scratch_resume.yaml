@@ -1,0 +1,68 @@
+# Training job submission via AML CLI v2
+
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+
+command: >-
+  bash examples/pretrain-llama/training/llama_ve/llama_ve_init_emb_en_reasoning_ar_with_trans_from_scratch/llama_ve_init_emb_en_reasoning_ar_with_trans_from_scratch_resume.sh \
+   ${{inputs.pretrained_llama_model}} \
+   ${{inputs.tokenizer_model_path}} \
+   ${{inputs.bin_idx_data_dir}} \
+   ${{outputs.data_cache}} \
+   ${{outputs.checkpoint_dir}} \
+   ${{outputs.tensorboard_dir}}
+
+display_name: LLaMa-VE-init-Emb-Allam-Reasoning-Data
+
+experiment_name: Vocab-Expansion
+code: ../../../../../
+environment: azureml:Megatron-LLaMA:7
+environment_variables:
+  HYDRA_FULL_ERROR: '1'
+  UCX_IB_PCI_RELAXED_ORDERING: 'auto'
+  NCCL_IB_PCI_RELAXED_ORDERING: '2'
+  NCCL_IB_TIMEOUT: '22'
+  NCCL_DEBUG: WARN
+  CUDA_DEVICE_MAX_CONNECTIONS: '1'
+inputs:
+  pretrained_llama_model:
+    type: uri_folder
+    mode: ro_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/megatronlm_models/Meg-LM-Llama-2-7b-hf-ExpTok-32K_10M_init_VE_with_llama_avg_tp1_pp1/
+  tokenizer_model_path:
+    type: uri_file
+    mode: ro_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llm_data_west_europe/paths/data_repo/tokenize_by_llama2-ve/tokenizer/tokenizer.model
+  bin_idx_data_dir:
+    type: uri_folder
+    mode: ro_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llm_data_west_europe/paths/data_repo/tokenize_by_llama2-ve/meglm_llama2-ve_bin_idx/
+outputs:
+  data_cache:
+    type: uri_folder
+    mode: rw_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/new_experiments/LLaMa-VE-init-Emb-Allam-Reasoning-Data/cache
+  checkpoint_dir:
+    type: uri_folder
+    mode: rw_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/new_experiments/LLaMa-VE-init-Emb-Allam-Reasoning-Data
+  tensorboard_dir:
+    type: uri_folder
+    mode: rw_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/new_experiments/LLaMa-VE-init-Emb-Allam-Reasoning-Data/tensorboard
+
+services:
+  my_jupyterlab:
+    type: jupyter_lab
+  my_tensorboard:
+    type: tensor_board
+    log_dir: ${{outputs.tensorboard_dir}}
+
+compute: azureml:A100-SSH
+
+distribution:
+  type: pytorch
+  process_count_per_instance: 8
+
+resources:
+  instance_count: 16
+  shm_size: 1250g
