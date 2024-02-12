@@ -11,7 +11,7 @@ command: >-
    ${{outputs.checkpoint_dir}} \
    ${{outputs.tensorboard_dir}}
 
-display_name: LLaMa-VE-init-Emb-Allam-Reasoning-Data
+display_name: LLaMa-VE-init-Emb-Allam-Reasoning-Data-En
 
 experiment_name: Vocab-Expansion
 code: ../../../../../
