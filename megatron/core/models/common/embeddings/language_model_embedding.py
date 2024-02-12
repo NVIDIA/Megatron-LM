@@ -20,7 +20,7 @@ class NoiseSchedulerConfig:
     class_name: str
     milestones: Optional[List[int]] = None
     max_steps: Optional[int] = None
-    num_segments: Optional[int] = None
+    num_milestones: Optional[int] = None
     gamma: Optional[float] = None
     verbose: Optional[bool] = False
     starting_value: Optional[float] = 0.0
@@ -36,26 +36,32 @@ class NoiseScheduler:
 class MultiStepNoiseScheduler(NoiseScheduler):
     def __init__(self, noise_scheduler_config):
         super().__init__(noise_scheduler_config)
-        if not ('milestones' in noise_scheduler_config or ('max_steps' in noise_scheduler_config and 'num_segments' in noise_scheduler_config)):
-            raise ValueError('Either milestones or both max_steps and num_segments must be present in noise_scheduler_config')
+        if not (noise_scheduler_config.milestones or (noise_scheduler_config.max_steps and noise_scheduler_config.num_milestones)):
+            raise ValueError('Either milestones or both max_steps and num_milestones must be present in noise_scheduler_config')
         
-        self.milestones = noise_scheduler_config.milestones if 'milestones' in noise_scheduler_config else list(range(0, noise_scheduler_config.max_steps, noise_scheduler_config.max_steps // noise_scheduler_config.num_segments))
+        if noise_scheduler_config.milestones:
+            self.milestones = noise_scheduler_config.milestones
+        else:
+            interval = noise_scheduler_config.max_steps // noise_scheduler_config.num_milestones
+            self.milestones = [i * interval for i in range(1, noise_scheduler_config.num_milestones + 1)]
+        
         self.gamma = noise_scheduler_config.gamma
-        self.verbose = noise_scheduler_config.get('verbose', True)
+        self.verbose = noise_scheduler_config.verbose
         self.starting_value = noise_scheduler_config.starting_value
         self.current_value = self.starting_value
         if self.verbose:
             print(f'Noise milestones: {self.milestones}')
             print(f'Noise gamma: {self.gamma}')
             print(f'Noise starting value: {self.starting_value}')
-            milestone_to_val = {self.milestones[i]:self.starting_value * self.gamma ** i for i in range(len(self.milestones))}
+            milestone_to_val = {milestone: self.starting_value * (self.gamma ** i) for i, milestone in enumerate(self.milestones)}
             print(f'Noise will change like this: {milestone_to_val}')
 
     def get_noise(self):
         if self.current_step in self.milestones:
             if self.verbose:
                 print(f'Noise step {self.current_step} reached milestone')
-                self.current_value *= self.gamma
+            self.current_value *= self.gamma
+            if self.verbose:
                 print(f'Noise value changed to {self.current_value}')
         return self.current_value
 
