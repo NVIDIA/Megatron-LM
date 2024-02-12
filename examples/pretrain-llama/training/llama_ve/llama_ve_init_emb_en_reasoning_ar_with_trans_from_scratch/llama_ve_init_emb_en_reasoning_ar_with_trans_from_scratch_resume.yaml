@@ -27,28 +27,28 @@ inputs:
   pretrained_llama_model:
     type: uri_folder
     mode: ro_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/LLaMa-VE-init-Emb-Allam-Reasoning-Data-with-Ar-Translation/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/new_experiments/LLaMa-VE-init-Emb-Allam-Reasoning-Data-with-Ar-Translation/
   tokenizer_model_path:
     type: uri_file
     mode: ro_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llm_data/paths/data_repo/tokenize_by_llama2-ve/tokenizer/tokenizer.model
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llm_data_west_europe/paths/data_repo/tokenize_by_llama2-ve/tokenizer/tokenizer.model
   bin_idx_data_dir:
     type: uri_folder
     mode: ro_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llm_data/paths/data_repo/tokenize_by_llama2-ve/meglm_llama2-ve_bin_idx/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llm_data_west_europe/paths/data_repo/tokenize_by_llama2-ve/meglm_llama2-ve_bin_idx/
 outputs:
   data_cache:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/LLaMa-VE-init-Emb-Allam-Reasoning-Data-with-Ar-Translation/cache
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/new_experiments/LLaMa-VE-init-Emb-Allam-Reasoning-Data-with-Ar-Translation/cache
   checkpoint_dir:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/LLaMa-VE-init-Emb-Allam-Reasoning-Data-with-Ar-Translation
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/new_experiments/LLaMa-VE-init-Emb-Allam-Reasoning-Data-with-Ar-Translation/
   tensorboard_dir:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/LLaMa-VE-init-Emb-Allam-Reasoning-Data-with-Ar-Translation/tensorboard
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/new_experiments/LLaMa-VE-init-Emb-Allam-Reasoning-Data-with-Ar-Translation/tensorboard
 
 services:
   my_jupyterlab:
