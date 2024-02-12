@@ -36,25 +36,24 @@ class NoiseScheduler:
 class MultiStepNoiseScheduler(NoiseScheduler):
     def __init__(self, noise_scheduler_config):
         super().__init__(noise_scheduler_config)
-        if not (noise_scheduler_config.milestones or (noise_scheduler_config.max_steps and noise_scheduler_config.num_milestones)):
-            raise ValueError('Either milestones or both max_steps and num_milestones must be present in noise_scheduler_config')
-        
-        if noise_scheduler_config.milestones:
-            self.milestones = noise_scheduler_config.milestones
-        else:
-            interval = noise_scheduler_config.max_steps // noise_scheduler_config.num_milestones
-            self.milestones = [i * interval for i in range(1, noise_scheduler_config.num_milestones + 1)]
-        
-        self.gamma = noise_scheduler_config.gamma
-        self.verbose = noise_scheduler_config.verbose
-        self.starting_value = noise_scheduler_config.starting_value
+        self.milestones = noise_scheduler_config.get('milestones')
+        if self.milestones is None:
+            num_milestones = noise_scheduler_config.get('num_milestones')
+            max_steps = noise_scheduler_config.get('max_steps')
+            if num_milestones is not None and max_steps is not None:
+                self.milestones =  [(i + 1) * max_steps // (num_milestones + 1) for i in range(num_milestones)]
+            else:
+                raise ValueError("Configuration for MultiStepNoiseScheduler must include either 'milestones' or both 'num_milestones' and 'max_steps'.")
+
+        self.gamma = noise_scheduler_config.get('gamma')
+        self.verbose = noise_scheduler_config.get('verbose', True)
+        self.starting_value = noise_scheduler_config.get('starting_value', 1.0)
         self.current_value = self.starting_value
         if self.verbose:
+            print(f'Noise value initialized to {self.current_value}')
             print(f'Noise milestones: {self.milestones}')
-            print(f'Noise gamma: {self.gamma}')
-            print(f'Noise starting value: {self.starting_value}')
             milestone_to_val = {milestone: self.starting_value * (self.gamma ** i) for i, milestone in enumerate(self.milestones)}
-            print(f'Noise will change like this: {milestone_to_val}')
+            print(f'Noise will change: {milestone_to_val}')
 
     def get_noise(self):
         if self.current_step in self.milestones:
@@ -64,7 +63,6 @@ class MultiStepNoiseScheduler(NoiseScheduler):
             if self.verbose:
                 print(f'Noise value changed to {self.current_value}')
         return self.current_value
-
 
 def get_noise_scheduler(class_name):
     if class_name == 'MultiStepNoiseScheduler':
