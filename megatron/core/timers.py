@@ -143,6 +143,7 @@ class Timer(TimerBase):
     def active_time(self):
         return self._active_time
 
+
 class Timers:
     """Class for a group of Timers.
     """
