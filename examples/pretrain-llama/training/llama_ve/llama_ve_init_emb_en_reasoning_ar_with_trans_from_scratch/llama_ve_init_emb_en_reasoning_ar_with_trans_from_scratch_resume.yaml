@@ -57,7 +57,7 @@ services:
     type: tensor_board
     log_dir: ${{outputs.tensorboard_dir}}
 
-compute: azureml:NCAI-A100-LLMv3
+compute: azureml:A100-SSH
 
 distribution:
   type: pytorch
