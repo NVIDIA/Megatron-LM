@@ -64,5 +64,5 @@ distribution:
   process_count_per_instance: 8
 
 resources:
-  instance_count: 32
+  instance_count: 4
   shm_size: 1250g
