@@ -1,7 +1,8 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from dataclasses import dataclass
 import math
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 import torch
 from torch import Tensor
@@ -13,6 +14,57 @@ from megatron.core.utils import (
     make_sharded_tensor_for_checkpoint,
     make_tp_sharded_tensor_for_checkpoint,
 )
+
+@dataclass
+class NoiseSchedulerConfig:
+    class_name: str
+    milestones: Optional[List[int]] = None
+    max_steps: Optional[int] = None
+    num_segments: Optional[int] = None
+    gamma: Optional[float] = None
+    verbose: Optional[bool] = False
+    starting_value: Optional[float] = 0.0
+
+class NoiseScheduler:
+    def __init__(self, noise_scheduler_config):
+        self.noise_scheduler_config = noise_scheduler_config
+        self.current_step = 0
+
+    def step(self):
+        self.current_step += 1
+        
+class MultiStepNoiseScheduler(NoiseScheduler):
+    def __init__(self, noise_scheduler_config):
+        super().__init__(noise_scheduler_config)
+        if not ('milestones' in noise_scheduler_config or ('max_steps' in noise_scheduler_config and 'num_segments' in noise_scheduler_config)):
+            raise ValueError('Either milestones or both max_steps and num_segments must be present in noise_scheduler_config')
+        
+        self.milestones = noise_scheduler_config.milestones if 'milestones' in noise_scheduler_config else list(range(0, noise_scheduler_config.max_steps, noise_scheduler_config.max_steps // noise_scheduler_config.num_segments))
+        self.gamma = noise_scheduler_config.gamma
+        self.verbose = noise_scheduler_config.get('verbose', True)
+        self.starting_value = noise_scheduler_config.starting_value
+        self.current_value = self.starting_value
+        if self.verbose:
+            print(f'Noise milestones: {self.milestones}')
+            print(f'Noise gamma: {self.gamma}')
+            print(f'Noise starting value: {self.starting_value}')
+            milestone_to_val = {self.milestones[i]:self.starting_value * self.gamma ** i for i in range(len(self.milestones))}
+            print(f'Noise will change like this: {milestone_to_val}')
+
+    def get_noise(self):
+        if self.current_step in self.milestones:
+            if self.verbose:
+                print(f'Noise step {self.current_step} reached milestone')
+                self.current_value *= self.gamma
+                print(f'Noise value changed to {self.current_value}')
+        return self.current_value
+
+
+def get_noise_scheduler(class_name):
+    if class_name == 'MultiStepNoiseScheduler':
+        return MultiStepNoiseScheduler
+    else:
+        raise ValueError(f'Noise scheduler {class_name} not implemented')
 
 
 class LanguageModelEmbedding(MegatronModule):
@@ -26,6 +78,15 @@ class LanguageModelEmbedding(MegatronModule):
         add_position_embedding (bool): Add a position embedding.
         embedding_dropout_prob (float): dropout probability for embeddings
         num_tokentypes (int): Set to 0 without binary head, and 2 with a binary head . Defaults to 0.
+        embedding_noise (bool): Add noise to the embeddings. Defaults to False.
+        embedding_noise_mean (float): Mean of the noise added to the embeddings. Defaults to 0.0.
+        embedding_noise_std (float): Standard deviation of the noise added to the embeddings. Defaults to 0.001.
+        embedding_noise_type (str): Type of noise added to the embeddings. Defaults to 'uniform'.
+        neft (bool): Add noise to the embeddings using NEFT. Defaults to False.
+        neft_alpha (float): Scaling factor for NEFT. Defaults to 5.0.
+        noise_positonal_embedding (bool): Add noise to the positional embeddings. Defaults to False.
+        noise_scaling_factor (float): Scaling factor for the noise added to the embeddings. Defaults to None.
+        noise_ascend (bool): Ascend the noise added to the embeddings. Defaults to None.
     """
 
     def __init__(
@@ -42,6 +103,7 @@ class LanguageModelEmbedding(MegatronModule):
         neft=False,
         neft_alpha=5.0,
         noise_positonal_embedding=False,
+        noise_scheduler_config=None,
     ):
         super().__init__(config=config)
 
@@ -58,6 +120,9 @@ class LanguageModelEmbedding(MegatronModule):
         self.neft = neft
         self.neft_alpha = neft_alpha
         self.noise_positonal_embedding = noise_positonal_embedding
+
+        if noise_scheduler_config is not None:
+            self.noise_scheduler = get_noise_scheduler(noise_scheduler_config.class_name)(noise_scheduler_config)
 
         # Word embeddings (parallel).
         self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
@@ -103,10 +168,13 @@ class LanguageModelEmbedding(MegatronModule):
     def _noise(self, embeddings):
         if self.training:
             if self.embedding_noise and not self.neft:
+                    noise_scale = self.embedding_noise_std
+                    if self.noise_scheduler is not None:
+                        noise_scale = self.noise_scheduler.get_noise()
                     if self.embedding_noise_type == 'uniform':
-                        noise = torch.empty_like(embeddings).uniform_(self.embedding_noise_mean, self.embedding_noise_std).detach()
+                        noise = torch.empty_like(embeddings).uniform_(self.embedding_noise_mean, noise_scale).detach()
                     elif self.embedding_noise_type == 'normal':
-                        noise = torch.empty_like(embeddings).normal_(self.embedding_noise_mean, self.embedding_noise_std).detach()
+                        noise = torch.empty_like(embeddings).normal_(self.embedding_noise_mean, noise_scale).detach()
                     else:
                         raise NotImplementedError(f"embedding noise type {self.embedding_noise_type} not implemented")
 
@@ -115,8 +183,12 @@ class LanguageModelEmbedding(MegatronModule):
                     noisy_norm = torch.norm(embeddings, p=2, dim=1, keepdim=True)
                     embeddings = embeddings * (original_norm / noisy_norm)
             elif self.neft:
+                    current_alpha = self.neft_alpha
+                    if self.noise_scheduler is not None:
+                        current_alpha = self.noise_scheduler.get_noise()
+
                     epsilon = torch.empty_like(embeddings).uniform_(-1, 1).detach()
-                    scaled_noise = (self.neft_alpha / math.sqrt(embeddings.shape[0] * embeddings.shape[-1])) * epsilon
+                    scaled_noise = (current_alpha / math.sqrt(embeddings.shape[0] * embeddings.shape[-1])) * epsilon
                     embeddings = embeddings + scaled_noise
         return embeddings
 

@@ -7,7 +7,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
-from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
+from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding, NoiseSchedulerConfig
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.transformer.enums import AttnMaskType, ModelType
@@ -43,6 +43,7 @@ class GPTModel(LanguageModule):
         noise_positonal_embedding (bool, optional): Add noise to positional embedding. Defaults to False.
         adversarial_training (bool, optional): Adversarial training. Defaults to False.
         adversarial_training_epsilon (float, optional): Adversarial training scaling factor. Defaults to 0.01.
+        noise_scheduler_config (Optional[dict], optional): Noise scheduler configuration. Defaults to None.
     """
 
     def __init__(
@@ -69,6 +70,7 @@ class GPTModel(LanguageModule):
         noise_positonal_embedding=False,
         adversarial_training=False,
         adversarial_training_epsilon=0.01,
+        noise_scheduler_config: NoiseSchedulerConfig = None,
     ) -> None:
         super().__init__(config=config)
 
@@ -110,6 +112,7 @@ class GPTModel(LanguageModule):
                 neft=self.neft,
                 neft_alpha=self.neft_alpha,
                 noise_positonal_embedding=self.noise_positonal_embedding,
+                noise_scheduler_config=noise_scheduler_config,
             )
 
         if self.position_embedding_type == 'rope':
@@ -197,7 +200,6 @@ class GPTModel(LanguageModule):
                 inference_params, self.decoder, decoder_input, self.config
             )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
-
         if self.adversarial_training and decoder_input is not None and self.training:
             decoder_input_clone = decoder_input.clone().detach().requires_grad_(True)
 
