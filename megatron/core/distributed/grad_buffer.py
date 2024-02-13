@@ -218,6 +218,16 @@ class GradBuffer:
         self.bucket_indices = []
         per_bucket_numel_unpadded = []
         bucket_id = 0
+
+        def _create_new_bucket(data_end_index: int):
+            nonlocal bucket_data_start_index, bucket_params, bucket_id
+            per_bucket_numel_unpadded.append(data_end_index - bucket_data_start_index)
+            data_end_index = _pad_if_needed(data_end_index)
+            self.bucket_indices.append((bucket_data_start_index, data_end_index))
+            bucket_data_start_index = data_end_index
+            bucket_params = set()
+            bucket_id += 1
+
         for param in params[::-1]:
             # Iterate through parameters in reverse order to roughly follow backprop order,
             # and skip parameters that don't require gradients.
@@ -225,6 +235,21 @@ class GradBuffer:
                 continue
             this_numel = param.data.nelement()
             data_end_index = data_start_index + this_numel
+
+            def _does_param_require_new_bucket(param):
+                # Split shared embedding parameters into separate bucket if using distributed
+                # optimizer that makes use of reduce-scatters instead of all-reduces.
+                # This ensures that the first and last pipeline stage partition optimizer state
+                # for the shared embedding parameters the same way across DP replicas, allowing
+                # the DP reduce-scatter to be before the embedding all-reduce.
+                return getattr(param, "shared_embedding", False) and self.use_distributed_optimizer
+
+            # Create bucket with already collected parameters if current param needs its own bucket.
+            if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
+                # We are creating a bucket for the already accumulated parameters, whose params
+                # end at the current data_start_index.
+                _create_new_bucket(data_start_index)
+
             self.param_index_map[param] = (
                 data_start_index,
                 data_end_index,
@@ -232,33 +257,18 @@ class GradBuffer:
             )
             bucket_params.add(param)
 
-            # If we have enough elements already, form a new bucket.
-            # If bucket_size is None, accumulate everything into a single bucket.
-
-            # TODO: Remove len(bucket_params) > 1 when the final head that transforms token
-            # representations from hidden space to vocabulary space is in a PyTorch module
-            # whose forward method is called. If it is not and a bucket contains only this
-            # one parameter, we get incorrect behavior (i.e., higher losses) since we do not
-            # call the wait function on the bucket's all_gather_handle (we use forward pre-
-            # hooks on PyTorch modules to do this when --overlap-param-gather is used).
-            # As a temporary workaround, we make sure that no bucket has only one parameter.
-            if bucket_size is not None:
-                if (data_end_index - bucket_data_start_index) >= bucket_size and len(
-                    bucket_params
-                ) > 1:
-                    per_bucket_numel_unpadded.append(data_end_index - bucket_data_start_index)
-                    data_end_index = _pad_if_needed(data_end_index)
-                    self.bucket_indices.append((bucket_data_start_index, data_end_index))
-                    bucket_data_start_index = data_end_index
-                    bucket_params = set()
-                    bucket_id += 1
+            # If we have enough elements already or the current param is part of the shared embedding
+            # layer and needs a separate bucket, form a new bucket.
+            if (
+                bucket_size is not None
+                and (data_end_index - bucket_data_start_index) >= bucket_size
+            ) or _does_param_require_new_bucket(param):
+                _create_new_bucket(data_end_index)
             data_start_index = data_end_index
 
         # Add remaining params to a new bucket.
         if len(bucket_params) > 0:
-            per_bucket_numel_unpadded.append(data_end_index - bucket_data_start_index)
-            data_end_index = _pad_if_needed(data_end_index)
-            self.bucket_indices.append((bucket_data_start_index, data_end_index))
+            _create_new_bucket(data_end_index)
 
         # Next, create underlying storage for buffer (with numel elements that includes
         # padding as necessary).
@@ -304,11 +314,6 @@ class GradBuffer:
                 numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
                 bucket_id=cur_bucket_id,
             )
-
-        if not overlap_grad_reduce:
-            assert len(bucket_params) == len(
-                params
-            ), 'All params should be in one bucket when overlap_grad_reduce is False'
 
         # Log buckets for all PP stages.
         if (
