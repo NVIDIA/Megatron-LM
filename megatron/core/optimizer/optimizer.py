@@ -1,21 +1,20 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron optimizer."""
 
-from abc import ABC
-from abc import abstractmethod
-from apex.multi_tensor_apply import multi_tensor_applier
+import math
+from abc import ABC, abstractmethod
+from logging import getLogger
+
 import amp_C
 import torch
-import math
+from apex.multi_tensor_apply import multi_tensor_applier
 
-from megatron import get_timers
-from megatron import print_rank_0
-from megatron.core import mpu, tensor_parallel
-from megatron.model import Float16Module
-from megatron.model.module import param_is_not_shared
-
+from .. import parallel_state, tensor_parallel
+from ..transformer.module import param_is_not_shared
 from .clip_grads import clip_grad_norm_fp32, count_zeros_fp32
+
+logger = getLogger(__name__)
 
 
 def _zero_grad_group_helper(group, set_to_none):
@@ -93,7 +92,7 @@ class MegatronOptimizer(ABC):
 
     def get_model_parallel_group(self):
         """Default returned here, but the distributed optimizer overrides this."""
-        return mpu.get_model_parallel_group()
+        return parallel_state.get_model_parallel_group()
 
     def clip_grad_norm(self, clip_grad, check_for_nan_in_grad):
         params = self.get_parameters()
@@ -524,20 +523,20 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         optimizer_key = 'optimizer'
         if optimizer_key not in state_dict:
             optimizer_key = 'optimizer_state_dict'
-            print_rank_0('***WARNING*** loading optimizer from ' 'an old checkpoint ...')
+            logger.info('***WARNING*** loading optimizer from ' 'an old checkpoint ...')
         self.optimizer.load_state_dict(state_dict[optimizer_key])
 
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
             if self.fp16:
-                print_rank_0(
+                logger.info(
                     '***WARNING*** found an old checkpoint, will not ' 'load grad scaler ...'
                 )
         else:
             if self.grad_scaler:
                 self.grad_scaler.load_state_dict(state_dict['grad_scaler'])
             else:
-                print_rank_0(
+                logger.info(
                     '***WARNING*** fould the grad scaler in the '
                     'checkpoint but it is None in the class. '
                     'Skipping loading grad scaler ...'
@@ -690,7 +689,7 @@ class ChainedOptimizer(MegatronOptimizer):
         Args:
             filename (str): path to save parameter state to.
         """
-        data_parallel_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
+        data_parallel_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
 
         states = []
         for optimizer in self.chained_optimizers:
@@ -708,7 +707,7 @@ class ChainedOptimizer(MegatronOptimizer):
         Args:
             filename (str): path to load parameter state from.
         """
-        data_parallel_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
+        data_parallel_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
         num_of_optimizers = len(self.chained_optimizers)
         if data_parallel_rank == 0:
             states = torch.load(filename)

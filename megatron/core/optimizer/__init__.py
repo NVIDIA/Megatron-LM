@@ -1,24 +1,19 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from apex.optimizers import FusedAdam as Adam
 from apex.optimizers import FusedSGD as SGD
 
-from megatron import get_args
-
 from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
-from .optimizer import (
-    Float16OptimizerWithFloat16Params,
-    FP32Optimizer,
-    ChainedOptimizer,
-)
+from .optimizer import ChainedOptimizer, Float16OptimizerWithFloat16Params, FP32Optimizer
+from .optimizer_config import OptimizerConfig
 
 
 def get_param_groups(model_chunks, no_weight_decay_cond, scale_lr_cond, lr_mult):
     """Create parameter groups for optimizer.
 
     Creates parameter groups based on weight decay condition (regularized vs
-    non regularized), learning rate scale condition (args.lr vs lr_mult * args.lr),
+    non regularized), learning rate scale condition (lr vs lr_mult * lr),
     and whether it is expert parameters. scale_lr_cond is used during finetuning
     where head of the network requires a scaled version of the base learning rate.
 
@@ -89,7 +84,7 @@ def get_param_groups(model_chunks, no_weight_decay_cond, scale_lr_cond, lr_mult)
     return param_groups
 
 
-def get_megatron_optimizer_based_on_param_groups(param_groups, grad_buffers=None):
+def get_megatron_optimizer_based_on_param_groups(config, param_groups, grad_buffers=None):
     """Get megatron optimizer based on parameter groups.
 
     For distributed optimizer, we need the parameter gradients to be stored in a
@@ -99,22 +94,23 @@ def get_megatron_optimizer_based_on_param_groups(param_groups, grad_buffers=None
         param_groups (list): list of parameter groups.
         grad_buffers (list, optional): list of gradient buffers. Defaults to None.
     """
-    args = get_args()
-
-    if args.optimizer == 'adam':
+    if config.optimizer == 'adam':
         optimizer = Adam(
             param_groups,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            betas=(args.adam_beta1, args.adam_beta2),
-            eps=args.adam_eps,
+            lr=config.lr,
+            weight_decay=config.weight_decay,
+            betas=(config.adam_beta1, config.adam_beta2),
+            eps=config.adam_eps,
         )
-    elif args.optimizer == 'sgd':
+    elif config.optimizer == 'sgd':
         optimizer = SGD(
-            param_groups, lr=args.lr, weight_decay=args.weight_decay, momentum=args.sgd_momentum
+            param_groups,
+            lr=config.lr,
+            weight_decay=config.weight_decay,
+            momentum=config.sgd_momentum,
         )
     else:
-        raise Exception('{} optimizer is not supported.'.format(args.optimizer))
+        raise Exception('{} optimizer is not supported.'.format(config.optimizer))
 
     # Determine whether the params have main-grad field.
     params_have_main_grad = True
@@ -122,7 +118,7 @@ def get_megatron_optimizer_based_on_param_groups(param_groups, grad_buffers=None
     # If it is expert parameters, we do not use the distributed optimizer.
     # TODO: enable support for distributed optimizer with expert parameters
     # (need to support DistOpt across process group with size dp_size / ep_size).
-    use_distributed_optimizer = args.use_distributed_optimizer and not any(
+    use_distributed_optimizer = config.use_distributed_optimizer and not any(
         [pg['is_expert_parallel'] for pg in param_groups]
     )
 
@@ -130,7 +126,7 @@ def get_megatron_optimizer_based_on_param_groups(param_groups, grad_buffers=None
     # - Note: both the Float16Optimizer and the DistributedOptimizer inherit
     #   from the MixedPrecisionOptimizer, which manages any optimizer where
     #   the model params and main params are distinct.
-    if args.fp16 or args.bf16 or use_distributed_optimizer:
+    if config.fp16 or config.bf16 or use_distributed_optimizer:
 
         # Grad scaler:
         #    if loss-scale is provided, instantiate the constant scaler.
@@ -141,34 +137,36 @@ def get_megatron_optimizer_based_on_param_groups(param_groups, grad_buffers=None
         grad_scaler = None
 
         # Constant loss scale.
-        if args.loss_scale:
-            grad_scaler = ConstantGradScaler(args.loss_scale)
+        if config.loss_scale:
+            grad_scaler = ConstantGradScaler(config.loss_scale)
 
         # Dynamic loss scale.
         else:
-            if args.fp16:
+            if config.fp16:
                 grad_scaler = DynamicGradScaler(
-                    initial_scale=args.initial_loss_scale,
-                    min_scale=args.min_loss_scale,
+                    initial_scale=config.initial_loss_scale,
+                    min_scale=config.min_loss_scale,
                     growth_factor=2.0,
                     backoff_factor=0.5,
-                    growth_interval=args.loss_scale_window,
-                    hysteresis=args.hysteresis,
+                    growth_interval=config.loss_scale_window,
+                    hysteresis=config.hysteresis,
                 )
 
         optimizer_args = [
             optimizer,
-            args.clip_grad,
-            args.log_num_zeros_in_grad,
-            args.check_for_nan_in_loss_and_grad,
+            config.clip_grad,
+            config.log_num_zeros_in_grad,
+            config.check_for_nan_in_loss_and_grad,
             params_have_main_grad,
-            args.fp16,
-            args.bf16,
-            args.params_dtype,
+            config.fp16,
+            config.bf16,
+            config.params_dtype,
             grad_scaler,
         ]
         if use_distributed_optimizer:
-            optimizer = DistributedOptimizer(*optimizer_args, grad_buffers)
+            optimizer = DistributedOptimizer(
+                *optimizer_args, grad_buffers, config.overlap_param_gather
+            )
         else:
             optimizer = Float16OptimizerWithFloat16Params(*optimizer_args)
 
@@ -177,15 +175,15 @@ def get_megatron_optimizer_based_on_param_groups(param_groups, grad_buffers=None
     # FP32.
     return FP32Optimizer(
         optimizer,
-        args.clip_grad,
-        args.log_num_zeros_in_grad,
-        args.check_for_nan_in_loss_and_grad,
+        config.clip_grad,
+        config.log_num_zeros_in_grad,
+        config.check_for_nan_in_loss_and_grad,
         params_have_main_grad,
     )
 
 
 def get_megatron_optimizer(
-    model_chunks, no_weight_decay_cond=None, scale_lr_cond=None, lr_mult=1.0
+    config, model_chunks, no_weight_decay_cond=None, scale_lr_cond=None, lr_mult=1.0
 ):
     """Retrieve the Megatron optimizer for model chunks.
 
@@ -215,10 +213,12 @@ def get_megatron_optimizer(
 
     # Create optimizers.
     optimizers = [
-        get_megatron_optimizer_based_on_param_groups(dense_param_groups, per_model_grad_buffers)
+        get_megatron_optimizer_based_on_param_groups(
+            config, dense_param_groups, per_model_grad_buffers
+        )
     ]
     if len(moe_param_groups):
-        optimizers.append(get_megatron_optimizer_based_on_param_groups(moe_param_groups))
+        optimizers.append(get_megatron_optimizer_based_on_param_groups(config, moe_param_groups))
 
     if len(optimizers) == 1:
         return optimizers[0]
