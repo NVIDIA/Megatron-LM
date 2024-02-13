@@ -35,6 +35,10 @@ def _get_extra_te_kwargs(config: TransformerConfig):
     return extra_transformer_engine_kwargs
 
 
+def condition_init_method(config, init_method):
+    return init_method if config.perform_initialization else (lambda w: None)
+
+
 class TENorm:
     """
     A conditional wrapper to initialize an instance of Transformer-Engine's
@@ -129,7 +133,7 @@ class TELinear(te.pytorch.Linear):
             tp_group=get_tensor_model_parallel_group(check_initialized=False),
             tp_size=self.config.tensor_model_parallel_size,
             get_rng_state_tracker=get_cuda_rng_tracker,
-            init_method=init_method,
+            init_method=condition_init_method(config, init_method),
             bias=bias,
             return_bias=self.te_return_bias,
             parallel_mode=parallel_mode,
@@ -220,7 +224,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             tp_group=get_tensor_model_parallel_group(check_initialized=False),
             tp_size=self.config.tensor_model_parallel_size,
             get_rng_state_tracker=get_cuda_rng_tracker,
-            init_method=init_method,
+            init_method=condition_init_method(config, init_method),
             bias=bias,
             return_bias=self.te_return_bias,
             parallel_mode="column",
@@ -279,7 +283,7 @@ class TEColumnParallelLinear(TELinear):
             output_size=output_size,
             parallel_mode="column",
             config=config,
-            init_method=init_method,
+            init_method=condition_init_method(config, init_method),
             bias=bias,
             skip_bias_add=skip_bias_add,
             skip_weight_param_allocation=skip_weight_param_allocation,
@@ -326,7 +330,7 @@ class TERowParallelLinear(TELinear):
             output_size=output_size,
             parallel_mode="row",
             config=config,
-            init_method=init_method,
+            init_method=condition_init_method(config, init_method),
             bias=bias,
             skip_bias_add=skip_bias_add,
             skip_weight_param_allocation=False,  # We don't currently use this for row parallel layers
