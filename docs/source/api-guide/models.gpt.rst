@@ -5,14 +5,6 @@ This is the implementation of the popular GPT model. It supports several feature
 Submodules
 ----------
 
-models.gpt.gpt\_embedding module
---------------------------------
-
-.. automodule:: core.models.gpt.gpt_embedding
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
 models.gpt.gpt\_model module
 ----------------------------
 
