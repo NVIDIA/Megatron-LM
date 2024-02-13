@@ -96,7 +96,8 @@ def load_plugin(plugin_type, name):
         module_name = name
         try:
             plugin = importlib.import_module(module_name)
-        except ModuleNotFoundError:
+        except ModuleNotFoundError as e:
+            print(f"Exception: {e}")
             sys.exit(f"Unable to load {plugin_type} plugin {name}. Exiting.")
 
     if not hasattr(plugin, 'add_arguments'):
