@@ -1,17 +1,16 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Gradient clipping."""
 
 import os
 
+import amp_C
 import torch
+from apex.multi_tensor_apply import multi_tensor_applier
 from torch import inf
 
-from apex.multi_tensor_apply import multi_tensor_applier
-import amp_C
-
-from megatron.model.module import param_is_not_shared
-from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
+from ..tensor_parallel import param_is_not_tensor_parallel_duplicate
+from ..transformer.module import param_is_not_shared
 
 
 def clip_grad_norm_fp32(
