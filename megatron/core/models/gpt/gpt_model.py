@@ -44,6 +44,13 @@ class GPTModel(LanguageModule):
         adversarial_training (bool, optional): Adversarial training. Defaults to False.
         adversarial_training_epsilon (float, optional): Adversarial training scaling factor. Defaults to 0.01.
         noise_scheduler_config (Optional[dict], optional): Noise scheduler configuration. Defaults to None.
+        cre_adversarial_training (bool, optional): Contextualized representation adversarial training. Defaults to False.
+        creat_init_var (float, optional): Contextualized representation adversarial training initial variance. Used to scale the initial adversarial perturbation. Defaults to 0.01.
+        creat_num_adv_steps (int, optional): Contextualized representation adversarial training number of adversarial steps. Used to refine the adversarial perturbation. Defaults to 2.
+        creat_adv_temp (float, optional): Contextualized representation adversarial training adversarial temperature. Used to control the strength of the adversarial perturbation. Defaults to 1.0.
+        creat_lambda (float, optional): Contextualized representation adversarial training lambda. Used to balance the adversarial loss and the original loss. Defaults to 0.5.
+        creat_lr (float, optional): Contextualized representation adversarial training learning rate. Used to scale the gradient of the adversarial perturbation. Defaults to 0.1.
+        crear_max_norm (float, optional): Contextualized representation adversarial training max norm. Used to clip the adversarial perturbation. Defaults to 0.1.
     """
 
     def __init__(
@@ -71,6 +78,13 @@ class GPTModel(LanguageModule):
         adversarial_training=False,
         adversarial_training_epsilon=0.01,
         noise_scheduler_config: NoiseSchedulerConfig = None,
+        cre_adversarial_training=False,
+        creat_init_var=1e-2,
+        creat_num_adv_steps=2,
+        creat_adv_temp=1.0,
+        creat_lambda=0.5,
+        creat_lr=0.1,
+        crear_max_norm=0.1,
     ) -> None:
         super().__init__(config=config)
 
@@ -94,6 +108,14 @@ class GPTModel(LanguageModule):
         
         self.adversarial_training = adversarial_training
         self.adversarial_training_epsilon = adversarial_training_epsilon
+
+        self.cre_adversarial_training = cre_adversarial_training
+        self.creat_init_var = creat_init_var
+        self.creat_num_adv_steps = creat_num_adv_steps
+        self.creat_adv_temp = creat_adv_temp
+        self.creat_lambda = creat_lambda
+        self.creat_lr = creat_lr
+        self.crear_max_norm = crear_max_norm
 
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
@@ -246,7 +268,58 @@ class GPTModel(LanguageModule):
 
         loss = self.compute_language_model_loss(labels, logits)
 
+        if self.cre_adversarial_training and self.training:
+            cos_sim = torch.nn.CosineSimilarity(dim=-1)
+            delta = torch.zeros_like(decoder_input).normal_(0, 1) * self.creat_init_var
+            delta.requires_grad_()
+            for j in range(self.creat_num_adv_steps):
+                hidden_states_p = self.decoder(
+                    hidden_states=decoder_input + delta,
+                    attention_mask=attention_mask,
+                    inference_params=inference_params,
+                    rotary_pos_emb=rotary_pos_emb,
+                    **(extra_block_kwargs or {}),
+                )
+                if self.share_embeddings_and_output_weights:
+                    output_weight = self.shared_embedding_or_output_weight()
+
+                logits_p, _ = self.output_layer(hidden_states_p, weight=output_weight)
+                loss_p = self.compute_language_model_loss(labels, logits_p)
+
+                # No need to compute loss and gradients for the last step
+                if j == self.creat_num_adv_steps - 1:
+                    break
+
+                cos_loss_p = cos_sim(hidden_states_p, hidden_states.detach()).transpose(0, 1)
+                loss_p = loss_p - cos_loss_p * self.creat_adv_temp
+                delta = self._inner_update(delta, loss_p)
+                delta.requires_grad_()
+            loss = loss_p * self.creat_lambda + loss * (1 - self.creat_lambda)
+
         return loss
+
+    def _inner_update(self, delta, loss):
+        loss = loss.transpose(0, 1).sum(-1).mean()
+        delta_grad, = torch.autograd.grad(loss, delta, retain_graph=True, create_graph=True)
+        _shape = None
+        if delta.dim() > 3:
+            # e.g. multi-choice
+            _shape = delta.shape
+            delta, delta_grad = delta.view(-1, _shape[-2], _shape[-1]), delta_grad.view(-1, _shape[-2], _shape[-1])
+
+        grad_norm = torch.norm(delta_grad.view(delta_grad.shape[0], -1), dim=-1, p="fro")
+        grad_norm = torch.clamp(grad_norm, min=1e-8).view(-1, 1, 1)
+        delta = (delta + self.creat_lr * delta_grad / grad_norm).detach()
+
+        delta_norm = torch.norm(delta.view(delta.shape[0], -1), dim=-1, p="fro").detach()
+        clip_mask = (delta_norm > self.crear_max_norm).to(delta)
+        clip_weights = self.crear_max_norm / delta_norm * clip_mask + (1 - clip_mask)
+        delta = (delta * clip_weights.view(-1, 1, 1)).detach()
+
+        if _shape is not None:
+            delta = delta.view(_shape)
+
+        return delta
 
     def sharded_state_dict(self, prefix: str = '') -> dict:
         sharded_state_dict = {}
