@@ -21,7 +21,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
 
@@ -73,11 +73,13 @@ def _get_block_submodules(
     if isinstance(spec, TransformerBlockSubmodules):
         return spec
 
-    # ModuleSpec here is generally assumed to be for a transformer layer.
+    # ModuleSpec here is generally assumed to be for a transformer layer that
+    # is implemented in `transformer_layer.py` or if it subclasses
+    # `BaseTransformerLayer` from the `transformer_layer.py` file.
     elif isinstance(spec, ModuleSpec):
         if issubclass(spec.module, TransformerBlock):
             return spec.submodules
-        elif issubclass(spec.module, TransformerLayer):
+        elif issubclass(spec.module, BaseTransformerLayer):
             num_layers = get_num_layers_to_build(config)
             return TransformerBlockSubmodules(layer_specs=[spec] * num_layers)
         else:
