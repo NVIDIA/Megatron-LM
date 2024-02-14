@@ -9,5 +9,6 @@ API Guide
    pipeline_parallel
    fusions
    transformer
+   moe
    dist_checkpointing
    distributed
