@@ -50,7 +50,7 @@ class GPTModel(LanguageModule):
         creat_adv_temp (float, optional): Contextualized representation adversarial training adversarial temperature. Used to control the strength of the adversarial perturbation. Defaults to 1.0.
         creat_lambda (float, optional): Contextualized representation adversarial training lambda. Used to balance the adversarial loss and the original loss. Defaults to 0.5.
         creat_lr (float, optional): Contextualized representation adversarial training learning rate. Used to scale the gradient of the adversarial perturbation. Defaults to 0.1.
-        crear_max_norm (float, optional): Contextualized representation adversarial training max norm. Used to clip the adversarial perturbation. Defaults to 0.1.
+        creat_max_norm (float, optional): Contextualized representation adversarial training max norm. Used to clip the adversarial perturbation. Defaults to 0.1.
     """
 
     def __init__(
@@ -84,7 +84,7 @@ class GPTModel(LanguageModule):
         creat_adv_temp=1.0,
         creat_lambda=0.5,
         creat_lr=0.1,
-        crear_max_norm=0.1,
+        creat_max_norm=0.1,
     ) -> None:
         super().__init__(config=config)
 
@@ -115,7 +115,7 @@ class GPTModel(LanguageModule):
         self.creat_adv_temp = creat_adv_temp
         self.creat_lambda = creat_lambda
         self.creat_lr = creat_lr
-        self.crear_max_norm = crear_max_norm
+        self.creat_max_norm = creat_max_norm
 
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
@@ -312,8 +312,8 @@ class GPTModel(LanguageModule):
         delta = (delta + self.creat_lr * delta_grad / grad_norm).detach()
 
         delta_norm = torch.norm(delta.view(delta.shape[0], -1), dim=-1, p="fro").detach()
-        clip_mask = (delta_norm > self.crear_max_norm).to(delta)
-        clip_weights = self.crear_max_norm / delta_norm * clip_mask + (1 - clip_mask)
+        clip_mask = (delta_norm > self.creat_max_norm).to(delta)
+        clip_weights = self.creat_max_norm / delta_norm * clip_mask + (1 - clip_mask)
         delta = (delta * clip_weights.view(-1, 1, 1)).detach()
 
         if _shape is not None:
