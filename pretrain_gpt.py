@@ -86,7 +86,7 @@ def get_batch(data_iterator):
         return None, None, None, None, None
 
     # get batches based on the TP rank you are on
-    batch = get_batch_on_this_tp_rank(data_iterator) 
+    batch = get_batch_on_this_tp_rank(data_iterator)
 
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
@@ -99,7 +99,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     Args:
         loss_mask (torch.Tensor): Used to mask out some portions of the loss
         output_tensor (torch.Tensor): The tensor with the losses
-    """    
+    """
     args = get_args()
 
     losses = output_tensor.float()
