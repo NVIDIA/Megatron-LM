@@ -300,7 +300,14 @@ class GPTModel(LanguageModule):
 
     def _inner_update(self, delta, loss):
         loss = loss.transpose(0, 1).sum(-1).mean()
-        delta_grad, = torch.autograd.grad(loss, delta, retain_graph=True, create_graph=True)
+        if delta.grad is not None:
+            delta.grad.zero_()
+    
+    # Compute gradients using backward
+        loss.backward(retain_graph=True, create_graph=True)
+    
+    # Extract the computed gradient from delta
+        delta_grad = delta.grad
         _shape = None
         if delta.dim() > 3:
             # e.g. multi-choice
@@ -318,7 +325,7 @@ class GPTModel(LanguageModule):
 
         if _shape is not None:
             delta = delta.view(_shape)
-
+        delta.grad.zero_()
         return delta
 
     def sharded_state_dict(self, prefix: str = '') -> dict:
