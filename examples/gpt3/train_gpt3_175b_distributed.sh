@@ -12,11 +12,11 @@ NUM_NODES=1
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 
-CHECKPOINT_PATH=$0 #<Specify path>
-TENSORBOARD_LOGS_PATH=$1 #<Specify path>
-VOCAB_FILE=$2 #<Specify path to file>/gpt2-vocab.json
-MERGE_FILE=$3 #<Specify path to file>/gpt2-merges.txt
-DATA_PATH=$4 #<Specify path and file prefix>_text_document
+CHECKPOINT_PATH=$1 #<Specify path>
+TENSORBOARD_LOGS_PATH=$2 #<Specify path>
+VOCAB_FILE=$3 #<Specify path to file>/gpt2-vocab.json
+MERGE_FILE=$4 #<Specify path to file>/gpt2-merges.txt
+DATA_PATH=$5 #<Specify path and file prefix>_text_document
 
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE 
