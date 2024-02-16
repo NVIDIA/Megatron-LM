@@ -120,7 +120,6 @@ options="${options} \
         --zero-stage=${ZERO_STAGE} \
         --deepspeed-activation-checkpointing \
 "
-
 if [[ ${ZERO_STAGE} -gt 1 ]]; then
 options="${options} \
     --no-pipeline-parallel"

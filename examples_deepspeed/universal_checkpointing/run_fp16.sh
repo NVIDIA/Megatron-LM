@@ -54,7 +54,7 @@ RUN_TAG="save"
 
 EXP_DIR="z${ZERO_STAGE}_uni_ckpt" 
 CHECKPOINT_PATH=${EXP_DIR}/checkpoints/gpt2/z${ZERO_STAGE}/$DTYPE/tp${TP}_pp${PP}_dp${DP}_sp${SP}_${SIZE_TAG}
-LOAD_CHECKPOINT_PATH=${EXP_DIR}/checkpoints/gpt2/z${ZERO_STAGE}/$DTYPE/tp${LOAD_TP}_pp${LOAD_PP}_dp${LOAD_DP}_${LOAD_SP}_${SIZE_TAG}
+LOAD_CHECKPOINT_PATH=${EXP_DIR}/checkpoints/gpt2/z${ZERO_STAGE}/$DTYPE/tp${LOAD_TP}_pp${LOAD_PP}_dp${LOAD_DP}_sp${LOAD_SP}_${SIZE_TAG}
 LOG_DIR="${EXP_DIR}/tensorboard/$DTYPE/tp${TP}_pp${PP}_dp${DP}_sp${SP}_hd${HIDDEN}_nl${LAYERS}_gbsz${GLOBAL_BATCH}_mbsz${MICRO_BATCH}_z${ZERO_STAGE}_LR_${LR}_${MIN_LR}_${DTYPE}_${SIZE_TAG}_${RUN_TAG}"
 mkdir -p $LOG_DIR
 
@@ -120,7 +120,6 @@ options="${options} \
         --zero-stage=${ZERO_STAGE} \
         --deepspeed-activation-checkpointing \
 "
-
 if [[ ${ZERO_STAGE} -gt 1 ]]; then
 options="${options} \
     --no-pipeline-parallel"
@@ -157,6 +156,7 @@ WORKER_STR="--num_nodes 1 --num_gpus $WORLD_SIZE"
 run_cmd="deepspeed --master_port 29700 $WORKER_STR ${DIR}/pretrain_gpt.py $@ ${options}"
 
 
+echo ${options}
 echo ${run_cmd}
 eval ${run_cmd}
 

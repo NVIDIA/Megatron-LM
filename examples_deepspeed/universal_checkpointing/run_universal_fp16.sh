@@ -17,12 +17,12 @@ ZERO_STAGE=1
 DTYPE="fp16"
 
 # Debug
-DEBUG_MODE=1 
+DEBUG_MODE=1
 if [[ $DEBUG_MODE == 1 ]]; then
         LAYERS=4
         HIDDEN=512
         SEQ=512
-        EXIT_INTERVAL=100
+        EXIT_INTERVAL=200
         SIZE_TAG="toy"
 else
         HIDDEN=1024
@@ -156,6 +156,7 @@ WORKER_STR="--num_nodes 1 --num_gpus $WORLD_SIZE"
 run_cmd="deepspeed --master_port 29700 $WORKER_STR ${DIR}/pretrain_gpt.py $@ ${options}"
 
 
+echo ${options}
 echo ${run_cmd}
 eval ${run_cmd}
 
