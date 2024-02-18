@@ -54,6 +54,7 @@ class Attention(MegatronModule, ABC):
         super().__init__(config=config)
 
         self.config = config
+        self.submodules = submodules
         self.layer_number = layer_number
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
@@ -70,6 +71,8 @@ class Attention(MegatronModule, ABC):
         )
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
+
+        self._build_linear_qkv()
 
         self.core_attention = build_module(
             submodules.core_attention,
@@ -225,6 +228,12 @@ class Attention(MegatronModule, ABC):
         return key, value, rotary_pos_emb, attn_mask_type
 
     @abstractmethod
+    def _build_linear_qkv(self):
+        """
+        This method builds special qkv modules required for derived class.
+        """
+
+    @abstractmethod
     def get_query_key_value_tensors(self, hidden_states, key_value_states):
         """
         This method needs to be implemented based on whether the derived class
@@ -349,8 +358,13 @@ class SelfAttention(Attention):
             attention_type="self",
         )
 
+    def _build_linear_qkv(self):
+        """
+        build linear_qkv
+        """
+
         self.linear_qkv = build_module(
-            submodules.linear_qkv,
+            self.submodules.linear_qkv,
             self.config.hidden_size,
             self.query_projection_size + 2 * self.kv_projection_size,
             config=self.config,
@@ -426,6 +440,11 @@ class CrossAttention(Attention):
             attention_type="cross",
         )
 
+    def _build_linear_qkv(self):
+        """
+        Build linear_q and linear_kv
+        """
+
         if self.config.num_query_groups != self.config.num_attention_heads:
             raise ValueError(
                 f"Group query attention is not currently supported in cross attention."
@@ -433,7 +452,7 @@ class CrossAttention(Attention):
         assert self.query_projection_size == self.kv_projection_size
 
         self.linear_q = build_module(
-            submodules.linear_q,
+            self.submodules.linear_q,
             self.config.hidden_size,
             self.query_projection_size,
             config=self.config,
@@ -445,7 +464,7 @@ class CrossAttention(Attention):
         )
 
         self.linear_kv = build_module(
-            submodules.linear_kv,
+            self.submodules.linear_kv,
             self.config.hidden_size,
             2 * self.kv_projection_size,
             config=self.config,
