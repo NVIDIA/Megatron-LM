@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from contextlib import contextmanager
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 
@@ -44,6 +44,7 @@ class DistributedDataParallel(MegatronModule):
         accumulate_allreduce_grads_in_fp32: bool,
         overlap_grad_reduce: bool,
         use_distributed_optimizer: bool,
+        expert_data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         disable_bucketing: bool = False,
         bucket_size: int = 40000000,
     ):
@@ -68,53 +69,75 @@ class DistributedDataParallel(MegatronModule):
         self.bucket_size = bucket_size
 
         self.module = module
-        self.grad_buffers = {}
-        self.expert_grads = []
-        self.grad_buffer_param_index_map = {}
         self.param_to_grad_buffer = {}
 
         # Group parameters by their gradient type.
-        grad_dtype_to_params = {}
         param_to_name = {}
+        dense_params = []
+        expert_parallel_params = []
         for name, param in self.module.named_parameters():
-            if param.requires_grad and getattr(param, 'allreduce', True):
-                param.grad_added_to_main_grad = False
-                param_to_name[param] = name
+            if not param.requires_grad:
+                continue
+
+            param.grad_added_to_main_grad = False
+            param_to_name[param] = name
+
+            if getattr(param, 'allreduce', True):
+                dense_params.append(param)
+            else:
+                expert_parallel_params.append(param)
+
+        def allocate_grad_buffers_for_parameters(
+            input_params, data_parallel_group, gradient_scaling_factor=1.0,
+        ):
+            grad_dtype_to_params = {}
+
+            # Group parameters by their gradient type.
+            for param in input_params:
+                if not param.requires_grad:
+                    continue
+
                 dtype = torch.float if accumulate_allreduce_grads_in_fp32 else param.dtype
 
                 params = grad_dtype_to_params.get(dtype, [])
                 params.append(param)
                 grad_dtype_to_params[dtype] = params
 
-        # Allocate the grad buffers and map the grads.
-        # The grad buffer under the hood creates buckets as appropriate based on bucket_size.
-        self.data_parallel_world_size = torch.distributed.get_world_size(group=data_parallel_group)
-        for dtype, params in grad_dtype_to_params.items():
-            self.grad_buffers[dtype] = GradBuffer(
-                dtype,
-                params,
-                data_parallel_group,
-                bucket_size,
-                param_to_name,
-                self.overlap_grad_reduce,
-                self.use_distributed_optimizer,
-            )
-            self.grad_buffer_param_index_map[dtype] = self.grad_buffers[dtype].param_index_map
-            for param in params:
-                self.param_to_grad_buffer[param] = self.grad_buffers[dtype]
-
-        # Allocate separate buffer for MoE params' grads.
-        for param in self.module.parameters():
-            if param.requires_grad and not getattr(param, 'allreduce', True):
-                param.grad_added_to_main_grad = False
-                dtype = torch.float if accumulate_allreduce_grads_in_fp32 else param.dtype
-                param.main_grad = torch.zeros(
-                    param.data.shape,
-                    dtype=dtype,
-                    device=torch.cuda.current_device(),
-                    requires_grad=False,
+            # Allocate the grad buffers and map the grads.
+            grad_buffers = []
+            for dtype, params in grad_dtype_to_params.items():
+                grad_buffers.append(
+                    GradBuffer(
+                        dtype,
+                        params,
+                        data_parallel_group,
+                        bucket_size,
+                        param_to_name,
+                        self.overlap_grad_reduce,
+                        self.use_distributed_optimizer,
+                        gradient_scaling_factor=gradient_scaling_factor,
+                    )
                 )
-                self.expert_grads.append(param.main_grad)
+                for param in params:
+                    self.param_to_grad_buffer[param] = grad_buffers[-1]
+
+            return grad_buffers
+
+        data_parallel_world_size = torch.distributed.get_world_size(data_parallel_group)
+
+        # Allocate the grad buffers for dense params' grads.
+        self.grad_buffers = allocate_grad_buffers_for_parameters(
+            dense_params,
+            data_parallel_group,
+            gradient_scaling_factor=1.0 / data_parallel_world_size,
+        )
+
+        # Allocate separate grad buffers for expert parallel params' grads.
+        self.expert_parallel_grad_buffers = allocate_grad_buffers_for_parameters(
+            expert_parallel_params,
+            expert_data_parallel_group,
+            gradient_scaling_factor=1.0 / data_parallel_world_size,
+        )
 
         # Register backward hook.
         # Accumulation function for the gradients need to be stored so they
@@ -163,12 +186,12 @@ class DistributedDataParallel(MegatronModule):
         """
         Context manager that turns off gradient synchronization.
         """
-        for grad_buffer in self.grad_buffers.values():
+        for grad_buffer in self.grad_buffers + self.expert_parallel_grad_buffers:
             grad_buffer.is_last_microbatch = False
         try:
             yield
         finally:
-            for grad_buffer in self.grad_buffers.values():
+            for grad_buffer in self.grad_buffers + self.expert_parallel_grad_buffers:
                 grad_buffer.is_last_microbatch = True
 
     def start_grad_sync(self, *unused):
@@ -180,7 +203,7 @@ class DistributedDataParallel(MegatronModule):
         calls. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
         """
-        for grad_buffer in self.grad_buffers.values():
+        for grad_buffer in self.grad_buffers + self.expert_parallel_grad_buffers:
             grad_buffer.start_grad_sync()
 
     def finish_grad_sync(self):
@@ -192,11 +215,8 @@ class DistributedDataParallel(MegatronModule):
         calls to complete. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
         """
-        for grad_buffer in self.grad_buffers.values():
+        for grad_buffer in self.grad_buffers + self.expert_parallel_grad_buffers:
             grad_buffer.finish_grad_sync()
-
-        for expert_grad in self.expert_grads:
-            expert_grad /= self.data_parallel_world_size
 
     def zero_grad_buffer(self, zero_buffer):
         """
@@ -208,21 +228,28 @@ class DistributedDataParallel(MegatronModule):
         for param in self.module.parameters():
             if param.requires_grad:
                 param.grad_added_to_main_grad = False
-        for grad_buffer in self.grad_buffers.values():
+        for grad_buffer in self.grad_buffers + self.expert_parallel_grad_buffers:
             grad_buffer.reset(zero_buffer)
-        for expert_grad in self.expert_grads:
-            expert_grad.zero_()
 
     def broadcast_params(self):
         """
         Syncs parameters across all DP ranks.
         """
         for param in self.module.parameters():
-            torch.distributed.broadcast(
-                param.data,
-                src=parallel_state.get_data_parallel_src_rank(with_context_parallel=True),
-                group=parallel_state.get_data_parallel_group(with_context_parallel=True),
-            )
+            is_expert_parallel = not getattr(param, 'allreduce', True)
+
+            if is_expert_parallel:
+                torch.distributed.broadcast(
+                    param.data,
+                    src=torch.distributed.get_process_group_ranks(self.expert_data_parallel_group),
+                    group=self.expert_data_parallel_group,
+                )
+            else:
+                torch.distributed.broadcast(
+                    param.data,
+                    src=torch.distributed.get_process_group_ranks(self.data_parallel_group),
+                    group=self.data_parallel_group,
+                )
 
     def state_dict(self, prefix='', keep_vars=False):
         """
