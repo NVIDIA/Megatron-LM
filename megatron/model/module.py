@@ -10,9 +10,9 @@ from megatron import get_args
 from megatron.core import mpu, tensor_parallel
 
 
-_FLOAT_TYPES = (torch.FloatTensor, get_accelerator().FloatTensor)
-_HALF_TYPES = (torch.HalfTensor, get_accelerator().HalfTensor)
-_BF16_TYPES = (torch.BFloat16Tensor, get_accelerator().BFloat16Tensor)
+_FLOAT_TYPES = [get_accelerator().FloatTensor(0).dtype]
+_HALF_TYPES = [get_accelerator().HalfTensor(0).dtype]
+_BF16_TYPES = [get_accelerator().BFloat16Tensor(0).dtype]
 
 
 
@@ -135,7 +135,7 @@ def fp32_to_float16(val, float16_convertor):
         val_typecheck = val
         if isinstance(val_typecheck, (Parameter, Variable)):
             val_typecheck = val.data
-        if isinstance(val_typecheck, _FLOAT_TYPES):
+        if val_typecheck.dtype in _FLOAT_TYPES:
             val = float16_convertor(val)
         return val
     return conversion_helper(val, half_conversion)
@@ -147,7 +147,7 @@ def float16_to_fp32(val):
         val_typecheck = val
         if isinstance(val_typecheck, (Parameter, Variable)):
             val_typecheck = val.data
-        if isinstance(val_typecheck, (_BF16_TYPES, _HALF_TYPES)):
+        if val_typecheck.dtype in _BF16_TYPES + _HALF_TYPES:
             val = val.float()
         return val
     return conversion_helper(val, float_conversion)
