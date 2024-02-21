@@ -1,0 +1,66 @@
+# Training job submission via AML CLI v2
+
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+
+command: >-
+  bash examples/pretrain-allam/training/allam-7bv5-en-ar/run.sh \
+   ${{inputs.pretrained_model_path}} \
+   ${{inputs.tokenizer_model_path}} \
+   ${{inputs.bin_idx_data_dir}} \
+   ${{outputs.data_cache}} \
+   ${{outputs.checkpoint_dir}} \
+   ${{outputs.checkpoint_dir}} 
+
+display_name: allam-7bv5-en-ar
+
+experiment_name: pretrain-allam
+code: ../../../../
+environment: azureml:Allam-MegatronLM:2
+environment_variables:
+  HYDRA_FULL_ERROR: '1'
+  UCX_IB_PCI_RELAXED_ORDERING: 'auto'
+  NCCL_IB_PCI_RELAXED_ORDERING: '2'
+  NCCL_IB_TIMEOUT: '22'
+  NCCL_DEBUG: WARN
+  CUDA_DEVICE_MAX_CONNECTIONS: '1'
+inputs:
+  pretrained_model_path:
+    type: uri_file
+    mode: ro_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/megatronlm_models/allam-7b-alpha/megatron/combined_iter_0105000_iter_0200000_iter_0460000_iter_0615000_tp1_pp1/
+  tokenizer_model_path:
+    type: uri_file
+    mode: ro_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llm_data/paths/data_repo/tokenize_by_v5_improved/tokenizer/ar_en.model
+  bin_idx_data_dir:
+    type: uri_folder
+    mode: ro_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llm_data/paths/data_repo/tokenize_by_v5_improved/meglm_tok_v5_improved_bin_idx/
+outputs:
+  data_cache:
+    type: uri_folder
+    mode: rw_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/allam_index_mapped_data_allamllmuksstandard/paths/allam-7bv5-en-ar/
+  checkpoint_dir:
+    type: uri_folder
+    mode: rw_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/allam_checkpoints_allamllmuksstandard/paths/allam-7bv5-en-ar/
+
+
+services:
+  my_jupyterlab:
+    type: jupyter_lab
+  my_tensorboard:
+    type: tensor_board
+    log_dir: ${{outputs.checkpoint_dir}}
+
+compute: azureml:NCAI-A100-LLMv5
+
+distribution:
+  type: pytorch
+  process_count_per_instance: 8
+
+resources:
+  instance_count: 16
+  shm_size: 1250g
+  docker_args: "--volume=/home/azureuser/allamlustre/tokenize_by_v5_improved:/eph/nvme0/allam/bin_idx_data"

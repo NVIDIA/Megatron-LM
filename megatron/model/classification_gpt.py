@@ -6,11 +6,10 @@ import torch
 
 from megatron import get_args, print_rank_last
 from megatron.model.enums import AttnMaskType
-from megatron.model.bert_model import bert_extended_attention_mask, bert_position_ids
 from megatron.model.language_model import get_language_model
+from megatron.model.bert_model import bert_extended_attention_mask
 from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal
-from megatron.model.utils import scaled_init_method_normal
 from .module import MegatronModule
 
 
@@ -19,7 +18,7 @@ class Classification(MegatronModule):
     def __init__(self,
                  config,
                  num_classes,
-                 num_tokentypes=2,
+                 num_tokentypes=0,
                  pre_process=True,
                  post_process=True):
         super().__init__(config=config, share_embeddings_and_output_weights=False)
@@ -32,13 +31,13 @@ class Classification(MegatronModule):
             config.init_method = init_method_normal(config.init_method_std)
         self.language_model, self._language_model_key = get_language_model(
             config=config,
-            num_tokentypes=num_tokentypes,
-            add_pooler=True,
-            encoder_attn_mask_type=AttnMaskType.padding,
+            num_tokentypes=0,
+            add_pooler=False,
+            encoder_attn_mask_type=AttnMaskType.causal,
             pre_process=self.pre_process,
             post_process=self.post_process)
 
-        # Multi-choice head.
+        # Classifications head.
         if self.post_process:
             self.classification_dropout = torch.nn.Dropout(args.hidden_dropout)
             self.classification_head = get_linear_layer(args.hidden_size,
@@ -51,20 +50,32 @@ class Classification(MegatronModule):
         self.language_model.set_input_tensor(input_tensor)
 
     def forward(self, model_input, attention_mask, tokentype_ids=None):
-
-        extended_attention_mask = bert_extended_attention_mask(attention_mask)
+        
         input_ids = model_input
-        position_ids = bert_position_ids(input_ids)
+        batch_size, seq_length = input_ids.shape
+        
+        position_ids = torch.arange(seq_length, dtype=torch.long,
+                                device=input_ids.device)
+        position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
 
+        # build and combine padding and causal masks
+        padding_attention_mask = bert_extended_attention_mask(attention_mask)
+        causal_attention_mask = torch.triu(torch.ones((seq_length, seq_length), 
+                                                      dtype=torch.bool, device=input_ids.device),
+                                                      diagonal=1)
+        causal_attention_mask = causal_attention_mask.unsqueeze(0).unsqueeze(0)
+        causal_attention_mask = causal_attention_mask.expand(batch_size,-1,-1,-1)
+        attention_mask = causal_attention_mask & padding_attention_mask
+        
         lm_output = self.language_model(
             input_ids,
-            position_ids,
-            extended_attention_mask,
-            tokentype_ids=tokentype_ids
+            position_ids, 
+            attention_mask,
+            tokentype_ids=None
         )
-
         if self.post_process:
-            _, pooled_output = lm_output
+            # feed the final token representation to classification head
+            pooled_output = lm_output[-1]
             classification_output = self.classification_dropout(pooled_output)
             classification_logits = self.classification_head(classification_output)
 

@@ -5,14 +5,13 @@
 from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_tokenizer
-from megatron.model.classification import Classification
+from megatron.model.classification_gpt import Classification
 from tasks.eval_utils import accuracy_func_provider
 from tasks.finetune_utils import finetune
 from megatron.arguments import core_transformer_config_from_args
+from tasks.filter.data import FilterDataset
 
-
-def glue_classification(num_classes, Dataset,
-                        name_from_datapath_func):
+def filter_classification(num_classes, Dataset, name_from_datapath_func):
 
     def train_valid_datasets_provider():
         """Build train and validation dataset."""
@@ -39,7 +38,7 @@ def glue_classification(num_classes, Dataset,
         return model
 
     def metrics_func_provider():
-        """Privde metrics callback function."""
+        """Provide metrics callback function."""
         def single_dataset_provider(datapath):
             args = get_args()
             tokenizer = get_tokenizer()
@@ -50,32 +49,17 @@ def glue_classification(num_classes, Dataset,
 
     """Finetune/evaluate."""
     finetune(train_valid_datasets_provider, model_provider,
-             end_of_epoch_callback_provider=metrics_func_provider)
+             end_of_epoch_callback_provider=metrics_func_provider,
+             eval_callback_provider=metrics_func_provider)
 
 
 def main():
     args = get_args()
 
-    if args.task == 'MNLI':
+    num_classes = 2    
 
-        num_classes = 3
-        from tasks.glue.mnli import MNLIDataset as Dataset
+    def name_from_datapath(datapath):
+        return datapath.split('FILTER')[-1].strip(
+            '.json').strip('/').replace('_', '-')
 
-        def name_from_datapath(datapath):
-            return datapath.split('MNLI')[-1].strip(
-                '.tsv').strip('/').replace('_', '-')
-
-    elif args.task == 'QQP':
-
-        num_classes = 2
-        from tasks.glue.qqp import QQPDataset as Dataset
-
-        def name_from_datapath(datapath):
-            return datapath.split('QQP')[-1].strip(
-                '.tsv').strip('/').replace('_', '-')
-
-    else:
-        raise NotImplementedError('GLUE task {} is not implemented.'.format(
-            args.task))
-
-    glue_classification(num_classes, Dataset, name_from_datapath)
+    filter_classification(num_classes, FilterDataset, name_from_datapath)
