@@ -41,6 +41,9 @@ class Bucket:
             is used instead.
         use_distributed_optimizer: If true, issue reduce-scatter communication calls as part
             of distributed optimizer. If false, issue all-reduce communication calls.
+        gradient_scaling_factor: This factor is utilized to scale gradients prior to their
+            communication. Its application is twofold: it facilitates the averaging of gradients
+            and the scaling of gradients in the context of the Mixture of Experts (MoE) model.
     """
 
     def __init__(
@@ -53,6 +56,7 @@ class Bucket:
         data_parallel_world_size: int,
         overlap_grad_reduce: bool,
         use_distributed_optimizer: bool,
+        gradient_scaling_factor: float,
     ):
         # State for bookkeeping: params is the set of parameters this bucket is
         # responsible for, params_with_grad is the set of parameters with grads
@@ -71,6 +75,7 @@ class Bucket:
         self.data_parallel_rank = torch.distributed.get_rank(group=data_parallel_group)
         self.overlap_grad_reduce = overlap_grad_reduce
         self.use_distributed_optimizer = use_distributed_optimizer
+        self.gradient_scaling_factor = gradient_scaling_factor
 
         self.reset()
 
@@ -95,7 +100,7 @@ class Bucket:
             self.communication_handle is None and not self.communication_issued
         ), 'Should not have multiple communication calls in flight at once'
 
-        self.data /= self.data_parallel_world_size
+        self.data *= self.gradient_scaling_factor
         # Use async_op only when overlap_grad_reduce is True.
         if self.use_distributed_optimizer:
             local_data_view = shard_buffer(self.data, self.data_parallel_world_size)[
@@ -165,6 +170,9 @@ class GradBuffer:
             is used instead.
         use_distributed_optimizer: If true, issue reduce-scatter communication calls as part
             of distributed optimizer. If false, issue all-reduce communication calls.
+        gradient_scaling_factor: This factor is utilized to scale gradients prior to their
+            communication. Its application is twofold: it facilitates the averaging of gradients
+            and the scaling of gradients in the context of the Mixture of Experts (MoE) model.
     """
 
     def __init__(
@@ -176,6 +184,7 @@ class GradBuffer:
         param_to_name: Dict[torch.nn.Parameter, str],
         overlap_grad_reduce: bool,
         use_distributed_optimizer: bool,
+        gradient_scaling_factor: float,
     ):
 
         # Check that params are unique.
@@ -193,6 +202,7 @@ class GradBuffer:
         )
         self.overlap_grad_reduce = overlap_grad_reduce
         self.use_distributed_optimizer = use_distributed_optimizer
+        self.gradient_scaling_factor = gradient_scaling_factor
         self.is_last_microbatch = True
 
         # Data structures to store underlying buckets and relevant indexing data.
@@ -373,6 +383,7 @@ class GradBuffer:
             data_parallel_world_size=self.data_parallel_world_size,
             overlap_grad_reduce=self.overlap_grad_reduce,
             use_distributed_optimizer=self.use_distributed_optimizer,
+            gradient_scaling_factor=self.gradient_scaling_factor,
         )
         self.buckets.append(bucket)
         for bucket_param in bucket_params:

@@ -10,6 +10,9 @@ import amp_C
 import torch
 from apex.multi_tensor_apply import multi_tensor_applier
 
+from megatron.core import tensor_parallel
+from megatron.model.module import param_is_not_shared
+
 from .. import parallel_state, tensor_parallel
 from ..transformer.module import param_is_not_shared
 from .clip_grads import clip_grad_norm_fp32, count_zeros_fp32
@@ -689,16 +692,23 @@ class ChainedOptimizer(MegatronOptimizer):
         Args:
             filename (str): path to save parameter state to.
         """
-        data_parallel_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
-
+        save_states = False
         states = []
         for optimizer in self.chained_optimizers:
             if hasattr(optimizer, 'get_parameter_state'):
-                states.append(optimizer.get_parameter_state())
+                state_dict = optimizer.get_parameter_state()
+
+                # Save checkpoint economically, only when DP rank = 0, state dict
+                # needs to be saved.
+                if torch.distributed.get_rank(optimizer.data_parallel_group) == 0:
+                    states.append(state_dict)
+                    save_states = True
+                else:
+                    states.append(None)
             else:
                 states.append(None)
 
-        if data_parallel_rank == 0:
+        if save_states:
             torch.save(states, filename)
 
     def load_parameter_state(self, filename):
@@ -707,20 +717,17 @@ class ChainedOptimizer(MegatronOptimizer):
         Args:
             filename (str): path to load parameter state from.
         """
-        data_parallel_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
-        num_of_optimizers = len(self.chained_optimizers)
-        if data_parallel_rank == 0:
-            states = torch.load(filename)
-        else:
-            states = [None] * num_of_optimizers
+        states = None
+        for idx, optimizer in enumerate(self.chained_optimizers):
+            if not hasattr(optimizer, 'load_parameter_state_from_state_dict'):
+                continue
 
-        assert len(states) == num_of_optimizers, (
-            "Number of optimizers in " "checkpoint does not match number of optimizers in model."
-        )
+            # Lazy loading checkpoint, state dict is needed only when DP rank = 0.
+            if torch.distributed.get_rank(optimizer.data_parallel_group) == 0 and states is None:
+                states = torch.load(filename)
 
-        for optimizer, state in zip(self.chained_optimizers, states):
-            if hasattr(optimizer, 'load_parameter_state_from_state_dict'):
-                optimizer.load_parameter_state_from_state_dict(state)
+            state_dict = states[idx] if states else None
+            optimizer.load_parameter_state_from_state_dict(state_dict)
 
     def finish_param_sync(self, model_index):
         """Finish parameter synchronization for all optimizers.
