@@ -1066,21 +1066,6 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                                   elapsed_time_per_iteration, args.consumed_train_samples)
                 writer.add_scalar('iteration-time/iteration-time vs tokens',
                                   elapsed_time_per_iteration, args.consumed_train_tokens)
-            if wandb is not None and getattr(wandb, 'run', None) is not None:
-                wandb_metrics |= {
-                    'iteration': iteration,
-                    'iteration_time': elapsed_time_per_iteration,
-                    'iteration_time_vs_tokens': (
-                        (elapsed_time_per_iteration
-                            / args.consumed_train_tokens)
-                    ),
-                    'iteration_time_vs_samples': (
-                        (elapsed_time_per_iteration
-                            / args.consumed_train_samples),
-                    ),
-                }
-        if wandb is not None and getattr(wandb, 'run', None) is not None:
-            wandb.log(wandb_metrics)
         log_string = ' iteration {:8d}/{:8d} |'.format(
             iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(
@@ -1091,6 +1076,21 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             elapsed_time_per_iteration * 1000.0)
         log_string += ' learning rate: {:.3E} |'.format(learning_rate)
         log_string += ' global batch size: {:5d} |'.format(batch_size)
+        if wandb is not None and getattr(wandb, 'run', None) is not None:
+            wandb_metrics |= {
+                'training/iteration': iteration,
+                'training/iteration_time': elapsed_time_per_iteration,
+                'training/iteration_time_vs_tokens': (
+                    (elapsed_time_per_iteration
+                        / args.consumed_train_tokens)
+                ),
+                'training/iteration_time_vs_samples': (
+                    (elapsed_time_per_iteration
+                        / args.consumed_train_samples),
+                ),
+                'training/consumed_samples': args.consumed_train_samples,
+                'training/consumed_tokens': args.consumed_train_tokens,
+            }
         for key in total_loss_dict:
             if key not in [advanced_iters_key, skipped_iters_key,
                            nan_iters_key]:
@@ -1099,6 +1099,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                 if avg > 0.0:
                     log_string += ' {}: {:.6E} |'.format(key, avg)
                 total_loss_dict[key] = get_accelerator().FloatTensor([0.0])
+        if wandb is not None and getattr(wandb, 'run', None) is not None:
+            wandb.log(wandb_metrics)
         if loss_scale is not None:
             log_string += ' loss scale: {:.1f} |'.format(loss_scale)
         if grad_norm is not None:
