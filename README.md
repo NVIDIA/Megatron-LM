@@ -1,40 +1,27 @@
-Megatron ([1](https://arxiv.org/pdf/1909.08053.pdf), [2](https://arxiv.org/pdf/2104.04473.pdf), and [3](https://arxiv.org/pdf/2205.05198)) is a large, powerful transformer developed by the Applied Deep Learning Research team at NVIDIA. This repository is for ongoing research related to training large transformer language models at scale. We developed efficient, model-parallel ([tensor](https://arxiv.org/pdf/1909.08053.pdf), [sequence](https://arxiv.org/pdf/2205.05198), and [pipeline](https://arxiv.org/pdf/2104.04473.pdf)), and multi-node pre-training of transformer based models such as [GPT](https://arxiv.org/abs/2005.14165), [BERT](https://arxiv.org/pdf/1810.04805.pdf), and [T5](https://arxiv.org/abs/1910.10683) using mixed precision.
+<div align="center">
 
-Below are some of the projects where we have directly used Megatron:
-* [BERT and GPT Studies Using Megatron](https://arxiv.org/pdf/1909.08053.pdf)
-* [BioMegatron: Larger Biomedical Domain Language Model](https://www.aclweb.org/anthology/2020.emnlp-main.379.pdf)
-* [End-to-End Training of Neural Retrievers for Open-Domain Question Answering](https://arxiv.org/abs/2101.00408)
-* [Large Scale Multi-Actor Generative Dialog Modeling](https://www.aclweb.org/anthology/2020.acl-main.8.pdf)
-* [Local Knowledge Powered Conversational Agents](https://arxiv.org/abs/2010.10150)
-* [MEGATRON-CNTRL: Controllable Story Generation with External Knowledge Using Large-Scale Language Models](https://www.aclweb.org/anthology/2020.emnlp-main.226.pdf)
-* [RACE Reading Comprehension Dataset Leaderboard](http://www.qizhexie.com/data/RACE_leaderboard.html)
-* [Training Question Answering Models From Synthetic Data](https://www.aclweb.org/anthology/2020.emnlp-main.468.pdf)
-* [Few-shot Instruction Prompts for Pretrained Language Models to Detect Social Biases](https://arxiv.org/abs/2112.07868)
-* [Exploring the Limits of Domain-Adaptive Training for Detoxifying Large-Scale Language Models](https://arxiv.org/abs/2202.04173)
-* [Using DeepSpeed and Megatron to Train Megatron-Turing NLG 530B, A Large-Scale Generative Language Model](https://arxiv.org/abs/2201.11990)
-* [Multi-Stage Prompting for Knowledgeable Dialogue Generation](https://arxiv.org/abs/2203.08745)
-* [Evaluating Parameter Efficient Learning for Generation](https://aclanthology.org/2022.emnlp-main.319.pdf)
-* [Exploring the Limits of Domain-Adaptive Training for Detoxifying Large-Scale Language Models](https://arxiv.org/abs/2202.04173)
-* [Shall We Pretrain Autoregressive Language Models with Retrieval? A Comprehensive Study](https://arxiv.org/abs/2304.06762)
-* [InstructRetro: Instruction Tuning post Retrieval-Augmented Pretraining](https://arxiv.org/abs/2310.07713)
+Megatron-Core
+===========================
+<h4> A library of GPU optimized techniques for training transformer models at-scale</h4>
 
-Megatron is also used in [NeMo Megatron](https://developer.nvidia.com/nvidia-nemo#nemo-megatron), a framework to help enterprises overcome the challenges of building and training sophisticated natural language processing models with billions and trillions of parameters.
+[![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)]()
+[![python](https://img.shields.io/badge/python-3.10.12-green)](https://www.python.org/downloads/release/python-31012/)
+[![cuda](https://img.shields.io/badge/cuda-12.2-green)](https://developer.nvidia.com/cuda-downloads)
+[![version](https://img.shields.io/badge/release-0.5.0-green)](./setup.py)
+[![license](https://img.shields.io/badge/license-Apache%202-blue)](./LICENSE)
 
-Our codebase is capable of efficiently training very large (hundreds of billions of parameters) language models with both model and data parallelism. To demonstrate how the code scales with multiple GPUs and model sizes, we consider GPT models from 1 billion all the way to 1 trillion parameters. All models use a vocabulary size of 51,200 and a sequence length of 2048. We vary hidden size, number of attention heads, and number of layers to arrive at a specific model size. As the model size increases, we also modestly increase the batch size. We leverage [NVIDIA's Selene supercomputer](https://www.top500.org/system/179842/) to perform scaling studies and use up to 3072 [A100](https://www.nvidia.com/en-us/data-center/a100/) GPUs for the largest model. Each cluster node has 8 NVIDIA 80GB A100 GPUs. The graph below shows that we scale nearly linear up to 1 trillion parameter models running on 3072 GPUs. Note that these results are from benchmark runs and these models were not trained to convergence; however, the FLOPs are measured for end-to-end training, i.e., includes all operations including data loading, optimization, and even logging.
+[Architecture](./docs/source/architecture.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Results](./docs/source/performance.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Examples](./examples/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentation](./docs/source/)
 
-![Scaling Graph](images/Achieved_petaFLOPs.png)
+## Latest News
+- **[2024/1 Announcement]** Nvidia has productized the core capabilities in **Megatron-LM** into [**Megatron-Core**](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core) within this repository. Megatron-Core, a newly released open-source PyTorch-based library, expands upon Megatron-LM's GPU-optimized techniques with more cutting-edge innovations on system-level optimizations, featuring composable and modular APIs. Explore the [Megatron-Core intro](https://chat.openai.com/c/8d742b58-eba2-4488-bf84-2e626b91dab4#what-is-megatron-core) for more details.
 
-The following table shows both model (MFU) and hardware (HFU) FLOPs utilization for select configurations up to 1T parameters (see [our paper](https://arxiv.org/pdf/2205.05198) for a description of how these are calculated). As the model size increases, we achieve better GPU utilization. For the one trillion parameter model, we reach a MFU and HFU of 56.3% and 57.0%, respectively. Note that these numbers are also measured on benchmark runs and in this case are measured using a data parallel size of one. Data parallelism introduces some overhead due to the gradient all-reduce required between the data parallel groups. However, for large transformer models, this overhead is not large and can almost entirely eliminated by overlapping the gradient all-reduce with backpropagation.
 
-| Model Size | Model FLOPs Utilization | Hardware FLOPs Utilization |
-| :---: | :---: | :---: |
-| 22B   | 41.5% | 43.7% |
-| 175B  | 51.4% | 52.8% |
-| 530B  | 56.0% | 57.0% |
-| 1T    | 56.3% | 57.0% |
-
-# Contents
-   * [Contents](#contents)
+## Table of Contents
+   * [Intro](#intro)
+	   * [Megatron-Core](#what-is-megatron-core)
+	   * [History of Megatron-LLM](#history-of-megatron-llm)
+	   * [Megatron-Core v.s. Megatron-LLM](#megatron-core-vs-megatron-llm)
+   * [Performance](#performance)
    * [Setup](#setup)
       * [Downloading Checkpoints](#downloading-checkpoints)
    * [Usage](#usage)
@@ -62,6 +49,33 @@ The following table shows both model (MFU) and hardware (HFU) FLOPs utilization 
       * [Collecting Wikipedia Training Data](#collecting-wikipedia-training-data)
       * [Collecting GPT Webtext Data](#collecting-gpt-webtext-data)
    * [Reproducibility](#reproducibility)
+   * [Projects using Megatron](#projects-using-megatron)
+
+## Intro
+### What is Megatron-Core
+Megatron-Core is a newly released open-source PyTorch-based library that further expands the collections of GPU optimized techniques inherited from Megatron-LM with more cutting-edge innovations on system-level optimizations. It abstracts them into composable and modular APIs, allowing full flexibility for developers and model researchers to train custom transformers at-scale on NVIDIA accelerated computing infrastructure. This library is compatible with all NVIDIA Tensor Core GPUs, including FP8 acceleration support for NVIDIA Hopper architectures.
+
+Megatron-Core offers the core building blocks such as attention mechanisms, transformer blocks and layers, normalization layers, and embedding techniques. Additional functionality like activation recomputation, distributed checkpointing is also natively built-in to the library. The building blocks and functionality are all GPU optimized, and can be built with advanced parallelization strategies for optimal performance and stability on NVIDIA Accelerated Computing Infrastructure. Another key component of the Megatron-Core library includes advanced model parallelism techniques  ([tensor](https://arxiv.org/pdf/1909.08053.pdf), [sequence](https://arxiv.org/pdf/2205.05198), and [pipeline](https://arxiv.org/pdf/2104.04473.pdf)). Currently, popular LLM model architectures based on Decoder (ex. [GPT](https://arxiv.org/abs/2005.14165), Llama), Encoder (ex. [BERT](https://arxiv.org/pdf/1810.04805.pdf)), Encoder-Decoder (ex. [T5](https://arxiv.org/abs/1910.10683)), Retrieval Enhanced Transformers (ex. RETRO), and Mixture of Experts (MoE) can easily be built with performance and efficiency at large compute scales. Developers can also use Megatron-Core's transformer blocks and functional APIs to build their own custom layers.
+
+### History of Megatron-LLM
+First introduced in 2019, Megatron ([1](https://arxiv.org/pdf/1909.08053.pdf), [2](https://arxiv.org/pdf/2104.04473.pdf), and [3](https://arxiv.org/pdf/2205.05198)) sparked a wave of innovation in the AI community, enabling researchers and developers to utilize the underpinnings of this library to further large language model (LLM) advancements. Today, many of the most popular LLM developer frameworks have been inspired by and built directly leveraging the open-source Megatron-LM library, spurring a wave of foundation models and AI startups. Some of the most popular LLM frameworks built on top of Megatron-LM include [Colossal-AI](https://github.com/hpcaitech/ColossalAI), [HuggingFace Accelerate](https://github.com/huggingface/accelerate), and [NVIDIA NeMo Framework](https://www.nvidia.com/en-us/ai-data-science/generative-ai/nemo-framework/).  Going forward, this repository will house Nvidia's latest product, [Megatron-Core](#what-is-megatron-core), within the core module. Ongoing research for training large transformer language models at scale will remain part of this repository. A list of projects that have directly used Megatron can be found [here](#projects-using-megatron). 
+
+### Megatron-Core v.s. Megatron-LLM
+As core training capabilities have been moved into Megatron-Core with formal product support, we recommend users to use Megatron-LLM only as a lightweight reference framework including training loop and dataloaders for using Megatron-Core to build your own LLM framework. Our recommendation is to use Megatron-Core with [Nvidia NeMo Framework](https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/main/nlp/nemo_megatron/mcore_customization.html), an end-to-end, cloud-native framework to build, customize, and deploy generative AI models. Alternatively, we encourage you to directly incorporate Megatron-Core's building blocks into your training framework of choice and avoid forking Megatron-Core for easiest upgrade to SOTA training techniques.
+
+## Performance
+Our codebase is capable of efficiently training very large (hundreds of billions of parameters) language models with both model and data parallelism. To demonstrate how the code scales with multiple GPUs and model sizes, we consider GPT models from 1 billion all the way to 1 trillion parameters. All models use a vocabulary size of 51,200 and a sequence length of 2048. We vary hidden size, number of attention heads, and number of layers to arrive at a specific model size. As the model size increases, we also modestly increase the batch size. We leverage [NVIDIA's Selene supercomputer](https://www.top500.org/system/179842/) to perform scaling studies and use up to 3072 [A100](https://www.nvidia.com/en-us/data-center/a100/) GPUs for the largest model. Each cluster node has 8 NVIDIA 80GB A100 GPUs. The graph below shows that we scale nearly linear up to 1 trillion parameter models running on 3072 GPUs. Note that these results are from benchmark runs and these models were not trained to convergence; however, the FLOPs are measured for end-to-end training, i.e., includes all operations including data loading, optimization, and even logging.
+
+![Scaling Graph](images/Achieved_petaFLOPs.png)
+
+The following table shows both model (MFU) and hardware (HFU) FLOPs utilization for select configurations up to 1T parameters (see [our paper](https://arxiv.org/pdf/2205.05198) for a description of how these are calculated). As the model size increases, we achieve better GPU utilization. For the one trillion parameter model, we reach a MFU and HFU of 56.3% and 57.0%, respectively. Note that these numbers are also measured on benchmark runs and in this case are measured using a data parallel size of one. Data parallelism introduces some overhead due to the gradient all-reduce required between the data parallel groups. However, for large transformer models, this overhead is not large and can almost entirely eliminated by overlapping the gradient all-reduce with backpropagation.
+
+| Model Size | Model FLOPs Utilization | Hardware FLOPs Utilization |
+| :---: | :---: | :---: |
+| 22B   | 41.5% | 43.7% |
+| 175B  | 51.4% | 52.8% |
+| 530B  | 56.0% | 57.0% |
+| 1T    | 56.3% | 57.0% |    
 
 # Setup
 We strongly recommend using the latest release of [NGC's PyTorch container](https://ngc.nvidia.com/catalog/containers/nvidia:pytorch) with DGX nodes. If you can't use this for some reason, use the latest pytorch, cuda, nccl, and NVIDIA [APEX](https://github.com/NVIDIA/apex#quick-start) releases.  Data preprocessing requires [NLTK](https://www.nltk.org/install.html), though this is not required for training, evaluation, or downstream tasks.
@@ -538,3 +552,22 @@ There are currently two known Megatron optimizations that break reproducibility 
 2. Flash attention is nondeterministic. If reproducibility is required do not use `--use-flash-attn`.
 
 These sources of nondeterminism are under active investigation. If you observe nondeterminism in Megatron training under other circumstances please open an issue.
+
+## Projects Using Megatron
+Below are some of the projects where we have directly used Megatron:
+* [BERT and GPT Studies Using Megatron](https://arxiv.org/pdf/1909.08053.pdf)
+* [BioMegatron: Larger Biomedical Domain Language Model](https://www.aclweb.org/anthology/2020.emnlp-main.379.pdf)
+* [End-to-End Training of Neural Retrievers for Open-Domain Question Answering](https://arxiv.org/abs/2101.00408)
+* [Large Scale Multi-Actor Generative Dialog Modeling](https://www.aclweb.org/anthology/2020.acl-main.8.pdf)
+* [Local Knowledge Powered Conversational Agents](https://arxiv.org/abs/2010.10150)
+* [MEGATRON-CNTRL: Controllable Story Generation with External Knowledge Using Large-Scale Language Models](https://www.aclweb.org/anthology/2020.emnlp-main.226.pdf)
+* [RACE Reading Comprehension Dataset Leaderboard](http://www.qizhexie.com/data/RACE_leaderboard.html)
+* [Training Question Answering Models From Synthetic Data](https://www.aclweb.org/anthology/2020.emnlp-main.468.pdf)
+* [Few-shot Instruction Prompts for Pretrained Language Models to Detect Social Biases](https://arxiv.org/abs/2112.07868)
+* [Exploring the Limits of Domain-Adaptive Training for Detoxifying Large-Scale Language Models](https://arxiv.org/abs/2202.04173)
+* [Using DeepSpeed and Megatron to Train Megatron-Turing NLG 530B, A Large-Scale Generative Language Model](https://arxiv.org/abs/2201.11990)
+* [Multi-Stage Prompting for Knowledgeable Dialogue Generation](https://arxiv.org/abs/2203.08745)
+* [Evaluating Parameter Efficient Learning for Generation](https://aclanthology.org/2022.emnlp-main.319.pdf)
+* [Exploring the Limits of Domain-Adaptive Training for Detoxifying Large-Scale Language Models](https://arxiv.org/abs/2202.04173)
+* [Shall We Pretrain Autoregressive Language Models with Retrieval? A Comprehensive Study](https://arxiv.org/abs/2304.06762)
+* [InstructRetro: Instruction Tuning post Retrieval-Augmented Pretraining](https://arxiv.org/abs/2310.07713)
