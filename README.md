@@ -12,6 +12,8 @@ Megatron-Core
 
 [Architecture](./docs/source/architecture.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Results](./docs/source/performance.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Examples](./examples/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentation](./docs/source/)
 
+---
+<div align="left">
 ## Latest News
 - **[2024/1 Announcement]** Nvidia has productized the core capabilities in **Megatron-LM** into [**Megatron-Core**](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core) within this repository. Megatron-Core, a newly released open-source PyTorch-based library, expands upon Megatron-LM's GPU-optimized techniques with more cutting-edge innovations on system-level optimizations, featuring composable and modular APIs. Explore the [Megatron-Core intro](https://chat.openai.com/c/8d742b58-eba2-4488-bf84-2e626b91dab4#what-is-megatron-core) for more details.
 
