@@ -22,7 +22,7 @@ python3 examples_deepspeed/universal_checkpointing/tb_analysis/tb_analysis_scrip
 python3 examples_deepspeed/universal_checkpointing/tb_analysis/tb_analysis_script.py \
     --tb_dir $OUTPUT_PATH \
     --tb_event_key "lm-loss-validation/lm loss validation" \
-    --csv_name "val" \
+    --csv_name "val_" \
     --plot_name "uc_char_validation_loss.png" \
     --plot_title "Megatron-GPT Universal Checkpointing - Validation Loss" \
     --plot_y_label "Validation LM Loss" \

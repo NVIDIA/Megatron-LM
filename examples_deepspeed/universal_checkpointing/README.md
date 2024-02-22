@@ -77,6 +77,40 @@ Please see the corresponding [pull request](https://github.com/microsoft/Megatro
 
 Combining sequence parallelism with data parallelism is another good use case for universal checkpointing, see [sp pull request](https://github.com/microsoft/DeepSpeed/pull/4752) for example and visualization of matching loss values.
 
+### TensorBoard Log Analysis
+
+The Universal Checkpointing example includes a TensorBoard analysis script that will generate `csv` files and `png` plots across the unviersal checkpointing training steps for comparison of training and validation loss curves.
+
+After Step 3 is completed, the script may be executed as follows:
+```bash
+bash examples_deepspeed/universal_checkpointing/run_tb_analysis.sh z1_uni_ckpt
+```
+
+The script will output the following `csv` files:
+  - uc_out_tp_2_pp_2_dp_2_sp_1.csv
+  - uc_out_tp_2_pp_2_dp_1_sp_1.csv
+  - val_uc_out_tp_2_pp_2_dp_2_sp_1.csv
+  - val_uc_out_tp_2_pp_2_dp_1_sp_1.csv
+
+The script will also output the following `png` files:
+  - uc_char_training_loss.png
+  - uc_char_validation_loss.png
+
+Below is the visualization of the `png` files generated from this example.
+
+<div align="center">
+  <img src="assets/image/uc_char_training_loss.png" alt="" width="600"/>
+
+  *Figure 1: Training LM loss curve for first 200 training steps of Step 1 (TP=2, PP=2, DP=2) and training steps 101 to 200 of Step 3 (TP=2, PP=2, DP=1), which was loaded using the Universal Checkpoint.*
+</div>
+
+<div align="center">
+  <img src="assets/image/uc_char_validation_loss.png" alt="" width="600"/>
+
+  *Figure 2: Validation LM loss curve for first 200 training steps of Step 1 (TP=2, PP=2, DP=2) and training steps 101 to 200 of Step 3 (TP=2, PP=2, DP=1), which was loaded using the Universal Checkpoint.*
+</div>
+
+
 ## ZeRO stage 2 training 
 Repeat steps in ZeRO stage 1 training above with the following modifications to your job batch scripts:
 * Set ZERO_STAGE=2 
