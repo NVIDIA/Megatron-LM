@@ -12,6 +12,10 @@ import torch
 from megatron import update_num_microbatches
 from megatron.core import mpu, tensor_parallel, dist_checkpointing
 from .core.dist_checkpointing.mapping import ShardedObject
+from .core.dist_checkpointing.strategies.base import get_default_strategy, \
+    StrategyAction
+from .core.dist_checkpointing.strategies.fully_parallel import \
+    FullyParallelSaveStrategyWrapper
 from .global_vars import get_args
 from .utils import (unwrap_model,
                     print_rank_0)
@@ -259,7 +263,7 @@ def get_rng_state(use_dist_ckpt: bool = False):
 
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
-                    num_floating_point_operations_so_far):
+                    num_floating_point_operations_so_far, checkpointing_context=None):
     """Save a model checkpoint."""
     args = get_args()
 
@@ -302,7 +306,20 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 ensure_directory_exists(checkpoint_name,
                                         check_parent=False)
-            dist_checkpointing.save(state_dict, checkpoint_name, (args.dist_ckpt_format, 1))
+            save_strategy = (args.dist_ckpt_format, 1)
+            validate_sharding_integrity = True
+            if args.fully_parallel_save:
+                if checkpointing_context is not None and 'save_strategy' in checkpointing_context:
+                    save_strategy = checkpointing_context['save_strategy']
+                    # Already saved once before - don't need to rerun sharding validation
+                    validate_sharding_integrity = False
+                else:
+                    save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, *save_strategy)
+                    save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, mpu.get_data_parallel_group(with_context_parallel=True))
+                    if checkpointing_context is not None:
+                        checkpointing_context['save_strategy'] = save_strategy
+            dist_checkpointing.save(state_dict, checkpoint_name, save_strategy,
+                                    validate_access_integrity=validate_sharding_integrity)
 
         else:
             # Save.
