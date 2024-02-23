@@ -29,7 +29,7 @@ class MemoryBuffer:
     Usage: After the allocation, the `_start` index is set tot the first
            index of the memory. A memory chunk starting from `_start` index
            can be `allocated` for an input tensor, with the elements of the
-           tensor being coppied. The buffer can be reused by resetting the
+           tensor being copied. The buffer can be reused by resetting the
            `_start` index.
 
     """

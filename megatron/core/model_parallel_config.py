@@ -48,7 +48,7 @@ class ModelParallelConfig:
 
     bf16 (bool): If true, train with bf16 mixed precision training. Defaults to False.
 
-    params_dtype (torch.dtype): dtype used when intializing the weights. Defaults to torch.float32.
+    params_dtype (torch.dtype): dtype used when initializing the weights. Defaults to torch.float32.
 
     timers (optional, default=None): TODO.
 
@@ -63,7 +63,7 @@ class ModelParallelConfig:
         Defaults to False.
 
     async_tensor_model_parallel_allreduce (bool, optional): If true, enables asynchronous execution of
-        tensor-model-parallel all-reduce with weight gradient compuation of a column-linear layer.  Defaults to True.
+        tensor-model-parallel all-reduce with weight gradient computation of a column-linear layer.  Defaults to True.
 
     tp_comm_overlap (bool, optional): If true, allows overlapping of Linear layer execution with tensor parallel
         communication collectives like AllGather/ReduceScatter. Overlapping is done for the linear layers wherever

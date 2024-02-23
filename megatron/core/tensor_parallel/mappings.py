@@ -68,7 +68,7 @@ def _split_along_first_dim(input_):
 
 
 def _gather_along_last_dim(input_):
-    """Gather tensors and concatinate along the last dimension."""
+    """Gather tensors and concatenate along the last dimension."""
 
     world_size = get_tensor_model_parallel_world_size()
     # Bypass the function if we are using only 1 GPU.
@@ -90,7 +90,7 @@ def _gather_along_last_dim(input_):
 
 
 def _gather_along_first_dim(input_):
-    """Gather tensors and concatinate along the first dimension."""
+    """Gather tensors and concatenate along the first dimension."""
 
     world_size = get_tensor_model_parallel_world_size()
     # Bypass the function if we are using only 1 GPU.
@@ -212,7 +212,7 @@ class _ScatterToModelParallelRegion(torch.autograd.Function):
 
 
 class _GatherFromModelParallelRegion(torch.autograd.Function):
-    """Gather the input from model parallel region and concatinate."""
+    """Gather the input from model parallel region and concatenate."""
 
     @staticmethod
     def symbolic(graph, input_):
@@ -244,7 +244,7 @@ class _ScatterToSequenceParallelRegion(torch.autograd.Function):
 
 
 class _GatherFromSequenceParallelRegion(torch.autograd.Function):
-    """Gather the input from sequence parallel region and concatinate."""
+    """Gather the input from sequence parallel region and concatenate."""
 
     @staticmethod
     def symbolic(graph, input_, tensor_parallel_output_grad=True):

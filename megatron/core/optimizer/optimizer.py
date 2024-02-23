@@ -223,7 +223,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if self.grad_scaler is None:
             assert not self.fp16, 'fp16 expects a grad scaler.'
 
-        # Tensor used to determine if a nan/if has happend.
+        # Tensor used to determine if a nan/if has happened.
         # Any non-zero value indicates inf/nan.
         # Note that we keep this for the cases that grad scaler is none.
         # We still record nan/inf if we have a bfloat16 with a grad scaler.

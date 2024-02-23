@@ -135,13 +135,13 @@ class SubPolicy:
             There are fourteen key values altogether (see supported_ops below
             listing supported operations). probability1 (float): Probability
             within [0., 1.] of applying the first augmentation operation.
-            magnitude_idx1 (int): Integer specifiying the strength of the first
+            magnitude_idx1 (int): Integer specifying the strength of the first
             operation as an index further used to derive the magnitude from a
             range of possible values.
             operation2 (str): Key specifying the second augmentation operation.
             probability2 (float): Probability within [0., 1.] of applying the
             second augmentation operation.
-            magnitude_idx2 (int): Integer specifiying the strength of the
+            magnitude_idx2 (int): Integer specifying the strength of the
             second operation as an index further used to derive the magnitude
             from a range of possible values.
             fillcolor (tuple): RGB color components of the color to be used for

@@ -178,7 +178,7 @@ class SequentialMLP(MegatronModule):
             output_bias_local = torch.zeros_like(permuted_local_hidden_states)
 
         cumsum_num_tokens = torch.cumsum(tokens_per_expert, dim=0)
-        # Insert zero at the begining for offset index's convenience
+        # Insert zero at the beginning for offset index's convenience
         zero_tensor = torch.zeros(1, dtype=torch.long)
         cumsum_num_tokens = torch.cat((zero_tensor, cumsum_num_tokens))
         for expert_num, expert in enumerate(self.local_experts):

@@ -17,7 +17,7 @@ class Pooler(MegatronModule):
         hidden_size (int): The hidden size_
         init_method (callable): weight initialization method for the linear layer. bias is set to zero.
         config (TransformerConfig): The transformer configuration
-        sequence_parallel (bool): Using squence parallel ? Defaults to False
+        sequence_parallel (bool): Using sequence parallel ? Defaults to False
     """
 
     def __init__(
@@ -28,7 +28,7 @@ class Pooler(MegatronModule):
         sequence_parallel: bool = False,
     ):
         super(Pooler, self).__init__(config)
-        # TODO: Shoudl switch this to TE ?
+        # TODO: Should switch this to TE ?
         self.dense = get_linear_layer(
             hidden_size, hidden_size, init_method, config.perform_initialization
         )

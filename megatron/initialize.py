@@ -272,7 +272,7 @@ def _init_autoresume():
 
 
 def _set_random_seed(seed_, data_parallel_random_init=False):
-    """Set random seed for reproducability."""
+    """Set random seed for reproducibility."""
     if seed_ is not None and seed_ > 0:
         # Ensure that different pipeline MP stages get different seeds.
         seed = seed_ + (100 * mpu.get_pipeline_model_parallel_rank())
@@ -322,7 +322,7 @@ def set_jit_fusion_options():
 
 
 def _warmup_jit_function():
-    """Compilie JIT functions before the main training steps"""
+    """Compile JIT functions before the main training steps"""
     args = get_args()
     if args.bf16:
         dtype = torch.bfloat16

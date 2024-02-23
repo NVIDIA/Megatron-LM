@@ -24,7 +24,7 @@ def param_is_not_shared(param):
 
 
 class MegatronModule(torch.nn.Module):
-    """Base Megatron module inhertied by all Models.
+    """Base Megatron module inherited by all Models.
 
     Megatron specific extensions of torch Module with support
     for pipelining
@@ -133,7 +133,7 @@ class Float16Module(MegatronModule):
         bf16 (bool) : Specifies if the model runs in bf16 mode
 
     Args:
-        config (TransformerConfig): The transformer config used to initalize the model
+        config (TransformerConfig): The transformer config used to initialize the model
     """
 
     def __init__(self, config: TransformerConfig, module: torch.nn.Module):

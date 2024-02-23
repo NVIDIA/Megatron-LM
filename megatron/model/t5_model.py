@@ -41,7 +41,7 @@ class T5LMHead(MegatronModule):
 
     Arguments:
         mpu_vocab_size: model parallel size of vocabulary.
-        parallel_output: wether output logits being distributed or not.
+        parallel_output: whether output logits being distributed or not.
     """
 
     def __init__(self, mpu_vocab_size, parallel_output):

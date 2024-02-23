@@ -69,7 +69,7 @@ def broadcast_data(keys, data, datatype):
     members of the same model parallel group.
 
     Arguments:
-        keys: list of keys in the data disctionary to be broadcasted
+        keys: list of keys in the data dictionary to be broadcasted
         data: data dictionary of string keys and cpu tensor values.
         datatype: torch data type of all tensors in data associated
                   with keys.

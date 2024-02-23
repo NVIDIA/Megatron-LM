@@ -205,7 +205,7 @@ class SwitchMLP(MegatronModule):
             self.local_experts.append(ParallelMLP(config, is_expert=True))
 
     def gather_indices(self, local_indices):
-        """ Gather tensors and concatinate along the first dimension."""
+        """ Gather tensors and concatenate along the first dimension."""
         group = get_tensor_and_expert_parallel_group()
         world_size = torch.distributed.get_world_size(group=group)
         # Bypass the function if we are using only 1 GPU.
@@ -1174,7 +1174,7 @@ class ParallelTransformerLayer(MegatronModule):
 
         if self.drop_path is None:
             # jit scripting for a nn.module (with dropout) is not
-            # trigerring the fusion kernel. For now, we use two
+            # triggering the fusion kernel. For now, we use two
             # different nn.functional routines to account for varying
             # dropout semantics during training and inference phases.
             if self.bias_dropout_fusion:
@@ -1291,7 +1291,7 @@ class NoopTransformerLayer(MegatronModule):
     deallocating it). Thus, this layer disconnects the input from the output
     via a clone. Since ranks containing a no-op layer are generally under-
     utilized (both compute and memory), there's no worry of any performance
-    degredation.
+    degradation.
     """
 
     def __init__(self, layer_number):

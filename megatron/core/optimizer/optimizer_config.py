@@ -19,7 +19,7 @@ class OptimizerConfig:
 
     bf16 (bool): If true, train with bf16 mixed precision training. Defaults to False.
 
-    params_dtype (torch.dtype): dtype used when intializing the weights. Defaults to torch.float32.
+    params_dtype (torch.dtype): dtype used when initializing the weights. Defaults to torch.float32.
 
 
     General Optimizer

@@ -151,7 +151,7 @@ def pretrain(train_valid_test_dataset_provider,
         1) initialize Megatron.
         2) setup model, optimizer and lr schedule using the model_provider.
         3) call train_val_test_data_provider to get train/val/test datasets.
-        4) train the modle using the forward_step_func.
+        4) train the model using the forward_step_func.
 
     Arguments:
         train_valid_test_dataset_provider: a function that takes the size of
@@ -174,7 +174,7 @@ def pretrain(train_valid_test_dataset_provider,
             to set already parse arguments.
     """
 
-    # Initalize and get arguments, timers, and Tensorboard writer.
+    # Initialize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(extra_args_provider=extra_args_provider,
                         args_defaults=args_defaults)
 
@@ -1299,7 +1299,7 @@ def build_train_valid_test_data_loaders(
     # Backward compatibility, assume fixed batch size.
     if args.iteration > 0 and args.consumed_train_samples == 0:
         assert args.train_samples is None, \
-            'only backward compatiblity support for iteration-based training'
+            'only backward compatibility support for iteration-based training'
         args.consumed_train_samples = args.iteration * args.global_batch_size
     if args.iteration > 0 and args.consumed_valid_samples == 0:
         if args.train_samples is None:

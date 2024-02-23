@@ -172,7 +172,7 @@ def broadcast_list(size, dtype, list_values=None, rank=0):
 
 
 def broadcast_int_list(size, int_list=None, rank=0):
-    """Broadcast a list of interger values."""
+    """Broadcast a list of integer values."""
 
     return broadcast_list(size, torch.int64, list_values=int_list, rank=rank)
 

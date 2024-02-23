@@ -35,7 +35,7 @@ class MaskedWordPieceDatasetConfig(BlendedMegatronDatasetConfig):
         masking_do_permutation (bool): Whether we shuffle a subset of candidate N-grams in addition
         to masking
 
-        masking_use_longer_ngrams (bool): Wehther to favor longer N-grams over shorter N-grams
+        masking_use_longer_ngrams (bool): Whether to favor longer N-grams over shorter N-grams
 
         masking_use_geometric_distribution (bool): Whether to draw the size of the N-gram from a
         geometric distribution according to SpanBERT https://arxiv.org/abs/1907.10529 (Section 3.1)
@@ -281,7 +281,7 @@ class MaskedWordPieceDataset(MegatronDataset):
 
         ngram_nvals = numpy.arange(self.config.masking_max_ngram, dtype=numpy.int64) + 1
 
-        # By default, the N-gram probabilites are inversely proportional to N
+        # By default, the N-gram probabilities are inversely proportional to N
         # e.g. N = 3
         #    -> P = array([0.54545455, 0.27272727, 0.18181818])
         nprobs = 1.0 / ngram_nvals

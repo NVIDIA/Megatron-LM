@@ -12,7 +12,7 @@ from megatron.core import mpu
 
 
 def build_pretraining_data_loader(dataset, consumed_samples):
-    """Buld dataloader given an input dataset."""
+    """Build dataloader given an input dataset."""
 
     if dataset is None:
         return None

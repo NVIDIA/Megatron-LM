@@ -160,7 +160,7 @@ def model_parallel_cuda_manual_seed(seed):
     after this function. Basically, this is replacement for that
     function.
     Two set of RNG states are tracked:
-    default state: This is for data parallelism and is the same among a set of model parallel GPUs but different across different model paralle groups. This is used for example for dropout in the non-tensor-model-parallel regions.
+    default state: This is for data parallelism and is the same among a set of model parallel GPUs but different across different model parallel groups. This is used for example for dropout in the non-tensor-model-parallel regions.
     tensor-model-parallel state: This state is different among a set of model parallel GPUs, but the same across data parallel groups. This is used for example for dropout in model parallel regions.
     """
     # 2718 is just for fun and any POSITIVE value will work.

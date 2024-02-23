@@ -260,7 +260,7 @@ def validate_args(args, defaults={}):
     if args.ffn_hidden_size is None:
         if args.swiglu:
             # reduce the dimnesion for MLP since projections happens on
-            # two linear layers. this keeps the number of paramters in
+            # two linear layers. this keeps the number of parameters in
             # the same ballpark as the counterpart with 4*h size
             # we keep it a multiple of 64, which means the actual tensor size
             # will be a multiple of 64 / tp_size
@@ -636,7 +636,7 @@ def _add_network_size_args(parser):
                        dest='add_position_embedding')
     group.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
                        help='Pad the vocab size to be divisible by this value.'
-                       'This is added for computational efficieny reasons.')
+                       'This is added for computational efficiency reasons.')
     group.add_argument('--normalization', default='LayerNorm',
                        choices=['LayerNorm', 'RMSNorm'],
                        help='Which normalization technique to use.')
@@ -689,7 +689,7 @@ def _add_logging_args(parser):
                        '   1: report timing for operations that are executed '
                        '      very limited times (basically once) during '
                        '      each iteration (such as gradient all-reduce) '
-                       '   2: report timing for operations that migh be '
+                       '   2: report timing for operations that might be '
                        '      executed numerous times during each iteration. '
                        'Note that setting the level to 1 or 2 might '
                        'cause increase in iteration time.')
@@ -949,7 +949,7 @@ def _add_training_args(parser):
                        action='store_false',
                        help='Disable asynchronous execution of '
                        'tensor-model-parallel all-reduce with weight '
-                       'gradient compuation of a column-linear layer.',
+                       'gradient computation of a column-linear layer.',
                        dest='async_tensor_model_parallel_allreduce')
     group.add_argument('--no-persist-layer-norm', action='store_true',
                        help='Disable using persistent fused layer norm kernel. '
@@ -1293,7 +1293,7 @@ def _add_data_args(parser):
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='Sentencepiece tokenizer model.')
     group.add_argument('--reset-position-ids', action='store_true',
-                       help='Reset posistion ids after end-of-document token.')
+                       help='Reset position ids after end-of-document token.')
     group.add_argument('--reset-attention-mask', action='store_true',
                        help='Reset self attention maske after '
                        'end-of-document token.')
@@ -1375,7 +1375,7 @@ def _add_biencoder_args(parser):
 def _add_vision_args(parser):
     group = parser.add_argument_group(title="vision")
 
-    # general vision arguements
+    # general vision arguments
     group.add_argument('--num-classes', type=int, default=1000,
                        help='num of classes in vision classificaiton task')
     group.add_argument('--img-h', type=int, default=224,

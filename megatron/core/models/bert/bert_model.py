@@ -123,7 +123,7 @@ class BertModel(LanguageModule):
 
             self.binary_head = None
             if self.add_binary_head:
-                # TODO: Shoudl switch this to TE ?
+                # TODO: Should switch this to TE ?
                 self.binary_head = get_linear_layer(
                     config.hidden_size, 2, config.init_method, config.perform_initialization
                 )

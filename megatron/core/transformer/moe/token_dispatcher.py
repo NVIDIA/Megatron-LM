@@ -174,13 +174,13 @@ class MoEDroplessTokenDispatcher(MoETokenDispatcher):
         bias: torch.Tensor = None,
     ):
         """
-        Reverse process of `dispatch()` which permutes the ouput of local
+        Reverse process of `dispatch()` which permutes the output of local
         experts locallay and across expert parallel rank into the original order to
         produce the final output.
 
         Args:
             hidden_states: 2D tensor of shape [sum_tokens_of_all_local_experts, HiddenSize],
-            ouput of local experts.
+            output of local experts.
             scores: 2D tensor of the probs of token assignment to local experts.
             indices: 2D tensor of the indices of `local_indices` (which holds the un-sorted expert
             indices of tokens that local expert can process) that give its sorted order along dim 0.

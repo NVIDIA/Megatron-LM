@@ -166,7 +166,7 @@ def find_checkpoint_rank_0(checkpoints_path, iteration, release=False):
 
 def get_checkpoint_tracker_filename(checkpoints_path):
 
-    """Tracker file rescords the latest chckpoint during
+    """Tracker file rescords the latest checkpoint during
     training to restart from."""
     return os.path.join(checkpoints_path, 'latest_checkpointed_iteration.txt')
 
@@ -327,7 +327,7 @@ def _transpose_first_dim(t, num_splits, num_splits_first, model):
     if num_splits_first:
         """[num_splits * np * hn, h]
         -->(view) [num_splits, np, hn, h]
-        -->(tranpose) [np, num_splits, hn, h]
+        -->(transpose) [np, num_splits, hn, h]
         -->(view) [np * num_splits * hn, h] """
 
         intermediate_shape = \
@@ -339,7 +339,7 @@ def _transpose_first_dim(t, num_splits, num_splits_first, model):
     else:
         """[np * hn * num_splits, h]
         -->(view) [np, hn, num_splits, h]
-        -->(tranpose) [np, num_splits, hn, h]
+        -->(transpose) [np, num_splits, hn, h]
         -->(view) [np * num_splits * hn, h] """
 
         intermediate_shape = \
@@ -381,7 +381,7 @@ def fix_query_key_value_ordering(model, checkpoint_version):
                     print_rank_0(f"Invalid checkpoint version {checkpoint_version}.")
                     sys.exit()
                 param.data.copy_(fixed_param)
-        print_rank_0(" succesfully fixed query-key-values ordering for"
+        print_rank_0(" successfully fixed query-key-values ordering for"
                      " checkpoint version {}".format(checkpoint_version))
 
 
@@ -618,7 +618,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
 
             # Load scheduler.
             if opt_param_scheduler is not None:
-                if 'lr_scheduler' in state_dict: # backward compatbility
+                if 'lr_scheduler' in state_dict: # backward compatibility
                     opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
                 else:
                     opt_param_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
@@ -650,7 +650,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                     raise KeyError
                 tensor_parallel.get_cuda_rng_tracker().set_states(
                     rng_state['rng_tracker_states'])
-            else:  # backward compatability
+            else:  # backward compatibility
                 random.setstate(state_dict['random_rng_state'])
                 np.random.set_state(state_dict['np_rng_state'])
                 torch.set_rng_state(state_dict['torch_rng_state'])

@@ -96,7 +96,7 @@ def generate(model,
        output_log_probs: log probs of the tokens.
     """
 
-    # Make sure input params are avaialble to all ranks.
+    # Make sure input params are available to all ranks.
     values = [tokens_to_generate,
               return_output_log_probs,
               top_k_sampling, top_p_sampling, top_p_decay, top_p_bound,
@@ -182,7 +182,7 @@ def beam_search_and_post_process(model,
     return None
 
 def beam_search(model, prompts=None, tokens_to_generate=0, beam_size=0, add_BOS=False, stop_token=50256, num_return_gen=1, length_penalty=1, prevent_newline_after_colon=False):
-    # Make sure input params are avaialble to all ranks.
+    # Make sure input params are available to all ranks.
     values = [tokens_to_generate,
               beam_size,
               add_BOS,

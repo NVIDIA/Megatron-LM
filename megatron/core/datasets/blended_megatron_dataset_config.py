@@ -35,7 +35,7 @@ class BlendedMegatronDatasetConfig:
 
         blend_per_split (blend_per_split: Optional[List[Optional[List[str]]]]): A set of blend
         strings, as defined above, one for each split distribution. Not to be used with 'blend'.
-        Defauls to None.
+        Defaults to None.
 
         split (Optional[str]): The split string, a comma separated weighting for the dataset splits
         when drawing samples from a single distribution. Not to be used with 'blend_per_split'.
@@ -112,7 +112,7 @@ def parse_and_normalize_split(split: str) -> List[float]:
         split (str): The train valid test split string e.g. "99,1,0"
 
     Returns:
-        List[float]: The trian valid test split ratios e.g. [0.99, 0.01, 0.0]
+        List[float]: The train valid test split ratios e.g. [0.99, 0.01, 0.0]
     """
     split = list(map(float, re.findall(r"[.0-9]+", split)))
     split = split + [0.0 for _ in range(len(Split) - len(split))]

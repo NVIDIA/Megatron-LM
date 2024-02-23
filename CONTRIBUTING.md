@@ -46,7 +46,7 @@ Here are some dos & don'ts to try and stick to:
 
 Megatron-LM is developed and maintained by a small team of researchers. We will endeavour to read and acknowledge all new issues and PRs within a week. A few rules of thumb:
 - Reproducible bugs/regressions and bug/regression fixes are likely to get the attention of maintainers the quickest.
-- Issues requesting an enhancement may only recieve acknowlegement that they've been read and may be closed with a "wontfix" label if they're not inline with the project direction. If they are acknowledged and remain open you can assume the maintainers agree they're a desirable feature.
+- Issues requesting an enhancement may only receive acknowledgement that they've been read and may be closed with a "wontfix" label if they're not inline with the project direction. If they are acknowledged and remain open you can assume the maintainers agree they're a desirable feature.
 - Support requests, i.e. requests for help running the code, have the lowest priority and will be responded to as maintainer time permits.
 
 ### If my issue or PR isn't getting attention, how long should I wait before pinging one of the project maintainers?
@@ -61,6 +61,6 @@ The corresponding maintainers at this time are @jaredcasper and @jon-barker.
 
 Yes, starting in July 2023 we have a bot that will mark untouched PRs as "stale" after 60 days.
 
-We have a long backlog of issues and PRs dating back 3.5 years. We are trying to triage these now by working backwards. Older issues we believe may still be relevant may recieve a request to re-test them with the latest code. If there's no response they may be closed. Again, if you they should be re-opened then just respond with a comment to that effect.
+We have a long backlog of issues and PRs dating back 3.5 years. We are trying to triage these now by working backwards. Older issues we believe may still be relevant may receive a request to re-test them with the latest code. If there's no response they may be closed. Again, if you they should be re-opened then just respond with a comment to that effect.
 
 Thank-you!

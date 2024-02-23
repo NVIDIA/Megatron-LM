@@ -142,7 +142,7 @@ class BlendedMegatronDatasetBuilder(object):
                 sizes_spoof = [0] * len(Split)
                 sizes_spoof[i] = self.sizes[i]
 
-                # Blend consists of a sigle prefix
+                # Blend consists of a single prefix
                 if len(blend) == 1:
                     blended_datasets.append(
                         self._build_megatron_dataset_splits(blend[0], split_spoof, sizes_spoof)[i]

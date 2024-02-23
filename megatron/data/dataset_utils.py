@@ -226,7 +226,7 @@ def create_masked_lm_predictions(tokens,
     ngrams = np.arange(1, max_ngrams + 1, dtype=np.int64)
     if not geometric_dist:
         # Note(mingdachen):
-        # By default, we set the probilities to favor shorter ngram sequences.
+        # By default, we set the probabilities to favor shorter ngram sequences.
         pvals = 1. / np.arange(1, max_ngrams + 1)
         pvals /= pvals.sum(keepdims=True)
         if favor_longer_ngram:
@@ -394,7 +394,7 @@ def pad_and_convert_to_numpy(tokens, tokentypes, masked_positions,
     padding_mask_np = np.array([1] * num_tokens + [0] * padding_length,
                                dtype=np.int64)
 
-    # Lables and loss mask.
+    # Labels and loss mask.
     labels = [-1] * max_seq_length
     loss_mask = [0] * max_seq_length
     for i in range(len(masked_positions)):
@@ -475,7 +475,7 @@ def _build_train_valid_test_datasets(data_prefix, splits_string,
                                            dataset_type)
 
     # Get start and end indices of train/valid/train into doc-idx
-    # Note that doc-idx is desinged to be num-docs + 1 so we can
+    # Note that doc-idx is designed to be num-docs + 1 so we can
     # easily iterate over it.
     total_num_of_documents = indexed_dataset.document_indices.shape[0] - 1
     splits = get_train_valid_test_split_(splits_string, total_num_of_documents)
@@ -700,7 +700,7 @@ def get_samples_mapping(indexed_dataset,
         print_rank_0(' > saved the index mapping in {}'.format(
             indexmap_filename))
         # Make sure all the ranks have built the mapping
-        print_rank_0(' > elasped time to build and save samples mapping '
+        print_rank_0(' > elapsed time to build and save samples mapping '
                      '(seconds): {:4f}'.format(
                          time.time() - start_time))
     # This should be a barrier but nccl barrier assumes

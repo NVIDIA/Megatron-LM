@@ -613,7 +613,7 @@ def _get_ltor_masks_and_position_ids(
 
     # Position ids.
     position_ids = torch.arange(seq_length, dtype=torch.long, device=data.device)
-    # We need to clone as the ids will be modifed based on batch index.
+    # We need to clone as the ids will be modified based on batch index.
     if reset_position_ids:
         position_ids = position_ids.clone()
 

@@ -37,9 +37,9 @@ class LanguageModule(MegatronModule):
         return loss
 
     def initialize_last_stage_with_word_embeddings(self) -> None:
-        """Intializes the word embeddings in the final stage.
+        """Initializes the word embeddings in the final stage.
 
-        This function just initalizes word embeddings in the final stage, when we are
+        This function just initializes word embeddings in the final stage, when we are
         using pipeline parallelism and sharing word embeddings. Nothing to do if we
         aren't sharing weights or aren't using pipeline parallelism.
         """

@@ -89,7 +89,7 @@ class DynamicGradScaler(MegatronGradScaler):
         else:
             # If there is no nan/inf, increment the growth tracker.
             self._growth_tracker += 1
-            # If we have had enough consequitive intervals with no nan/inf:
+            # If we have had enough consecutive intervals with no nan/inf:
             if self._growth_tracker == self.growth_interval:
                 # Reset the tracker and hysteresis trackers,
                 self._growth_tracker = 0

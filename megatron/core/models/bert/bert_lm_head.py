@@ -34,7 +34,7 @@ class BertLMHead(MegatronModule):
         self.vocab_size = vocab_size
         self.parallel_output = parallel_output
 
-        # TODO: Shoudl switch this to TE ?
+        # TODO: Should switch this to TE ?
         self.dense = get_linear_layer(
             hidden_size, hidden_size, config.init_method, config.perform_initialization
         )
@@ -51,9 +51,9 @@ class BertLMHead(MegatronModule):
 
         self.gelu = torch.nn.functional.gelu
         # TODO Use activation_func in config to determine what to use
-        # if config.openai_gelu: # Dont have these configs in transfomer config yet
+        # if config.openai_gelu: # Dont have these configs in transformer config yet
         #    self.gelu = openai_gelu
-        # elif config.onnx_safe: # Dont have these configs in transfomer config yet
+        # elif config.onnx_safe: # Dont have these configs in transformer config yet
         #   self.gelu = erf_gelu
 
         self.output_layer = tensor_parallel.ColumnParallelLinear(

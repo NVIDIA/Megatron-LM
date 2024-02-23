@@ -24,7 +24,7 @@ class T5LMHead(MegatronModule):
 
     Args:
         config (TransformerConfig): transformer config
-        parallel_output (bool): wether output logits being distributed or not.
+        parallel_output (bool): whether output logits being distributed or not.
         vocab_size (int): vocabulary size
         pre_process (bool): Include embedding layer
         share_embeddings_and_output_weights (bool): When True, input embeddings and output logit weights are

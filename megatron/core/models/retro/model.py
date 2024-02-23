@@ -32,7 +32,7 @@ class RetroModel(GPTModel):
     ) -> Tensor:
         """RetroModel forward method.
 
-        Foward input tokens & mask, along with neighbor tokens & mask, through
+        Forward input tokens & mask, along with neighbor tokens & mask, through
         the Retro model..
 
         Arguments:

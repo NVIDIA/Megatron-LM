@@ -485,7 +485,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
     the weight gradients.
 
     In the case of sequence parallelism, the reduce scatter of the
-    input gradients is done asynchronously with the calcluation of the
+    input gradients is done asynchronously with the calculation of the
     weight gradients.
 
     Use of this module requires that the environment variable
@@ -515,7 +515,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
         must turn off gradient accumulation fusion."
 
     async_grad_allreduce (bool required): Do the allreduce of input
-        gradients asyncronously with the computation of weight
+        gradients asynchronously with the computation of weight
         gradients. If sequence_parallel is True, this must be
         False, as no all reduce is performed.
 

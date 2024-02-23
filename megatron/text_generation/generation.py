@@ -104,7 +104,7 @@ def generate_tokens_probs_and_return_on_first_stage(
             the generated tokens. Note that the log probability is the one
             from the original logit.
         top_k, top_p: top-k and top-p sampling parameters.
-            Note that top-k = 1 is gready. Also, these paramters are
+            Note that top-k = 1 is gready. Also, these parameters are
             exclusive meaning that:
                 if top-k > 0 then we expect top-p=0.
                 if top-p > 0 then we check for top-k=0.
@@ -414,7 +414,7 @@ def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, sto
 
 
 def _build_attention_mask_and_position_ids(tokens):
-    """Build the attention mask and postition ids for the input tokens."""
+    """Build the attention mask and position ids for the input tokens."""
 
     # Since we are not interested in loss-mask and reset attention/position
     # is also False, eod_token is not used so it is safe to set it to None.

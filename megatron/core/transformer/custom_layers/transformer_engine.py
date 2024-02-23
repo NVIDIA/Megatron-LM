@@ -69,7 +69,7 @@ class TENorm:
                 **_get_extra_te_kwargs(config),
             )
         else:
-            raise Exception('Only LayerNorm and RMSNorm are curently supported')
+            raise Exception('Only LayerNorm and RMSNorm are currently supported')
 
         return instance
 
