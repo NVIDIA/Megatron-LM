@@ -623,6 +623,9 @@ def _add_network_size_args(parser):
                        'This is the size of position embedding.')
     group.add_argument('--use-rotary-position-embeddings', action='store_true',
                        help='Use rotary positional embeddings or not')
+    group.add_argument('--rotary-position-embeddings-theta', type=int, default=10000,
+                       help='Rotary positional embeddings theta value.',
+                       dest='rope_theta')
     group.add_argument('--rotary-percent', type=float, default=1.0,
                        help='Percent of rotary dimension to use, default 100%')
     group.add_argument('--no-position-embedding',
