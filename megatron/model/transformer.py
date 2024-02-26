@@ -1802,7 +1802,11 @@ class ParallelTransformer(MegatronModule):
         # Handle renaming layernorm -> norm in component names
         state_dict_ = {}
         for key in state_dict.keys():
-            newkey = key.replace("layernorm", "norm")
-            state_dict_[newkey] = state_dict[key]
+            if self.transformer_impl == 'transformer_engine':
+                new_key = key
+            else:
+                new_key = key.replace("layernorm", "norm")
+
+            state_dict_[new_key] = state_dict[key]
 
         super().load_state_dict(state_dict_, strict)
