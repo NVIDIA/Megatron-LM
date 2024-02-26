@@ -26,15 +26,18 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
     )
     embedding_size = args.hidden_size * args.padded_vocab_size
     if args.untie_embeddings_and_output_weights:
-        num_total_parameters_with_embeddings = num_parameters_in_transformer_layers + (
-            2 * embedding_size
-        )
+        num_parameters_in_embedding_layers = 2 * embedding_size
     else:
-        num_total_parameters_with_embeddings = num_parameters_in_transformer_layers + embedding_size
+        num_parameters_in_embedding_layers = embedding_size
+    num_total_parameters = num_parameters_in_transformer_layers + num_parameters_in_embedding_layers
     if verbose:
         print(
-            f"Number of parameters in billions: {num_total_parameters_with_embeddings / 10**9:.2f}"
+            f"Number of parameters in transformer layers in billions: {num_parameters_in_transformer_layers / 10**9: .2f}"
         )
+        print(
+            f"Number of parameters in embedding layers in billions: {num_parameters_in_embedding_layers / 10**9:.2f}"
+        )
+        print(f"Total number of parameters in billions: {num_total_parameters / 10**9:.2f}")
 
     # Most loaded model shard has (1/pp_size transformer layers + 1 embedding layer) / tp_size.
     num_parameters_on_most_loaded_model_shard = (
