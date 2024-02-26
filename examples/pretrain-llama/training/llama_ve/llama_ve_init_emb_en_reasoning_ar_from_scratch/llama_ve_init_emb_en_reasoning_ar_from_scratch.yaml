@@ -3,7 +3,7 @@
 $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
 command: >-
-  bash examples/pretrain-llama/training/llama_ve/llama_ve_init_emb_en_reasoning_ar_with_trans_from_scratch/llama_ve_init_emb_en_reasoning_ar_with_trans_from_scratch_resume.sh \
+  bash examples/pretrain-llama/training/llama_ve/llama_ve_init_emb_en_reasoning_ar_from_scratch/llama_ve_init_emb_en_reasoning_ar_from_scratch.sh \
    ${{inputs.pretrained_llama_model}} \
    ${{inputs.tokenizer_model_path}} \
    ${{inputs.bin_idx_data_dir}} \
@@ -11,7 +11,7 @@ command: >-
    ${{outputs.checkpoint_dir}} \
    ${{outputs.tensorboard_dir}}
 
-display_name: LLaMa-VE-init-Emb-Allam-Reasoning-Data-with-Ar-Translation
+display_name: LLaMa-VE-init-Emb-Allam-Reasoning-Data-En-Ar
 
 experiment_name: Vocab-Expansion
 code: ../../../../../
@@ -27,7 +27,7 @@ inputs:
   pretrained_llama_model:
     type: uri_folder
     mode: ro_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/new_experiments/LLaMa-VE-init-Emb-Allam-Reasoning-Data-with-Ar-Translation/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/megatronlm_models/Meg-LM-Llama-2-7b-hf-ExpTok-32K_10M_init_VE_with_llama_avg
   tokenizer_model_path:
     type: uri_file
     mode: ro_mount
@@ -40,15 +40,15 @@ outputs:
   data_cache:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/new_experiments/LLaMa-VE-init-Emb-Allam-Reasoning-Data-with-Ar-Translation/cache
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/new_experiments/LLaMa-VE-init-Emb-Allam-Reasoning-Data-En-Ar/cache
   checkpoint_dir:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/new_experiments/LLaMa-VE-init-Emb-Allam-Reasoning-Data-with-Ar-Translation/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/new_experiments/LLaMa-VE-init-Emb-Allam-Reasoning-Data-En-Ar
   tensorboard_dir:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/new_experiments/LLaMa-VE-init-Emb-Allam-Reasoning-Data-with-Ar-Translation/tensorboard
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/new_experiments/LLaMa-VE-init-Emb-Allam-Reasoning-Data-En-Ar/tensorboard
 
 services:
   my_jupyterlab:

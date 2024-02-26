@@ -70,7 +70,7 @@ MODEL_PARALLEL_ARGS=(
     --no-async-tensor-model-parallel-allreduce
 )
 
-source examples/pretrain-llama/training/llama_ve/llama_ve_init_emb_en_reasoning_ar_with_trans_from_scratch/iter_prob.sh
+source examples/pretrain-llama/training/llama_ve/llama_ve_init_emb_en_reasoning_with_trans_only_from_scratch/iter_prob.sh
 
 # $BIN_IDX_PATH/torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
 python pretrain_gpt.py \

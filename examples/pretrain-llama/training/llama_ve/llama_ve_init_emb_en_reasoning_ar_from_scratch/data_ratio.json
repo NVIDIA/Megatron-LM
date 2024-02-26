@@ -1,0 +1,19 @@
+{
+    "en" : {
+        "dolma-stack-code": 1,
+        "dolma-peS2o": 1,
+        "openwebmath": 2,
+        "Pile-DM-Mathematics": 2,
+        "Pile-books2-books3-pgtbrg": 2,
+        "mathpile-arxiv-cc-proofwiki-textbook-wiki": 2,
+        "SlimPajamaStackExchange": 2
+    },
+    "ar" : {
+        "Allam-books": 3, 
+        "Allam-encyclopedias": 3, 
+        "Allam-news": 1, 
+        "Allam-others": 1, 
+        "Allam-transcribed": 2, 
+        "Allam-web": 1
+    }
+}
