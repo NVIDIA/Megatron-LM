@@ -542,10 +542,11 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         if args.finetune:
             loaded_dir, state_dict = model[0].load_checkpoint(load_dir,
                 load_module_strict=strict, load_optimizer_states=False,
-                load_lr_scheduler_states=False, load_module_only=True)
+                load_lr_scheduler_states=False, load_module_only=True,
+                tag=args.load_tag)
         else:
             loaded_dir, state_dict = model[0].load_checkpoint(load_dir,
-                load_module_strict=strict)
+                load_module_strict=strict, tag=args.load_tag)
         if loaded_dir is None:
             print_rank_0('WARNING: could not find the metadata file {} '.format(
                 load_dir))

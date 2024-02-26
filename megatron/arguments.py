@@ -1041,6 +1041,8 @@ def _add_checkpointing_args(parser):
                        help='Do not save current rng state.')
     group.add_argument('--load', type=str, default=None,
                        help='Directory containing a model checkpoint.')
+    group.add_argument('--load-tag', type=str, default=None,
+                       help='Specific checkpoint tag to load. Ignores latest.')
     group.add_argument('--no-load-optim', action='store_true', default=None,
                        help='Do not load optimizer when loading checkpoint.')
     group.add_argument('--no-load-rng', action='store_true', default=None,
