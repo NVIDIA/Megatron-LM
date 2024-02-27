@@ -173,7 +173,7 @@ class LanguageModelEmbedding(MegatronModule):
         if self.training:
             if self.embedding_noise and not self.neft:
                     noise_scale = self.embedding_noise_std
-                    if self.noise_scheduler is not None:
+                    if hasattr(self, 'noise_scheduler') and self.noise_scheduler is not None:
                         noise_scale = self.noise_scheduler.get_noise()
                     if self.embedding_noise_type == 'uniform':
                         noise = torch.empty_like(embeddings).uniform_(self.embedding_noise_mean, noise_scale).detach()
@@ -188,7 +188,7 @@ class LanguageModelEmbedding(MegatronModule):
                     embeddings = embeddings * (original_norm / noisy_norm)
             elif self.neft:
                     current_alpha = self.neft_alpha
-                    if self.noise_scheduler is not None:
+                    if hasattr(self, 'noise_scheduler') and self.noise_scheduler is not None:
                         current_alpha = self.noise_scheduler.get_noise()
 
                     epsilon = torch.empty_like(embeddings).uniform_(-1, 1).detach()
