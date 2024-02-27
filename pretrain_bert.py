@@ -87,7 +87,7 @@ def data_post_process(data, data_sampler_state_dict):
     return data
 
 def loss_func(loss_mask, sentence_order, output_tensor):
-    lm_loss_, sop_logits = output_tensor
+    lm_loss_, sop_logits, _ = output_tensor
 
     lm_loss_ = lm_loss_.float()
     loss_mask = loss_mask.float()
