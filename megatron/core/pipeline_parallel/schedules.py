@@ -543,6 +543,13 @@ def forward_backward_pipelining_with_interleaving(
             model_chunk_id = num_model_chunks - model_chunk_id - 1
         return model_chunk_id
 
+    def get_microbatch_id_in_model_chunk(microbatch_id, forward):
+        """Helper method to get the microbatch_id within model chunk given the iteration number."""
+        assert forward
+        microbatch_group_id = microbatch_id // (pipeline_parallel_size * num_model_chunks)
+        microbatch_id_in_model_chunk = (microbatch_group_id * pipeline_parallel_size) + (microbatch_id % pipeline_parallel_size)
+        return microbatch_id_in_model_chunk
+
     def is_first_microbatch_for_model_chunk(microbatch_id: int) -> bool:
         """Check if an iteration is the first for a model chunk."""
         microbatch_group_size = pipeline_parallel_size * num_model_chunks
@@ -671,6 +678,8 @@ def forward_backward_pipelining_with_interleaving(
             for req in fwd_wait_handles:
                 req.wait()
 
+        cur_model_chunk_id = get_model_chunk_id(k, forward=True)
+        model[cur_model_chunk_id].module.decoder.current_microbatch = get_microbatch_id_in_model_chunk(k, forward=True)
         # Decide to checkpoint all layers' activations of the current micro-batch
         if max_outstanding_backprops is not None:
             checkpoint_activations_microbatch = (
@@ -773,6 +782,8 @@ def forward_backward_pipelining_with_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
+        cur_model_chunk_id = get_model_chunk_id(forward_k, forward=True)
+        model[cur_model_chunk_id].module.decoder.current_microbatch = get_microbatch_id_in_model_chunk(forward_k, forward=True)
         if config.overlap_p2p_comm:
             if fwd_wait_handles is not None:
                 for req in fwd_wait_handles:
@@ -1207,6 +1218,7 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
+        model.module.decoder.current_microbatch = i
         input_tensor = recv_forward(recv_tensor_shapes, config)
         output_tensor = forward_step(
             forward_step_func,
@@ -1245,6 +1257,7 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
+        model.module.decoder.current_microbatch = i + num_warmup_microbatches
         output_tensor = forward_step(
             forward_step_func,
             data_iterator,

@@ -105,6 +105,8 @@ class TransformerBlock(MegatronModule):
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
+        self.cg = {}
+        self.current_microbatch = -1
 
         # required for pipeline parallel schedules
         self.input_tensor = None
@@ -175,6 +177,15 @@ class TransformerBlock(MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
+
+    def reset_fp8_meta_tensors(self) -> None:
+        """Set TP group"""
+        # Deep iterate but skip self to avoid infinite recursion.
+        for index, child in enumerate(self.modules()):
+            if index == 0:
+                continue
+            if hasattr(child, "reset_fp8_meta_tensors"):
+                child.reset_fp8_meta_tensors()
 
     def _get_layer(self, layer_number: int):
         return self.layers[layer_number]
@@ -365,17 +376,23 @@ class TransformerBlock(MegatronModule):
                     packed_seq_params=packed_seq_params,
                 )
             else:
-                for layer in self.layers:
+                for l_no, layer in enumerate(self.layers):
+                    # Trigger pre_forward hook manually for CUDA graph
+                    for param in layer.parameters():
+                        param.data_ptr()
                     with self.offload_context:
-                        hidden_states, context = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            context=context,
-                            context_mask=context_mask,
-                            rotary_pos_emb=rotary_pos_emb,
-                            inference_params=inference_params,
-                            packed_seq_params=packed_seq_params,
-                        )
+                        if (len(self.cg) > l_no) and (self.current_microbatch < len(self.cg[l_no])) and (self.current_microbatch > 0):
+                            hidden_states = self.cg[l_no][self.current_microbatch](hidden_states)
+                        else:
+                            hidden_states = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                context=context,
+                                context_mask=context_mask,
+                                rotary_pos_emb=rotary_pos_emb,
+                                inference_params=inference_params,
+                                packed_seq_params=packed_seq_params,
+                            )
 
                     if (
                         torch.is_grad_enabled()

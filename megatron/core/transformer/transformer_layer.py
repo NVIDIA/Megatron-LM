@@ -154,10 +154,19 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         return offset
 
+    def reset_fp8_meta_tensors(self) -> None:
+        """Set TP group"""
+        # Deep iterate but skip self to avoid infinite recursion.
+        for index, child in enumerate(self.modules()):
+            if index == 0:
+                continue
+            if hasattr(child, "reset_fp8_meta_tensors"):
+                child.reset_fp8_meta_tensors()
+
     def forward(
         self,
         hidden_states,
-        attention_mask,
+        attention_mask=None,
         context=None,
         context_mask=None,
         rotary_pos_emb=None,
@@ -238,6 +247,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
+        if context is None:
+            return output
         return output, context
 
     def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()) -> ShardedStateDict:
