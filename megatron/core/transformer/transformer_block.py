@@ -381,17 +381,17 @@ class TransformerBlock(MegatronModule):
                     for param in layer.parameters():
                         param.data_ptr()
                     with self.offload_context:
-                        if (len(self.cg) > l_no) and (self.current_microbatch < len(self.cg[l_no])) and (self.current_microbatch > 0):
+                        if (len(self.cg) > l_no) and (self.current_microbatch < len(self.cg[l_no])) and self.training:# and (self.current_microbatch > 0):
                             hidden_states = self.cg[l_no][self.current_microbatch](hidden_states)
                         else:
                             hidden_states = layer(
-                                hidden_states=hidden_states,
-                                attention_mask=attention_mask,
-                                context=context,
-                                context_mask=context_mask,
-                                rotary_pos_emb=rotary_pos_emb,
-                                inference_params=inference_params,
-                                packed_seq_params=packed_seq_params,
+                                hidden_states,
+#                                attention_mask=attention_mask,
+#                                context=context,
+#                                context_mask=context_mask,
+#                                rotary_pos_emb=rotary_pos_emb,
+#                                inference_params=inference_params,
+#                                packed_seq_params=packed_seq_params,
                             )
 
                     if (
