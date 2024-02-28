@@ -18,7 +18,7 @@ variables: &VARS
   DISPLAY_OUTPUT: "True" # Set to true for new tests to copy the logs for creating golden truth file
   TIME_LIMIT: "10:00" # Default time limit for all jobs
   MOE_GROUPED_GEMM: 0 # Set to 1 to enable grouped gemm for MoE
- 
+
 
 include:
   - jet-tests.yml
@@ -69,29 +69,6 @@ formatting:
     - isort megatron/core --check
   rules:
     - when: always
-
-.selene_test_resume_checkpoint_launcher: &selene-test-resume-checkpoint-launcher
-  tags:
-    - ssh_selene_runner
-  stage: test
-  script: &selene-test-resume-launcher-script
-    - echo "Running selene resume from checkpoint test. "
-    - pwd
-    - run_cmd="bash tests/functional_tests/shell_test_utils/run_selene_test_resume_checkpoint_launcher_script.sh RUN_MODEL=$RUN_MODEL TP_SIZE=$TP_SIZE PP_SIZE=$PP_SIZE VP_SIZE=$VP_SIZE NUM_NODES=$NUM_NODES SELENE_ADLR_CI_PATH=$SELENE_ADLR_CI_PATH CI_PIPELINE_ID=$CI_PIPELINE_ID RUN_NAME=$RUN_NAME PYTORCH_IMAGE=$PYTORCH_IMAGE DATA_DIR=$DATA_DIR TIME_LIMIT=$TIME_LIMIT"
-    - echo "$run_cmd"
-    - ${run_cmd}
-    - echo "Completed the job"
-  rules:
-    - if: $TEST_LEVEL =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TEST_REGEX_ON_THIS_COMMIT 
-      when: always
-    - if: '$CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGING'
-      when: always
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
-      when: always
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ "READY FOR REVIEW" && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
-      when: always
-  allow_failure: false
-  retry: 2
 
 .selene_test_launcher: &selene-test-launcher
   tags:
