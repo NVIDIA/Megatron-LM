@@ -413,7 +413,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                      use_distributed_optimizer=args.use_distributed_optimizer,
                      # Turn off bucketing for model_chunk 2 onwards, since communication for these
                      # model chunks is overlapped with compute anyway.
-                     disable_bucketing=(model_chunk_idx > 0))
+                     disable_bucketing=(model_chunk_idx > 0),
+                     check_for_nan_in_grad=args.check_for_nan_in_loss_and_grad)
                  for (model_chunk_idx, model_chunk) in enumerate(model)]
 
         # Broadcast params from data parallel src rank to other data parallel ranks.

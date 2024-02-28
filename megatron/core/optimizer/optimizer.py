@@ -51,12 +51,7 @@ def _multi_tensor_copy_this_to_that(this, that, overflow_buf=None):
 
 class MegatronOptimizer(ABC):
     def __init__(
-        self,
-        optimizer,
-        clip_grad,
-        log_num_zeros_in_grad,
-        check_for_nan_in_grad,
-        params_have_main_grad,
+        self, optimizer, clip_grad, log_num_zeros_in_grad, params_have_main_grad,
     ):
 
         """Input optimizer is the base optimizer for example Adam."""
@@ -65,7 +60,6 @@ class MegatronOptimizer(ABC):
         # Set gradient clipping and logging params.
         self.clip_grad = clip_grad
         self.log_num_zeros_in_grad = log_num_zeros_in_grad
-        self.check_for_nan_in_grad = check_for_nan_in_grad
         self.params_have_main_grad = params_have_main_grad
 
     def get_parameters(self):
@@ -97,15 +91,11 @@ class MegatronOptimizer(ABC):
         """Default returned here, but the distributed optimizer overrides this."""
         return parallel_state.get_model_parallel_group()
 
-    def clip_grad_norm(self, clip_grad, check_for_nan_in_grad):
+    def clip_grad_norm(self, clip_grad):
         params = self.get_parameters()
         grads_for_norm = self.get_main_grads_for_grad_norm()
         return clip_grad_norm_fp32(
-            params,
-            grads_for_norm,
-            clip_grad,
-            check_for_nan_in_grad,
-            model_parallel_group=self.get_model_parallel_group(),
+            params, grads_for_norm, clip_grad, model_parallel_group=self.get_model_parallel_group(),
         )
 
     def count_zeros(self):
@@ -176,7 +166,6 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         clip_grad: clip gradeints with this global L2 norm. Note
             that clipping is ignored if clip_grad == 0
         log_num_zeros_in_grad: return number of zeros in the gradients.
-        check_for_nan_in_grad: check if gradients have a NaN.
         params_have_main_grad: flag indicating if parameters have
             a `main_grad` field. If this is set, we are assuming
             that the model parameters are store in the `main_grad`
@@ -201,7 +190,6 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         optimizer,
         clip_grad,
         log_num_zeros_in_grad,
-        check_for_nan_in_grad,
         params_have_main_grad,
         fp16,
         bf16,
@@ -210,11 +198,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
     ):
 
         super().__init__(
-            optimizer,
-            clip_grad,
-            log_num_zeros_in_grad,
-            check_for_nan_in_grad,
-            params_have_main_grad,
+            optimizer, clip_grad, log_num_zeros_in_grad, params_have_main_grad,
         )
 
         self.fp16 = fp16
@@ -307,7 +291,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         timers('optimizer-clip-main-grad', log_level=1).start(barrier=args.barrier_with_L1_time)
         grad_norm = None
         if self.clip_grad > 0.0:
-            grad_norm = self.clip_grad_norm(self.clip_grad, self.check_for_nan_in_grad)
+            grad_norm = self.clip_grad_norm(self.clip_grad)
         timers('optimizer-clip-main-grad').stop()
 
         # Count the zeros in the grads.
@@ -339,7 +323,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         clip_grad: clip gradeints with this global L2 norm. Note
             that clipping is ignored if clip_grad == 0
         log_num_zeros_in_grad: return number of zeros in the gradients.
-        check_for_nan_in_grad: check if gradients have a NaN.
         params_have_main_grad: flag indicating if parameters have
             a `main_grad` field. If this is set, we are assuming
             that the model parameters are store in the `main_grad`
@@ -363,7 +346,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         optimizer,
         clip_grad,
         log_num_zeros_in_grad,
-        check_for_nan_in_grad,
         params_have_main_grad,
         fp16,
         bf16,
@@ -375,7 +357,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             optimizer,
             clip_grad,
             log_num_zeros_in_grad,
-            check_for_nan_in_grad,
             params_have_main_grad,
             fp16,
             bf16,
@@ -558,20 +539,11 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
 class FP32Optimizer(MegatronOptimizer):
     def __init__(
-        self,
-        optimizer,
-        clip_grad,
-        log_num_zeros_in_grad,
-        check_for_nan_in_grad,
-        params_have_main_grad,
+        self, optimizer, clip_grad, log_num_zeros_in_grad, params_have_main_grad,
     ):
 
         super(FP32Optimizer, self).__init__(
-            optimizer,
-            clip_grad,
-            log_num_zeros_in_grad,
-            check_for_nan_in_grad,
-            params_have_main_grad,
+            optimizer, clip_grad, log_num_zeros_in_grad, params_have_main_grad,
         )
 
         self._scale = torch.tensor([1.0], dtype=torch.float, device='cuda')
@@ -603,7 +575,7 @@ class FP32Optimizer(MegatronOptimizer):
         timers('optimizer-clip-main-grad', log_level=1).start(barrier=args.barrier_with_L1_time)
         grad_norm = None
         if self.clip_grad > 0.0:
-            grad_norm = self.clip_grad_norm(self.clip_grad, self.check_for_nan_in_grad)
+            grad_norm = self.clip_grad_norm(self.clip_grad)
         timers('optimizer-clip-main-grad').stop()
 
         # count the zeros in the grads

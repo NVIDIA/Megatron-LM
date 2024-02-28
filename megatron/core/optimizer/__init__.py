@@ -162,7 +162,6 @@ def get_megatron_optimizer_based_on_param_groups(
             optimizer,
             config.clip_grad,
             config.log_num_zeros_in_grad,
-            config.check_for_nan_in_loss_and_grad,
             params_have_main_grad,
             config.fp16,
             config.bf16,
@@ -184,11 +183,7 @@ def get_megatron_optimizer_based_on_param_groups(
 
     # FP32.
     return FP32Optimizer(
-        optimizer,
-        config.clip_grad,
-        config.log_num_zeros_in_grad,
-        config.check_for_nan_in_loss_and_grad,
-        params_have_main_grad,
+        optimizer, config.clip_grad, config.log_num_zeros_in_grad, params_have_main_grad,
     )
 
 
