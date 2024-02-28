@@ -13,7 +13,10 @@ from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, is_main_replica
 from megatron.core.dist_checkpointing.serialization import validate_sharding_integrity
-from megatron.core.dist_checkpointing.strategies.base import SaveShardedStrategy
+from megatron.core.dist_checkpointing.strategies.base import (
+    LoadShardedStrategy,
+    SaveShardedStrategy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +102,88 @@ class FullyParallelSaveStrategyWrapper(SaveShardedStrategy):
     @property
     def can_handle_sharded_objects(self):
         return self.base_strategy.can_handle_sharded_objects
+
+
+class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
+    def __init__(
+        self,
+        strategy: LoadShardedStrategy,
+        parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
+        super().__init__()
+        self.base_strategy = strategy
+        self.parallelization_group = parallelization_group
+
+    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+        precomputed_distribution = self.apply_loading_parallelization(sharded_state_dict)
+        # TODO: limit tensors to main replicas
+        loaded_state_dict = self.base_strategy.load(sharded_state_dict, checkpoint_dir)
+        # TODO: all gather all tensors
+
+    def apply_loading_parallelization(self, sharded_state_dict: ShardedStateDict) -> None:
+        print('Apply FPL')
+        precomputed_distribution = determine_main_replica_uniform_distribution(
+            sharded_state_dict, self.parallelization_group
+        )
+        distribute_main_replicas_with_precomputed_distribution(
+            sharded_state_dict, self.parallelization_group, precomputed_distribution
+        )
+        return precomputed_distribution
+
+    def all_gather_shards(self, state_dict, shard_to_saving_rank, shard_to_shape):
+        local_shards = list(nested_values(state_dict))
+        local_shards_by_id = {_sharded_tensor_chunk_id(sh_ten): sh_ten for sh_ten in local_shards}
+        local_rank = torch.distributed.get_rank(group=self.parallelization_group)
+
+        for dtype in sorted(set(map(lambda x: x[1], shard_to_shape.values())), key=str):
+
+            shards_by_rank = [
+                []
+                for _ in range(torch.distributed.get_world_size(group=self.parallelization_group))
+            ]
+            for shard_id, rank in shard_to_saving_rank.items():
+                if shard_to_shape[shard_id][1] != dtype:
+                    continue
+                if rank == local_rank:
+                    shards_by_rank[rank].append(local_shards_by_id[shard_id].data)
+                else:
+                    shards_by_rank[rank].append(
+                        torch.empty(
+                            shard_to_shape[shard_id][0],
+                            dtype=shard_to_shape[shard_id][1],
+                            device='cuda',
+                        )
+                    )
+
+            num_rounds = max(map(len, shards_by_rank))
+            for rank_shards in shards_by_rank:
+                rank_shards.extend(
+                    [
+                        torch.empty(0, dtype=dtype, device='cuda')
+                        for _ in range(num_rounds - len(rank_shards))
+                    ]
+                )
+
+            for round_idx, round_tensors in enumerate(zip(*shards_by_rank)):
+                torch.distributed.all_gather(
+                    list(round_tensors),
+                    round_tensors[local_rank],
+                    group=self.parallelization_group,
+                    async_op=True,
+                )
+
+    @property
+    def can_handle_sharded_objects(self):
+        return self.base_strategy.can_handle_sharded_objects
+
+    def load_tensors_metadata(self, checkpoint_dir: Path):
+        self.base_strategy.load_tensors_metadata(checkpoint_dir)
+
+    def check_backend_compatibility(self, loaded_version):
+        self.base_strategy.check_backend_compatibility(loaded_version)
+
+    def check_version_compatibility(self, loaded_version):
+        self.base_strategy.check_version_compatibility(loaded_version)
 
 
 def _sharded_tensor_chunk_id(sharded_tensor: ShardedTensor) -> tuple:
