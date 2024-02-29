@@ -72,24 +72,15 @@ class Router(ABC, MegatronModule):
         """
         raise NotImplementedError("Routing function not implemented.")
 
+    @abstractmethod
     def forward(self, input: torch.Tensor):
         """
         Forward pass of the router.
 
         Args:
             input (torch.Tensor): Input tensor.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: scores and indices.
         """
-        self.hidden = input.shape[-1]
-
-        logits = self.gating(input)
-        logits = logits.view(-1, self.config.num_moe_experts)
-
-        scores, indices = self.routing(logits)
-
-        return scores, indices
+        raise NotImplementedError("Forward function not implemented.")
 
 
 class TopKRouter(Router):
@@ -227,8 +218,6 @@ class TopKRouter(Router):
 
         # Apply Z-Loss
         logits = self.apply_z_loss(logits)
-        # Apply input jitter
-        logits = self.apply_input_jitter(logits)
 
         if (
             self.config.tensor_model_parallel_size > 1
@@ -247,5 +236,26 @@ class TopKRouter(Router):
             scores = torch.softmax(top_logits, dim=-1, dtype=torch.float32).type_as(logits)
         else:
             raise ValueError(f"Unsupported MoE routing type: {self.routing_type}")
+
+        return scores, indices
+
+    def forward(self, input: torch.Tensor):
+        """
+        Forward pass of the router.
+
+        Args:
+            input (torch.Tensor): Input tensor.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: scores and indices.
+        """
+        self.hidden = input.shape[-1]
+
+        # Apply input jitter
+        input = self.apply_input_jitter(input)
+        logits = self.gating(input)
+        logits = logits.view(-1, self.config.num_moe_experts)
+
+        scores, indices = self.routing(logits)
 
         return scores, indices
