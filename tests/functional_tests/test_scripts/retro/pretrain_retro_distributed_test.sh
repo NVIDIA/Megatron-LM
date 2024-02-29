@@ -13,7 +13,7 @@ do
 done
 echo "---------------------------------"
 
-set -x
+set -exo pipefail
 if [[ -z $MBS ]]; then MBS=4; fi
 
 GPUS_PER_NODE=8

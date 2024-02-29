@@ -12,7 +12,7 @@ do
 done
 echo "---------------------------------"
 
-set -x
+set -exo pipefail
 if [[ -z $MBS ]]; then MBS=4; fi
 if [[ -z $GBS ]]; then GBS=32; fi
 if [[ -z $MOE_GROUPED_GEMM ]]; then MOE_GROUPED_GEMM=0; fi

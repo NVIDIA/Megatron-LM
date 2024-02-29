@@ -18,7 +18,13 @@ variables: &VARS
   DISPLAY_OUTPUT: "True" # Set to true for new tests to copy the logs for creating golden truth file
   TIME_LIMIT: "10:00" # Default time limit for all jobs
   MOE_GROUPED_GEMM: 0 # Set to 1 to enable grouped gemm for MoE
-
+  JET_CLUSTER_BRANCH: 
+    value: "mcore/draco-oci"  
+    options:
+      - "mcore/draco-oci"
+      - "mcore/eos"
+    description: '"mcore/draco-oci" for OCI-IAD, "mcore/eos" for EOS'
+ 
 
 include:
   - jet-tests.yml
@@ -92,47 +98,3 @@ formatting:
       when: always
   allow_failure: false
   retry: 2
-
-train.bert_core.345m_tp1_pp2_1node_50steps_rope:
-  <<: *selene-test-launcher
-  variables:
-    <<: [*VARS]
-    RUN_MODEL: bert
-    TP_SIZE: 1
-    PP_SIZE: 2
-    NUM_NODES: 1
-    USE_CORE: 1
-    MAX_STEPS: 50
-    TIME_LIMIT: "20:00"
-    TEST_LEVEL: L0
-    METADATA: rope_embeddings
-    ADDITIONAL_PARAMS: "--position-embedding-type rope"
-
-train.bert_core.345m_tp1_pp2_1node_50steps_sequence_parallel:
-  <<: *selene-test-launcher
-  variables:
-    <<: [*VARS]
-    RUN_MODEL: bert
-    TP_SIZE: 1
-    PP_SIZE: 2
-    NUM_NODES: 1
-    USE_CORE: 1
-    MAX_STEPS: 50
-    TIME_LIMIT: "20:00"
-    TEST_LEVEL: L0
-    METADATA: sequence_parallel
-    ADDITIONAL_PARAMS: "--sequence-parallel"
-
-train.retro_core.tp1_pp1_1node_50steps:
-  <<: *selene-test-launcher
-  variables:
-    <<: [*VARS]
-    RUN_MODEL: retro
-    USE_TE: 0
-    USE_CORE: 1
-    TP_SIZE: 1
-    PP_SIZE: 1
-    NUM_NODES: 1
-    MAX_STEPS: 50
-    TIME_LIMIT: "20:00"
-    TEST_LEVEL: MONTHLY_TESTS
