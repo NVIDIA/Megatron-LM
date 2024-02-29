@@ -53,11 +53,12 @@ jet-trigger:
   needs:  [ jet-configure, jet-setup ]
   trigger:
     project: dl/jet/ci
-    branch: mcore/eos
+    branch: $JET_CLUSTER_BRANCH
     strategy: depend
   inherit:
     variables:
       - JET_CUSTOM_FILTER
+      - JET_CLUSTER_BRANCH
   variables:
     JET_WORKLOADS_FILTER: "$_JET_FILTER"
 
