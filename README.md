@@ -519,6 +519,12 @@ The Llama-2 [family of models](https://ai.meta.com/llama/) are an open-source se
 
 The Llama-2 checkpoints can be loaded into Megatron for inference and finetuning. See documentation [here](docs/llama2.md).
 
+# Model Optimization and Deployment
+Megatron-Core (MCore) `GPTModel` family supports advanced quantization algorithms and high-performance deployment through TensorRT-LLM.
+
+## Quantization and TensorRT-LLM Deployment
+See [Megatron Model Optimization and Deployment](examples/modelopt/README.md) for `llama2` and `nemotron3` examples.
+
 # Datasets
 We do not host any datasets for GPT or BERT training, however, we detail their collection so that our results may be reproduced.
 

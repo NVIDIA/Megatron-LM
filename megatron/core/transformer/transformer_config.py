@@ -138,6 +138,10 @@ class TransformerConfig(ModelParallelConfig):
     moe_input_jitter_eps: float = None
     moe_token_dropping: bool = False  # TODO: Support token dropping.
 
+    # These 2 attributes are WAR for TRTLLM export. DO NOT USE!! WILL BE DEPRECATED SOON!!
+    max_position_embeddings: int = 0
+    rotary_percent: float = 0
+
     def __post_init__(self):
         """ Python dataclass method that is used to modify attributes after initialization.
             See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more details.
