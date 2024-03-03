@@ -18,7 +18,7 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
         * args.hidden_size
         * args.hidden_size
         * (
-            1
+            ((1 + (args.ffn_hidden_size / args.hidden_size)) / 5.0)
             + (args.num_query_groups / (5.0 * args.num_attention_heads))
             + (2 / (5 * args.hidden_size))
             + (1 / (5 * args.num_layers * args.hidden_size))
@@ -78,7 +78,9 @@ def compute_activation_memory(args, num_microbatches, verbose=False):
     # are for the first pipeline stage.
 
     # Memory footprint from transformer layer (self-attention and MLP).
-    activation_memory = (args.seq_length * args.micro_batch_size * args.hidden_size) * 34
+    activation_memory = (args.seq_length * args.micro_batch_size * args.hidden_size) * (
+        18 + (4 * (args.ffn_hidden_size / args.hidden_size))
+    )
     if verbose:
         print(
             f"Activation memory footprint per transformer layer: "

@@ -71,7 +71,7 @@ def num_floating_point_operations(args, batch_size):
         * args.hidden_size
         * args.hidden_size
         * (
-            1
+            ((1 + (args.ffn_hidden_size / args.hidden_size)) / 5.0)
             + (args.num_query_groups / (5 * args.num_attention_heads))
             + (args.seq_length / (5 * args.hidden_size))
             + (args.padded_vocab_size / (10 * args.num_layers * args.hidden_size))
