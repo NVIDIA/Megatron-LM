@@ -379,6 +379,7 @@ class TransformerLanguageModel(MegatronModule):
                 kv_channels=rotary_dim,
                 rotary_percent=args.rotary_percent,
                 seq_len_interpolation_factor=args.rotary_seq_len_interpolation_factor,
+                rotary_base=args.rotary_base,
             )
 
         # Encoder (usually set to True, False if part of an encoder-decoder
