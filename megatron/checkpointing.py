@@ -641,10 +641,9 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
 
             optim_sd_kwargs = dict(is_loading=True)
             if args.use_distributed_optimizer:
-                optim_sd_kwargs['sharding_type'] = state_dict['optimizer']['param_state_sharding_type']
-                # TODO: remove this, it is for local tests backward compatibility
-                if optim_sd_kwargs['sharding_type'] == 'fully_sharded_bucket_space_noncont':
-                    optim_sd_kwargs['sharding_type'] = 'fully_sharded_bucket_space'
+                optim_sd_kwargs['sharding_type'] = ('fully_sharded_bucket_space'
+                                                    if getattr(state_dict['args'], 'ckpt_fully_parallel_save', False)
+                                                    else 'dp_zero_gather_scatter')
             load_kwargs['sharded_state_dict'] = generate_state_dict(args, model, optimizer, opt_param_scheduler,
                                                                     rng_state, args.use_dist_ckpt, optim_sd_kwargs=optim_sd_kwargs)
             load_kwargs['exit_on_missing_checkpoint'] = args.exit_on_missing_checkpoint
