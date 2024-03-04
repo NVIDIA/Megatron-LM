@@ -181,7 +181,9 @@ def sharded_tensor_to_torch_sharded_tensor_flattened(
         assert len(sh_ten.global_offset) == 1, sh_ten
 
     local_shards = [
-        Shard.from_tensor_and_offsets(sh_ten.data, [sh_ten.global_offset[0] + sh_ten.flattened_range.start], rank)
+        Shard.from_tensor_and_offsets(
+            sh_ten.data, [sh_ten.global_offset[0] + sh_ten.flattened_range.start], rank
+        )
         for sh_ten in sh_tens
     ]
     local_global_offsets = {}

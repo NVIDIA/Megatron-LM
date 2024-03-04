@@ -692,7 +692,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             "param": main_param,
                             **optim_state,
                             "gbuf_local_start": param_range_map["gbuf_local"].start,
-                            "gbuf_local_end": param_range_map["gbuf_local"].end
+                            "gbuf_local_end": param_range_map["gbuf_local"].end,
                         }
                         bucket_state.append(tensors)
                     buckets_state.append(bucket_state)
@@ -807,7 +807,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             torch.save(state_dict, filename)
 
     def sharded_state_dict(
-        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False,
+        self,
+        model_sharded_state_dict: ShardedStateDict,
+        is_loading: bool = False,
         sharding_type: str = 'fully_sharded_bucket_space',
     ):
         """ Chooses between 3 param state sharding implementations as requested by `sharding_type`.
@@ -830,20 +832,25 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.init_state_fn(self.optimizer)
 
         if sharding_type == 'fully_sharded_bucket_space':
-            param_state = self.sharded_param_state_fs_bucket_space(model_sharded_state_dict, is_loading)
+            param_state = self.sharded_param_state_fs_bucket_space(
+                model_sharded_state_dict, is_loading
+            )
         elif sharding_type == 'dp_zero_gather_scatter':
-            param_state = self.sharded_param_state_dp_zero_gather_scatter(model_sharded_state_dict, is_loading)
+            param_state = self.sharded_param_state_dp_zero_gather_scatter(
+                model_sharded_state_dict, is_loading
+            )
         elif sharding_type == 'fully_sharded_model_space':
             # In this approach the tensors could be directly related to model parameters
             # by linking them with metadata from `model_sharded_state_dict`.
             # This would allow changing TP and PP while using DistOpt (as with other optimizers).
             # This implementation is more involved and left out for now.
-            raise NotImplementedError(f'The fully sharded model space version for'
-                                      f' {self.__class__.__name__}.sharded_state_dict'
-                                      f' not implemented.')
+            raise NotImplementedError(
+                f'The fully sharded model space version for'
+                f' {self.__class__.__name__}.sharded_state_dict'
+                f' not implemented.'
+            )
         else:
             raise NotImplementedError(f'Unknown sharding_type: {sharding_type}')
-
 
         state_dict['param_state'] = param_state
         state_dict['param_state_sharding_type'] = sharding_type
@@ -905,17 +912,25 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                     assert bucket_state, 'empty bucket encountered'
                     if bucket_state[-1]['gbuf_local_end'] != gbuf_local_numel:
-                        assert data_parallel_rank == data_parallel_world_size - 1, 'encountered padding on non-last DP rank'
+                        assert (
+                            data_parallel_rank == data_parallel_world_size - 1
+                        ), 'encountered padding on non-last DP rank'
                         pad_tensors = {
-                            k: torch.empty(gbuf_local_numel - bucket_state[-1]['gbuf_local_end'], dtype=v.dtype, device=v.device)
+                            k: torch.empty(
+                                gbuf_local_numel - bucket_state[-1]['gbuf_local_end'],
+                                dtype=v.dtype,
+                                device=v.device,
+                            )
                             for k, v in bucket_state[-1].items()
                             if isinstance(v, torch.Tensor)
                         }
-                        bucket_state.append({
-                            **pad_tensors,
-                            'gbuf_local_start': bucket_state[-1]['gbuf_local_end'],
-                            'gbuf_local_end': gbuf_local_numel,
-                        })
+                        bucket_state.append(
+                            {
+                                **pad_tensors,
+                                'gbuf_local_start': bucket_state[-1]['gbuf_local_end'],
+                                'gbuf_local_end': gbuf_local_numel,
+                            }
+                        )
 
                     for bucket_params_idx in range(len(bucket_state)):
                         tensors = bucket_state[bucket_params_idx]
@@ -923,7 +938,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         gbuf_local_end = tensors.pop('gbuf_local_end')
 
                         for key in tensors:
-                            assert tensors[key].shape == (gbuf_local_end - gbuf_local_start,), (tensors[key].shape, gbuf_local_start, gbuf_local_end)
+                            assert tensors[key].shape == (gbuf_local_end - gbuf_local_start,), (
+                                tensors[key].shape,
+                                gbuf_local_start,
+                                gbuf_local_end,
+                            )
 
                             tensors[key] = ShardedTensor(
                                 f'{sharded_bucket_key}.{key}',
@@ -954,9 +973,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     bucket_state = state_dict[gbuf_idx][dtype][bucket_idx]
 
                     # State dict bucket state can be 1 entry longer in case of padding
-                    assert len(bucket_state) in (len(gbuf_range_map["param_map"]), len(gbuf_range_map["param_map"]) + 1),\
-                        (len(bucket_state), len(gbuf_range_map["param_map"]))
-                    for src_tensors, (model_param, param_range_map) in zip(bucket_state, gbuf_range_map["param_map"].items()):
+                    assert len(bucket_state) in (
+                        len(gbuf_range_map["param_map"]),
+                        len(gbuf_range_map["param_map"]) + 1,
+                    ), (len(bucket_state), len(gbuf_range_map["param_map"]))
+                    for src_tensors, (model_param, param_range_map) in zip(
+                        bucket_state, gbuf_range_map["param_map"].items()
+                    ):
 
                         # Main param & optimizer states.
                         group_index, group_order = self.model_param_group_index_map[model_param]
