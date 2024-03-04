@@ -21,10 +21,10 @@ if [[ -z $MERGE_FILE ]]; then MERGE_FILE="/workspace/data/gpt3_data/merges.txt" 
 
 GPUS_PER_NODE=8
 # Change for multinode config
-MASTER_ADDR=localhost
-MASTER_PORT=6000
-NODE_RANK=0
-WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
+#MASTER_ADDR=localhost
+#MASTER_PORT=6000
+#NODE_RANK=0
+#WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 
 command="export CUDA_DEVICE_MAX_CONNECTIONS=1;"
 
@@ -61,19 +61,20 @@ if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
          MAX_STEPS=100
        fi
 else
-       __SAVE_INTERVAL=10000  # inf
+       __SAVE_INTERVAL=${SAVE_INTERVAL:-10000}  # inf
 fi
 if [[ -n "$CKPT_FORMAT" ]] && [[ "$CKPT_FORMAT" != 'torch' ]]; then
-       echo "Using distributed checkpoint format..."
-       command="$command pip install zarr tensorstore==0.1.45;"
+       echo "Using distributed checkpoint format $CKPT_FORMAT..."
+       [[ "$CKPT_FORMAT" == 'zarr' ]] && command="$command pip install zarr tensorstore==0.1.45;"
        ADDITIONAL_PARAMS+=" --use-dist-ckpt --dist-ckpt-format $CKPT_FORMAT"
 fi
 set +x
 # Runs the "345M" parameter model
-DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 
 build_torch_run_cmd() {
-  torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
+  DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
+  [[ -n "$RUN_CMD" ]] && run_cmd=$RUN_CMD || run_cmd="torchrun $DISTRIBUTED_ARGS"
+  torch_run_cmd="$run_cmd \
        pretrain_gpt.py \
        --num-layers 12 \
        --hidden-size 512 \
@@ -135,6 +136,7 @@ if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
   _NONEMPTY_OVERRIDES=0
   for ARGUMENT in "$@"
   do
+    echo $ARGUMENT
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
     if [[ $KEY == ${_OVERRIDE_PREFIX}* ]]; then
       KEY_LENGTH=${#KEY}

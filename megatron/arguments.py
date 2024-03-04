@@ -1119,6 +1119,10 @@ def _add_checkpointing_args(parser):
     group.add_argument('--dist-ckpt-format', type=str, default='torch_dist',
                        choices=['zarr', 'torch_dist'],
                        help='Distributed checkpoint format to use.')
+    group.add_argument('--ckpt-fully-parallel-save', action='store_true',
+                       help='Apply full save parallelization across DP for'
+                            ' distributed checkpoints. Depending on ckpt format'
+                            ' might increase number of files in the checkpoint.')
 
     return parser
 

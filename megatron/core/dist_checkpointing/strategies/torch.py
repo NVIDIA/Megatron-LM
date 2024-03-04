@@ -102,6 +102,9 @@ def sharded_tensor_to_torch_sharded_tensor(
         for sh_ten in sh_tens:
             sh_ten.data = sh_ten.data.view((1,) * prepend_axis_num + sh_ten.local_shape)
 
+    for sh_ten in sh_tens:
+        assert sh_ten.flattened_range is None, sh_ten.flattened_range
+
     local_shards = [
         Shard.from_tensor_and_offsets(sh_ten.data, list(sh_ten.global_offset), rank)
         for sh_ten in sh_tens
@@ -126,6 +129,87 @@ def sharded_tensor_to_torch_sharded_tensor(
         ShardMetadata(offset, size, placement)
         for offset, size, placement in zip(chunk_offsets, chunk_sizes, placements)
     ]
+    tensor = sh_ten.data
+    sharded_tensor_metadata = ShardedTensorMetadata(
+        shards_metadata=shard_metadata,
+        size=torch.Size(sh_ten.global_shape),
+        tensor_properties=TensorProperties(
+            dtype=tensor.dtype,
+            layout=tensor.layout,
+            requires_grad=tensor.requires_grad,
+            memory_format=torch.contiguous_format,
+            pin_memory=tensor.is_pinned(),
+        ),
+    )
+    pyt_sh_ten = TorchShardedTensor._init_from_local_shards_and_global_metadata(
+        local_shards, sharded_tensor_metadata=sharded_tensor_metadata, process_group=None
+    )
+    pyt_sh_ten.prepend_axis_num = prepend_axis_num
+    return pyt_sh_ten
+
+
+def sharded_tensor_to_torch_sharded_tensor_flattened(
+    sh_tens: List[ShardedTensor], rank: Optional[int] = None
+) -> TorchShardedTensor:
+    """Convert MCore ShardedTensor to PyT ShardedTensor. PyT requires information about all chunks.
+
+    NOTE: this function assumes regular (grid) sharding of the MCore ShardedTensor.
+
+    This function follows the logic of torch.distributed.fsdp._shard_utils._create_chunk_sharded_tensor.
+    Additionally, it saves `prepend_axis_num` (specific to MCore) as an attribute
+    for further restoration in `_unwrap_pyt_sharded_tensor`.
+
+    Args:
+        sh_tens (List[ShardedTensor]): list of sharded tensors to convert
+        rank (int, optional): current process rank passed to PyT ShardedTensor.
+            If None, assumes rank in the default pg.
+
+    Returns (TorchShardedTensor): PyT ShardedTensor containing all passed shards.
+
+    """
+    if rank is None:
+        rank = torch.distributed.get_rank()
+
+    # Determine local shards
+
+    prepend_axis_num = sh_tens[0].prepend_axis_num
+    if prepend_axis_num:
+        raise NotImplementedError
+
+    for sh_ten in sh_tens:
+        assert sh_ten.flattened_range is not None
+        assert len(sh_ten.global_offset) == 1, sh_ten
+
+    local_shards = [
+        Shard.from_tensor_and_offsets(sh_ten.data, [sh_ten.global_offset[0] + sh_ten.flattened_range.start], rank)
+        for sh_ten in sh_tens
+    ]
+    local_global_offsets = {}
+    for sh_ten in sh_tens:
+        local_global_offsets.setdefault(sh_ten.global_offset, []).append(sh_ten)
+    sh_ten = sh_tens[0]
+
+    # Create a ShardedTensor without invoking communication. Determine global shards
+    shard_metadata = []
+    # NOTE: here we assume a regular grid of shards
+    for fragment_offsets in itertools.product(*map(range, sh_ten.axis_fragmentations)):
+        offset = tuple(map(lambda x: x[0] * x[1], zip(fragment_offsets, sh_ten.local_shape)))
+        if offset in local_global_offsets:
+            # local shard
+            placement = f"rank:{rank}/cuda"
+            for sh_ten in local_global_offsets[offset]:
+                offset = (sh_ten.global_offset[0] + sh_ten.flattened_range.start,)
+                size = sh_ten.data.shape
+                shard_metadata.append(ShardMetadata(offset, size, placement))
+
+        else:
+            # for shards from other ranks we provide simplistic data - this information will be discarded
+            # during TorchShardedTensor._init_from_local_shards_and_global_metadata call
+            size = sh_ten.local_shape
+            placement = "cuda"
+
+            shard_metadata.append(ShardMetadata(offset, size, placement))
+
     tensor = sh_ten.data
     sharded_tensor_metadata = ShardedTensorMetadata(
         shards_metadata=shard_metadata,
@@ -191,7 +275,10 @@ def mcore_to_pyt_state_dict(
                 if sh_ten.allow_shape_mismatch and is_loading:
                     sh_ten.data.zero_()
 
-        torch_sh_ten = sharded_tensor_to_torch_sharded_tensor(sh_tens, rank)
+        if sh_tens[0].flattened_range is None:
+            torch_sh_ten = sharded_tensor_to_torch_sharded_tensor(sh_tens, rank)
+        else:
+            torch_sh_ten = sharded_tensor_to_torch_sharded_tensor_flattened(sh_tens, rank)
         torch_sh_ten.key = sh_tens[0].key
         return torch_sh_ten
 

@@ -133,7 +133,7 @@ class ShardedTensor(ShardedBase):
         *rank_offsets: Tuple[int, int, int],
         replica_id: ReplicaId = 0,
         prepend_axis_num: int = 0,
-        allow_shape_mismatch: bool = False,
+        **init_kwargs,
     ):
         """Allows to construct the ShardedTensor given offset specified in process ranks.
 
@@ -143,7 +143,7 @@ class ShardedTensor(ShardedBase):
             rank_offsets: each tuple (axis, axis_rank_offset, axis_fragm) says that if global tensor is divided into `axis_fragm` fragment along `axis` axis, then local tensor data corresponds to the `axis_rank_offset` chunk.
             replica_id: see ShardedTensor
             prepend_axis_num: see ShardedTensor
-            allow_shape_mismatch: see ShardedTensor
+            init_kwargs: passed to ShardedTensor.__init__
         """
         global_offset = [0] * (data.ndim + prepend_axis_num)
         global_shape = ([1] * prepend_axis_num) + list(data.shape)
@@ -177,7 +177,7 @@ class ShardedTensor(ShardedBase):
             tuple(axis_fragmentations),
             replica_id,
             prepend_axis_num,
-            allow_shape_mismatch,
+            **init_kwargs,
         )
 
     def init_data(self, device: torch.device, init_fn=torch.empty):
