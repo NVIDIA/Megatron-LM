@@ -9,7 +9,7 @@ spec:
   scope: merge-request
   nodes: 1
   gpus: 8
-  platforms: [dgx_h100]
+  platforms: [dgx_a100]
   steps: 50
   use_te: False
   use_mcore: True

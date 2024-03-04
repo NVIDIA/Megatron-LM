@@ -45,7 +45,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         clip_grad: clip gradeints with this global L2 norm. Note
             that clipping is ignored if clip_grad == 0
         log_num_zeros_in_grad: return number of zeros in the gradients.
-        check_for_nan_in_grad: check if gradients have a NaN.
         params_have_main_grad: flag indicating if parameters have
             a `main_grad` field. If this is set, we are assuming
             that the model parameters are store in the `main_grad`
@@ -374,7 +373,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         optimizer,
         clip_grad,
         log_num_zeros_in_grad,
-        check_for_nan_in_grad,
         params_have_main_grad,
         fp16,
         bf16,
@@ -399,7 +397,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             optimizer,
             clip_grad,
             log_num_zeros_in_grad,
-            check_for_nan_in_grad,
             params_have_main_grad,
             fp16,
             bf16,

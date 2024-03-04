@@ -12,7 +12,7 @@ do
 done
 echo "---------------------------------"
 
-set -x 
+set -exo pipefail
 if [[ -z $MBS ]]; then MBS=4; fi
 if [[ -z $GBS ]]; then GBS=128; fi
 if [[ -z $VOCAB_FILE ]]; then VOCAB_FILE="/workspace/data/bert_data/vocab.txt" ; fi

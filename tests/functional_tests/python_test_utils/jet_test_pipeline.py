@@ -47,10 +47,7 @@ def check_exitcodes(results):
     for result in results:
         exit_codes.append(result.get('l_exit_code', -1))
         log_urls.append(select_asset(result, 'output_script-0.log'))
-        name = result['obj_workload']['s_key'].lstrip('recipe/')
-        remove_substr = result['obj_workload']['obj_spec']['s_build'] + \
-            '_' + result['obj_workload']['obj_spec']['s_scope']
-        names.append(''.join(name.split(remove_substr)))
+        names.append(result['obj_workload']['s_key'].lstrip('recipe/'))
 
     table = PrettyTable()
     table.add_column("Job Key", names)

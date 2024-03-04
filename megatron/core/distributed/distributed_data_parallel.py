@@ -33,6 +33,7 @@ class DistributedDataParallel(MegatronModule):
         disable_bucketing: If true, force assign all parameters to a single bucket. If false,
             use standard bucketing policy: assign parameters to smaller buckets and all-reduce
             per bucket _if_ overlap_grad_reduce is True and pp_rank is 0.
+        check_for_nan_in_grad: If true, check if local grad norm is NaN.
 
     """
 
@@ -46,6 +47,7 @@ class DistributedDataParallel(MegatronModule):
         use_distributed_optimizer: bool,
         expert_data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         disable_bucketing: bool = False,
+        check_for_nan_in_grad: bool = False,
         bucket_size: int = 40000000,
     ):
         super().__init__(config=config)
@@ -66,6 +68,8 @@ class DistributedDataParallel(MegatronModule):
             bucket_size = None
         if disable_bucketing:
             bucket_size = None
+
+        self.check_for_nan_in_grad = check_for_nan_in_grad
         self.bucket_size = bucket_size
 
         self.module = module
@@ -115,7 +119,8 @@ class DistributedDataParallel(MegatronModule):
                         param_to_name,
                         self.overlap_grad_reduce,
                         self.use_distributed_optimizer,
-                        gradient_scaling_factor=gradient_scaling_factor,
+                        gradient_scaling_factor,
+                        self.check_for_nan_in_grad,
                     )
                 )
                 for param in params:
@@ -176,6 +181,7 @@ class DistributedDataParallel(MegatronModule):
                 ):
                     param.main_grad.add_(param.grad.data)
                 param.grad = None
+
                 if self.overlap_grad_reduce:
                     param_to_grad_buffer[param].register_grad_ready(param)
 
