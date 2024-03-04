@@ -21,10 +21,10 @@ if [[ -z $MERGE_FILE ]]; then MERGE_FILE="/workspace/data/gpt3_data/merges.txt" 
 
 GPUS_PER_NODE=8
 # Change for multinode config
-#MASTER_ADDR=localhost
-#MASTER_PORT=6000
-#NODE_RANK=0
-#WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
+MASTER_ADDR=localhost
+MASTER_PORT=6000
+NODE_RANK=0
+WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 
 command="export CUDA_DEVICE_MAX_CONNECTIONS=1;"
 
