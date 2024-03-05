@@ -24,6 +24,7 @@ from megatron.utils import (
     average_losses_across_data_parallel_group
 )
 from megatron.arguments import core_transformer_config_from_args
+from megatron.yaml_arguments import core_transformer_config_from_yaml
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 
 
@@ -43,7 +44,11 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
     args = get_args()
 
     print_rank_0('building GPT model ...')
-    config = core_transformer_config_from_args(get_args())
+    # Experimental loading arguments from yaml
+    if args.yaml_cfg is not None:
+        config = core_transformer_config_from_yaml(args, "language_model")
+    else:
+        config = core_transformer_config_from_args(args)
 
     if args.use_mcore_models:
         if args.spec is not None:

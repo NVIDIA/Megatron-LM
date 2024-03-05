@@ -46,12 +46,19 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     # Custom arguments.
     if extra_args_provider is not None:
         parser = extra_args_provider(parser)
-
+    
     # Parse.
     if ignore_unknown_args:
         args, _ = parser.parse_known_args()
     else:
         args = parser.parse_args()
+
+    # Experimental yaml
+    if args.yaml_cfg is not None:
+        from .yaml_arguments import load_yaml
+        assert args.yaml_cfg and args.use_mcore_models, "To use yaml, mcore must be enabled"
+        args = load_yaml(args.yaml_cfg)
+        
 
     # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
@@ -1474,5 +1481,7 @@ def _add_experimental_args(parser):
                        'To use local spec specify local as the argument.'
                        'For more details, see the model class, '
                        '`transformer_block.py`, or `transformer_layer.py`')
+    group.add_argument('--yaml-cfg', type=str, default=None, 
+                       help = 'Config file to add additional arguments')
 
     return parser
