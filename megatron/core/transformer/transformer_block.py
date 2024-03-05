@@ -357,7 +357,7 @@ class TransformerBlock(MegatronModule):
             )
             fp8_group = None
             if parallel_state.model_parallel_is_initialized():
-                fp8_group = parallel_state.get_amax_reduction_group(with_context_parallel=True)
+                fp8_group = parallel_state.get_amax_reduction_group(with_context_parallel=False)
             fp8_context = transformer_engine.pytorch.fp8_autocast(
                 enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group
             )
@@ -381,7 +381,7 @@ class TransformerBlock(MegatronModule):
                     for param in layer.parameters():
                         param.data_ptr()
                     with self.offload_context:
-                        if (len(self.cg) > l_no) and (self.current_microbatch < len(self.cg[l_no])) and self.training:# and (self.current_microbatch > 0):
+                        if (len(self.cg) > l_no) and (self.current_microbatch < len(self.cg[l_no])) and self.training and (self.current_microbatch > 0):
                             hidden_states = self.cg[l_no][self.current_microbatch](hidden_states)
                         else:
                             hidden_states = layer(
