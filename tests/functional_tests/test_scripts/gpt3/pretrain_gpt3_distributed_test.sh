@@ -136,7 +136,6 @@ if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
   _NONEMPTY_OVERRIDES=0
   for ARGUMENT in "$@"
   do
-    echo $ARGUMENT
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
     if [[ $KEY == ${_OVERRIDE_PREFIX}* ]]; then
       KEY_LENGTH=${#KEY}

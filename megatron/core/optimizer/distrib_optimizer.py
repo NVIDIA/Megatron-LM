@@ -868,10 +868,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if is_loading:
             param_state_data = None
         else:
+            # Gather on rank 0
             param_state_data = self.get_parameter_state()
 
         if torch.distributed.get_rank(self.data_parallel_group) == 0:
-            # Fixed TPxPP
+            # Fixed TPxPP. Save on DP rank 0 only
             param_state = ShardedObject(
                 f'optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}.param_state',
                 param_state_data,
@@ -879,6 +880,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 (0,),
             )
         else:
+            # DP ranks > 0 don't save. During loading, the param_state needs to be None.
             param_state = LocalNonpersitentObject(None)
 
         return param_state
@@ -886,11 +888,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def sharded_param_state_fs_bucket_space(
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
     ):
-        """Sharded state dict where each noncontiguous buffer is a separate ShardedTensor."""
+        """Sharded state dict where each noncontiguous buffer is a separate ShardedTensor.
+
+        Results in fully parallel save and load without any inter-process
+        communication or intermediate buffers/copies.
+        """
         data_parallel_rank = torch.distributed.get_rank(self.data_parallel_group)
         data_parallel_world_size = torch.distributed.get_world_size(self.data_parallel_group)
 
         state = self.get_parameter_state_internal_repr()
+        # per_bucket_numel metadata is saved separately for each TPxPP domain.
         for per_bucket_key in ('per_bucket_numel', 'per_bucket_numel_unpadded'):
             state[per_bucket_key] = ShardedObject(
                 f'optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}.{per_bucket_key}',
@@ -910,6 +917,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                     sharded_bucket_key = f'optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}.gbuf_idx_{gbuf_idx}.dtype_{dtype}.bucket_idx_{bucket_idx}'
 
+                    # The global ckpt tensors must be fully covered.
+                    # We add extra empty padding if necessary
                     assert bucket_state, 'empty bucket encountered'
                     if bucket_state[-1]['gbuf_local_end'] != gbuf_local_numel:
                         assert (
@@ -932,6 +941,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             }
                         )
 
+                    # Each tensor is mapped to a slice (`flattened_range`)
+                    # of a DP-local shard of size `gbuf_local_numel`.
                     for bucket_params_idx in range(len(bucket_state)):
                         tensors = bucket_state[bucket_params_idx]
                         gbuf_local_start = tensors.pop('gbuf_local_start')
@@ -958,6 +969,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return state
 
     def load_parameter_state_from_internal_repr(self, state_dict):
+        """ Loads the parameter state from an internal representation.
+
+        Inverse of the `get_parameter_state_internal_repr` method.
+        """
         if state_dict is not None and "per_bucket_numel_unpadded" in state_dict:
             per_bucket_numel_unpadded_in_checkpoint = state_dict["per_bucket_numel_unpadded"]
             assert self.per_bucket_numel_unpadded == per_bucket_numel_unpadded_in_checkpoint, (
@@ -980,7 +995,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     for src_tensors, (model_param, param_range_map) in zip(
                         bucket_state, gbuf_range_map["param_map"].items()
                     ):
-
                         # Main param & optimizer states.
                         group_index, group_order = self.model_param_group_index_map[model_param]
                         main_param = self.optimizer.param_groups[group_index]["params"][group_order]
