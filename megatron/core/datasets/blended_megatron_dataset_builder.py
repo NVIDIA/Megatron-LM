@@ -1,5 +1,6 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
+import os
 import logging
 import math
 from typing import Any, Callable, List, Optional, Tuple, Type, Union
@@ -33,10 +34,12 @@ class BlendedMegatronDatasetBuilder(object):
     """
 
     def __init__(
-        self, cls: Type[MegatronDataset], sizes: List[int], config: BlendedMegatronDatasetConfig,
+        self, cls: Type[MegatronDataset], sizes: List[int], 
+        consumed_samples_per_dataset, config: BlendedMegatronDatasetConfig,
     ):
         self.cls = cls
         self.sizes = sizes
+        self.consumed_samples_per_dataset = consumed_samples_per_dataset
         self.config = config
 
     def build(self) -> List[Optional[Union[BlendedDataset, MegatronDataset]]]:
@@ -207,6 +210,14 @@ class BlendedMegatronDatasetBuilder(object):
         else:
             split_indices = [None for _ in Split]
 
+        # look up the consumed_samples_dict using the path_prefix
+        prefix = os.path.basename(path_prefix)
+        consumed_samples_dict = dict()
+        if prefix in self.consumed_samples_per_dataset:
+            consumed_samples_dict = self.consumed_samples_per_dataset[prefix]
+        # Only track consumed samples for training split
+        consumed_samples_dicts = [consumed_samples_dict]+[None]*(len(Split)-1)
+        
         megatron_datasets = []
         for i, _split in enumerate(Split):
             if split[i] is None:
@@ -220,6 +231,7 @@ class BlendedMegatronDatasetBuilder(object):
                         split_indices[i],
                         sizes[i],
                         _split,
+                        consumed_samples_dicts[i],
                         self.config,
                     )
                 )

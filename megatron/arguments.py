@@ -1044,6 +1044,9 @@ def _add_checkpointing_args(parser):
                        help="If '--load' is set, but checkpoint is not found "
                        "(e.g., path typo), then exit instead of random "
                        "initialization.")
+    group.add_argument('--resume-with-new-dataset', action='store_true', default=False,
+                       help="Reloads the dataset with tracking for consumed samples of "
+                       "each datashard. Used when resuming training with a changed dataset.")
 
     return parser
 

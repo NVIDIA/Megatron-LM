@@ -36,6 +36,7 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
         indexed_indices: numpy.ndarray,
         num_samples: int,
         index_split: Split,
+        consumed_samples_dict: dict,
         config: BlendedMegatronDatasetConfig,
     ) -> None:
         assert indexed_indices.size > 0
@@ -47,6 +48,7 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
         self.indexed_indices = indexed_indices
         self.num_samples = num_samples
         self.index_split = index_split
+        self.consumed_samples_dict = consumed_samples_dict
         self.config = config
 
         self.unique_identifiers = OrderedDict()

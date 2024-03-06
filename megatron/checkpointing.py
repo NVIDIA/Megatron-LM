@@ -11,6 +11,8 @@ import torch
 
 from megatron import update_num_microbatches
 from megatron.core import mpu, tensor_parallel
+from megatron.core.datasets.blended_dataset import BlendedDataset
+from megatron.core.datasets.gpt_dataset import GPTDataset
 from .global_vars import get_args
 from .utils import (unwrap_model,
                     print_rank_0)
@@ -237,8 +239,21 @@ def get_rng_state():
 
     return rng_state_list
 
+def update_consumed_samples_per_dataset(train_ds):
+    args = get_args()
+    
+    # get the datapaths, process them and match them to the datasets
+    # TODO handle the `blend_per_split` case as well
+    blend = args.data_path
+    _, prefixes = zip(
+        *[(float(blend[i]), os.path.basename(blend[i + 1].strip())) for i in range(0, len(blend), 2)]
+    )
+    assert type(train_ds) == BlendedDataset and type(train_ds.datasets[0]) == GPTDataset,\
+        "Consumed samples per dataset tracking only supported for BlendedDataset and GPTDataset"
+    for prefix, ds in (prefixes, train_ds.datasets):
+        args.consumed_samples_per_dataset[prefix] = ds.consumed_samples_dict
 
-def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
+def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, train_dataloader):
     """Save a model checkpoint."""
     args = get_args()
 
@@ -265,6 +280,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
     if not torch.distributed.is_initialized() \
             or mpu.get_data_modulo_expert_parallel_rank() == 0:
 
+        # update args to have the latest consumed samples per dataset states
+        train_ds = train_dataloader.dataset
+        if type(train_ds) == BlendedDataset:
+            update_consumed_samples_per_dataset(train_ds)
+        
         # Arguments, iteration, and model.
         state_dict = {}
         state_dict['args'] = args
@@ -580,6 +600,8 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         update_num_microbatches(consumed_samples=args.consumed_train_samples)
         args.consumed_valid_samples = getattr(checkpoint_args,
                                               'consumed_valid_samples', 0)
+        args.consumed_samples_per_dataset = getattr(checkpoint_args,
+                                              'consumed_samples_per_dataset', dict())
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
 

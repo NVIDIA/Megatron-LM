@@ -197,10 +197,11 @@ def core_gpt_dataset_config_from_args(args):
         blend_per_split=[args.train_data_path, args.valid_data_path, args.test_data_path],
         split=args.split,
         path_to_cache=args.data_cache_path,
+        filter_consumed_samples=args.resume_with_new_dataset
     )
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples):
+def train_valid_test_datasets_provider(train_val_test_num_samples, consumed_samples_per_dataset):
     """Build the train test and validation datasets.
 
     Args:
@@ -213,6 +214,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         GPTDataset,
         train_val_test_num_samples,
+        consumed_samples_per_dataset,
         core_gpt_dataset_config_from_args(args)
     ).build()
 

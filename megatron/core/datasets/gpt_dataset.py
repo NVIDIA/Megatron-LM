@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 import numpy
 import torch
@@ -21,8 +21,7 @@ logger = logging.getLogger(__name__)
 class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Configuration object for Megatron Core GPT datasets
     """
-
-    pass
+    filter_consumed_samples: Optional[bool] = False
 
 
 class GPTDataset(MegatronDataset):
@@ -47,9 +46,11 @@ class GPTDataset(MegatronDataset):
         indexed_indices: numpy.ndarray,
         num_samples: int,
         index_split: Split,
+        consumed_samples_dict: dict,
         config: GPTDatasetConfig,
     ) -> None:
-        super().__init__(indexed_dataset, indexed_indices, num_samples, index_split, config)
+        super().__init__(indexed_dataset, indexed_indices, num_samples, 
+                         index_split, consumed_samples_dict, config)
 
     def _finalize(self) -> None:
         """Abstract method implementation
@@ -70,8 +71,8 @@ class GPTDataset(MegatronDataset):
         Returns:
             int: The length of the dataset
         """
-        return self.sample_index.shape[0] - 1
-
+        return len(self.shuffle_index)
+    
     def __getitem__(self, idx: int) -> Dict[str, numpy.ndarray]:
         """Abstract method implementation
 
@@ -119,6 +120,14 @@ class GPTDataset(MegatronDataset):
         # Get the beginning and end documents and offsets
         doc_index_beg, doc_index_beg_offset = self.sample_index[idx]
         doc_index_end, doc_index_end_offset = self.sample_index[idx + 1]
+
+        # mark this sample as consumed
+        if self.consumed_samples_dict is not None:
+            sample = tuple((doc_index_beg, doc_index_beg_offset))
+            if sample in self.consumed_samples_dict:
+                self.consumed_samples_dict[sample] += 1
+            else:
+                self.consumed_samples_dict[sample] = 1
 
         document_ids = []
         sample_parts = []
@@ -206,7 +215,7 @@ class GPTDataset(MegatronDataset):
         num_tokens_per_epoch = self._get_num_tokens_per_epoch()
         num_epochs = self._get_num_epochs(num_tokens_per_epoch)
 
-        if not cache_hit and torch.distributed.get_rank() == 0:
+        if (self.config.filter_consumed_samples or not cache_hit) and torch.distributed.get_rank() == 0:
             log_single_rank(
                 logger,
                 logging.INFO,
@@ -310,6 +319,8 @@ class GPTDataset(MegatronDataset):
                 shuffle_index = _build_shuffle_index(
                     sample_index.shape[0] - 1, sample_index.shape[0] - 1, numpy_random_state
                 )
+            if self.config.filter_consumed_samples:
+                shuffle_index = self._filter_shuffle_index(shuffle_index, sample_index)
             numpy.save(path_to_shuffle_index, shuffle_index, allow_pickle=True)
             t_end = time.time()
             log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
@@ -388,6 +399,19 @@ class GPTDataset(MegatronDataset):
             if num_tokens >= num_tokens_requested:
                 return num_epochs
 
+    def _filter_shuffle_index(self, shuffle_index, sample_index):
+        assert self.consumed_samples_dict is not None, \
+            "Cannot filter dataset without `consumed_samples_dict`!"
+        # removes samples marked as consumed from shuffle_index
+        consumed_samples_dict_copy = self.consumed_samples_dict.copy()
+        mask = numpy.ones_like(shuffle_index, dtype=bool)
+        for idx in range(len(shuffle_index)):
+            sample = tuple(sample_index[shuffle_index[idx]])
+            if sample in consumed_samples_dict_copy and consumed_samples_dict_copy[sample] > 0:
+                mask[idx] = 0
+                consumed_samples_dict_copy[sample] -= 1
+        shuffle_index = shuffle_index[mask]
+        return shuffle_index
 
 def _build_document_index(
     documents: numpy.ndarray,
