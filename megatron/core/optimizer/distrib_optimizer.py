@@ -1082,9 +1082,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if not param.requires_grad:
                     continue
 
-                assert param in self.param_to_all_gather_handle_index_map
-                all_gather_handle_index = self.param_to_all_gather_handle_index_map[param]
-                self._finish_param_sync_helper(all_gather_handle_index)
+                # Some params might be handled in another DistributedOptimizer instance; for
+                # example, we use separate DistributedOptimizer instances for expert and
+                # non-expert params.
+                if param in self.param_to_all_gather_handle_index_map:
+                    all_gather_handle_index = self.param_to_all_gather_handle_index_map[param]
+                    self._finish_param_sync_helper(all_gather_handle_index)
 
         return hook
 
