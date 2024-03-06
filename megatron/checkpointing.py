@@ -250,7 +250,7 @@ def update_consumed_samples_per_dataset(train_ds):
     )
     assert type(train_ds) == BlendedDataset and type(train_ds.datasets[0]) == GPTDataset,\
         "Consumed samples per dataset tracking only supported for BlendedDataset and GPTDataset"
-    for prefix, ds in (prefixes, train_ds.datasets):
+    for prefix, ds in zip(prefixes, train_ds.datasets):
         args.consumed_samples_per_dataset[prefix] = ds.consumed_samples_dict
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, train_dataloader):
