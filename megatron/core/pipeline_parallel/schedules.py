@@ -353,6 +353,7 @@ def forward_backward_no_pipelining(
     input_tensor, output_tensor_grad = None, None
     with no_sync_func():
         for i in range(num_microbatches - 1):
+            model.module.decoder.current_microbatch = i
             output_tensor = forward_step(
                 forward_step_func,
                 data_iterator,
@@ -369,6 +370,7 @@ def forward_backward_no_pipelining(
 
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).
+    model.module.decoder.current_microbatch = num_microbatches - 1
     output_tensor = forward_step(
         forward_step_func,
         data_iterator,

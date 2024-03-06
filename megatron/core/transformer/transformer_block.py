@@ -305,6 +305,7 @@ class TransformerBlock(MegatronModule):
         rotary_pos_emb: Tensor = None,
         inference_params: InferenceParams = None,
         packed_seq_params: PackedSeqParams = None,
+        is_first_microbatch = None,
     ):
         # hidden_states (float): [s, b, h]
         # attention_mask (bool): [1, 1, s, s]
@@ -381,11 +382,13 @@ class TransformerBlock(MegatronModule):
                     for param in layer.parameters():
                         param.data_ptr()
                     with self.offload_context:
-                        if (len(self.cg) > l_no) and (self.current_microbatch < len(self.cg[l_no])) and self.training and (self.current_microbatch > 0):
-                            hidden_states = self.cg[l_no][self.current_microbatch](hidden_states)
+                        skip_fp8_weight_update = torch.zeros(1, device="cuda")
+                        if (len(self.cg) > l_no) and (self.current_microbatch < len(self.cg[l_no])) and self.training:
+                            hidden_states = self.cg[l_no][self.current_microbatch](hidden_states, is_first_microbatch=(self.current_microbatch==0))
                         else:
                             hidden_states = layer(
                                 hidden_states,
+                                None,
 #                                attention_mask=attention_mask,
 #                                context=context,
 #                                context_mask=context_mask,
