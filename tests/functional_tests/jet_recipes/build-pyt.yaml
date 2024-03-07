@@ -5,7 +5,7 @@ spec:
   name: pyt
   platforms: [linux/amd64]
   source:
-    image: nvcr.io/nvidia/pytorch:23.04-py3
+    image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
 
 ---
 type: build
