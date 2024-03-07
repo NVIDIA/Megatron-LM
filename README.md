@@ -4,14 +4,8 @@ Megatron: Megatron-LM & Megatron-Core
 ===========================
 <h4>GPU optimized techniques for training transformer models at-scale</h4>
 
-[![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)]()
-[![python](https://img.shields.io/badge/python-3.10.12-green)](https://www.python.org/downloads/release/python-31012/)
-[![cuda](https://img.shields.io/badge/cuda-12.2-green)](https://developer.nvidia.com/cuda-downloads)
 [![version](https://img.shields.io/badge/release-0.5.0-green)](./setup.py)
-[![license](https://img.shields.io/badge/license-Apache%202-blue)](./LICENSE)
-
-[Architecture](./docs/source/architecture.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Results](./docs/source/performance.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Examples](./examples/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentation](./docs/source/)
-
+[![license](https://img.shields.io/badge/license-OpenBSD-blue)](./LICENSE)
 
 <div align="left">
 
