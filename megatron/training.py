@@ -159,7 +159,7 @@ def pretrain(train_valid_test_dataset_provider,
             valid_data_iterator.append(iterators[1])
             test_data_iterator.append(iterators[2])
     else:
-        train_data_iterator, valid_data_iterator, test_data_iterator, train_dataloader \
+        train_data_iterator, valid_data_iterator, test_data_iterator \
             = build_train_valid_test_data_iterators(
                 train_valid_test_dataset_provider)
     timers('train/valid/test-data-iterators-setup').stop()
@@ -181,13 +181,13 @@ def pretrain(train_valid_test_dataset_provider,
         if args.do_train and args.train_iters > 0:
             iteration = train(forward_step_func,
                               model, optimizer, opt_param_scheduler,
-                              train_data_iterator, valid_data_iterator, train_dataloader,
+                              train_data_iterator, valid_data_iterator,
                               process_non_loss_data_func, config)
 
         print_datetime('after training is done')
 
         if args.save and iteration != 0:
-            save_checkpoint(iteration, model, optimizer, opt_param_scheduler, train_dataloader)
+            save_checkpoint(iteration, model, optimizer, opt_param_scheduler, train_data_iterator._dataset)
     else:
         print_rank_0('skipping training (--skip-train is on) ...')
 
@@ -711,19 +711,18 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     return report_memory_flag
 
 
-def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler, train_dataloader):
+def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler, train_dataset):
     timers = get_timers()
     # Extra barrier is added to make sure
     # all ranks report the max time.
     timers('save-checkpoint', log_level=0).start(barrier=True)
-    save_checkpoint(iteration, model, optimizer, opt_param_scheduler, train_dataloader)
+    save_checkpoint(iteration, model, optimizer, opt_param_scheduler, train_dataset)
     timers('save-checkpoint').stop(barrier=True)
     timers.log(['save-checkpoint'])
 
 
 def train(forward_step_func, model, optimizer, opt_param_scheduler,
-          train_data_iterator, valid_data_iterator, train_dataloader,
-          process_non_loss_data_func, config):
+          train_data_iterator, valid_data_iterator, process_non_loss_data_func, config):
     """Train the model function."""
     args = get_args()
     timers = get_timers()
@@ -740,6 +739,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
     # Iterations.
     iteration = args.iteration
+
+    # Get access to training dataset
+    train_dataset = train_data_iterator._dataset
 
     # Setup some training config params
     config.grad_scale_func = optimizer.scale_loss
@@ -835,8 +837,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if args.exit_signal_handler:
             signal_handler = get_signal_handler()
             if any(signal_handler.signals_received()):
-                save_checkpoint_and_time(iteration, model, optimizer,
-                                         opt_param_scheduler, train_dataloader)
+                save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler, train_dataset)
                 print_datetime('exiting program after receiving SIGTERM.')
                 exit = True
                 break
@@ -844,8 +845,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if args.save and args.save_interval and \
            iteration % args.save_interval == 0:
             timers('interval-time').stop()
-            save_checkpoint_and_time(iteration, model, optimizer,
-                                     opt_param_scheduler, train_dataloader)
+            save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler, train_dataset)
             saved_checkpoint = True
             timers('interval-time', log_level=0).start(barrier=True)
 
@@ -860,8 +860,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             done = done_cuda.item()
             if done:
                 if not saved_checkpoint:
-                    save_checkpoint_and_time(iteration, model, optimizer,
-                                             opt_param_scheduler)
+                    save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler, train_dataset)
                 print_datetime('exiting program after {} minutes'.format(train_time))
                 exit = True
                 break
@@ -869,8 +868,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         # Exiting based on iterations
         if args.exit_interval and iteration % args.exit_interval == 0:
             if args.save and not saved_checkpoint:
-                save_checkpoint_and_time(iteration, model, optimizer,
-                                         opt_param_scheduler, train_dataloader)
+                save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler, train_dataset)
             torch.distributed.barrier()
             print_datetime('exiting program at iteration {}'.format(iteration))
             exit = True
@@ -1172,5 +1170,4 @@ def build_train_valid_test_data_iterators(
                              else iter(cyclic_iter(test_dataloader))
     else:
         test_data_iterator = None
-    # Pass the train data loader back to the caller to access the datasets later
-    return train_data_iterator, valid_data_iterator, test_data_iterator, train_dataloader
+    return train_data_iterator, valid_data_iterator, test_data_iterator

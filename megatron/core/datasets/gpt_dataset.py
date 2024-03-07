@@ -82,8 +82,8 @@ class GPTDataset(MegatronDataset):
         Returns:
             Dict[str, numpy.ndarray]: The text ids wrapped in a dictionary
         """
-        text, _ = self._query_document_sample_shuffle_indices(idx)
-        return {"text": text}
+        text, _, sample = self._query_document_sample_shuffle_indices(idx)
+        return {"text": text, "sample_id": sample}
 
     @staticmethod
     def is_multimodal() -> bool:
@@ -122,12 +122,7 @@ class GPTDataset(MegatronDataset):
         doc_index_end, doc_index_end_offset = self.sample_index[idx + 1]
 
         # mark this sample as consumed
-        if self.consumed_samples_dict is not None:
-            sample = tuple((doc_index_beg, doc_index_beg_offset))
-            if sample in self.consumed_samples_dict:
-                self.consumed_samples_dict[sample] += 1
-            else:
-                self.consumed_samples_dict[sample] = 1
+        sample = tuple((doc_index_beg, doc_index_beg_offset))
 
         document_ids = []
         sample_parts = []
@@ -162,6 +157,7 @@ class GPTDataset(MegatronDataset):
         return (
             numpy.array(numpy.concatenate(sample_parts), dtype=numpy.int64),
             numpy.array(document_ids, dtype=numpy.int64),
+            sample
         )
 
     def _build_document_sample_shuffle_indices(
@@ -320,13 +316,19 @@ class GPTDataset(MegatronDataset):
                     sample_index.shape[0] - 1, sample_index.shape[0] - 1, numpy_random_state
                 )
             if self.config.filter_consumed_samples:
+                orig_num_samples = len(shuffle_index)
                 shuffle_index = self._filter_shuffle_index(shuffle_index, sample_index)
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    f"\tFiltered {orig_num_samples-len(shuffle_index)} samples based on `consumed_samples_dict`.",
+                )
             numpy.save(path_to_shuffle_index, shuffle_index, allow_pickle=True)
             t_end = time.time()
             log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
             log_single_rank(
-                logger, logging.INFO, f"> total number of samples: {sample_index.shape[0] - 1}"
+                logger, logging.INFO, f"> total number of samples: {shuffle_index.shape[0]}"
             )
             log_single_rank(logger, logging.INFO, f"> total number of epochs: {num_epochs}")
 
@@ -412,6 +414,13 @@ class GPTDataset(MegatronDataset):
                 consumed_samples_dict_copy[sample] -= 1
         shuffle_index = shuffle_index[mask]
         return shuffle_index
+    
+    def update_consumed_samples(self, doc_id, offset):
+        sample = (doc_id, offset)
+        if sample in self.consumed_samples_dict:
+            self.consumed_samples_dict[sample]+=1
+        else:
+            self.consumed_samples_dict[sample] = 1
 
 def _build_document_index(
     documents: numpy.ndarray,

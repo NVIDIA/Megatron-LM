@@ -12,7 +12,7 @@ from megatron.core.datasets.blended_dataset import BlendedDataset
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.indexed_dataset import MMapIndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
-from megatron.core.datasets.utils import Split, normalize
+from megatron.core.datasets.utils import Split, normalize, log_single_rank
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +214,11 @@ class BlendedMegatronDatasetBuilder(object):
         prefix = os.path.basename(path_prefix)
         consumed_samples_dict = dict()
         if prefix in self.consumed_samples_per_dataset:
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"Loaded `consumed_samples_dict` for {self.cls.__name__} {prefix}. This is unused unless --resume-with-new-dataset is set."
+            )
             consumed_samples_dict = self.consumed_samples_per_dataset[prefix]
         # Only track consumed samples for training split
         consumed_samples_dicts = [consumed_samples_dict]+[None]*(len(Split)-1)

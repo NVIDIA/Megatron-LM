@@ -239,10 +239,9 @@ def get_rng_state():
 
     return rng_state_list
 
-def update_consumed_samples_per_dataset(train_ds):
+def get_consumed_samples_per_dataset(train_ds):
     args = get_args()
     
-    # get the datapaths, process them and match them to the datasets
     # TODO handle the `blend_per_split` case as well
     blend = args.data_path
     _, prefixes = zip(
@@ -250,10 +249,26 @@ def update_consumed_samples_per_dataset(train_ds):
     )
     assert type(train_ds) == BlendedDataset and type(train_ds.datasets[0]) == GPTDataset,\
         "Consumed samples per dataset tracking only supported for BlendedDataset and GPTDataset"
-    for prefix, ds in zip(prefixes, train_ds.datasets):
-        args.consumed_samples_per_dataset[prefix] = ds.consumed_samples_dict
 
-def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, train_dataloader):
+    if torch.distributed.is_initialized() and \
+            mpu.get_data_parallel_world_size() > 1:
+        for prefix, ds in zip(prefixes, train_ds.datasets):
+            consumed_samples_per_dataset = \
+                [None for i in range(mpu.get_data_parallel_world_size())]
+            torch.distributed.all_gather_object(
+                consumed_samples_per_dataset,
+                ds.consumed_samples_dict,
+                group=mpu.get_data_parallel_group())
+            consumed_samples_per_dataset_combined = dict()
+            for consumed_samples_dict in consumed_samples_per_dataset:
+                consumed_samples_per_dataset_combined.update(consumed_samples_dict)
+            args.consumed_samples_per_dataset[prefix] = consumed_samples_per_dataset_combined
+    else:
+        for prefix, ds in zip(prefixes, train_ds.datasets):
+            args.consumed_samples_per_dataset[prefix] = ds.consumed_samples_dict
+    
+
+def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, train_dataset):
     """Save a model checkpoint."""
     args = get_args()
 
@@ -265,6 +280,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, train_data
 
     # Collect rng state across data parallel ranks.
     rng_state = get_rng_state()
+
+    # update args to have the latest consumed samples per dataset states
+    if type(train_dataset) == BlendedDataset:
+        get_consumed_samples_per_dataset(train_dataset)
 
     # Checkpoint name.
     checkpoint_name = get_checkpoint_name(args.save, iteration)
@@ -280,11 +299,6 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, train_data
     if not torch.distributed.is_initialized() \
             or mpu.get_data_modulo_expert_parallel_rank() == 0:
 
-        # update args to have the latest consumed samples per dataset states
-        train_ds = train_dataloader.dataset
-        if type(train_ds) == BlendedDataset:
-            update_consumed_samples_per_dataset(train_ds)
-        
         # Arguments, iteration, and model.
         state_dict = {}
         state_dict['args'] = args
@@ -629,7 +643,10 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
             # Load distributed optimizer's custom parameter state.
             if args.use_distributed_optimizer:
                 tracker_filename = get_checkpoint_tracker_filename(load_dir)
-                iteration, release = read_metadata(tracker_filename)
+                if args.load_iteration:
+                    iteration, release = args.load_iteration, False
+                else:
+                    iteration, release = read_metadata(tracker_filename)
                 model_checkpoint_name = \
                     get_checkpoint_name(load_dir, iteration, release)
                 optim_checkpoint_name = \

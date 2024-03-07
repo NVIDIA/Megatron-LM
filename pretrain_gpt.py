@@ -103,6 +103,13 @@ def get_batch(data_iterator):
         data = next(data_iterator)
     else:
         data = None
+    
+    # update the datasets to reflect the consumed samples
+    dataset_id = data['dataset_id']
+    sample_id = data['sample_id']
+    for ds_id, doc_id, offset in zip(dataset_id, sample_id[0], sample_id[1]):
+        data_iterator._dataset.datasets[ds_id].update_consumed_samples(doc_id.item(), offset.item())
+        
     data_b = tensor_parallel.broadcast_data(keys, data, datatype)
 
     # Unpack.
