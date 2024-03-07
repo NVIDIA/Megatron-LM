@@ -1,4 +1,4 @@
-image: nvcr.io/nvidia/pytorch:23.04-py3
+image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
 
 stages:
   - test
@@ -30,17 +30,10 @@ include:
   - jet-tests.yml
 
 unit_tests:
-  image: nvcr.io/nvidia/pytorch:23.04-py3
   tags:
     - docker_local_runner
   stage: test
   script:
-    - pip install pytest-cov
-    - pip install pytest_mock
-    - pip install nltk
-    - pip install wrapt
-    - pip install zarr "tensorstore==0.1.45"  # for distributed checkpointing tests
-    - pip install git+https://github.com/fanshiqing/grouped_gemm@main  # for grouped gemm tests
     - torchrun --nproc_per_node=8 -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/unit_tests
   coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
   artifacts:
@@ -65,12 +58,10 @@ docs_build_test:
     - main
 
 formatting:
-  image: nvcr.io/nvidia/pytorch:23.04-py3
   tags:
     - docker_local_runner
   stage: test
   script:
-    - pip install --upgrade black==19.10b0 isort click==8.0.2
     - black megatron/core --check --verbose --diff
     - isort megatron/core --check
   rules:

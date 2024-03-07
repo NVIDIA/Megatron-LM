@@ -41,7 +41,6 @@ fi
 
 if [[ $MOE_GROUPED_GEMM -eq 1 ]]; then
        echo "Running MoE with Grouped GEMM"
-       command="$command pip install git+https://github.com/fanshiqing/grouped_gemm@main;"
        TRAINING_DTYPE=bf16  # Currently GroupedGEMM for MoE only supports bf16 dtype
 fi
 
