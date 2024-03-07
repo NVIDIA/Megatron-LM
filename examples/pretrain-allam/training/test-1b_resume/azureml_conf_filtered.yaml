@@ -3,15 +3,15 @@
 $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
 command: >-
-  bash examples/pretrain-allam/training/test-1b_resume/run.sh \
-   /dummy/path/ \
+  bash examples/pretrain-allam/training/test-1b_resume/run_filtered.sh \
+   ${{inputs.pretrained_model_path}} \
    ${{inputs.tokenizer_model_path}} \
    ${{inputs.bin_idx_data_dir}} \
    ${{outputs.data_cache}} \
    ${{outputs.checkpoint_dir}} \
    ${{outputs.checkpoint_dir}} 
 
-display_name: test-1b_resume
+display_name: test-1b_resume_filtered
 
 experiment_name: test_1b_mlm
 code: ../../../../
@@ -24,6 +24,10 @@ environment_variables:
   NCCL_DEBUG: WARN
   CUDA_DEVICE_MAX_CONNECTIONS: '1'
 inputs:
+  pretrained_model_path:
+    type: uri_folder
+    mode: ro_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/allam_checkpoints_allamllmuksstandard/paths/test-1b_resume_2gpu/
   tokenizer_model_path:
     type: uri_file
     mode: ro_mount
@@ -40,7 +44,7 @@ outputs:
   checkpoint_dir:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/allam_checkpoints_allamllmuksstandard/paths/test-1b_resume_2gpu/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/allam_checkpoints_allamllmuksstandard/paths/test-1b_resume_filtered_2gpu/
 
 
 services:

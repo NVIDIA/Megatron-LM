@@ -39,6 +39,10 @@ GPT_MODEL_ARGS=(
 )
 
 LOGISTICS_ARGS=(
+    --load $PRETRAINED_MODEL
+    --resume-with-new-dataset
+    --load-iteration 40
+    --override-dataloader-consumed-samples 0
     --save $CHECKPOINT_DIR 
     --tokenizer-model $TOKENIZER_MODEL
     --split 1,0,0 
@@ -68,7 +72,6 @@ TRAINING_ARGS=(
     --lr-warmup-iters 10
     --use-flash-attn
     --bf16
-    --num-workers 2
 )
 
 
@@ -82,7 +85,7 @@ MODEL_PARALLEL_ARGS=(
 DATA_PATH=(
     --data-path 1.0 $BIN_IDX_PATH/en_Pile-ArXiv_0000_text_document_dc\=1823931_sc\=1823931_tc\=28911020643
 1.0 $BIN_IDX_PATH/en_Pile-ArXiv_0001_text_document_dc\=553810_sc\=553810_tc\=8792719530
-# 1.0 $BIN_IDX_PATH/en_Pile-books2-books3-pgtbrg_0000_text_document_dc\=169830_sc\=169830_tc\=23873854486
+1.0 $BIN_IDX_PATH/en_Pile-books2-books3-pgtbrg_0000_text_document_dc\=169830_sc\=169830_tc\=23873854486
 )
 
 # torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
@@ -92,3 +95,8 @@ python pretrain_gpt.py \
     ${TRAINING_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${DATA_PATH[@]}
+  
+  
+  
+  
+  
