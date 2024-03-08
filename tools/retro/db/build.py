@@ -14,7 +14,7 @@ from tqdm import tqdm
 import types
 
 from megatron import get_retro_args, print_rank_0
-from megatron.core.datasets.indexed_dataset import MMapIndexedDataset
+from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.tokenizer.tokenizer import (
     _BertWordPieceTokenizer,
     _GPT2BPETokenizer,
@@ -61,7 +61,7 @@ def init_indexed_dataset_infos():
             "path" : path,
             "name" : name,
             "db_dir" : get_individual_db_dir(name),
-            "dataset" : MMapIndexedDataset(prefix),
+            "dataset" : IndexedDataset(prefix),
         })
 
     return infos

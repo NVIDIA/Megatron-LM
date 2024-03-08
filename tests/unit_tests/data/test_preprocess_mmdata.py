@@ -8,7 +8,7 @@ import tempfile
 import nltk
 import numpy
 
-from megatron.core.datasets.indexed_dataset import MMapIndexedDataset
+from megatron.core.datasets.indexed_dataset import IndexedDataset
 from tests.unit_tests.data.test_preprocess_data import dummy_jsonl, gpt2_merge, gpt2_vocab
 from tools.merge_datasets import main as merge_main
 from tools.preprocess_mmdata import Encoder
@@ -102,7 +102,7 @@ def do_test_preprocess_mmdata(temp_dir, extra_args=[]):
         raise RuntimeError(f"{type(encoder.tokenizer)} tokenizer cannot `decode` or `detokenize`.")
 
     merged_index = 0
-    merged_dataset = MMapIndexedDataset(os.path.join(path_to_data, "merge"), multimodal=True)
+    merged_dataset = IndexedDataset(os.path.join(path_to_data, "merge"), multimodal=True)
 
     # sorted to ensure ordering matches merged dataset
     basenames = sorted(
@@ -122,7 +122,7 @@ def do_test_preprocess_mmdata(temp_dir, extra_args=[]):
         realpath_doc = os.path.join(path_to_data, os.path.splitext(basename)[0])
 
         dataset_index = 0
-        dataset = MMapIndexedDataset(realpath_doc, multimodal=True)
+        dataset = IndexedDataset(realpath_doc, multimodal=True)
 
         merged_doc_idx = merged_dataset.document_indices[
             merged_doc_index_index : merged_doc_index_index + len(dataset.document_indices)

@@ -4,18 +4,18 @@
 
 Data preprocessing is built around the following classes:
 
-1. `MMapIndexedDatasetBuilder`
-2. `MMapIndexedDataset`
+1. `IndexedDatasetBuilder`
+2. `IndexedDataset`
 
 At the moment, an end-to-end data preprocessing implementation is left to the user. See the class docstring(s) for more details.
 
-#### MMapIndexedDatasetBuilder
+#### IndexedDatasetBuilder
 
-The `MMapIndexedDatasetBuilder` is capable of building and merging `MMapIndexedDataset` instances.
+The `IndexedDatasetBuilder` is capable of building and merging `IndexedDataset` instances.
 
-#### MMapIndexedDataset
+#### IndexedDataset
 
-The `MMapIndexedDataset` class is the lowest-level data interface in Megatron Core. Internally, an `MMapIndexedDataset` instance references two binaries: the data file (`.bin`) contains document/sequence data and the index file (`.idx`) contains document/sequence metadata.
+The `IndexedDataset` class is the lowest-level data interface in Megatron Core. Internally, an `IndexedDataset` instance references two binaries: the data file (`.bin`) contains document/sequence data and the index file (`.idx`) contains document/sequence metadata.
 
 The index file stores dataset-level metadata first:
 - The index header, for backward compatibility
@@ -36,7 +36,7 @@ Building the data loaders is a distributed-aware process built around the follow
 
 1. `BlendedMegatronDatasetConfig`
 2. `BlendedMegatronDatasetBuilder`
-3. `MMapIndexedDataset`
+3. `IndexedDataset`
 3. `MegatronDataset`
 4. `BlendedDataset`
 
@@ -54,16 +54,16 @@ The `BlendedMegatronDatasetBuilder` class builds the highest-level data interfac
 
 **NB:** All ranks should attempt to build the dataset via the `BlendedMegatronDatasetBuilder` or the program will hang. Which ranks follow through on their attempts can be controlled via the `BlendedMegatronDatasetConfig`.
 
-#### MMapIndexedDataset
+#### IndexedDataset
 
-The `MMapIndexedDataset` class is the lowest-level data interface in Megatron Core.
+The `IndexedDataset` class is the lowest-level data interface in Megatron Core.
 
-The `MMapIndexedDataset` should already exist on disk before attempting to build any of the high-level data interfaces.
+The `IndexedDataset` should already exist on disk before attempting to build any of the high-level data interfaces.
 
 
 #### MegatronDataset (extendable)
 
-The `MegatronDataset` abstract class is a high-level data interface in Megatron Core. It is an abstraction built upon the `MMapIndexedDataset`.
+The `MegatronDataset` abstract class is a high-level data interface in Megatron Core. It is an abstraction built upon the `IndexedDataset`.
 
 Different training/inference regimes will require different extensions e.g. the `GPTDataset`
 
@@ -77,7 +77,7 @@ The `BlendedDataset` is only necessary when a blend multiple data distributions,
 
 ### GPTDataset
 
-The `GPTDataset` is parameterized by the following variables: the underlying `MMapIndexedDataset` instance `indexed_dataset`, the split indices `indexed_indices` (the congituous subset of document or sequence indices used for training, validation, and testing), the number of samples `N`, the sequence length `S`, and the random seed `R`.
+The `GPTDataset` is parameterized by the following variables: the underlying `IndexedDataset` instance `indexed_dataset`, the split indices `indexed_indices` (the congituous subset of document or sequence indices used for training, validation, and testing), the number of samples `N`, the sequence length `S`, and the random seed `R`.
 
 The `GPTDataset` creates three index mappings to facilitate lookup: (1) the document index, (2) the sample index, and (3) the shuffle index.
 
