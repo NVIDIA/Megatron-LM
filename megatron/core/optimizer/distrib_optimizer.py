@@ -9,7 +9,8 @@ from logging import getLogger
 import torch
 from apex.optimizers import FusedAdam as Adam
 
-from .. import tensor_parallel
+from .. import parallel_state, tensor_parallel
+from ..dist_checkpointing.mapping import LocalNonpersitentObject, ShardedObject, ShardedStateDict
 from ..distributed import shard_buffer
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper
 
@@ -378,10 +379,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         bf16,
         params_dtype,
         grad_scaler,
+        init_state_fn,
         per_model_grad_buffers,
         overlap_param_gather,
         data_parallel_group,
         data_parallel_group_gloo,
+        data_parallel_group_idx,
     ):
         """
         See top of class definition for argument descriptions.
@@ -402,6 +405,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             bf16,
             params_dtype,
             grad_scaler,
+            init_state_fn,
         )
 
         assert isinstance(
@@ -414,6 +418,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.per_model_grad_buffers = per_model_grad_buffers
         self.data_parallel_group = data_parallel_group
         self.data_parallel_group_gloo = data_parallel_group_gloo
+        self.data_parallel_group_idx = data_parallel_group_idx
         self.gbuf_idx_to_model_idx_map = {}
         gbuf_idx = 0
         for model_idx, grad_buffers in self.per_model_grad_buffers.items():
@@ -660,6 +665,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     'Skipping loading grad scaler ...'
                 )
 
+        if 'param_state' in state_dict:
+            self.load_parameter_state_from_state_dict(state_dict["param_state"])
+
     def get_parameter_state(self):
         """Get parameter state (i.e., parameter & optimizer tensors).
 
@@ -766,6 +774,48 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if torch.distributed.get_rank(self.data_parallel_group) == 0:
             torch.save(state_dict, filename)
 
+    def sharded_state_dict(
+        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
+    ):
+        """ Naive implementation which reuses gather/scatter from the legacy ckpt format.
+
+        During saving, gathers the parameters state on DP rank 0 and saves a ShardedObject
+        with fixed TPxPP structure. During loading, loads the saved data on DP rank 0
+        (None on other ranks). Relies on the parameters scatter done in load_state_dict.
+
+        Regular state dict parameters are saved on DP rank 0 and loaded on all ranks.
+        """
+        state_dict = {
+            k: ShardedObject(
+                f'optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}.{k}',
+                v,
+                (1,),
+                (0,),
+                replica_id=torch.distributed.get_rank(self.data_parallel_group),
+            )
+            for k, v in self.state_dict().items()
+        }
+
+        if is_loading:
+            self.init_state_fn(self.optimizer)
+            param_state_data = None
+        else:
+            param_state_data = self.get_parameter_state()
+
+        if torch.distributed.get_rank(self.data_parallel_group) == 0:
+            # Fixed TPxPP
+            param_state = ShardedObject(
+                f'optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}.param_state',
+                param_state_data,
+                (1,),
+                (0,),
+            )
+        else:
+            param_state = LocalNonpersitentObject(None)
+
+        state_dict['param_state'] = param_state
+        return state_dict
+
     def load_parameter_state_from_state_dict(self, state_dict):
         """Load parameter state (i.e., parameter & optimizer tensors).
 
@@ -776,6 +826,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
           buffers. (e.g., one buffer each for main_param, exp_avg, and
           exp_avg_sq).
         """
+        if state_dict is not None and "per_bucket_numel_unpadded" in state_dict:
+            per_bucket_numel_unpadded_in_checkpoint = state_dict["per_bucket_numel_unpadded"]
+            assert self.per_bucket_numel_unpadded == per_bucket_numel_unpadded_in_checkpoint, (
+                f"Number of unpadded elements in each bucket need to be the same in current run "
+                f"({self.per_bucket_numel_unpadded}) and checkpoint "
+                f"({per_bucket_numel_unpadded_in_checkpoint})"
+            )
 
         # Data parallelism variables.
         data_parallel_world_size = self.data_parallel_group_gloo.size()
@@ -901,13 +958,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         state_dict = None
         if torch.distributed.get_rank(self.data_parallel_group) == 0:
             state_dict = torch.load(filename)
-            if "per_bucket_numel_unpadded" in state_dict:
-                per_bucket_numel_unpadded_in_checkpoint = state_dict["per_bucket_numel_unpadded"]
-                assert self.per_bucket_numel_unpadded == per_bucket_numel_unpadded_in_checkpoint, (
-                    f"Number of unpadded elements in each bucket need to be the same in current run "
-                    f"({self.per_bucket_numel_unpadded}) and checkpoint "
-                    f"({per_bucket_numel_unpadded_in_checkpoint})"
-                )
 
         self.load_parameter_state_from_state_dict(state_dict)
 

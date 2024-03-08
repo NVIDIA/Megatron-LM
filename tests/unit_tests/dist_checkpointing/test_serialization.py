@@ -1,12 +1,16 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import io
+
 import numpy as np
 import pytest
 import torch
+from torch.distributed.checkpoint import CheckpointException
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor, save, load
-from megatron.core.dist_checkpointing.core import CheckpointingException
+from megatron.core.dist_checkpointing.core import CheckpointingException, \
+    maybe_load_config
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory, \
     ShardedObject
@@ -29,10 +33,12 @@ class TestSerialization:
             save(sharded_state_dict, ckpt_dir)
             torch.distributed.barrier()
 
-            assert (ckpt_dir / 'keyA').is_dir()
-            assert (ckpt_dir / 'keyB').is_dir()
-            assert not (ckpt_dir / 'keyC').exists()
-            assert not (ckpt_dir / 'sd_keyA').is_dir()
+            saved_config = maybe_load_config(ckpt_dir)
+            if saved_config.sharded_backend == 'zarr':
+                assert (ckpt_dir / 'keyA').is_dir()
+                assert (ckpt_dir / 'keyB').is_dir()
+                assert not (ckpt_dir / 'keyC').exists()
+                assert not (ckpt_dir / 'sd_keyA').is_dir()
 
             load_ssd = {
                 'load_sd_keyA': ShardedTensor.from_rank_offsets('keyA', torch.ones(2, 4), replica_id=Utils.rank),
@@ -57,15 +63,17 @@ class TestSerialization:
         with TempNamedDir(tmp_path_dist_ckpt / 'test_multi_process_save') as ckpt_dir:
             save(state_dict, ckpt_dir)
 
-            assert (ckpt_dir / 'keyA').is_dir()
-            assert (ckpt_dir / 'keyB').is_dir()
-            assert not (ckpt_dir / 'keyC').exists()
-            assert not (ckpt_dir / 'sd_keyA').is_dir()
+            saved_config = maybe_load_config(ckpt_dir)
+            if saved_config.sharded_backend == 'zarr':
+                assert (ckpt_dir / 'keyA').is_dir()
+                assert (ckpt_dir / 'keyB').is_dir()
+                assert not (ckpt_dir / 'keyC').exists()
+                assert not (ckpt_dir / 'sd_keyA').is_dir()
 
         Utils.destroy_model_parallel()
 
 
-    def test_partition_change_save_load(self, tmp_path_dist_ckpt):
+    def test_partition_change_save_load(self, tmp_path_dist_ckpt, strategy=None):
         Utils.initialize_model_parallel(2,4)
 
         # ten_a: global shape (2, 4):
@@ -94,7 +102,7 @@ class TestSerialization:
         assert state_dict['sd_keyB'].global_shape == ten_b_global_shape
 
         with TempNamedDir(tmp_path_dist_ckpt / 'test_partition_change_save_load') as ckpt_dir:
-            save(state_dict, ckpt_dir)
+            save(state_dict, ckpt_dir, strategy)
 
             del ten_a, ten_b
 
@@ -162,8 +170,6 @@ class TestSerialization:
 
         with TempNamedDir(tmp_path_dist_ckpt / 'test_load_tensors_metadata') as ckpt_dir:
             save(state_dict, ckpt_dir)
-            torch.distributed.barrier()
-            assert (ckpt_dir / 'keyA').is_dir()
 
             del state_dict
             sharded_state_dict = load_tensors_metadata(ckpt_dir)
@@ -248,6 +254,88 @@ class TestSerialization:
             torch.distributed.barrier()
             save(state_dict, ckpt_dir)
             sh_ten.key = 'different_key'
-            with pytest.raises(CheckpointingException) as exc_info:
+            # TODO: remove torch exception
+            with pytest.raises((CheckpointingException, CheckpointException)) as exc_info:
                 load(state_dict, ckpt_dir)
-            assert f'{ckpt_dir / "different_key"}' in str(exc_info.value)
+            assert "different_key" in str(exc_info.value)
+
+    def test_sharded_object_serialization(self, tmp_path_dist_ckpt):
+        Utils.initialize_model_parallel(1, 1)
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_sh_obj') as ckpt_dir:
+            state = {'some': 'dict'}
+            state_serialized = io.BytesIO()
+            torch.save(state, state_serialized)
+            state_dict = {'some_key': ShardedObject('sh_obj_A', state_serialized, (1,), (0,),
+                                                    replica_id=Utils.rank)}
+
+            save(state_dict, ckpt_dir)
+            del state, state_serialized, state_dict
+            other_state = {'other': 'dictionary'}
+            other_serialized = io.BytesIO()
+            torch.save(other_state, other_serialized)
+            state_dict = {'other_key': ShardedObject('sh_obj_A', other_serialized, (1,), (0,),
+                                                     replica_id=Utils.rank)}
+            load_state_dict = load(state_dict, ckpt_dir)
+            assert 'other_key' in load_state_dict
+            load_state_dict['other_key'].seek(0)
+            loaded_state = torch.load(load_state_dict['other_key'])
+
+            assert loaded_state == {'some': 'dict'}
+
+        Utils.destroy_model_parallel()
+
+    def test_tensor_shape_mismatch(self, tmp_path_dist_ckpt):
+        Utils.initialize_model_parallel(2,4)
+
+        # Global tensor is just a range(32) repeated twice over the first dimension
+        local_tensor = torch.arange(4).unsqueeze(0).expand(2, 4) + Utils.rank * 4
+
+        state_dict = {
+            'rigid': ShardedTensor.from_rank_offsets('keyA', local_tensor, (1, Utils.rank, Utils.world_size)),
+            'flexible': ShardedTensor.from_rank_offsets('keyB', local_tensor, (1, Utils.rank, Utils.world_size),
+                                                        allow_shape_mismatch=True),
+        }
+        assert state_dict['rigid'].global_shape == (2, 32)
+        assert state_dict['flexible'].global_shape == (2, 32)
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_tensor_shape_mismatch') as ckpt_dir:
+            save(state_dict, ckpt_dir)
+
+            pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+            pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+            tp_rank = parallel_state.get_tensor_model_parallel_rank()
+
+            # Smaller coverage than expected (28 < 32)
+            state_dict = {
+                'rigid': ShardedTensor.from_rank_offsets('keyA', torch.ones(2, 7), (1, pp_rank, pp_size), replica_id=tp_rank),
+            }
+            with pytest.raises((CheckpointingException, CheckpointException)):
+                load(state_dict, ckpt_dir)
+
+            state_dict = {
+                'flexible': ShardedTensor.from_rank_offsets('keyB', torch.ones(2, 7), (1, pp_rank, pp_size), replica_id=tp_rank,
+                                                            allow_shape_mismatch=True),
+            }
+            loaded_state_dict = load(state_dict, ckpt_dir)
+            assert torch.all(loaded_state_dict['flexible'] == torch.arange(7).unsqueeze(0).expand(2, 7) + pp_rank * 7)
+
+            # Larger coverage than expected (36 > 32)
+            state_dict = {
+                'rigid': ShardedTensor.from_rank_offsets('keyA', torch.ones(2, 9), (1, pp_rank, pp_size), replica_id=tp_rank),
+            }
+            with pytest.raises((CheckpointingException, CheckpointException)):
+                load(state_dict, ckpt_dir)
+
+            state_dict = {
+                'flexible': ShardedTensor.from_rank_offsets('keyB', torch.ones(2, 9), (1, pp_rank, pp_size), replica_id=tp_rank,
+                                                            allow_shape_mismatch=True),
+            }
+            loaded_state_dict = load(state_dict, ckpt_dir)
+            expected_tensor = torch.arange(9).unsqueeze(0).expand(2, 9) + pp_rank * 9
+
+            if pp_rank >= (32 // 9):
+                assert pp_rank == 3, pp_rank
+                expected_tensor[:, 5:] = 0  # padding with 0s
+            assert torch.all(loaded_state_dict['flexible'] == expected_tensor)
+
+        Utils.destroy_model_parallel()

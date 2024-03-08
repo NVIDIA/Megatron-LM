@@ -101,5 +101,5 @@ class SaveShardedStrategy(SaveStrategyBase):
     """ Save strategy for sharded tensors """
 
     @abstractmethod
-    def save(self, sharded_tensors: List[ShardedTensor], checkpoint_dir: Path):
+    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         raise NotImplementedError
