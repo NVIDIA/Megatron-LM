@@ -1079,6 +1079,9 @@ def _add_checkpointing_args(parser):
                        help='Do not save current rng state.')
     group.add_argument('--load', type=str, default=None,
                        help='Directory containing a model checkpoint.')
+    group.add_argument('--override-dataloader-consumed-samples', type=int, default=None,
+                       help='When loading from checkpoint and using a new dataset, override the consumed training '
+                       'samples in the dataloader.')
     group.add_argument('--no-load-optim', action='store_true', default=None,
                        help='Do not load optimizer when loading checkpoint.')
     group.add_argument('--no-load-rng', action='store_true', default=None,
@@ -1099,6 +1102,9 @@ def _add_checkpointing_args(parser):
                        help="If '--load' is set, but checkpoint is not found "
                        "(e.g., path typo), then exit instead of random "
                        "initialization.")
+    group.add_argument('--resume-with-new-dataset', action='store_true', default=False,
+                       help="Reloads the dataset with tracking for consumed samples of "
+                       "each datashard. Used when resuming training with a changed dataset.")
 
     return parser
 

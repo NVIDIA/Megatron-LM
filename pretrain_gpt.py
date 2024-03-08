@@ -21,7 +21,8 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
-    average_losses_across_data_parallel_group
+    average_losses_across_data_parallel_group,
+    get_shard_names
 )
 from megatron.arguments import core_transformer_config_from_args
 from megatron.yaml_arguments import core_transformer_config_from_yaml
@@ -173,10 +174,11 @@ def core_gpt_dataset_config_from_args(args):
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
         vocab_size=get_tokenizer().vocab_size,
+        filter_consumed_samples=args.resume_with_new_dataset
     )
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples):
+def train_valid_test_datasets_provider(train_val_test_num_samples, consumed_samples_per_dataset):
     """Build the train test and validation datasets.
 
     Args:
@@ -196,6 +198,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         dataset_type,
         train_val_test_num_samples,
+        consumed_samples_per_dataset,
         config
     ).build()
 

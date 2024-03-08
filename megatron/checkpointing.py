@@ -11,9 +11,12 @@ import torch
 
 from megatron import update_num_microbatches
 from megatron.core import mpu, tensor_parallel
+from megatron.core.datasets.blended_dataset import BlendedDataset
+from megatron.core.datasets.gpt_dataset import GPTDataset
 from .global_vars import get_args
 from .utils import (unwrap_model,
-                    print_rank_0)
+                    print_rank_0,
+                    get_shard_names)
 
 
 _CHECKPOINT_VERSION = None
@@ -237,6 +240,24 @@ def get_rng_state():
 
     return rng_state_list
 
+def get_consumed_samples_per_dataset():
+    """ collect consumed samples per dataset across data parallel ranks """
+    args = get_args()
+    prefixes = get_shard_names(args.data_path)
+    if torch.distributed.is_initialized() and \
+            mpu.get_data_parallel_world_size() > 1:
+        for prefix in prefixes:
+            consumed_samples_per_dataset = \
+                [None for i in range(mpu.get_data_parallel_world_size())]
+            torch.distributed.all_gather_object(
+                consumed_samples_per_dataset,
+                args.consumed_samples_per_dataset[prefix],
+                group=mpu.get_data_parallel_group())
+            consumed_samples_per_dataset_combined = dict()
+            for consumed_samples_dict in consumed_samples_per_dataset:
+                consumed_samples_per_dataset_combined.update(consumed_samples_dict)
+            args.consumed_samples_per_dataset[prefix] = consumed_samples_per_dataset_combined
+    
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
                     num_floating_point_operations_so_far):
@@ -251,6 +272,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
 
     # Collect rng state across data parallel ranks.
     rng_state = get_rng_state()
+
+    # collect consumed samples per dataset across data parallel ranks
+    get_consumed_samples_per_dataset()
 
     # Checkpoint name.
     checkpoint_name = get_checkpoint_name(args.save, iteration)
@@ -581,6 +605,8 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         update_num_microbatches(consumed_samples=args.consumed_train_samples)
         args.consumed_valid_samples = getattr(checkpoint_args,
                                               'consumed_valid_samples', 0)
+        args.consumed_samples_per_dataset = getattr(checkpoint_args,
+                                              'consumed_samples_per_dataset', dict())
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
 

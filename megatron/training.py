@@ -495,6 +495,8 @@ def setup_model_and_optimizer(model_provider_func,
                                        scale_lr_cond, lr_mult)
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
+    args.consumed_samples_per_dataset = dict()
+
     if args.load is not None:
         timers = get_timers()
         timers('load-checkpoint', log_level=0).start(barrier=True)
@@ -1285,7 +1287,8 @@ def build_train_valid_test_datasets(build_train_valid_test_datasets_provider):
     print_rank_0('    test:       {}'.format(train_val_test_num_samples[2]))
 
     # Build the datasets.
-    return build_train_valid_test_datasets_provider(train_val_test_num_samples)
+    return build_train_valid_test_datasets_provider(train_val_test_num_samples, 
+                                                    args.consumed_samples_per_dataset)
 
 
 def build_train_valid_test_data_loaders(
@@ -1319,7 +1322,8 @@ def build_train_valid_test_data_loaders(
             build_train_valid_test_datasets_provider)
         # Build dataloders.
         train_dataloader = build_pretraining_data_loader(
-            train_ds, args.consumed_train_samples)
+            train_ds, args.consumed_train_samples if args.override_dataloader_consumed_samples is None
+                else  args.override_dataloader_consumed_samples)
         if args.skip_train:
             valid_dataloader = build_pretraining_data_loader(valid_ds, 0)
         else:

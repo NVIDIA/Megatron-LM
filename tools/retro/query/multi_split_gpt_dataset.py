@@ -79,7 +79,7 @@ class MultiSplitGPTDataset(GPTDataset):
         index_split: Split,
         config: MultiSplitGPTDatasetConfig,
     ) -> None:
-        super().__init__(indexed_dataset, dataset_path, indexed_indices, num_samples, index_split, config)
+        super().__init__(indexed_dataset, dataset_path, indexed_indices, num_samples, index_split, None, config)
 
     def __getitem__(self, idx: int) -> Dict[str, numpy.ndarray]:
         """Abstract method implementation
