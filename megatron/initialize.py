@@ -194,7 +194,7 @@ def _initialize_tp_communicators():
     else:
        ub_cfgs = {}
 
-    input_shape = [args.seq_length * args.micro_batch_size , args.hidden_size]
+    input_shape = [(args.seq_length * args.micro_batch_size) // args.context_parallel_size , args.hidden_size]
 
     #We create a MPI process group, which is needed to bootstrap the pipelined 
     #tensor-model-parallel communication overlap
