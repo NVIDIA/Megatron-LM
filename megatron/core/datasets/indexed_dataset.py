@@ -339,10 +339,10 @@ class IndexedDataset(torch.utils.data.Dataset):
 
         multimodal (bool, optional): Whether the dataset is multimodal. Defaults to False.
 
-        mmap (bool, optional): Whether to mmap the .bin files. Defaults to False.
+        mmap (bool, optional): Whether to mmap the .bin files. Defaults to True.
     """
 
-    def __init__(self, path_prefix: str, multimodal: bool = False, mmap: bool = False) -> None:
+    def __init__(self, path_prefix: str, multimodal: bool = False, mmap: bool = True) -> None:
         super().__init__()
         self.path_prefix = None
         self.multimodal = None
