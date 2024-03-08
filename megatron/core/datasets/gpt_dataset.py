@@ -5,7 +5,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 import numpy
 import torch
@@ -40,6 +40,8 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     eod_mask_loss: bool = None
 
     vocab_size: int = sys.maxsize
+
+    filter_consumed_samples: Optional[bool] = False
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init
@@ -126,10 +128,12 @@ class GPTDataset(MegatronDataset):
         indexed_indices: numpy.ndarray,
         num_samples: int,
         index_split: Split,
+        consumed_samples_dict: dict,
         config: GPTDatasetConfig,
     ) -> None:
+
         super().__init__(
-            indexed_dataset, dataset_path, indexed_indices, num_samples, index_split, config
+            indexed_dataset, dataset_path, indexed_indices, num_samples, index_split, consumed_samples_dict, config
         )
 
         self.vocab_size = config.vocab_size
@@ -180,7 +184,7 @@ class GPTDataset(MegatronDataset):
         Returns:
             int: The length of the dataset
         """
-        return self.sample_index.shape[0] - 1
+        return shuffle_index.shape[0]
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """Abstract method implementation
@@ -191,7 +195,8 @@ class GPTDataset(MegatronDataset):
         Returns:
             Dict[str, torch.Tensor]: The text ids wrapped in a dictionary
         """
-        text, _ = self._query_document_sample_shuffle_indices(idx)
+        text, _, sample = self._query_document_sample_shuffle_indices(idx)
+        return {"text": text, "sample_id": sample}
 
         text = torch.from_numpy(text).long()
         labels = text[1:].contiguous()
@@ -235,6 +240,8 @@ class GPTDataset(MegatronDataset):
         doc_index_beg, doc_index_beg_offset = self.sample_index[idx]
         doc_index_end, doc_index_end_offset = self.sample_index[idx + 1]
 
+        sample = tuple((doc_index_beg, doc_index_beg_offset))
+
         document_ids = []
         sample_parts = []
 
@@ -268,6 +275,7 @@ class GPTDataset(MegatronDataset):
         return (
             numpy.array(numpy.concatenate(sample_parts), dtype=numpy.int64),
             numpy.array(document_ids, dtype=numpy.int64),
+            sample
         )
 
     def _build_document_sample_shuffle_indices(
@@ -321,7 +329,7 @@ class GPTDataset(MegatronDataset):
         num_tokens_per_epoch = self._get_num_tokens_per_epoch()
         num_epochs = self._get_num_epochs(num_tokens_per_epoch)
 
-        if not cache_hit and torch.distributed.get_rank() == 0:
+        if (self.config.filter_consumed_samples or not cache_hit) and torch.distributed.get_rank() == 0:
             log_single_rank(
                 logger,
                 logging.INFO,
@@ -425,12 +433,20 @@ class GPTDataset(MegatronDataset):
                 shuffle_index = _build_shuffle_index(
                     sample_index.shape[0] - 1, sample_index.shape[0] - 1, numpy_random_state
                 )
+            if self.config.filter_consumed_samples:
+                orig_num_samples = len(shuffle_index)
+                shuffle_index = self._filter_shuffle_index(shuffle_index, sample_index)
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    f"\tFiltered {orig_num_samples-len(shuffle_index)} samples based on `consumed_samples_dict`.",
+                )
             numpy.save(path_to_shuffle_index, shuffle_index, allow_pickle=True)
             t_end = time.time()
             log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
             log_single_rank(
-                logger, logging.INFO, f"> total number of samples: {sample_index.shape[0] - 1}"
+                logger, logging.INFO, f"> total number of samples: {shuffle_index.shape[0]}"
             )
             log_single_rank(logger, logging.INFO, f"> total number of epochs: {num_epochs}")
 
@@ -503,6 +519,20 @@ class GPTDataset(MegatronDataset):
             if num_tokens >= num_tokens_requested:
                 return num_epochs
 
+    def _filter_shuffle_index(self, shuffle_index, sample_index):
+        assert self.consumed_samples_dict is not None, \
+            "Cannot filter dataset without `consumed_samples_dict`!"
+        # removes samples marked as consumed from shuffle_index
+        consumed_samples_dict_copy = self.consumed_samples_dict.copy()
+        mask = numpy.ones_like(shuffle_index, dtype=bool)
+        for idx in range(len(shuffle_index)):
+            sample = tuple(sample_index[shuffle_index[idx]])
+            if sample in consumed_samples_dict_copy and consumed_samples_dict_copy[sample] > 0:
+                mask[idx] = 0
+                consumed_samples_dict_copy[sample] -= 1
+        shuffle_index = shuffle_index[mask]
+        return shuffle_index
+    
 
 def _build_document_index(
     documents: numpy.ndarray,

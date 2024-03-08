@@ -3,7 +3,7 @@
 """General utilities."""
 
 import sys
-
+import os
 import torch
 
 try:
@@ -250,6 +250,9 @@ def get_batch_on_this_cp_rank(batch):
 
     return batch
 
+def get_shard_names(blend):
+    # TODO handle the `blend_per_split` case as well
+    return [os.path.basename(blend[i + 1].strip()) for i in range(0, len(blend), 2)]
 
 def print_rank_0(message):
     """If distributed is initialized, print only on rank 0."""
@@ -285,6 +288,21 @@ def get_batch_on_this_tp_rank(data_iterator):
            data = next(data_iterator)
        else:
            data = None
+
+        # mark the consumed samples
+       if 'sample_id' in data:
+            prefixes = get_shard_names(args.data_path)
+            dataset_id = data['dataset_id']
+            sample_id = data['sample_id']
+            for ds_id, doc_id, offset in zip(dataset_id, sample_id[0], sample_id[1]):
+                prefix = prefixes[ds_id]
+                if prefix not in args.consumed_samples_per_dataset:
+                    args.consumed_samples_per_dataset[prefix] = dict()
+                sample = (doc_id, offset)
+                if sample in args.consumed_samples_per_dataset[prefix]:
+                    args.consumed_samples_per_dataset[prefix][sample] += 1
+                else:
+                    args.consumed_samples_per_dataset[prefix][sample] = 1
 
        batch = {
            'tokens': data["tokens"].cuda(non_blocking = True),

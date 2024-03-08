@@ -1,5 +1,6 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
+import os
 import logging
 import math
 from typing import Any, Callable, Iterable, List, Optional, Tuple, Type, Union
@@ -10,7 +11,7 @@ import torch
 from megatron.core.datasets.blended_dataset import BlendedDataset
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset, MockDataset
-from megatron.core.datasets.utils import Split, normalize
+from megatron.core.datasets.utils import Split, normalize, log_single_rank
 
 logger = logging.getLogger(__name__)
 
@@ -36,10 +37,12 @@ class BlendedMegatronDatasetBuilder(object):
     """
 
     def __init__(
-        self, cls: Type[MidLevelDataset], sizes: List[int], config: BlendedMegatronDatasetConfig,
+        self, cls: Type[MidLevelDataset], sizes: List[int],
+        consumed_samples_per_dataset, config: BlendedMegatronDatasetConfig,
     ):
         self.cls = cls
         self.sizes = sizes
+        self.consumed_samples_per_dataset = consumed_samples_per_dataset
         self.config = config
 
         assert not self.config.mock or issubclass(self.cls, MockDataset)
@@ -220,6 +223,19 @@ class BlendedMegatronDatasetBuilder(object):
         else:
             split_indices = [None for _ in Split]
 
+        # look up the consumed_samples_dict using the path_prefix
+        prefix = os.path.basename(dataset_path)
+        consumed_samples_dict = dict()
+        if prefix in self.consumed_samples_per_dataset:
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"Loaded `consumed_samples_dict` for {self.cls.__name__} {prefix}. This is unused unless --resume-with-new-dataset is set."
+            )
+            consumed_samples_dict = self.consumed_samples_per_dataset[prefix]
+        # Only track consumed samples for training split
+        consumed_samples_dicts = [consumed_samples_dict]+[None]*(len(Split)-1)
+        
         # Build the mid level dataset
         mid_level_datasets = []
         for i, _split in enumerate(Split):
@@ -235,6 +251,7 @@ class BlendedMegatronDatasetBuilder(object):
                         split_indices[i],
                         sizes[i],
                         _split,
+                        consumed_samples_dicts[i],
                         self.config,
                     )
                 )

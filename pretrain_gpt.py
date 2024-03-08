@@ -20,8 +20,13 @@ from megatron.training import pretrain
 from megatron.core.transformer.spec_utils import import_module
 from megatron.utils import (
     get_batch_on_this_cp_rank,
+<<<<<<< HEAD
     get_batch_on_this_tp_rank,
     average_losses_across_data_parallel_group
+=======
+    average_losses_across_data_parallel_group,
+    get_shard_names
+>>>>>>> 8a135f51be9e8b58b626b23667d5d329ec68486c
 )
 from megatron.arguments import core_transformer_config_from_args
 from megatron.yaml_arguments import core_transformer_config_from_yaml
@@ -93,6 +98,56 @@ def get_batch(data_iterator):
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(data_iterator)
 
+<<<<<<< HEAD
+=======
+    # Items and their type.
+    keys = ['text']
+    datatype = torch.int64
+
+    # Broadcast data.
+    if data_iterator is not None:
+        data = next(data_iterator)
+    else:
+        data = None
+    
+    # mark the consumed samples
+    if 'sample_id' in data:
+        prefixes = get_shard_names(args.data_path)
+        dataset_id = data['dataset_id']
+        sample_id = data['sample_id']
+        for ds_id, doc_id, offset in zip(dataset_id, sample_id[0], sample_id[1]):
+            prefix = prefixes[ds_id]
+            if prefix not in args.consumed_samples_per_dataset:
+                args.consumed_samples_per_dataset[prefix] = dict()
+            sample = (doc_id, offset)
+            if sample in args.consumed_samples_per_dataset[prefix]:
+                args.consumed_samples_per_dataset[prefix][sample] += 1
+            else:
+                args.consumed_samples_per_dataset[prefix][sample] = 1
+        
+    data_b = tensor_parallel.broadcast_data(keys, data, datatype)
+
+    # Unpack.
+    tokens_ = data_b['text'].long()
+    labels = tokens_[:, 1:].contiguous()
+    tokens = tokens_[:, :-1].contiguous()
+
+    # Get the masks and postition ids.
+    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
+        tokens,
+        tokenizer.eod,
+        args.reset_position_ids,
+        args.reset_attention_mask,
+        args.eod_mask_loss)
+
+    batch = {
+        'tokens': tokens,
+        'labels': labels,
+        'loss_mask': loss_mask,
+        'attention_mask': attention_mask,
+        'position_ids': position_ids
+    }
+>>>>>>> 8a135f51be9e8b58b626b23667d5d329ec68486c
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
 
@@ -167,16 +222,20 @@ def core_gpt_dataset_config_from_args(args):
         blend_per_split=[args.train_data_path, args.valid_data_path, args.test_data_path],
         split=args.split,
         path_to_cache=args.data_cache_path,
+<<<<<<< HEAD
         mock=args.mock_data,
         tokenizer=tokenizer,
         reset_position_ids=args.reset_position_ids,
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
         vocab_size=get_tokenizer().vocab_size,
+=======
+        filter_consumed_samples=args.resume_with_new_dataset
+>>>>>>> 8a135f51be9e8b58b626b23667d5d329ec68486c
     )
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples):
+def train_valid_test_datasets_provider(train_val_test_num_samples, consumed_samples_per_dataset):
     """Build the train test and validation datasets.
 
     Args:
@@ -196,7 +255,12 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         dataset_type,
         train_val_test_num_samples,
+<<<<<<< HEAD
         config
+=======
+        consumed_samples_per_dataset,
+        core_gpt_dataset_config_from_args(args)
+>>>>>>> 8a135f51be9e8b58b626b23667d5d329ec68486c
     ).build()
 
     print_rank_0("> finished creating GPT datasets ...")
