@@ -168,6 +168,7 @@ def core_gpt_dataset_config_from_args(args):
         split=args.split,
         path_to_cache=args.data_cache_path,
         mock=args.mock_data,
+        mmap_bin_files=args.mmap_bin_files,
         tokenizer=tokenizer,
         reset_position_ids=args.reset_position_ids,
         reset_attention_mask=args.reset_attention_mask,

@@ -48,6 +48,8 @@ class BlendedMegatronDatasetConfig:
 
         path_to_cache (str): Where all re-useable dataset indices are to be cached.
 
+        mmap_bin_files (bool): Whether to mmap the .bin files or use file pointer.
+
         mock (bool): Whether to bypass real data loading and validation in favor of mock data
         generation.
 
@@ -70,6 +72,8 @@ class BlendedMegatronDatasetConfig:
     split_matrix: Optional[List[Tuple[float, float]]] = field(init=False, default=None)
 
     path_to_cache: Optional[str] = None
+
+    mmap_bin_files: bool = False
 
     mock: bool = False
 

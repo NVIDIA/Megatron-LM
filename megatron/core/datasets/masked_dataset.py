@@ -11,7 +11,7 @@ import numpy
 import torch
 
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
-from megatron.core.datasets.indexed_dataset import MMapIndexedDataset
+from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.utils import Split, log_single_rank
 
@@ -87,14 +87,14 @@ class MaskedWordPieceDataset(MegatronDataset):
     """The semi-abstract base class for masked WordPiece datasets
 
     This implementation makes the rigid assumption that all inheritor datasets are built upon the
-    MMapIndexedDataset class. This assumption may be pushed down to the inheritors in future if
+    IndexedDataset class. This assumption may be pushed down to the inheritors in future if
     necessary.
 
     NB: WordPiece tokenization prepends a double hash "##" to all tokens/pieces in a word, save the
     first token/piece.
 
     Args:
-        indexed_dataset (MMapIndexedDataset): The MMapIndexedDataset around which to build the
+        indexed_dataset (IndexedDataset): The IndexedDataset around which to build the
         MegatronDataset
 
         dataset_path (str): The real path on disk to the dataset, for bookkeeping
@@ -110,7 +110,7 @@ class MaskedWordPieceDataset(MegatronDataset):
 
     def __init__(
         self,
-        indexed_dataset: MMapIndexedDataset,
+        indexed_dataset: IndexedDataset,
         dataset_path: str,
         indexed_indices: numpy.ndarray,
         num_samples: int,
@@ -122,14 +122,14 @@ class MaskedWordPieceDataset(MegatronDataset):
         )
 
     @staticmethod
-    def numel_low_level_dataset(low_level_dataset: MMapIndexedDataset) -> int:
+    def numel_low_level_dataset(low_level_dataset: IndexedDataset) -> int:
         return low_level_dataset.document_indices.shape[0] - 1
 
     @staticmethod
     def build_low_level_dataset(
         dataset_path: str, config: MaskedWordPieceDatasetConfig
-    ) -> MMapIndexedDataset:
-        return MMapIndexedDataset(dataset_path)
+    ) -> IndexedDataset:
+        return IndexedDataset(dataset_path)
 
     @staticmethod
     def _key_config_attributes() -> List[str]:
