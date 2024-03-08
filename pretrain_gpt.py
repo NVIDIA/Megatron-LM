@@ -22,7 +22,8 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.utils import (
     get_ltor_masks_and_position_ids,
     get_batch_on_this_cp_rank,
-    average_losses_across_data_parallel_group
+    average_losses_across_data_parallel_group,
+    get_shard_names
 )
 from megatron.arguments import core_transformer_config_from_args
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -105,10 +106,18 @@ def get_batch(data_iterator):
         data = None
     
     # update the datasets to reflect the consumed samples
-    dataset_id = data['dataset_id']
-    sample_id = data['sample_id']
-    for ds_id, doc_id, offset in zip(dataset_id, sample_id[0], sample_id[1]):
-        data_iterator._dataset.datasets[ds_id].update_consumed_samples(doc_id.item(), offset.item())
+    if 'sample_id' in data:
+        prefixes = get_shard_names(args.data_path)
+        dataset_id = data['dataset_id']
+        sample_id = data['sample_id']
+        for ds_id, doc_id, offset in zip(dataset_id, sample_id[0], sample_id[1]):
+            # data_iterator._dataset.datasets[ds_id].update_consumed_samples(doc_id.item(), offset.item())
+            prefix = prefixes[ds_id]
+            sample = (doc_id, offset)
+            if sample in args.consumed_samples_per_dataset[prefix]:
+                args.consumed_samples_per_dataset[prefix][sample]+=1
+            else:
+                args.consumed_samples_per_dataset[prefix][sample] = 1
         
     data_b = tensor_parallel.broadcast_data(keys, data, datatype)
 

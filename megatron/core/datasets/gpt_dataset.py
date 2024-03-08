@@ -415,12 +415,6 @@ class GPTDataset(MegatronDataset):
         shuffle_index = shuffle_index[mask]
         return shuffle_index
     
-    def update_consumed_samples(self, doc_id, offset):
-        sample = (doc_id, offset)
-        if sample in self.consumed_samples_dict:
-            self.consumed_samples_dict[sample]+=1
-        else:
-            self.consumed_samples_dict[sample] = 1
 
 def _build_document_index(
     documents: numpy.ndarray,

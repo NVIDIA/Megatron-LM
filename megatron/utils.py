@@ -3,7 +3,7 @@
 """General utilities."""
 
 import sys
-
+import os
 import torch
 
 try:
@@ -249,6 +249,9 @@ def get_batch_on_this_cp_rank(batch):
 
     return batch
 
+def get_shard_names(blend):
+    # TODO handle the `blend_per_split` case as well
+    return [os.path.basename(blend[i + 1].strip()) for i in range(0, len(blend), 2)]
 
 def print_rank_0(message):
     """If distributed is initialized, print only on rank 0."""

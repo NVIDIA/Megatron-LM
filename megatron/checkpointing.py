@@ -15,7 +15,8 @@ from megatron.core.datasets.blended_dataset import BlendedDataset
 from megatron.core.datasets.gpt_dataset import GPTDataset
 from .global_vars import get_args
 from .utils import (unwrap_model,
-                    print_rank_0)
+                    print_rank_0,
+                    get_shard_names)
 
 
 _CHECKPOINT_VERSION = None
@@ -239,36 +240,26 @@ def get_rng_state():
 
     return rng_state_list
 
-def get_consumed_samples_per_dataset(train_ds):
+def get_consumed_samples_per_dataset():
+    """ collect consumed samples per dataset across data parallel ranks """
     args = get_args()
-    
-    # TODO handle the `blend_per_split` case as well
-    blend = args.data_path
-    _, prefixes = zip(
-        *[(float(blend[i]), os.path.basename(blend[i + 1].strip())) for i in range(0, len(blend), 2)]
-    )
-    assert type(train_ds) == BlendedDataset and type(train_ds.datasets[0]) == GPTDataset,\
-        "Consumed samples per dataset tracking only supported for BlendedDataset and GPTDataset"
-
+    prefixes = get_shard_names(args.data_path)
     if torch.distributed.is_initialized() and \
             mpu.get_data_parallel_world_size() > 1:
-        for prefix, ds in zip(prefixes, train_ds.datasets):
+        for prefix in prefixes:
             consumed_samples_per_dataset = \
                 [None for i in range(mpu.get_data_parallel_world_size())]
             torch.distributed.all_gather_object(
                 consumed_samples_per_dataset,
-                ds.consumed_samples_dict,
+                args.consumed_samples_per_dataset[prefix],
                 group=mpu.get_data_parallel_group())
             consumed_samples_per_dataset_combined = dict()
             for consumed_samples_dict in consumed_samples_per_dataset:
                 consumed_samples_per_dataset_combined.update(consumed_samples_dict)
             args.consumed_samples_per_dataset[prefix] = consumed_samples_per_dataset_combined
-    else:
-        for prefix, ds in zip(prefixes, train_ds.datasets):
-            args.consumed_samples_per_dataset[prefix] = ds.consumed_samples_dict
     
 
-def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, train_dataset):
+def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
     """Save a model checkpoint."""
     args = get_args()
 
@@ -281,9 +272,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, train_data
     # Collect rng state across data parallel ranks.
     rng_state = get_rng_state()
 
-    # update args to have the latest consumed samples per dataset states
-    if type(train_dataset) == BlendedDataset:
-        get_consumed_samples_per_dataset(train_dataset)
+    # collect consumed samples per dataset across data parallel ranks
+    get_consumed_samples_per_dataset()
 
     # Checkpoint name.
     checkpoint_name = get_checkpoint_name(args.save, iteration)
