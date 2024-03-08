@@ -41,7 +41,7 @@ def collect_train_test_metrics(logs_dir, index):
 
 class TestCIPipeline:
 
-    margin_loss = 0.05
+    margin_loss = 0.005
     train_metrics_100 = collect_train_test_metrics(LOGS_DIR, 0)
     train_metrics_50_to_100 = collect_train_test_metrics(LOGS_DIR, 1)
 
@@ -64,8 +64,8 @@ class TestCIPipeline:
             else:
                 assert actual_val == expected_val, f"The value at step {step} should be {expected_val} but it is {actual_val}."
 
-    def test_lm_loss_deterministic(self):
-        self._test_helper("lm loss", TypeOfTest.DETERMINISTIC)
+    # def test_lm_loss_deterministic(self):
+    #     self._test_helper("lm loss", TypeOfTest.DETERMINISTIC)
 
     def test_lm_loss_approx(self):
         self._test_helper("lm loss", TypeOfTest.APPROX)

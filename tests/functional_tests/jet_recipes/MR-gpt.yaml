@@ -22,6 +22,7 @@ spec:
   precision: bf16
   time_limit: 1200
   artifacts: {/workspace/data/gpt3_data: text/the_pile/shard00}
+  ckpt_format: torch
   checkpoint_resume_test: 0
   script: |-
     ls
@@ -44,6 +45,7 @@ spec:
         MBS={micro_batch_size} \
         GBS={batch_size} \
         MOE_GROUPED_GEMM={moe_grouped_gemm} \
+        CKPT_FORMAT={ckpt_format} \
         CHECKPOINT_RESUME_TEST={checkpoint_resume_test} \
         ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'} && \
         python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py {assets_dir} "" | \

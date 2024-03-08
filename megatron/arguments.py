@@ -429,6 +429,10 @@ def validate_args(args, defaults={}):
         assert not args.fp16, \
             "Expert parallelism is not supported with fp16 training."
 
+    # Distributed checkpointing checks
+    if args.use_dist_ckpt and not args.use_mcore_models:
+        raise RuntimeError('--use-dist-ckpt only support Megatron Core, please add --use-mcore-models.')
+
     # Print arguments.
     _print_args("arguments", args)
     retro_args = get_retro_args()
@@ -1099,6 +1103,15 @@ def _add_checkpointing_args(parser):
                        help="If '--load' is set, but checkpoint is not found "
                        "(e.g., path typo), then exit instead of random "
                        "initialization.")
+    group.add_argument('--use-dist-ckpt', action='store_true',
+                       help='Use distributed checkpoint format.')
+    group.add_argument('--auto-detect-ckpt-format', action='store_true',
+                       help='Determine if the checkpoint format is in legacy or distributed format.'
+                            ' If False, expects distributed checkpoint iff args.use_dist_ckpt.'
+                            ' Might slow down loading a bit (double rank0 ckpt load).')
+    group.add_argument('--dist-ckpt-format', type=str, default='zarr',
+                       choices=['zarr'],
+                       help='Distributed checkpoint format to use.')
 
     return parser
 

@@ -70,7 +70,7 @@ def extract_sharded_tensors_or_nonpersistent(
 
 
 def add_prefix_for_sharding(sharded_state_dict: ShardedStateDict, prefix: str):
-    """ Prepend a given prefix to all ShardedTensor objects in a given state dict *in-place*.
+    """ Prepend a given prefix to all ShardedBase objects in a given state dict *in-place*.
 
     Args:
         sharded_state_dict (ShardedStateDict): sharded state dict
@@ -81,8 +81,8 @@ def add_prefix_for_sharding(sharded_state_dict: ShardedStateDict, prefix: str):
     """
 
     def add_prefix(t):
-        if isinstance(t, ShardedTensor):
-            t.key = f'{prefix}.{t.key}'
+        if isinstance(t, (ShardedTensor, ShardedTensorFactory, ShardedObject)):
+            t.key = f'{prefix}{t.key}'
         return t
 
     dict_list_map_inplace(add_prefix, sharded_state_dict)

@@ -18,13 +18,13 @@ variables: &VARS
   DISPLAY_OUTPUT: "True" # Set to true for new tests to copy the logs for creating golden truth file
   TIME_LIMIT: "10:00" # Default time limit for all jobs
   MOE_GROUPED_GEMM: 0 # Set to 1 to enable grouped gemm for MoE
-  JET_CLUSTER_BRANCH: 
-    value: "mcore/draco-oci"  
+  JET_CLUSTER_BRANCH:
+    value: "mcore/draco-oci"
     options:
       - "mcore/draco-oci"
       - "mcore/eos"
     description: '"mcore/draco-oci" for OCI-IAD, "mcore/eos" for EOS'
- 
+
 
 include:
   - jet-tests.yml

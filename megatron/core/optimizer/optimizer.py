@@ -4,6 +4,7 @@
 
 import math
 from abc import ABC, abstractmethod
+from itertools import chain
 from logging import getLogger
 
 import amp_C
@@ -14,6 +15,13 @@ from megatron.core import tensor_parallel
 from megatron.model.module import param_is_not_shared
 
 from .. import parallel_state, tensor_parallel
+from ..dist_checkpointing.mapping import ShardedStateDict
+from ..dist_checkpointing.optimizer import (
+    get_param_id_to_sharded_param_map,
+    make_sharded_optimizer_tensor,
+    optim_state_to_sharding_state,
+)
+from ..dist_checkpointing.utils import add_prefix_for_sharding
 from ..transformer.module import param_is_not_shared
 from .clip_grads import clip_grad_norm_fp32, count_zeros_fp32
 
@@ -51,7 +59,12 @@ def _multi_tensor_copy_this_to_that(this, that, overflow_buf=None):
 
 class MegatronOptimizer(ABC):
     def __init__(
-        self, optimizer, clip_grad, log_num_zeros_in_grad, params_have_main_grad,
+        self,
+        optimizer,
+        clip_grad,
+        log_num_zeros_in_grad,
+        params_have_main_grad,
+        init_state_fn=lambda x: None,
     ):
 
         """Input optimizer is the base optimizer for example Adam."""
@@ -61,6 +74,7 @@ class MegatronOptimizer(ABC):
         self.clip_grad = clip_grad
         self.log_num_zeros_in_grad = log_num_zeros_in_grad
         self.params_have_main_grad = params_have_main_grad
+        self.init_state_fn = init_state_fn
 
     def get_parameters(self):
         params = []
@@ -157,6 +171,20 @@ class MegatronOptimizer(ABC):
     def step(self, args, timers):
         pass
 
+    @abstractmethod
+    def sharded_state_dict(
+        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
+    ) -> ShardedStateDict:
+        """ Builds sharded state dict for the optimizer, based on model's sharded state dict.
+
+        Args:
+            model_sharded_state_dict (ShardedStateDict): sharded state dict of the model
+            is_loading (bool, optional): flag indicating whether the state dict will be used to save or load the optimizer state.
+                Defaults to False.
+
+        Returns: optimizer sharded state dict
+        """
+
 
 class MixedPrecisionOptimizer(MegatronOptimizer):
     """Base class for both the float-16 and the distributed optimizer.
@@ -195,10 +223,11 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         bf16,
         params_dtype,
         grad_scaler,
+        init_state_fn,
     ):
 
         super().__init__(
-            optimizer, clip_grad, log_num_zeros_in_grad, params_have_main_grad,
+            optimizer, clip_grad, log_num_zeros_in_grad, params_have_main_grad, init_state_fn,
         )
 
         self.fp16 = fp16
@@ -351,6 +380,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         bf16,
         params_dtype,
         grad_scaler,
+        init_state_fn,
     ):
 
         super().__init__(
@@ -362,6 +392,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             bf16,
             params_dtype,
             grad_scaler,
+            init_state_fn,
         )
 
         # ======================
@@ -502,6 +533,40 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         state_dict['fp32_from_fp16_params'] = self.fp32_from_float16_groups
         return state_dict
 
+    def sharded_state_dict(
+        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
+    ):
+        if is_loading:
+            self.init_state_fn(self.optimizer)
+
+        state_dict = self.state_dict()
+
+        id_to_sharded_param_map = get_param_id_to_sharded_param_map(
+            model_sharded_state_dict, chain.from_iterable(g for g in self.float16_groups)
+        )
+
+        # Convert fp32_from_fp16_params
+        assert len(state_dict['fp32_from_fp16_params']) == len(
+            state_dict['optimizer']['param_groups']
+        )
+        state_dict['fp32_from_fp16_params'] = [
+            [
+                make_sharded_optimizer_tensor(
+                    id_to_sharded_param_map[param_id],
+                    fp32_param,
+                    prefix=f'optimizer.state.fp32_param',
+                )
+                for param_id, fp32_param in zip(state_group['params'], fp32_group)
+            ]
+            for fp32_group, state_group in zip(
+                state_dict['fp32_from_fp16_params'], state_dict['optimizer']['param_groups']
+            )
+        ]
+
+        # Convert regular optimizer state
+        optim_state_to_sharding_state(state_dict['optimizer'], id_to_sharded_param_map)
+        return state_dict
+
     def load_state_dict(self, state_dict):
         # Optimizer.
         optimizer_key = 'optimizer'
@@ -539,11 +604,11 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
 class FP32Optimizer(MegatronOptimizer):
     def __init__(
-        self, optimizer, clip_grad, log_num_zeros_in_grad, params_have_main_grad,
+        self, optimizer, clip_grad, log_num_zeros_in_grad, params_have_main_grad, init_state_fn,
     ):
 
         super(FP32Optimizer, self).__init__(
-            optimizer, clip_grad, log_num_zeros_in_grad, params_have_main_grad,
+            optimizer, clip_grad, log_num_zeros_in_grad, params_have_main_grad, init_state_fn,
         )
 
         self._scale = torch.tensor([1.0], dtype=torch.float, device='cuda')
@@ -635,7 +700,26 @@ class ChainedOptimizer(MegatronOptimizer):
     def state_dict(self):
         return [optimizer.state_dict() for optimizer in self.chained_optimizers]
 
+    def sharded_state_dict(
+        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False, **kwargs
+    ):
+        sharded_state_dict = {}
+        for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
+            optim_state_dict = optimizer.sharded_state_dict(
+                model_sharded_state_dict, is_loading, **kwargs
+            )
+            add_prefix_for_sharding(optim_state_dict, f'chained_{optimizer_idx}.')
+            sharded_state_dict[optimizer_idx] = optim_state_dict
+        return sharded_state_dict
+
     def load_state_dict(self, state_dict):
+        if len(self.chained_optimizers) != len(state_dict):
+            raise RuntimeError(
+                f'Expected {len(self.chained_optimizers)} entries'
+                f' in state dict, but got {len(state_dict)}.'
+            )
+        if isinstance(state_dict, dict):
+            state_dict = (v for k, v in sorted(state_dict.items()))
         for optimizer, state in zip(self.chained_optimizers, state_dict):
             optimizer.load_state_dict(state)
 
