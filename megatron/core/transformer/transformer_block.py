@@ -389,6 +389,7 @@ class TransformerBlock(MegatronModule):
                             hidden_states = layer(
                                 hidden_states,
                                 None,
+                                is_first_microbatch=(self.current_microbatch==0),
 #                                attention_mask=attention_mask,
 #                                context=context,
 #                                context_mask=context_mask,
