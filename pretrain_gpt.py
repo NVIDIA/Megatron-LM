@@ -105,17 +105,18 @@ def get_batch(data_iterator):
     else:
         data = None
     
-    # update the datasets to reflect the consumed samples
+    # mark the consumed samples
     if 'sample_id' in data:
         prefixes = get_shard_names(args.data_path)
         dataset_id = data['dataset_id']
         sample_id = data['sample_id']
         for ds_id, doc_id, offset in zip(dataset_id, sample_id[0], sample_id[1]):
-            # data_iterator._dataset.datasets[ds_id].update_consumed_samples(doc_id.item(), offset.item())
             prefix = prefixes[ds_id]
+            if prefix not in args.consumed_samples_per_dataset:
+                args.consumed_samples_per_dataset[prefix] = dict()
             sample = (doc_id, offset)
             if sample in args.consumed_samples_per_dataset[prefix]:
-                args.consumed_samples_per_dataset[prefix][sample]+=1
+                args.consumed_samples_per_dataset[prefix][sample] += 1
             else:
                 args.consumed_samples_per_dataset[prefix][sample] = 1
         
