@@ -18,7 +18,6 @@ import torch.nn.functional as F
 from megatron.global_vars import set_retro_args, get_retro_args
 from tools.retro.utils import get_args_path as get_retro_args_path
 
-from megatron.core.models.retro import RetroConfig
 from megatron.core.transformer import TransformerConfig
 
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
@@ -458,6 +457,7 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
     # If using Retro, return Retro config.
     retro_args = get_retro_args()
     if retro_args:
+        from megatron.core.models.retro import RetroConfig
         kw_args['retro_preprocess'] = retro_args
         return RetroConfig(**kw_args)
 
