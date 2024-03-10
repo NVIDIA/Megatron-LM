@@ -899,6 +899,9 @@ def _add_training_args(parser):
     group.add_argument('--create-moe-param-group', action='store_true',
                        help='Create separate groups for MoE params.'
                        'This is necessary for techniques like ZeRO.')
+    group.add_argument('--disable-moe-top2-2nd-expert-sampling', action='store_false',
+                       help='Disable MoE top2 sampling of the 2nd expert. Instead of sampling, use argmax.',
+                       dest='moe_top2_2nd_expert_sampling')
     group.add_argument('--use-flash-attn', '--use-flash-attn-v1', dest='use_flash_attn_v1', action='store_true',
                        help='use first version FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')

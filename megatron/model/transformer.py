@@ -952,18 +952,20 @@ class ParallelTransformerLayer(MegatronModule):
             else: # DeepSpeed's MoE
                 enable_expert_tensor_parallelism = args.enable_expert_tensor_parallelism
                 self.mlp = MoE(args.hidden_size,
-                                ParallelMLP(config,
-                                    moe=True,
-                                    enable_expert_tensor_parallelism=enable_expert_tensor_parallelism),
-                                num_experts=self.num_experts,
-                                ep_size=args.moe_expert_parallel_size,
-                                k=args.topk,
-                                use_residual=(args.mlp_type == 'residual'),
-                                capacity_factor=args.moe_train_capacity_factor,
-                                eval_capacity_factor=args.moe_eval_capacity_factor,
-                                min_capacity=args.moe_min_capacity,
-                                drop_tokens=args.moe_token_dropping, use_tutel=args.use_tutel,
-                                enable_expert_tensor_parallelism=enable_expert_tensor_parallelism)
+                               ParallelMLP(config,
+                                           moe=True,
+                                           enable_expert_tensor_parallelism=enable_expert_tensor_parallelism),
+                               num_experts=self.num_experts,
+                               ep_size=args.moe_expert_parallel_size,
+                               k=args.topk,
+                               use_residual=(args.mlp_type == 'residual'),
+                               capacity_factor=args.moe_train_capacity_factor,
+                               eval_capacity_factor=args.moe_eval_capacity_factor,
+                               min_capacity=args.moe_min_capacity,
+                               drop_tokens=args.moe_token_dropping,
+                               use_tutel=args.use_tutel,
+                               enable_expert_tensor_parallelism=enable_expert_tensor_parallelism,
+                               top2_2nd_expert_sampling=args.moe_top2_2nd_expert_sampling)
 
         # Set bias+dropout+add fusion grad_enable execution handler.
         TORCH_MAJOR = int(torch.__version__.split('.')[0])
