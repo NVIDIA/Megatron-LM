@@ -31,6 +31,7 @@ jet-setup:
       dotenv: config.env
 
 jet-configure:
+  image: alpine
   extends: [.jet_common, .jet-configure]
   tags:
     - os/linux
@@ -65,9 +66,9 @@ jet-trigger:
 
 jet-functional-results:
   stage: jet
-  tags:
-    - docker_local_runner
   image: gitlab-master.nvidia.com:5005/dl/jet/api:latest
+  tags:
+    - os/linux
   needs: [ jet-trigger ]
   before_script:
     - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $CI_JOB_JWT
@@ -85,9 +86,9 @@ jet-functional-results:
 
 jet-compare-metrics:
   extends: .jet_common
-  tags:
-    - docker_local_runner
   image: gitlab-master.nvidia.com:5005/dl/jet/api:latest
+  tags:
+    - os/linux
   needs: [ jet-functional-results ]
   before_script:
     - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $CI_JOB_JWT
