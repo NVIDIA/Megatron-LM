@@ -1,5 +1,3 @@
-image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
-
 stages:
   - test
   - jet
@@ -30,6 +28,7 @@ include:
   - jet-tests.yml
 
 unit_tests:
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
   tags:
     - docker_local_runner
   stage: test
@@ -44,9 +43,10 @@ unit_tests:
     - when: always
 
 docs_build_test:
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/python-format:0.0.1
   stage: test
   tags:
-    - docker_local_runner
+    - os/linux
   script:
     - cd ..
     - rm -rf documentation && git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab-master.nvidia.com/nemo-megatron-core-tme/documentation.git
@@ -58,8 +58,9 @@ docs_build_test:
     - main
 
 formatting:
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/python-format:0.0.1
   tags:
-    - docker_local_runner
+    - os/linux
   stage: test
   script:
     - black megatron/core --check --verbose --diff
