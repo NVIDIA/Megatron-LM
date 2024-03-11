@@ -1,15 +1,19 @@
-type: recipe
+type: basic
 format_version: 1
 maintainers: [maanug]
 loggers: [stdout]
 spec:
+  name: "{model}_{variant}_{scope}_{platforms}_{nodes}N{gpus}G_\
+         {'mcore_' if use_mcore else ''}{'te_' if use_te else ''}\
+         tp{tp_size}_pp{pp_size}{'_vp'+str(vp_size) if vp_size else ''}\
+         {'_'+args_meta if args_meta else ''}"
   model: t5
   variant: 220m
   build: mcore-pyt 
   scope: merge-request
   nodes: 1
   gpus: 8
-  platforms: [dgx_a100]
+  platforms: dgx_a100
   steps: 100
   use_te: False
   use_mcore: True
@@ -44,8 +48,3 @@ spec:
         tee {assets_dir}/results.json
 products:
   - {use_te: [True], tp_size: [1],  pp_size: [1], vp_size: [1]}
-key_segments:
-  vp_size: vp
-  use_mcore: mcore
-  use_te: te
-  args_meta: args
