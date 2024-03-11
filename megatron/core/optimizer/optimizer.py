@@ -11,9 +11,6 @@ import amp_C
 import torch
 from apex.multi_tensor_apply import multi_tensor_applier
 
-from megatron.core import tensor_parallel
-from megatron.model.module import param_is_not_shared
-
 from .. import parallel_state, tensor_parallel
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..dist_checkpointing.optimizer import (

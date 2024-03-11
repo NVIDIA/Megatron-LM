@@ -1,6 +1,10 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from megatron import print_rank_0
+from logging import getLogger
+
+import torch
+
+logger = getLogger(__name__)
 
 
 def mcore_gpt_load_classic_state_dict_pre_hook(
@@ -46,7 +50,8 @@ def mcore_gpt_load_classic_state_dict_pre_hook(
             for key, param in language_model_state_dict["output_layer"].items():
                 state_dict.update({"output_layer." + key: param})
 
-    print_rank_0("ModelOptGPTModel {}".format(state_dict.keys()))
+    if torch.distributed.get_rank() == 0:
+        logger.info("ModelOptGPTModel {}".format(state_dict.keys()))
 
     module_name_rewrite_list = [
         ("input_norm", "input_layernorm"),
@@ -69,7 +74,8 @@ def mcore_gpt_load_classic_state_dict_pre_hook(
                 key_rewrite_list += [(key, key.replace(old_name, new_name))]
 
     for old_key, new_key in key_rewrite_list:
-        print_rank_0("replace {} with {}".format(old_key, new_key))
+        if torch.distributed.get_rank() == 0:
+            logger.info("replace {} with {}".format(old_key, new_key))
         state_dict[new_key] = state_dict[old_key]
         state_dict.pop(old_key)
 
@@ -121,6 +127,7 @@ def mcore_gpt_load_te_state_dict_pre_hook(
                 key_rewrite_list += [(key, key.replace(old_name, new_name))]
 
     for old_key, new_key in key_rewrite_list:
-        print_rank_0("replace {} with {}".format(old_key, new_key))
+        if torch.distributed.get_rank() == 0:
+            logger.info("replace {} with {}".format(old_key, new_key))
         state_dict[new_key] = state_dict[old_key]
         state_dict.pop(old_key)
