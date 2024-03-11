@@ -53,6 +53,7 @@ def check_exitcodes(results):
     table.add_column("Job Key", names)
     table.add_column("Exit Code", exit_codes)
     table.add_column("Log URL", log_urls)
+    table.align["Job Key"] = 'l'
     exit_codes_good = [ec == 0 for ec in exit_codes]
     if exit_codes_good == []:
         raise Exception("Can't find any jobs, something went wrong.\n" + table.get_string())
