@@ -5,13 +5,14 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Union
 
 import numpy
 import torch
 
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.indexed_dataset import IndexedDataset
+from megatron.core.datasets.s3_indexed_dataset import S3IndexedDataset, is_s3_path
 from megatron.core.datasets.megatron_dataset import MegatronDataset, MockDataset
 from megatron.core.datasets.utils import Split, log_single_rank
 
@@ -57,7 +58,7 @@ class MockGPTDataset(MockDataset):
     """The mock GPT dataset
     """
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Dict[str, numpy.ndarray]:
         """Return a sequence_length + 1 token sequence consisting of the following:
             - (1) S, the RNG length-sentinel in the range [0, sequence_length)
             - (S) tokens
@@ -176,7 +177,9 @@ class GPTDataset(MegatronDataset):
         Returns:
             IndexedDataset: The underlying IndexedDataset
         """
-        return IndexedDataset(dataset_path, multimodal=False, mmap=config.mmap_bin_files)
+        if is_s3_path(dataset_path):
+            return S3IndexedDataset(dataset_path, False, config.path_to_cache)
+        return IndexedDataset(dataset_path, False)
 
     def __len__(self) -> int:
         """Abstract method implementation

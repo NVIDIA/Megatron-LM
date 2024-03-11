@@ -1,14 +1,18 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
+import glob
+import io
 import json
 import os
 import sys
 import tempfile
 
+import boto3
 import nltk
 import requests
 
 from megatron.core.datasets.indexed_dataset import IndexedDataset
+from megatron.core.datasets.s3_indexed_dataset import S3IndexedDataset
 from megatron.tokenizer.gpt2_tokenization import (
     PRETRAINED_MERGES_ARCHIVE_MAP,
     PRETRAINED_VOCAB_ARCHIVE_MAP,
@@ -67,7 +71,7 @@ def merge_datasets(idir):
     merge_main()
 
 
-def do_test_preprocess_data(temp_dir, extra_args=[]):
+def do_test_preprocess_data(temp_dir, extra_args=[], indexed_dataset_type=IndexedDataset):
     # set the default nltk data path
     os.environ["NLTK_DATA"] = os.path.join(temp_dir, "nltk_data")
     nltk.data.path.append(os.environ["NLTK_DATA"])
@@ -100,8 +104,27 @@ def do_test_preprocess_data(temp_dir, extra_args=[]):
                 continue
         raise RuntimeError(f"{type(encoder.tokenizer)} tokenizer cannot decode or detokenize")
 
+    prefix_for_path_prefix = ""
+    indexed_dataset_kwargs = {}
+    if indexed_dataset_type == S3IndexedDataset:
+        # Copy all the files in `temp_dir` to S3.
+        s3_client = boto3.client("s3")
+        bucket_name = "test-bucket"
+        for path in glob.glob(os.path.join(temp_dir, "**/**")):
+            assert path.startswith("/")
+            s3_client.upload_file(path, bucket_name, path[1:])
+        assert path_to_data.startswith("/")
+        prefix_for_path_prefix = "s3://" + bucket_name
+        IndexedDataset = S3IndexedDataset
+        indexed_dataset_kwargs = {
+            "multimodal": False,
+            "path_to_idx_cache": os.path.join(temp_dir, "idx_cache"),
+        }
+
     merged_index = 0
-    merged_dataset = IndexedDataset(os.path.join(path_to_data, "merge"))
+    merged_dataset = indexed_dataset_type(
+        prefix_for_path_prefix + os.path.join(path_to_data, "merge"), **indexed_dataset_kwargs
+    )
 
     # sorted to ensure ordering matches merged dataset
     basenames = sorted(
@@ -120,7 +143,9 @@ def do_test_preprocess_data(temp_dir, extra_args=[]):
         realpath_doc = os.path.join(path_to_data, basename.split(".")[-2])
 
         dataset_index = 0
-        dataset = IndexedDataset(realpath_doc)
+        dataset = indexed_dataset_type(
+            prefix_for_path_prefix + realpath_doc, **indexed_dataset_kwargs
+        )
 
         merged_doc_idx = merged_dataset.document_indices[
             merged_doc_index_index : merged_doc_index_index + len(dataset.document_indices)
@@ -184,25 +209,70 @@ def gpt2_merge(odir):
     return path
 
 
+def gpt_args(temp_dir):
+    # gpt specific args
+    return [
+        "--tokenizer-type",
+        "GPT2BPETokenizer",
+        "--vocab-file",
+        gpt2_vocab(temp_dir),
+        "--merge-file",
+        gpt2_merge(temp_dir),
+        "--append-eod",
+        "--workers",
+        "10",
+        "--log-interval",
+        "1",
+    ]
+
+
 def test_preprocess_data_gpt():
     with tempfile.TemporaryDirectory() as temp_dir:
+        do_test_preprocess_data(temp_dir, extra_args=gpt_args(temp_dir))
 
-        # gpt specific args
-        gpt_args = [
-            "--tokenizer-type",
-            "GPT2BPETokenizer",
-            "--vocab-file",
-            gpt2_vocab(temp_dir),
-            "--merge-file",
-            gpt2_merge(temp_dir),
-            "--append-eod",
-            "--workers",
-            "10",
-            "--log-interval",
-            "1",
-        ]
 
-        do_test_preprocess_data(temp_dir, extra_args=gpt_args)
+class MockS3Client:
+    def __init__(self, *args, **kwargs):
+        self._data = {}
+
+    def download_file(self, bucket, key, local_path):
+        with open(local_path, "wb") as fout:
+            fout.write(self._data[(bucket, key)])
+
+    def upload_file(self, local_path, bucket, key):
+        with open(local_path, "rb") as fin:
+            self._data[(bucket, key)] = fin.read()
+
+    def head_object(self, Bucket, Key):
+        return (Bucket, Key) in self._data
+
+    def get_object(self, Bucket, Key, Range):
+        assert Range.startswith("bytes=")
+        parts = Range.split("=")
+        assert len(parts) == 2
+        subparts = parts[1].split("-")
+        assert len(subparts) == 2
+        start = int(subparts[0])
+        # add 1 to convert inclusive index into exclusive index.
+        end = int(subparts[1]) + 1
+        return {"Body": io.BytesIO(self._data[(Bucket, Key)][start:end])}
+
+    def close(self):
+        pass
+
+
+def test_preprocess_data_gpt_s3(monkeypatch):
+    MOCK_S3_CLIENT = MockS3Client()
+
+    def mock_s3_client(*args, **kwargs):
+        return MOCK_S3_CLIENT
+
+    monkeypatch.setattr("boto3.client", mock_s3_client)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        do_test_preprocess_data(
+            temp_dir, extra_args=gpt_args(temp_dir), indexed_dataset_type=S3IndexedDataset
+        )
 
 
 def bert_vocab(odir):
