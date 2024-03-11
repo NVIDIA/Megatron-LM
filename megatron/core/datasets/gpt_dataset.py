@@ -58,7 +58,7 @@ class MockGPTDataset(MockDataset):
     """The mock GPT dataset
     """
 
-    def __getitem__(self, idx: int) -> Dict[str, numpy.ndarray]:
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """Return a sequence_length + 1 token sequence consisting of the following:
             - (1) S, the RNG length-sentinel in the range [0, sequence_length)
             - (S) tokens
@@ -69,7 +69,7 @@ class MockGPTDataset(MockDataset):
             idx (int): The integer seed for mock data generation
 
         Returns:
-            Dict[str, numpy.ndarray]: The mock data
+            Dict[str, torch.Tensor]: The mock data
         """
         tok = 1
         pad = 2
