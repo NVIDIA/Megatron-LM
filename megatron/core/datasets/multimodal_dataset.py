@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Callable, Dict
 
 import numpy
 import torch
@@ -19,10 +19,13 @@ class MultimodalDatasetConfig(GPTDatasetConfig):
     Attributes:
         image_h (int): Image height.
         image_w (int): Image width.
+        preprocess_func (callable): Optional function to preprocess data samples for a specific model.
     """
 
     image_h: int = None
     image_w: int = None
+    # Function to preprocess the data sample to a format expected by a specific model. By default, do nothing.
+    preprocess_func: Callable[[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]] = lambda x: x
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -45,7 +48,7 @@ class MockMultimodalDataset(MockGPTDataset):
             idx (int): The integer seed for mock data generation.
 
         Returns:
-            Dict[str, numpy.ndarray]: The mock data.
+            Dict[str, torch.Tensor]: The mock data.
         """
         # Get a text sample.
         sample = super().__getitem__(idx)
@@ -55,4 +58,7 @@ class MockMultimodalDataset(MockGPTDataset):
             (3, self.config.image_h, self.config.image_w), dtype=torch.float32
         )
 
-        return sample
+        # Run optional data preprocessing.
+        preprocess_func = self.config.preprocess_func
+
+        return preprocess_func(sample)
