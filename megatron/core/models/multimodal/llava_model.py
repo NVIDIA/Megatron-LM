@@ -48,7 +48,7 @@ class LLaVAModel(MegatronModule):
 
         # Map (intermediate) vision model outputs to the language model input dimension.
         # TODO: Separate work is adding a configurable multimodal projection layer. Replace this with that one.
-        self._vision_projection = tensor_parallel.ColumnParallelLinear(
+        self.vision_projection = tensor_parallel.ColumnParallelLinear(
             vision_transformer_config.hidden_size,
             language_transformer_config.hidden_size,
             config=vision_transformer_config,
@@ -70,7 +70,7 @@ class LLaVAModel(MegatronModule):
 
     def forward(
         self,
-        image: torch.Tensor,
+        images: torch.Tensor,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor,
@@ -79,7 +79,7 @@ class LLaVAModel(MegatronModule):
         """Forward function of the LLaVA model.
 
         Args:
-            image (torch.Tensor): input image of shape [batch, img_h, img_w].
+            images (torch.Tensor): input image of shape [batch, img_h, img_w].
             input_ids (torch.Tensor): input text ids [batch, text_seq_len].
             position_ids (torch.Tensor): input text position ids [batch, text_seq_len].
             attention_mask (torch.Tensor): attention mask for the language model [batch, 1, combined_seq_len, combined_seq_len].
@@ -88,10 +88,10 @@ class LLaVAModel(MegatronModule):
         Returns:
             output (torch.Tensor): Loss of shape [b, s] if labels are provided, otherwise logits of shape [b, s, vocab_size].
         """
-        image_embeddings = self.vision_model(image)  # [b, img_seq_len, h_vision]
+        image_embeddings = self.vision_model(images)  # [b, img_seq_len, h_vision]
 
         # map vision model output size to language model input size.
-        image_embeddings, _ = self._vision_projection(
+        image_embeddings, _ = self.vision_projection(
             image_embeddings
         )  # [b, img_seq_len, h_language]
 
