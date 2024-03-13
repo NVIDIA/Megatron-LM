@@ -6,7 +6,7 @@ The following guide will show you how to quickly get started with Megatron Core.
 * We will save the model using the distributed checkpointing format
 * We will load the model saved above. 
 
-*NOTE: The following has been testing for megatron core version 0.5 and pytorch version 24.02
+*NOTE: The following has been testing for megatron core version 0.5 and NGC Pytorch Container version 24.02
 
 ### Environment Setup
 ```
