@@ -1109,8 +1109,8 @@ def _add_checkpointing_args(parser):
                        help='Determine if the checkpoint format is in legacy or distributed format.'
                             ' If False, expects distributed checkpoint iff args.use_dist_ckpt.'
                             ' Might slow down loading a bit (double rank0 ckpt load).')
-    group.add_argument('--dist-ckpt-format', type=str, default='zarr',
-                       choices=['zarr'],
+    group.add_argument('--dist-ckpt-format', type=str, default='torch_dist',
+                       choices=['zarr', 'torch_dist'],
                        help='Distributed checkpoint format to use.')
 
     return parser

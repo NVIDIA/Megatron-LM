@@ -7,6 +7,7 @@ ShardedTensor class (mostly with the ShardedTensor.from_rank_offsets classmethod
 """
 
 import logging
+from abc import ABC
 from dataclasses import dataclass, replace
 from itertools import chain
 from typing import Any, Callable, Dict, Optional, Tuple, Union
@@ -27,8 +28,14 @@ ShardedStateDict = Dict[str, Any]
 ReplicaId = Union[int, Tuple[int, ...]]
 
 
+class ShardedBase(ABC):
+    key: str
+    data: object
+    replica_id: ReplicaId
+
+
 @dataclass
-class ShardedTensor:
+class ShardedTensor(ShardedBase):
     """Represents a mapping between a local tensor and a global tensor.
 
     Global tensor is assumed to consist of many local tensors distributed
@@ -173,6 +180,11 @@ class ShardedTensor:
             allow_shape_mismatch,
         )
 
+    def init_data(self, device: torch.device, init_fn=torch.empty):
+        if self.data is not None:
+            return
+        self.data = init_fn(self.local_shape, dtype=self.dtype, device=device)
+
     def __str__(self):
         return f'{self.__class__.__name__}(key=\'{self.key}\')'
 
@@ -214,7 +226,7 @@ class LocalNonpersitentObject:
 
 
 @dataclass
-class ShardedObject:
+class ShardedObject(ShardedBase):
     """Represents a mapping between a local object and a global object.
 
     Global object is assumed to consist of many local objects distributed
@@ -250,7 +262,7 @@ class ShardedObject:
 
 
 @dataclass
-class ShardedTensorFactory:
+class ShardedTensorFactory(ShardedBase):
     """ Allows to apply transformations to tensors before/after serialization.
 
     The essence of those transformations is that they can be applied to
