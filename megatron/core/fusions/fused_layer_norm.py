@@ -9,8 +9,8 @@ from torch import Tensor
 from torch.nn import init
 from torch.nn.parameter import Parameter
 
-from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
 
 try:
@@ -171,11 +171,13 @@ class FusedLayerNorm(torch.nn.Module):
                 )
 
         return output
-    
+
     def sharded_state_dict(self, prefix=''):
-        sharded_state_dict={}
+        sharded_state_dict = {}
         state_dict = self.state_dict(keep_vars=True)
-        layer_norm_prefix=f'{prefix}layer_norm.'
-        layer_norm_sharded_state_dict = make_sharded_tensors_for_checkpoint(state_dict, layer_norm_prefix)
-        sharded_state_dict.update(layer_norm_sharded_state_dict) 
+        layer_norm_prefix = f'{prefix}layer_norm.'
+        layer_norm_sharded_state_dict = make_sharded_tensors_for_checkpoint(
+            state_dict, layer_norm_prefix
+        )
+        sharded_state_dict.update(layer_norm_sharded_state_dict)
         return sharded_state_dict

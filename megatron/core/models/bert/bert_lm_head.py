@@ -1,12 +1,18 @@
 import torch
 from torch import Tensor
 
-from megatron.core import tensor_parallel, parallel_state
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import erf_gelu, get_linear_layer, make_sharded_tensors_for_checkpoint, openai_gelu
+from megatron.core.transformer.utils import (
+    erf_gelu,
+    get_linear_layer,
+    make_sharded_tensors_for_checkpoint,
+    openai_gelu,
+)
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
+
 
 class BertLMHead(MegatronModule):
     """Masked LM head for Bert. 
@@ -17,9 +23,7 @@ class BertLMHead(MegatronModule):
      """
 
     def __init__(
-        self,
-        hidden_size: int,
-        config: TransformerConfig,
+        self, hidden_size: int, config: TransformerConfig,
     ):
         super().__init__(config=config)
 
@@ -50,13 +54,15 @@ class BertLMHead(MegatronModule):
         hidden_states = self.gelu(hidden_states)
         hidden_states = self.layer_norm(hidden_states)
         return hidden_states
-    
+
     def sharded_state_dict(self, prefix=''):
         sharded_state_dict = {}
 
         dense_prefix = f'{prefix}dense.'
         state_dict = self.dense.state_dict(keep_vars=True)
-        dense_layer_sharded_state_dict = make_sharded_tensors_for_checkpoint(state_dict, dense_prefix)
+        dense_layer_sharded_state_dict = make_sharded_tensors_for_checkpoint(
+            state_dict, dense_prefix
+        )
         sharded_state_dict.update(dense_layer_sharded_state_dict)
 
         layer_norm_sharded_state_dict = self.layer_norm.sharded_state_dict(prefix=prefix)
