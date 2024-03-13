@@ -3,6 +3,7 @@
 import importlib
 import inspect
 import numbers
+from typing import Iterable, Tuple
 
 import torch
 from torch import Tensor
@@ -173,11 +174,13 @@ class FusedLayerNorm(torch.nn.Module):
 
         return output
 
-    def sharded_state_dict(self, prefix='') -> ShardedStateDict:
+    def sharded_state_dict(self, prefix='', sharded_offsets: Iterable[Tuple[int, int, int]] = ()) -> ShardedStateDict:
         """Sharded state dict used during dist checkpointing
 
         Args:
             prefix (str, optional): Prefix string to attach to the layer names. Defaults to ''.
+            sharded_offsets (Iterable[Tuple[int, int, int]], optional): sharding already
+            applied (e.g. PP related), passed along to ShardedTensor
 
         Returns:
             ShardedStateDict: The sharded state dictionary
@@ -186,7 +189,7 @@ class FusedLayerNorm(torch.nn.Module):
         state_dict = self.state_dict(keep_vars=True)
         layer_norm_prefix = f'{prefix}layer_norm.'
         layer_norm_sharded_state_dict = make_sharded_tensors_for_checkpoint(
-            state_dict, layer_norm_prefix
+            state_dict, layer_norm_prefix, sharded_offsets=sharded_offsets
         )
         sharded_state_dict.update(layer_norm_sharded_state_dict)
         return sharded_state_dict
