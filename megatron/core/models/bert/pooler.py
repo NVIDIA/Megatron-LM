@@ -1,9 +1,8 @@
-from collections import OrderedDict
-
 import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import get_linear_layer, make_sharded_tensors_for_checkpoint
@@ -52,7 +51,15 @@ class Pooler(MegatronModule):
         pooled = torch.tanh(pooled)
         return pooled
 
-    def sharded_state_dict(self, prefix=''):
+    def sharded_state_dict(self, prefix='') -> ShardedStateDict:
+        """Sharded state dict used during dist checkpointing
+
+        Args:
+            prefix (str, optional): Prefix string to attach to the layer names. Defaults to ''.
+
+        Returns:
+            ShardedStateDict: The sharded state dictionary
+        """ 
         sharded_state_dict = {}
         state_dict = self.dense.state_dict(keep_vars=True)
         dense_prefix = f'{prefix}dense.'

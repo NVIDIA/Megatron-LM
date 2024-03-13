@@ -281,8 +281,17 @@ class BertModel(LanguageModule):
 
         return loss, binary_logits
 
-    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()) -> ShardedStateDict:
-        assert not sharded_offsets, "Unexpected sharded offsets"
+    def sharded_state_dict(self, prefix: str = '') -> ShardedStateDict:
+        """Sharded state dict used during dist checkpointing
+
+        This is the utility that returns the sharded state dict thats used with distributed checkpoint
+
+        Args:
+            prefix (str, optional): The layer name prefix. Defaults to ''.
+
+        Returns:
+            ShardedStateDict: _description_
+        """
         sharded_state_dict = {}
 
         if self.pre_process:

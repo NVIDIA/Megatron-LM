@@ -9,6 +9,7 @@ from torch import Tensor
 from torch.nn import init
 from torch.nn.parameter import Parameter
 
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
@@ -172,7 +173,15 @@ class FusedLayerNorm(torch.nn.Module):
 
         return output
 
-    def sharded_state_dict(self, prefix=''):
+    def sharded_state_dict(self, prefix='') -> ShardedStateDict:
+        """Sharded state dict used during dist checkpointing
+
+        Args:
+            prefix (str, optional): Prefix string to attach to the layer names. Defaults to ''.
+
+        Returns:
+            ShardedStateDict: The sharded state dictionary
+        """ 
         sharded_state_dict = {}
         state_dict = self.state_dict(keep_vars=True)
         layer_norm_prefix = f'{prefix}layer_norm.'

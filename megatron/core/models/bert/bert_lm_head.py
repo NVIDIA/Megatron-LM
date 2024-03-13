@@ -1,7 +1,7 @@
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -55,11 +55,21 @@ class BertLMHead(MegatronModule):
         hidden_states = self.layer_norm(hidden_states)
         return hidden_states
 
-    def sharded_state_dict(self, prefix=''):
+    def sharded_state_dict(self, prefix='') -> ShardedStateDict:
+        """Sharded state dict used during dist checkpointing
+
+        Args:
+            prefix (str, optional): Prefix string to attach to the layer names. Defaults to ''.
+
+        Returns:
+            ShardedStateDict: The sharded state dictionary
+        """ 
         sharded_state_dict = {}
 
         dense_prefix = f'{prefix}dense.'
         state_dict = self.dense.state_dict(keep_vars=True)
+        # NOTE : We dont use any tensor_parallel_layers_axis_map since this is a simple torch linear layer and the weights are replicated across differnt ranks. 
+        # This will ensure that its saved from TP rank 0 and loaded on all TP ranks.
         dense_layer_sharded_state_dict = make_sharded_tensors_for_checkpoint(
             state_dict, dense_prefix
         )
