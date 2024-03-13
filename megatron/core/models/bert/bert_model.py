@@ -312,7 +312,7 @@ class BertModel(LanguageModule):
 
             if self.add_binary_head:
                 binary_head_prefix = f'{prefix}binary_head.'
-                state_dict = self.dense.state_dict(keep_vars=True)
+                state_dict = self.binary_head.state_dict(keep_vars=True)
                 binary_head_sharded_state_dict = make_sharded_tensors_for_checkpoint(
                     state_dict, binary_head_prefix
                 )
