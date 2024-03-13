@@ -176,6 +176,6 @@ class FusedLayerNorm(torch.nn.Module):
         sharded_state_dict={}
         state_dict = self.state_dict(keep_vars=True)
         layer_norm_prefix=f'{prefix}layer_norm.'
-        layer_norm_sharded_state_dict = make_sharded_tensors_for_checkpoint(state_dict, layer_norm_prefix,  {'weight': 0, 'bias': 0})
+        layer_norm_sharded_state_dict = make_sharded_tensors_for_checkpoint(state_dict, layer_norm_prefix)
         sharded_state_dict.update(layer_norm_sharded_state_dict) 
         return sharded_state_dict

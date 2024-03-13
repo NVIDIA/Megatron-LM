@@ -308,11 +308,8 @@ class BertModel(LanguageModule):
 
             if self.add_binary_head:
                 binary_head_prefix = f'{prefix}binary_head.'
-                state_dict = OrderedDict()
-                for name, value in self.binary_head.named_parameters():
-                    state_dict[name] = value
-                #TODO need to check fi this dictionary of weight and bias is required
-                binary_head_sharded_state_dict = make_sharded_tensors_for_checkpoint(state_dict, binary_head_prefix, {'weight': 0, 'bias': 0})
+                state_dict = self.dense.state_dict(keep_vars=True)
+                binary_head_sharded_state_dict = make_sharded_tensors_for_checkpoint(state_dict, binary_head_prefix)
                 sharded_state_dict.update(binary_head_sharded_state_dict)     
 
                 pooler_prefix =  f'{prefix}pooler.'  

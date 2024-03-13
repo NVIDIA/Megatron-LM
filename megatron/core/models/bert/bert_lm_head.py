@@ -56,7 +56,7 @@ class BertLMHead(MegatronModule):
 
         dense_prefix = f'{prefix}dense.'
         state_dict = self.dense.state_dict(keep_vars=True)
-        dense_layer_sharded_state_dict = make_sharded_tensors_for_checkpoint(state_dict, dense_prefix,  {'weight': 0, 'bias': 0})
+        dense_layer_sharded_state_dict = make_sharded_tensors_for_checkpoint(state_dict, dense_prefix)
         sharded_state_dict.update(dense_layer_sharded_state_dict)
 
         layer_norm_sharded_state_dict = self.layer_norm.sharded_state_dict(prefix=prefix)
