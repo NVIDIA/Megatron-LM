@@ -48,7 +48,7 @@ def initialize_distributed(tensor_model_parallel_size = 1, pipeline_model_parall
 <br>
 
 **STEP 2 - GPT Model Setup**
-The following step shows you how you can quickly create a GPT model. For a list of other configs that you can pass into the model look into [transformer_config.py](https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/blob/main/megatron/core/transformer/transformer_config.py)
+The following step shows you how you can quickly create a GPT model. For a list of other configs that you can pass into the model look into [transformer_config.py](megatron/core/transformer/transformer_config.py)
 ```
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -75,7 +75,7 @@ def model_provider():
 <br>
 
 **STEP 3 - GPT Mock dataset setup**
-The following shows you how you can quickly get started with a mock dataset utility we created. In order to train with your data, please use the actual GPTDataset class in [gpt_dataset.py](https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/blob/main/megatron/core/datasets/gpt_dataset.py)
+The following shows you how you can quickly get started with a mock dataset utility we created. In order to train with your data, please use the actual GPTDataset class in [gpt_dataset.py](megatron/core/datasets/gpt_dataset.py)
 ```
 from torch.utils.data import DataLoader
 from megatron.core.datasets.utils import Split
@@ -103,7 +103,7 @@ def get_train_data_iterator():
 <br>
 
 **STEP 4 - Forward Step Function**
-In megatron core, we use [schedules.py](https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/blob/main/megatron/core/pipeline_parallel/schedules.py) to run the model. So it is sufficient to define a forward step function which takes as input the data iterator and the model and produces as output the output tensor and a loss function 
+In megatron core, we use [schedules.py](megatron/core/pipeline_parallel/schedules.py) to run the model. So it is sufficient to define a forward step function which takes as input the data iterator and the model and produces as output the output tensor and a loss function 
 
 ```
 from functools import partial
@@ -205,7 +205,7 @@ if __name__ == "__main__":
 <br>
 
 **STEP 7 - Running the full example**
-All the above steps are put to gether in a [run_simple_mcore_train_loop.py](https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/blob/main/examples/run_simple_mcore_train_loop.py) script in examples folder in megatron . You can run it as follows
+All the above steps are put to gether in a [run_simple_mcore_train_loop.py](examples/run_simple_mcore_train_loop.py) script in examples folder in megatron . You can run it as follows
 
 ```
 git clone https://github.com/NVIDIA/Megatron-LM.git
@@ -216,4 +216,4 @@ torchrun --nproc-per-node $NUM_GPUS run_simple_mcore_train_loop.py
 <br>
 
 ### Extending Further
-The above example introduced you to a basic training loop in MCore. To see more advanced examples please look at [https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/blob/main/pretrain_gpt.py]. That will show you how you can write more complex training loops, involving pipeline parallel, context parallel, rope embeddings, mixture of experts and all other functionalities present in mcore. 
+The above example introduced you to a basic training loop in MCore. To see more advanced examples please look at [pretrain_gpt.py]. That will show you how you can write more complex training loops, involving pipeline parallel, context parallel, rope embeddings, mixture of experts and all other functionalities present in mcore. 
