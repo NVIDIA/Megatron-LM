@@ -1,3 +1,4 @@
+from collections import OrderedDict
 import torch
 from torch import Tensor
 
@@ -52,7 +53,7 @@ class Pooler(MegatronModule):
     
     def sharded_state_dict(self, prefix=''):
         sharded_state_dict={}
-        state_dict = self.dense.state_dict()
+        state_dict = self.dense.state_dict(keep_vars=True)
         dense_prefix=f'{prefix}dense.'
         pooler_sharded_state_dict = make_sharded_tensors_for_checkpoint(state_dict, dense_prefix, {'weight': 0, 'bias': 0})
         sharded_state_dict.update(pooler_sharded_state_dict)    

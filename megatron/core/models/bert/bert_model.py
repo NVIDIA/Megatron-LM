@@ -1,11 +1,12 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+from collections import OrderedDict
 import os
 from typing import Literal, Optional
 
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.models.bert.bert_lm_head import BertLMHead
 from megatron.core.models.bert.pooler import Pooler
@@ -114,13 +115,22 @@ class BertModel(LanguageModule):
             self.lm_head = BertLMHead(
                 config.hidden_size,
                 config,
-                parallel_output,
-                self.vocab_size,
-                self.pre_process,
-                self.share_embeddings_and_output_weights,
             )
 
-            self.output_layer = self.lm_head.output_layer
+            self.output_layer = tensor_parallel.ColumnParallelLinear(
+                config.hidden_size,
+                self.vocab_size,
+                config=config,
+                init_method=config.init_method,
+                bias=True, # Check this ? Not sure if we can have bias with share_embeddings_and_output_weights 
+                skip_bias_add=False,
+                gather_output=not self.parallel_output,
+                skip_weight_param_allocation=pre_process and share_embeddings_and_output_weights,
+            )
+
+            output_layer_state_dict = self.output_layer.state_dict(
+                prefix='', keep_vars=True
+                )
 
             self.binary_head = None
             if self.add_binary_head:
@@ -260,7 +270,8 @@ class BertModel(LanguageModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
-        logits = self.lm_head(hidden_states=hidden_states, word_embeddings_weight=output_weight)
+        hidden_states_after_lm_head = self.lm_head(hidden_states=hidden_states)
+        logits, _ = self.output_layer(hidden_states_after_lm_head, weight=output_weight)
 
         binary_logits = None
         if self.binary_head is not None:
@@ -297,7 +308,9 @@ class BertModel(LanguageModule):
 
             if self.add_binary_head:
                 binary_head_prefix = f'{prefix}binary_head.'
-                state_dict = self.binary_head.state_dict()
+                state_dict = OrderedDict()
+                for name, value in self.binary_head.named_parameters():
+                    state_dict[name] = value
                 #TODO need to check fi this dictionary of weight and bias is required
                 binary_head_sharded_state_dict = make_sharded_tensors_for_checkpoint(state_dict, binary_head_prefix, {'weight': 0, 'bias': 0})
                 sharded_state_dict.update(binary_head_sharded_state_dict)     
@@ -305,9 +318,20 @@ class BertModel(LanguageModule):
                 pooler_prefix =  f'{prefix}pooler.'  
                 pooler_sharded_state_dict = self.pooler.sharded_state_dict(prefix=pooler_prefix)
                 sharded_state_dict.update(pooler_sharded_state_dict) 
- 
+        
+            output_layer_prefix = f'{prefix}output_layer.'
+            output_layer_bias_key = f'{output_layer_prefix}bias'
+            output_layer_bias_tensor = self.output_layer.state_dict(prefix=output_layer_prefix, keep_vars=True)[output_layer_bias_key]
+                # independent output layer
+            sharded_output_layer_bias_tensor = make_tp_sharded_tensor_for_checkpoint(
+                    tensor=output_layer_bias_tensor, key=output_layer_bias_key, allow_shape_mismatch=True,
+            )
+            sharded_state_dict[output_layer_bias_key] = sharded_output_layer_bias_tensor
+
+            # Depending on share_embeddings_and_output_weights , the weights tensor is obtained either from the weight matrix of word embeddings or the output layer state dict. 
+            output_layer_weight_key = f'{output_layer_prefix}weight'
             if self.share_embeddings_and_output_weights:
-                if not self.pre_process:
+                if not self.pre_process: 
                     # when sharing embeddings with last stage, we need to use the weights from the first stage
                     # on pipeline first rank, word embeddings are saved to {prefix}embedding.word_embeddings.weight
                     tensor = self.shared_embedding_or_output_weight()
@@ -318,14 +342,23 @@ class BertModel(LanguageModule):
                         parallel_state.get_data_parallel_rank(with_context_parallel=True),
                     )
 
-                    sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
+                    sharded_output_layer_weight_tensor = make_tp_sharded_tensor_for_checkpoint(
                         tensor=tensor,
                         key=first_stage_word_emb_key,
                         replica_id=last_stage_word_emb_replica_id,
                         allow_shape_mismatch=True,
                     )
-                    # TODO :I think bias also needs to be added. However the shared_embedding_or_output_weight returns onlyt the weights.
-                    output_layer_key = f'{prefix}binary_head.output.weight'
-                    sharded_state_dict[output_layer_key] = sharded_output_layer_tensor
+                    sharded_state_dict[output_layer_weight_key] = sharded_output_layer_weight_tensor
+            else:
+                # TODO : Why do we not use the ColumnParallelLinear.sharded_state_dict() ? and rather just use the statedict? and do a tp sharded tensor
+                output_layer_state_dict = self.output_layer.state_dict(
+                    prefix=output_layer_prefix, keep_vars=True
+                )
+                output_layer_weight_tensor = output_layer_state_dict[output_layer_weight_key]
+                # independent output layer
+                sharded_output_layer_weight_tensor = make_tp_sharded_tensor_for_checkpoint(
+                    tensor=output_layer_weight_tensor, key=output_layer_weight_key, allow_shape_mismatch=True,
+                )
 
+                sharded_state_dict[output_layer_weight_key] = sharded_output_layer_weight_tensor
         return sharded_state_dict
