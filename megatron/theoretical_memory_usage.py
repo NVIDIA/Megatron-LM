@@ -10,18 +10,22 @@ NUM_BYTES_IN_MEGABYTE = 1024 * 1024
 
 
 def compute_weight_and_optimizer_memory(args, verbose=False):
+    # Group Query Attention.
     if not args.group_query_attention:
         args.num_query_groups = args.num_attention_heads
+    # MoE.
+    num_experts = 1 if args.num_experts is None else args.num_experts
     num_parameters_in_transformer_layers = (
-        10
+        2
         * args.num_layers
         * args.hidden_size
         * args.hidden_size
         * (
-            ((1 + (args.ffn_hidden_size / args.hidden_size)) / 5.0)
-            + (args.num_query_groups / (5.0 * args.num_attention_heads))
-            + (2 / (5 * args.hidden_size))
-            + (1 / (5 * args.num_layers * args.hidden_size))
+            1
+            + ((args.ffn_hidden_size / args.hidden_size) * num_experts)
+            + (args.num_query_groups / args.num_attention_heads)
+            + (2 / args.hidden_size)
+            + (1 / (args.num_layers * args.hidden_size))
         )
     )
     embedding_size = args.hidden_size * args.padded_vocab_size
