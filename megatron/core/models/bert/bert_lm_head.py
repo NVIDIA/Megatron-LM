@@ -63,12 +63,12 @@ class BertLMHead(MegatronModule):
 
         Returns:
             ShardedStateDict: The sharded state dictionary
-        """ 
+        """
         sharded_state_dict = {}
 
         dense_prefix = f'{prefix}dense.'
         state_dict = self.dense.state_dict(keep_vars=True)
-        # NOTE : We dont use any tensor_parallel_layers_axis_map since this is a simple torch linear layer and the weights are replicated across differnt ranks. 
+        # NOTE : We dont use any tensor_parallel_layers_axis_map since this is a simple torch linear layer and the weights are replicated across differnt ranks.
         # This will ensure that its saved from TP rank 0 and loaded on all TP ranks.
         dense_layer_sharded_state_dict = make_sharded_tensors_for_checkpoint(
             state_dict, dense_prefix

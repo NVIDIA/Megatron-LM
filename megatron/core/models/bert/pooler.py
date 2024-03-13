@@ -59,7 +59,7 @@ class Pooler(MegatronModule):
 
         Returns:
             ShardedStateDict: The sharded state dictionary
-        """ 
+        """
         sharded_state_dict = {}
         state_dict = self.dense.state_dict(keep_vars=True)
         dense_prefix = f'{prefix}dense.'

@@ -181,7 +181,7 @@ class FusedLayerNorm(torch.nn.Module):
 
         Returns:
             ShardedStateDict: The sharded state dictionary
-        """ 
+        """
         sharded_state_dict = {}
         state_dict = self.state_dict(keep_vars=True)
         layer_norm_prefix = f'{prefix}layer_norm.'
