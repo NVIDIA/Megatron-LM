@@ -7,6 +7,7 @@ from typing import Dict, Tuple
 from .dict_utils import dict_list_map_inplace, extract_matching_values
 from .mapping import (
     LocalNonpersitentObject,
+    ShardedBase,
     ShardedObject,
     ShardedStateDict,
     ShardedTensor,
@@ -66,6 +67,20 @@ def extract_sharded_tensors_or_nonpersistent(
     return extract_matching_values(
         sharded_state_dict,
         lambda v: isinstance(v, (ShardedTensor, LocalNonpersitentObject, ShardedTensorFactory)),
+    )
+
+
+def extract_sharded_base(
+    sharded_state_dict: ShardedStateDict,
+) -> Tuple[ShardedStateDict, StateDict]:
+    return extract_matching_values(sharded_state_dict, lambda v: isinstance(v, ShardedBase),)
+
+
+def extract_nonpersistent(
+    sharded_state_dict: ShardedStateDict,
+) -> Tuple[ShardedStateDict, StateDict]:
+    return extract_matching_values(
+        sharded_state_dict, lambda v: isinstance(v, LocalNonpersitentObject),
     )
 
 
