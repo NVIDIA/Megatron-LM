@@ -76,6 +76,9 @@ def model_provider():
 
 **STEP 3 - GPT Mock dataset setup**
 The following shows you how you can quickly get started with a mock dataset utility we created. In order to train with your data, please use the actual GPTDataset class in [gpt_dataset.py](megatron/core/datasets/gpt_dataset.py)
+
+To find more information about megatron core data pipeline please refer to [this](megatron/core/datasets/readme.md?ref_type=heads)
+
 ```
 from torch.utils.data import DataLoader
 from megatron.core.datasets.utils import Split
