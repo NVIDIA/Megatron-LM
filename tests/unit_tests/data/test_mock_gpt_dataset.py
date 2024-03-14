@@ -10,7 +10,7 @@ from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
 
 def sample_N(dataset, N, randomize):
     if randomize:
-        indices = [random.randint(0, sys.maxsize) for _ in range(N)]
+        indices = [random.randint(0, len(dataset)-1) for _ in range(N)]
     else:
         indices = list(range(N))
     samples = [dataset[index]["tokens"].numpy() for index in indices]
@@ -29,7 +29,7 @@ def test_builder_mock_data():
         tokenizer=SimpleNamespace(),
     )
 
-    datasets = BlendedMegatronDatasetBuilder(MockGPTDataset, [None, None, None], config).build()
+    datasets = BlendedMegatronDatasetBuilder(MockGPTDataset, [100, 100, 100], config).build()
 
     N = 10
 

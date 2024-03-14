@@ -74,7 +74,12 @@ class MockGPTDataset(MockDataset):
         pad = 2
         eod = 0
 
-        rng = numpy.random.default_rng(seed=[self.split.value, idx])
+        assert (
+            idx < self.num_samples,
+            "Exceeded the available number of samples ({self.num_samples})",
+        )
+
+        rng = numpy.random.default_rng(seed=[self.index_split.value, idx])
         length = rng.integers(low=0, high=self.config.sequence_length)
         sample_toks = numpy.zeros(length) + tok
         sample_pads = numpy.zeros(self.config.sequence_length - length - 1) + pad

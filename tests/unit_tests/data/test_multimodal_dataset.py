@@ -23,7 +23,7 @@ def test_mock_multimodal_dataset():
     )
 
     datasets = BlendedMegatronDatasetBuilder(
-        MockMultimodalDataset, [None, None, None], config
+        MockMultimodalDataset, [100, 100, 100], config
     ).build()
 
     for ds in datasets:
