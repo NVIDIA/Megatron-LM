@@ -55,6 +55,7 @@ class TransformerConfig(ModelParallelConfig):
             fp8_amax_compute_algo (str): Algorithm used for choosing the `amax` value for the scaling factor computation. There are 2 predefined choices: `max` chooses the largest `amax` in the history window, while `most_recent` always chooses the most recently seen value.
             fp8_wgrad (bool): When set to False, override FP8 config options and do the wgrad computation in higher precision. Defaults to True.
             clone_scatter_output_in_embedding (bool): When set to true, clone the output of scatter_to_sequence_parallel_region in embedding layer to facilitate garbage collection of input.
+            disable_parameter_transpose_cache (bool): When set to true, the parameter transposes are not cached for subsequent iterations. Defaults to False.
             normalization (str): Swtich b/w `LayerNorm` and `RMSNorm` as normalization layers. For now, these are primarily used by Transformer-Engine's layers like `LayerNormLinear`. Default value is `LayerNorm`.
             window_size ((int,int) or None): If not None, then will use sliding window attention. The size of the window is specified by the numbers inside the tuple; -1 is special value meaning "infinite window size".
             moe_router_load_balancing_type (str): Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".
@@ -125,6 +126,7 @@ class TransformerConfig(ModelParallelConfig):
 
     # miscellaneous
     clone_scatter_output_in_embedding: bool = True
+    disable_parameter_transpose_cache: bool = False
 
     # experimental section (TODO: move to apt. section above once stable)
     normalization: bool = "LayerNorm"  # alt value supported by TE: "RMSNorm"
