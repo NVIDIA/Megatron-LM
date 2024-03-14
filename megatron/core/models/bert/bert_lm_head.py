@@ -75,7 +75,8 @@ class BertLMHead(MegatronModule):
         )
         sharded_state_dict.update(dense_layer_sharded_state_dict)
 
-        layer_norm_sharded_state_dict = self.layer_norm.sharded_state_dict(prefix=prefix)
+        layer_norm_prefix = f'{prefix}layer_norm.'
+        layer_norm_sharded_state_dict = self.layer_norm.sharded_state_dict(prefix=layer_norm_prefix)
         sharded_state_dict.update(layer_norm_sharded_state_dict)
 
         return sharded_state_dict
