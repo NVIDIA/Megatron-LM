@@ -17,7 +17,7 @@ from megatron.core.transformer.enums import AttnMaskType, ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import get_linear_layer, make_sharded_tensors_for_checkpoint
+from megatron.core.transformer.utils import get_linear_layer
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
 

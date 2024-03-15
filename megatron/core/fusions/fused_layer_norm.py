@@ -3,17 +3,14 @@
 import importlib
 import inspect
 import numbers
-from typing import Iterable, Tuple
 
 import torch
 from torch import Tensor
 from torch.nn import init
 from torch.nn.parameter import Parameter
 
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
-from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
+from megatron.core.utils import make_viewless_tensor
 
 try:
     from apex.contrib.layer_norm.layer_norm import FastLayerNormFN
@@ -29,7 +26,7 @@ try:
 except:
     HAVE_FUSED_LAYER_NORM = False
 
-# TODO : Shouldnt we add sharded state dict method here so that other models will use it
+
 class FusedLayerNorm(torch.nn.Module):
 
     """Layer Norm, fused into a single CUDA kernel.
