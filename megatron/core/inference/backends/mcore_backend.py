@@ -2,6 +2,7 @@ from typing import List
 from megatron.core.inference.backends.abstract_backend import AbstractBackend
 from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.communication_utils import synchronize_params_across_all_ranks
+from megatron.core.inference.inference_model_wrappers.abstract_model_inference_wrapper import AbstractModelInferenceWrapper
 from megatron.core.inference.text_generation_strategies.abstract_text_generation_strategy import AbstractTextGenerationStrategy
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.inference.text_generation_strategies.simple_text_generation_strategy import SimpleTextGenerationStrategy
@@ -9,7 +10,7 @@ import torch
 from megatron.core import parallel_state
 
 class MCoreBackend(AbstractBackend):
-    def __init__(self, model: callable, tokenizer = None, text_generation_strategy:AbstractTextGenerationStrategy = None, random_seed:int = None):
+    def __init__(self, model: AbstractModelInferenceWrapper, tokenizer = None, text_generation_strategy:AbstractTextGenerationStrategy = None, random_seed:int = None):
         """The Megatron core backend constructor
 
         This is the backend that does a simple forward pass on the model. Supports any model that is callable (Accepts the inputs and outputs the tensor)

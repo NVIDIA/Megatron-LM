@@ -2,6 +2,7 @@ from typing import List, Tuple
 from megatron.core.datasets.gpt_dataset import _get_ltor_masks_and_position_ids
 from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.communication_utils import copy_from_last_to_first_pipeline_stage, synchronize_list_across_all_ranks, synchronize_tensor_across_all_ranks
+from megatron.core.inference.inference_model_wrappers.abstract_model_inference_wrapper import AbstractModelInferenceWrapper
 from megatron.core.inference.text_generation_strategies.abstract_text_generation_strategy import AbstractTextGenerationStrategy
 import torch
 import torch.nn.functional as F
@@ -11,13 +12,13 @@ from megatron.global_vars import get_num_microbatches
 from megatron.core import parallel_state
 
 class SimpleTextGenerationStrategy(AbstractTextGenerationStrategy):
-    def __init__(self, model:callable, tokenizer):
+    def __init__(self, model:AbstractModelInferenceWrapper, tokenizer):
         """The basic text generation strategy
 
         This class is responsible for tokenizing the input , running the inference and also detokenizing the output
 
         Args:
-            model (callable): A callable instance (Can be a megatron model or a wrapped model with __call__ implemented)
+            model (AbstractModelInferenceWrapper): A model that is wrapped using the specs given in the abstract_model_inference_wrapper.py
             tokenizer (_type_): Tokenizer used for tokenizing and detokenizing the prompts
         """
         self.model = model
@@ -71,23 +72,6 @@ class SimpleTextGenerationStrategy(AbstractTextGenerationStrategy):
     
         return prompts_tokens_tensor , prompts_length_tensor
     
-
-    def build_attention_mask_and_position_ids(self, prompts_tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Builds the full attention mask and position ids for the input tokens
-
-        Args:
-            tokens (torch.Tensor): A tensor of shape [batch_size, max_seq_len]
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: The attention mask of shape [1, 1, max_seq_len, max_seq_len] and position ids of shape [batch_size, max_seq_len]
-        """
-        seq_length = prompts_tokens.size(1)
-        attention_mask = torch.tril(torch.ones(
-        (1, seq_length, seq_length), device=prompts_tokens.device)).view(
-            1, 1, seq_length, seq_length)  
-        position_ids = torch.arange(seq_length, dtype=torch.long,
-                                    device=prompts_tokens.device).unsqueeze(0).expand_as(prompts_tokens)    
-        return attention_mask, position_ids  
 
     def sanity_check_inference_params(self, common_inference_params:CommonInferenceParams):
         """Sanity checking the common inference parameters 
@@ -205,20 +189,16 @@ class SimpleTextGenerationStrategy(AbstractTextGenerationStrategy):
                                            device=torch.cuda.current_device())
         
         with torch.no_grad():
-            attention_mask, position_ids = self.build_attention_mask_and_position_ids(prompts_tokens)
+            self.model.prep_model_for_inference()
 
             context_start_position = 0           
-            # Pick the slice that we need to pass through the network.
+            # Pick the context window that we need to pass through the network.
             for context_end_position in range(min_prompt_length, max_sequence_length):
 
-                tokens2use = prompts_tokens[:, context_start_position:context_end_position]
-                positions2use = position_ids[:, context_start_position:context_end_position]
-                attention_mask2use = attention_mask[..., context_start_position:context_end_position, :context_end_position]
+                inference_input = self.model.get_batch_for_context_window(context_start_position, context_end_position)
 
                 # Returns the logits of shape [batch_size, context_length, vocab_size]
-                # NOTE: Can pass in a simple model or a model wrapper here. 
-                # TODO : Maybe just pass in a data iterator, and then in the __call__ get the inputs rather than passing them individually to make it more generalizable. 
-                logits = self.model(tokens2use, positions2use, attention_mask2use, max_sequence_length)
+                logits = self.model(inference_input)
                 
                 if model_is_not_pipeline_parallel or parallel_state.is_pipeline_last_stage():
                     last_token_logits  = logits[:, -1 , :]
