@@ -50,19 +50,3 @@ class Pooler(MegatronModule):
         pooled = self.dense(pooled)
         pooled = torch.tanh(pooled)
         return pooled
-
-    def sharded_state_dict(self, prefix='') -> ShardedStateDict:
-        """Sharded state dict used during dist checkpointing
-
-        Args:
-            prefix (str, optional): Prefix string to attach to the layer names. Defaults to ''.
-
-        Returns:
-            ShardedStateDict: The sharded state dictionary
-        """
-        sharded_state_dict = {}
-        state_dict = self.dense.state_dict(keep_vars=True)
-        dense_prefix = f'{prefix}dense.'
-        pooler_sharded_state_dict = make_sharded_tensors_for_checkpoint(state_dict, dense_prefix)
-        sharded_state_dict.update(pooler_sharded_state_dict)
-        return sharded_state_dict

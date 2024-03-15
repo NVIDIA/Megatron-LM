@@ -126,8 +126,6 @@ class BertModel(LanguageModule):
                 skip_weight_param_allocation=pre_process and share_embeddings_and_output_weights,
             )
 
-            output_layer_state_dict = self.output_layer.state_dict(prefix='', keep_vars=True)
-
             self.binary_head = None
             if self.add_binary_head:
                 # TODO: Shoudl switch this to TE ?
@@ -281,93 +279,41 @@ class BertModel(LanguageModule):
 
         return loss, binary_logits
 
-    def sharded_state_dict(self, prefix: str = '') -> ShardedStateDict:
+    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()) -> ShardedStateDict:
         """Sharded state dict used during dist checkpointing
 
         This is the utility that returns the sharded state dict thats used with distributed checkpoint
 
         Args:
             prefix (str, optional): The layer name prefix. Defaults to ''.
-
+            sharded_offsets(tuple, optional): Sharding already applied (e.g. PP related) by sup-modules. Passed along to ShardedTensor . defaults to ()
         Returns:
             ShardedStateDict: _description_
         """
-        sharded_state_dict = {}
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets)
 
-        if self.pre_process:
-            embedding_prefix = f'{prefix}embedding.'
-            embedding_sharded_state_dict = self.embedding.sharded_state_dict(
-                prefix=embedding_prefix
-            )
-            sharded_state_dict.update(embedding_sharded_state_dict)
-
-        encoder_prefix = f'{prefix}encoder.'
-        encoder_sharded_state_dict = self.encoder.sharded_state_dict(prefix=encoder_prefix)
-        sharded_state_dict.update(encoder_sharded_state_dict)
-
-        if self.post_process:
-            lm_head_prefix = f'{prefix}lm_head.'
-            lm_head_sharded_state_dict = self.lm_head.sharded_state_dict(prefix=lm_head_prefix)
-            sharded_state_dict.update(lm_head_sharded_state_dict)
-
-            if self.add_binary_head:
-                binary_head_prefix = f'{prefix}binary_head.'
-                state_dict = self.binary_head.state_dict(keep_vars=True)
-                binary_head_sharded_state_dict = make_sharded_tensors_for_checkpoint(
-                    state_dict, binary_head_prefix
+        output_layer_prefix = f'{prefix}output_layer.'
+        # Depending on share_embeddings_and_output_weights , the weights tensor is obtained either from the weight matrix of word embeddings or the output layer state dict.
+        output_layer_weight_key = f'{output_layer_prefix}weight'
+        if self.share_embeddings_and_output_weights:
+            if not self.pre_process:
+                # when sharing embeddings with last stage, we need to use the weights from the first stage
+                # on pipeline first rank, word embeddings are saved to {prefix}embedding.word_embeddings.weight
+                del sharded_state_dict[output_layer_weight_key]
+                tensor = self.shared_embedding_or_output_weight()
+                first_stage_word_emb_key = f'{prefix}embedding.word_embeddings.weight'
+                last_stage_word_emb_replica_id = (
+                    1,  # copy of first stage embedding
+                    0,
+                    parallel_state.get_data_parallel_rank(with_context_parallel=True),
                 )
-                sharded_state_dict.update(binary_head_sharded_state_dict)
 
-                pooler_prefix = f'{prefix}pooler.'
-                pooler_sharded_state_dict = self.pooler.sharded_state_dict(prefix=pooler_prefix)
-                sharded_state_dict.update(pooler_sharded_state_dict)
-
-            output_layer_prefix = f'{prefix}output_layer.'
-            output_layer_bias_key = f'{output_layer_prefix}bias'
-            output_layer_bias_tensor = self.output_layer.state_dict(
-                prefix=output_layer_prefix, keep_vars=True
-            )[output_layer_bias_key]
-            # independent output layer
-            sharded_output_layer_bias_tensor = make_tp_sharded_tensor_for_checkpoint(
-                tensor=output_layer_bias_tensor,
-                key=output_layer_bias_key,
-                allow_shape_mismatch=True,
-            )
-            sharded_state_dict[output_layer_bias_key] = sharded_output_layer_bias_tensor
-
-            # Depending on share_embeddings_and_output_weights , the weights tensor is obtained either from the weight matrix of word embeddings or the output layer state dict.
-            output_layer_weight_key = f'{output_layer_prefix}weight'
-            if self.share_embeddings_and_output_weights:
-                if not self.pre_process:
-                    # when sharing embeddings with last stage, we need to use the weights from the first stage
-                    # on pipeline first rank, word embeddings are saved to {prefix}embedding.word_embeddings.weight
-                    tensor = self.shared_embedding_or_output_weight()
-                    first_stage_word_emb_key = f'{prefix}embedding.word_embeddings.weight'
-                    last_stage_word_emb_replica_id = (
-                        1,  # copy of first stage embedding
-                        0,
-                        parallel_state.get_data_parallel_rank(with_context_parallel=True),
-                    )
-
-                    sharded_output_layer_weight_tensor = make_tp_sharded_tensor_for_checkpoint(
-                        tensor=tensor,
-                        key=first_stage_word_emb_key,
-                        replica_id=last_stage_word_emb_replica_id,
-                        allow_shape_mismatch=True,
-                    )
-                    sharded_state_dict[output_layer_weight_key] = sharded_output_layer_weight_tensor
-            else:
-                # TODO : Why do we not use the ColumnParallelLinear.sharded_state_dict() ? and rather just use the statedict? and do a tp sharded tensor
-                output_layer_state_dict = self.output_layer.state_dict(
-                    prefix=output_layer_prefix, keep_vars=True
-                )
-                output_layer_weight_tensor = output_layer_state_dict[output_layer_weight_key]
-                # independent output layer
                 sharded_output_layer_weight_tensor = make_tp_sharded_tensor_for_checkpoint(
-                    tensor=output_layer_weight_tensor,
-                    key=output_layer_weight_key,
+                    tensor=tensor,
+                    key=first_stage_word_emb_key,
+                    replica_id=last_stage_word_emb_replica_id,
                     allow_shape_mismatch=True,
                 )
-
                 sharded_state_dict[output_layer_weight_key] = sharded_output_layer_weight_tensor
+
         return sharded_state_dict
