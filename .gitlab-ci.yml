@@ -30,7 +30,7 @@ include:
 unit_tests:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
   tags:
-    - docker_local_runner
+    - 8xL40S
   stage: test
   script:
     - torchrun --nproc_per_node=8 -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/unit_tests
@@ -67,26 +67,3 @@ formatting:
     - isort megatron/core --check
   rules:
     - when: always
-
-.selene_test_launcher: &selene-test-launcher
-  tags:
-    - ssh_selene_runner
-  stage: test
-  script: &selene-test-launcher-script
-    - echo "Running selene test"
-    - pwd
-    - run_cmd="bash tests/functional_tests/shell_test_utils/run_selene_test_launcher_script.sh RUN_MODEL=$RUN_MODEL TP_SIZE=$TP_SIZE PP_SIZE=$PP_SIZE VP_SIZE=$VP_SIZE NUM_NODES=$NUM_NODES SELENE_ADLR_CI_PATH=$SELENE_ADLR_CI_PATH CI_PIPELINE_ID=$CI_PIPELINE_ID RUN_NAME=$RUN_NAME MAX_STEPS=$MAX_STEPS PYTORCH_IMAGE=$PYTORCH_IMAGE DATA_DIR=$DATA_DIR USE_CORE=$USE_CORE USE_TE=$USE_TE MOE_GROUPED_GEMM=$MOE_GROUPED_GEMM TIME_LIMIT=$TIME_LIMIT"
-    - echo "$run_cmd"
-    - ${run_cmd}
-    - echo "Completed the job"
-  rules:
-    - if: $TEST_LEVEL =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TEST_REGEX_ON_THIS_COMMIT
-      when: always
-    - if: '$CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGING'
-      when: always
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
-      when: always
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ "READY FOR REVIEW" && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
-      when: always
-  allow_failure: false
-  retry: 2

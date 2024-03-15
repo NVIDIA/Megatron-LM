@@ -78,7 +78,7 @@ To train a top-2 MoE model with an auxiliary loss, include the following argumen
 <details>
 <summary>Click here. </summary>
     
-```python
+```bash
 #!/bin/bash
 
 # Runs Mixtral 8x7B model on 16 A100 GPUs
