@@ -309,7 +309,7 @@ def initialize_model_parallel(
             device_ids=[torch.cuda.current_device()],
         )
         # Set `NCCL_SHARP_DISABLE=1` to restrict SHARP application to DP process groups
-        os.environ["NCCL_SHARP_DISABLE"] = "1"
+        os.environ["NCCL_COLLNET_ENABLE"] = "0"
 
     # Build the context-parallel groups.
     global _CONTEXT_PARALLEL_GROUP
@@ -536,6 +536,11 @@ def get_pipeline_model_parallel_group():
 
 def get_data_parallel_group(with_context_parallel=False):
     """Get the data parallel group the caller rank belongs to."""
+    if with_context_parallel:
+        with_context_parallel = (
+            torch.distributed.get_world_size(_DATA_PARALLEL_GROUP_WITH_CP)
+            != torch.distributed.get_world_size(_DATA_PARALLEL_GROUP)
+        )
     if with_context_parallel:
         assert (
             _DATA_PARALLEL_GROUP_WITH_CP is not None
