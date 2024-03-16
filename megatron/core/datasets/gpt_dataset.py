@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Configuration object for Megatron Core GPT datasets
 
-    Attributes:          
+    Args:          
         reset_position_ids (bool): Option to reset the position IDs in the dataset at an interval
 
         reset_attention_mask (bool): Option to reset the attention mask from the dataset
@@ -110,8 +110,7 @@ class GPTDataset(MegatronDataset):
     """The base GPT dataset
 
     Args:
-        indexed_dataset (IndexedDataset): The IndexedDataset around which to build the
-        MegatronDataset
+        indexed_dataset (IndexedDataset): The IndexedDataset around which to build the MegatronDataset
 
         dataset_path (str): The real path on disk to the dataset, for bookkeeping
 
@@ -293,10 +292,7 @@ class GPTDataset(MegatronDataset):
             -- A random permutation of index range of the sample index
 
         Returns:
-            Tuple[numpy.ndarray, numpy.ndarray]: The document index, the sample index, and the
-            shuffle index
-
-        TODO: Explain the 80% threshold
+            Tuple[numpy.ndarray, numpy.ndarray]: The document index, the sample index, and the shuffle index
         """
         path_to_cache = self.config.path_to_cache
         if path_to_cache is None:
@@ -526,8 +522,6 @@ def _build_document_index(
 
     Returns:
         numpy.ndarray: The document index
-
-    TODO: Explain separate_final_epoch
     """
     if not separate_final_epoch or num_epochs == 1:
         document_index = numpy.mgrid[0:num_epochs, 0 : len(documents)][1]
@@ -546,20 +540,16 @@ def _build_shuffle_index(
     num_samples: int, total_size: int, numpy_random_state: numpy.random.RandomState
 ) -> numpy.ndarray:
     """Build the range [0, size) and shuffle
-
+    
     Args:
         num_samples (int): The size of the first shuffle range [0, num_samples)
 
-        total_size (int): The size of the entire index. If larger than 'num_samples', it defines
-
-        the second shuffle range [num_samples, total_size)
+        total_size (int): The size of the entire index. If larger than 'num_samples', it defines the second shuffle range [num_samples, total_size)
 
         numpy_random_state (numpy.random.RandomState): The NumPy random state
 
     Returns:
         numpy.ndarray: The shuffle index
-
-    TODO: Explain [0, num_samples) [num_samples, total_size) split
     """
     dtype_ = numpy.uint32
     if total_size >= (numpy.iinfo(numpy.uint32).max - 1):
@@ -597,11 +587,11 @@ def _get_ltor_masks_and_position_ids(
         eod_mask_loss (bool): Switch to enable the EOD mask loss
 
     Returns:
-        torch.Tensor : Attention mask needed to be used for Attention
+        torch.Tensor: Attention mask needed to be used for Attention
 
-        torch.Tensor : The mask used for loss value during training
+        torch.Tensor: The mask used for loss value during training
 
-        torch.Tensor : The position ID's of the token
+        torch.Tensor: The position ID's of the token
     """
     seq_length = data.numel()
 

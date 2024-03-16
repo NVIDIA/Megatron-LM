@@ -22,23 +22,20 @@ logger = logging.getLogger(__name__)
 class MaskedWordPieceDatasetConfig(BlendedMegatronDatasetConfig):
     """Configuration object for Megatron Core Masked WordPiece datasets
 
-    Attributes:
+    Args:
         masking_probability (float): The probability we mask a candidate N-gram
 
-        short_sequence_probability (float): The probability we return a sequence shorter than the
-        target sequence length
+        short_sequence_probability (float): The probability we return a sequence shorter than the target sequence length
 
         masking_max_ngram (int): The maximum length N-gram to consider masking or permuting
 
         masking_do_full_word (bool): Whether we mask the the whole word or its component parts
 
-        masking_do_permutation (bool): Whether we shuffle a subset of candidate N-grams in addition
-        to masking
+        masking_do_permutation (bool): Whether we shuffle a subset of candidate N-grams in addition to masking
 
         masking_use_longer_ngrams (bool): Wehther to favor longer N-grams over shorter N-grams
 
-        masking_use_geometric_distribution (bool): Whether to draw the size of the N-gram from a
-        geometric distribution according to SpanBERT https://arxiv.org/abs/1907.10529 (Section 3.1)
+        masking_use_geometric_distribution (bool): Whether to draw the size of the N-gram from a geometric distribution according to SpanBERT https://arxiv.org/abs/1907.10529 (Section 3.1)
     """
 
     masking_probability: float = None
@@ -93,9 +90,8 @@ class MaskedWordPieceDataset(MegatronDataset):
     NB: WordPiece tokenization prepends a double hash "##" to all tokens/pieces in a word, save the
     first token/piece.
 
-    Args:
-        indexed_dataset (IndexedDataset): The IndexedDataset around which to build the
-        MegatronDataset
+    Args:    
+        indexed_dataset (IndexedDataset): The IndexedDataset around which to build the MegatronDataset
 
         dataset_path (str): The real path on disk to the dataset, for bookkeeping
 
