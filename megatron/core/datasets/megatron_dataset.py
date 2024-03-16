@@ -22,8 +22,7 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
     Args:
         dataset (LowLevelDataset): The dataset around which to build the MegatronDataset
 
-        dataset_path (str): The real path on disk to the dataset, for bookkeeping. TODO: subsume
-        this argument by enforcing auto-bookkeeping in the dataset class type.
+        dataset_path (str): The real path on disk to the dataset, for bookkeeping. TODO: subsume this argument by enforcing auto-bookkeeping in the dataset class type.
 
         indices (numpy.ndarray): The set of the documents indices to expose
 

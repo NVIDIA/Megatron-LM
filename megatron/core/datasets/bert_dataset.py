@@ -17,9 +17,8 @@ from megatron.core.datasets.utils import Split
 class BERTMaskedWordPieceDatasetConfig(MaskedWordPieceDatasetConfig):
     """Configuration object for Megatron Core BERT WordPiece datasets
 
-    Attributes:
-        classification_head (bool): Option to perform the next sequence prediction during
-        sampling
+    Args:
+        classification_head (bool): Option to perform the next sequence prediction during sampling
     """
 
     classification_head: bool = None
@@ -36,8 +35,7 @@ class BERTMaskedWordPieceDataset(MaskedWordPieceDataset):
     """The BERT dataset that assumes WordPiece tokenization
 
     Args:
-        indexed_dataset (IndexedDataset): The IndexedDataset around which to build the
-        MegatronDataset
+        indexed_dataset (IndexedDataset): The IndexedDataset around which to build the MegatronDataset
 
         dataset_path (str): The real path on disk to the dataset, for bookkeeping
 

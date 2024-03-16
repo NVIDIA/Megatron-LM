@@ -22,9 +22,8 @@ class T5MaskedWordPieceDatasetConfig(MaskedWordPieceDatasetConfig):
     a number of special sentinel tokens used during sampling. The assert in __post_init__ serves to
     preserve compatibility with Megatron-LM until the T5 tokenizer is in Megatron Core.
 
-    Attributes:
-        sequence_length_encoder (Optional[int]): A sequence_length alias and the sequence length
-        for the encoder
+    Args:
+        sequence_length_encoder (Optional[int]): A sequence_length alias and the sequence length for the encoder
 
         sequence_length_decoder (int): The sequence length for the decoder
     """
@@ -50,8 +49,7 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
     """The T5 dataset that assumes WordPiece tokenization
 
     Args:
-        indexed_dataset (IndexedDataset): The IndexedDataset around which to build the
-        MegatronDataset
+        indexed_dataset (IndexedDataset): The IndexedDataset around which to build the MegatronDataset
 
         dataset_path (str): The real path on disk to the dataset, for bookkeeping
 

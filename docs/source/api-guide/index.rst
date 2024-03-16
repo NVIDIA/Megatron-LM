@@ -12,3 +12,4 @@ API Guide
    moe
    dist_checkpointing
    distributed
+   datasets

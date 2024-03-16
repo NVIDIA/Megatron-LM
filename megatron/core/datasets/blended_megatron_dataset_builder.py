@@ -29,8 +29,7 @@ class BlendedMegatronDatasetBuilder(object):
     Args:
         cls (Type[MegatronDataset]): The class to instantiate, must inherit from MegatronDataset
 
-        sizes (List[int]): The minimum number of total samples to draw from each split, varies
-        with blend
+        sizes (List[int]): The minimum number of total samples to draw from each split, varies with blend
 
         config (BlendedMegatronDatasetConfig): The config object which informs dataset creation
     """
@@ -55,8 +54,7 @@ class BlendedMegatronDatasetBuilder(object):
         splits from separate distributions.
 
         Returns:
-            List[Optional[TopLevelDataset]]: A list containing a dataset instance (or None) per
-            split
+            List[Optional[TopLevelDataset]]: A list containing a dataset instance (or None) per split
         """
         return self._build_blended_dataset_splits()
 
@@ -66,8 +64,7 @@ class BlendedMegatronDatasetBuilder(object):
         See the BlendedMegatronDatasetBuilder.build alias for more information.
 
         Returns:
-            List[Optional[TopLevelDataset]]: A list containing a dataset instance (or None) per
-            split
+            List[Optional[TopLevelDataset]]: A list containing a dataset instance (or None) per split
         """
 
         # Return fake "mock" datasets
@@ -185,9 +182,7 @@ class BlendedMegatronDatasetBuilder(object):
         """Build each MidLevelDataset split from a single LowLevelDataset
 
         Args:
-            dataset_path (Optional[str]): The path on disk which defines the underlying
-            LowLevelDataset, e.g. the .bin and .idx file prefix when self.cls is of type
-            IndexedMegatronDataset or None when self.cls is of type MockDataset
+            dataset_path (Optional[str]): The path on disk which defines the underlying LowLevelDataset, e.g. the .bin and .idx file prefix when self.cls is of type IndexedMegatronDataset or None when self.cls is of type MockDataset
 
             split (List[Tuple[float, float]]): The dataset split matrix
 
@@ -251,19 +246,15 @@ class BlendedMegatronDatasetBuilder(object):
         and torch.distributed is initialized.
 
         Args:
-            cls (Union[Type[DistributedDataset], Callable]): The DistributedDataset class to be
-            built. In special cases, e.g. when we are building the low level dataset for a
-            RawMegatronDataset instance, we can accept a Callable which returns an Iterable.
+            cls (Union[Type[DistributedDataset], Callable]): The DistributedDataset class to be built. In special cases, e.g. when we are building the low level dataset for a RawMegatronDataset instance, we can accept a Callable which returns an Iterable.
 
-            args (Tuple[Any]): The positional arguments used to build the provided
-            DistributedDataset class
+            args (Tuple[Any]): The positional arguments used to build the provided DistributedDataset class
 
         Raises:
             Exception: When the dataset constructor raises an OSError
 
         Returns:
-            Optional[Union[DistributedDataset, Iterable]]: The DistributedDataset instantion, the
-            Iterable instantiation, or None
+            Optional[Union[DistributedDataset, Iterable]]: The DistributedDataset instantion, the Iterable instantiation, or None
         """
         if torch.distributed.is_initialized():
             rank = torch.distributed.get_rank()
@@ -300,16 +291,12 @@ def _get_prefixes_weights_and_sizes_for_blend(
     """Determine the contribution of the MegatronDataset splits to the BlendedDataset splits
     
     Args:
-        blend (List[str]): e.g. ["30", "path/to/dataset_1_prefix", "70", 
-        "path/to/dataset_2_prefix"]
+        blend (List[str]): e.g. ["30", "path/to/dataset_1_prefix", "70", "path/to/dataset_2_prefix"]
 
-        target_num_samples_per_split (List[int]): The number of samples to target for each
-        BlendedDataset split
+        target_num_samples_per_split (List[int]): The number of samples to target for each BlendedDataset split
 
     Returns:
-        Tuple[List[str], List[float], List[List[int]]]: The prefix strings e.g.
-        ["path/to/dataset_1_prefix", "path/to/dataset_2_prefix"], the normalized weights e.g.
-        [0.3, 0.7], and the number of samples to request per MegatronDataset per split
+        Tuple[List[str], List[float], List[List[int]]]: The prefix strings e.g. ["path/to/dataset_1_prefix", "path/to/dataset_2_prefix"], the normalized weights e.g. [0.3, 0.7], and the number of samples to request per MegatronDataset per split
     """
     weights, prefixes = zip(
         *[(float(blend[i]), blend[i + 1].strip()) for i in range(0, len(blend), 2)]

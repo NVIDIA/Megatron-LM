@@ -321,8 +321,7 @@ class _IndexReader(object):
             idx (int): The index into the dataset
 
         Returns:
-            Tuple[numpy.int32, numpy.int64, Optional[numpy.int8]]: The pointer, length and mode at
-            the index
+            Tuple[numpy.int32, numpy.int64, Optional[numpy.int8]]: The pointer, length and mode at the index
         """
         return (
             self.sequence_pointers[idx],
@@ -422,8 +421,7 @@ class IndexedDataset(torch.utils.data.Dataset):
             TypeError: When the index is of an unexpected type
 
         Returns:
-            Union[numpy.ndarray, Tuple[numpy.ndarray, numpy.ndarray]]: The sequence tokens and
-            modes at the index or index slice
+            Union[numpy.ndarray, Tuple[numpy.ndarray, numpy.ndarray]]: The sequence tokens and modes at the index or index slice
         """
         if isinstance(idx, (int, numpy.integer)):
             sequence_pointer, sequence_length, sequence_mode = self.index[idx]
@@ -510,6 +508,16 @@ class IndexedDataset(torch.utils.data.Dataset):
         return a portion of the item.
 
         get(idx) is the same as [idx] but get() does not support slicing.
+
+        Args:
+            idx (Union[int, numpy.integer]): The index into the dataset
+
+            offset (int): The integer token offset in the sequence
+
+            length (int): The number of tokens to grab from the sequence
+
+        Returns:
+            Union[numpy.ndarray, Tuple[numpy.ndarray, numpy.ndarray]]: The sequence tokens and modes at the index
         """
         sequence_pointer, sequence_length, sequence_mode = self.index[idx]
         if length is None:
@@ -632,9 +640,10 @@ class IndexedDatasetBuilder(object):
 
         Args:
             tensor (torch.Tensor): The document to add
+
             lengths (List[int]): The lengths of each item in the document
-            modes (Optional[List[int]], optional): The modes for each item in the document.
-            Defaults to None.
+
+            modes (Optional[List[int]], optional): The modes for each item in the document. Defaults to None.
         """
         np_array = numpy.array(tensor, dtype=self.dtype)
         self.data_file.write(np_array.tobytes(order="C"))
