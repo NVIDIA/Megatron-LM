@@ -53,7 +53,7 @@ class ORQAEvaluator(object):
 
     def faiss_wrapper(self):
         # Initialize FAISS wrapper on local rank = 0 as the evidence embeddings
-        # is distributed over all the GPUs in a node and FAISS is not 
+        # is distributed over all the GPUs in a node and FAISS is not
         # thread-safe
         args = get_args()
         if args.local_rank == 0:
@@ -88,7 +88,7 @@ class ORQAEvaluator(object):
 
             with torch.no_grad():
                 query_logits = unwrapped_model.embed_text(
-                    unwrapped_model.query_model, query_tokens, 
+                    unwrapped_model.query_model, query_tokens,
                     query_mask, query_types)
 
             reference_list.extend(reference)
@@ -121,16 +121,17 @@ class ORQAEvaluator(object):
             if node_id == node:
                 device_start_rank = start_rank
                 group = node_group
-        
-        input_ = torch.empty_like(query_tensor).copy_(query_tensor).detach_()
-        tensor_list = [torch.empty_like(input_) for _ in range(device_count)]
-        torch.distributed.all_gather(tensor_list, query_tensor, group=group)
+
+        query_size = list(query_tensor.size())
+        query_size[0] = query_size[0] * device_count
+        all_query_tensor= torch.empty(query_size,
+                                      dtype=query_tensor.dtype,
+                                      device=query_tensor.device)
+        torch.distributed._all_gather_base(all_query_tensor, query_tensor, group=group)
 
         if local_rank == 0 and self.mips_index is not None:
-            all_query_tensor = torch.cat(tensor_list, dim=0).contiguous()
-
             distance, topkindex = self.mips_index.search_mips_index(
-                all_query_tensor, top_k=args.faiss_topk_retrievals, 
+                all_query_tensor, top_k=args.faiss_topk_retrievals,
                 reconstruct=False)
             distance = torch.from_numpy(distance).cuda()
             topkindex = torch.LongTensor(topkindex).cuda()
