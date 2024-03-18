@@ -286,9 +286,9 @@ class BertModel(LanguageModule):
 
         Args:
             prefix (str, optional): The layer name prefix. Defaults to ''.
-            sharded_offsets(tuple, optional): Sharding already applied (e.g. PP related) by sup-modules. Passed along to ShardedTensor . defaults to ()
+            sharded_offsets(tuple, optional): Sharding already applied (e.g. PP related) by sub-modules. Passed along to ShardedTensor . defaults to ()
         Returns:
-            ShardedStateDict: _description_
+            ShardedStateDict: The sharded state dictionary
         """
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets)
 
