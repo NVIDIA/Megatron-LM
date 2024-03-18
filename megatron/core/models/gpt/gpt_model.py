@@ -199,7 +199,7 @@ class GPTModel(LanguageModule):
 
     def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()) -> ShardedStateDict:
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets)
- 
+
         output_layer_prefix = f'{prefix}output_layer.'
         # No bias in GPT model
         output_layer_weight_key = f'{output_layer_prefix}weight'
