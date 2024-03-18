@@ -4,8 +4,7 @@ from torch import Tensor
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import erf_gelu, get_linear_layer, openai_gelu
-from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
+from megatron.core.transformer.utils import get_linear_layer
 
 
 class BertLMHead(MegatronModule):
@@ -37,10 +36,6 @@ class BertLMHead(MegatronModule):
         )
 
         self.gelu = torch.nn.functional.gelu
-        if config.openai_gelu:  # Dont have these configs in transfomer config yet
-            self.gelu = openai_gelu
-        elif config.onnx_safe:  # Dont have these configs in transfomer config yet
-            self.gelu = erf_gelu
 
     def forward(self, hidden_states: Tensor) -> Tensor:
         hidden_states = self.dense(hidden_states)

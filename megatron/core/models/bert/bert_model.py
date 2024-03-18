@@ -120,7 +120,7 @@ class BertModel(LanguageModule):
                 self.vocab_size,
                 config=config,
                 init_method=config.init_method,
-                bias=True,  # Check this ? Not sure if we can have bias with share_embeddings_and_output_weights
+                bias=True,
                 skip_bias_add=False,
                 gather_output=not self.parallel_output,
                 skip_weight_param_allocation=pre_process and share_embeddings_and_output_weights,
