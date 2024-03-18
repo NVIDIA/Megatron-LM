@@ -1,4 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+
 from typing import Tuple
 
 import numpy as np
@@ -29,7 +30,6 @@ class GroupedMLP(MegatronModule):
         super().__init__(config=config)
         self.config: TransformerConfig = config
         self.num_local_experts = num_local_experts
-
         gg.assert_grouped_gemm_is_available()
         assert (
             config.add_bias_linear == False

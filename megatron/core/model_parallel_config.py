@@ -48,9 +48,10 @@ class ModelParallelConfig:
 
     bf16 (bool): If true, train with bf16 mixed precision training. Defaults to False.
 
-    params_dtype (torch.dtype): dtype used when intializing the weights. Defaults to torch.float32
+    params_dtype (torch.dtype): dtype used when intializing the weights. Defaults to torch.float32.
 
-    timers (optional, default=None): TODO
+    timers (optional, default=None): TODO.
+
 
     Optimizations
     -------------
@@ -72,13 +73,13 @@ class ModelParallelConfig:
         and All-Gather splits. Don't care if tp_comm_overlap is False. Defaults to True.
 
     tp_comm_atomic_ag (bool, optional): If true, allows All-Gather overlap with Fprop GEMM by pipelining the GEMM 
-        and All-Gather both done atomically. Don't care if tp_comm_overlap is False. Defaults to True.
+        and All-Gather both done atomically. Don't care if tp_comm_overlap is False. Defaults to False.
 
     tp_comm_split_rs (bool, optional): If true, allows Reduce-Scatter overlap with Fprop GEMM by pipelining the 
         GEMM and Reduce-Scatter splits. Don't care if tp_comm_overlap is False. Defaults to True.
 
     tp_comm_atomic_rs (bool, optional): If true, allows Reduce-Scatter overlap with Fprop GEMM by pipelining the
-        GEMM and Reduce-Scatter both done atomically. Don't care if tp_comm_overlap is False. Defaults to True.
+        GEMM and Reduce-Scatter both done atomically. Don't care if tp_comm_overlap is False. Defaults to False.
 
     tp_comm_bulk_dgrad (bool, optional): If true, allows All-Gather overlap with Bprop activation gradient GEMM. Don't 
         care if tp_comm_overlap is False. Defaults to True.
@@ -184,9 +185,9 @@ class ModelParallelConfig:
 
     # Debug Options
     tp_comm_split_ag: bool = True
-    tp_comm_atomic_ag: bool = True
+    tp_comm_atomic_ag: bool = False
     tp_comm_split_rs: bool = True
-    tp_comm_atomic_rs: bool = True
+    tp_comm_atomic_rs: bool = False
     tp_comm_bulk_wgrad: bool = True
     tp_comm_bulk_dgrad: bool = True
 

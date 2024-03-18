@@ -12,9 +12,10 @@ do
 done
 echo "---------------------------------"
 
-set -x
+set -exo pipefail
 if [[ -z $MBS ]]; then MBS=4; fi
 if [[ -z $GBS ]]; then GBS=32; fi
+if [[ -z $VOCAB_PATH ]]; then VOCAB_PATH="/workspace/data/t5_data/bert-large-cased-vocab.txt"; fi
 
 GPUS_PER_NODE=8
 # Change for multinode config
@@ -49,6 +50,17 @@ if [[ $USE_TE -eq 1 ]]; then
        TRAINING_DTYPE=bf16
 else
        echo "Running with local transformer implementation ..."
+fi
+
+if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
+       echo "Running checkpoint resume test..."
+       __SAVE_INTERVAL=50
+       if [[ $MAX_STEPS -ne 100 ]]; then
+         echo "Overriding MAX_STEPS=100"
+         MAX_STEPS=100
+       fi
+else
+       __SAVE_INTERVAL=10000  # inf
 fi
 set +x
 
@@ -99,13 +111,17 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --log-timers-to-tensorboard \
     --timing-log-level 2 \
     --log-interval 1 \
-    --save-interval 5000 \
+    --save-interval $__SAVE_INTERVAL \
     --eval-interval 1000 \
     --eval-iters 10 \
     --distributed-backend nccl \
+    ${DATA_CACHE:+--data-cache-path "$DATA_CACHE"} \
     ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS}"
 
 command="$command $torch_run_cmd"
+if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
+  command="$command; rm -rf $CHECKPOINT_PATH/iter_0000100; echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt; $torch_run_cmd"
+fi
 echo "-------------------- THE FINAL PRETRAIN SCRIPT COMMAND THAT WILL BE RUN ------------"
 echo "$command"
 echo "-----------------------------------------------------------------------------"

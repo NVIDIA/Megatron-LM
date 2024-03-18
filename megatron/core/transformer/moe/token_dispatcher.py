@@ -1,3 +1,5 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
 from abc import abstractmethod
 from typing import List
 
@@ -64,27 +66,11 @@ class MoEDroplessTokenDispatcher(MoETokenDispatcher):
         """
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
+        assert self.num_local_experts > 0, "Expected at least one expert"
         self.local_expert_indices = local_expert_indices
+        assert len(self.local_expert_indices) > 0, "Expected at least one local expert index"
         self.router_topk = config.moe_router_topk
         self.add_bias = config.add_bias_linear
-
-    def gather_indices(self, local_indices: torch.Tensor):
-        """ Gather tensors and concatenate along the first dimension."""
-        group = get_tensor_and_expert_parallel_group()
-        world_size = torch.distributed.get_world_size(group=group)
-        # Bypass the function if we are using only 1 GPU.
-        if world_size == 1:
-            return local_indices
-
-        dim_size = list(local_indices.size())
-        dim_size[0] = dim_size[0] * world_size
-
-        # TODO pre allocate memory
-        output = torch.empty(
-            dim_size, dtype=local_indices.dtype, device=torch.cuda.current_device()
-        )
-        torch.distributed._all_gather_base(output, local_indices.contiguous(), group=group)
-        return output
 
     def token_permutation(
         self, hidden_states: torch.Tensor, max_prob: torch.Tensor, max_ind: torch.Tensor
@@ -122,21 +108,25 @@ class MoEDroplessTokenDispatcher(MoETokenDispatcher):
                 hidden_states
             )
             with torch.no_grad():
-                global_indices = self.gather_indices(max_ind)
+                global_indices = tensor_parallel.gather_from_sequence_parallel_region_to_moe(
+                    max_ind
+                )
                 # Create a mask of mapping between global and local tokens where each
                 # element is True if it's between the local_expert_indices
-                global_local_map = (global_indices >= self.local_expert_indices[0]) & (
+                global_local_mask = (global_indices >= self.local_expert_indices[0]) & (
                     global_indices <= self.local_expert_indices[-1]
                 )
-                local_indices = global_indices.masked_select(global_local_map)
-                if self.router_topk > 1:  # k > 1
-                    global_probs = self.gather_indices(max_prob)
-                    local_probs = global_probs.masked_select(global_local_map)
-                else:
-                    local_probs = max_prob
-                # Reshape global_local_map to be compatible with Tensor.gather
-                global_local_map = global_local_map.nonzero()[:, 0]
-                global_local_map = global_local_map.view(-1, 1).expand(-1, hidden_states.shape[-1])
+                local_indices = global_indices.masked_select(global_local_mask)
+
+            if self.router_topk > 1:  # k > 1
+                global_probs = tensor_parallel.gather_from_sequence_parallel_region_to_moe(max_prob)
+                local_probs = global_probs.masked_select(global_local_mask)
+            else:
+                local_probs = max_prob
+
+            # Reshape global_local_mask to be compatible with Tensor.gather
+            global_local_map = global_local_mask.nonzero()[:, 0]
+            global_local_map = global_local_map.view(-1, 1).expand(-1, hidden_states.shape[-1])
             local_hidden_states = torch.gather(global_hidden_states, 0, global_local_map)
         else:
             if self.router_topk > 1:

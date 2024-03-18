@@ -124,3 +124,4 @@ class TestGPTModelReconfiguration:
             only_left, only_right, mismatch = diff(state_dict_A, state_dict_B)
             assert (not only_left and not only_right), (only_left, only_right)
             assert len(mismatch) == len(state_dict_A), (len(mismatch), (len(state_dict_A)))
+        Utils.destroy_model_parallel()

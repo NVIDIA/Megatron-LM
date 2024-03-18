@@ -35,6 +35,10 @@ def _get_extra_te_kwargs(config: TransformerConfig):
     return extra_transformer_engine_kwargs
 
 
+def condition_init_method(config, init_method):
+    return init_method if config.perform_initialization else (lambda w: None)
+
+
 class TENorm:
     """
     A conditional wrapper to initialize an instance of Transformer-Engine's
@@ -101,6 +105,7 @@ class TELinear(te.pytorch.Linear):
         # and we don't have to deal with the zero length Tensor.
         self.te_return_bias = skip_bias_add and bias
         self.is_first_microbatch = True
+        self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
         if skip_weight_param_allocation:
             raise ValueError(
                 'Transformer Engine linear layers do not support skip_weight_param_allocation'
@@ -129,7 +134,7 @@ class TELinear(te.pytorch.Linear):
             tp_group=get_tensor_model_parallel_group(check_initialized=False),
             tp_size=self.config.tensor_model_parallel_size,
             get_rng_state_tracker=get_cuda_rng_tracker,
-            init_method=init_method,
+            init_method=condition_init_method(config, init_method),
             bias=bias,
             return_bias=self.te_return_bias,
             parallel_mode=parallel_mode,
@@ -137,7 +142,10 @@ class TELinear(te.pytorch.Linear):
         )
 
     def forward(self, x):
-        out = super().forward(x, is_first_microbatch=self.is_first_microbatch)
+        _is_first_microbatch = (
+            None if self.disable_parameter_transpose_cache else self.is_first_microbatch
+        )
+        out = super().forward(x, is_first_microbatch=_is_first_microbatch)
         self.is_first_microbatch = False
 
         # TE only returns a tuple when return_bias is True, otherwise
@@ -188,6 +196,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         # and we don't have to deal with the zero length Tensor.
         self.te_return_bias = skip_bias_add and bias
         self.is_first_microbatch = True
+        self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
         extra_kwargs = _get_extra_te_kwargs(config)
 
         # Only Transformer-Engine version >= 0.11.0 supports `RMSNorm`
@@ -220,7 +229,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             tp_group=get_tensor_model_parallel_group(check_initialized=False),
             tp_size=self.config.tensor_model_parallel_size,
             get_rng_state_tracker=get_cuda_rng_tracker,
-            init_method=init_method,
+            init_method=condition_init_method(config, init_method),
             bias=bias,
             return_bias=self.te_return_bias,
             parallel_mode="column",
@@ -230,7 +239,10 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         )
 
     def forward(self, x):
-        out = super().forward(x, is_first_microbatch=self.is_first_microbatch)
+        _is_first_microbatch = (
+            None if self.disable_parameter_transpose_cache else self.is_first_microbatch
+        )
+        out = super().forward(x, is_first_microbatch=_is_first_microbatch)
         self.is_first_microbatch = False
 
         # TE only returns a tuple when return_bias is True, otherwise
@@ -279,7 +291,7 @@ class TEColumnParallelLinear(TELinear):
             output_size=output_size,
             parallel_mode="column",
             config=config,
-            init_method=init_method,
+            init_method=condition_init_method(config, init_method),
             bias=bias,
             skip_bias_add=skip_bias_add,
             skip_weight_param_allocation=skip_weight_param_allocation,
@@ -326,7 +338,7 @@ class TERowParallelLinear(TELinear):
             output_size=output_size,
             parallel_mode="row",
             config=config,
-            init_method=init_method,
+            init_method=condition_init_method(config, init_method),
             bias=bias,
             skip_bias_add=skip_bias_add,
             skip_weight_param_allocation=False,  # We don't currently use this for row parallel layers

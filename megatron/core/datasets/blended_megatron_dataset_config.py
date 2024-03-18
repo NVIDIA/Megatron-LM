@@ -19,40 +19,28 @@ logger = logging.getLogger(__name__)
 class BlendedMegatronDatasetConfig:
     """Configuration object for Megatron Core datasets
 
-    Attributes:
-        is_built_on_rank (Callable): A callable which returns True if the dataset should be built
-        on the current rank. It should be Megatron Core parallelism aware i.e. global rank, group
-        rank, and virtual rank may inform its return value.
+    Args:
+        is_built_on_rank (Callable): A callable which returns True if the dataset should be built on the current rank. It should be Megatron Core parallelism aware i.e. global rank, group rank, and virtual rank may inform its return value.
 
         random_seed (int): The seed for all RNG during dataset creation.
 
         sequence_length (int): The sequence length.
 
-        blend (Optional[List[str]]): The blend string, consisting of either a single dataset or a
-        flattened sequential sequence of weight-dataset pairs. For exampe, ["dataset-path1"] and
-        ["50", "dataset-path1", "50", "dataset-path2"] are both valid. Not to be used with
-        'blend_per_split'. Defaults to None.
+        blend (Optional[List[str]]): The blend string, consisting of either a single dataset or a flattened sequential sequence of weight-dataset pairs. For exampe, ["dataset-path1"] and ["50", "dataset-path1", "50", "dataset-path2"] are both valid. Not to be used with 'blend_per_split'. Defaults to None.
 
-        blend_per_split (blend_per_split: Optional[List[Optional[List[str]]]]): A set of blend
-        strings, as defined above, one for each split distribution. Not to be used with 'blend'.
-        Defauls to None.
+        blend_per_split (blend_per_split: Optional[List[Optional[List[str]]]]): A set of blend strings, as defined above, one for each split distribution. Not to be used with 'blend'. Defauls to None.
 
-        split (Optional[str]): The split string, a comma separated weighting for the dataset splits
-        when drawing samples from a single distribution. Not to be used with 'blend_per_split'.
-        Defaults to None.
+        split (Optional[str]): The split string, a comma separated weighting for the dataset splits when drawing samples from a single distribution. Not to be used with 'blend_per_split'. Defaults to None.
 
-        split_matrix (Optional[List[Tuple[float, float]]]): The split matrix consisting of
-        non-overlapping book-ends of each split in order. For more information, refer to
-        'convert_split_vector_to_split_matrix'. Created automatically from 'split'. Not to be
-        passed in to the constructor.
+        split_matrix (Optional[List[Tuple[float, float]]]): The split matrix consisting of non-overlapping book-ends of each split in order. For more information, refer to 'convert_split_vector_to_split_matrix'. Created automatically from 'split'. Not to be passed in to the constructor.
 
         path_to_cache (str): Where all re-useable dataset indices are to be cached.
 
-        mock (bool): Whether to bypass real data loading and validation in favor of mock data
-        generation.
+        mmap_bin_files (bool): Whether to mmap the .bin files or use file pointer.
 
-        tokenizer (Optional[MegatronTokenizer]): The MegatronTokenizer instance or None. Required
-        for datasets which do online tokenization.
+        mock (bool): Whether to bypass real data loading and validation in favor of mock data generation.
+
+        tokenizer (Optional[MegatronTokenizer]): The MegatronTokenizer instance or None. Required for datasets which do online tokenization.
     """
 
     is_built_on_rank: Callable
@@ -70,6 +58,8 @@ class BlendedMegatronDatasetConfig:
     split_matrix: Optional[List[Tuple[float, float]]] = field(init=False, default=None)
 
     path_to_cache: Optional[str] = None
+
+    mmap_bin_files: bool = False
 
     mock: bool = False
 
@@ -142,8 +132,7 @@ def convert_split_vector_to_split_matrix(
     Args:
         vector_a (List[float]): The primary split vector
 
-        vector_b (Optional[List[float]]): An optional secondary split vector which constrains the
-        primary split vector. Defaults to None.
+        vector_b (Optional[List[float]]): An optional secondary split vector which constrains the primary split vector. Defaults to None.
 
     Returns:
         List[Tuple[float, float]]: The split matrix consisting of book-ends of each split in order

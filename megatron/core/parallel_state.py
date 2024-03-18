@@ -28,6 +28,7 @@ _TENSOR_AND_DATA_PARALLEL_GROUP = None
 # Expert parallel group that the current rank belongs to.
 _TENSOR_AND_EXPERT_PARALLEL_GROUP = None
 _DATA_MODULO_EXPERT_PARALLEL_GROUP = None
+_DATA_MODULO_EXPERT_PARALLEL_GROUP_GLOO = None
 
 
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = None
@@ -458,6 +459,7 @@ def initialize_model_parallel(
     assert (
         _DATA_MODULO_EXPERT_PARALLEL_GROUP is None
     ), 'Data modulo expert group is already initialized'
+    global _DATA_MODULO_EXPERT_PARALLEL_GROUP_GLOO
     tensor_and_data_group_size: int = tensor_model_parallel_size * data_parallel_size
     num_tensor_and_data_groups: int = world_size // tensor_and_data_group_size
     tensor_and_expert_group_size: int = tensor_model_parallel_size * expert_model_parallel_size
@@ -481,8 +483,10 @@ def initialize_model_parallel(
             group = torch.distributed.new_group(
                 ranks, pg_options=get_nccl_options('dp_modulo_exp', nccl_comm_cfgs)
             )
+            group_gloo = torch.distributed.new_group(ranks, backend="gloo")
             if rank in ranks:
                 _DATA_MODULO_EXPERT_PARALLEL_GROUP = group
+                _DATA_MODULO_EXPERT_PARALLEL_GROUP_GLOO = group_gloo
 
     # Initialize global memory buffer
     # This isn't really "parallel state" but there isn't another good place to
@@ -624,6 +628,13 @@ def get_data_modulo_expert_parallel_group():
     return _DATA_MODULO_EXPERT_PARALLEL_GROUP
 
 
+def get_data_modulo_expert_parallel_group_gloo():
+    assert (
+        _DATA_MODULO_EXPERT_PARALLEL_GROUP_GLOO is not None
+    ), 'data modulo expert parallel group-gloo is not initialized'
+    return _DATA_MODULO_EXPERT_PARALLEL_GROUP_GLOO
+
+
 def set_expert_model_parallel_world_size(world_size):
     global _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE
     _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE = world_size
@@ -685,14 +696,6 @@ def set_pipeline_model_parallel_split_rank(rank):
     """Set pipeline model parallel split rank."""
     global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
     _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = rank
-
-
-def get_expert_model_parallel_rank():
-    """Return my rank for the tensor model parallel group."""
-    global _MPU_EXPERT_MODEL_PARALLEL_RANK
-    if _MPU_EXPERT_MODEL_PARALLEL_RANK is not None:
-        return _MPU_EXPERT_MODEL_PARALLEL_RANK
-    return torch.distributed.get_rank(group=get_tensor_and_expert_parallel_group())
 
 
 def get_tensor_model_parallel_rank():

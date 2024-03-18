@@ -1,6 +1,6 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
-""" Optimizer related helpers. """
+""" Helpers for defining sharding for optimizer states based on existing sharding for model parameters. """
 
 import logging
 from copy import deepcopy
@@ -20,7 +20,7 @@ from .mapping import (
     ShardedTensorFactory,
     StateDict,
 )
-from .utils import extract_sharded_tensors, extract_sharded_tensors_and_factories
+from .utils import extract_sharded_tensors_and_factories
 
 
 def get_optim_param_to_id_map(optim_params_iter: Iterable[torch.nn.Parameter]) -> Dict[int, int]:
@@ -34,6 +34,17 @@ def get_optim_param_to_id_map(optim_params_iter: Iterable[torch.nn.Parameter]) -
 def get_param_id_to_sharded_param_map(
     model_sharded_state_dict: ShardedStateDict, optim_params_iter: Iterable[torch.nn.Parameter]
 ) -> Dict[int, Union[ShardedTensor, ShardedTensorFactory]]:
+    """ Generate mapping from optimizer state ids to model sharded parameters.
+
+    Args:
+        model_sharded_state_dict: sharded state dict with all model sharded tensors (can have any structure)
+        optim_params_iter: iterable which iterates over model parameters tracked by the optimizer.
+            The iteration must be in the same order as in the optimizer parameters.
+
+    Returns:
+        Dict[int, Union[ShardedTensor, ShardedTensorFactory]]: mapping from optimizer state ids
+            to model sharded parameters.
+    """
     model_sharded_state_dict, _ = extract_sharded_tensors_and_factories(model_sharded_state_dict)
     id_to_sharded_param_map = {}
     param_to_id_map = get_optim_param_to_id_map(optim_params_iter)
@@ -55,6 +66,16 @@ def get_param_id_to_sharded_param_map(
 def make_sharded_optimizer_tensor(
     model_param: Union[ShardedTensor, ShardedTensorFactory], optim_param: torch.Tensor, prefix: str
 ) -> Union[ShardedTensor, ShardedTensorFactory]:
+    """ Build a ShardedTensor or ShardedTensorFactory for optimizer param based on model param
+
+    Args:
+        model_param (Union[ShardedTensor, ShardedTensorFactory]): model param
+        optim_param (torch.Tensor): corresponding optimizer param
+        prefix (str): optimizer prefix for the ShardedTensor or ShardedTensorFactory
+
+    Returns:
+        Union[ShardedTensor, ShardedTensorFactory]: wrapped optimizer parameter
+    """
     if isinstance(model_param, ShardedTensorFactory):
         return replace(model_param, key=f'{prefix}.{model_param.key}', data=optim_param)
 
@@ -71,6 +92,22 @@ def optim_state_to_sharding_state(
     id_to_sharded_param_map: Dict[int, ShardedTensor],
     exclude_keys: Tuple[str] = (),
 ):
+    """ Turn optimizer state dict to sharded state dict based on model state dict *in-place*.
+
+    Can be used to add sharding information to most common optimizer state dict.
+    Creates separate ShardedTensors for each key in `optim_state_dict['state']`
+    (e.g. for torch.optim.Adam there will be separate tensors for `exp_avg` and `exp_avg_sq`)
+
+    Args:
+        optim_state_dict (StateDict): optimizer state dict with
+            state parameters under `state` key and group hyperparameters under `param_groups` -> `params` key.
+        id_to_sharded_param_map (Dict[int, ShardedTensor]): mapping from optimizer param ids to model sharded tensors.
+            Can be generated with `get_param_id_to_sharded_param_map` function
+        exclude_keys (Tuple[str]): optimizer state keys to exclude from the final state dict.
+
+    Returns:
+        None: state dict is modified in place
+    """
     sharded_state = {}
     for param_id, param_state in optim_state_dict['state'].items():
         sharded_state[param_id] = {}

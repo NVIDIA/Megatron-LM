@@ -1,81 +1,97 @@
 .jet_common:
   stage: jet
   rules:
-    - if: '"JET" =~ $TESTS_TO_RUN_ON_THIS_COMMIT'
-    - if: $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH && "JET" =~ $TESTS_TO_RUN_AFTER_MERGING
-    - if: $CI_MERGE_REQUEST_APPROVED && "JET" =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
-    - if: '$CI_MERGE_REQUEST_LABELS == "READY FOR REVIEW" && "JET" =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED'
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_APPROVED 
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /READY FOR REVIEW/'
+    - if: $JET_CUSTOM_FILTER != "" && $CI_PIPELINE_SOURCE != 'merge_request_event'
+    - when: never
 
-jet-generate:
-  extends: .jet_common
+include:
+  - project: dl/jet/gitlab-templates
+    ref: main
+    file: downstreams.yml
+
+jet-setup:
+  extends: [ .jet_common ]
+  tags: 
+    - os/linux
+  script:
+    - set -x
+    - |
+      if [[ $CI_PIPELINE_SOURCE == "merge_request_event" ]] && [[ $CI_MERGE_REQUEST_APPROVED || $CI_MERGE_REQUEST_LABELS =~ "READY FOR REVIEW" ]]; then
+          JET_FILTER="type == 'build' or 'merge-request' in spec.scope"
+      elif [[ -n $JET_CUSTOM_FILTER && $CI_PIPELINE_SOURCE != 'merge_request_event' ]]; then
+        JET_FILTER=$JET_CUSTOM_FILTER
+      else
+        JET_FILTER="False"
+      fi
+      echo "_JET_FILTER=$JET_FILTER" | tee -a config.env
+  artifacts:
+    reports:
+      dotenv: config.env
+
+jet-configure:
+  image: alpine
+  extends: [.jet_common, .jet-configure]
   tags:
-    - docker_local_runner
-  variables:
-    JET_WORKLOADS_REF_MAIN: megatron-core
-    JET_WORKLOADS_REF_EPHEMERAL: ephemeral/${CI_PROJECT_PATH_SLUG}/${CI_PIPELINE_ID}
+    - os/linux
   script:
     - wget https://github.com/mikefarah/yq/releases/download/v4.35.2/yq_linux_amd64.tar.gz -O - | tar xz && mv yq_linux_amd64 /usr/local/bin/yq
-    - git clone https://gitlab-ci-token:${JET_WORKLOADS_TOKEN}@gitlab-master.nvidia.com/dl/jet/workloads-registry jet-workloads-registry 
-
-    - cd jet-workloads-registry
-    - git config user.name "Megatron-LM CI"  
-    - git config user.email "megatron-lm@ci.nvidia.com"  
-
-    - git checkout -f "$JET_WORKLOADS_REF_MAIN"
-    - git checkout -b "$JET_WORKLOADS_REF_EPHEMERAL"
-
+    - cd tests/functional_tests/jet_recipes
     - |
       if [[ $CI_PIPELINE_SOURCE == "merge_request_event" ]]; then
-        yq e ".spec.source.ref = \"merge-requests/${CI_MERGE_REQUEST_IID}/head\"" -i recipes/build-pyt.yaml
+        yq e ".spec.source.ref = \"merge-requests/${CI_MERGE_REQUEST_IID}/head\"" -i build-pyt.yaml
       else
-        yq e ".spec.source.ref = \"${CI_COMMIT_REF_NAME}\"" -i recipes/build-pyt.yaml
+        yq e ".spec.source.ref = \"${CI_COMMIT_REF_NAME}\"" -i build-pyt.yaml
       fi
-
-    - git add recipes/build-pyt.yaml
-    - git commit -m "Dynamic configuration - ${CI_PIPELINE_ID}"
-    - git push origin "$JET_WORKLOADS_REF_EPHEMERAL"
+  artifacts:
+    paths:
+      - tests/functional_tests/jet_recipes
 
 jet-trigger:
-  extends: .jet_common
-  needs: [ jet-generate ]
-  when: on_success
-  inherit:
-    variables:
-      - CI_PROJECT_PATH_SLUG
-      - CI_PIPELINE_ID
-      - TESTS_TO_RUN_ON_THIS_COMMIT
-      - TESTS_TO_RUN_AFTER_MERGING
-      - TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
-  variables:
-    JET_WORKLOADS_REF: ephemeral/${CI_PROJECT_PATH_SLUG}/${CI_PIPELINE_ID}
-    JET_WORKLOADS_FILTER: "True"
+  stage: jet
+  extends: [.jet_common, .jet-trigger]
+  needs:  [ jet-configure, jet-setup ]
   trigger:
     project: dl/jet/ci
-    branch: megatron-core
+    branch: $JET_CLUSTER_BRANCH
     strategy: depend
+  inherit:
+    variables:
+      - JET_CUSTOM_FILTER
+      - JET_CLUSTER_BRANCH
+  variables:
+    JET_WORKLOADS_FILTER: "$_JET_FILTER"
+
 
 jet-functional-results:
-  extends: .jet_common
-  tags:
-    - docker_local_runner
+  stage: jet
   image: gitlab-master.nvidia.com:5005/dl/jet/api:latest
+  tags:
+    - os/linux
   needs: [ jet-trigger ]
-  when: on_success
   before_script:
     - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $CI_JOB_JWT
   script: 
     - python -m pip install -U --no-cache-dir prettytable
-    - python tests/functional_tests/python_test_utils/jet_test_pipeline.py "ephemeral/${CI_PROJECT_PATH_SLUG}/${CI_PIPELINE_ID}" --test exit
+    - python tests/functional_tests/python_test_utils/jet_test_pipeline.py ${CI_PIPELINE_ID} --test exit
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_APPROVED 
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /READY FOR REVIEW/'
+      when: always
+    - if: $JET_CUSTOM_FILTER != "" && $CI_PIPELINE_SOURCE != 'merge_request_event'
+      when: always
+    - when: never
 
 jet-compare-metrics:
   extends: .jet_common
-  tags:
-    - docker_local_runner
   image: gitlab-master.nvidia.com:5005/dl/jet/api:latest
+  tags:
+    - os/linux
   needs: [ jet-functional-results ]
-  when: on_success
   before_script:
     - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $CI_JOB_JWT
   script:
     - python -m pip install -U --no-cache-dir pytest tensorboard
-    - python tests/functional_tests/python_test_utils/jet_test_pipeline.py "ephemeral/${CI_PROJECT_PATH_SLUG}/${CI_PIPELINE_ID}" --test metrics
+    - python tests/functional_tests/python_test_utils/jet_test_pipeline.py ${CI_PIPELINE_ID} --test metrics

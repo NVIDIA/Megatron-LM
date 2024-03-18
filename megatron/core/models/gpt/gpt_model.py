@@ -70,6 +70,10 @@ class GPTModel(LanguageModule):
         # TODO: remove this dependency ?
         self.model_type = ModelType.encoder_or_decoder
 
+        # These 2 attributes are needed for TensorRT-LLM export.
+        self.max_position_embeddings = max_sequence_length
+        self.rotary_percent = rotary_percent
+
         if self.pre_process:
             self.embedding = LanguageModelEmbedding(
                 config=self.config,
@@ -82,6 +86,7 @@ class GPTModel(LanguageModule):
             self.rotary_pos_emb = RotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
             )

@@ -1,6 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Utilities for transformer layers."""
+from functools import lru_cache
 from operator import itemgetter
 from typing import Any, Dict, Iterable, Iterator, Optional, Tuple, Union
 
@@ -23,6 +24,12 @@ def get_linear_layer(rows, columns, init_method, perform_initialization=True):
     with torch.no_grad():
         layer.bias.zero_()
     return layer
+
+
+@lru_cache(maxsize=32)
+def get_default_causal_mask(sq: int) -> torch.Tensor:
+    """Return the causal upper triangular mask for softmax input."""
+    return torch.triu(torch.ones(sq, sq, device="cuda"), diagonal=1).bool()
 
 
 def attention_mask_func(attention_scores, attention_mask):

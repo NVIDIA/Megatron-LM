@@ -53,7 +53,7 @@ class TestParallelGroupedMLP:
         _set_random_seed(seed_=123, data_parallel_random_init=False)
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             self.num_experts, moe_grouped_gemm=False)
-        self.switch_mlp_smm = MoELayer(tf_config,
+        self.sequential_mlp = MoELayer(tf_config,
             transformer_layer_spec.submodules.mlp.submodules)
 
         self.args = parse_args(ignore_unknown_args=True)
@@ -61,25 +61,25 @@ class TestParallelGroupedMLP:
         # Bias is not supported in grouped gemm currently, thus we disable the
         # bias in the linear layer.
         self.args.add_bias_linear=False
-        self.switch_mlp_smm = Float16Module(self.switch_mlp_smm, self.args).module
+        self.sequential_mlp = Float16Module(self.sequential_mlp, self.args).module
         print("done intializing for sequential gemm")
 
         ## Grouped GEMM
         _set_random_seed(seed_=123, data_parallel_random_init=False)
         tf_config.moe_grouped_gemm = True
-        self.switch_mlp_gmm = MoELayer(tf_config)
-        self.switch_mlp_gmm = Float16Module(self.switch_mlp_gmm, self.args).module
+        self.grouped_mlp = MoELayer(tf_config)
+        self.grouped_mlp = Float16Module(self.grouped_mlp, self.args).module
         print("done intializing for grouped gemm")
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
     def test_constructor(self):
-        assert isinstance(self.switch_mlp_smm, MoELayer)
-        assert isinstance(self.switch_mlp_gmm, MoELayer)
+        assert isinstance(self.sequential_mlp, MoELayer)
+        assert isinstance(self.grouped_mlp, MoELayer)
 
-        num_weights_smm = sum([p.numel() for p in self.switch_mlp_smm.parameters()])
-        num_weights_gmm = sum([p.numel() for p in self.switch_mlp_gmm.parameters()])
+        num_weights_smm = sum([p.numel() for p in self.sequential_mlp.parameters()])
+        num_weights_gmm = sum([p.numel() for p in self.grouped_mlp.parameters()])
 
         # For the same hyper-parm model configs except the `moe_grouped_gemm`,
         # GroupedGEMM and sequential GEMMs should hold the same number of parms.
@@ -90,30 +90,30 @@ class TestParallelGroupedMLP:
             self.hidden_size * (self.fc1_ffn_hidden_size + self.fc2_ffn_hidden_size) * self.num_experts
         assert num_weights_smm == expected_num_weights
 
-        assert torch.equal(self.switch_mlp_smm.router.weight, self.switch_mlp_gmm.router.weight)
+        assert torch.equal(self.sequential_mlp.router.weight, self.grouped_mlp.router.weight)
 
         # weight1: [h, num_experts*4h]
         # weight2: [num_experts*4h, h]
-        assert self.switch_mlp_gmm.experts.weight1.shape[0] == self.hidden_size
-        assert self.switch_mlp_gmm.experts.weight1.shape[1] == self.num_experts * self.fc1_ffn_hidden_size
+        assert self.grouped_mlp.experts.weight1.shape[0] == self.hidden_size
+        assert self.grouped_mlp.experts.weight1.shape[1] == self.num_experts * self.fc1_ffn_hidden_size
         if self.gated_linear_unit:
-            assert self.switch_mlp_gmm.experts.weight2.shape[0] == self.num_experts * self.fc2_ffn_hidden_size
-            assert self.switch_mlp_gmm.experts.weight2.shape[1] == self.hidden_size
+            assert self.grouped_mlp.experts.weight2.shape[0] == self.num_experts * self.fc2_ffn_hidden_size
+            assert self.grouped_mlp.experts.weight2.shape[1] == self.hidden_size
         else:
-            assert self.switch_mlp_gmm.experts.weight1.shape == self.switch_mlp_gmm.experts.weight2.t().shape
+            assert self.grouped_mlp.experts.weight1.shape == self.grouped_mlp.experts.weight2.t().shape
 
     def test_weight_init_value_the_same(self):
-        gmm_w1 = self.switch_mlp_gmm.experts.weight1.view(self.num_experts, -1, self.hidden_size)
-        gmm_w2 = self.switch_mlp_gmm.experts.weight2.view(self.num_experts, self.hidden_size, -1)
+        gmm_w1 = self.grouped_mlp.experts.weight1.view(self.num_experts, -1, self.hidden_size)
+        gmm_w2 = self.grouped_mlp.experts.weight2.view(self.num_experts, self.hidden_size, -1)
         gmm_expert1_fc1 = gmm_w1[0]
         gmm_expert1_fc2 = gmm_w2[0]
         gmm_expert2_fc1 = gmm_w1[1]
         gmm_expert2_fc2 = gmm_w2[1]
 
-        smm_expert1_fc1 = self.switch_mlp_smm.experts.local_experts[0].linear_fc1.weight
-        smm_expert1_fc2 = self.switch_mlp_smm.experts.local_experts[0].linear_fc2.weight
-        smm_expert2_fc1 = self.switch_mlp_smm.experts.local_experts[1].linear_fc1.weight
-        smm_expert2_fc2 = self.switch_mlp_smm.experts.local_experts[1].linear_fc2.weight
+        smm_expert1_fc1 = self.sequential_mlp.experts.local_experts[0].linear_fc1.weight
+        smm_expert1_fc2 = self.sequential_mlp.experts.local_experts[0].linear_fc2.weight
+        smm_expert2_fc1 = self.sequential_mlp.experts.local_experts[1].linear_fc1.weight
+        smm_expert2_fc2 = self.sequential_mlp.experts.local_experts[1].linear_fc2.weight
 
         assert torch.equal(gmm_expert1_fc1, smm_expert1_fc1)
         if not self.use_cpu_initialization:
@@ -129,17 +129,17 @@ class TestParallelGroupedMLP:
         not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8, reason='GroupedGEMM kernels are not supported on this device.'
     )
     def test_gpu_forward(self):
-        self.switch_mlp_smm.cuda()
-        self.switch_mlp_gmm.cuda()
+        self.sequential_mlp.cuda()
+        self.grouped_mlp.cuda()
         # [sequence length, batch size, hidden size]
         seq_len = 3 #32
         batch_size = 2
         hidden_states = torch.rand(
-            (seq_len, batch_size, self.switch_mlp_smm.config.hidden_size),
+            (seq_len, batch_size, self.sequential_mlp.config.hidden_size),
             dtype=torch.bfloat16)
         hidden_states = hidden_states.cuda()
-        output_smm, _ = self.switch_mlp_smm(hidden_states)
-        output_gmm, _ = self.switch_mlp_gmm(hidden_states)
+        output_smm, _ = self.sequential_mlp(hidden_states)
+        output_gmm, _ = self.grouped_mlp(hidden_states)
 
         # The following assert fails due to the param init value is not exactly
         # the same between gmm and smm (refer to test_weight_init_value_the_same.)
@@ -151,7 +151,7 @@ class TestParallelGroupedMLP:
     )
     def test_gpu_forward_with_no_tokens_allocated(self):
         """Test the case when no token is allocated for groupedGEMM kernels."""
-        w1 = self.switch_mlp_gmm.experts.weight1.view(self.num_experts, -1, self.hidden_size)
+        w1 = self.grouped_mlp.experts.weight1.view(self.num_experts, -1, self.hidden_size)
         num_allocated_tokens = 0
         tokens_per_expert = torch.zeros(self.num_experts)
         hidden_states = torch.rand((num_allocated_tokens, self.hidden_size), dtype=torch.bfloat16)

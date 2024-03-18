@@ -45,11 +45,17 @@ class MLP(MegatronModule):
     """
 
     def __init__(
-        self, config: TransformerConfig, submodules: MLPSubmodules, is_expert: bool = False
+        self,
+        config: TransformerConfig,
+        submodules: MLPSubmodules,
+        is_expert: bool = False,
+        input_size: int = None,
     ):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
+
+        self.input_size = input_size if input_size != None else self.config.hidden_size
 
         # If this is a gated linear unit we double the output width, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = self.config.ffn_hidden_size
@@ -58,7 +64,7 @@ class MLP(MegatronModule):
 
         self.linear_fc1 = build_module(
             submodules.linear_fc1,
-            self.config.hidden_size,
+            self.input_size,
             ffn_hidden_size,
             config=self.config,
             init_method=self.config.init_method,

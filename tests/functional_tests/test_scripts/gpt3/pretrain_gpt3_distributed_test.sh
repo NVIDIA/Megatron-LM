@@ -12,7 +12,7 @@ do
 done
 echo "---------------------------------"
 
-set -x
+set -exo pipefail
 if [[ -z $MBS ]]; then MBS=4; fi
 if [[ -z $GBS ]]; then GBS=32; fi
 if [[ -z $MOE_GROUPED_GEMM ]]; then MOE_GROUPED_GEMM=0; fi
@@ -41,7 +41,6 @@ fi
 
 if [[ $MOE_GROUPED_GEMM -eq 1 ]]; then
        echo "Running MoE with Grouped GEMM"
-       command="$command pip install git+https://github.com/fanshiqing/grouped_gemm@main;"
        TRAINING_DTYPE=bf16  # Currently GroupedGEMM for MoE only supports bf16 dtype
 fi
 
@@ -53,11 +52,28 @@ if [[ $USE_TE -eq 1 ]]; then
 else
        echo "Running with local transformer implementation ..."
 fi
+if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
+       echo "Running checkpoint resume test..."
+       __SAVE_INTERVAL=50
+       ADDITIONAL_PARAMS+=" --use-checkpoint-opt_param-scheduler"
+       if [[ $MAX_STEPS -ne 100 ]]; then
+         echo "Overriding MAX_STEPS=100"
+         MAX_STEPS=100
+       fi
+else
+       __SAVE_INTERVAL=10000  # inf
+fi
+if [[ -n "$CKPT_FORMAT" ]] && [[ "$CKPT_FORMAT" != 'torch' ]]; then
+       echo "Using distributed checkpoint format..."
+       command="$command pip install zarr tensorstore==0.1.45;"
+       ADDITIONAL_PARAMS+=" --use-dist-ckpt --dist-ckpt-format $CKPT_FORMAT"
+fi
 set +x
 # Runs the "345M" parameter model
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 
-torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
+build_torch_run_cmd() {
+  torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        pretrain_gpt.py \
        --num-layers 12 \
        --hidden-size 512 \
@@ -88,7 +104,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        --clip-grad 1.0 \
        --lr-warmup-fraction .01 \
        --log-interval 1 \
-       --save-interval 10000 \
+       --save-interval $__SAVE_INTERVAL \
        --eval-interval 1000 \
        --eval-iters 10 \
        --transformer-impl $TRANSFORMER_IMPL \
@@ -103,11 +119,41 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        ${DATA_CACHE:+--data-cache-path "$DATA_CACHE"} \
        --${TRAINING_DTYPE}"
 
-if [[ "${TRAINING_DTYPE}" == "fp16" ]]; then
-    torch_run_cmd+=" --apply-query-key-layer-scaling"
-fi
+  if [[ "${TRAINING_DTYPE}" == "fp16" ]]; then
+      torch_run_cmd+=" --apply-query-key-layer-scaling"
+  fi
+}
 
+build_torch_run_cmd
 command="$command $torch_run_cmd"
+if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
+  echo "------RESUME OVERRIDES ARGS LIST --------"
+  # apply all env vars starting from 'RESUME_OVERRIDE_' (after removing prefix)
+  _OVERRIDE_PREFIX="RESUME_OVERRIDE_"
+  _OVERRIDE_PREFIX_LENGTH=${#_OVERRIDE_PREFIX}
+  _NONEMPTY_OVERRIDES=0
+  for ARGUMENT in "$@"
+  do
+    KEY=$(echo $ARGUMENT | cut -f1 -d=)
+    if [[ $KEY == ${_OVERRIDE_PREFIX}* ]]; then
+      KEY_LENGTH=${#KEY}
+      VALUE="${ARGUMENT:$KEY_LENGTH+1}"
+      KEY="${KEY:$_OVERRIDE_PREFIX_LENGTH}"
+      if [[ -n "${VALUE}" ]]; then
+        export "$KEY"="$VALUE"
+        echo "$KEY=$VALUE"
+        _NONEMPTY_OVERRIDES=1
+      fi
+    fi
+  done
+  echo "---------------------------------"
+  if [[ $_NONEMPTY_OVERRIDES == 1 ]]; then
+    ADDITIONAL_PARAMS+=" --no-load-rng"  # assuming TPxPP mismatch
+  fi
+
+  build_torch_run_cmd
+  command="$command; rm -rf $CHECKPOINT_PATH/iter_0000100; echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt; $torch_run_cmd"
+fi
 echo "-------------------- THE FINAL PRETRAIN SCRIPT COMMAND THAT WILL BE RUN ------------"
 echo "$command"
 echo "-----------------------------------------------------------------------------"

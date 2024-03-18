@@ -46,12 +46,19 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     # Custom arguments.
     if extra_args_provider is not None:
         parser = extra_args_provider(parser)
-
+    
     # Parse.
     if ignore_unknown_args:
         args, _ = parser.parse_known_args()
     else:
         args = parser.parse_args()
+
+    # Experimental yaml
+    if args.yaml_cfg is not None:
+        from .yaml_arguments import load_yaml
+        assert args.yaml_cfg and args.use_mcore_models, "To use yaml, mcore must be enabled"
+        args = load_yaml(args.yaml_cfg)
+        
 
     # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
@@ -173,12 +180,21 @@ def validate_args(args, defaults={}):
             '--overlap-param-gather only supported with distributed optimizer'
         assert args.overlap_grad_reduce, \
             '--overlap-grad-reduce should be turned on when using --overlap-param-gather'
+        assert args.use_mcore_models, \
+            '--overlap-param-gather only supported with MCore models'
 
     # Parameters dtype.
     args.params_dtype = torch.float
     if args.fp16:
         assert not args.bf16
         args.params_dtype = torch.half
+        # Turn off checking for NaNs in loss and grads if using dynamic loss scaling,
+        # where NaNs in grads / loss are signal to the loss scaler.
+        if not args.loss_scale:
+            args.check_for_nan_in_loss_and_grad = False
+            if args.rank == 0:
+                print('WARNING: Setting args.check_for_nan_in_loss_and_grad to False since '
+                      'dynamic loss scaling is being used')
     if args.bf16:
         assert not args.fp16
         args.params_dtype = torch.bfloat16
@@ -388,6 +404,10 @@ def validate_args(args, defaults={}):
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
         args.position_embedding_type = 'rope'
+    if args.rotary_interleaved and args.apply_rope_fusion:
+        raise RuntimeError('--rotary-interleaved does not work with rope_fusion.')
+    if args.rotary_interleaved and not args.use_mcore_models:
+        raise RuntimeError('--rotary-interleaved only support Megatron Core, please add --use-mcore-models.')
 
     # Would just need to add 'NoPE' as a position_embedding_type to support this, but for now
     # don't allow it to keep things simple
@@ -408,6 +428,10 @@ def validate_args(args, defaults={}):
             "Number of experts should be a multiple of expert model parallel_size."
         assert not args.fp16, \
             "Expert parallelism is not supported with fp16 training."
+
+    # Distributed checkpointing checks
+    if args.use_dist_ckpt and not args.use_mcore_models:
+        raise RuntimeError('--use-dist-ckpt only support Megatron Core, please add --use-mcore-models.')
 
     # Print arguments.
     _print_args("arguments", args)
@@ -448,8 +472,9 @@ def core_transformer_config_from_args(args):
     kw_args['layernorm_epsilon'] = args.norm_epsilon
     kw_args['deallocate_pipeline_outputs'] = True
     kw_args['pipeline_dtype'] = args.params_dtype
-    kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
+    kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm 
     kw_args['num_moe_experts'] = args.num_experts
+    kw_args['rotary_interleaved'] = args.rotary_interleaved
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
@@ -619,6 +644,8 @@ def _add_network_size_args(parser):
                        'Deprecated: use --position-embedding-type')
     group.add_argument('--rotary-percent', type=float, default=1.0,
                        help='Percent of rotary dimension to use, default 100%%')
+    group.add_argument('--rotary-interleaved', action='store_true',
+                          help='Use interleaved rotary embedding.')
     group.add_argument('--rotary-seq-len-interpolation-factor', type=int, default=None,
                        help='Sequence length interpolation factor for rotary embeddings.')
     group.add_argument('--no-position-embedding',
@@ -732,6 +759,22 @@ def _add_logging_args(parser):
                        help='The wandb experiment name.')
     group.add_argument('--wandb-save-dir', type=str, default='',
                        help='Path to save the wandb results locally.')
+    group.add_argument('--enable-one-logger', action='store_true',
+                       help='If set, use one_logger to track E2E metrics'
+                       'Note that one_logger is an internal tool and not available externally. '
+                       'For installation, please try command: `pip install '
+                       '--index-url=https://sc-hw-artf.nvidia.com/api/pypi/hwinf-ml-pypi/simple'
+                       ' one_logger` or go to https://gitlab-master.nvidia.com/hwinf-dcm/onelogger '
+                       'for more details')
+    group.add_argument('--one-logger-project', type=str, default='e2e-tracking',
+                       help='The one-logger project name. Will ignore if '
+                       '--enable-one-logger is not set')
+    group.add_argument('--one-logger-entity', type=str, default='hwinf_dcm',
+                       help='The one-logger username or team name. Will ignore if '
+                       '--enable-one-logger is not set')
+    group.add_argument('--one-logger-run-name', type=str, default=None,
+                       help='The one-logger run name displayed. Will ignore if '
+                       '--enable-one-logger is not set')
     return parser
 
 
@@ -911,6 +954,9 @@ def _add_training_args(parser):
     group.add_argument('--disable-bias-linear', action='store_false',
                        help='Disable bias in the linear layers',
                        dest='add_bias_linear')
+    group.add_argument('--add-qkv-bias', action='store_true',
+                       help='Enable bias only in the QKV linear layers',
+                       dest='add_qkv_bias')
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd'],
                        help='Optimizer function')
@@ -980,7 +1026,7 @@ def _add_learning_rate_args(parser):
 
     group.add_argument('--lr', type=float, default=None,
                        help='Initial learning rate. Depending on decay style '
-                       'and initial warmup, the learing rate at each '
+                       'and initial warmup, the learning rate at each '
                        'iteration would be different.')
     group.add_argument('--lr-decay-style', type=str, default='linear',
                        choices=['constant', 'linear', 'cosine', 'inverse-square-root'],
@@ -1057,6 +1103,15 @@ def _add_checkpointing_args(parser):
                        help="If '--load' is set, but checkpoint is not found "
                        "(e.g., path typo), then exit instead of random "
                        "initialization.")
+    group.add_argument('--use-dist-ckpt', action='store_true',
+                       help='Use distributed checkpoint format.')
+    group.add_argument('--auto-detect-ckpt-format', action='store_true',
+                       help='Determine if the checkpoint format is in legacy or distributed format.'
+                            ' If False, expects distributed checkpoint iff args.use_dist_ckpt.'
+                            ' Might slow down loading a bit (double rank0 ckpt load).')
+    group.add_argument('--dist-ckpt-format', type=str, default='torch_dist',
+                       choices=['zarr', 'torch_dist'],
+                       help='Distributed checkpoint format to use.')
 
     return parser
 
@@ -1075,7 +1130,7 @@ def _add_mixed_precision_args(parser):
     group.add_argument('--initial-loss-scale', type=float, default=2**32,
                        help='Initial loss-scale for dynamic loss scaling.')
     group.add_argument('--min-loss-scale', type=float, default=1.0,
-                       help='Minimum loss scale for dynamic loss scale.')
+                       help='Minimum loss scale for dynamic loss scaling.')
     group.add_argument('--loss-scale-window', type=float, default=1000,
                        help='Window over which to raise/lower dynamic scale.')
     group.add_argument('--hysteresis', type=int, default=2,
@@ -1220,6 +1275,9 @@ def _add_data_args(parser):
                        'dataset2-path ...')
     group.add_argument('--data-cache-path', default=None,
                        help='Path to a directory to hold cached index files.')
+    group.add_argument('--no-mmap-bin-files', action='store_false',
+                       help='Disable mmap-ing of .bin files.',
+                       dest='mmap_bin_files')
     group.add_argument('--mock-data', action='store_true',
                        help='Skip data loading and validation and opt for artificial '
                        'generation of mock data when an implementation is available.')
@@ -1418,9 +1476,9 @@ def _add_moe_args(parser):
     group.add_argument('--num-experts', type=int, default=None,
                        help='Number of Experts in MoE (None means no MoE)')
     group.add_argument('--moe-router-load-balancing-type', type=str,
-                       choices=['aux_loss', 'sinkhorn', None],
+                       choices=['aux_loss', 'sinkhorn', "none"],
                        default='aux_loss',
-                       help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "None" implies no load balancing. The default is "aux_loss".')
+                       help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
     group.add_argument('--moe-router-topk', type=int, default=2,
                        help='Number of experts to route to for each token. The default is 2.')
     group.add_argument('--moe-grouped-gemm', action='store_true',
@@ -1439,11 +1497,14 @@ def _add_moe_args(parser):
 def _add_experimental_args(parser):
     group = parser.add_argument_group(title='experimental')
 
-    group.add_argument('--spec', type=str, default=None, nargs=2,
+    group.add_argument('--spec', type=str, default=None, nargs='*',
                        help='Specify the <module_location function_name> pair '
                        'that returns a spec to customize a model, transformer '
-                       'block, or transformer layer, depending on the use case. '
+                       'block, or transformer layer, depending on the use case.'
+                       'To use local spec specify local as the argument.'
                        'For more details, see the model class, '
                        '`transformer_block.py`, or `transformer_layer.py`')
+    group.add_argument('--yaml-cfg', type=str, default=None, 
+                       help = 'Config file to add additional arguments')
 
     return parser

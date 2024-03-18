@@ -27,7 +27,7 @@ _INDEX_HEADER = b"MMIDIDX\x00\x00"
 
 
 class DType(Enum):
-    """The NumPy data type Enum for writing/reading the MMapIndexedDataset indices
+    """The NumPy data type Enum for writing/reading the IndexedDataset indices
     """
 
     uint8 = 1
@@ -321,8 +321,7 @@ class _IndexReader(object):
             idx (int): The index into the dataset
 
         Returns:
-            Tuple[numpy.int32, numpy.int64, Optional[numpy.int8]]: The pointer, length and mode at
-            the index
+            Tuple[numpy.int32, numpy.int64, Optional[numpy.int8]]: The pointer, length and mode at the index
         """
         return (
             self.sequence_pointers[idx],
@@ -331,59 +330,66 @@ class _IndexReader(object):
         )
 
 
-class MMapIndexedDataset(torch.utils.data.Dataset):
+class IndexedDataset(torch.utils.data.Dataset):
     """The low-level interface dataset class
 
     Args:
         path_prefix (str): The index (.idx) and data (.bin) prefix
 
         multimodal (bool, optional): Whether the dataset is multimodal. Defaults to False.
+
+        mmap (bool, optional): Whether to mmap the .bin files. Defaults to True.
     """
 
-    def __init__(self, path_prefix: str, multimodal: bool = False) -> None:
+    def __init__(self, path_prefix: str, multimodal: bool = False, mmap: bool = True) -> None:
         super().__init__()
         self.path_prefix = None
         self.multimodal = None
+        self.mmap = None
 
         self.index = None
         self.bin_buffer = None
         self.bin_buffer_mmap = None
 
-        self.initialize(path_prefix, multimodal)
+        self.initialize(path_prefix, multimodal, mmap)
 
-    def initialize(self, path_prefix: str, multimodal: bool) -> None:
+    def initialize(self, path_prefix: str, multimodal: bool, mmap: bool) -> None:
         """Initialize the dataset
 
-        This method is called by MMapIndexedDataset.__init__ during object creation and by
-        MMapIndexedDataset.__setstate__ during un-puckling
+        This method is called by IndexedDataset.__init__ during object creation and by
+        IndexedDataset.__setstate__ during un-puckling
 
         Args:
             path_prefix (str): The index (.idx) and data (.bin) prefix
 
             multimodal (bool): Whether the dataset is multimodal
+
+            mmap (bool): Whether to mmap the .bin file
         """
         self.path_prefix = path_prefix
         self.multimodal = multimodal
+        self.mmap = mmap
         self.index = _IndexReader(get_idx_path(self.path_prefix), self.multimodal)
-        self.bin_buffer_mmap = numpy.memmap(get_bin_path(self.path_prefix), mode="r", order="C")
-        self.bin_buffer = memoryview(self.bin_buffer_mmap)
+        if mmap:
+            self.bin_buffer_mmap = numpy.memmap(get_bin_path(self.path_prefix), mode="r", order="C")
+            self.bin_buffer = memoryview(self.bin_buffer_mmap)
 
-    def __getstate__(self) -> Tuple[str, bool]:
+    def __getstate__(self) -> Tuple[str, bool, bool]:
         """Get the state during pickling
 
         Returns:
-            Tuple[str, bool]: The state tuple
+            Tuple[str, bool, bool]: The state tuple
         """
-        return self.path_prefix, self.multimodal
+        return self.path_prefix, self.multimodal, self.mmap
 
-    def __setstate__(self, state: Tuple[str, bool]) -> None:
+    def __setstate__(self, state: Tuple[str, bool, bool]) -> None:
         """Set the state during un-pickling
 
         Args:
-            state (Tuple[str, bool]): The state tuple
+            state (Tuple[str, bool, bool]): The state tuple
         """
-        path_prefix, multimodal = state
-        self.initialize(path_prefix, multimodal)
+        path_prefix, multimodal, mmap = state
+        self.initialize(path_prefix, multimodal, mmap)
 
     def __del__(self) -> None:
         """Clean up the object
@@ -401,10 +407,10 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
         """
         return len(self.index)
 
-    def __getitem__(
+    def _getitem_mmap(
         self, idx: Union[int, numpy.integer, slice]
     ) -> Union[numpy.ndarray, Tuple[numpy.ndarray, numpy.ndarray]]:
-        """Return from the dataset
+        """Return from the dataset by mmap-ing .bin file
 
         Args:
             idx (Union[int, numpy.integer, slice]): The index or index slice into the dataset
@@ -415,8 +421,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
             TypeError: When the index is of an unexpected type
 
         Returns:
-            Union[numpy.ndarray, Tuple[numpy.ndarray, numpy.ndarray]]: The sequence tokens and
-            modes at the index or index slice
+            Union[numpy.ndarray, Tuple[numpy.ndarray, numpy.ndarray]]: The sequence tokens and modes at the index or index slice
         """
         if isinstance(idx, (int, numpy.integer)):
             sequence_pointer, sequence_length, sequence_mode = self.index[idx]
@@ -447,19 +452,87 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
         else:
             raise TypeError("Unexpected type received for idx: {}".format(type(idx)))
 
+    def _getitem_file(
+        self, idx: Union[int, numpy.integer, slice]
+    ) -> Union[numpy.ndarray, Tuple[numpy.ndarray, numpy.ndarray]]:
+        """Return from the dataset by using file pointer
+
+        Args:
+            idx (Union[int, numpy.integer, slice]): The index or index slice into the dataset
+
+        Raises:
+            ValueError: When the index slice is non-contiguous
+
+            TypeError: When the index is of an unexpected type
+
+        Returns:
+            Union[numpy.ndarray, Tuple[numpy.ndarray, numpy.ndarray]]: The sequence tokens and
+            modes at the index or index slice
+        """
+        if isinstance(idx, (int, numpy.integer)):
+            sequence_pointer, sequence_length, sequence_mode = self.index[idx]
+            sequence = numpy.empty(sequence_length, dtype=self.index.dtype)
+            with open(get_bin_path(self.path_prefix), mode='rb', buffering=0) as bin_buffer_file:
+                bin_buffer_file.seek(sequence_pointer)
+                bin_buffer_file.readinto(sequence)
+            return (sequence, sequence_mode) if sequence_mode is not None else sequence
+        elif isinstance(idx, slice):
+            assert False, "slicing not implemented without mmap"
+        else:
+            raise TypeError("Unexpected type received for idx: {}".format(type(idx)))
+
+    def __getitem__(
+        self, idx: Union[int, numpy.integer, slice]
+    ) -> Union[numpy.ndarray, Tuple[numpy.ndarray, numpy.ndarray]]:
+        """Return from the dataset
+
+        Args:
+            idx (Union[int, numpy.integer, slice]): The index or index slice into the dataset
+
+        Raises:
+            ValueError: When the index slice is non-contiguous
+
+            TypeError: When the index is of an unexpected type
+
+        Returns:
+            Union[numpy.ndarray, Tuple[numpy.ndarray, numpy.ndarray]]: The sequence tokens and
+            modes at the index or index slice
+        """
+        if self.bin_buffer_mmap is not None:
+            return self._getitem_mmap(idx)
+        else:
+            return self._getitem_file(idx)
+
     def get(self, idx: int, offset: int = 0, length: Optional[int] = None) -> numpy.ndarray:
         """Retrieve a single item from the dataset with the option to only
         return a portion of the item.
 
         get(idx) is the same as [idx] but get() does not support slicing.
+
+        Args:
+            idx (Union[int, numpy.integer]): The index into the dataset
+
+            offset (int): The integer token offset in the sequence
+
+            length (int): The number of tokens to grab from the sequence
+
+        Returns:
+            Union[numpy.ndarray, Tuple[numpy.ndarray, numpy.ndarray]]: The sequence tokens and modes at the index
         """
         sequence_pointer, sequence_length, sequence_mode = self.index[idx]
         if length is None:
             length = sequence_length - offset
         sequence_pointer += offset * DType.size(self.index.dtype)
-        sequence = numpy.frombuffer(
-            self.bin_buffer, dtype=self.index.dtype, count=length, offset=sequence_pointer
-        )
+        if self.bin_buffer:
+            sequence = numpy.frombuffer(
+                self.bin_buffer, dtype=self.index.dtype, count=length, offset=sequence_pointer
+            )
+        else:
+            sequence = numpy.empty(length, dtype=self.index.dtype)
+            with open(get_bin_path(self.path_prefix), mode='rb', buffering=0) as bin_buffer_file:
+                bin_buffer_file.seek(sequence_pointer)
+                bin_buffer_file.readinto(sequence)
+
         return (sequence, sequence_mode) if sequence_mode is not None else sequence
 
     @property
@@ -511,21 +584,21 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def exists(path_prefix: str) -> bool:
-        """Return whether the MMapIndexedDataset exists on disk at the prefix
+        """Return whether the IndexedDataset exists on disk at the prefix
 
         Args:
             path_prefix (str): The prefix to the index (.idx) and data (.bin) files
 
         Returns:
-            bool: Whether the MMapIndexedDataset exists on disk at the prefix
+            bool: Whether the IndexedDataset exists on disk at the prefix
         """
         return os.path.exists(get_idx_path(path_prefix)) and os.path.exists(
             get_bin_path(path_prefix)
         )
 
 
-class MMapIndexedDatasetBuilder(object):
-    """Builder class for the MMapIndexedDataset class
+class IndexedDatasetBuilder(object):
+    """Builder class for the IndexedDataset class
 
     Args:
         bin_path (str): The path to the data (.bin) file
@@ -567,9 +640,10 @@ class MMapIndexedDatasetBuilder(object):
 
         Args:
             tensor (torch.Tensor): The document to add
+
             lengths (List[int]): The lengths of each item in the document
-            modes (Optional[List[int]], optional): The modes for each item in the document.
-            Defaults to None.
+
+            modes (Optional[List[int]], optional): The modes for each item in the document. Defaults to None.
         """
         np_array = numpy.array(tensor, dtype=self.dtype)
         self.data_file.write(np_array.tobytes(order="C"))
@@ -579,12 +653,12 @@ class MMapIndexedDatasetBuilder(object):
             self.sequence_modes.extend(modes if modes is not None else [0] * lengths)
 
     def end_document(self) -> None:
-        """Finalize the document, for use with MMapIndexedDatasetBuilder.add_item
+        """Finalize the document, for use with IndexedDatasetBuilder.add_item
         """
         self.document_indices.append(len(self.sequence_lengths))
 
     def add_index(self, path_prefix: str) -> None:
-        """Add an entire MMapIndexedDataset to the dataset
+        """Add an entire IndexedDataset to the dataset
 
         Args:
             path_prefix (str): The index (.idx) and data (.bin) prefix

@@ -10,31 +10,38 @@ NUM_BYTES_IN_MEGABYTE = 1024 * 1024
 
 
 def compute_weight_and_optimizer_memory(args, verbose=False):
+    # Group Query Attention.
     if not args.group_query_attention:
         args.num_query_groups = args.num_attention_heads
+    # MoE.
+    num_experts = 1 if args.num_experts is None else args.num_experts
     num_parameters_in_transformer_layers = (
-        10
+        2
         * args.num_layers
         * args.hidden_size
         * args.hidden_size
         * (
             1
-            + (args.num_query_groups / (5.0 * args.num_attention_heads))
-            + (2 / (5 * args.hidden_size))
-            + (1 / (5 * args.num_layers * args.hidden_size))
+            + ((args.ffn_hidden_size / args.hidden_size) * num_experts)
+            + (args.num_query_groups / args.num_attention_heads)
+            + (2 / args.hidden_size)
+            + (1 / (args.num_layers * args.hidden_size))
         )
     )
     embedding_size = args.hidden_size * args.padded_vocab_size
     if args.untie_embeddings_and_output_weights:
-        num_total_parameters_with_embeddings = num_parameters_in_transformer_layers + (
-            2 * embedding_size
-        )
+        num_parameters_in_embedding_layers = 2 * embedding_size
     else:
-        num_total_parameters_with_embeddings = num_parameters_in_transformer_layers + embedding_size
+        num_parameters_in_embedding_layers = embedding_size
+    num_total_parameters = num_parameters_in_transformer_layers + num_parameters_in_embedding_layers
     if verbose:
         print(
-            f"Number of parameters in billions: {num_total_parameters_with_embeddings / 10**9:.2f}"
+            f"Number of parameters in transformer layers in billions: {num_parameters_in_transformer_layers / 10**9: .2f}"
         )
+        print(
+            f"Number of parameters in embedding layers in billions: {num_parameters_in_embedding_layers / 10**9:.2f}"
+        )
+        print(f"Total number of parameters in billions: {num_total_parameters / 10**9:.2f}")
 
     # Most loaded model shard has (1/pp_size transformer layers + 1 embedding layer) / tp_size.
     num_parameters_on_most_loaded_model_shard = (
@@ -75,7 +82,9 @@ def compute_activation_memory(args, num_microbatches, verbose=False):
     # are for the first pipeline stage.
 
     # Memory footprint from transformer layer (self-attention and MLP).
-    activation_memory = (args.seq_length * args.micro_batch_size * args.hidden_size) * 34
+    activation_memory = (args.seq_length * args.micro_batch_size * args.hidden_size) * (
+        18 + (4 * (args.ffn_hidden_size / args.hidden_size))
+    )
     if verbose:
         print(
             f"Activation memory footprint per transformer layer: "

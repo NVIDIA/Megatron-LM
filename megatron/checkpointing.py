@@ -10,7 +10,8 @@ import numpy as np
 import torch
 
 from megatron import update_num_microbatches
-from megatron.core import mpu, tensor_parallel
+from megatron.core import mpu, tensor_parallel, dist_checkpointing
+from .core.dist_checkpointing.mapping import ShardedObject
 from .global_vars import get_args
 from .utils import (unwrap_model,
                     print_rank_0)
@@ -59,33 +60,37 @@ def check_checkpoint_args(checkpoint_args):
     if args.vocab_file:
         _compare('max_position_embeddings')
         _compare('make_vocab_size_divisible_by')
-        _compare('padded_vocab_size')
+        if not args.use_dist_ckpt:
+            _compare('padded_vocab_size')
         _compare('tokenizer_type')
     if args.data_parallel_random_init:
         _compare('data_parallel_random_init')
     if get_checkpoint_version() < 3.0:
         _compare('tensor_model_parallel_size',
                  old_arg_name='model_parallel_size')
-    if get_checkpoint_version() >= 3.0:
+    if get_checkpoint_version() >= 3.0 and not args.use_dist_ckpt:
         _compare('tensor_model_parallel_size')
         _compare('pipeline_model_parallel_size')
 
-
-def ensure_directory_exists(filename):
+def ensure_directory_exists(filename, check_parent=True):
     """Build filename's path if it does not already exists."""
-    dirname = os.path.dirname(filename)
-    os.makedirs(dirname, exist_ok = True)
+    dirname = os.path.dirname(filename) if check_parent else filename
+    os.makedirs(dirname, exist_ok=True)
 
 
 def get_checkpoint_name(checkpoints_path, iteration, release=False,
                         pipeline_parallel=None,
                         tensor_rank=None, pipeline_rank=None,
-                        expert_parallel=None, expert_rank=None):
+                        expert_parallel=None, expert_rank=None,
+                        return_base_dir=False):
     """Determine the directory name for this rank's checkpoint."""
     if release:
         directory = 'release'
     else:
         directory = 'iter_{:07d}'.format(iteration)
+    if return_base_dir:
+        common_path = os.path.join(checkpoints_path, directory)
+        return common_path
 
     # Use both the tensor and pipeline MP rank.
     if pipeline_parallel is None:
@@ -161,7 +166,14 @@ def find_checkpoint_rank_0(checkpoints_path, iteration, release=False):
     if os.path.isfile(filename):
         return filename
 
-    return None, None
+    # Look for a distributed checkpoint
+    filename = get_checkpoint_name(checkpoints_path, iteration, release,
+                                   pipeline_parallel=True,
+                                   return_base_dir=True)
+    if dist_checkpointing.check_is_distributed_checkpoint(filename):
+        return filename
+
+    return None
 
 
 def get_checkpoint_tracker_filename(checkpoints_path):
@@ -212,7 +224,7 @@ def read_metadata(tracker_filename):
     return max_iter, release
 
 
-def get_rng_state():
+def get_rng_state(use_dist_ckpt: bool = False):
     """ collect rng state across data parallel ranks """
     args = get_args()
     rng_state = {
@@ -235,6 +247,14 @@ def get_rng_state():
     else:
         rng_state_list = [rng_state]
 
+    if use_dist_ckpt:
+        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        pp_size = mpu.get_pipeline_model_parallel_world_size()
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        tp_size = mpu.get_tensor_model_parallel_world_size()
+        rng_state_list = ShardedObject('rng_state', rng_state_list, (pp_size, tp_size), (pp_rank, tp_rank),
+                                       replica_id=mpu.get_data_parallel_rank(with_context_parallel=True))
+
     return rng_state_list
 
 
@@ -246,17 +266,18 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
     # Only rank zero of the data parallel writes to the disk.
     model = unwrap_model(model)
 
-    print_rank_0('saving checkpoint at iteration {:7d} to {}'.format(
-        iteration, args.save))
+    ckpt_format = args.dist_ckpt_format if args.use_dist_ckpt else 'torch'
+    print_rank_0('saving checkpoint at iteration {:7d} to {} in {} format'.format(
+        iteration, args.save, ckpt_format))
 
     # Collect rng state across data parallel ranks.
-    rng_state = get_rng_state()
+    rng_state = get_rng_state(args.use_dist_ckpt)
 
     # Checkpoint name.
-    checkpoint_name = get_checkpoint_name(args.save, iteration)
+    checkpoint_name = get_checkpoint_name(args.save, iteration, return_base_dir=args.use_dist_ckpt)
 
     # Save distributed optimizer's custom parameter state.
-    if args.use_distributed_optimizer and not args.no_save_optim and optimizer is not None:
+    if args.use_distributed_optimizer and not args.no_save_optim and optimizer is not None and not args.use_dist_ckpt:
         optim_checkpoint_name = \
             get_distributed_optimizer_checkpoint_name(checkpoint_name)
         ensure_directory_exists(optim_checkpoint_name)
@@ -264,37 +285,23 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
 
     # Collect args, model, RNG.
     if not torch.distributed.is_initialized() \
-            or mpu.get_data_modulo_expert_parallel_rank() == 0:
+            or mpu.get_data_modulo_expert_parallel_rank() == 0 \
+            or args.use_dist_ckpt:
 
-        # Arguments, iteration, and model.
-        state_dict = {}
-        state_dict['args'] = args
-        state_dict['checkpoint_version'] = 3.0
-        state_dict['iteration'] = iteration
+        state_dict = generate_state_dict(args, model, optimizer, opt_param_scheduler, rng_state,
+                                         args.use_dist_ckpt, iteration)
+
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
-        if len(model) == 1:
-            state_dict['model'] = model[0].state_dict_for_save_checkpoint()
+        if args.use_dist_ckpt:
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                ensure_directory_exists(checkpoint_name,
+                                        check_parent=False)
+            dist_checkpointing.save(state_dict, checkpoint_name, (args.dist_ckpt_format, 1))
+
         else:
-            for i in range(len(model)):
-                mpu.set_virtual_pipeline_model_parallel_rank(i)
-                state_dict['model%d' % i] = \
-                    model[i].state_dict_for_save_checkpoint()
-
-        # Optimizer stuff.
-        if not args.no_save_optim:
-            if optimizer is not None:
-                state_dict['optimizer'] = optimizer.state_dict()
-            if opt_param_scheduler is not None:
-                state_dict['opt_param_scheduler'] = \
-                    opt_param_scheduler.state_dict()
-
-        # RNG states.
-        if not args.no_save_rng:
-            state_dict["rng_state"] = rng_state
-
-        # Save.
-        ensure_directory_exists(checkpoint_name)
-        torch.save(state_dict, checkpoint_name)
+            # Save.
+            ensure_directory_exists(checkpoint_name)
+            torch.save(state_dict, checkpoint_name)
 
     # Wait so everyone is done (necessary)
     if torch.distributed.is_initialized():
@@ -313,6 +320,42 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
     # Wait so everyone is done (not necessary)
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
+
+
+def generate_state_dict(args, model, optimizer, opt_param_scheduler,
+                        rng_state, use_dist_ckpt=False, iteration=None,
+                        is_loading=False):
+    # Arguments, iteration, and model.
+    state_dict = {}
+    state_dict['args'] = args
+    state_dict['checkpoint_version'] = 3.0
+    if iteration is not None:
+        state_dict['iteration'] = iteration
+
+    if len(model) == 1:
+        state_dict['model'] = (model[0].sharded_state_dict()
+                               if use_dist_ckpt else
+                               model[0].state_dict_for_save_checkpoint())
+    else:
+        for i in range(len(model)):
+            mpu.set_virtual_pipeline_model_parallel_rank(i)
+            state_dict['model%d' % i] = (
+                model[i].sharded_state_dict()
+                if use_dist_ckpt else
+                model[i].state_dict_for_save_checkpoint())
+    # Optimizer stuff.
+    if not args.no_save_optim:
+        if optimizer is not None:
+            state_dict['optimizer'] = (optimizer.sharded_state_dict(state_dict, is_loading)
+                                       if use_dist_ckpt else
+                                       optimizer.state_dict())
+        if opt_param_scheduler is not None:
+            state_dict['opt_param_scheduler'] = \
+                opt_param_scheduler.state_dict()
+    # RNG states.
+    if not args.no_save_rng:
+        state_dict["rng_state"] = rng_state
+    return state_dict
 
 
 def _transpose_first_dim(t, num_splits, num_splits_first, model):
@@ -385,7 +428,7 @@ def fix_query_key_value_ordering(model, checkpoint_version):
                      " checkpoint version {}".format(checkpoint_version))
 
 
-def _load_base_checkpoint(load_dir, rank0=False):
+def _load_base_checkpoint(load_dir, rank0=False, sharded_state_dict=None):
     """ Load the base state_dict from the given directory
 
     If rank0 is true, just loads rank 0 checkpoint, ignoring arguments.
@@ -410,14 +453,33 @@ def _load_base_checkpoint(load_dir, rank0=False):
     # Checkpoint.
     if rank0:
         checkpoint_name = find_checkpoint_rank_0(load_dir, iteration, release)
+        is_dist_ckpt = checkpoint_name is not None and dist_checkpointing.check_is_distributed_checkpoint(checkpoint_name)
     else:
-        checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
+        checkpoint_name = get_checkpoint_name(load_dir, iteration, release,
+                                              return_base_dir=True)
+        is_dist_ckpt = dist_checkpointing.check_is_distributed_checkpoint(checkpoint_name)
+        if not is_dist_ckpt:
+            checkpoint_name = get_checkpoint_name(load_dir, iteration, release,
+                                                  return_base_dir=False)
+        dist_infix = "distributed " if is_dist_ckpt else ""
         if release:
-            print_rank_0(f' loading release checkpoint from {load_dir}')
+            print_rank_0(f' loading release {dist_infix}checkpoint from {load_dir}')
         else:
-            print_rank_0(f' loading checkpoint from {load_dir} at iteration {iteration}')
+            print_rank_0(f' loading {dist_infix}checkpoint from {load_dir} at iteration {iteration}')
 
     # Load the checkpoint.
+    if is_dist_ckpt:
+        if rank0:
+            state_dict = dist_checkpointing.load_common_state_dict(checkpoint_name)
+            return state_dict, checkpoint_name, release
+
+        if sharded_state_dict is None:
+            args = get_args()
+            assert not args.auto_detect_ckpt_format and not args.use_dist_ckpt, (args.auto_detect_ckpt_format, args.use_dist_ckpt)
+            raise RuntimeError('Detected load from a distributed checkpoint, but neither --use-dist-ckpt nor --auto-detect-ckpt-format is set.')
+        state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name)
+        return state_dict, checkpoint_name, release
+
     try:
         state_dict = torch.load(checkpoint_name, map_location='cpu')
     except ModuleNotFoundError:
@@ -506,7 +568,9 @@ def load_args_from_checkpoint(args, load_arg='load'):
     _set_arg('add_position_embedding', force=True)
     _set_arg('use_rotary_position_embeddings', force=True)
     _set_arg('rotary_percent', force=True)
+    _set_arg('rotary_interleaved', force=True)
     _set_arg('add_bias_linear', force=True)
+    _set_arg('add_qkv_bias', force=True)
     _set_arg('swiglu', force=True)
     _set_arg('untie_embeddings_and_output_weights', force=True)
     _set_arg('apply_layernorm_1p', force=True)
@@ -535,7 +599,30 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
 
     model = unwrap_model(model)
 
-    state_dict, checkpoint_name, release = _load_base_checkpoint(load_dir, rank0=False)
+    load_kwargs = {}
+    is_dist_ckpt = False
+    if args.auto_detect_ckpt_format or args.use_dist_ckpt:
+        state_dict, checkpoint_name, release = _load_base_checkpoint(load_dir, rank0=True)
+        is_dist_ckpt = dist_checkpointing.check_is_distributed_checkpoint(checkpoint_name)
+        if is_dist_ckpt:
+            ckpt_tp_pp = (state_dict['args'].tensor_model_parallel_size, state_dict['args'].pipeline_model_parallel_size)
+            run_tp_pp = (mpu.get_tensor_model_parallel_world_size(), mpu.get_pipeline_model_parallel_world_size())
+            mismatch_msg = "(TP, PP) mismatch after resume ({} vs {} from checkpoint)".format(ckpt_tp_pp, run_tp_pp)
+
+            if ckpt_tp_pp == run_tp_pp and not getattr(state_dict['args'], 'no_save_rng', False):
+                rng_state = get_rng_state(True)  # we can load the rng state
+            else:
+                rng_state = None
+                print_rank_0("{}: RNG state will be ignored".format(mismatch_msg))
+
+            # TODO: add DistributedOptimizer support for differing TPxPP
+            if ckpt_tp_pp != run_tp_pp and not release and not args.finetune and not args.no_load_optim and args.use_distributed_optimizer:
+                raise RuntimeError("{}: not supported for DistributedOptimizer".format(mismatch_msg))
+
+            load_kwargs['sharded_state_dict'] = generate_state_dict(args, model, optimizer, opt_param_scheduler,
+                                                                    rng_state, args.use_dist_ckpt, is_loading=True)
+
+    state_dict, checkpoint_name, release = _load_base_checkpoint(load_dir, rank0=False, **load_kwargs)
 
     # Checkpoint not loaded.
     if state_dict is None:
@@ -563,8 +650,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 iteration = state_dict['total_iters']
             except KeyError:
                 print_rank_0('A metadata file exists but unable to load '
-                             'iteration from checkpoint {}, exiting'.format(
-                                 checkpoint_name))
+                             'iteration from checkpoint {}, exiting'.format(checkpoint_name))
                 sys.exit()
     num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
 
@@ -604,7 +690,8 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 optimizer.load_state_dict(state_dict['optimizer'])
 
             # Load distributed optimizer's custom parameter state.
-            if args.use_distributed_optimizer:
+            # For distributed checkpoint it's already loaded in load_state_dict above
+            if args.use_distributed_optimizer and not is_dist_ckpt:
                 tracker_filename = get_checkpoint_tracker_filename(load_dir)
                 iteration, release = read_metadata(tracker_filename)
                 model_checkpoint_name = \

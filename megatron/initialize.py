@@ -16,6 +16,7 @@ from megatron import get_args
 from megatron import get_tensorboard_writer
 from megatron.core import mpu, tensor_parallel
 from megatron.arguments import parse_args, validate_args
+from megatron.yaml_arguments import validate_yaml
 from megatron.checkpointing import load_args_from_checkpoint
 from megatron.global_vars import set_global_variables
 from megatron.model.transformer import bias_dropout_add_fused_train
@@ -47,7 +48,11 @@ def initialize_megatron(
         assert args.load is not None, "--use-checkpoints-args requires --load argument"
         load_args_from_checkpoint(args)
 
-    validate_args(args, args_defaults)
+    if args.yaml_cfg is not None:
+        args = validate_yaml(args, args_defaults)
+    else:
+        validate_args(args, args_defaults)
+
 
     # set global args, build tokenizer, and set adlr-autoresume,
     # tensorboard-writer, and timers.
@@ -189,7 +194,7 @@ def _initialize_tp_communicators():
     else:
        ub_cfgs = {}
 
-    input_shape = [args.seq_length * args.micro_batch_size , args.hidden_size]
+    input_shape = [(args.seq_length * args.micro_batch_size) // args.context_parallel_size , args.hidden_size]
 
     #We create a MPI process group, which is needed to bootstrap the pipelined 
     #tensor-model-parallel communication overlap

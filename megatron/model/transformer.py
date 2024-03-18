@@ -509,7 +509,7 @@ class ParallelAttention(MegatronModule):
         self.attn_mask_type = attn_mask_type
         self.params_dtype = config.params_dtype
         self.sequence_parallel = config.sequence_parallel
-
+        self.config = config
         self.group_query_attention = args.group_query_attention
         self.num_query_groups = args.num_query_groups
 
@@ -556,7 +556,7 @@ class ParallelAttention(MegatronModule):
                 query_projection_size + 2 * kv_projection_size,
                 config=config,
                 init_method=config.init_method,
-                bias=args.add_bias_linear,
+                bias=args.add_bias_linear or args.add_qkv_bias,
                 gather_output=False)
         else:
             assert attention_type == AttnType.cross_attn
@@ -783,8 +783,8 @@ class ParallelAttention(MegatronModule):
         # apply relative positional encoding (rotary embedding)
         if rotary_pos_emb is not None:
             q_pos_emb, k_pos_emb = rotary_pos_emb
-            query_layer = apply_rotary_pos_emb(query_layer, q_pos_emb)
-            key_layer = apply_rotary_pos_emb(key_layer, k_pos_emb)
+            query_layer = apply_rotary_pos_emb(query_layer, q_pos_emb,self.config)
+            key_layer = apply_rotary_pos_emb(key_layer, k_pos_emb,self.config)
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect

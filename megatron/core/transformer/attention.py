@@ -277,9 +277,12 @@ class Attention(MegatronModule, ABC):
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
             query = apply_rotary_pos_emb(
-                query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q
+                query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q,
             )
-            key = apply_rotary_pos_emb(key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv)
+            key = apply_rotary_pos_emb(
+                key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv,
+            )
+
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
@@ -289,7 +292,7 @@ class Attention(MegatronModule, ABC):
         # core attention computation
         # ==================================
 
-        if self.checkpoint_core_attention:
+        if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 query,
                 key,
@@ -353,7 +356,7 @@ class SelfAttention(Attention):
             config=self.config,
             init_method=self.config.init_method,
             gather_output=False,
-            bias=self.config.add_bias_linear,
+            bias=self.config.add_bias_linear or self.config.add_qkv_bias,
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name='qkv',

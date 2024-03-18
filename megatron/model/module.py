@@ -63,6 +63,9 @@ class MegatronModule(torch.nn.Module):
             self.shared_embedding_or_output_weight().zero_out_wgrad = True
             return
 
+        if mpu.is_pipeline_first_stage() and self.pre_process and not self.post_process:
+           self.shared_embedding_or_output_weight().shared_embedding = True
+
         # Parameters are shared between the word embeddings layers, and the
         # heads at the end of the model. In a pipelined setup with more than
         # one stage, the initial embedding layer and the head are on different
@@ -85,6 +88,7 @@ class MegatronModule(torch.nn.Module):
                 config=self.config, init_method=self.config.init_method)
             self.word_embeddings.weight.data.fill_(0)
             self.word_embeddings.weight.shared = True
+            self.word_embeddings.weight.shared_embedding = True
 
         # Zero out initial weights for decoder embedding.
         # NOTE: We don't currently support T5 with the interleaved schedule.

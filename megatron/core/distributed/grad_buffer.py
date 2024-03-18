@@ -1,6 +1,7 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import math
+import os
 from logging import getLogger
 from typing import Dict, List
 
@@ -41,6 +42,10 @@ class Bucket:
             is used instead.
         use_distributed_optimizer: If true, issue reduce-scatter communication calls as part
             of distributed optimizer. If false, issue all-reduce communication calls.
+        gradient_scaling_factor: This factor is utilized to scale gradients prior to their
+            communication. Its application is twofold: it facilitates the averaging of gradients
+            and the scaling of gradients in the context of the Mixture of Experts (MoE) model.
+        check_for_nan_in_grad: If true, check if local grad norm is NaN.
     """
 
     def __init__(
@@ -53,6 +58,8 @@ class Bucket:
         data_parallel_world_size: int,
         overlap_grad_reduce: bool,
         use_distributed_optimizer: bool,
+        gradient_scaling_factor: float,
+        check_for_nan_in_grad: bool,
     ):
         # State for bookkeeping: params is the set of parameters this bucket is
         # responsible for, params_with_grad is the set of parameters with grads
@@ -71,6 +78,8 @@ class Bucket:
         self.data_parallel_rank = torch.distributed.get_rank(group=data_parallel_group)
         self.overlap_grad_reduce = overlap_grad_reduce
         self.use_distributed_optimizer = use_distributed_optimizer
+        self.gradient_scaling_factor = gradient_scaling_factor
+        self.check_for_nan_in_grad = check_for_nan_in_grad
 
         self.reset()
 
@@ -95,7 +104,18 @@ class Bucket:
             self.communication_handle is None and not self.communication_issued
         ), 'Should not have multiple communication calls in flight at once'
 
-        self.data /= self.data_parallel_world_size
+        # Make sure norm of grads in bucket are not NaN
+        # prior to data-parallel all-reduce / reduce-scatter.
+        if self.check_for_nan_in_grad:
+            global_rank = torch.distributed.get_rank()
+            norm = self.data.norm(p=2)
+            assert not norm.isnan(), (
+                f'Rank {global_rank}: found NaN in local grad norm in '
+                f'backward pass before data-parallel communication collective. '
+                f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
+            )
+
+        self.data *= self.gradient_scaling_factor
         # Use async_op only when overlap_grad_reduce is True.
         if self.use_distributed_optimizer:
             local_data_view = shard_buffer(self.data, self.data_parallel_world_size)[
@@ -165,6 +185,10 @@ class GradBuffer:
             is used instead.
         use_distributed_optimizer: If true, issue reduce-scatter communication calls as part
             of distributed optimizer. If false, issue all-reduce communication calls.
+        gradient_scaling_factor: This factor is utilized to scale gradients prior to their
+            communication. Its application is twofold: it facilitates the averaging of gradients
+            and the scaling of gradients in the context of the Mixture of Experts (MoE) model.
+        check_for_nan_in_grad: If true, check if local grad norm is NaN.
     """
 
     def __init__(
@@ -176,6 +200,8 @@ class GradBuffer:
         param_to_name: Dict[torch.nn.Parameter, str],
         overlap_grad_reduce: bool,
         use_distributed_optimizer: bool,
+        gradient_scaling_factor: float,
+        check_for_nan_in_grad: bool,
     ):
 
         # Check that params are unique.
@@ -193,6 +219,8 @@ class GradBuffer:
         )
         self.overlap_grad_reduce = overlap_grad_reduce
         self.use_distributed_optimizer = use_distributed_optimizer
+        self.gradient_scaling_factor = gradient_scaling_factor
+        self.check_for_nan_in_grad = check_for_nan_in_grad
         self.is_last_microbatch = True
 
         # Data structures to store underlying buckets and relevant indexing data.
@@ -200,8 +228,10 @@ class GradBuffer:
         self.param_to_bucket = {}  # Param -> bucket mapping.
         self.param_index_map = {}  # Param -> location in buffer mapping (used in dist. optimizer).
 
-        def _pad_if_needed(data_index: int):
-            """Pads data indices if using distributed optimizer (to ensure uniform sharding)."""
+        def _pad_if_needed(data_index: int) -> int:
+            """
+            Pads data indices if using distributed optimizer (to ensure uniform sharding).
+            """
             if use_distributed_optimizer:
                 return (
                     int(math.ceil(data_index / self.data_parallel_world_size))
@@ -218,6 +248,24 @@ class GradBuffer:
         self.bucket_indices = []
         per_bucket_numel_unpadded = []
         bucket_id = 0
+
+        def _create_new_bucket(data_end_index: int) -> int:
+            """
+            Create the bucket_id'th bucket with collected bucket_params, starting at
+            bucket_data_start_index.
+            """
+            nonlocal bucket_data_start_index, bucket_params, bucket_id
+            per_bucket_numel_unpadded.append(data_end_index - bucket_data_start_index)
+            data_end_index = _pad_if_needed(data_end_index)
+            # Update bucket metadata.
+            self.bucket_indices.append((bucket_data_start_index, data_end_index))
+            bucket_data_start_index = data_end_index
+            # Re-set bucket_params and increment bucket_id for next bucket.
+            bucket_params = set()
+            bucket_id += 1
+            # Return the potentially padded data_end_index.
+            return data_end_index
+
         for param in params[::-1]:
             # Iterate through parameters in reverse order to roughly follow backprop order,
             # and skip parameters that don't require gradients.
@@ -225,6 +273,26 @@ class GradBuffer:
                 continue
             this_numel = param.data.nelement()
             data_end_index = data_start_index + this_numel
+
+            def _does_param_require_new_bucket(param):
+                """
+                Split shared embedding parameters into separate bucket if using distributed
+                optimizer that makes use of reduce-scatters instead of all-reduces.
+                This ensures that the first and last pipeline stage partition optimizer state
+                for the shared embedding parameters the same way across DP replicas, allowing
+                the DP reduce-scatter to be before the embedding all-reduce.
+                """
+                return getattr(param, "shared_embedding", False) and self.use_distributed_optimizer
+
+            # Create bucket with already collected parameters if current param needs its own bucket.
+            if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
+                # We are creating a bucket for the already accumulated parameters, whose params
+                # end at the current data_start_index.
+                if use_distributed_optimizer:
+                    # data_start_index should already be padded.
+                    assert data_start_index % self.data_parallel_world_size == 0
+                _create_new_bucket(data_start_index)
+
             self.param_index_map[param] = (
                 data_start_index,
                 data_end_index,
@@ -232,33 +300,18 @@ class GradBuffer:
             )
             bucket_params.add(param)
 
-            # If we have enough elements already, form a new bucket.
-            # If bucket_size is None, accumulate everything into a single bucket.
-
-            # TODO: Remove len(bucket_params) > 1 when the final head that transforms token
-            # representations from hidden space to vocabulary space is in a PyTorch module
-            # whose forward method is called. If it is not and a bucket contains only this
-            # one parameter, we get incorrect behavior (i.e., higher losses) since we do not
-            # call the wait function on the bucket's all_gather_handle (we use forward pre-
-            # hooks on PyTorch modules to do this when --overlap-param-gather is used).
-            # As a temporary workaround, we make sure that no bucket has only one parameter.
-            if bucket_size is not None:
-                if (data_end_index - bucket_data_start_index) >= bucket_size and len(
-                    bucket_params
-                ) > 1:
-                    per_bucket_numel_unpadded.append(data_end_index - bucket_data_start_index)
-                    data_end_index = _pad_if_needed(data_end_index)
-                    self.bucket_indices.append((bucket_data_start_index, data_end_index))
-                    bucket_data_start_index = data_end_index
-                    bucket_params = set()
-                    bucket_id += 1
+            # If we have enough elements already or the current param is part of the shared embedding
+            # layer and needs a separate bucket, form a new bucket.
+            if (
+                bucket_size is not None
+                and (data_end_index - bucket_data_start_index) >= bucket_size
+            ) or _does_param_require_new_bucket(param):
+                data_end_index = _create_new_bucket(data_end_index)
             data_start_index = data_end_index
 
         # Add remaining params to a new bucket.
         if len(bucket_params) > 0:
-            per_bucket_numel_unpadded.append(data_end_index - bucket_data_start_index)
-            data_end_index = _pad_if_needed(data_end_index)
-            self.bucket_indices.append((bucket_data_start_index, data_end_index))
+            data_end_index = _create_new_bucket(data_end_index)
 
         # Next, create underlying storage for buffer (with numel elements that includes
         # padding as necessary).
@@ -304,11 +357,6 @@ class GradBuffer:
                 numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
                 bucket_id=cur_bucket_id,
             )
-
-        if not overlap_grad_reduce:
-            assert len(bucket_params) == len(
-                params
-            ), 'All params should be in one bucket when overlap_grad_reduce is False'
 
         # Log buckets for all PP stages.
         if (
@@ -368,6 +416,8 @@ class GradBuffer:
             data_parallel_world_size=self.data_parallel_world_size,
             overlap_grad_reduce=self.overlap_grad_reduce,
             use_distributed_optimizer=self.use_distributed_optimizer,
+            gradient_scaling_factor=self.gradient_scaling_factor,
+            check_for_nan_in_grad=self.check_for_nan_in_grad,
         )
         self.buckets.append(bucket)
         for bucket_param in bucket_params:

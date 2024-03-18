@@ -29,9 +29,11 @@ class TransformerConfig(ModelParallelConfig):
             layernorm_epsilon (float): Layernorm epsilon. Defaults to 1e-5.
             layernorm_zero_centered_gamma (bool): if set to 'True', the LayerNorm is adjusted to center the gamma values around 0. This improves numerical stability. Defaults to False.
             add_bias_linear (bool): Include a bias term in all linear layers (QKV projections, after core attention, and two in MLP layer). Default is True.
+            add_qkv_bias (bool): Add a bias term only for QKV projections. Default is False.
             gated_linear_unit (bool): Use a gated linear unit for the first linear layer in the MLP. Defaults to False.
             activation_func (Callable): Activation function to use for the non-linearity in the MLP. Defaults to F.gelu.
             num_moe_experts (int): Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Defaults to None (no MoE).
+            rotary_interleaved (bool): True is rotate pairs of even and odd dimensions (RoFormer style), False is rotate pairs of first half and second half (LLaMa style). Default to False.
             init_method (Callable): Method to initialize weights. Note that bias is always set to zero. Should be a function that takes a single Tensor and initializes it. Defaults to megatron.core.utils.init_method_normal(init_method_std) which is torch nn init normal with mean=0.0 and std=init_method_Std.
             output_layer_init_method (Callable): Method to initialize weights of the output layer of both attention and MLP blocks. Defaults to megatron.core.utils.scaled_init_method_normal(init_method_std) which is torch nn init normal with mean=0.0 and std=init_method_std / math.sqrt(2.0 * num_layers).
             init_method_std (float): Standard deviation of the zero mean normal for the default initialization method, not used if init_method and output_layer_init_method are provided. Defaults to 0.02.
@@ -53,9 +55,10 @@ class TransformerConfig(ModelParallelConfig):
             fp8_amax_compute_algo (str): Algorithm used for choosing the `amax` value for the scaling factor computation. There are 2 predefined choices: `max` chooses the largest `amax` in the history window, while `most_recent` always chooses the most recently seen value.
             fp8_wgrad (bool): When set to False, override FP8 config options and do the wgrad computation in higher precision. Defaults to True.
             clone_scatter_output_in_embedding (bool): When set to true, clone the output of scatter_to_sequence_parallel_region in embedding layer to facilitate garbage collection of input.
+            disable_parameter_transpose_cache (bool): When set to true, the parameter transposes are not cached for subsequent iterations. Defaults to False.
             normalization (str): Swtich b/w `LayerNorm` and `RMSNorm` as normalization layers. For now, these are primarily used by Transformer-Engine's layers like `LayerNormLinear`. Default value is `LayerNorm`.
             window_size ((int,int) or None): If not None, then will use sliding window attention. The size of the window is specified by the numbers inside the tuple; -1 is special value meaning "infinite window size".
-            moe_router_load_balancing_type (str): Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "None" implies no load balancing. The default is "aux_loss".
+            moe_router_load_balancing_type (str): Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".
             moe_router_topk (int): Number of experts to route to for each token. The default is 2.
             moe_grouped_gemm (bool): When there are multiple experts per rank, compress multiple local (potentially small)
             gemms in a single kernel launch to improve the utilization and performance by leveraging the Grouped GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
@@ -81,9 +84,11 @@ class TransformerConfig(ModelParallelConfig):
     layernorm_epsilon: float = 1e-5
     layernorm_zero_centered_gamma: bool = False
     add_bias_linear: bool = True
+    add_qkv_bias: bool = False
     gated_linear_unit: bool = False
     activation_func: Callable = F.gelu
     num_moe_experts: int = None
+    rotary_interleaved: bool = False
     window_size: Optional[Tuple[int, int]] = None
 
     # initialization
@@ -121,6 +126,7 @@ class TransformerConfig(ModelParallelConfig):
 
     # miscellaneous
     clone_scatter_output_in_embedding: bool = True
+    disable_parameter_transpose_cache: bool = False
 
     # experimental section (TODO: move to apt. section above once stable)
     normalization: bool = "LayerNorm"  # alt value supported by TE: "RMSNorm"
@@ -133,6 +139,10 @@ class TransformerConfig(ModelParallelConfig):
     moe_z_loss_coeff: float = None  # 1e-3 would be a good start value for z-loss
     moe_input_jitter_eps: float = None
     moe_token_dropping: bool = False  # TODO: Support token dropping.
+
+    # These 2 attributes are WAR for TRTLLM export. DO NOT USE!! WILL BE DEPRECATED SOON!!
+    max_position_embeddings: int = 0
+    rotary_percent: float = 0
 
     def __post_init__(self):
         """ Python dataclass method that is used to modify attributes after initialization.
@@ -171,7 +181,12 @@ class TransformerConfig(ModelParallelConfig):
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
             raise ValueError(f'num_moe_experts must be non None to use expert-parallel.')
 
-        if self.cpu_offloading_num_layers < 0 or self.cpu_offloading_num_layers >= self.num_layers:
+        if self.num_moe_experts is not None and self.num_moe_experts <= 0:
+            raise ValueError(f'num_moe_experts must be non-negative.')
+
+        if self.cpu_offloading and (
+            self.cpu_offloading_num_layers < 0 or self.cpu_offloading_num_layers >= self.num_layers
+        ):
             raise ValueError(
                 f'CPU offloading can be done only for layers less than {self.num_layers}'
             )
@@ -237,6 +252,8 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "When bias_activation_fusion is True and activation function is gelu, add_bias_linear must also be True."
                 )
+        if self.apply_rope_fusion and self.rotary_interleaved:
+            raise ValueError(f'rotary_interleaved does not work with apply_rope_fusion.')
 
         if self.init_method is None:
             self.init_method = init_method_normal(self.init_method_std)

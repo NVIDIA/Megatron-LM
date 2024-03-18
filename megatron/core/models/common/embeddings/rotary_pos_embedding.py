@@ -34,7 +34,9 @@ __all__ = ['RotaryEmbedding', 'apply_rotary_pos_emb']
 def get_pos_emb_on_this_cp_rank(pos_emb, seq_dim):
     cp_size = parallel_state.get_context_parallel_world_size()
     cp_rank = parallel_state.get_context_parallel_rank()
-    cp_idx = torch.tensor([cp_rank, (2 * cp_size - cp_rank - 1)], device=pos_emb.device)
+    cp_idx = torch.tensor(
+        [cp_rank, (2 * cp_size - cp_rank - 1)], device="cpu", pin_memory=True
+    ).cuda(non_blocking=True)
     pos_emb = pos_emb.view(
         *pos_emb.shape[:seq_dim], 2 * cp_size, -1, *pos_emb.shape[(seq_dim + 1) :]
     )
@@ -57,6 +59,7 @@ class RotaryEmbedding(nn.Module):
         self,
         kv_channels: int,
         rotary_percent: float,
+        rotary_interleaved: bool = False,
         seq_len_interpolation_factor: float = None,
         rotary_base: int = 10000,
     ) -> None:
@@ -65,6 +68,7 @@ class RotaryEmbedding(nn.Module):
         dim = kv_channels
         if rotary_percent < 1.0:
             dim = int(dim * rotary_percent)
+        self.rotary_interleaved = rotary_interleaved
 
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
         self.inv_freq = 1.0 / (
@@ -96,7 +100,12 @@ class RotaryEmbedding(nn.Module):
         freqs = torch.outer(seq, self.inv_freq)
         # first part even vector components, second part odd vector components,
         #  2 * dim in dimension size
-        emb = torch.cat((freqs, freqs), dim=-1)
+        if not self.rotary_interleaved:
+            emb = torch.cat((freqs, freqs), dim=-1)
+        else:
+            emb = torch.stack((freqs.view(-1, 1), freqs.view(-1, 1)), dim=-1).view(
+                freqs.shape[0], -1
+            )
         # emb [seq_length, .., dim]
         emb = emb[:, None, None, :]
         if parallel_state.get_context_parallel_world_size() > 1:
@@ -142,7 +151,7 @@ class RotaryEmbedding(nn.Module):
         return rotary_seq_len
 
 
-def _rotate_half(x: Tensor) -> Tensor:
+def _rotate_half(x: Tensor, rotary_interleaved: bool) -> Tensor:
     """Change sign so the last dimension becomes [-odd, +even]
 
     Args:
@@ -151,12 +160,17 @@ def _rotate_half(x: Tensor) -> Tensor:
     Returns:
         Tensor: Tensor rotated half
     """
+    if not rotary_interleaved:
+        x1, x2 = torch.chunk(x, 2, dim=-1)
+        return torch.cat((-x2, x1), dim=-1)
+    else:
+        x1 = x[:, :, :, ::2]
+        x2 = x[:, :, :, 1::2]
+        x_new = torch.stack((-x2, x1), dim=-1)
+        return x_new.view(x_new.shape[0], x_new.shape[1], x_new.shape[2], -1)
 
-    x1, x2 = torch.chunk(x, 2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
 
-
-def apply_rotary_pos_emb_bshd(t: Tensor, freqs: Tensor) -> Tensor:
+def apply_rotary_pos_emb_bshd(t: Tensor, freqs: Tensor, rotary_interleaved: bool = False) -> Tensor:
     """Apply rotary positional embedding to input tensor T.
 
     check https://kexue.fm/archives/8265 for detailed formulas
@@ -178,11 +192,14 @@ def apply_rotary_pos_emb_bshd(t: Tensor, freqs: Tensor) -> Tensor:
     cos_ = torch.cos(freqs).to(t.dtype)
     sin_ = torch.sin(freqs).to(t.dtype)
 
-    t = (t * cos_) + (_rotate_half(t) * sin_)
+    t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)
     return torch.cat((t, t_pass), dim=-1)
 
 
-def apply_rotary_pos_emb_thd(t: Tensor, cu_seqlens: Tensor, freqs: Tensor) -> Tensor:
+def apply_rotary_pos_emb_thd(
+    t: Tensor, cu_seqlens: Tensor, freqs: Tensor, rotary_interleaved: bool = False
+) -> Tensor:
+
     """A baseline implementation of applying RoPE for `thd` format.
 
     Args:
@@ -205,7 +222,7 @@ def apply_rotary_pos_emb_thd(t: Tensor, cu_seqlens: Tensor, freqs: Tensor) -> Te
 
 
 def apply_rotary_pos_emb(
-    t: Tensor, freqs: Tensor, config: TransformerConfig, cu_seqlens: Optional[Tensor] = None
+    t: Tensor, freqs: Tensor, config: TransformerConfig, cu_seqlens: Optional[Tensor] = None,
 ):
     """
     Reroute to the appropriate apply_rotary_pos_emb function depending on
@@ -227,6 +244,8 @@ def apply_rotary_pos_emb(
             return fused_apply_rotary_pos_emb_thd(t, cu_seqlens, freqs)
     else:
         if cu_seqlens is None:
-            return apply_rotary_pos_emb_bshd(t, freqs)
+            return apply_rotary_pos_emb_bshd(t, freqs, rotary_interleaved=config.rotary_interleaved)
         else:
-            return apply_rotary_pos_emb_thd(t, cu_seqlens, freqs)
+            return apply_rotary_pos_emb_thd(
+                t, cu_seqlens, freqs, rotary_interleaved=config.rotary_interleaved
+            )

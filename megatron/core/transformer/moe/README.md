@@ -5,26 +5,23 @@
 - **Expert Parallel**
     - A specific method of parallelism for MoE models, where experts are partitioned onto different workers and each worker processes a different batch of training samples, each worker process one or more experts for each MoE layer.
 - **3D Parallel**: Data Parallel , Tensor Parallel, Pipeline Parallel, Sequence Parallel
-    - Note: When using MoE and tensor parallelism, sequence parallelism must be used.
+    - Note: When using MoE with expert parallelism and tensor parallelism, sequence parallelism must be used.
 - **Richer parallel mappings**: EP can be combined with DP/TP/PP/SP for handling larger MoE variants.
 - **Distributed optimizer.**
 
 ### Router and Load Balancing
 
 - Router type:
-    - Top-K router
+    - Top-K MLP router
     - Expert Choice router (coming soon)
 - Load Balancing algorithms:
     - Sinkhorn (S-BASE)
-    - Z-Loss
     - Aux loss / Load balancing loss
 
 ### Performance Optimizations
 
 - GroupedGEMM when num local experts > 1
-    - Supported dtype: fp32/bf16/fp16
-- Token permutation / unpermutation fusion
-- Fused Sinkhorn Kernel
+    - Supported dtype: bf16
 
 ### Token Dispatch Mechanism
 
@@ -36,9 +33,17 @@
 
 ## Upcoming features
 
+- Enhanced cutlass GroupedGEMM kernels
+    - Reduced host-device syncs.
+    - More supported dtype: fp32/bf16/fp16
+    - Kernel heuristics tuned for A100/A10/L40S
+    - BWD cutlass GroupedGEMM kernels supported
+- Token permutation / unpermutation fusion
+- Fused Sinkhorn Kernel
 - Context Parallel with MoE
 - FP8 training support
 - Enable ’--tp-comm-overlap‘ for MoE
+- Distributed optimizer for MoE params.
 
 # User Guide
 
@@ -49,10 +54,11 @@
 | num-experts | Number of Experts in MoE (None means no MoE) |
 | expert-model-parallel-size | Degree of expert model parallelism. |
 | moe-grouped-gemm | When there are multiple experts per rank, compress multiple local gemms into a single kernel launch to improve the utilization and performance by leveraging the Grouped GEMM feature introduced since CUTLASS 2.8 |
-| moe-router-load-balancing-type | Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "None" implies no load balancing. The default is "aux_loss". |
+| moe-router-load-balancing-type | Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss". |
 | moe-router-topk | Number of experts to route to for each token. The default is 2. |
 | moe-aux-loss-coeff | Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended. |
 | moe-z-loss-coeff | Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended. |
+| moe-input-jitter-eps | Add noise to the input tensor by applying jitter with a specified epsilon value. |
 | moe-token-dropping | This feature involves selectively dropping and padding tokens for each expert to achieve a specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note: Currently unsupported. |
 
 ### Example
@@ -62,15 +68,17 @@ To train a top-2 MoE model with an auxiliary loss, include the following argumen
 ```python
 --num-experts 8
 --expert-model-parallel-size 8
---moe-router-load-balancing-type aux_loss # options: aux_loss, sinkhorn, None. Default is sinkhorn1.
+--moe-grouped-gemm
+--moe-router-load-balancing-type aux_loss # options: aux_loss, sinkhorn, none. Default is aux_loss.
 --moe-router-topk 2
 --moe-aux-loss-coeff 1e-2
+--use-distributed-optimizer
 ```
 ## A detailed MoE script:
 <details>
 <summary>Click here. </summary>
     
-```python
+```bash
 #!/bin/bash
 
 # Runs Mixtral 8x7B model on 16 A100 GPUs
@@ -121,9 +129,11 @@ MODEL_ARGS=(
 
 MOE_ARGS=(
     --num-experts 8
+    --expert-model-parallel-size 4
     --moe-router-load-balancing-type aux_loss # options: aux_loss, sinkhorn, None. Default is aux_loss.
     --moe-router-topk 2
     --moe-aux-loss-coeff 1e-2
+    --moe-grouped-gemm
 )
 
 DATA_ARGS=(
@@ -150,8 +160,8 @@ TRAINING_ARGS=(
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 4
     --pipeline-model-parallel-size 1
-    --expert-model-parallel-size 4
     --sequence-parallel
+    --use-distributed-optimizer
 )
 
 LOGGING_ARGS=(

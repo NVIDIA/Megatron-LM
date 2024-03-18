@@ -24,6 +24,7 @@ from megatron.utils import (
     average_losses_across_data_parallel_group
 )
 from megatron.arguments import core_transformer_config_from_args
+from megatron.yaml_arguments import core_transformer_config_from_yaml
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 
 
@@ -43,7 +44,11 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
     args = get_args()
 
     print_rank_0('building GPT model ...')
-    config = core_transformer_config_from_args(get_args())
+    # Experimental loading arguments from yaml
+    if args.yaml_cfg is not None:
+        config = core_transformer_config_from_yaml(args, "language_model")
+    else:
+        config = core_transformer_config_from_args(args)
 
     if args.use_mcore_models:
         if args.spec is not None:
@@ -62,7 +67,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             parallel_output=True,
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
-            rotary_percent=args.rotary_percent
+            rotary_percent=args.rotary_percent,
         )
     else:
         assert(args.context_parallel_size == 1), "Context parallelism is only supported with Megatron Core!"
@@ -86,7 +91,7 @@ def get_batch(data_iterator):
         return None, None, None, None, None
 
     # get batches based on the TP rank you are on
-    batch = get_batch_on_this_tp_rank(data_iterator) 
+    batch = get_batch_on_this_tp_rank(data_iterator)
 
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
@@ -99,7 +104,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     Args:
         loss_mask (torch.Tensor): Used to mask out some portions of the loss
         output_tensor (torch.Tensor): The tensor with the losses
-    """    
+    """
     args = get_args()
 
     losses = output_tensor.float()
@@ -163,10 +168,12 @@ def core_gpt_dataset_config_from_args(args):
         split=args.split,
         path_to_cache=args.data_cache_path,
         mock=args.mock_data,
+        mmap_bin_files=args.mmap_bin_files,
         tokenizer=tokenizer,
         reset_position_ids=args.reset_position_ids,
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
+        vocab_size=get_tokenizer().vocab_size,
     )
 
 

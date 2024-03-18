@@ -18,14 +18,78 @@ from megatron.initialize import initialize_megatron
 from megatron.model import GPTModel
 from megatron.training import get_model
 from megatron.text_generation import generate_and_post_process
+from megatron.arguments import core_transformer_config_from_args
+from megatron.core.models.gpt import GPTModel
+from typing import Union
+import megatron.model
+from megatron.core.transformer.spec_utils import import_module
+from megatron.arguments import core_transformer_config_from_args
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec, get_gpt_layer_local_spec
+
+def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.model.GPTModel]:
+    """Builds the model.
+
+    If you set the use_mcore_models to True, it will return the mcore GPT model and if not the legacy GPT model.
+
+    Args:
+        pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
+        post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
 
 
-def model_provider(pre_process=True, post_process=True):
-    """Build the model."""
+    Returns:
+        Union[GPTModel, megatron.model.GPTModel]: The returned model
+    """
+    args = get_args()
 
     print_rank_0('building GPT model ...')
-    model = GPTModel(num_tokentypes=0, parallel_output=False,
-                     pre_process=pre_process, post_process=post_process)
+    config = core_transformer_config_from_args(args)
+
+    if args.use_mcore_models:
+
+        if args.spec is None:
+            if args.transformer_impl == 'local':
+                transformer_layer_spec = get_gpt_layer_local_spec(
+                    num_experts=args.num_experts,
+                    moe_grouped_gemm=args.moe_grouped_gemm
+                )
+            elif args.transformer_impl == 'transformer_engine':
+                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                    num_experts=args.num_experts,
+                    moe_grouped_gemm=args.moe_grouped_gemm
+                )
+            else:
+                raise ValueError(f"Invalid transformer_impl {args.transformer_impl}")
+        elif args.spec[0] == 'local':
+            transformer_layer_spec = get_gpt_layer_local_spec(
+                num_experts=args.num_experts,
+                moe_grouped_gemm=args.moe_grouped_gemm
+            )
+        else:
+            transformer_layer_spec = import_module(args.spec)
+
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=transformer_layer_spec,
+            vocab_size=args.padded_vocab_size,
+            max_sequence_length=args.max_position_embeddings,
+            pre_process=pre_process,
+            post_process=post_process,
+            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+            parallel_output=True,
+            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+            position_embedding_type=args.position_embedding_type,
+            rotary_percent=args.rotary_percent
+        )
+    else:
+        assert(args.context_parallel_size == 1), "Context parallelism is only supported with Megatron Core!"
+
+        model = megatron.model.GPTModel(
+            config,
+            num_tokentypes=0,
+            parallel_output=True,
+            pre_process=pre_process,
+            post_process=post_process
+        )
 
     return model
 

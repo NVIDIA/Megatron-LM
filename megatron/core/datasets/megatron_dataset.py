@@ -4,16 +4,16 @@ import hashlib
 import json
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from typing import Any, Dict, Iterable, List, Union
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 import numpy
 import torch
 
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
-from megatron.core.datasets.indexed_dataset import MMapIndexedDataset
+from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.utils import Split
 
-LowLevelDataset = Union[MMapIndexedDataset, Iterable]
+LowLevelDataset = Union[IndexedDataset, Iterable]
 
 
 class MegatronDataset(ABC, torch.utils.data.Dataset):
@@ -22,8 +22,7 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
     Args:
         dataset (LowLevelDataset): The dataset around which to build the MegatronDataset
 
-        dataset_path (str): The real path on disk to the dataset, for bookkeeping. TODO: subsume
-        this argument by enforcing auto-bookkeeping in the dataset class type.
+        dataset_path (str): The real path on disk to the dataset, for bookkeeping. TODO: subsume this argument by enforcing auto-bookkeeping in the dataset class type.
 
         indices (numpy.ndarray): The set of the documents indices to expose
 
@@ -50,20 +49,21 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
         self.index_split = index_split
         self.config = config
 
-        self.unique_identifiers = OrderedDict()
-        self.unique_identifiers["class"] = type(self).__name__
-        self.unique_identifiers["dataset_path"] = self.dataset_path
-        self.unique_identifiers["num_samples"] = self.num_samples
-        self.unique_identifiers["index_split"] = self.index_split.name
-        for attr in self._key_config_attributes():
-            self.unique_identifiers[attr] = getattr(self.config, attr)
+        if not self.config.mock:
+            self.unique_identifiers = OrderedDict()
+            self.unique_identifiers["class"] = type(self).__name__
+            self.unique_identifiers["dataset_path"] = self.dataset_path
+            self.unique_identifiers["num_samples"] = self.num_samples
+            self.unique_identifiers["index_split"] = self.index_split.name
+            for attr in self._key_config_attributes():
+                self.unique_identifiers[attr] = getattr(self.config, attr)
 
-        self.unique_description = json.dumps(
-            self.unique_identifiers, indent=4, default=lambda obj: obj.unique_identifiers
-        )
-        self.unique_description_hash = hashlib.md5(
-            self.unique_description.encode("utf-8")
-        ).hexdigest()
+            self.unique_description = json.dumps(
+                self.unique_identifiers, indent=4, default=lambda obj: obj.unique_identifiers
+            )
+            self.unique_description_hash = hashlib.md5(
+                self.unique_description.encode("utf-8")
+            ).hexdigest()
 
         self._finalize()
 
@@ -145,43 +145,49 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
 
 
 class MockDataset(MegatronDataset):
-    """The highest level wrapper class from which all dataset classes should inherit
+    """The highest level wrapper class from which all mock dataset classes should inherit
 
     The MockDataset is a special, one-off class that should not serve as a precedent for developers
     seeking to extend the MegatronDataset. This class is incompatible with BlendedDataset
 
     This class cannibalizes the constructor of the parent class. As such, we do not need to
-    enumerate the constructor parameters. They may be populated, but most are superfluous and can
-    be None. Only the split and the config are required.
+    pass in some constructor parameters. They may be populated, but most are superfluous and can
+    be None. Only num_samples, index_split, and config are required.
+
 
     Args:
-       args (Tuple[Any]): The positional arguments used to build an arbitrary MegatronDataset
+        dataset (Optional[LowLevelDataset]): The dataset around which to build the MegatronDataset
+
+        dataset_path (Optional[str]): The real path on disk to the dataset, for bookkeeping. TODO: subsume
+        this argument by enforcing auto-bookkeeping in the dataset class type.
+
+        indices (Optional[numpy.ndarray]): The set of the documents indices to expose
+
+        num_samples (int): The number of samples to draw from the indexed dataset
+
+        index_split (Split): The indices Split
+
+        config (BlendedMegatronDatasetConfig): The config
     """
 
-    def __init__(self, *args: Any) -> None:
-        self.split = None
-        self.config = None
-
-        # Extract a select few parameters
-        for arg in args:
-            # Extract the split for RNG parameterization
-            if issubclass(type(arg), Split):
-                assert self.split is None
-                self.split = arg
-            # Extract the config for sequence_length and mock attribute values
-            if issubclass(type(arg), BlendedMegatronDatasetConfig):
-                assert self.config is None
-                self.config = arg
-
-        assert self.split is not None
-        assert self.config is not None
-
+    def __init__(
+        self,
+        dataset: Optional[LowLevelDataset],
+        dataset_path: Optional[str],
+        indices: Optional[numpy.ndarray],
+        num_samples: int,
+        index_split: Split,
+        config: BlendedMegatronDatasetConfig,
+    ) -> None:
+        self.config = config
         assert self.config.mock
+
+        super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
 
     def __len__(self) -> int:
         """Return an arbitrary length
 
         Returns:
-            int: The torch.int16 max representable value
+            int: The total number of samples that are present in the dataset
         """
-        return torch.iinfo(torch.int16).max
+        return self.num_samples

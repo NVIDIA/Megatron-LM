@@ -11,7 +11,7 @@ import numpy
 import torch
 
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
-from megatron.core.datasets.indexed_dataset import MMapIndexedDataset
+from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.utils import Split, log_single_rank
 
@@ -22,23 +22,20 @@ logger = logging.getLogger(__name__)
 class MaskedWordPieceDatasetConfig(BlendedMegatronDatasetConfig):
     """Configuration object for Megatron Core Masked WordPiece datasets
 
-    Attributes:
+    Args:
         masking_probability (float): The probability we mask a candidate N-gram
 
-        short_sequence_probability (float): The probability we return a sequence shorter than the
-        target sequence length
+        short_sequence_probability (float): The probability we return a sequence shorter than the target sequence length
 
         masking_max_ngram (int): The maximum length N-gram to consider masking or permuting
 
         masking_do_full_word (bool): Whether we mask the the whole word or its component parts
 
-        masking_do_permutation (bool): Whether we shuffle a subset of candidate N-grams in addition
-        to masking
+        masking_do_permutation (bool): Whether we shuffle a subset of candidate N-grams in addition to masking
 
         masking_use_longer_ngrams (bool): Wehther to favor longer N-grams over shorter N-grams
 
-        masking_use_geometric_distribution (bool): Whether to draw the size of the N-gram from a
-        geometric distribution according to SpanBERT https://arxiv.org/abs/1907.10529 (Section 3.1)
+        masking_use_geometric_distribution (bool): Whether to draw the size of the N-gram from a geometric distribution according to SpanBERT https://arxiv.org/abs/1907.10529 (Section 3.1)
     """
 
     masking_probability: float = None
@@ -87,15 +84,14 @@ class MaskedWordPieceDataset(MegatronDataset):
     """The semi-abstract base class for masked WordPiece datasets
 
     This implementation makes the rigid assumption that all inheritor datasets are built upon the
-    MMapIndexedDataset class. This assumption may be pushed down to the inheritors in future if
+    IndexedDataset class. This assumption may be pushed down to the inheritors in future if
     necessary.
 
     NB: WordPiece tokenization prepends a double hash "##" to all tokens/pieces in a word, save the
     first token/piece.
 
-    Args:
-        indexed_dataset (MMapIndexedDataset): The MMapIndexedDataset around which to build the
-        MegatronDataset
+    Args:    
+        indexed_dataset (IndexedDataset): The IndexedDataset around which to build the MegatronDataset
 
         dataset_path (str): The real path on disk to the dataset, for bookkeeping
 
@@ -110,7 +106,7 @@ class MaskedWordPieceDataset(MegatronDataset):
 
     def __init__(
         self,
-        indexed_dataset: MMapIndexedDataset,
+        indexed_dataset: IndexedDataset,
         dataset_path: str,
         indexed_indices: numpy.ndarray,
         num_samples: int,
@@ -122,14 +118,14 @@ class MaskedWordPieceDataset(MegatronDataset):
         )
 
     @staticmethod
-    def numel_low_level_dataset(low_level_dataset: MMapIndexedDataset) -> int:
+    def numel_low_level_dataset(low_level_dataset: IndexedDataset) -> int:
         return low_level_dataset.document_indices.shape[0] - 1
 
     @staticmethod
     def build_low_level_dataset(
         dataset_path: str, config: MaskedWordPieceDatasetConfig
-    ) -> MMapIndexedDataset:
-        return MMapIndexedDataset(dataset_path)
+    ) -> IndexedDataset:
+        return IndexedDataset(dataset_path)
 
     @staticmethod
     def _key_config_attributes() -> List[str]:

@@ -16,6 +16,7 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
 
@@ -90,7 +91,7 @@ def _get_mlp_module_spec(
             ),
         )
     else:
-        # SwitchMLP based MoE with modules in megatron core.
+        # Mixture of experts with modules in megatron core.
         return ModuleSpec(
             module=MoELayer,
             submodules=MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear,)

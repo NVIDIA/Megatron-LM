@@ -31,7 +31,7 @@ from megatron import (
     print_rank_0
 )
 from megatron.core import mpu
-from megatron.core.datasets.indexed_dataset import MMapIndexedDataset
+from megatron.core.datasets.indexed_dataset import IndexedDataset
 
 
 DSET_TYPE_BERT = 'standard_bert'
@@ -596,7 +596,7 @@ def get_indexed_dataset_(data_prefix, dataset_type):
 
     start_time = time.time()
     multimodal = dataset_type == DSET_TYPE_MULTIMODAL
-    indexed_dataset = MMapIndexedDataset(data_prefix, multimodal)
+    indexed_dataset = IndexedDataset(data_prefix, multimodal)
     assert indexed_dataset.sequence_lengths.shape[0] == indexed_dataset.document_indices[-1]
     print_rank_0(' > finished creating indexed dataset in {:4f} '
                  'seconds'.format(time.time() - start_time))

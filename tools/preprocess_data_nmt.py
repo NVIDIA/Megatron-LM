@@ -82,7 +82,7 @@ def main():
     print(f"Output prefix: {args.output_prefix}")
     output_bin_file = "{}.bin".format(args.output_prefix)
     output_idx_file = "{}.idx".format(args.output_prefix)
-    builder = indexed_dataset.MMapIndexedDatasetBuilder(
+    builder = indexed_dataset.IndexedDatasetBuilder(
         output_bin_file, dtype=indexed_dataset.DType.optimal_dtype(tokenizer.vocab_size)
     )
 
