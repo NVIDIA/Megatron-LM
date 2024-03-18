@@ -42,7 +42,7 @@ class Classification(MegatronModule):
             self.classification_dropout = torch.nn.Dropout(args.hidden_dropout)
             self.classification_head = get_linear_layer(args.hidden_size,
                                                         self.num_classes,
-                                                        init_method)
+                                                        init_method_normal)
             self._classification_head_key = 'classification_head'
 
     def set_input_tensor(self, input_tensor):
