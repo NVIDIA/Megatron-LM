@@ -109,6 +109,7 @@ class MegatronModule(torch.nn.Module):
         # Ensure that first and last stages have the same initial parameter
         # values.
         if mpu.is_rank_in_embedding_group():
+            self.shared_embedding_or_output_weight().data = self.shared_embedding_or_output_weight().data.cuda()
             torch.distributed.all_reduce(self.shared_embedding_or_output_weight().data,
                                          group=mpu.get_embedding_group())
 

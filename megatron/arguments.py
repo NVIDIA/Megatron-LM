@@ -105,6 +105,9 @@ def validate_args(args, defaults={}):
 
 
     # Deprecated arguments
+    if args.use_gpu_initialization:
+        del args.use_gpu_initialization
+        args.use_cpu_initialization = False
     assert args.batch_size is None, '--batch-size argument is no longer ' \
         'valid, use --micro-batch-size instead'
     del args.batch_size
@@ -888,6 +891,9 @@ def _add_training_args(parser):
 
 
     # deprecated
+    group.add_argument('--use-cpu-initialization', action='store_true', default=True,
+                       help=('If set, initialize all weights on the CPU. Deprecated because all init '
+                             'is done on the CPU, unless use-gpu-initialization is passed.'))
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '
                        'with larger models, sequences, and batch sizes.')
@@ -1174,9 +1180,9 @@ def _add_distributed_args(parser):
                        'complete it instead.Also turns on '
                        '--use-cpu-initialization flag. This is for '
                        'external DDP manager.' )
-    group.add_argument('--use-cpu-initialization', action='store_true',
-                       default=None, help='If set, affine parallel weights '
-                       'initialization uses CPU' )
+    group.add_argument('--use-gpu-initialization', action='store_true',
+                       default=None,
+                       help='If set, initialize weights on the GPU')
     group.add_argument('--empty-unused-memory-level', default=0, type=int,
                        choices=[0, 1, 2],
                        help='Call torch.cuda.empty_cache() each iteration '
