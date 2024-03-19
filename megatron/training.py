@@ -1363,23 +1363,32 @@ def build_train_valid_test_data_iterators(
 
     # Build iterators.
     dl_type = args.dataloader_type
-    assert dl_type in ['single', 'cyclic']
+    assert dl_type in ['single', 'cyclic', 'external']
+
+    def _get_iterator(dataloader_type, dataloader):
+        """Return dataset iterator."""
+        if dataloader_type == "single":
+            return iter(dataloader)
+        elif dataloader_type == "cyclic":
+            return iter(cyclic_iter(dataloader))
+        elif dataloader_type == "external":
+            # External dataloader is passed through. User is expected to define how to iterate.
+            return dataloader
+        else:
+            raise RuntimeError("unexpected dataloader type")
 
     if train_dataloader is not None:
-        train_data_iterator = iter(train_dataloader) if dl_type == 'single' \
-                              else iter(cyclic_iter(train_dataloader))
+        train_data_iterator = _get_iterator(dl_type, train_dataloader)
     else:
         train_data_iterator = None
 
     if valid_dataloader is not None:
-        valid_data_iterator = iter(valid_dataloader) if dl_type == 'single' \
-                              else iter(cyclic_iter(valid_dataloader))
+        valid_data_iterator = _get_iterator(dl_type, valid_dataloader)
     else:
         valid_data_iterator = None
 
     if test_dataloader is not None:
-        test_data_iterator = iter(test_dataloader) if dl_type == 'single' \
-                             else iter(cyclic_iter(test_dataloader))
+        test_data_iterator = _get_iterator(dl_type, test_dataloader)
     else:
         test_data_iterator = None
 

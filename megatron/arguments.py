@@ -472,7 +472,7 @@ def core_transformer_config_from_args(args):
     kw_args['layernorm_epsilon'] = args.norm_epsilon
     kw_args['deallocate_pipeline_outputs'] = True
     kw_args['pipeline_dtype'] = args.params_dtype
-    kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm 
+    kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
     kw_args['rotary_interleaved'] = args.rotary_interleaved
     if args.swiglu:
@@ -889,18 +889,18 @@ def _add_training_args(parser):
                        help='Global ranks to profile.')
     group.add_argument('--tp-comm-overlap', action='store_true', help = 'Enables the '
                        ' overlap of Tensor parallel communication and GEMM kernels.')
-    group.add_argument('--tp-comm-overlap-cfg', type=str, default=None, 
+    group.add_argument('--tp-comm-overlap-cfg', type=str, default=None,
                        help = 'Config file when tp_comm_overlap is enabled.')
-    group.add_argument('--disable-tp-comm-split-ag', action='store_false', 
+    group.add_argument('--disable-tp-comm-split-ag', action='store_false',
                        help = 'Disables the All-Gather overlap with fprop GEMM.',
                        dest='tp_comm_split_ag')
-    group.add_argument('--disable-tp-comm-split-rs', action='store_false', 
+    group.add_argument('--disable-tp-comm-split-rs', action='store_false',
                        help = 'Disables the Reduce-Scatter overlap with fprop GEMM.',
                        dest='tp_comm_split_rs')
-    group.add_argument('--disable-tp-comm-bulk-dgrad', action='store_false', 
+    group.add_argument('--disable-tp-comm-bulk-dgrad', action='store_false',
                        help = 'Disables the All-Gather overlap with bprop activation gradient GEMM.',
                        dest='tp_comm_bulk_dgrad')
-    group.add_argument('--disable-tp-comm-bulk-wgrad', action='store_false', 
+    group.add_argument('--disable-tp-comm-bulk-wgrad', action='store_false',
                        help = 'Disables the Reduce-Scatter overlap with bprop weight gradient GEMM.',
                        dest='tp_comm_bulk_wgrad')
 
@@ -961,7 +961,7 @@ def _add_training_args(parser):
                        choices=['adam', 'sgd'],
                        help='Optimizer function')
     group.add_argument('--dataloader-type', type=str, default=None,
-                       choices=['single', 'cyclic'],
+                       choices=['single', 'cyclic', 'external'],
                        help='Single pass vs multiple pass data loader')
     group.add_argument('--no-async-tensor-model-parallel-allreduce',
                        action='store_false',
