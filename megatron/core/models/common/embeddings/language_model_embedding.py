@@ -14,6 +14,7 @@ from megatron.core.utils import (
     make_sharded_tensor_for_checkpoint,
     make_tp_sharded_tensor_for_checkpoint,
 )
+from megatron.core.parallel_state import get_tensor_model_parallel_rank, get_pipeline_model_parallel_rank   , get_data_parallel_rank
 
 @dataclass
 class NoiseSchedulerConfig:
@@ -31,17 +32,24 @@ class NoiseScheduler:
         self.current_step = 0
 
     def step(self):
-        self.current_step += 1
+        if get_tensor_model_parallel_rank() == 0 and get_pipeline_model_parallel_rank() == 0 and torch.distributed.get_rank() == 0 and get_data_parallel_rank() == 0: # Make sure only one process updates the step, maybe only torch.distributed.get_rank() == 0 is enough
+            self.current_step += 1
+            if self.current_step in self.milestones:
+                if self.verbose:
+                    print(f'Noise step {self.current_step} reached milestone')
+                self.current_value *= self.gamma
+                if self.verbose:
+                    print(f'Noise value changed to {self.current_value}')
         
 class MultiStepNoiseScheduler(NoiseScheduler):
     def __init__(self, noise_scheduler_config):
         super().__init__(noise_scheduler_config)
         self.milestones = noise_scheduler_config.get('milestones')
+        self.max_steps = noise_scheduler_config.get('max_steps')
         if self.milestones is None:
             num_milestones = noise_scheduler_config.get('num_milestones')
-            max_steps = noise_scheduler_config.get('max_steps')
-            if num_milestones is not None and max_steps is not None:
-                self.milestones =  [(i + 1) * max_steps // (num_milestones + 1) for i in range(num_milestones)]
+            if num_milestones is not None and self.max_steps is not None:
+                self.milestones =  [(i + 1) * self.max_steps // (num_milestones + 1) for i in range(num_milestones)]
             else:
                 raise ValueError("Configuration for MultiStepNoiseScheduler must include either 'milestones' or both 'num_milestones' and 'max_steps'.")
 
@@ -52,17 +60,35 @@ class MultiStepNoiseScheduler(NoiseScheduler):
         if self.verbose:
             print(f'Noise value initialized to {self.current_value}')
             print(f'Noise milestones: {self.milestones}')
-            milestone_to_val = {milestone: self.starting_value * (self.gamma ** i) for i, milestone in enumerate(self.milestones)}
-            print(f'Noise will change: {milestone_to_val}')
+            intervals = [0] + self.milestones + [self.max_steps] # Include start and end to cover all intervals
+            verbose_output = []
+            for i in range(len(intervals) - 1):
+                start_step = intervals[i]
+                end_step = intervals[i+1]
+                noise_value = self.starting_value * (self.gamma ** i)
+                verbose_output.append(f'from step {start_step} to {end_step}, noise will be {noise_value}')
+            print("\n".join(verbose_output))
 
     def get_noise(self):
-        if self.current_step in self.milestones:
-            if self.verbose:
-                print(f'Noise step {self.current_step} reached milestone')
-            self.current_value *= self.gamma
-            if self.verbose:
-                print(f'Noise value changed to {self.current_value}')
         return self.current_value
+
+    def state_dict(self, prefix='', keep_vars=False):
+        return {
+            f'{prefix}current_step': torch.LongTensor([self.current_step]),
+            f'{prefix}current_value': torch.Tensor([self.current_value]),
+            f'{prefix}starting_value': torch.Tensor([self.starting_value]),
+            f'{prefix}milestones': torch.LongTensor(self.milestones),
+            f'{prefix}gamma': torch.Tensor([self.gamma]),
+            f'{prefix}verbose': torch.LongTensor([int(self.verbose)])
+        }
+
+    def load_state_dict(self, state_dict):
+        self.current_step = state_dict['current_step'].item()
+        self.current_value = state_dict['current_value'].item()
+        self.starting_value = state_dict['starting_value'].item()
+        self.milestones = state_dict['milestones'].tolist()
+        self.gamma = state_dict['gamma'].item()
+        self.verbose = state_dict['verbose'].item() == 1
 
 def get_noise_scheduler(class_name):
     if class_name == 'MultiStepNoiseScheduler':
@@ -158,6 +184,24 @@ class LanguageModelEmbedding(MegatronModule):
 
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(self.config.hidden_dropout)
+
+    def state_dict(self, destination=None, prefix='', keep_vars=False):
+        state_dict = super(LanguageModelEmbedding, self).state_dict(destination, prefix, keep_vars)
+        if hasattr(self, 'noise_scheduler') and self.noise_scheduler is not None:
+            for key, value in self.noise_scheduler.state_dict().items():
+                state_dict[prefix + 'noise_scheduler.' + key] = value
+        return state_dict
+
+    def load_state_dict(self, state_dict, strict=True):
+        noise_scheduler_keys = {key.replace('noise_scheduler.', ''): value for key, value in state_dict.items() if key.startswith('noise_scheduler.')}
+        if noise_scheduler_keys:
+            if not hasattr(self, 'noise_scheduler') or self.noise_scheduler is None:
+                self.noise_scheduler = get_noise_scheduler(self.noise_scheduler_config.class_name)(self.noise_scheduler_config)
+            self.noise_scheduler.load_state_dict(noise_scheduler_keys)
+            for key in list(state_dict.keys()):
+                if key.startswith('noise_scheduler.'):
+                    del state_dict[key]
+        super(LanguageModelEmbedding, self).load_state_dict(state_dict, strict)
 
     def zero_parameters(self):
         """Zero out all parameters in embedding."""
@@ -277,5 +321,11 @@ class LanguageModelEmbedding(MegatronModule):
                 key=sharded_position_embeddings_key,
             )
             sharded_state_dict[sharded_position_embeddings_key] = sharded_position_embeddings_tensor
+        if hasattr(self, 'noise_scheduler') and self.noise_scheduler is not None:
+            ns_prefix = f'{prefix}noise_scheduler.'
+            noise_scheduler_state = self.noise_scheduler.state_dict(prefix=ns_prefix, keep_vars=True)
+            for key, value in noise_scheduler_state.items():
+                sharded_state_key = f'{ns_prefix}{key}'
+                sharded_state_dict[sharded_state_key] = value
 
         return sharded_state_dict
