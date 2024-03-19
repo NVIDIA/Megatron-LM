@@ -4,6 +4,7 @@ Megatron-LM & Megatron-Core
 ===========================
 <h4>GPU optimized techniques for training transformer models at-scale</h4>
 
+[![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html)
 [![version](https://img.shields.io/badge/release-0.5.0-green)](./setup.py)
 [![license](https://img.shields.io/badge/license-OpenBSD-blue)](./LICENSE)
 
