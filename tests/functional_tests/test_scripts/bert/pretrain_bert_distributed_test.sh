@@ -79,6 +79,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        --save-interval $__SAVE_INTERVAL \
        --eval-interval 1000 \
        --eval-iters 10 \
+       --use-gpu-initialization \
        --tensor-model-parallel-size $TP_SIZE \
        --pipeline-model-parallel-size $PP_SIZE \
        ${VP_SIZE:+--num-layers-per-virtual-pipeline-stage "$VP_SIZE"} \

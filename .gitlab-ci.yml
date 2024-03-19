@@ -23,7 +23,6 @@ variables: &VARS
       - "mcore/eos"
     description: '"mcore/draco-oci" for OCI-IAD, "mcore/eos" for EOS'
 
-
 include:
   - jet-tests.yml
 
