@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 
+
+# TODO : Have an update class that can add more key value pairs
 @dataclass
 class CommonInferenceParams:
     use_greedy: bool = False

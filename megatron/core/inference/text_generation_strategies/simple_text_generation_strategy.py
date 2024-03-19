@@ -12,16 +12,16 @@ from megatron.global_vars import get_num_microbatches
 from megatron.core import parallel_state
 
 class SimpleTextGenerationStrategy(AbstractTextGenerationStrategy):
-    def __init__(self, model:AbstractModelInferenceWrapper, tokenizer):
+    def __init__(self, inference_wrapped_model:AbstractModelInferenceWrapper, tokenizer):
         """The basic text generation strategy
 
         This class is responsible for tokenizing the input , running the inference and also detokenizing the output
 
         Args:
-            model (AbstractModelInferenceWrapper): A model that is wrapped using the specs given in the abstract_model_inference_wrapper.py
+            inference_wrapped_model (AbstractModelInferenceWrapper): A model that is wrapped using the specs given in the abstract_model_inference_wrapper.py
             tokenizer (_type_): Tokenizer used for tokenizing and detokenizing the prompts
         """
-        self.model = model
+        self.inference_wrapped_model = inference_wrapped_model
         self.tokenizer = tokenizer
 
     def tokenize_and_pad_input_prompts(self, prompts: List[str], num_tokens_to_generate: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -189,16 +189,16 @@ class SimpleTextGenerationStrategy(AbstractTextGenerationStrategy):
                                            device=torch.cuda.current_device())
         
         with torch.no_grad():
-            self.model.prep_model_for_inference()
+            self.inference_wrapped_model.prep_model_for_inference() # initalize small model (inference)
 
             context_start_position = 0           
             # Pick the context window that we need to pass through the network.
             for context_end_position in range(min_prompt_length, max_sequence_length):
 
-                inference_input = self.model.get_batch_for_context_window(context_start_position, context_end_position)
+                inference_input = self.inference_wrapped_model.get_batch_for_context_window(context_start_position, context_end_position)
 
                 # Returns the logits of shape [batch_size, context_length, vocab_size]
-                logits = self.model(inference_input)
+                logits = self.inference_wrapped_model(inference_input)
                 
                 if model_is_not_pipeline_parallel or parallel_state.is_pipeline_last_stage():
                     last_token_logits  = logits[:, -1 , :]
@@ -220,7 +220,7 @@ class SimpleTextGenerationStrategy(AbstractTextGenerationStrategy):
 
                 context_start_position = context_end_position
 
-                #TODO : Need to add condition to check early stopping  and update generated sequence lengths
+                #TODO : Need to add condition to check early stopping  and update generated sequence lengths (Send in the prompts, the tokenizer and the common inference params)
 
         # Include all the generated tokens
         prompts_tokens_with_generations = prompts_tokens[:,:(context_end_position+1)]
