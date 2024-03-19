@@ -2,14 +2,20 @@
 
 import math
 import os
+from enum import Enum
 from logging import getLogger
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 
 from .. import parallel_state
 
 logger = getLogger(__name__)
+
+
+class BufferType(Enum):
+    PARAM = 1
+    GRAD = 2
 
 
 def shard_buffer(buffer: torch.Tensor, data_parallel_world_size: int):
@@ -32,8 +38,9 @@ class Bucket:
 
     Arguments:
         params: List of parameters whose gradients are collated in this bucket.
-        data: View in larger GradBuffer that this bucket is responsible for.
-        offset: Offset of this bucket's view in the larger GradBuffer.
+        param_data: View in larger ParamAndGradBuffer.param_data that this bucket is responsible for.
+        grad_data: View in larger ParamAndGradBuffer.grad_data that this bucket is responsible for.
+        offset: Offset of this bucket's view in the larger ParamAndGradBuffer.
         numel_unpadded: Number of unpadded elements in bucket.
         data_parallel_group: Data-parallel process group.
         data_parallel_world_size: World size using the data-parallel group group.
@@ -51,7 +58,8 @@ class Bucket:
     def __init__(
         self,
         params: List[torch.nn.Parameter],
-        data: torch.Tensor,
+        param_data: Optional[torch.Tensor],
+        grad_data: torch.Tensor,
         offset: int,
         numel_unpadded: int,
         data_parallel_group: torch.distributed.ProcessGroup,
@@ -68,7 +76,8 @@ class Bucket:
         self.params_list = params
         self.params = set(params)
         self.params_with_grad = set()
-        self.data = data
+        self.param_data = param_data
+        self.grad_data = grad_data
         # The distributed optimizer needs to keep track of this bucket's offset
         # within the full grad_buffer.
         self.offset = offset
@@ -108,28 +117,28 @@ class Bucket:
         # prior to data-parallel all-reduce / reduce-scatter.
         if self.check_for_nan_in_grad:
             global_rank = torch.distributed.get_rank()
-            norm = self.data.norm(p=2)
+            norm = self.grad_data.norm(p=2)
             assert not norm.isnan(), (
                 f'Rank {global_rank}: found NaN in local grad norm in '
                 f'backward pass before data-parallel communication collective. '
                 f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
             )
 
-        self.data *= self.gradient_scaling_factor
+        self.grad_data *= self.gradient_scaling_factor
         # Use async_op only when overlap_grad_reduce is True.
         if self.use_distributed_optimizer:
-            local_data_view = shard_buffer(self.data, self.data_parallel_world_size)[
+            local_data_view = shard_buffer(self.grad_data, self.data_parallel_world_size)[
                 self.data_parallel_rank
             ]
             self.communication_handle = torch.distributed._reduce_scatter_base(
                 local_data_view,
-                self.data,
+                self.grad_data,
                 group=self.data_parallel_group,
                 async_op=self.overlap_grad_reduce,
             )
         else:
             self.communication_handle = torch.distributed.all_reduce(
-                self.data, group=self.data_parallel_group, async_op=self.overlap_grad_reduce
+                self.grad_data, group=self.data_parallel_group, async_op=self.overlap_grad_reduce
             )
         self.communication_issued = True
 
@@ -169,14 +178,16 @@ class Bucket:
             self.start_grad_sync()
 
 
-class GradBuffer:
+class ParamAndGradBuffer:
     """
-    Groups gradients into a contiguous buffer, and then breaks the buffer into buckets with
-    roughly `bucket_size` parameters each.
+    Groups parameters and gradients into a contiguous buffer, and then breaks the buffer into
+    buckets with roughly `bucket_size` parameters each.
 
     Arguments:
-        dtype: Type of underlying tensor.
-        params: List of parameters whose gradients are collated in the underlying tensor.
+        param_dtype: Type of param tensor.
+        grad_dtype: Type of grad tensor.
+        params: List of parameters whose parameters and gradients are collated in the underlying
+            tensor.
         data_parallel_group: Data-parallel process group.
         bucket_size: The rough size of each bucket in terms of number of parameters.
         param_to_name: Mapping from `torch.nn.Parameter` to name (for logging purposes).
@@ -193,7 +204,8 @@ class GradBuffer:
 
     def __init__(
         self,
-        dtype: torch.dtype,
+        param_dtype: torch.dtype,
+        grad_dtype: torch.dtype,
         params: List[torch.nn.Parameter],
         data_parallel_group: torch.distributed.ProcessGroup,
         bucket_size: int,
@@ -212,7 +224,8 @@ class GradBuffer:
         del unique_params
 
         # Store attributes that will be needed later.
-        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.grad_dtype = grad_dtype
         self.data_parallel_group = data_parallel_group
         self.data_parallel_world_size = torch.distributed.get_world_size(
             group=self.data_parallel_group
@@ -318,11 +331,23 @@ class GradBuffer:
         self.numel = data_end_index
         if use_distributed_optimizer:
             assert self.numel % self.data_parallel_world_size == 0
-        self.data = torch.zeros(
-            self.numel, dtype=self.dtype, device=torch.cuda.current_device(), requires_grad=False,
+        self.param_data = None
+        # Only re-map param tensors if using distributed optimizer.
+        if self.use_distributed_optimizer:
+            self.param_data = torch.zeros(
+                self.numel,
+                dtype=self.param_dtype,
+                device=torch.cuda.current_device(),
+                requires_grad=False,
+            )
+        self.grad_data = torch.zeros(
+            self.numel,
+            dtype=self.grad_dtype,
+            device=torch.cuda.current_device(),
+            requires_grad=False,
         )
 
-        # Finally, map main_grad fields for each parameter with a .grad field.
+        # Finally, map param.data and param.main_grad fields to buffers.
         bucket_params = set()
         bucket_data_start_index = 0
         cur_bucket_id = 0
@@ -330,7 +355,21 @@ class GradBuffer:
             if not param.requires_grad:
                 continue
             data_start_index, data_end_index, bucket_id = self.param_index_map[param]
-            param.main_grad = self._get(param.data.shape, data_start_index)
+
+            # Assign param.data to appropriate segment of self.param_data.
+            if self.param_data is not None:
+                old_param_data = param.data
+                param.data = self._get(
+                    param.data.shape, data_start_index, buffer_type=BufferType.PARAM
+                )
+                assert old_param_data._base is None
+                # Copy tensor values (from initialization or checkpoint).
+                param.data.detach().copy_(old_param_data)
+                del old_param_data
+
+            param.main_grad = self._get(
+                param.data.shape, data_start_index, buffer_type=BufferType.GRAD
+            )
             if bucket_id != cur_bucket_id:
                 bucket_data_end_index = _pad_if_needed(data_start_index)
                 self._set_bucket(
@@ -374,14 +413,20 @@ class GradBuffer:
                 for param in bucket.params:
                     logger.info(f'    {param_to_name[param]}')
 
-    def _get(self, shape: torch.Size, start_index: int) -> torch.Tensor:
+    def _get(self, shape: torch.Size, start_index: int, buffer_type: BufferType) -> torch.Tensor:
         """
         Return a tensor with the input `shape` as a view into the 1-D data starting at
         `start_index`.
         """
         end_index = start_index + shape.numel()
         assert end_index <= self.numel, 'Requested tensor is out of buffer range'
-        buffer_tensor = self.data[start_index:end_index]
+        if buffer_type == BufferType.PARAM:
+            assert self.param_data is not None
+            buffer_tensor = self.param_data[start_index:end_index]
+        elif buffer_type == BufferType.GRAD:
+            buffer_tensor = self.grad_data[start_index:end_index]
+        else:
+            raise Exception("Illegal buffer type provided to GradBuffer._get() function")
         buffer_tensor = buffer_tensor.view(shape)
         return buffer_tensor
 
@@ -405,11 +450,19 @@ class GradBuffer:
             assert end_index % self.data_parallel_world_size == 0
         assert (start_index, end_index) == self.bucket_indices[bucket_id]
 
-        # Get appropriate view into global GradBuffer.
-        bucket_data = self._get(torch.Size([end_index - start_index]), start_index)
+        # Get appropriate view into global ParamAndGradBuffer.
+        bucketed_param_data = None
+        if self.param_data is not None:
+            bucketed_param_data = self._get(
+                torch.Size([end_index - start_index]), start_index, buffer_type=BufferType.PARAM
+            )
+        bucketed_grad_data = self._get(
+            torch.Size([end_index - start_index]), start_index, buffer_type=BufferType.GRAD
+        )
         bucket = Bucket(
             params=bucket_params,
-            data=bucket_data,
+            param_data=bucketed_param_data,
+            grad_data=bucketed_grad_data,
             offset=start_index,
             numel_unpadded=numel_unpadded,
             data_parallel_group=self.data_parallel_group,
@@ -424,15 +477,12 @@ class GradBuffer:
             assert bucket_param not in self.param_to_bucket
             self.param_to_bucket[bucket_param] = bucket
 
-    def reset(self, zero_buffer):
+    def reset(self):
         """
-        Zero out the underlying buffer and reset all buckets in preparation for the next
+        Zero out the underlying grad_buffer and reset all buckets in preparation for the next
         iteration of training.
-
-        When zero_buffer is set to True, the underlying buffer is zeroed out.
         """
-        if zero_buffer:
-            self.data.zero_()
+        self.grad_data.zero_()
         for bucket in self.buckets:
             bucket.reset()
         self.is_last_microbatch = True

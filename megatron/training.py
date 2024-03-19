@@ -530,10 +530,7 @@ def train_step(forward_step_func, data_iterator,
 
     # Set grad to zero.
     for model_chunk in model:
-        # If using distributed optimizer, don't zero buffer here; zeroing of buffer is
-        # handled automatically by the optimizer after all-gathers finish.
-        # Otherwise, zero the buffer.
-        model_chunk.zero_grad_buffer(zero_buffer=(not args.use_distributed_optimizer))
+        model_chunk.zero_grad_buffer()
     optimizer.zero_grad()
 
     # Forward pass.

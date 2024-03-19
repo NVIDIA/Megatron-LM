@@ -89,7 +89,7 @@ def get_param_groups(model_chunks, no_weight_decay_cond, scale_lr_cond, lr_mult)
 def get_megatron_optimizer_based_on_param_groups(
     config,
     param_groups,
-    per_model_grad_buffers=None,
+    per_model_buffers=None,
     data_parallel_group=None,
     data_parallel_group_gloo=None,
     data_parallel_group_idx=None,
@@ -101,7 +101,7 @@ def get_megatron_optimizer_based_on_param_groups(
 
     Args:
         param_groups (list): list of parameter groups.
-        per_model_grad_buffers (list, optional): list of gradient buffers for
+        per_model_buffers (list, optional): list of buffers for
             distributed optimizer. Defaults to None.
         data_parallel_group (ProcessGroup, optional): data parallel group for
             distributed optimizer. Defaults to None.
@@ -184,7 +184,7 @@ def get_megatron_optimizer_based_on_param_groups(
         if config.use_distributed_optimizer:
             optimizer = DistributedOptimizer(
                 *optimizer_args,
-                per_model_grad_buffers=per_model_grad_buffers,
+                per_model_buffers=per_model_buffers,
                 data_parallel_group=data_parallel_group,
                 data_parallel_group_gloo=data_parallel_group_gloo,
                 overlap_param_gather=config.overlap_param_gather,
@@ -225,12 +225,12 @@ def get_megatron_optimizer(
     param_groups = get_param_groups(model_chunks, no_weight_decay_cond, scale_lr_cond, lr_mult)
 
     # Collect grad buffers for distributed optimizer.
-    per_model_grad_buffers = {}
-    per_model_ep_grad_buffers = {}
+    per_model_buffers = {}
+    per_model_ep_buffers = {}
     for model_idx, model_chunk in enumerate(model_chunks):
-        if hasattr(model_chunk, 'grad_buffers'):
-            per_model_grad_buffers[model_idx] = model_chunk.grad_buffers
-            per_model_ep_grad_buffers[model_idx] = model_chunk.expert_parallel_grad_buffers
+        if hasattr(model_chunk, 'buffers'):
+            per_model_buffers[model_idx] = model_chunk.buffers
+            per_model_ep_buffers[model_idx] = model_chunk.expert_parallel_buffers
 
     # Split param groups into dense and moe.
     dense_param_groups = list(filter(lambda g: not g['is_expert_parallel'], param_groups))
@@ -242,7 +242,7 @@ def get_megatron_optimizer(
         get_megatron_optimizer_based_on_param_groups(
             config,
             param_groups=dense_param_groups,
-            per_model_grad_buffers=per_model_grad_buffers,
+            per_model_buffers=per_model_buffers,
             data_parallel_group=mpu.get_data_parallel_group(with_context_parallel=True),
             data_parallel_group_gloo=mpu.get_data_parallel_group_gloo(with_context_parallel=True),
             data_parallel_group_idx=model_parallel_rank,
@@ -255,7 +255,7 @@ def get_megatron_optimizer(
             get_megatron_optimizer_based_on_param_groups(
                 config,
                 param_groups=moe_param_groups,
-                per_model_grad_buffers=per_model_ep_grad_buffers,
+                per_model_buffers=per_model_ep_buffers,
                 data_parallel_group=mpu.get_data_modulo_expert_parallel_group(),
                 data_parallel_group_gloo=mpu.get_data_modulo_expert_parallel_group_gloo(),
                 data_parallel_group_idx=expert_parallel_rank * model_parallel_world_size
