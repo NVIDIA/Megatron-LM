@@ -660,14 +660,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             sharding_type = state_dict['param_state_sharding_type']
             logger.info(f'Loading distributed optimizer sharded state of type {sharding_type}')
             if sharding_type == 'dp_zero_gather_scatter':
-                self.load_parameter_state_from_state_dict(param_state)
+                self.load_parameter_state_from_dp_zero(param_state)
             elif sharding_type == 'fully_sharded_bucket_space':
-                self.load_parameter_state_from_internal_repr(param_state)
+                self.load_parameter_state_from_fs_bucket_space(param_state)
             else:
                 raise NotImplementedError(f'Unknown sharding_type: {sharding_type}')
 
-    def get_parameter_state_internal_repr(self):
-        """Get internal representation of parameter state without any copies and modifications """
+    def get_parameter_state_fs_bucket_space(self):
+        """Get internal representation of parameter state without any copies and modifications.
+
+        This is referred to as "fully sharded bucket space" because the optimizer state is
+        fully sharded (e.g. no gather involved) and bucket-centric (the state
+        follows the internal structure of the Distributed Optimizer buckets)
+        as opposed to model-centric (typical structure of PyT optimizers)
+        """
         state = {
             "per_bucket_numel": self.per_bucket_numel,
             "per_bucket_numel_unpadded": self.per_bucket_numel_unpadded,
@@ -700,7 +706,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             state[gbuf_idx] = dtype_state
         return state
 
-    def get_parameter_state(self):
+    def get_parameter_state_dp_zero(self):
         """Get parameter state (i.e., parameter & optimizer tensors).
 
         This method performs three steps:
@@ -802,7 +808,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             filename (str): path to save parameter state to.
         """
 
-        state_dict = self.get_parameter_state()
+        state_dict = self.get_parameter_state_dp_zero()
         if torch.distributed.get_rank(self.data_parallel_group) == 0:
             torch.save(state_dict, filename)
 
@@ -836,7 +842,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 model_sharded_state_dict, is_loading
             )
         elif sharding_type == 'dp_zero_gather_scatter':
-            param_state = self.sharded_param_state_dp_zero_gather_scatter(
+            param_state = self.sharded_param_state_dp_zero(
                 model_sharded_state_dict, is_loading
             )
         elif sharding_type == 'fully_sharded_model_space':
@@ -856,7 +862,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         state_dict['param_state_sharding_type'] = sharding_type
         return state_dict
 
-    def sharded_param_state_dp_zero_gather_scatter(
+    def sharded_param_state_dp_zero(
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
     ):
         """ Naive implementation which reuses gather/scatter from the legacy ckpt format.
@@ -869,7 +875,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             param_state_data = None
         else:
             # Gather on rank 0
-            param_state_data = self.get_parameter_state()
+            param_state_data = self.get_parameter_state_dp_zero()
 
         if torch.distributed.get_rank(self.data_parallel_group) == 0:
             # Fixed TPxPP. Save on DP rank 0 only
@@ -896,7 +902,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_rank = torch.distributed.get_rank(self.data_parallel_group)
         data_parallel_world_size = torch.distributed.get_world_size(self.data_parallel_group)
 
-        state = self.get_parameter_state_internal_repr()
+        state = self.get_parameter_state_fs_bucket_space()
         # per_bucket_numel metadata is saved separately for each TPxPP domain.
         for per_bucket_key in ('per_bucket_numel', 'per_bucket_numel_unpadded'):
             state[per_bucket_key] = ShardedObject(
@@ -968,7 +974,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             )
         return state
 
-    def load_parameter_state_from_internal_repr(self, state_dict):
+    def load_parameter_state_from_fs_bucket_space(self, state_dict):
         """ Loads the parameter state from an internal representation.
 
         Inverse of the `get_parameter_state_internal_repr` method.
@@ -1007,10 +1013,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         for key in dst_tensors:
                             dst_tensors[key].copy_(src_tensors[key])
 
-    def load_parameter_state_from_state_dict(self, state_dict):
-        """Load parameter state (i.e., parameter & optimizer tensors).
+    def load_parameter_state_from_dp_zero(self, state_dict):
+        """Load parameter state (i.e., parameter & optimizer tensors) from DP 0 rank.
 
-        This method performs the reverse of get_parameter_state():
+        This method performs the reverse of get_parameter_state_dp_zero():
         - Scatter contiguous buffers from DP rank 0 to each DP rank (each DP
           rank receives its relevant subset of the world buffers).
         - For each DP rank, copy param & optimizer shards from contiguous CPU
@@ -1150,7 +1156,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if torch.distributed.get_rank(self.data_parallel_group) == 0:
             state_dict = torch.load(filename)
 
-        self.load_parameter_state_from_state_dict(state_dict)
+        self.load_parameter_state_from_dp_zero(state_dict)
 
     def zero_grad(self, set_to_none=True):
         """

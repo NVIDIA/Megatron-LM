@@ -153,7 +153,7 @@ class TestDistributedOptimizer:
                     Utils.initialize_model_parallel(*tp_pp)
                     model, optimizer_A = setup_model_and_optimizer(seed=2)
                     save(optimizer_A.sharded_state_dict(model[0].sharded_state_dict()), ckpt_dir)
-                    optim_param_state_A = optimizer_A.get_parameter_state()
+                    optim_param_state_A = optimizer_A.get_parameter_state_dp_zero()
                     Utils.destroy_model_parallel()
                 else:
                     # this prevents NCCL errors when changing DP. TODO: fix it properly
@@ -167,7 +167,7 @@ class TestDistributedOptimizer:
                     Utils.initialize_model_parallel(*tp_pp)
 
                     model, optimizer_B = setup_model_and_optimizer(seed=3)
-                    optim_param_state_B = optimizer_B.get_parameter_state()
+                    optim_param_state_B = optimizer_B.get_parameter_state_dp_zero()
                     diffs = diff(optim_param_state_A, optim_param_state_B)
                     # Expect a mismatch in values - diffs[2] nonempty
                     if parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0:
@@ -175,7 +175,7 @@ class TestDistributedOptimizer:
 
                     optim_state_dict = load(optimizer_B.sharded_state_dict(model[0].sharded_state_dict()), ckpt_dir)
                     optimizer_B.load_state_dict(optim_state_dict)
-                    optim_param_state_B = optimizer_B.get_parameter_state()
+                    optim_param_state_B = optimizer_B.get_parameter_state_dp_zero()
 
                     # Test both param state dicts are equal
                     diffs = diff(optim_param_state_A, optim_param_state_B)
