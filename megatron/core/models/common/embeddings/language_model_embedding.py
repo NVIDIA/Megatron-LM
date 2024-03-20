@@ -247,12 +247,13 @@ class LanguageModelEmbedding(MegatronModule):
                         input_mask = mask.int() # B x L
                         input_lengths = input_lengths # B
 
-                        noise_ = torch.zeros_like(embeddings).uniform_(-1, 1)
+                        noise_ = torch.zeros_like(embeddings).uniform_(-1, 1).to(embeddings.dtype)
                         delta = noise_ * input_mask.unsqueeze(-1)
                         dims = input_lengths * embeddings.shape[-1]
                         mag = current_alpha / torch.sqrt(dims)
 
                         delta = (delta * mag.view(-1,1,1)).detach()
+                        delta = delta.to(embeddings.dtype)
                         embeddings = embeddings + delta
 
         return embeddings
