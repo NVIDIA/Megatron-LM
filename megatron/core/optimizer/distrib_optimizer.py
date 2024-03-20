@@ -5,14 +5,17 @@
 
 import itertools
 from logging import getLogger
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 from apex.optimizers import FusedAdam as Adam
 
 from .. import parallel_state, tensor_parallel
 from ..dist_checkpointing.mapping import LocalNonpersitentObject, ShardedObject, ShardedStateDict
-from ..distributed import shard_buffer
+from ..distributed import ParamAndGradBuffer, shard_buffer
+from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper
+from .optimizer_config import OptimizerConfig
 
 logger = getLogger(__name__)
 
@@ -23,12 +26,12 @@ class Range:
     from a full tensor.
     """
 
-    def __init__(self, start, end):
+    def __init__(self, start: int, end: int):
         self.start = start
         self.end = end
         self.size = end - start
 
-    def normalize(self, start=0):
+    def normalize(self, start: int = 0):
         return Range(start, start + self.size)
 
     def __str__(self):
@@ -39,39 +42,13 @@ class Range:
 
 
 class DistributedOptimizer(MixedPrecisionOptimizer):
-    """Distributed optimizer, for all data types (fp16, bf16, and fp32).
-
-    Arguments:
-        optimizer: base optimizer such as Adam or SGD
-        clip_grad: clip gradeints with this global L2 norm. Note
-            that clipping is ignored if clip_grad == 0
-        log_num_zeros_in_grad: return number of zeros in the gradients.
-        params_have_main_grad: flag indicating if parameters have
-            a `main_grad` field. If this is set, we are assuming
-            that the model parameters are store in the `main_grad`
-            field instead of the typical `grad` field. This happens
-            for the DDP cases where there is a continuous buffer
-            holding the gradients. For example for bfloat16, we want
-            to do gradient accumulation and all-reduces in float32
-            and as a result we store those gradients in the main_grad.
-            Note that main grad is not necessarily in float32.
-        fp16: if true, the model is running in fp16.
-        bf16: if true, the model is running in bfloat16.
-        grad_scaler: used for scaling gradients. Note that this can be
-            None. This case happens when `bf16 = True` and we don't
-            use any loss scale. Note that for `bf16 = True`, we can have
-            a constnat gradient scaler. Also for `bf16 = False`, we
-            always require a grad scaler.
-        buffers: the implementation of the distributed optimizer is
-            centered on using a contiguous buffer for communicating
-            grads & params between the model state and the optimizer state.
-            You can find a more detailed description in this document 
-            https://github.com/NVIDIA/Megatron-LM/blob/main/docs/source/distrib_optimizer.md
-            .
-    """
-
     @classmethod
-    def build_model_gbuf_param_range_map(cls, grad_buffer, gbuf_world_range, bucket_offset):
+    def _build_model_gbuf_param_range_map(
+        cls,
+        param_world_index_map: Dict[torch.nn.Parameter, Tuple],
+        gbuf_world_range: Range,
+        bucket_offset: int,
+    ):
         """
         Build mapping from param reference to grad buffer shard ranges.
 
@@ -99,7 +76,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
 
         # Param range map.
-        param_world_index_map = grad_buffer.param_index_map
         param_range_map = {}
         for param, param_world_indexes in param_world_index_map.items():
 
@@ -129,21 +105,21 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return param_range_map
 
     @classmethod
-    def build_model_gbuf_range(cls, grad_buffer, bucket_index):
+    def _build_model_gbuf_range(cls, param_and_grad_buffer: ParamAndGradBuffer, bucket_index: int):
         """
         Build mapping between params and their grad buffers.
 
         This method does the initial setup for the method above. This setup
-        includes determining the shard ranges into the DDP's grad buffer for
-        each data-parallel (DP) rank. Each DP rank keeps range info for
+        includes determining the shard ranges into the param_and_grad_buffer
+        for each data-parallel (DP) rank. Each DP rank keeps range info for
         all other DP ranks, for the purpose of creating args for
         reduce-scatter and all-gather.
         """
 
-        data_parallel_rank = torch.distributed.get_rank(grad_buffer.data_parallel_group)
-        data_parallel_world_size = grad_buffer.data_parallel_group.size()
+        data_parallel_rank = torch.distributed.get_rank(param_and_grad_buffer.data_parallel_group)
+        data_parallel_world_size = param_and_grad_buffer.data_parallel_group.size()
 
-        bucket = grad_buffer.buckets[bucket_index]
+        bucket = param_and_grad_buffer.buckets[bucket_index]
         gbuf_size = bucket.grad_data.numel()
         assert (
             gbuf_size % data_parallel_world_size == 0
@@ -166,8 +142,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         gbuf_world_range = gbuf_world_all_ranges[data_parallel_rank]
 
         # Get each param's ranges.
-        param_range_map = cls.build_model_gbuf_param_range_map(
-            grad_buffer, gbuf_world_range, bucket.offset
+        param_range_map = cls._build_model_gbuf_param_range_map(
+            param_and_grad_buffer.param_index_map, gbuf_world_range, bucket.offset
         )
 
         # Group into dict.
@@ -178,7 +154,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return data
 
     @classmethod
-    def build_gbuf_range_map(cls, grad_buffer):
+    def _build_gbuf_range_map(cls, param_and_grad_buffer: ParamAndGradBuffer):
         """
         Build mapping between params and their grad buffers. These mappings are
         partitioned according to data type.
@@ -187,21 +163,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         that this rank "owns" (the dp_rank'th shard of each bucket, where each
         shard is 1/dp_world_size of the bucket).
 
-        Args:
-            grad_buffer (ParamAndGradBuffer): grad buffer to build mapping for.
+        Arguments:
+            param_and_grad_buffer (ParamAndGradBuffer): buffer to build mapping for.
         """
         return {
-            (grad_buffer.param_dtype, grad_buffer.grad_dtype): [
-                cls.build_model_gbuf_range(grad_buffer, bucket_index)
-                for bucket_index in range(len(grad_buffer.buckets))
+            (param_and_grad_buffer.param_dtype, param_and_grad_buffer.grad_dtype): [
+                cls._build_model_gbuf_range(param_and_grad_buffer, bucket_index)
+                for bucket_index in range(len(param_and_grad_buffer.buckets))
             ]
         }
 
     @classmethod
-    def build_model_param_gbuf_map(cls, gbuf_ranges):
+    def _build_model_param_gbuf_map(
+        cls, gbuf_ranges: List[Dict]
+    ) -> Dict[torch.nn.Parameter, Tuple]:
         """
-        Create a reverse of the gbuf_ranges, for referencing in
-        opposite direction.
+        Create a reverse of the gbuf_ranges, for referencing in opposite direction.
         """
         param_gbuf_map = {}
         for gbuf_index, gbuf_range_map in enumerate(gbuf_ranges):
@@ -215,7 +192,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return param_gbuf_map
 
     @classmethod
-    def build_optimizer_group_ranges(cls, param_groups, gbuf_ranges):
+    def _build_optimizer_group_ranges(cls, param_groups: List[Dict], gbuf_ranges: List[Dict]):
         """
         Create optimizer groups.
 
@@ -224,8 +201,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         used (in the method below) to create the current DP's optimizer
         groups.
         """
-
-        num_groups = len(param_groups)
 
         # Param group map.
         # World param group map.
@@ -264,7 +239,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return local_param_group_map, group_ranges
 
     @classmethod
-    def build_model_and_main_param_groups(cls, gbuf_ranges, param_gbuf_map, opt_group_ranges):
+    def _build_model_and_main_param_groups(
+        cls,
+        gbuf_ranges: List[Dict],
+        param_gbuf_map: Dict[torch.nn.Parameter, Tuple],
+        opt_group_ranges: List,
+    ):
         """
         Create main parameter groups needed for the optimizer step.
 
@@ -289,7 +269,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         shard_fp32_from_float16_groups = []
 
         # Allocate (or slice) each group's param shard.
-        for group_index, group_range in enumerate(opt_group_ranges):
+        for group_range in opt_group_ranges:
 
             # Params of this group.
             model_float16_params_this_group = []
@@ -370,41 +350,47 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
     def __init__(
         self,
-        optimizer,
-        clip_grad,
-        log_num_zeros_in_grad,
-        params_have_main_grad,
-        fp16,
-        bf16,
-        params_dtype,
-        grad_scaler,
-        init_state_fn,
-        per_model_buffers,
-        overlap_param_gather,
-        data_parallel_group,
-        data_parallel_group_gloo,
-        data_parallel_group_idx,
+        optimizer: torch.optim.Optimizer,
+        config: OptimizerConfig,
+        grad_scaler: MegatronGradScaler,
+        init_state_fn: Optional[Callable],
+        per_model_buffers: Dict[int, List[ParamAndGradBuffer]],
+        data_parallel_group: torch.distributed.ProcessGroup,
+        data_parallel_group_gloo: torch.distributed.ProcessGroup,
+        data_parallel_group_idx: int,
     ):
         """
-        See top of class definition for argument descriptions.
+        Distributed optimizer, for all data types (fp16, bf16, and fp32).
 
-        The steps in this method create the core mapping between DDP grad
-        buffers, parameters, and parameter shard ranges, that is needed for
-        converting between model param indexes and main parameter shard
-        indexes. This method also updates the optimizer parameter groups
-        with the newly created shards.
+        The steps in this method create the core mapping between param and grad buffers,
+        parameters, and parameter shard ranges, that is needed for converting between model
+        param indexes and main parameter shard indexes. This method also updates the optimizer
+        parameter groups with the newly created shards.
+
+        Arguments:
+            optimizer (torch.optim.Optimizer): base optimizer such as Adam or SGD.
+            config (OptimizerConfig): configuration object for optimizer.
+            grad_scaler (MegatronGradScaler): used for scaling gradients. Note that
+                this can be None. This case happens when `bf16 = True` and we don't
+                use any loss scale. Note that for `bf16 = True`, we can have
+                a constant gradient scaler. Also for `bf16 = False`, we
+                always require a grad scaler.
+            init_state_fn (Callable, optional): function to initialize state in the optimizer.
+            per_model_buffers (Dict[int, List[ParamAndGradBuffer]]): the implementation of the
+                distributed optimizer is centered on using a contiguous buffer for
+                communicating grads & params between the model state and the optimizer state.
+                You can find a more detailed description in
+                https://github.com/NVIDIA/Megatron-LM/blob/main/docs/source/distrib_optimizer.md.
+            data_parallel_group (torch.distributed.ProcessGroup): data-parallel group to use to
+                all-gather params after optimizer.step().
+            data_parallel_group_gloo (torch.distributed.ProcessGroup): gloo data-parallel group
+                (used in checkpoint loading and saving).
+            data_parallel_group_idx (int): index in data-parallel group (used by
+                distributed checkpointing logic).
         """
 
         super().__init__(
-            optimizer,
-            clip_grad,
-            log_num_zeros_in_grad,
-            params_have_main_grad,
-            fp16,
-            bf16,
-            params_dtype,
-            grad_scaler,
-            init_state_fn,
+            optimizer, config, grad_scaler, init_state_fn,
         )
 
         assert isinstance(
@@ -412,7 +398,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         ), "Only Adam currently supported, due to checkpointing requirements."
 
         # Model grad buffer ranges.
-        assert per_model_buffers, "buffers must be provided"
+        assert per_model_buffers is not None, "per_model_buffers must be provided"
         self.buffers = list(itertools.chain(*per_model_buffers.values()))
         self.per_model_buffers = per_model_buffers
         self.data_parallel_group = data_parallel_group
@@ -427,12 +413,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.gbuf_ranges = []
         self.per_bucket_numel = []
         self.per_bucket_numel_unpadded = []
-        self.param_buffers = []
         for buffer in self.buffers:
-            # self.param_buffers needs handles to each param_buffer bucket to coordinate all-gather.
-            self.param_buffers.append([])
-            for bucket in buffer.buckets:
-                self.param_buffers[-1].append(bucket.param_data)
 
             self.per_bucket_numel.append(
                 {
@@ -448,13 +429,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     ]
                 }
             )
-            self.gbuf_ranges.append(self.build_gbuf_range_map(buffer))
-        self.model_param_gbuf_map = self.build_model_param_gbuf_map(self.gbuf_ranges)
+            self.gbuf_ranges.append(self._build_gbuf_range_map(buffer))
+        self.model_param_gbuf_map = self._build_model_param_gbuf_map(self.gbuf_ranges)
 
         # Optimizer ranges.
-        self.model_param_group_index_map, self.opt_group_ranges = self.build_optimizer_group_ranges(
-            self.optimizer.param_groups, self.gbuf_ranges
-        )
+        (
+            self.model_param_group_index_map,
+            self.opt_group_ranges,
+        ) = self._build_optimizer_group_ranges(self.optimizer.param_groups, self.gbuf_ranges)
 
         # Allocate main param shards.
         (
@@ -463,7 +445,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.shard_float16_groups,
             self.shard_fp32_groups,
             self.shard_fp32_from_float16_groups,
-        ) = self.build_model_and_main_param_groups(
+        ) = self._build_model_and_main_param_groups(
             self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges
         )
 
@@ -474,7 +456,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.all_gather_handle_indices = []
         self.param_to_all_gather_handle_index_map = {}
 
-        self.pbuf_view_items = self.get_model_param_buffer_dp_views()
+        self.pbuf_view_items = self._get_model_param_buffer_dp_views()
         for (gbuf_index, dtype, bucket_index, _, _) in self.pbuf_view_items:
             self.all_gather_handle_index_to_bucket_index_map.append(
                 (gbuf_index, dtype, bucket_index)
@@ -494,7 +476,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 self.param_to_all_gather_handle_index_map[param] = all_gather_handle_index
         self.num_all_gather_handles = len(self.all_gather_handle_index_to_bucket_index_map)
 
-        self.overlap_param_gather = overlap_param_gather
+        self.overlap_param_gather = self.config.overlap_param_gather
         self.remove_pre_hook_handle = None
         if self.overlap_param_gather:
             self.enable_pre_hook()
@@ -507,7 +489,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
         self.optimizer.load_state_dict(self.optimizer.state_dict())
 
+    def enable_pre_hook(self):
+        """
+        Enable forward pre-hook needed for param all-gather overlap with forward compute.
+        """
+        assert self.remove_pre_hook_handle is None
+        self.remove_pre_hook_handle = torch.nn.modules.module.register_module_forward_pre_hook(
+            self._make_forward_pre_hook()
+        )
+
     def disable_pre_hook(self):
+        """
+        Disable forward pre-hook needed for param all-gather overlap with forward compute.
+        """
         assert self.remove_pre_hook_handle is not None
         self.remove_pre_hook_handle.remove()
         self.remove_pre_hook_handle = None
@@ -515,13 +509,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Make sure all-gathers are completed as needed.
         self._reset_metadata_and_sync_gather_all_model_params(force_sync=True)
 
-    def enable_pre_hook(self):
-        assert self.remove_pre_hook_handle is None
-        self.remove_pre_hook_handle = torch.nn.modules.module.register_module_forward_pre_hook(
-            self._make_forward_pre_hook()
-        )
-
-    def get_model_param_range_map(self, param):
+    def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """
         Given a model param, get the index sub-range of the param that this
         data-parallel rank owns.
@@ -531,7 +519,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         param_range_map = gbuf_range_map["param_map"][param]
         return param_range_map
 
-    def get_model_parallel_group(self):
+    def get_model_parallel_group(self) -> torch.distributed.ProcessGroup:
         """
         With the distributed optimizer, the model parallel group is the
         entire world.
@@ -639,7 +627,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
-            if self.fp16:
+            if self.config.fp16:
                 logger.info(
                     '***WARNING*** found an old checkpoint, will not ' 'load grad scaler ...'
                 )
@@ -659,9 +647,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def get_parameter_state(self):
         """Get parameter state (i.e., parameter & optimizer tensors).
 
-        This method performs three steps:
+        This method performs two steps:
         - For each DP rank, copy param & optimizer shards to contiguous CPU
-          buffers. (e.g., one buffer each for main_param, exp_avg, and
+          buffers (e.g., one buffer each for main_param, exp_avg, and
           exp_avg_sq).
         - Gather contiguous buffers on DP rank 0 and concatenate to world
           buffers.
@@ -751,10 +739,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         return state
 
-    def save_parameter_state(self, filename):
+    def save_parameter_state(self, filename: str):
         """Save the distributed parameter state on DP rank 0.
 
-        Args:
+        Arguments:
             filename (str): path to save parameter state to.
         """
 
@@ -765,7 +753,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def sharded_state_dict(
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
     ):
-        """ Naive implementation which reuses gather/scatter from the legacy ckpt format.
+        """
+        Naive implementation which reuses gather/scatter from the legacy ckpt format.
 
         During saving, gathers the parameters state on DP rank 0 and saves a ShardedObject
         with fixed TPxPP structure. During loading, loads the saved data on DP rank 0
@@ -937,10 +926,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 local_shards[key][gbuf_local_start:gbuf_local_end]
                             )
 
-    def load_parameter_state(self, filename):
+    def load_parameter_state(self, filename: str):
         """Load the distributed parameter state from disk.
 
-        Args:
+        Arguments:
             filename (str): path to load parameter state from.
         """
         state_dict = None
@@ -949,15 +938,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         self.load_parameter_state_from_state_dict(state_dict)
 
-    def zero_grad(self, set_to_none=True):
+    def zero_grad(self, set_to_none: bool = True):
         """
-        Zero grads.
+        Zeroes grads for the model related parameters, i.e., model_float16_groups
+        and model_fp32_groups. We additionally zero the remaining groups as a
+        memory optimization to reduce fragmentation; in the case of
+        set_to_none==True, the space used by this field can be safely deallocated.
 
-        We only need to zero the model related parameters, i.e.,
-        model_float16_groups & model_fp32_groups. We additionally zero
-        the remaining groups as a memory optimization to reduce
-        fragmentation; in the case of set_to_none==True, the space
-        used by this field can be safely deallocated at this point.
+        Arguments:
+            set_to_none (bool): if true, set grads to None.
         """
         for groups in (
             self.model_float16_groups,
@@ -978,7 +967,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.overlap_param_gather:
             self._dispatch_gather_model_params(all_gather_handle_index=0)
 
-    def get_model_param_buffer_dp_views(self):
+    def _get_model_param_buffer_dp_views(self):
         """
         Get shard views of each of the param buffers.
 
@@ -1002,28 +991,28 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # In all cases, we want all_gather and all_gather_handle.wait() to be called in the same order,
         # and all_gather_handle.wait() needs to be called just before the corresponding forward pass.
         view_items = []
-        for gbuf_index, buffers in enumerate(self.param_buffers):
+        for gbuf_index, buffer in enumerate(self.buffers):
             view_items_per_model_chunk = []
             dtype = self.buffers[gbuf_index].param_dtype
-            for bucket_index, buf in enumerate(buffers):
+            for bucket_index, bucket in enumerate(buffer.buckets):
                 data_parallel_world_size = torch.distributed.get_world_size(
                     self.data_parallel_group
                 )
-                buf_views = shard_buffer(buf, data_parallel_world_size)
+                buf_views = shard_buffer(bucket.param_data, data_parallel_world_size)
                 view_items_per_model_chunk.insert(
-                    0, (gbuf_index, dtype, bucket_index, buf, buf_views)
+                    0, (gbuf_index, dtype, bucket_index, bucket.param_data, buf_views)
                 )
             view_items.extend(view_items_per_model_chunk)
 
         return view_items
 
-    def _dispatch_gather_model_params(self, all_gather_handle_index, force_sync=False):
+    def _dispatch_gather_model_params(self, all_gather_handle_index: int, force_sync: bool = False):
         """
         All-gather updated model params.
 
-        The DDP's param buffer is used for the all-gather, and thus no
-        tensors are dynamically allocated. After the all-gather, the params
-        can be copied from the param buffer to the param.
+        When using the distributed optimizer, the params are already laid out in a contiguous
+        buffer (see mcore/distributed/param_and_grad_buffer.py for details), and so the
+        all-gather will put the results in the right region of memory.
         """
         async_op = self.overlap_param_gather and not force_sync
         if self.update_successful:
@@ -1032,8 +1021,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
             # All-gather updated main params.
             # All param_buf views are guaranteed to have the same number of elements
-            # across all data-parallel ranks, due to padding (done in grad_buffer.py),
-            # and extended to the param_bufs. Thus, all sub-views will have consistent
+            # across all data-parallel ranks, due to padding done in
+            # param_and_grad_buffer.py). Thus, all sub-views will have consistent
             # start / end indexes across data-parallel ranks.
             (gbuf_index, dtype, bucket_index, pbuf, pbuf_views) = self.pbuf_view_items[
                 all_gather_handle_index
@@ -1076,9 +1065,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         return hook
 
-    def finish_param_sync(self, model_index, *unused):
+    def finish_param_sync(self, model_index: int, *unused):
         """
         Finishes all necessary param syncs for the model_index'th model chunk.
+
+        Arguments:
+            model_index (int): index of model chunk to synchronize params.
         """
         if model_index not in self.model_index_to_all_gather_handle_index_map:
             return
@@ -1087,10 +1079,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for all_gather_handle_index in all_gather_handle_indices:
             self._finish_param_sync_helper(all_gather_handle_index)
 
-    def _finish_param_sync_helper(self, all_gather_handle_index):
+    def _finish_param_sync_helper(self, all_gather_handle_index: int):
         """
-        Waits on all_gather_handle if necessary, then copies params from param_buffer
-        into model_params if necessary.
+        Waits on all_gather_handle if necessary, then dispatches the next all-gather
+        as necessary.
         """
 
         # First check if there is an outstanding all-gather handle for this param.
@@ -1113,7 +1105,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def _collect_main_grad_data_for_unscaling(self):
         """
         Note: this should be equivalent to the float-16 optimizer's method,
-        but writtent differently, so the two should be combined.
+        but written differently, so the two should be combined.
         """
         return [
             param.grad.data for group in self.optimizer.param_groups for param in group["params"]
@@ -1147,7 +1139,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for model_group, shard_main_group in zip(model_groups, shard_main_groups):
                 for model_param, shard_main_param in zip(model_group, shard_main_group):
 
-                    param_range_map = self.get_model_param_range_map(model_param)
+                    param_range_map = self._get_model_param_range_map(model_param)
                     param_range = param_range_map["param"]
                     assert param_range.size == shard_main_param.nelement()
 
@@ -1173,13 +1165,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for shard_main_group, model_group in zip(shard_main_groups, model_groups):
                 for shard_main_param, model_param in zip(shard_main_group, model_group):
 
-                    param_range_map = self.get_model_param_range_map(model_param)
+                    param_range_map = self._get_model_param_range_map(model_param)
                     world_range = param_range_map["gbuf_world_in_bucket"]
 
                     assert world_range.size == shard_main_param.nelement()
 
-                    gbuf_index, dtype, bucket_id = self.model_param_gbuf_map[model_param]
-                    model_param_buffer = self.param_buffers[gbuf_index][bucket_id]
+                    gbuf_index, _, bucket_id = self.model_param_gbuf_map[model_param]
+                    model_param_buffer = self.buffers[gbuf_index].buckets[bucket_id].param_data
 
                     shard_model_param = model_param_buffer.view(-1)[
                         world_range.start : world_range.end
@@ -1205,7 +1197,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for model_group, shard_main_group in zip(model_groups, shard_main_groups):
                 for model_param, shard_main_param in zip(model_group, shard_main_group):
 
-                    param_range_map = self.get_model_param_range_map(model_param)
+                    param_range_map = self._get_model_param_range_map(model_param)
                     param_range = param_range_map["param"]
                     assert param_range.size == shard_main_param.nelement()
 
@@ -1216,8 +1208,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
         copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)
 
-    def _reset_metadata_and_sync_gather_all_model_params(self, force_sync):
-        # Reset metadata needed to track results of all-gathers.
+    def _reset_metadata_and_sync_gather_all_model_params(self, force_sync: bool):
+        """
+        Reset metadata needed to track results of all-gathers.
+        """
         self.all_gather_handles = [None for _ in range(len(self.all_gather_handles))]
 
         # Launch synchronous all-gather if --overlap-param-gather is turned on or if force_sync
@@ -1228,16 +1222,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 self._dispatch_gather_model_params(all_gather_handle_index, force_sync=force_sync)
 
     @torch.no_grad()
-    def step(self, args, timers):
-        self.update_successful, grad_norm, num_zeros_in_grad = super().step(args, timers)
+    def step(self):
+        """
+        Step optimizer.
+        Under the hood, either launch synchronous param all-gathers or get ready to launch
+        asynchorous all-gathers that get overlapped with the next forward pass.
+        """
+        self.update_successful, grad_norm, num_zeros_in_grad = super().step()
 
+        timers = self.config.timers
+        if timers is not None:
+            timers('params-all-gather', log_level=1).start(barrier=self.config.barrier_with_L1_time)
         # If not overlapping all-gather for parameters, launch synchronous all-gather
         # communication calls here. If overlapping all-gather for parameters, the following
         # call to _gather_all_model_params is a no-op: the first all-gather is launched
         # asynchronously in the next optimizer.zero_grad() call and subsequent all-gathers
         # are launched in the forward pre-hook.
-        timers('params-all-gather', log_level=1).start(barrier=args.barrier_with_L1_time)
         self._reset_metadata_and_sync_gather_all_model_params(force_sync=False)
-        timers('params-all-gather').stop()
+        if timers is not None:
+            timers('params-all-gather').stop()
 
         return self.update_successful, grad_norm, num_zeros_in_grad
