@@ -13,7 +13,8 @@ from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import is_main_replica, \
     ShardedStateDict
-from megatron.core.dist_checkpointing.strategies.base import SaveShardedStrategy
+from megatron.core.dist_checkpointing.strategies.base import \
+    SaveShardedStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -34,15 +35,15 @@ class FullyParallelSaveStrategyWrapper(SaveShardedStrategy):
 
     def apply_saving_parallelization(self, sharded_state_dict: ShardedStateDict) -> None:
         if self.do_cache_distribution and self.cached_distribution is not None:
-            logger.debug(f'Apply *cached* save parallelization')
+            logger.info(f'Apply *cached* save parallelization')
             precomputed_distribution = self.cached_distribution
         else:
-            logger.debug(f'Apply save parallelization')
-            precomputed_distribution = determine_save_distribution(sharded_state_dict, self.parallelization_group)
+            logger.info(f'Apply save parallelization')
+            precomputed_distribution = determine_main_replica_uniform_distribution(sharded_state_dict, self.parallelization_group)
             if self.do_cache_distribution:
                 self.cached_distribution = precomputed_distribution
 
-        distribute_save_with_precomputed_distribution(sharded_state_dict, self.parallelization_group, precomputed_distribution)
+        distribute_main_replicas_with_precomputed_distribution(sharded_state_dict, self.parallelization_group, precomputed_distribution)
 
 
     @property
@@ -51,16 +52,26 @@ class FullyParallelSaveStrategyWrapper(SaveShardedStrategy):
 
 
 def sharded_tensor_chunk_id(sharded_tensor: ShardedTensor):
+    f_range = sharded_tensor.flattened_range
     return (
         sharded_tensor.key,
         sharded_tensor.global_offset,
+        None if f_range is None else (f_range.start, f_range.stop)
     )
+
+
+def _shard_size(sh_ten: ShardedTensor):
+    if sh_ten.flattened_range is None:
+        numel = np.product(sh_ten.local_shape)
+    else:
+        numel = sh_ten.flattened_range.stop - sh_ten.flattened_range.start
+    return numel * torch._utils._element_size(sh_ten.dtype)
 
 
 T = TypeVar('T')
 
 
-def determine_save_distribution(sharded_state_dict, parallelization_group):
+def determine_main_replica_uniform_distribution(sharded_state_dict, parallelization_group):
     group_size = torch.distributed.get_world_size(group=parallelization_group)
     if group_size <= 1:
         return
@@ -77,42 +88,38 @@ def determine_save_distribution(sharded_state_dict, parallelization_group):
 
     shard_to_ranks = defaultdict(list)
     shard_to_size = {}
-    dtype_sizes = {
-        dtype: torch.tensor([], dtype=dtype).element_size()
-        for dtype in [torch.bfloat16, torch.float, torch.half]
-    }
-    is_saved_by_this_dp_group = {}
+    is_saved_by_this_distributed_group = {}
     for rank, rank_shards in enumerate(all_shards):
         for sh_ten in rank_shards:
             shard_id = sharded_tensor_chunk_id(sh_ten)
             shard_to_ranks[shard_id].append(rank)
             if shard_id not in shard_to_size:
-                shard_to_size[shard_id] = np.product(sh_ten.local_shape) * dtype_sizes[sh_ten.dtype]
+                shard_to_size[shard_id] = _shard_size(sh_ten)
             if is_main_replica(sh_ten.replica_id):
-                is_saved_by_this_dp_group[shard_id] = True
+                is_saved_by_this_distributed_group[shard_id] = True
 
     shard_to_ranks = {k: v for k, v in shard_to_ranks.items()
-                      if is_saved_by_this_dp_group.get(k, False)}
+                      if is_saved_by_this_distributed_group.get(k, False)}
 
     # print(f'End prep, elapsed: {time() - start:<10.5f}.')
     shard_to_saving_rank = distribute_chunks_to_ranks(shard_to_ranks, shard_to_size, len(all_shards))
 
-    return shard_to_saving_rank, is_saved_by_this_dp_group
+    return shard_to_saving_rank, is_saved_by_this_distributed_group
 
 
-def distribute_save_with_precomputed_distribution(sharded_state_dict, data_parallel_group, precomputed_distribution):
+def distribute_main_replicas_with_precomputed_distribution(sharded_state_dict, data_parallel_group, precomputed_distribution):
     group_size = torch.distributed.get_world_size(group=data_parallel_group)
     if group_size <= 1:
         return
     local_shards = list(sh_base for sh_base in nested_values(sharded_state_dict)
                         if isinstance(sh_base, ShardedTensor))
 
-    shard_to_saving_rank, is_saved_by_this_dp_group = precomputed_distribution
+    shard_to_saving_rank, is_saved_by_this_distributed_group = precomputed_distribution
 
     rank_within_dp_group = torch.distributed.get_rank(data_parallel_group)
     for sh_ten in local_shards:
         shard_id = sharded_tensor_chunk_id(sh_ten)
-        if is_saved_by_this_dp_group.get(shard_id, False) and rank_within_dp_group == shard_to_saving_rank[shard_id]:
+        if is_saved_by_this_distributed_group.get(shard_id, False) and rank_within_dp_group == shard_to_saving_rank[shard_id]:
             sh_ten.replica_id = 0
         else:
             sh_ten.replica_id = 1  # TODO: consider something more informative
