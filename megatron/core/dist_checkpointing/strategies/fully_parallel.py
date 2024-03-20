@@ -79,12 +79,8 @@ def determine_main_replica_uniform_distribution(sharded_state_dict, parallelizat
                         if isinstance(sh_base, ShardedTensor))
     local_shards_no_data = [ten.without_data() for ten in local_shards]
 
-    start = time()
-
     all_shards = [None] * torch.distributed.get_world_size(group=parallelization_group)
     torch.distributed.all_gather_object(all_shards, local_shards_no_data, group=parallelization_group)
-
-    # print(f'End all_gather_object, elapsed: {time() - start:<10.5f}.')
 
     shard_to_ranks = defaultdict(list)
     shard_to_size = {}
@@ -101,7 +97,6 @@ def determine_main_replica_uniform_distribution(sharded_state_dict, parallelizat
     shard_to_ranks = {k: v for k, v in shard_to_ranks.items()
                       if is_saved_by_this_distributed_group.get(k, False)}
 
-    # print(f'End prep, elapsed: {time() - start:<10.5f}.')
     shard_to_saving_rank = distribute_chunks_to_ranks(shard_to_ranks, shard_to_size, len(all_shards))
 
     return shard_to_saving_rank, is_saved_by_this_distributed_group
@@ -125,16 +120,8 @@ def distribute_main_replicas_with_precomputed_distribution(sharded_state_dict, d
             sh_ten.replica_id = 1  # TODO: consider something more informative
 
 
-
-
 def distribute_chunks_to_ranks_heapq(shard_to_ranks: Dict[T, List[int]], shard_to_size: Dict[T, int], num_ranks: int) -> Dict[T, int]:
     shard_to_ranks = {k: tuple(v) for k, v in shard_to_ranks.items()}
-    # if torch.distributed.get_rank() == 0:
-    #     print('_____________')
-    #     print(shard_to_ranks)
-    #     print(shard_to_size)
-    #     print(flush=True)
-
     shard_to_saving_rank = {}
     rank_sizes = [(0, rank) for rank in range(num_ranks)]
     heapq.heapify(rank_sizes)
@@ -155,22 +142,11 @@ def distribute_chunks_to_ranks_heapq(shard_to_ranks: Dict[T, List[int]], shard_t
 
         heapq.heappush(rank_sizes, (size + shard_to_size[shard_id], rank))
 
-    # if torch.distributed.get_rank() == 0:
-    #     print('rank sizes', rank_sizes)
-    #     print('shard_to_saving_rank', shard_to_saving_rank)
-    #     print('^^^^^^^^^^^^')
-
     return shard_to_saving_rank
 
 
 def distribute_chunks_to_ranks(shard_to_ranks: Dict[T, List[int]], shard_to_size: Dict[T, int], num_ranks: int) -> Dict[T, int]:
     shard_to_ranks = {k: tuple(v) for k, v in shard_to_ranks.items()}
-    # if torch.distributed.get_rank() == 0:
-    #     print('_____________')
-    #     print(shard_to_ranks)
-    #     print(shard_to_size)
-    #     print(flush=True)
-
     shard_to_saving_rank = {}
     rank_sizes = [(0, rank) for rank in range(num_ranks)]
 
@@ -182,10 +158,5 @@ def distribute_chunks_to_ranks(shard_to_ranks: Dict[T, List[int]], shard_to_size
 
         shard_to_saving_rank[shard_id] = rank
         rank_sizes[rank] = (size + shard_to_size[shard_id], rank)
-
-    # if torch.distributed.get_rank() == 0:
-    #     print('rank sizes', rank_sizes)
-    #     print('shard_to_saving_rank', shard_to_saving_rank)
-    #     print('^^^^^^^^^^^^')
 
     return shard_to_saving_rank
