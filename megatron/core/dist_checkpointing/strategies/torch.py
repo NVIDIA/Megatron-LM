@@ -101,7 +101,7 @@ def sharded_tensor_to_torch_sharded_tensor(
         rank = torch.distributed.get_rank()
 
     some_sh_ten = sh_tens[0]
-    has_flattened_range = some_sh_ten.flattened_range
+    has_flattened_range = some_sh_ten.flattened_range is not None
 
     prepend_axis_num = sh_tens[0].prepend_axis_num
     # Determine local shards
@@ -156,9 +156,7 @@ def sharded_tensor_to_torch_sharded_tensor(
         else:
             # for shards from other ranks we provide simplistic data - this information will be discarded
             # during TorchShardedTensor._init_from_local_shards_and_global_metadata call
-            size = some_sh_ten.local_shape
-            placement = "cuda"
-            shard_metadata.append(ShardMetadata(offset, size, placement))
+            shard_metadata.append(ShardMetadata(offset, offsets_shape, "cuda"))
 
     tensor = some_sh_ten.data
     sharded_tensor_metadata = ShardedTensorMetadata(
