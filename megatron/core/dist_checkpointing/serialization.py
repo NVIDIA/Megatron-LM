@@ -321,7 +321,9 @@ def save(
     torch.distributed.barrier()
 
 
-def get_default_save_sharded_strategy(backend: str = 'torch_dist', version: int = 1) -> SaveShardedStrategy:
+def get_default_save_sharded_strategy(
+    backend: str = 'torch_dist', version: int = 1
+) -> SaveShardedStrategy:
     return get_default_strategy(StrategyAction.SAVE_SHARDED, backend, version)
 
 
