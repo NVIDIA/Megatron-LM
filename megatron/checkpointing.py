@@ -677,7 +677,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         print_rank_0('could not find arguments in the checkpoint ...')
 
     # Model.
-    strict = False if args.retro_add_retriever or args.transformer_impl == 'transformer_engine' else strict
+    strict = False if args.retro_add_retriever else strict
     if len(model) == 1:
         model[0].load_state_dict(state_dict['model'], strict=strict)
     else:
