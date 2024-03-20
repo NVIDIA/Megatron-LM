@@ -85,6 +85,7 @@ class GPTModel(LanguageModule):
         creat_lambda=0.5,
         creat_lr=0.1,
         creat_max_norm=0.1,
+        neft_reimplement=False,
     ) -> None:
         super().__init__(config=config)
 
@@ -116,6 +117,7 @@ class GPTModel(LanguageModule):
         self.creat_lambda = creat_lambda
         self.creat_lr = creat_lr
         self.creat_max_norm = creat_max_norm
+        self.neft_reimplement = neft_reimplement
 
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
@@ -135,6 +137,7 @@ class GPTModel(LanguageModule):
                 neft_alpha=self.neft_alpha,
                 noise_positonal_embedding=self.noise_positonal_embedding,
                 noise_scheduler_config=noise_scheduler_config,
+                neft_reimplement=self.neft_reimplement,
             )
 
         if self.position_embedding_type == 'rope':
@@ -195,6 +198,7 @@ class GPTModel(LanguageModule):
         labels: Tensor = None,
         inference_params: InferenceParams = None,
         extra_block_kwargs: dict = None,
+        input_lengths: Optional[Tensor] = None
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoeder and finally into the post
@@ -209,7 +213,7 @@ class GPTModel(LanguageModule):
         if decoder_input is not None:
             pass
         elif self.pre_process:
-            decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+            decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids, input_lengths=input_lengths)
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor

@@ -134,6 +134,7 @@ class LanguageModelEmbedding(MegatronModule):
         neft_alpha=5.0,
         noise_positonal_embedding=False,
         noise_scheduler_config=None,
+        neft_reimplement=False,
     ):
         super().__init__(config=config)
 
@@ -149,6 +150,7 @@ class LanguageModelEmbedding(MegatronModule):
         self.embedding_noise_type = embedding_noise_type
         self.neft = neft
         self.neft_alpha = neft_alpha
+        self.neft_reimplement = neft_reimplement
         self.noise_positonal_embedding = noise_positonal_embedding
 
         if noise_scheduler_config is not None:
@@ -213,7 +215,7 @@ class LanguageModelEmbedding(MegatronModule):
             self.tokentype_embeddings.weight.data.fill_(0)
             self.tokentype_embeddings.weight.shared = True
 
-    def _noise(self, embeddings):
+    def _noise(self, embeddings, input_lengths=None):
         if self.training:
             if self.embedding_noise and not self.neft:
                     noise_scale = self.embedding_noise_std
@@ -235,12 +237,27 @@ class LanguageModelEmbedding(MegatronModule):
                     if hasattr(self, 'noise_scheduler') and self.noise_scheduler is not None:
                         current_alpha = self.noise_scheduler.get_noise()
 
-                    epsilon = torch.empty_like(embeddings).uniform_(-1, 1).detach()
-                    scaled_noise = (current_alpha / math.sqrt(embeddings.shape[0] * embeddings.shape[-1])) * epsilon
-                    embeddings = embeddings + scaled_noise
+                    if not self.neft_reimplement:
+                        epsilon = torch.empty_like(embeddings).uniform_(-1, 1).detach()
+                        scaled_noise = (current_alpha / math.sqrt(embeddings.shape[0] * embeddings.shape[-1])) * epsilon
+                        embeddings = embeddings + scaled_noise
+                    else:
+                        max_length = embeddings.shape[1]
+                        mask = torch.arange(max_length).to(input_lengths).unsqueeze(0) < input_lengths.unsqueeze(1)
+                        input_mask = mask.int() # B x L
+                        input_lengths = input_lengths # B
+
+                        noise_ = torch.zeros_like(embeddings).uniform_(-1, 1)
+                        delta = noise_ * input_mask.unsqueeze(-1)
+                        dims = input_lengths * embeddings.shape[-1]
+                        mag = current_alpha / torch.sqrt(dims)
+
+                        delta = (delta * mag.view(-1,1,1)).detach()
+                        embeddings = embeddings + delta
+
         return embeddings
 
-    def forward(self, input_ids: Tensor, position_ids: Tensor, tokentype_ids: int = None) -> Tensor:
+    def forward(self, input_ids: Tensor, position_ids: Tensor, tokentype_ids: int = None, input_lengths: Optional[Tensor] = None) -> Tensor:
         """Forward pass of the embedding module
         Args:
             input_ids (Tensor): The input tokens
@@ -253,7 +270,7 @@ class LanguageModelEmbedding(MegatronModule):
         word_embeddings = self.word_embeddings(input_ids)
 
         if not self.noise_positonal_embedding:
-            word_embeddings = self._noise(word_embeddings)
+            word_embeddings = self._noise(word_embeddings, input_lengths=input_lengths)
 
         if self.add_position_embedding:
             position_embeddings = self.position_embeddings(position_ids)
@@ -262,7 +279,7 @@ class LanguageModelEmbedding(MegatronModule):
             embeddings = word_embeddings
 
         if self.noise_positonal_embedding:
-            embeddings = self._noise(embeddings)
+            embeddings = self._noise(embeddings, input_lengths=input_lengths)
         # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
         embeddings = embeddings.transpose(0, 1).contiguous()
 
