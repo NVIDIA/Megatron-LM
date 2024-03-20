@@ -33,7 +33,7 @@ TRAINING_DTYPE=fp16
 
 if [[ $USE_CORE -eq 1 ]]; then
        echo "Running using megatron core"
-       TRANSFORMER_IMPL=local
+       TRANSFORMER_IMPL=transformer_engine
        TRAINING_DTYPE=bf16
        command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0;"
        USE_MCORE=1
