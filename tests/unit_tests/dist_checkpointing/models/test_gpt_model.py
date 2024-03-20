@@ -6,8 +6,12 @@ import torch
 from torch.distributed._tensor import DeviceMesh
 
 from megatron.core.dist_checkpointing import save, load, load_plain_tensors
-from megatron.core import parallel_state as ps
+from megatron.core import parallel_state as ps, parallel_state
 from megatron.core.dist_checkpointing.dict_utils import diff
+from megatron.core.dist_checkpointing.serialization import \
+    get_default_save_sharded_strategy
+from megatron.core.dist_checkpointing.strategies.fully_parallel import \
+    FullyParallelSaveStrategyWrapper
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.gpt.gpt_model import GPTModel
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -56,6 +60,7 @@ class TestGPTModel:
 
 
 class TestGPTModelReconfiguration:
+    @pytest.mark.parametrize("use_fpsl", [False, True])
     @pytest.mark.parametrize("src_tp_pp,dest_tp_pp,src_layer_spec_fn,dst_layer_spec_fn", [
         ((2, 4), (4, 2), gpt_te_spec, gpt_te_spec),
         ((1, 8), (8, 1), gpt_te_spec, gpt_te_spec),
@@ -66,18 +71,25 @@ class TestGPTModelReconfiguration:
         ((1, 8), (2, 1), gpt_local_spec, gpt_te_spec),
     ])
     def test_parallel_reconfiguration_e2e(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp,
-                                          src_layer_spec_fn, dst_layer_spec_fn):
+                                          src_layer_spec_fn, dst_layer_spec_fn, use_fpsl):
         """ Test model saving and loading with different TP/PP """
         with TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_A') as ckpt_dir_A, \
              TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_B') as ckpt_dir_B:
             # Save checkpoint A
             Utils.initialize_model_parallel(*src_tp_pp)
             gpt_model_A = initialize_gpt_model(1, src_layer_spec_fn)
-            save(gpt_model_A.sharded_state_dict(), ckpt_dir_A)
+            save_strategy = get_default_save_sharded_strategy()
+            if use_fpsl:
+                save_strategy = FullyParallelSaveStrategyWrapper(
+                    save_strategy,
+                    parallel_state.get_data_parallel_group(with_context_parallel=True)
+                )
+            save(gpt_model_A.sharded_state_dict(), ckpt_dir_A, save_strategy)
             regular_state_dict_A = gpt_model_A.state_dict()
             Utils.destroy_model_parallel()
 
             # Load checkpoint A with different TP/PP and save as checkpoint B
+            # No FPS this time
             Utils.initialize_model_parallel(*dest_tp_pp)
             gpt_model_B = initialize_gpt_model(2, dst_layer_spec_fn)
             state_dict = load(gpt_model_B.sharded_state_dict(), ckpt_dir_A)
