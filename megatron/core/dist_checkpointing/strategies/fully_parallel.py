@@ -35,10 +35,10 @@ class FullyParallelSaveStrategyWrapper(SaveShardedStrategy):
 
     def apply_saving_parallelization(self, sharded_state_dict: ShardedStateDict) -> None:
         if self.do_cache_distribution and self.cached_distribution is not None:
-            logger.info(f'Apply *cached* save parallelization')
+            logger.debug(f'Apply *cached* save parallelization')
             precomputed_distribution = self.cached_distribution
         else:
-            logger.info(f'Apply save parallelization')
+            logger.debug(f'Apply save parallelization')
             precomputed_distribution = determine_main_replica_uniform_distribution(sharded_state_dict, self.parallelization_group)
             if self.do_cache_distribution:
                 self.cached_distribution = precomputed_distribution
@@ -158,5 +158,7 @@ def distribute_chunks_to_ranks(shard_to_ranks: Dict[T, List[int]], shard_to_size
 
         shard_to_saving_rank[shard_id] = rank
         rank_sizes[rank] = (size + shard_to_size[shard_id], rank)
+
+    logger.debug(f'distribute_chunks_to_ranks distribution: {rank_sizes}')
 
     return shard_to_saving_rank
