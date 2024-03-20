@@ -13,6 +13,10 @@ from megatron.core.dist_checkpointing import ShardedTensor, save, load
 from megatron.core.dist_checkpointing.dict_utils import nested_values, diff
 from megatron.core.dist_checkpointing.optimizer import \
     get_param_id_to_sharded_param_map, optim_state_to_sharding_state
+from megatron.core.dist_checkpointing.serialization import \
+    get_default_save_sharded_strategy
+from megatron.core.dist_checkpointing.strategies.fully_parallel import \
+    FullyParallelSaveStrategyWrapper
 from megatron.core.dist_checkpointing.utils import extract_sharded_tensors
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
@@ -132,6 +136,7 @@ def setup_model_and_optimizer(seed):
 
 
 class TestDistributedOptimizer:
+    @pytest.mark.parametrize("use_fpsl", [False, True])
     @pytest.mark.parametrize("tp_pp,src_dp,dest_dp", [
         ((4, 1), 2, 2),
         # ((1, 1), 8, 1),  # TODO: changing DP doesn't work for now
@@ -139,7 +144,7 @@ class TestDistributedOptimizer:
         # ((2, 1), 2, 1),
         # ((2, 1), 2, 2),
     ])
-    def test_full_dp_sharding(self, tmp_path_dist_ckpt, tp_pp, src_dp, dest_dp):
+    def test_full_dp_sharding(self, tmp_path_dist_ckpt, tp_pp, src_dp, dest_dp, use_fpsl):
         src_world_size = tp_pp[0] * tp_pp[1] * src_dp
         dest_world_size = tp_pp[0] * tp_pp[1] * dest_dp
         assert src_world_size <= Utils.world_size, (tp_pp, src_dp)
@@ -152,7 +157,14 @@ class TestDistributedOptimizer:
                     # Save checkpoint A
                     Utils.initialize_model_parallel(*tp_pp)
                     model, optimizer_A = setup_model_and_optimizer(seed=2)
-                    save(optimizer_A.sharded_state_dict(model[0].sharded_state_dict()), ckpt_dir)
+
+                    save_strategy = get_default_save_sharded_strategy()
+                    if use_fpsl:
+                        save_strategy = FullyParallelSaveStrategyWrapper(
+                            save_strategy,
+                            parallel_state.get_data_parallel_group(with_context_parallel=True)
+                        )
+                    save(optimizer_A.sharded_state_dict(model[0].sharded_state_dict()), ckpt_dir, save_strategy)
                     optim_param_state_A = optimizer_A.get_parameter_state_dp_zero()
                     Utils.destroy_model_parallel()
                 else:
