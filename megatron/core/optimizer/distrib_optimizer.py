@@ -842,9 +842,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 model_sharded_state_dict, is_loading
             )
         elif sharding_type == 'dp_zero_gather_scatter':
-            param_state = self.sharded_param_state_dp_zero(
-                model_sharded_state_dict, is_loading
-            )
+            param_state = self.sharded_param_state_dp_zero(model_sharded_state_dict, is_loading)
         elif sharding_type == 'fully_sharded_model_space':
             # In this approach the tensors could be directly related to model parameters
             # by linking them with metadata from `model_sharded_state_dict`.
