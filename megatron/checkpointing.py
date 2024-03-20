@@ -308,7 +308,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
                                         check_parent=False)
             save_strategy = (args.dist_ckpt_format, 1)
             validate_sharding_integrity = True
-            if args.fully_parallel_save:
+            if args.ckpt_fully_parallel_save:
                 if checkpointing_context is not None and 'save_strategy' in checkpointing_context:
                     save_strategy = checkpointing_context['save_strategy']
                     # Already saved once before - don't need to rerun sharding validation
