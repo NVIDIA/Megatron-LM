@@ -915,7 +915,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for dtype, gbuf_range_map_for_all_buckets in state[gbuf_idx].items():
                 for bucket_idx, bucket_state in enumerate(gbuf_range_map_for_all_buckets):
                     # Compute local DP contiguous shard's size.
-                    gbuf_world_numel = self.grad_buffers[gbuf_idx].buckets[bucket_idx].data.numel()
+                    gbuf_world_numel = self.buffers[gbuf_idx].buckets[bucket_idx].grad_data.numel()
                     assert gbuf_world_numel % data_parallel_world_size == 0
                     gbuf_local_numel = gbuf_world_numel // data_parallel_world_size
 
