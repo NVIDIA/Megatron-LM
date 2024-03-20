@@ -479,6 +479,7 @@ def setup_model_and_optimizer(model_provider_func,
                               lr_mult=1.0):
     """Setup model and optimizer."""
     args = get_args()
+    timers = get_timers()
 
     model = get_model(model_provider_func, model_type)
     unwrapped_model = unwrap_model(model)
@@ -488,12 +489,12 @@ def setup_model_and_optimizer(model_provider_func,
         if hasattr(args, f.name):
             kwargs[f.name] = getattr(args, f.name)
     config = OptimizerConfig(**kwargs)
+    config.timers = timers
     optimizer = get_megatron_optimizer(config, model, no_wd_decay_cond,
                                        scale_lr_cond, lr_mult)
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     if args.load is not None:
-        timers = get_timers()
         timers('load-checkpoint', log_level=0).start(barrier=True)
         args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
             model, optimizer, opt_param_scheduler)
@@ -549,7 +550,7 @@ def train_step(forward_step_func, data_iterator,
 
     # Update parameters.
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
+    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     timers('optimizer').stop()
 
     # Vision momentum.
