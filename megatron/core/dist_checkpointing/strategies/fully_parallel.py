@@ -64,7 +64,8 @@ def determine_save_distribution(sharded_state_dict, parallelization_group):
     group_size = torch.distributed.get_world_size(group=parallelization_group)
     if group_size <= 1:
         return
-    local_shards = list(nested_values(sharded_state_dict))
+    local_shards = list(sh_base for sh_base in nested_values(sharded_state_dict)
+                        if isinstance(sh_base, ShardedTensor))
     local_shards_no_data = [ten.without_data() for ten in local_shards]
 
     start = time()
@@ -103,7 +104,8 @@ def distribute_save_with_precomputed_distribution(sharded_state_dict, data_paral
     group_size = torch.distributed.get_world_size(group=data_parallel_group)
     if group_size <= 1:
         return
-    local_shards = list(nested_values(sharded_state_dict))
+    local_shards = list(sh_base for sh_base in nested_values(sharded_state_dict)
+                        if isinstance(sh_base, ShardedTensor))
 
     shard_to_saving_rank, is_saved_by_this_dp_group = precomputed_distribution
 
