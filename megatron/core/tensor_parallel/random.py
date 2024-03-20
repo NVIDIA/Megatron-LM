@@ -82,14 +82,21 @@ class CudaRNGStatesTracker:
     """
 
     def __init__(self):
-        # Map from a string name to the cuda rng state.
-        self.states_ = {}
-        # Seeds are just for book keeping and ensure no seed is set twice.
-        self.seeds_ = set()
+        self.reset()
+
+    def is_initialized(self):
+        return self._is_initialized
 
     def reset(self):
         """Set to the initial state (no tracker)."""
+
+        # Track if initialized.
+        self._is_initialized = False
+
+        # Map from a string name to the cuda rng state.
         self.states_ = {}
+
+        # Seeds are just for book keeping and ensure no seed is set twice.
         self.seeds_ = set()
 
     def get_states(self):
@@ -103,10 +110,12 @@ class CudaRNGStatesTracker:
     def set_states(self, states):
         """Set the rng states. For efficiency purposes, we do not check
         the size of seed for compatibility."""
+        self._is_initialized = True
         self.states_ = states
 
     def add(self, name, seed):
         """Track the rng state."""
+        self._is_initialized = True
         # Check seed is not already used.
         if seed in self.seeds_:
             raise Exception('seed {} already exists'.format(seed))

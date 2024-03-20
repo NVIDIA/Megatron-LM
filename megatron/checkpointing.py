@@ -428,7 +428,8 @@ def fix_query_key_value_ordering(model, checkpoint_version):
                      " checkpoint version {}".format(checkpoint_version))
 
 
-def _load_base_checkpoint(load_dir, rank0=False, sharded_state_dict=None):
+def _load_base_checkpoint(load_dir, rank0=False, sharded_state_dict=None,
+                          exit_on_missing_checkpoint=False):
     """ Load the base state_dict from the given directory
 
     If rank0 is true, just loads rank 0 checkpoint, ignoring arguments.
@@ -444,6 +445,14 @@ def _load_base_checkpoint(load_dir, rank0=False, sharded_state_dict=None):
                 tracker_filename))
             print_rank_0('    will not load any checkpoints and will start from '
                          'random')
+
+        # Conditionally exit if checkpoint not found.
+        if exit_on_missing_checkpoint:
+            print_rank_0(">> '--exit-on-missing-checkpoint' set ... exiting. <<")
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+            sys.exit()
+
         return None, "", False
 
     # Otherwise, read the tracker file and either set the iteration or
@@ -502,7 +511,8 @@ def _load_base_checkpoint(load_dir, rank0=False, sharded_state_dict=None):
     return state_dict, checkpoint_name, release
 
 
-def load_args_from_checkpoint(args, load_arg='load'):
+def load_args_from_checkpoint(args, load_arg='load',
+                              exit_on_missing_checkpoint=False):
     """Set required arguments from the checkpoint specified in the
     arguments.
 
@@ -521,7 +531,11 @@ def load_args_from_checkpoint(args, load_arg='load'):
         print_rank_0('No load directory specified, using provided arguments.')
         return args
 
-    state_dict, checkpoint_name, release = _load_base_checkpoint(load_dir, rank0=True)
+    state_dict, checkpoint_name, release = _load_base_checkpoint(
+        load_dir,
+        rank0=True,
+        exit_on_missing_checkpoint=exit_on_missing_checkpoint,
+    )
 
     # Args.
     if not state_dict:
@@ -602,7 +616,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     load_kwargs = {}
     is_dist_ckpt = False
     if args.auto_detect_ckpt_format or args.use_dist_ckpt:
-        state_dict, checkpoint_name, release = _load_base_checkpoint(load_dir, rank0=True)
+        state_dict, checkpoint_name, release = _load_base_checkpoint(load_dir, rank0=True, exit_on_missing_checkpoint=args.exit_on_missing_checkpoint)
         is_dist_ckpt = dist_checkpointing.check_is_distributed_checkpoint(checkpoint_name)
         if is_dist_ckpt:
             ckpt_tp_pp = (state_dict['args'].tensor_model_parallel_size, state_dict['args'].pipeline_model_parallel_size)
@@ -621,18 +635,12 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
 
             load_kwargs['sharded_state_dict'] = generate_state_dict(args, model, optimizer, opt_param_scheduler,
                                                                     rng_state, args.use_dist_ckpt, is_loading=True)
+            load_kwargs['exit_on_missing_checkpoint'] = args.exit_on_missing_checkpoint
 
     state_dict, checkpoint_name, release = _load_base_checkpoint(load_dir, rank0=False, **load_kwargs)
 
     # Checkpoint not loaded.
     if state_dict is None:
-
-        # Conditionally exit at this point.
-        if args.exit_on_missing_checkpoint:
-            print_rank_0(">> '--exit-on-missing-checkpoint' set ... exiting. <<")
-            torch.distributed.barrier()
-            sys.exit()
-
         # Iteration and num_floating_point_operations_so_far default to 0.
         return 0, 0
 
@@ -756,7 +764,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    print_rank_0(f'  successfully loaded checkpoint from {args.load} '
+    print_rank_0(f'  successfully loaded checkpoint from {args.load} [ t {mpu.get_tensor_model_parallel_rank()}, p {mpu.get_pipeline_model_parallel_rank()} ] '
                  f'at iteration {iteration}')
 
     return iteration, num_floating_point_operations_so_far

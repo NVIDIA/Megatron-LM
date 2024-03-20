@@ -3,10 +3,200 @@
 import os
 import sys
 import torch
+from importlib.metadata import version
+from pkg_resources import packaging
+
+from setter import ModelSetter
+from utils import print_memory_usage
+
+
+class MCoreSetter(ModelSetter):
+
+    @classmethod
+    def has_position_embeddings(cls, model):
+        return hasattr(model.embedding, "position_embeddings")
+
+    @classmethod
+    def set_embeddings(
+        cls,
+        model,
+        word=None,
+        pos=None,
+    ):
+        cls.set_tensor(model.embedding.word_embeddings.weight, word)
+        if pos is not None:
+            cls.set_tensor(model.embedding.position_embeddings.weight, pos)
+
+    @classmethod
+    def set_final_norm(
+        cls,
+        model,
+        weight=None,
+        bias=None,
+    ):
+        cls.set_tensor(model.decoder.final_layernorm.weight, weight)
+        if bias is not None:
+            cls.set_tensor(model.decoder.final_layernorm.bias, bias)
+
+    @classmethod
+    def set_output_word_embeddings(
+        cls,
+        model,
+        emb=None,
+    ):
+        cls.set_tensor(model.embedding.word_embeddings.weight, emb)
+
+    @classmethod
+    def set_output_layer(
+        cls,
+        model,
+        weight=None,
+    ):
+        cls.set_tensor(model.output_layer.weight, weight)
+
+    @classmethod
+    def set_pooler(
+        cls,
+        model,
+        weight=None,
+        bias=None,
+    ):
+        cls.set_tensor(model.pooler.dense.weight, weight)
+        if bias is not None:
+            cls.set_tensor(model.pooler.dense.bias, bias)
+
+    @classmethod
+    def set_lm_head(
+        cls,
+        model,
+        dense_weight=None,
+        dense_bias=None,
+        norm_weight=None,
+        norm_bias=None,
+    ):
+
+        cls.set_tensor(model.lm_head.dense.weight, dense_weight)
+        if dense_bias is not None:
+            cls.set_tensor(model.lm_head.dense.bias, dense_bias)
+
+        cls.set_tensor(model.lm_head.norm.weight, norm_weight)
+        if norm_bias is not None:
+            cls.set_tensor(model.lm_head.norm.bias, norm_bias)
+
+    @classmethod
+    def set_binary_head(
+        cls,
+        model,
+        weight=None,
+        bias=None,
+    ):
+        cls.set_tensor(model.binary_head.weight, weight)
+        if bias is not None:
+            cls.set_tensor(model.binary_head.bias, bias)
+
+
+class MCoreLocalSetter(MCoreSetter):
+
+    @classmethod
+    def set_layer(
+        cls,
+        model,
+        layer_idx,
+        self_attn_norm_weight=None,
+        self_attn_norm_bias=None,
+        self_attn_qkv_weight=None,
+        self_attn_qkv_bias=None,
+        self_attn_proj_weight=None,
+        self_attn_proj_bias=None,
+        mlp_norm_weight=None,
+        mlp_norm_bias=None,
+        mlp_fc1_weight=None,
+        mlp_fc1_bias=None,
+        mlp_fc2_weight=None,
+        mlp_fc2_bias=None,
+    ):
+
+        l = model.decoder.layers[layer_idx]
+
+        # Self attention.
+        cls.set_tensor(l.input_layernorm.weight, self_attn_norm_weight)
+        if self_attn_norm_bias is not None:
+            cls.set_tensor(l.input_layernorm.bias, self_attn_norm_bias)
+
+        cls.set_tensor(l.self_attention.linear_qkv.weight, self_attn_qkv_weight)
+        if self_attn_qkv_bias is not None:
+            cls.set_tensor(l.self_attention.linear_qkv.bias, self_attn_qkv_bias)
+
+        cls.set_tensor(l.self_attention.linear_proj.weight, self_attn_proj_weight)
+        if self_attn_proj_bias is not None:
+            cls.set_tensor(l.self_attention.linear_proj.bias, self_attn_proj_bias)
+
+        # MLP.
+        cls.set_tensor(l.pre_mlp_layernorm.weight, mlp_norm_weight)
+        if mlp_norm_bias is not None:
+            cls.set_tensor(l.pre_mlp_layernorm.bias, mlp_norm_bias)
+
+        cls.set_tensor(l.mlp.linear_fc1.weight, mlp_fc1_weight)
+        if mlp_fc1_bias is not None:
+            cls.set_tensor(l.mlp.linear_fc1.bias, mlp_fc1_bias)
+
+        cls.set_tensor(l.mlp.linear_fc2.weight, mlp_fc2_weight)
+        if mlp_fc2_bias is not None:
+            cls.set_tensor(l.mlp.linear_fc2.bias, mlp_fc2_bias)
+
+
+class MCoreTESetter(MCoreSetter):
+
+    @classmethod
+    def set_layer(
+        cls,
+        model,
+        layer_idx,
+        self_attn_norm_weight=None,
+        self_attn_norm_bias=None,
+        self_attn_qkv_weight=None,
+        self_attn_qkv_bias=None,
+        self_attn_proj_weight=None,
+        self_attn_proj_bias=None,
+        mlp_norm_weight=None,
+        mlp_norm_bias=None,
+        mlp_fc1_weight=None,
+        mlp_fc1_bias=None,
+        mlp_fc2_weight=None,
+        mlp_fc2_bias=None,
+    ):
+
+        l = model.decoder.layers[layer_idx]
+
+        # Self attention.
+        cls.set_tensor(l.self_attention.linear_qkv.layer_norm_weight, self_attn_norm_weight)
+        if self_attn_norm_bias is not None:
+            cls.set_tensor(l.self_attention.linear_qkv.layer_norm_bias, self_attn_norm_bias)
+
+        cls.set_tensor(l.self_attention.linear_qkv.weight, self_attn_qkv_weight)
+        if self_attn_qkv_bias is not None:
+            cls.set_tensor(l.self_attention.linear_qkv.bias, self_attn_qkv_bias)
+
+        cls.set_tensor(l.self_attention.linear_proj.weight, self_attn_proj_weight)
+        if self_attn_proj_bias is not None:
+            cls.set_tensor(l.self_attention.linear_proj.bias, self_attn_proj_bias)
+
+        # MLP.
+        cls.set_tensor(l.mlp.linear_fc1.layer_norm_weight, mlp_norm_weight)
+        if mlp_norm_bias is not None:
+            cls.set_tensor(l.mlp.linear_fc1.layer_norm_bias, mlp_norm_bias)
+
+        cls.set_tensor(l.mlp.linear_fc1.weight, mlp_fc1_weight)
+        if mlp_fc1_bias is not None:
+            cls.set_tensor(l.mlp.linear_fc1.bias, mlp_fc1_bias)
+
+        cls.set_tensor(l.mlp.linear_fc2.weight, mlp_fc2_weight)
+        if mlp_fc2_bias is not None:
+            cls.set_tensor(l.mlp.linear_fc2.bias, mlp_fc2_bias)
 
 
 def add_arguments(parser):
-    group = parser.add_argument_group(title='Megatron saver')
+    group = parser.add_argument_group(title='M-Core saver')
 
     group.add_argument('--megatron-path', type=str, default=None,
                        help='Base directory of Megatron repository')
@@ -17,8 +207,17 @@ def add_arguments(parser):
     group.add_argument('--target-pipeline-parallel-size', type=int,
                        help='Target tensor model parallel size, default to the pipeline parall size '
                        'in the input checkpoint if provided by the loader, otherwise to 1')
+    group.add_argument('--transformer-impl', required=True,
+                       choices=['local', 'transformer_engine'],
+                       help='Which Transformer implementation to use.')
+
 
 def save_checkpoint(queue, args):
+
+    # Transformer engine >= 0.12.0, for CPU initialization.
+    te_version = packaging.version.Version(version("transformer-engine"))
+    assert te_version >= packaging.version.Version("0.12.0"), \
+        "transformer engine version: %s (>=0.12.0 required)." % te_version
 
     # Search in directory above this
     sys.path.append(os.path.abspath(
@@ -132,7 +331,6 @@ def save_checkpoint(queue, args):
 
     margs = parse_args()
 
-
     if hasattr (md, 'checkpoint_args'):
         # These are arguments that we are either changing, or cause problems for validation if they are set
         # Note that some of these deal with T5 so will need to be changed if we support T5.
@@ -150,7 +348,6 @@ def save_checkpoint(queue, args):
                         'train_iters', 'lr_decay_iters', 'lr_warmup_iters', 'lr_warmup_fraction',
                         'start_weight_decay', 'end_weight_decay']
 
-
         for arg, value in vars(md.checkpoint_args).items():
             if arg in args_to_keep:
                 continue
@@ -161,11 +358,25 @@ def save_checkpoint(queue, args):
                 print(f"Overwriting default {arg} value {getattr(margs, arg)} with value from checkpoint {value}.")
                 setattr(margs, arg, value)
 
+    # Explicitly copy sequence_parallel, apply_query_key_layer_scaling.
+    margs.sequence_parallel = md.checkpoint_args.sequence_parallel
+    margs.apply_query_key_layer_scaling = md.checkpoint_args.apply_query_key_layer_scaling
+
     validate_args(margs)
+
+    # Use M-core models & unset loaded paths.
+    margs.use_mcore_models = True
+    margs.blendable_index_path = None
+    margs.data_path = []
+    margs.load = None
+    margs.save = args.save_dir
+    margs.tensorboard_dir = None
+    margs.tokenizer_model = None
+    margs.transformer_impl = args.transformer_impl
 
     set_global_variables(margs, build_tokenizer=False)
 
-    # margs = megatron args
+    # Megatron args. (i.e., 'margs')
     margs = get_args()
 
     if hasattr(md, 'consumed_train_samples'):
@@ -185,10 +396,6 @@ def save_checkpoint(queue, args):
         margs.model_type = ModelType.encoder_or_decoder
     else:
         raise Exception(f'unrecognized model type: {args.model_type}')
-
-    def get_models(count, dtype, pre_process, post_process):
-        models = [model_provider(pre_process, post_process).to(dtype) for _ in range(count)]
-        return models
 
     # fake initializing distributed
     mpu.set_tensor_model_parallel_world_size(args.target_tensor_parallel_size)
@@ -237,19 +444,38 @@ def save_checkpoint(queue, args):
     # Split into new tensor model parallel sizes
     out_word_embed = torch.chunk(full_word_embed, args.target_tensor_parallel_size, dim=0)
 
+    # Parameter setter class.
+    setter = {
+        "local" : MCoreLocalSetter,
+        "transformer_engine" : MCoreTESetter,
+    }[args.transformer_impl]
+
+    # Get models.
+    def get_models(count, dtype, pre_process, post_process):
+        models = []
+        for rank in range(count):
+            models.append(model_provider(pre_process, post_process).to(dtype))
+            print_memory_usage("saver", rank, count)
+        return models
+
     # Make models for first pipeline stage and fill in embeddings
     mpu.set_pipeline_model_parallel_rank(0)
     post_process = args.target_pipeline_parallel_size == 1
     models = get_models(args.target_tensor_parallel_size, md.params_dtype, True, post_process)
-    for tp_rank, model in enumerate(models):
-        model.language_model.embedding.word_embeddings.weight.data.copy_(out_word_embed[tp_rank])
-        if pos_embed is not None:
-            model.language_model.embedding.position_embeddings.weight.data.copy_(pos_embed)
-        else:
-            assert not hasattr(model.language_model.embedding, "position_embeddings")
 
-    # Transformer layers
-    #-------------------
+    # Set embeddings.
+    # --------------
+    for tp_rank, model in enumerate(models):
+        if pos_embed is None:
+            assert not setter.has_position_embeddings(model)
+        setter.set_embeddings(
+            model,
+            word=out_word_embed[tp_rank],
+            pos=pos_embed,
+        )
+
+    # Transformer layers.
+    # ------------------
     total_layer_num = 0
     for pp_rank in range(args.target_pipeline_parallel_size):
         # For later pipeline parallel ranks, make the new models
@@ -258,7 +484,7 @@ def save_checkpoint(queue, args):
             post_process = pp_rank == args.target_pipeline_parallel_size - 1
             models = get_models(args.target_tensor_parallel_size, md.params_dtype, False, post_process)
 
-        for layer in range(len(models[0].language_model.encoder.layers)):
+        for layer in range(len(models[0].decoder.layers)):
             msg = queue_get(f"transformer layer {total_layer_num}")
 
             # duplicated tensors
@@ -296,22 +522,29 @@ def save_checkpoint(queue, args):
 
             # Save them to the model
             for tp_rank in range(args.target_tensor_parallel_size):
-                l = models[tp_rank].language_model.encoder.layers[layer]
-                l.input_norm.weight.data.copy_(input_norm_weight)
+                params_dict = {
+                    "self_attn_norm_weight" : input_norm_weight,
+                    "self_attn_qkv_weight" : qkv_weight[tp_rank],
+                    "self_attn_proj_weight" : dense_weight[tp_rank],
+                    "mlp_norm_weight" : post_norm_weight,
+                    "mlp_fc1_weight" : mlp_l0_weight[tp_rank],
+                    "mlp_fc2_weight" : mlp_l1_weight[tp_rank],
+                }
                 if md.norm_has_bias:
-                    l.input_norm.bias.data.copy_(input_norm_bias)
-                l.self_attention.query_key_value.weight.data.copy_(qkv_weight[tp_rank])
-                l.self_attention.dense.weight.data.copy_(dense_weight[tp_rank])
-                l.post_attention_norm.weight.data.copy_(post_norm_weight)
-                if md.norm_has_bias:
-                    l.post_attention_norm.bias.data.copy_(post_norm_bias)
-                l.mlp.dense_h_to_4h.weight.data.copy_(mlp_l0_weight[tp_rank])
-                l.mlp.dense_4h_to_h.weight.data.copy_(mlp_l1_weight[tp_rank])
+                    params_dict.update({
+                        "self_attn_norm_bias" :
+                        input_norm_bias if md.norm_has_bias else None,
+                        "mlp_norm_bias" :
+                        post_norm_bias if md.norm_has_bias else None,
+                    })
                 if md.linear_bias:
-                    l.self_attention.query_key_value.bias.data.copy_(qkv_bias[tp_rank])
-                    l.self_attention.dense.bias.data.copy_(dense_bias)
-                    l.mlp.dense_h_to_4h.bias.data.copy_(mlp_l0_bias[tp_rank])
-                    l.mlp.dense_4h_to_h.bias.data.copy_(mlp_l1_bias)
+                    params_dict.update({
+                        "self_attn_qkv_bias" : qkv_bias[tp_rank],
+                        "self_attn_proj_bias" : dense_bias,
+                        "mlp_fc1_bias" : mlp_l0_bias[tp_rank],
+                        "mlp_fc2_bias" : mlp_l1_bias,
+                    })
+                setter.set_layer(models[tp_rank], layer, **params_dict)
 
             total_layer_num = total_layer_num + 1
             check_message(msg)
@@ -322,13 +555,18 @@ def save_checkpoint(queue, args):
             final_norm_weight = msg.pop("weight")
             if md.norm_has_bias:
                 final_norm_bias = msg.pop("bias")
-            for tp_rank in range(args.target_tensor_parallel_size):
-                models[tp_rank].language_model.encoder.final_norm.weight.data.copy_(final_norm_weight)
-                if md.norm_has_bias:
-                    models[tp_rank].language_model.encoder.final_norm.bias.data.copy_(final_norm_bias)
+            for tp_rank, model in enumerate(models):
+                setter.set_final_norm(
+                    model,
+                    weight=final_norm_weight,
+                    bias=final_norm_bias if md.norm_has_bias else None,
+                )
                 if pp_rank != 0 and not md.output_layer:
                     # Copy word embeddings to final pipeline rank
-                    models[tp_rank].word_embeddings.weight.data.copy_(out_word_embed[tp_rank])
+                    setter.set_output_word_embeddings(
+                        model,
+                        emb=out_word_embed[tp_rank],
+                    )
             del final_norm_weight
             if md.norm_has_bias:
                 del final_norm_bias
@@ -336,26 +574,29 @@ def save_checkpoint(queue, args):
 
             if md.output_layer:
                 msg = queue_get("output layer")
-                if not hasattr(models[0].language_model, 'output_layer'):
+                if not hasattr(models[0], 'output_layer'):
                     print("ERROR: got an output layer, but model does not have one")
                     exit(1)
                 output_layer_weight = torch.chunk(msg.pop("weight"), args.target_tensor_parallel_size, dim=0)
-                for tp_rank in range(args.target_tensor_parallel_size):
-                    models[tp_rank].language_model.output_layer.weight.data.copy_(output_layer_weight[tp_rank])
+                for tp_rank, model in enumerate(models):
+                    setter.set_output_layer(model, output_layer_weight[tp_rank])
                 del output_layer_weight
                 check_message(msg)
 
             msg = queue_get()
             if msg != "done" and msg["name"] == "pooler":
-                if not hasattr(models[0].language_model, 'pooler'):
+                if not hasattr(models[0], 'pooler'):
                     print("ERROR: got a pooler, but model does not have one")
                     exit(1)
                 print("received pooler")
                 pooler_weight = msg.pop("weight")
                 pooler_bias = msg.pop("bias")
                 for tp_rank in range(args.target_tensor_parallel_size):
-                    models[tp_rank].language_model.pooler.dense.weight.data.copy_(pooler_weight)
-                    models[tp_rank].language_model.pooler.dense.bias.data.copy_(pooler_bias)
+                    setter.set_pooler(
+                        model=models[tp_rank],
+                        weight=pooler_weight,
+                        bias=pooler_bias,
+                    )
                 del pooler_weight
                 del pooler_bias
                 check_message(msg)
@@ -372,11 +613,13 @@ def save_checkpoint(queue, args):
                 if md.norm_has_bias:
                     lm_head_norm_bias = msg.pop("norm bias")
                 for tp_rank in range(args.target_tensor_parallel_size):
-                    models[tp_rank].lm_head.dense.weight.data.copy_(lm_head_dense_weight)
-                    models[tp_rank].lm_head.dense.bias.data.copy_(lm_head_dense_bias)
-                    models[tp_rank].lm_head.norm.weight.data.copy_(lm_head_norm_weight)
-                    if md.norm_has_bias:
-                        models[tp_rank].lm_head.norm.bias.data.copy_(lm_head_norm_bias)
+                    setter.set_lm_head(
+                        model=models[tp_rank],
+                        dense_weight=lm_head_dense_weight,
+                        dense_bias=lm_head_dense_bias,
+                        norm_weight=lm_head_norm_weight,
+                        norm_bias=lm_head_norm_bias if md.norm_has_bias else None,
+                    )
                 check_message(msg)
                 msg = queue_get()
 
@@ -388,8 +631,11 @@ def save_checkpoint(queue, args):
                 binary_head_weight = msg.pop("weight")
                 binary_head_bias = msg.pop("bias")
                 for tp_rank in range(args.target_tensor_parallel_size):
-                    models[tp_rank].binary_head.weight.data.copy_(binary_head_weight)
-                    models[tp_rank].binary_head.bias.data.copy_(binary_head_bias)
+                    setter.set_binary_head(
+                        model=models[tp_rank],
+                        weight=binary_head_weight,
+                        bias=binary_head_bias,
+                    )
                 check_message(msg)
                 msg = queue_get()
 
@@ -400,4 +646,5 @@ def save_checkpoint(queue, args):
             mpu.set_tensor_model_parallel_rank(tp_rank)
             save_checkpoint(md.iteration, [models[tp_rank]], None, None,
                             num_floating_point_operations_so_far=0)
+
     print("Done!")

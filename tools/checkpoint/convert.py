@@ -50,14 +50,14 @@ import sys
 # (for each transformer layer):
 # {
 #   "name": "transformer layer N"
-#   "input layernorm weight"
-#   "input layernorm bias"
+#   "input norm weight"
+#   "input norm bias"
 #   "qkv weight"
 #   "qkv bias"
 #   "dense weight"
 #   "dense bias"
-#   "post layernorm weight"
-#   "post layernorm bias"
+#   "post norm weight"
+#   "post norm bias"
 #   "mlp l0 weight"
 #   "mlp l0 bias"
 #   "mlp l1 weight"
@@ -78,8 +78,8 @@ import sys
 #   "name": "lm head"
 #   "dense weight"
 #   "dense bias"
-#   "layernorm weight"
-#   "layernorm bias"
+#   "norm weight"
+#   "norm bias"
 # }
 # {
 #   "name": "binary head"
@@ -92,11 +92,13 @@ def load_plugin(plugin_type, name):
     module_name = f"{plugin_type}_{name}"
     try:
         plugin = importlib.import_module(module_name)
-    except ModuleNotFoundError:
+    except ModuleNotFoundError as e:
+        print(e)
         module_name = name
         try:
             plugin = importlib.import_module(module_name)
-        except ModuleNotFoundError:
+        except ModuleNotFoundError as e:
+            print(e)
             sys.exit(f"Unable to load {plugin_type} plugin {name}. Exiting.")
 
     if not hasattr(plugin, 'add_arguments'):
@@ -107,7 +109,7 @@ def load_plugin(plugin_type, name):
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Megatron Checkpoint Utility Arguments",
+    parser = argparse.ArgumentParser(description="Megatron Checkpoint Converter Arguments",
                                      allow_abbrev=False, conflict_handler='resolve')
 
     parser.add_argument('--model-type', type=str, required=True,
