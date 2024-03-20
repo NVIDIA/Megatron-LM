@@ -150,8 +150,8 @@ def distribute_chunks_to_ranks(shard_to_ranks: Dict[T, List[int]], shard_to_size
     shard_to_saving_rank = {}
     rank_sizes = [(0, rank) for rank in range(num_ranks)]
 
-    # start from tensors with lowest coverage, then go by tensor size from largest
-    for shard_id, shard_ranks in sorted(shard_to_ranks.items(), key=lambda sh_id_ranks: (len(sh_id_ranks[1]), shard_to_size[sh_id_ranks[0]], sh_id_ranks[0])):
+    # start from tensors with lowest coverage, then go by tensor size from largest (hence minus size)
+    for shard_id, shard_ranks in sorted(shard_to_ranks.items(), key=lambda sh_id_ranks: (len(sh_id_ranks[1]), -shard_to_size[sh_id_ranks[0]], sh_id_ranks[0])):
         # assign greedily to the least occupied rank
 
         size, rank = min((size, rank) for size, rank in rank_sizes if rank in shard_ranks)
