@@ -748,7 +748,7 @@ class ChainedOptimizer(MegatronOptimizer):
         save_states = False
         states = []
         for optimizer in self.chained_optimizers:
-            if hasattr(optimizer, 'get_parameter_state'):
+            if hasattr(optimizer, 'get_parameter_state_dp_zero'):
                 state_dict = optimizer.get_parameter_state_dp_zero()
 
                 # Save checkpoint economically, only when DP rank = 0, state dict
