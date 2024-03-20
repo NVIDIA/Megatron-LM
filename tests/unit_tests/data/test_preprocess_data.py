@@ -11,8 +11,10 @@ import boto3
 import nltk
 import requests
 
-from megatron.core.datasets.indexed_dataset import IndexedDataset
-from megatron.core.datasets.s3_indexed_dataset import S3IndexedDataset
+from botocore.exceptions import ClientError
+
+from megatron.core.datasets.indexed_dataset import IndexedDataset, S3Config
+from megatron.core.datasets.s3_utils import S3_PREFIX
 from megatron.tokenizer.gpt2_tokenization import (
     PRETRAINED_MERGES_ARCHIVE_MAP,
     PRETRAINED_VOCAB_ARCHIVE_MAP,
@@ -71,7 +73,7 @@ def merge_datasets(idir):
     merge_main()
 
 
-def do_test_preprocess_data(temp_dir, extra_args=[], indexed_dataset_type=IndexedDataset):
+def do_test_preprocess_data(temp_dir, extra_args=[], s3=False):
     # set the default nltk data path
     os.environ["NLTK_DATA"] = os.path.join(temp_dir, "nltk_data")
     nltk.data.path.append(os.environ["NLTK_DATA"])
@@ -106,7 +108,7 @@ def do_test_preprocess_data(temp_dir, extra_args=[], indexed_dataset_type=Indexe
 
     prefix_for_path_prefix = ""
     indexed_dataset_kwargs = {}
-    if indexed_dataset_type == S3IndexedDataset:
+    if s3:
         # Copy all the files in `temp_dir` to S3.
         s3_client = boto3.client("s3")
         bucket_name = "test-bucket"
@@ -114,15 +116,14 @@ def do_test_preprocess_data(temp_dir, extra_args=[], indexed_dataset_type=Indexe
             assert path.startswith("/")
             s3_client.upload_file(path, bucket_name, path[1:])
         assert path_to_data.startswith("/")
-        prefix_for_path_prefix = "s3://" + bucket_name
-        IndexedDataset = S3IndexedDataset
+        prefix_for_path_prefix = S3_PREFIX + bucket_name
         indexed_dataset_kwargs = {
-            "multimodal": False,
-            "path_to_idx_cache": os.path.join(temp_dir, "idx_cache"),
+            "mmap": False,
+            "s3_config": S3Config(path_to_idx_cache=os.path.join(temp_dir, "idx_cache"))
         }
 
     merged_index = 0
-    merged_dataset = indexed_dataset_type(
+    merged_dataset = IndexedDataset(
         prefix_for_path_prefix + os.path.join(path_to_data, "merge"), **indexed_dataset_kwargs
     )
 
@@ -143,7 +144,7 @@ def do_test_preprocess_data(temp_dir, extra_args=[], indexed_dataset_type=Indexe
         realpath_doc = os.path.join(path_to_data, basename.split(".")[-2])
 
         dataset_index = 0
-        dataset = indexed_dataset_type(
+        dataset = IndexedDataset(
             prefix_for_path_prefix + realpath_doc, **indexed_dataset_kwargs
         )
 
@@ -271,7 +272,7 @@ def test_preprocess_data_gpt_s3(monkeypatch):
 
     with tempfile.TemporaryDirectory() as temp_dir:
         do_test_preprocess_data(
-            temp_dir, extra_args=gpt_args(temp_dir), indexed_dataset_type=S3IndexedDataset
+            temp_dir, extra_args=gpt_args(temp_dir), s3=True
         )
 
 

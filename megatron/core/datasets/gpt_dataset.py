@@ -5,14 +5,14 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, Tuple, Union
+from typing import Dict, Tuple
 
 import numpy
 import torch
 
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
-from megatron.core.datasets.indexed_dataset import IndexedDataset
-from megatron.core.datasets.s3_indexed_dataset import S3IndexedDataset, is_s3_path
+from megatron.core.datasets.indexed_dataset import IndexedDataset, S3Config
+from megatron.core.datasets.s3_utils import is_s3_path
 from megatron.core.datasets.megatron_dataset import MegatronDataset, MockDataset
 from megatron.core.datasets.utils import Split, log_single_rank
 
@@ -178,8 +178,12 @@ class GPTDataset(MegatronDataset):
             IndexedDataset: The underlying IndexedDataset
         """
         if is_s3_path(dataset_path):
-            return S3IndexedDataset(dataset_path, False, config.path_to_cache)
-        return IndexedDataset(dataset_path, False)
+            return IndexedDataset(
+                dataset_path,
+                multimodal=False,
+                mmap=config.mmap_bin_files,
+                s3_config=S3Config(path_to_idx_cache=config.path_to_cache))
+        return IndexedDataset(dataset_path, multimodal=False, mmap=config.mmap_bin_files)
 
     def __len__(self) -> int:
         """Abstract method implementation
