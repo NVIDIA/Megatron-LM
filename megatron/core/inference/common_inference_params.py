@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+
 @dataclass
 class CommonInferenceParams:
     use_greedy: bool = False
@@ -7,9 +8,9 @@ class CommonInferenceParams:
     top_k: int = 0
     top_p: float = 0.0
     return_log_probs: bool = False
-    num_tokens_to_generate:int = 30
+    num_tokens_to_generate: int = 30
 
-    def add_attributes(self, attribute_value_pair:dict):
+    def add_attributes(self, attribute_value_pair: dict):
         """Utility to add more attributes to inference params
 
         Use this method to pass in a custom dictonary to add more inference parameter attributes to the instance you created. Use as follows

@@ -185,7 +185,7 @@ def generate_samples_conditional(model):
                 input_pos += 1
                 sentences.append(raw_text)
 
-            max_len = args.out_seq_length
+            max_len = 30
             resp_sentences, resp_sentences_seg, output_logits, \
             tokens = generate_and_post_process(model, prompts=sentences,
                                                tokens_to_generate=max_len,

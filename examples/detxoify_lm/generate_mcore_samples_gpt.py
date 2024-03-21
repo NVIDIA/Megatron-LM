@@ -7,6 +7,7 @@ from argparse import Namespace
 import json
 import os
 import sys
+import numpy as np 
 from megatron.core.inference.backends.abstract_backend import AbstractBackend
 from megatron.core.inference.backends.mcore_backend import MCoreBackend
 from megatron.core.inference.backends.trt_llm_backend import TRTLLMBackend
@@ -144,11 +145,11 @@ def write_results_to_file(output_file:str, prompts:List[str], prompt_plus_genera
     """
     with open(output_file, 'a') as f: 
         for idx, prompt in enumerate(prompts):
-            tokens = prompt_plus_generated_tokens[idx].cpu().numpy()
+            print(f' ------------- WRITING RESULT FOR PROMPT {idx} --------------- ')
+            tokens = np.array2string(prompt_plus_generated_tokens[idx].cpu().numpy())
             generated_text = prompts_plus_generated_text[idx]
-            output_log_probs = None if output_log_probs is None else output_log_probs[idx].cpu().numpy()
+            output_log_probs = None if output_log_probs is None else np.array2string(output_log_probs[idx].cpu().numpy())
             write_data = {'id': idx,'original_prompt': prompt, 'prompt_with_generated_text': generated_text, 'all_tokens' : tokens, 'output_log_probs': output_log_probs}
-            print(f'SHAN : {write_data}')
             f.write(json.dumps(write_data) + '\n')
 
 

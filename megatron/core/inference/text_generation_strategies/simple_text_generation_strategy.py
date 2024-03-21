@@ -1,17 +1,25 @@
 from typing import List, Tuple
-from megatron.core.datasets.gpt_dataset import _get_ltor_masks_and_position_ids
-from megatron.core.inference.common_inference_params import CommonInferenceParams
-from megatron.core.inference.communication_utils import copy_from_last_to_first_pipeline_stage, synchronize_list_across_all_ranks, synchronize_tensor_across_all_ranks
-from megatron.core.inference.inference_model_wrappers.abstract_model_inference_wrapper import AbstractModelInferenceWrapper
+
 import torch
 import torch.nn.functional as F
 
+from megatron.core import parallel_state
+from megatron.core.datasets.gpt_dataset import _get_ltor_masks_and_position_ids
+from megatron.core.inference.common_inference_params import CommonInferenceParams
+from megatron.core.inference.communication_utils import (
+    copy_from_last_to_first_pipeline_stage,
+    synchronize_list_across_all_ranks,
+    synchronize_tensor_across_all_ranks,
+)
+from megatron.core.inference.inference_model_wrappers.abstract_model_inference_wrapper import (
+    AbstractModelInferenceWrapper,
+)
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.global_vars import get_num_microbatches
-from megatron.core import parallel_state
+
 
 class SimpleTextGenerationStrategy:
-    def __init__(self, inference_wrapped_model:AbstractModelInferenceWrapper, tokenizer):
+    def __init__(self, inference_wrapped_model: AbstractModelInferenceWrapper, tokenizer):
         """The basic text generation strategy
 
         This class is responsible for tokenizing the input , running the inference and also detokenizing the output
@@ -23,7 +31,9 @@ class SimpleTextGenerationStrategy:
         self.inference_wrapped_model = inference_wrapped_model
         self.tokenizer = tokenizer
 
-    def tokenize_and_pad_input_prompts(self, prompts: List[str], num_tokens_to_generate: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def tokenize_and_pad_input_prompts(
+        self, prompts: List[str], num_tokens_to_generate: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Utility to tokenize and pad the input prompts
 
         Tokenizes the input prompts, pads them to required length and returns the tokenized tensor and also the original prompt lengths. 
@@ -34,19 +44,18 @@ class SimpleTextGenerationStrategy:
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Returns the padded and tokenized prompts of dimension [batch_size, max_seq_length] (i.e max_seq_length = max prompt len + num_tokens_to_generate) and 1D tensor containing the lenghts of each prompt
-        """        
+        """
         tokenizer = self.tokenizer
         sizes_list = None
         prompts_tokens_tensor = None
         prompts_length_tensor = None
-
 
         if torch.distributed.get_rank() == 0:
             # tokenize
             prompts_tokens = [tokenizer.tokenize(prompt) for prompt in prompts]
             prompts_lengths = [len(prompt_tokens) for prompt_tokens in prompts_tokens]
             max_prompt_len = max(prompts_lengths)
-            
+
             samples_length = max_prompt_len + num_tokens_to_generate
 
             # padding
@@ -57,37 +66,53 @@ class SimpleTextGenerationStrategy:
             prompts_tokens_tensor = torch.tensor(prompts_tokens, dtype=torch.long, device='cuda')
             prompts_length_tensor = torch.tensor(prompts_lengths, dtype=torch.long, device='cuda')
 
-            sizes_list = [prompts_tokens_tensor.size(0), # batch_size
-                      prompts_tokens_tensor.size(1)] # max_seq_length (max prompt len + num_tokens_to_generate)
+            sizes_list = [
+                prompts_tokens_tensor.size(0),  # batch_size
+                prompts_tokens_tensor.size(1),
+            ]  # max_seq_length (max prompt len + num_tokens_to_generate)
 
-        # Synchronize the prompt tokens and lengths tensor across all gpus  
-        sizes_tensor = synchronize_list_across_all_ranks(size = 2, list_values=sizes_list, dtype=torch.int64)
+        # Synchronize the prompt tokens and lengths tensor across all gpus
+        sizes_tensor = synchronize_list_across_all_ranks(
+            size=2, list_values=sizes_list, dtype=torch.int64
+        )
 
         sizes = sizes_tensor.tolist()
         prompts_tokens_tensor = synchronize_tensor_across_all_ranks(
-            sizes, torch.int64, tensor=prompts_tokens_tensor)
+            sizes, torch.int64, tensor=prompts_tokens_tensor
+        )
         prompts_length_tensor = synchronize_tensor_across_all_ranks(
-            sizes[0], torch.int64, tensor=prompts_length_tensor) 
-    
-        return prompts_tokens_tensor , prompts_length_tensor
-    
+            sizes[0], torch.int64, tensor=prompts_length_tensor
+        )
 
-    def sanity_check_inference_params(self, common_inference_params:CommonInferenceParams):
+        return prompts_tokens_tensor, prompts_length_tensor
+
+    def sanity_check_inference_params(self, common_inference_params: CommonInferenceParams):
         """Sanity checking the common inference parameters 
 
         Args:
             common_inference_params (CommonInferenceParams): The inference parameters
-        """    
+        """
         if common_inference_params.use_greedy:
-            assert common_inference_params.top_k == 0, 'Cannot use greedy sampling and have top_k greater than 0'
-            assert common_inference_params.top_p == 0, 'Cannot use greedy sampling and have top_p greater than 0'
-        
+            assert (
+                common_inference_params.top_k == 0
+            ), 'Cannot use greedy sampling and have top_k greater than 0'
+            assert (
+                common_inference_params.top_p == 0
+            ), 'Cannot use greedy sampling and have top_p greater than 0'
+
         if common_inference_params.top_k > 0:
-            assert common_inference_params.top_p == 0, 'Cannot have a non zero top_k and top_p value. Set one of these to zero.'
-        
+            assert (
+                common_inference_params.top_p == 0
+            ), 'Cannot have a non zero top_k and top_p value. Set one of these to zero.'
+
         assert common_inference_params.top_p <= 1.0, 'top-p should be in (0, 1].'
 
-    def sample_from_logits(self, last_token_logits:torch.Tensor, common_inference_params:CommonInferenceParams, vocab_size:int) -> torch.Tensor:
+    def sample_from_logits(
+        self,
+        last_token_logits: torch.Tensor,
+        common_inference_params: CommonInferenceParams,
+        vocab_size: int,
+    ) -> torch.Tensor:
         """Samples the logits to generate outputs
 
         Given the logits of the last token, this function samples it according to the parameters defined in common_inference_params and returns the samples
@@ -136,12 +161,16 @@ class SimpleTextGenerationStrategy:
                 last_token_logits.div_(common_inference_params.temperature)
 
             if common_inference_params.top_k > 1:
-                assert common_inference_params.top_k <= last_token_logits.size(1), 'top-k is larger than logit size.'
+                assert common_inference_params.top_k <= last_token_logits.size(
+                    1
+                ), 'top-k is larger than logit size.'
                 if vocab_size:
-                    assert common_inference_params.top_k < vocab_size, 'top-k is larger than vocab size.'
+                    assert (
+                        common_inference_params.top_k < vocab_size
+                    ), 'top-k is larger than vocab size.'
                 modify_logits_for_top_k_filtering(last_token_logits, common_inference_params.top_k)
 
-            elif common_inference_params.top_p > 0.0:               
+            elif common_inference_params.top_p > 0.0:
                 modify_logits_for_top_p_filtering(last_token_logits, common_inference_params.top_p)
 
             # After filtering, we need to recalculate the distribution.
@@ -153,7 +182,12 @@ class SimpleTextGenerationStrategy:
                 sampled_logits = torch.clamp(sampled_logits, min=0, max=(vocab_size - 1))
         return sampled_logits
 
-    def generate_output_tokens(self, prompts_tokens: torch.Tensor, prompts_lengths: torch.Tensor, common_inference_params: CommonInferenceParams) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def generate_output_tokens(
+        self,
+        prompts_tokens: torch.Tensor,
+        prompts_lengths: torch.Tensor,
+        common_inference_params: CommonInferenceParams,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Utility to generate the output tokens and probabilities for the prompts
 
         This utility generates the output tokens. It uses the model wrapper to generate the outputs internally
@@ -169,69 +203,90 @@ class SimpleTextGenerationStrategy:
 
         batch_size, max_sequence_length = prompts_tokens.size(0), prompts_tokens.size(1)
         min_prompt_length = prompts_lengths.min().item()
-    
+
         output_log_probs = None
         if common_inference_params.return_log_probs:
-            output_log_probs = torch.empty((batch_size, max_sequence_length - 1),
-                                           dtype=torch.float32,
-                                           device=torch.cuda.current_device())
-            
+            output_log_probs = torch.empty(
+                (batch_size, max_sequence_length - 1),
+                dtype=torch.float32,
+                device=torch.cuda.current_device(),
+            )
+
         # For tensor parallel models both of these return True.
-        model_is_not_pipeline_parallel = parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
+        model_is_not_pipeline_parallel = (
+            parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
+        )
         model_is_pipeline_parallel = not model_is_not_pipeline_parallel
 
         if model_is_not_pipeline_parallel or parallel_state.is_pipeline_last_stage():
             if common_inference_params.return_log_probs:
                 # Pre allocate memory for output log probabilities
-                output_log_probs = torch.empty((batch_size, max_sequence_length - 1),
-                                           dtype=torch.float32,
-                                           device=torch.cuda.current_device())
-        
+                output_log_probs = torch.empty(
+                    (batch_size, max_sequence_length - 1),
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                )
+
         with torch.no_grad():
             self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=prompts_tokens)
 
-            context_start_position = 0           
+            context_start_position = 0
             # Pick the context window that we need to pass through the network.
             for context_end_position in range(min_prompt_length, max_sequence_length):
 
-                inference_input = self.inference_wrapped_model.get_batch_for_context_window(context_start_position, context_end_position)
+                inference_input = self.inference_wrapped_model.get_batch_for_context_window(
+                    context_start_position, context_end_position
+                )
 
                 # Returns the logits of shape [batch_size, context_length, vocab_size]
                 logits = self.inference_wrapped_model(inference_input)
-                
+
                 if model_is_not_pipeline_parallel or parallel_state.is_pipeline_last_stage():
-                    last_token_logits  = logits[:, -1 , :]
-                    sampled_logits = self.sample_from_logits(last_token_logits, common_inference_params, self.tokenizer.vocab_size)
+                    last_token_logits = logits[:, -1, :]
+                    sampled_logits = self.sample_from_logits(
+                        last_token_logits, common_inference_params, self.tokenizer.vocab_size
+                    )
 
                     # Indicates which of the input prompts have started generating tokens. A 1D boolean tensor with [batch_size] elements
                     started = prompts_lengths < context_end_position
 
                     # Substitute the sampled logits only for only the prompts that have started generating tokens
-                    prompts_tokens[started, context_end_position]  = sampled_logits[started]   
+                    prompts_tokens[started, context_end_position] = sampled_logits[started]
 
                     if common_inference_params.return_log_probs:
                         log_probs = F.log_softmax(logits, dim=2)
-                        indices = torch.unsqueeze(prompts_tokens[:,(context_start_position+1):(context_end_position+1)], 2)
-                        output_log_probs[:, context_start_position:context_end_position] = torch.gather(log_probs, 2, indices).squeeze(2)
-                        
+                        indices = torch.unsqueeze(
+                            prompts_tokens[
+                                :, (context_start_position + 1) : (context_end_position + 1)
+                            ],
+                            2,
+                        )
+                        output_log_probs[
+                            :, context_start_position:context_end_position
+                        ] = torch.gather(log_probs, 2, indices).squeeze(2)
+
                 if model_is_pipeline_parallel:
                     copy_from_last_to_first_pipeline_stage(batch_size, torch.int64, prompts_tokens)
 
                 context_start_position = context_end_position
 
-                #TODO : Need to add condition to check early stopping  and update generated sequence lengths (Send in the prompts, the tokenizer and the common inference params)
+                # TODO : Need to add condition to check early stopping  and update generated sequence lengths (Send in the prompts, the tokenizer and the common inference params)
 
         # Include all the generated tokens
-        prompts_tokens_with_generations = prompts_tokens[:,:(context_end_position+1)]
+        prompts_tokens_with_generations = prompts_tokens[:, : (context_end_position + 1)]
         if model_is_not_pipeline_parallel or parallel_state.is_pipeline_last_stage():
             if common_inference_params.return_log_probs:
-                output_log_probs = output_log_probs[:, :context_end_position] 
+                output_log_probs = output_log_probs[:, :context_end_position]
 
-        generated_sequence_lengths = prompts_lengths + common_inference_params.num_tokens_to_generate
+        generated_sequence_lengths = (
+            prompts_lengths + common_inference_params.num_tokens_to_generate
+        )
 
         return prompts_tokens_with_generations, generated_sequence_lengths, output_log_probs
 
-    def detokenize_generations(self, prompt_tokens_with_generations: torch.Tensor, generated_sequence_lengths: torch.Tensor)-> List[str]:
+    def detokenize_generations(
+        self, prompt_tokens_with_generations: torch.Tensor, generated_sequence_lengths: torch.Tensor
+    ) -> List[str]:
         """Detokenize the output generations
 
         This function takes the prompts with the generated tokens, and detokenizes it and trims off according to the generated sequence length param
@@ -243,15 +298,14 @@ class SimpleTextGenerationStrategy:
         Returns:
             List[str]: The detokenized outputs
         """
-        
-        prompts_plus_generations_detokenized = []  
+
+        prompts_plus_generations_detokenized = []
 
         tokens = prompt_tokens_with_generations.cpu().numpy().tolist()
         lengths = generated_sequence_lengths.cpu().numpy().tolist()
 
         for sequence_tokens, length in zip(tokens, lengths):
             sequence_tokens = sequence_tokens[:length]
-            prompts_plus_generations_detokenized.append(
-                self.tokenizer.detokenize(sequence_tokens))
+            prompts_plus_generations_detokenized.append(self.tokenizer.detokenize(sequence_tokens))
 
         return prompts_plus_generations_detokenized
