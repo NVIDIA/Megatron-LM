@@ -11,7 +11,8 @@ import numpy
 import torch
 
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
-from megatron.core.datasets.indexed_dataset import IndexedDataset
+from megatron.core.datasets.indexed_dataset import IndexedDataset, S3Config
+from megatron.core.datasets.s3_utils import is_s3_path
 from megatron.core.datasets.megatron_dataset import MegatronDataset, MockDataset
 from megatron.core.datasets.utils import Split, log_single_rank
 
@@ -68,7 +69,7 @@ class MockGPTDataset(MockDataset):
             idx (int): The integer seed for mock data generation
 
         Returns:
-            Dict[str, numpy.ndarray]: The mock data
+            Dict[str, torch.Tensor]: The mock data
         """
         tok = 1
         pad = 2
@@ -176,6 +177,12 @@ class GPTDataset(MegatronDataset):
         Returns:
             IndexedDataset: The underlying IndexedDataset
         """
+        if is_s3_path(dataset_path):
+            return IndexedDataset(
+                dataset_path,
+                multimodal=False,
+                mmap=config.mmap_bin_files,
+                s3_config=S3Config(path_to_idx_cache=config.path_to_cache))
         return IndexedDataset(dataset_path, multimodal=False, mmap=config.mmap_bin_files)
 
     def __len__(self) -> int:
