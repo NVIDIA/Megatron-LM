@@ -255,12 +255,14 @@ class SimpleTextGenerationStrategy:
 
                     if common_inference_params.return_log_probs:
                         log_probs = F.log_softmax(logits, dim=2)
+
                         indices = torch.unsqueeze(
                             prompts_tokens[
                                 :, (context_start_position + 1) : (context_end_position + 1)
                             ],
                             2,
                         )
+
                         output_log_probs[
                             :, context_start_position:context_end_position
                         ] = torch.gather(log_probs, 2, indices).squeeze(2)

@@ -67,10 +67,6 @@ class MCoreBackend(AbstractBackend):
             prompts_plus_generations_detokenized = self.text_generation_strategy.detokenize_generations(
                 prompts_tokens_with_generations, generated_sequence_lengths
             )
-            output_log_probs = None
-            if common_inference_params.return_log_probs:
-                # TODO: Need to change this
-                output_log_probs = output_log_probs.cpu().numpy().tolist()
 
             return {
                 'prompts_tokens_with_generations': prompts_tokens_with_generations,

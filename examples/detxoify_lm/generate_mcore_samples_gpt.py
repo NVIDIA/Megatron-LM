@@ -99,7 +99,7 @@ def add_text_generate_args(parser):
                        help='Top k sampling.')
     group.add_argument("--top_p", type=float, default=0.0,
                        help='Top p sampling.')
-    group.add_argument("--return-log-probs", type=bool, default=False,
+    group.add_argument("--return-log-probs", action='store_true', default=False,
                        help='Return the log probabilities of the final output tokens')
     group.add_argument("--num-tokens-to-generate", type=int, default=30,
                        help='Number of tokens to generate for each prompt')
@@ -148,10 +148,9 @@ def write_results_to_file(output_file:str, prompts:List[str], prompt_plus_genera
             print(f' ------------- WRITING RESULT FOR PROMPT {idx} --------------- ')
             tokens = np.array2string(prompt_plus_generated_tokens[idx].cpu().numpy())
             generated_text = prompts_plus_generated_text[idx]
-            output_log_probs = None if output_log_probs is None else np.array2string(output_log_probs[idx].cpu().numpy())
-            write_data = {'id': idx,'original_prompt': prompt, 'prompt_with_generated_text': generated_text, 'all_tokens' : tokens, 'output_log_probs': output_log_probs}
+            output_log_probs_idx = None if output_log_probs is None else np.array2string(output_log_probs[idx].cpu().numpy())
+            write_data = {'id': idx,'original_prompt': prompt, 'prompt_with_generated_text': generated_text, 'all_tokens' : tokens, 'output_log_probs': output_log_probs_idx}
             f.write(json.dumps(write_data) + '\n')
-
 
 def generate_and_write_results(model: MegatronModule, args:Namespace):
     """Generates the output text and writes it to a file
