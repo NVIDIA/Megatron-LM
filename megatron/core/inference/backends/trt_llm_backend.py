@@ -10,11 +10,11 @@ class TRTLLMBackend(AbstractBackend):
         self.model = model
         self.tokenizer = tokenizer
 
-    # TODO : Implement this
+    # TODO : Will use high level apis to implement this
     def generate(self, prompts: List[str], common_inference_params: CommonInferenceParams):
         return prompts
 
-    # TODO : Implement this
+    # TODO : Need to implement this
     @staticmethod
     def is_model_trt_llm_exportable(model: LanguageModule):
         return False

@@ -26,7 +26,18 @@ class MCoreBackend(AbstractBackend):
         self.text_generation_strategy = text_generation_strategy
         self.random_seed = random_seed
 
-    def generate(self, prompts: List[str], common_inference_params: CommonInferenceParams):
+    def generate(self, prompts: List[str], common_inference_params: CommonInferenceParams) -> dict:
+        """The megatron core inference backend generate function
+
+        This backend returns the output generations as a dictionary. It returns the prompt tokens along with the generated tokens, the prompt plus the generated string and the output log probabilities if requested
+
+        Args:
+            prompts (List[str]): All the prompts (of a global batch size) as a list of strings
+            common_inference_params (CommonInferenceParams): The inference parameters
+
+        Returns:
+            dict: The output dictionary containing the generated tokens, texts and log probs if required
+        """
 
         # TODO :M core- get rng state tracker
         if self.random_seed:
@@ -58,14 +69,14 @@ class MCoreBackend(AbstractBackend):
             )
             output_log_probs = None
             if common_inference_params.return_log_probs:
-                output_log_probs = (
-                    output_log_probs.cpu().numpy().tolist()
-                )  # TODO: Need to change this
-            return (
-                prompts_tokens_with_generations,
-                prompts_plus_generations_detokenized,
-                output_log_probs,
-            )  # TODO : Return dictionary
+                # TODO: Need to change this
+                output_log_probs = output_log_probs.cpu().numpy().tolist()
+
+            return {
+                'prompts_tokens_with_generations': prompts_tokens_with_generations,
+                'prompts_plus_generations_detokenized': prompts_plus_generations_detokenized,
+                'output_log_probs': output_log_probs,
+            }
 
         else:
-            return None, None, None
+            return None

@@ -12,7 +12,7 @@ from megatron.core.inference.backends.abstract_backend import AbstractBackend
 from megatron.core.inference.backends.mcore_backend import MCoreBackend
 from megatron.core.inference.backends.trt_llm_backend import TRTLLMBackend
 from megatron.core.inference.common_inference_params import CommonInferenceParams
-from megatron.core.inference.generate_function import common_generate
+from megatron.core.inference.common_generate_function import common_generate
 from megatron.core.inference.inference_model_wrappers.gpt.gpt_inference_wrapper import GPTInferenceWrapper
 from megatron.core.inference.text_generation_strategies.simple_text_generation_strategy import SimpleTextGenerationStrategy
 from megatron.core.transformer.module import MegatronModule
@@ -189,9 +189,9 @@ def generate_and_write_results(model: MegatronModule, args:Namespace):
             end = min(total_number_of_prompts, start + args.global_batch_size)
             prompts = all_prompts[start:end]
 
-            prompts_tokens_with_generations, prompts_plus_generations_detokenized, output_log_probs  = common_generate(inference_backend=inference_backend, prompts=prompts, common_inference_params=common_inference_params)
+            output_dictionary  = common_generate(inference_backend=inference_backend, prompts=prompts, common_inference_params=common_inference_params)
             
-            write_results_to_file(output_file, prompts, prompts_tokens_with_generations, prompts_plus_generations_detokenized, output_log_probs)
+            write_results_to_file(output_file, prompts, output_dictionary['prompts_tokens_with_generations'], output_dictionary['prompts_plus_generations_detokenized'], output_dictionary['output_log_probs'])
     else:
         common_generate(inference_backend=inference_backend, common_inference_params=common_inference_params)
 
