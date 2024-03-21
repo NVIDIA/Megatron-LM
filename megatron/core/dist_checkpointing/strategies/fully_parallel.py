@@ -3,7 +3,7 @@ import logging
 from collections import defaultdict
 from pathlib import Path
 from time import time
-from typing import Dict, List, Optional, TypeVar, Tuple
+from typing import Dict, List, Optional, Tuple, TypeVar
 
 import numpy as np
 import torch
@@ -34,6 +34,7 @@ class FullyParallelSaveStrategyWrapper(SaveShardedStrategy):
     Currently, the save distribution is realized with a greedy algorithm
     described in `distribute_chunks_to_ranks`.
     """
+
     def __init__(
         self,
         strategy: SaveShardedStrategy,
@@ -125,8 +126,9 @@ def _shard_size(sh_ten: ShardedTensor):
     return numel * torch._utils._element_size(sh_ten.dtype)
 
 
-
-def determine_main_replica_uniform_distribution(sharded_state_dict: ShardedStateDict, parallelization_group: torch.distributed.ProcessGroup) -> Optional[SaveDistributionT]:
+def determine_main_replica_uniform_distribution(
+    sharded_state_dict: ShardedStateDict, parallelization_group: torch.distributed.ProcessGroup
+) -> Optional[SaveDistributionT]:
     """ Computes the save distribution.
 
     Should be used in conjunction with `distribute_main_replicas_with_precomputed_distribution`
@@ -183,7 +185,9 @@ def determine_main_replica_uniform_distribution(sharded_state_dict: ShardedState
 
 
 def distribute_main_replicas_with_precomputed_distribution(
-    sharded_state_dict: ShardedStateDict, parallelization_group: torch.distributed.ProcessGroup, precomputed_distribution: Optional[SaveDistributionT]
+    sharded_state_dict: ShardedStateDict,
+    parallelization_group: torch.distributed.ProcessGroup,
+    precomputed_distribution: Optional[SaveDistributionT],
 ):
     """ Applies the save distribution computed with `determine_main_replica_uniform_distribution`
 
@@ -201,7 +205,9 @@ def distribute_main_replicas_with_precomputed_distribution(
     if group_size <= 1:
         return
     if precomputed_distribution is None:
-        raise ValueError('precomputed_distribution must be not None for non-trivial parallelization group')
+        raise ValueError(
+            'precomputed_distribution must be not None for non-trivial parallelization group'
+        )
 
     local_shards = list(
         sh_base
