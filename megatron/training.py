@@ -35,7 +35,6 @@ from megatron import print_rank_last
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.model import Float16Module
-from megatron.model import GPTModel
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
@@ -375,12 +374,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if not isinstance(model, list):
         model = [model]
 
-    # Disallow training and inference with Transformer Engine
-    # for non-GPT models
-    args.allow_transformer_engine = all([type(m) == GPTModel for m in model])
-    # assert args.allow_transformer_engine or args.transformer_impl == 'local', \
-    #     'Transformer Engine is only approved for GPT models'
-
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
     # attributes set for them. We should make sure the default attributes
@@ -486,6 +479,7 @@ def setup_model_and_optimizer(model_provider_func,
                               lr_mult=1.0):
     """Setup model and optimizer."""
     args = get_args()
+    timers = get_timers()
 
     model = get_model(model_provider_func, model_type)
     unwrapped_model = unwrap_model(model)
@@ -495,12 +489,12 @@ def setup_model_and_optimizer(model_provider_func,
         if hasattr(args, f.name):
             kwargs[f.name] = getattr(args, f.name)
     config = OptimizerConfig(**kwargs)
+    config.timers = timers
     optimizer = get_megatron_optimizer(config, model, no_wd_decay_cond,
                                        scale_lr_cond, lr_mult)
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     if args.load is not None:
-        timers = get_timers()
         timers('load-checkpoint', log_level=0).start(barrier=True)
         args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
             model, optimizer, opt_param_scheduler)
@@ -530,10 +524,7 @@ def train_step(forward_step_func, data_iterator,
 
     # Set grad to zero.
     for model_chunk in model:
-        # If using distributed optimizer, don't zero buffer here; zeroing of buffer is
-        # handled automatically by the optimizer after all-gathers finish.
-        # Otherwise, zero the buffer.
-        model_chunk.zero_grad_buffer(zero_buffer=(not args.use_distributed_optimizer))
+        model_chunk.zero_grad_buffer()
     optimizer.zero_grad()
 
     # Forward pass.
@@ -559,7 +550,7 @@ def train_step(forward_step_func, data_iterator,
 
     # Update parameters.
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
+    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     timers('optimizer').stop()
 
     # Vision momentum.
@@ -1363,23 +1354,32 @@ def build_train_valid_test_data_iterators(
 
     # Build iterators.
     dl_type = args.dataloader_type
-    assert dl_type in ['single', 'cyclic']
+    assert dl_type in ['single', 'cyclic', 'external']
+
+    def _get_iterator(dataloader_type, dataloader):
+        """Return dataset iterator."""
+        if dataloader_type == "single":
+            return iter(dataloader)
+        elif dataloader_type == "cyclic":
+            return iter(cyclic_iter(dataloader))
+        elif dataloader_type == "external":
+            # External dataloader is passed through. User is expected to define how to iterate.
+            return dataloader
+        else:
+            raise RuntimeError("unexpected dataloader type")
 
     if train_dataloader is not None:
-        train_data_iterator = iter(train_dataloader) if dl_type == 'single' \
-                              else iter(cyclic_iter(train_dataloader))
+        train_data_iterator = _get_iterator(dl_type, train_dataloader)
     else:
         train_data_iterator = None
 
     if valid_dataloader is not None:
-        valid_data_iterator = iter(valid_dataloader) if dl_type == 'single' \
-                              else iter(cyclic_iter(valid_dataloader))
+        valid_data_iterator = _get_iterator(dl_type, valid_dataloader)
     else:
         valid_data_iterator = None
 
     if test_dataloader is not None:
-        test_data_iterator = iter(test_dataloader) if dl_type == 'single' \
-                             else iter(cyclic_iter(test_dataloader))
+        test_data_iterator = _get_iterator(dl_type, test_dataloader)
     else:
         test_data_iterator = None
 

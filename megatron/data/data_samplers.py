@@ -12,7 +12,7 @@ from megatron.core import mpu
 
 
 def build_pretraining_data_loader(dataset, consumed_samples):
-    """Buld dataloader given an input dataset."""
+    """Build dataloader given an input dataset."""
 
     if dataset is None:
         return None
@@ -35,6 +35,10 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             data_parallel_rank=mpu.get_data_parallel_rank(),
             data_parallel_size=mpu.get_data_parallel_world_size(),
             data_sharding=args.data_sharding)
+    elif args.dataloader_type == "external":
+        # External dataloaders are passed through. User is expected to provide a
+        # torch-compatible dataloader and define samplers, if needed.
+        return dataset
     else:
         raise Exception('{} dataloader type is not supported.'.format(
                 args.dataloader_type))
@@ -162,7 +166,7 @@ class MegatronPretrainingRandomSampler:
                            * self.micro_batch_size
             bucket_offset = current_epoch_samples // self.data_parallel_size
             start_idx = self.data_parallel_rank * bucket_size
-            
+
             g = torch.Generator()
             g.manual_seed(self.epoch)
             random_idx = torch.randperm(bucket_size, generator=g).tolist()

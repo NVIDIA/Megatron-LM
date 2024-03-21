@@ -1,17 +1,29 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from logging import getLogger
+from typing import Callable, Dict, List, Optional
+
 import torch
 from apex.optimizers import FusedAdam as Adam
 from apex.optimizers import FusedSGD as SGD
 
 from megatron.core import mpu
 
+from ..distributed import ParamAndGradBuffer
+from ..transformer.module import MegatronModule
 from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import ChainedOptimizer, Float16OptimizerWithFloat16Params, FP32Optimizer
 from .optimizer_config import OptimizerConfig
 
+logger = getLogger(__name__)
 
-def get_param_groups(model_chunks, no_weight_decay_cond, scale_lr_cond, lr_mult):
+
+def get_param_groups(
+    model_chunks: List[MegatronModule],
+    no_weight_decay_cond: Callable,
+    scale_lr_cond: Callable,
+    lr_mult: float,
+):
     """Create parameter groups for optimizer.
 
     Creates parameter groups based on weight decay condition (regularized vs
@@ -87,28 +99,25 @@ def get_param_groups(model_chunks, no_weight_decay_cond, scale_lr_cond, lr_mult)
 
 
 def get_megatron_optimizer_based_on_param_groups(
-    config,
-    param_groups,
-    per_model_grad_buffers=None,
-    data_parallel_group=None,
-    data_parallel_group_gloo=None,
-    data_parallel_group_idx=None,
+    config: OptimizerConfig,
+    param_groups: List,
+    per_model_buffers: Optional[Dict[int, List[ParamAndGradBuffer]]] = None,
+    data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    data_parallel_group_gloo: Optional[torch.distributed.ProcessGroup] = None,
+    data_parallel_group_idx: Optional[int] = None,
 ):
     """Get megatron optimizer based on parameter groups.
 
-    For distributed optimizer, we need the parameter gradients to be stored in a
-    contiguous grad_buffer.
-
     Args:
+        config (OptimizerConfig): optimizer configuration object.
         param_groups (list): list of parameter groups.
-        per_model_grad_buffers (list, optional): list of gradient buffers for
+        per_model_buffers (dict, optional): buffers for distributed optimizer. Defaults to None.
+        data_parallel_group (torch.distributed.ProcessGroup, optional): data-parallel group for
             distributed optimizer. Defaults to None.
-        data_parallel_group (ProcessGroup, optional): data parallel group for
-            distributed optimizer. Defaults to None.
-        data_parallel_group_gloo (ProcessGroup, optional): data parallel
-            group-gloo for distributed optimizer. Defaults to None.
-        data_parallel_group_idx (int, optional): data parallel
-            group index for distributed optimizer. Defaults to None.
+        data_parallel_group_gloo (torch.distributed.ProcessGroup, optional): gloo data-parallel
+            group for distributed optimizer. Defaults to None.
+        data_parallel_group_idx (int, optional): data-parallel group index for distributed
+            optimizer. Defaults to None.
     """
     if config.optimizer == 'adam':
         optimizer = Adam(
@@ -136,9 +145,6 @@ def get_megatron_optimizer_based_on_param_groups(
         init_state_fn = None
     else:
         raise Exception('{} optimizer is not supported.'.format(config.optimizer))
-
-    # Determine whether the params have main-grad field.
-    params_have_main_grad = True
 
     # Mixed precision optimizer.
     # - Note: both the Float16Optimizer and the DistributedOptimizer inherit
@@ -172,22 +178,16 @@ def get_megatron_optimizer_based_on_param_groups(
 
         optimizer_args = [
             optimizer,
-            config.clip_grad,
-            config.log_num_zeros_in_grad,
-            params_have_main_grad,
-            config.fp16,
-            config.bf16,
-            config.params_dtype,
+            config,
             grad_scaler,
             init_state_fn,
         ]
         if config.use_distributed_optimizer:
             optimizer = DistributedOptimizer(
                 *optimizer_args,
-                per_model_grad_buffers=per_model_grad_buffers,
+                per_model_buffers=per_model_buffers,
                 data_parallel_group=data_parallel_group,
                 data_parallel_group_gloo=data_parallel_group_gloo,
-                overlap_param_gather=config.overlap_param_gather,
                 data_parallel_group_idx=data_parallel_group_idx,
             )
         else:
@@ -196,23 +196,22 @@ def get_megatron_optimizer_based_on_param_groups(
         return optimizer
 
     # FP32.
-    return FP32Optimizer(
-        optimizer,
-        config.clip_grad,
-        config.log_num_zeros_in_grad,
-        params_have_main_grad,
-        init_state_fn,
-    )
+    return FP32Optimizer(optimizer, config, init_state_fn,)
 
 
 def get_megatron_optimizer(
-    config, model_chunks, no_weight_decay_cond=None, scale_lr_cond=None, lr_mult=1.0
+    config: OptimizerConfig,
+    model_chunks: List[MegatronModule],
+    no_weight_decay_cond: Optional[Callable] = None,
+    scale_lr_cond: Optional[Callable] = None,
+    lr_mult: float = 1.0,
 ):
     """Retrieve the Megatron optimizer for model chunks.
 
     We use separate optimizers for expert parameters and non-expert parameters.
 
     Args:
+        config (OptimizerConfig): optimizer configuration object.
         model_chunks (List[MegatronModule]): model chunks to get optimizer for.
         no_weight_decay_cond (func, optional): function to determine whether a parameter
             should not perform weight decay. Defaults to None.
@@ -221,18 +220,23 @@ def get_megatron_optimizer(
         lr_mult (float, optional): learning rate multiplier for parameters that
             satisfy scale_lr_cond. Defaults to 1.0.
     """
+
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        logger.info(f'Setting up optimizer with {config}')
+
     # Collect param groups.
     param_groups = get_param_groups(model_chunks, no_weight_decay_cond, scale_lr_cond, lr_mult)
 
     # Collect grad buffers for distributed optimizer.
-    per_model_grad_buffers = {}
-    per_model_ep_grad_buffers = {}
+    per_model_buffers = {}
+    per_model_ep_buffers = {}
     for model_idx, model_chunk in enumerate(model_chunks):
-        if hasattr(model_chunk, 'grad_buffers'):
-            per_model_grad_buffers[model_idx] = model_chunk.grad_buffers
-            per_model_ep_grad_buffers[model_idx] = model_chunk.expert_parallel_grad_buffers
+        if hasattr(model_chunk, 'buffers'):
+            per_model_buffers[model_idx] = model_chunk.buffers
+            per_model_ep_buffers[model_idx] = model_chunk.expert_parallel_buffers
 
-    # Split param groups into dense and moe.
+    # Split param groups into dense and MoE params (since data-parallel groups for MoE
+    # parameters can be different with expert parallelism).
     dense_param_groups = list(filter(lambda g: not g['is_expert_parallel'], param_groups))
     moe_param_groups = list(filter(lambda g: g['is_expert_parallel'], param_groups))
 
@@ -242,20 +246,20 @@ def get_megatron_optimizer(
         get_megatron_optimizer_based_on_param_groups(
             config,
             param_groups=dense_param_groups,
-            per_model_grad_buffers=per_model_grad_buffers,
+            per_model_buffers=per_model_buffers,
             data_parallel_group=mpu.get_data_parallel_group(with_context_parallel=True),
             data_parallel_group_gloo=mpu.get_data_parallel_group_gloo(with_context_parallel=True),
             data_parallel_group_idx=model_parallel_rank,
         )
     ]
-    if len(moe_param_groups):
+    if len(moe_param_groups) > 0:
         model_parallel_world_size = torch.distributed.get_world_size(mpu.get_model_parallel_group())
         expert_parallel_rank = mpu.get_expert_model_parallel_rank()
         optimizers.append(
             get_megatron_optimizer_based_on_param_groups(
                 config,
                 param_groups=moe_param_groups,
-                per_model_grad_buffers=per_model_ep_grad_buffers,
+                per_model_buffers=per_model_ep_buffers,
                 data_parallel_group=mpu.get_data_modulo_expert_parallel_group(),
                 data_parallel_group_gloo=mpu.get_data_modulo_expert_parallel_group_gloo(),
                 data_parallel_group_idx=expert_parallel_rank * model_parallel_world_size

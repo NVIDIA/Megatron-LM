@@ -33,7 +33,7 @@ TRAINING_DTYPE=fp16
 
 if [[ $USE_CORE -eq 1 ]]; then
        echo "Running using megatron core"
-       TRANSFORMER_IMPL=local
+       TRANSFORMER_IMPL=transformer_engine
        TRAINING_DTYPE=bf16
        command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0;"
        USE_MCORE=1
@@ -111,6 +111,7 @@ build_torch_run_cmd() {
        --tensor-model-parallel-size $TP_SIZE \
        --pipeline-model-parallel-size $PP_SIZE \
        --no-bias-swiglu-fusion \
+       --use-gpu-initialization \
        --no-rope-fusion \
        ${VP_SIZE:+--num-layers-per-virtual-pipeline-stage "$VP_SIZE"} \
        ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \

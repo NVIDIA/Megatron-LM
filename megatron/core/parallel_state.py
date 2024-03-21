@@ -495,9 +495,9 @@ def initialize_model_parallel(
     _set_global_memory_buffer()
 
 
-def is_unitialized():
+def is_initialized():
     """Useful for code segments that may be accessed with or without mpu initialization"""
-    return _DATA_PARALLEL_GROUP is None
+    return _DATA_PARALLEL_GROUP is not None
 
 
 def model_parallel_is_initialized():
