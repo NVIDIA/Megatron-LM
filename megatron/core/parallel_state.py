@@ -3,6 +3,7 @@
 """Model and data parallel groups."""
 
 import os
+from datetime import timedelta
 from typing import Optional
 
 import torch
@@ -103,6 +104,7 @@ def initialize_model_parallel(
     context_parallel_size: int = 1,
     expert_model_parallel_size: int = 1,
     nccl_communicator_config_path: Optional[str] = None,
+    distributed_timeout_minutes: int = 30,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -176,6 +178,12 @@ def initialize_model_parallel(
             Path to the yaml file of NCCL communicator configurations.
             `min_ctas`, `max_ctas`, and `cga_cluster_size` can be set
             for each communicator.
+
+        distributed_timeout_minutes (int, default = 30): Timeout, in
+            minutes,for operations executed against distributed
+            process groups. See PyTorch documentation at
+            https://pytorch.org/docs/stable/distributed.html for
+            caveats.
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -255,6 +263,8 @@ def initialize_model_parallel(
         with open(nccl_communicator_config_path, "r") as stream:
             nccl_comm_cfgs = yaml.safe_load(stream)
 
+    timeout = timedelta(minutes=distributed_timeout_minutes)
+
     # Build the data-parallel groups.
     global _DATA_PARALLEL_GROUP
     global _DATA_PARALLEL_GROUP_GLOO
@@ -272,9 +282,9 @@ def initialize_model_parallel(
                 start_rank + j, end_rank, context_parallel_size * tensor_model_parallel_size
             )
             group = torch.distributed.new_group(
-                ranks, pg_options=get_nccl_options('dp', nccl_comm_cfgs)
+                ranks, timeout=timeout, pg_options=get_nccl_options('dp', nccl_comm_cfgs)
             )
-            group_gloo = torch.distributed.new_group(ranks, backend="gloo")
+            group_gloo = torch.distributed.new_group(ranks, timeout=timeout, backend="gloo")
             if rank in ranks:
                 _DATA_PARALLEL_GROUP = group
                 _DATA_PARALLEL_GROUP_GLOO = group_gloo
@@ -283,9 +293,11 @@ def initialize_model_parallel(
             ranks_with_cp = range(start_rank + j, end_rank, tensor_model_parallel_size)
             all_data_parallel_group_ranks_with_cp.append(list(ranks_with_cp))
             group_with_cp = torch.distributed.new_group(
-                ranks_with_cp, pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs)
+                ranks_with_cp, timeout=timeout, pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs)
             )
-            group_with_cp_gloo = torch.distributed.new_group(ranks_with_cp, backend="gloo")
+            group_with_cp_gloo = torch.distributed.new_group(
+                ranks_with_cp, timeout=timeout, backend="gloo"
+            )
             if rank in ranks_with_cp:
                 _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
                 _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
@@ -328,7 +340,7 @@ def initialize_model_parallel(
             for k in range(tensor_model_parallel_size):
                 ranks = range(start_rank + k, end_rank, tensor_model_parallel_size)
                 group = torch.distributed.new_group(
-                    ranks, pg_options=get_nccl_options('cp', nccl_comm_cfgs)
+                    ranks, timeout=timeout, pg_options=get_nccl_options('cp', nccl_comm_cfgs)
                 )
                 if rank in ranks:
                     _CONTEXT_PARALLEL_GROUP = group
@@ -343,7 +355,7 @@ def initialize_model_parallel(
             for data_parallel_group_ranks_with_cp in all_data_parallel_group_ranks_with_cp
         ]
         group = torch.distributed.new_group(
-            ranks, pg_options=get_nccl_options('mp', nccl_comm_cfgs)
+            ranks, timeout=timeout, pg_options=get_nccl_options('mp', nccl_comm_cfgs)
         )
         if rank in ranks:
             _MODEL_PARALLEL_GROUP = group
@@ -356,7 +368,7 @@ def initialize_model_parallel(
     for i in range(num_tensor_model_parallel_groups):
         ranks = range(i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size)
         group = torch.distributed.new_group(
-            ranks, pg_options=get_nccl_options('tp', nccl_comm_cfgs)
+            ranks, timeout=timeout, pg_options=get_nccl_options('tp', nccl_comm_cfgs)
         )
         if rank in ranks:
             _TENSOR_MODEL_PARALLEL_GROUP = group
@@ -377,7 +389,7 @@ def initialize_model_parallel(
     for i in range(num_pipeline_model_parallel_groups):
         ranks = range(i, world_size, num_pipeline_model_parallel_groups)
         group = torch.distributed.new_group(
-            ranks, pg_options=get_nccl_options('pp', nccl_comm_cfgs)
+            ranks, timeout=timeout, pg_options=get_nccl_options('pp', nccl_comm_cfgs)
         )
         if rank in ranks:
             _PIPELINE_MODEL_PARALLEL_GROUP = group
@@ -401,7 +413,7 @@ def initialize_model_parallel(
             position_embedding_ranks = ranks
 
         group = torch.distributed.new_group(
-            embedding_ranks, pg_options=get_nccl_options('embd', nccl_comm_cfgs)
+            embedding_ranks, timeout=timeout, pg_options=get_nccl_options('embd', nccl_comm_cfgs)
         )
         if rank in embedding_ranks:
             _EMBEDDING_GROUP = group
@@ -409,7 +421,9 @@ def initialize_model_parallel(
             _EMBEDDING_GLOBAL_RANKS = embedding_ranks
 
         group = torch.distributed.new_group(
-            position_embedding_ranks, pg_options=get_nccl_options('embd', nccl_comm_cfgs)
+            position_embedding_ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options('embd', nccl_comm_cfgs),
         )
         if rank in position_embedding_ranks:
             _POSITION_EMBEDDING_GROUP = group
@@ -429,7 +443,7 @@ def initialize_model_parallel(
         end_rank = start_rank + tensor_and_data_group_size_with_cp
         ranks = range(start_rank, end_rank)
         group = torch.distributed.new_group(
-            ranks, pg_options=get_nccl_options('tp_dp_cp', nccl_comm_cfgs)
+            ranks, timeout=timeout, pg_options=get_nccl_options('tp_dp_cp', nccl_comm_cfgs)
         )
         if rank in ranks:
             _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = group
@@ -445,7 +459,7 @@ def initialize_model_parallel(
                 end_rank = start_rank + tensor_model_parallel_size
                 ranks = ranks + list(range(start_rank, end_rank))
             group = torch.distributed.new_group(
-                ranks, pg_options=get_nccl_options('tp_dp', nccl_comm_cfgs)
+                ranks, timeout=timeout, pg_options=get_nccl_options('tp_dp', nccl_comm_cfgs)
             )
             if rank in ranks:
                 _TENSOR_AND_DATA_PARALLEL_GROUP = group
@@ -470,7 +484,7 @@ def initialize_model_parallel(
             end_rank = i * tensor_and_data_group_size + (j + 1) * tensor_and_expert_group_size
             ranks = range(start_rank, end_rank)
             group = torch.distributed.new_group(
-                ranks, pg_options=get_nccl_options('tp_exp', nccl_comm_cfgs)
+                ranks, timeout=timeout, pg_options=get_nccl_options('tp_exp', nccl_comm_cfgs)
             )
             if rank in ranks:
                 _TENSOR_AND_EXPERT_PARALLEL_GROUP = group
@@ -481,7 +495,7 @@ def initialize_model_parallel(
         for j in range(tensor_and_expert_group_size):
             ranks = range(start_rank + j, end_rank, tensor_and_expert_group_size)
             group = torch.distributed.new_group(
-                ranks, pg_options=get_nccl_options('dp_modulo_exp', nccl_comm_cfgs)
+                ranks, timeout=timeout, pg_options=get_nccl_options('dp_modulo_exp', nccl_comm_cfgs)
             )
             group_gloo = torch.distributed.new_group(ranks, backend="gloo")
             if rank in ranks:

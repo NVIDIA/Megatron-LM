@@ -750,7 +750,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             if wandb_writer:
                 wandb_writer.log({'iteration-time': elapsed_time_per_iteration},
                                  iteration)
-        log_string = ' iteration {:8d}/{:8d} |'.format(
+        log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+        log_string += ' iteration {:8d}/{:8d} |'.format(
             iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(
             args.consumed_train_samples)
