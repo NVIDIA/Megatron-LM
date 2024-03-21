@@ -248,9 +248,14 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "When bias_activation_fusion is True, activation function should be either gelu or swiglu"
                 )
-            if self.activation_func == F.gelu and not self.add_bias_linear:
+            if (
+                self.activation_func == F.gelu
+                and not self.gated_linear_unit
+                and not self.add_bias_linear
+            ):
                 raise ValueError(
-                    "When bias_activation_fusion is True and activation function is gelu, add_bias_linear must also be True."
+                    "When bias_activation_fusion is True, gated_linear_unit is False, "
+                    "and activation function is gelu, add_bias_linear must also be True."
                 )
         if self.apply_rope_fusion and self.rotary_interleaved:
             raise ValueError(f'rotary_interleaved does not work with apply_rope_fusion.')

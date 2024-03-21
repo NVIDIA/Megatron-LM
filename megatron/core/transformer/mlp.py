@@ -13,6 +13,7 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedStateDict,
     ShardedTensorFactory,
 )
+from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
@@ -97,8 +98,11 @@ class MLP(MegatronModule):
 
         if self.config.bias_activation_fusion:
             if self.activation_func == F.gelu:
-                assert self.config.add_bias_linear is True
-                intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+                if self.config.gated_linear_unit:
+                    intermediate_parallel = bias_geglu_impl(intermediate_parallel, bias_parallel)
+                else:
+                    assert self.config.add_bias_linear is True
+                    intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
             elif self.activation_func == F.silu and self.config.gated_linear_unit:
                 intermediate_parallel = bias_swiglu_impl(intermediate_parallel, bias_parallel)
             else:
