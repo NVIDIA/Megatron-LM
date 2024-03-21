@@ -50,7 +50,6 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
         Union[GPTModel, megatron.model.GPTModel]: The returned model
     """
     args = get_args()
-    print(f'shan args: {type(args)}')
     print_rank_0('building GPT model ...')
     config = core_transformer_config_from_args(args)
 
@@ -111,7 +110,7 @@ def add_text_generate_args(parser):
     return parser
 
 
-def get_backend(args: Namespace, model: MegatronModule) -> AbstractBackend:
+def get_inference_backend(args: Namespace, model: MegatronModule) -> AbstractBackend:
     """Utility to get the relevant backend for running inference
 
     This function will automatically chose the TRTLLMBackend when possible, and if not revert to Mcore backend if the user does not specify any backends. 
@@ -124,17 +123,14 @@ def get_backend(args: Namespace, model: MegatronModule) -> AbstractBackend:
         AbstractBackend: The chosen backend
     """
     tokenizer = get_tokenizer()
-    if args.backend is not None:
-        return args.backend
-    else:
-        if TRTLLMBackend.is_model_trt_llm_exportable(model):
-            backend = TRTLLMBackend(model, tokenizer)
-        else :
-            wrapped_model = GPTInferenceWrapper(model, args)
-            text_generation_strategy = SimpleTextGenerationStrategy(model, tokenizer) if args.text_generation_strategy is None else args.text_generation_strategy
-            backend = MCoreBackend(model=wrapped_model, tokenizer=tokenizer, text_generation_strategy=text_generation_strategy)
-            
-    return backend    
+
+    if TRTLLMBackend.is_model_trt_llm_exportable(model):
+        return TRTLLMBackend(model, tokenizer)
+    else :
+        inference_wrapped_model = GPTInferenceWrapper(model, args)
+        text_generation_strategy = SimpleTextGenerationStrategy(inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer)
+        return MCoreBackend(text_generation_strategy=text_generation_strategy)
+          
 
 def write_results_to_file(output_file:str, prompts:List[str], prompt_plus_generated_tokens:List , prompts_plus_generated_text: List, output_log_probs:List) -> None :
     """Utility to write the output results to a text file
@@ -148,10 +144,11 @@ def write_results_to_file(output_file:str, prompts:List[str], prompt_plus_genera
     """
     with open(output_file, 'a') as f: 
         for idx, prompt in enumerate(prompts):
-            tokens = prompt_plus_generated_tokens[idx]
+            tokens = prompt_plus_generated_tokens[idx].cpu().numpy()
             generated_text = prompts_plus_generated_text[idx]
-            output_log_probs = None if output_log_probs is None else output_log_probs[idx]
+            output_log_probs = None if output_log_probs is None else output_log_probs[idx].cpu().numpy()
             write_data = {'id': idx,'original_prompt': prompt, 'prompt_with_generated_text': generated_text, 'all_tokens' : tokens, 'output_log_probs': output_log_probs}
+            print(f'SHAN : {write_data}')
             f.write(json.dumps(write_data) + '\n')
 
 
@@ -164,8 +161,16 @@ def generate_and_write_results(model: MegatronModule, args:Namespace):
         model (MegatronModule): The transformer model on which generate function is called
         args (Namespace): The arguments prased from the command line and default arguments (arguments.py)
     """    
-    backend = get_backend(args, model)
-    
+    inference_backend = get_inference_backend(args, model)
+
+    common_inference_params = CommonInferenceParams(
+        use_greedy=args.greedy, 
+        temperature=args.temperature, 
+        top_k=args.top_k, 
+        top_p=args.top_p, 
+        return_log_probs=args.return_log_probs, 
+        num_tokens_to_generate=args.num_tokens_to_generate)
+
     if torch.distributed.get_rank() == 0:
         fname = open(args.prompts_input_file, "r")
         lines = fname.readlines()
@@ -173,15 +178,7 @@ def generate_and_write_results(model: MegatronModule, args:Namespace):
 
         output_file = args.prompts_input_file + ".out" if args.output_file is None else args.output_file
         print('`sample-output-file` not specified, setting ''it to {}'.format(output_file))
-
-        common_inference_params = CommonInferenceParams(
-            use_greedy=args.greedy, 
-            temperature=args.temperature, 
-            top_k=args.top_k, 
-            top_p=args.top_p, 
-            return_log_probs=args.return_log_probs, 
-            num_tokens_to_generate=args.num_tokens_to_generate)
-        
+   
         total_number_of_prompts = len(all_prompts)
         num_inference_steps = math.ceil(total_number_of_prompts/args.global_batch_size)
 
@@ -191,11 +188,11 @@ def generate_and_write_results(model: MegatronModule, args:Namespace):
             end = min(total_number_of_prompts, start + args.global_batch_size)
             prompts = all_prompts[start:end]
 
-            prompts_tokens_with_generations, prompts_plus_generations_detokenized, output_log_probs  = common_generate(backend, prompts=prompts, common_inference_params=common_inference_params)
+            prompts_tokens_with_generations, prompts_plus_generations_detokenized, output_log_probs  = common_generate(inference_backend=inference_backend, prompts=prompts, common_inference_params=common_inference_params)
             
             write_results_to_file(output_file, prompts, prompts_tokens_with_generations, prompts_plus_generations_detokenized, output_log_probs)
     else:
-        common_generate(backend)
+        common_generate(inference_backend=inference_backend, common_inference_params=common_inference_params)
 
 def main():
     """Main program."""

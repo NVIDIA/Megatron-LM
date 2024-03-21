@@ -3,7 +3,6 @@ from megatron.core.datasets.gpt_dataset import _get_ltor_masks_and_position_ids
 from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.communication_utils import copy_from_last_to_first_pipeline_stage, synchronize_list_across_all_ranks, synchronize_tensor_across_all_ranks
 from megatron.core.inference.inference_model_wrappers.abstract_model_inference_wrapper import AbstractModelInferenceWrapper
-from megatron.core.inference.text_generation_strategies.abstract_text_generation_strategy import AbstractTextGenerationStrategy
 import torch
 import torch.nn.functional as F
 
@@ -11,7 +10,7 @@ from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.global_vars import get_num_microbatches
 from megatron.core import parallel_state
 
-class SimpleTextGenerationStrategy(AbstractTextGenerationStrategy):
+class SimpleTextGenerationStrategy:
     def __init__(self, inference_wrapped_model:AbstractModelInferenceWrapper, tokenizer):
         """The basic text generation strategy
 
@@ -189,7 +188,7 @@ class SimpleTextGenerationStrategy(AbstractTextGenerationStrategy):
                                            device=torch.cuda.current_device())
         
         with torch.no_grad():
-            self.inference_wrapped_model.prep_model_for_inference() # initalize small model (inference)
+            self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=prompts_tokens)
 
             context_start_position = 0           
             # Pick the context window that we need to pass through the network.

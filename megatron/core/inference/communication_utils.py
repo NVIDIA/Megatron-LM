@@ -2,25 +2,6 @@ import torch
 
 from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core import parallel_state
-def synchronize_params_across_all_ranks(common_inference_params: CommonInferenceParams):
-    values = [
-            common_inference_params.use_greedy,
-            common_inference_params.temperature,
-            common_inference_params.top_k,
-            common_inference_params.top_p,
-            common_inference_params.return_log_probs,
-            common_inference_params.num_tokens_to_generate,
-            ]
-    size = len(values)
-    common_inference_params_tensor = synchronize_list_across_all_ranks(size, values, dtype=torch.float32)
-
-    if torch.distributed.get_rank() != 0:
-        # TODO: Should change this . Might not be best to convert them to object
-        common_inference_params = CommonInferenceParams(*common_inference_params_tensor.tolist())
-        common_inference_params.use_greedy = bool(common_inference_params.use_greedy)
-        common_inference_params.return_log_probs = bool(common_inference_params.return_log_probs)
-
-    return common_inference_params
 
 def synchronize_list_across_all_ranks(size, list_values = None, dtype = torch.float32):
     tensor = None

@@ -4,6 +4,7 @@ import abc
 
 import torch
 
+from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference_params import InferenceParams
 
 class AbstractModelInferenceWrapper:
@@ -21,13 +22,14 @@ class AbstractModelInferenceWrapper:
         self.args = args
 
     @abc.abstractclassmethod
-    def prep_model_for_inference(self,  prompts_tokens: torch.Tensor):
+    def prep_model_for_inference(self,  prompts_tokens: torch.Tensor = None):
         """A utility function for preparing model for inference
 
         The function gets called before you get the inference data and running forward pass. Use it to put the model in eval mode, build position ids ,attention mask etc, so that required slices can be extracted during the forward pass. 
 
         Args:
-            prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_seq_len]
+            prompts_tokens (torch.Tensor, optional): A tensor of shape [batch_size, max_seq_len]. Defaults to None
+
         """
         pass
 
