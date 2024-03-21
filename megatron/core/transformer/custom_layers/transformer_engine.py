@@ -115,10 +115,8 @@ class TELinear(te.pytorch.Linear):
         te_version = packaging.version.Version(version("transformer-engine"))
         if te_version >= packaging.version.Version("0.8.0"):
             if self.config.tp_comm_overlap:
-                extra_kwargs["ub_split_ag"] = self.config.tp_comm_split_ag
-                extra_kwargs["ub_atomic_gemm_ag"] = self.config.tp_comm_atomic_ag
-                extra_kwargs["ub_split_rs"] = self.config.tp_comm_split_rs
-                extra_kwargs["ub_atomic_gemm_rs"] = self.config.tp_comm_atomic_rs
+                extra_kwargs["ub_overlap_rs"] = self.config.tp_comm_overlap_rs
+                extra_kwargs["ub_overlap_ag"] = self.config.tp_comm_overlap_ag
                 if te_version > packaging.version.Version("1.0.0"):
                     assert (
                         tp_comm_buffer_name is not None
@@ -207,8 +205,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             if self.config.tp_comm_overlap:
                 extra_kwargs["ub_bulk_wgrad"] = self.config.tp_comm_bulk_wgrad
                 extra_kwargs["ub_bulk_dgrad"] = self.config.tp_comm_bulk_dgrad
-                extra_kwargs["ub_atomic_gemm_ag"] = self.config.tp_comm_atomic_ag
-                extra_kwargs["ub_split_ag"] = self.config.tp_comm_split_ag
+                extra_kwargs["ub_overlap_ag"] = self.config.tp_comm_overlap_ag
+                extra_kwargs["ub_overlap_rs_dgrad"] = self.config.tp_comm_overlap_rs_dgrad
                 if te_version > packaging.version.Version("1.0.0"):
                     assert (
                         tp_comm_buffer_name is not None
