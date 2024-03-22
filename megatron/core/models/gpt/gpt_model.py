@@ -197,7 +197,9 @@ class GPTModel(LanguageModule):
 
         return loss
 
-    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[Dict] = None) -> ShardedStateDict:
+    def sharded_state_dict(
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[Dict] = None
+    ) -> ShardedStateDict:
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
 
         # We do this for backward compatibility. Old GPT checkpoints only stored the output layer weight key. So we remove the _extra_state key
