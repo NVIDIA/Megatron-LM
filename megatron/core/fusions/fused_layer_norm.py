@@ -40,8 +40,6 @@ class FusedLayerNorm(torch.nn.Module):
       This kernel supports only a set of hidden sizes. Please
       check persist_ln_hidden_sizes if your hidden size is supported.
 
-      sequence parallel (bool): Apply sequence parallelism optimization.
-
       zero_centered_gamma (bool): Adjust LayerNorm weights such that they are
       centered around zero. This improves numerical stability.
 
@@ -58,7 +56,6 @@ class FusedLayerNorm(torch.nn.Module):
         hidden_size: int,
         eps: float = 1e-5,
         persist_layer_norm: bool = True,
-        sequence_parallel: bool = False,
         zero_centered_gamma: bool = False,
         normalization: str = "LayerNorm",  # included to match TE interface
     ):

@@ -65,6 +65,8 @@ class TransformerConfig(ModelParallelConfig):
             moe_z_loss_coeff (float): Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended.
             moe_input_jitter_eps (float): Add noise to the input tensor by applying jitter with a specified epsilon value.
             moe_token_dropping (bool): This feature involves selectively dropping and padding tokens for each expert to achieve a specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note: Currently unsupported.
+            qk_layernorm (bool): Whether to apply LayerNorm to the query and key embeddings.
+            test_mode (bool): Whether to run real-time tests.
     """
 
     # model architecture
@@ -89,6 +91,9 @@ class TransformerConfig(ModelParallelConfig):
     num_moe_experts: int = None
     rotary_interleaved: bool = False
     window_size: Optional[Tuple[int, int]] = None
+
+    qk_layernorm: bool = False
+    test_mode: bool = False
 
     # initialization
     init_method: Callable = None

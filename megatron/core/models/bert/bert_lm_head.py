@@ -8,7 +8,7 @@ from megatron.core.transformer.utils import get_linear_layer
 
 
 class BertLMHead(MegatronModule):
-    """Masked LM head for Bert. 
+    """Masked LM head for Bert.
 
     Args:
         hidden_size: hidden size
@@ -29,10 +29,7 @@ class BertLMHead(MegatronModule):
         setattr(self.dense.bias, 'sequence_parallel', config.sequence_parallel)
 
         self.layer_norm = FusedLayerNorm(
-            config=config,
-            hidden_size=hidden_size,
-            eps=config.layernorm_epsilon,
-            sequence_parallel=config.sequence_parallel,
+            config=config, hidden_size=hidden_size, eps=config.layernorm_epsilon,
         )
 
         self.gelu = torch.nn.functional.gelu
