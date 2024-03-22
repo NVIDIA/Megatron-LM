@@ -203,7 +203,7 @@ class GPTModel(LanguageModule):
         # We do this for backward compatibility. Old GPT checkpoints only stored the output layer weight key. So we remove the _extra_state key
         output_layer_prefix = f'{prefix}output_layer.'
         sharded_state_dict.pop(f'{output_layer_prefix}_extra_state', None)
- 
+
         # No bias in GPT model
         output_layer_weight_key = f'{output_layer_prefix}weight'
         if self.share_embeddings_and_output_weights:
