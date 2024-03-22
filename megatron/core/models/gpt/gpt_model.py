@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-from typing import Literal, Optional, Tuple, Union
+from typing import Dict, Literal, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -197,8 +197,8 @@ class GPTModel(LanguageModule):
 
         return loss
 
-    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()) -> ShardedStateDict:
-        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets)
+    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[Dict] = None) -> ShardedStateDict:
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
 
         # We do this for backward compatibility. Old GPT checkpoints only stored the output layer weight key. So we remove the _extra_state key
         output_layer_prefix = f'{prefix}output_layer.'
