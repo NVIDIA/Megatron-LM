@@ -200,6 +200,9 @@ class GPTModel(LanguageModule):
     def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()) -> ShardedStateDict:
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets)
 
+        # We do this for backward compatibility. Old GPT checkpoints only stored the output layer weight key. So we remove the _extra_state key
+        sharded_state_dict.pop(f'{output_layer_prefix}_extra_state', None)
+
         output_layer_prefix = f'{prefix}output_layer.'
         # No bias in GPT model
         output_layer_weight_key = f'{output_layer_prefix}weight'
@@ -224,9 +227,5 @@ class GPTModel(LanguageModule):
                 )
 
                 sharded_state_dict[output_layer_weight_key] = sharded_output_layer_tensor
-        else:
-            # We do this for backward compatibility. Old GPT checkpoints only stored the output layer weight key.
-            if f'{output_layer_prefix}_extra_state' in sharded_state_dict:
-                del sharded_state_dict[f'{output_layer_prefix}_extra_state']
 
         return sharded_state_dict
