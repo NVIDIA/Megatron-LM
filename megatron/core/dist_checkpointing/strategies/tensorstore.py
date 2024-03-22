@@ -5,8 +5,8 @@
 from functools import partial
 from itertools import starmap
 from logging import getLogger
-from pathlib import Path
 
+import os
 import tensorstore as ts
 import torch
 
@@ -30,7 +30,7 @@ class TensorStoreLoadShardedStrategy(LoadShardedStrategy):
         super().__init__()
         self.load_directly_on_device = load_directly_on_device
 
-    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: str):
         if torch.distributed.get_rank() == 0:
             print(f'Loading distributed checkpoint with {self.__class__.__name__}')
             if self.load_directly_on_device:
@@ -43,7 +43,7 @@ class TensorStoreLoadShardedStrategy(LoadShardedStrategy):
         dict_list_map_inplace(load_fn, sharded_state_dict)
         return sharded_state_dict
 
-    def load_tensors_metadata(self, checkpoint_dir: Path):
+    def load_tensors_metadata(self, checkpoint_dir: str):
         def get_ts_shape_dtype(path):
             arr = open_ts_array(path)
             return arr.shape, arr.dtype.numpy_dtype
@@ -73,7 +73,7 @@ def merge_global_slice_with_shape(global_slice, actual_shape, key):
 
 def _load_from_array(
     sharded_tensor: ShardedTensor,
-    checkpoint_dir: Path,
+    checkpoint_dir: str,
     load_directly_on_device: bool = False,
     apply_flattened_range: bool = True,
 ):
@@ -86,9 +86,9 @@ def _load_from_array(
         return ten
 
 
-def _load_regular_chunk(sharded_tensor: ShardedTensor, checkpoint_dir: Path):
+def _load_regular_chunk(sharded_tensor: ShardedTensor, checkpoint_dir: str):
     assert isinstance(sharded_tensor, ShardedTensor), type(sharded_tensor)
-    arr = open_ts_array(checkpoint_dir / sharded_tensor.key)
+    arr = open_ts_array(os.path.join(checkpoint_dir, sharded_tensor.key))
     if sharded_tensor.global_shape == arr.shape:
         x = (
             arr[sharded_tensor.global_slice()].read().result()
@@ -108,16 +108,16 @@ def _load_regular_chunk(sharded_tensor: ShardedTensor, checkpoint_dir: Path):
     return x
 
 
-def open_ts_array(arr_path: Path):
+def open_ts_array(arr_path: str):
     """Opens a Zarr file array with Tensorstore with basic setting.
 
     Arguments:
-        arr_path (Path): path to a Zarr (Tensorstore) array
+        arr_path (str): path to a Zarr (Tensorstore) array
     """
     spec = {'driver': 'zarr', 'metadata_key': '.zarray', 'kvstore': {}}
     spec['kvstore'] = {
         'driver': 'file',
-        'path': str(arr_path),
+        'path': arr_path,
     }
     try:
         arr = ts.open(ts.Spec(spec), open=True).result()

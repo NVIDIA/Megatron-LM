@@ -9,7 +9,6 @@ from functools import partial, wraps
 from itertools import chain
 from logging import DEBUG, INFO, StreamHandler, getLogger
 from operator import attrgetter, itemgetter
-from pathlib import Path
 from typing import Iterable, List, NamedTuple, Optional, Tuple, Union
 
 import torch
@@ -103,7 +102,7 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
         self.dp_group_rank = torch.distributed.get_rank(self.data_parallel_group_orig)
         self.global_rank = torch.distributed.get_rank()
 
-    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: str):
         self.maybe_init_gloo_group()
         all_tensors_sorted = self._build_load_plan(sharded_state_dict)
         self._exchange_loaded_tensors(all_tensors_sorted, sharded_state_dict, checkpoint_dir)
@@ -247,7 +246,7 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
 
         dict_list_map_inplace(_fill_in_data, sharded_state_dict)
 
-    def load_tensors_metadata(self, checkpoint_dir: Path):
+    def load_tensors_metadata(self, checkpoint_dir: str):
         def get_ts_shape_dtype(path):
             arr = open_ts_array(path)
             return arr.shape, arr.dtype.numpy_dtype

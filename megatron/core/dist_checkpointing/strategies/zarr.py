@@ -6,7 +6,7 @@ import os
 import threading
 from functools import partial
 from logging import getLogger
-from pathlib import Path
+from cloudpathlib import AnyPath
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
@@ -52,7 +52,7 @@ logger = getLogger(__name__)
 
 
 class ZarrSaveShardedStrategy(SaveShardedStrategy):
-    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: str):
         sharded_tensors = list(nested_values(sharded_state_dict))
         arrays = _create_or_open_zarr_arrays(sharded_tensors, checkpoint_dir)
         for ten, arr in zip(sharded_tensors, arrays):
@@ -61,7 +61,7 @@ class ZarrSaveShardedStrategy(SaveShardedStrategy):
 
 
 def _create_or_open_zarr_arrays(
-    sharded_tensors: List[ShardedTensor], checkpoint_dir: Path
+    sharded_tensors: List[ShardedTensor], checkpoint_dir: str
 ) -> List[Optional[zarr.Array]]:
     """ Returns list of zarr arrays corresponding to given tensors.
 
@@ -72,7 +72,7 @@ def _create_or_open_zarr_arrays(
 
     Args:
         sharded_tensors (List[ShardedTensor]): sharded tensors from a given rank that will be saved to checkpoint
-        checkpoint_dir (Path): checkpoint in which the arrays will be created
+        checkpoint_dir (str): checkpoint in which the arrays will be created
     """
     arrays = []
     for ten in sharded_tensors:
@@ -92,9 +92,9 @@ def _create_or_open_zarr_arrays(
         open_kwargs = {}
         if ten.flattened_range is not None:
             open_kwargs['synchronizer'] = zarr.ProcessSynchronizer(
-                str(checkpoint_dir / f'{ten.key}.sync')
+                os.path.join(checkpoint_dir, f'{ten.key}.sync')
             )
-        arrays[arr_idx] = _open_zarr_array_verbose(checkpoint_dir / ten.key, 'r+', **open_kwargs)
+        arrays[arr_idx] = _open_zarr_array_verbose(os.path.join(checkpoint_dir, ten.key), 'r+', **open_kwargs)
     return arrays
 
 
@@ -126,22 +126,23 @@ def _save_to_existing_array(sharded_tensor: ShardedTensor, arr: Optional[zarr.Ar
         arr.set_coordinate_selection(sharded_tensor.global_coordinates(), x)
 
 
-def _create_zarr_array(sharded_tensor: ShardedTensor, checkpoint_dir: Path):
+def _create_zarr_array(sharded_tensor: ShardedTensor, checkpoint_dir: str):
     np_dtype = torch_to_numpy_dtype_dict[sharded_tensor.dtype]
+    store = os.path.join(checkpoint_dir, sharded_tensor.key)
     try:
         arr = zarr.create(
             sharded_tensor.global_shape,
             dtype=np_dtype,
-            store=checkpoint_dir / sharded_tensor.key,
+            store=store,
             chunks=sharded_tensor.max_allowed_chunks(),
             compressor=None,
             fill_value=None,
             write_empty_chunks=True,
         )
-        logger.debug(f'Created a new Zarr array at {checkpoint_dir / sharded_tensor.key}')
+        logger.debug(f'Created a new Zarr array at {store}')
     except zarr.errors.ContainsArrayError as e:
         raise CheckpointingException(
-            f'Array {checkpoint_dir / sharded_tensor.key} already exists'
+            f'Array {store} already exists'
         ) from e
 
     if HAS_BFLOAT16 and np_dtype == np.dtype('bfloat16'):
@@ -152,13 +153,13 @@ def _create_zarr_array(sharded_tensor: ShardedTensor, checkpoint_dir: Path):
 
 
 class ZarrLoadShardedStrategy(LoadShardedStrategy):
-    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: str):
         dict_list_map_inplace(
             partial(_load_from_array, checkpoint_dir=checkpoint_dir), sharded_state_dict
         )
         return sharded_state_dict
 
-    def load_tensors_metadata(self, checkpoint_dir: Path):
+    def load_tensors_metadata(self, checkpoint_dir: str):
         def get_zarr_shape_dtype(path):
             arr = zarr.open(path, 'r')
             return arr.shape, arr.dtype
@@ -172,9 +173,9 @@ class ZarrLoadShardedStrategy(LoadShardedStrategy):
         pass  # TODO
 
 
-def _load_from_array(sharded_tensor: ShardedTensor, checkpoint_dir: Path):
+def _load_from_array(sharded_tensor: ShardedTensor, checkpoint_dir: str):
     assert isinstance(sharded_tensor, ShardedTensor), type(sharded_tensor)
-    arr = _open_zarr_array_verbose(checkpoint_dir / sharded_tensor.key, 'r')
+    arr = _open_zarr_array_verbose(os.path.join(checkpoint_dir, sharded_tensor.key), 'r')
 
     if not sharded_tensor.allow_shape_mismatch and sharded_tensor.global_shape != arr.shape:
         _msg = (
@@ -188,9 +189,9 @@ def _load_from_array(sharded_tensor: ShardedTensor, checkpoint_dir: Path):
     return postprocess_numpy_array(x, sharded_tensor)
 
 
-def _open_zarr_array_verbose(path: Path, mode: str, **open_kwargs):
+def _open_zarr_array_verbose(path: str, mode: str, **open_kwargs):
     try:
-        return zarr.open(str(path), mode, **open_kwargs)
+        return zarr.open(path, mode, **open_kwargs)
     except zarr.errors.PathNotFoundError as e:
         ckpt_dir = path.parent
         err_msg = f'Array {path} not found'
@@ -266,7 +267,7 @@ def pad_to_expected_shape(x: torch.Tensor, expected_sharded_ten: ShardedTensor):
 
 
 def load_zarr_based_sharded_metadata(
-    checkpoint_dir: Path, get_shape_dtype_fn: Callable[[str], Tuple[Tuple[int], np.dtype]]
+    checkpoint_dir: str, get_shape_dtype_fn: Callable[[str], Tuple[Tuple[int], np.dtype]]
 ) -> ShardedStateDict:
     """Load metadata of Zarr arrays.
 
@@ -276,7 +277,7 @@ def load_zarr_based_sharded_metadata(
             an array shape and dtype for a given Zarr array path
     """
     sharded_state_dict = {}
-    for subdir in checkpoint_dir.iterdir():
+    for subdir in AnyPath(checkpoint_dir).iterdir():
         if not subdir.is_dir() or not (subdir / '.zarray').exists():
             continue
         key = subdir.name

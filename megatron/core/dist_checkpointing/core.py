@@ -3,8 +3,9 @@
 """ Module for managing distributed checkpoints metadata. """
 
 import json
+import os
+from cloudpathlib import AnyPath
 from dataclasses import asdict, dataclass
-from pathlib import Path
 from typing import Optional
 
 CONFIG_FNAME = 'metadata.json'
@@ -33,7 +34,7 @@ class CheckpointingConfig:
     common_backend_version: int = 1
 
 
-def check_is_distributed_checkpoint(checkpoint_dir):
+def check_is_distributed_checkpoint(checkpoint_dir: str):
     """ Checks if `metadata.json` exists in the checkpoint and is a valid config.
 
     Args:
@@ -54,7 +55,7 @@ def maybe_load_config(checkpoint_dir: str) -> Optional[CheckpointingConfig]:
     Returns:
         CheckpointingConfig (optional): None if checkpoint is not a valid distributed checkpoint
     """
-    config_path = Path(checkpoint_dir, CONFIG_FNAME)
+    config_path = AnyPath(os.path.join(checkpoint_dir, CONFIG_FNAME))
     if not config_path.exists():
         return None
     with config_path.open() as f:
@@ -72,6 +73,6 @@ def save_config(config: CheckpointingConfig, checkpoint_dir: str):
     Returns:
         None
     """
-    config_path = Path(checkpoint_dir, CONFIG_FNAME)
+    config_path = AnyPath(os.path.join(checkpoint_dir, CONFIG_FNAME))
     with config_path.open('w') as f:
         json.dump(asdict(config), f)

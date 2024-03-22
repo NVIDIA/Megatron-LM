@@ -5,7 +5,6 @@
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from enum import Enum
-from pathlib import Path
 from typing import Dict, List, Optional
 
 from ..mapping import CheckpointingException, ShardedStateDict, ShardedTensor, StateDict
@@ -77,7 +76,7 @@ class LoadCommonStrategy(LoadStrategyBase):
     """ Load strategy for common (non-sharded) objects """
 
     @abstractmethod
-    def load(self, checkpoint_dir: Path):
+    def load(self, checkpoint_dir: str):
         raise NotImplementedError
 
 
@@ -85,11 +84,11 @@ class LoadShardedStrategy(LoadStrategyBase):
     """ Load strategy for sharded tensors """
 
     @abstractmethod
-    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: str):
         raise NotImplementedError
 
     @abstractmethod
-    def load_tensors_metadata(self, checkpoint_dir: Path):
+    def load_tensors_metadata(self, checkpoint_dir: str):
         """Load tensors metadata from the checkpoint.
 
         Returns a dictionary similar to a sharded state dict, but note that
@@ -108,7 +107,7 @@ class SaveCommonStrategy(SaveStrategyBase):
     """ Save strategy for common (non-sharded) objects """
 
     @abstractmethod
-    def save(self, common_state_dict: StateDict, checkpoint_dir: Path):
+    def save(self, common_state_dict: StateDict, checkpoint_dir: str):
         raise NotImplementedError
 
 
@@ -116,5 +115,5 @@ class SaveShardedStrategy(SaveStrategyBase):
     """ Save strategy for sharded tensors """
 
     @abstractmethod
-    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: str):
         raise NotImplementedError

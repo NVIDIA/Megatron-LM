@@ -8,10 +8,12 @@ Additionally, `load` expects the sharded state dict argument as a guidance for l
 """
 
 import logging
+import io
 import os
 from collections import Counter, defaultdict
 from itertools import chain
-from pathlib import Path
+from cloudpathlib import AnyPath, S3Path
+from torch.serialization import MAP_LOCATION
 from typing import Iterable, List, Optional, Tuple, Union
 
 import numpy as np
@@ -57,6 +59,22 @@ COMMON_STATE_FNAME = 'common.pt'
 logger = logging.getLogger(__name__)
 
 
+def _save(obj: object, path: AnyPath):
+    fileobj = io.BytesIO()
+    torch.save(obj, fileobj)
+    fileobj.seek(0)
+    with path.open('wb') as f:
+        f.write(fileobj.read())
+
+
+def _load(path: AnyPath, map_location: MAP_LOCATION = None):
+    fileobj = io.BytesIO()
+    with path.open('rb') as f:
+        fileobj.write(f.read())
+    fileobj.seek(0)
+    return torch.load(fileobj, map_location)
+
+
 def load(
     sharded_state_dict: ShardedStateDict,
     checkpoint_dir: str,
@@ -92,7 +110,7 @@ def load(
 
     sharded_strategy = _verify_checkpoint_and_load_strategy(checkpoint_dir, sharded_strategy)
 
-    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir = AnyPath(checkpoint_dir)
     common_state_dict = load_common_state_dict(checkpoint_dir)
     if not sharded_state_dict:
         return common_state_dict
@@ -121,7 +139,7 @@ def load(
     if validate_access_integrity:
         validate_sharding_integrity(nested_values(sharded_state_dict))
 
-    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir)
+    loaded_state_dict = sharded_strategy.load(sharded_state_dict, str(checkpoint_dir))
 
     loaded_state_dict = apply_factory_merges(loaded_state_dict, sh_ten_factories)
 
@@ -140,7 +158,7 @@ def _verify_checkpoint_and_load_strategy(
             if compatible with the checkpoint content. If None, the default load strategy
             for the checkpoint backend will be returned.
     """
-    if not Path(checkpoint_dir).exists():
+    if not AnyPath(checkpoint_dir).exists():
         raise CheckpointingException(f'Checkpoint directory {checkpoint_dir} does not exist')
 
     saved_config = maybe_load_config(checkpoint_dir)
@@ -161,18 +179,18 @@ def _verify_checkpoint_and_load_strategy(
 
 
 # TODO: implement it as common torch strategy
-def load_common_state_dict(checkpoint_dir: Path) -> StateDict:
+def load_common_state_dict(checkpoint_dir: AnyPath) -> StateDict:
     """ Load common (non-sharded) objects state dict from the checkpoint.
 
     Args:
-        checkpoint_dir (Path): checkpoint directory
+        checkpoint_dir (AnyPath): checkpoint directory
 
     Returns:
         StateDict: state dict with non-sharded objects from the checkpoint
     """
-    load_path = Path(checkpoint_dir) / COMMON_STATE_FNAME
+    load_path = AnyPath(checkpoint_dir) / COMMON_STATE_FNAME
     try:
-        return torch.load(load_path, map_location='cpu')
+        return _load(load_path, map_location='cpu')
     except FileNotFoundError as e:
         err_msg = f'Common file {load_path} does not exist'
         ckpt_files = [f.name for f in checkpoint_dir.iterdir()]
@@ -180,12 +198,12 @@ def load_common_state_dict(checkpoint_dir: Path) -> StateDict:
         raise CheckpointingException(err_msg) from e
 
 
-def load_sharded_objects(sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+def load_sharded_objects(sharded_state_dict: ShardedStateDict, checkpoint_dir: AnyPath):
     """ Replaces all ShardedObject from a given state dict with values loaded from the checkpoint.
 
     Args:
         sharded_state_dict (ShardedStateDict): sharded state dict defining what objects should be loaded.
-        checkpoint_dir (Path): checkpoint directory
+        checkpoint_dir (AnyPath): checkpoint directory
 
     Returns:
         None: state dict is modified in place
@@ -198,7 +216,7 @@ def load_sharded_objects(sharded_state_dict: ShardedStateDict, checkpoint_dir: P
         sh_obj.data = None
         load_path = (checkpoint_dir / sh_obj.unique_key).with_suffix('.pt')
         try:
-            loaded_obj = torch.load(load_path)
+            loaded_obj = _load(load_path)
         except FileNotFoundError as e:
             err_msg = f'Object shard {load_path} not found'
             obj_subdir = checkpoint_dir / sh_obj.key
@@ -232,7 +250,7 @@ def load_tensors_metadata(
     given, a default for a given backend is used.
     """
     sharded_strategy = _verify_checkpoint_and_load_strategy(checkpoint_dir, sharded_strategy)
-    return sharded_strategy.load_tensors_metadata(Path(checkpoint_dir))
+    return sharded_strategy.load_tensors_metadata(str(checkpoint_dir))
 
 
 def load_plain_tensors(checkpoint_dir: str):
@@ -277,10 +295,10 @@ def save(
         validate_access_integrity (bool default = True): checks if each tensor shard is accessed
             exactly once (as main replica) by some process
     """
-    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir = AnyPath(checkpoint_dir)
 
     if torch.distributed.get_rank() == 0:
-        if not checkpoint_dir.exists():
+        if (not isinstance(checkpoint_dir, S3Path)) and (not checkpoint_dir.exists()):
             raise CheckpointingException(
                 f'Checkpoint destination directory does not exist: {checkpoint_dir}'
             )
@@ -313,20 +331,20 @@ def save(
             sharded_state_dict, checkpoint_dir, validate_access_integrity
         )
 
-    sharded_strategy.save(sharded_state_dict, checkpoint_dir)
+    sharded_strategy.save(sharded_state_dict, str(checkpoint_dir))
     if torch.distributed.get_rank() == 0:
         save_config(
-            CheckpointingConfig(sharded_strategy.backend, sharded_strategy.version), checkpoint_dir
+            CheckpointingConfig(sharded_strategy.backend, sharded_strategy.version), str(checkpoint_dir)
         )
     torch.distributed.barrier()
 
 
 # TODO: implement it as common torch strategy
 def _save_common_dict(
-    state_dict: StateDict, checkpoint_dir: Path, validate_consistency: bool = False
+    state_dict: StateDict, checkpoint_dir: AnyPath, validate_consistency: bool = False
 ):
     if torch.distributed.get_rank() == 0:
-        torch.save(state_dict, checkpoint_dir / COMMON_STATE_FNAME)
+        _save(state_dict, checkpoint_dir / COMMON_STATE_FNAME)
     if validate_consistency:
         # TODO: implement checking consistency with rank 0 common dict on other ranks
         pass
@@ -337,7 +355,7 @@ def _save_common_dict(
 
 
 def _extract_and_save_sharded_objects(
-    state_dict: StateDict, checkpoint_dir: Path, validate_consistency: bool = False
+    state_dict: StateDict, checkpoint_dir: AnyPath, validate_consistency: bool = False
 ):
     sharded_objects, state_dict = extract_matching_values(
         state_dict, lambda v: isinstance(v, ShardedObject)
@@ -346,8 +364,8 @@ def _extract_and_save_sharded_objects(
     for sh_obj in sharded_objects:
         if is_main_replica(sh_obj.replica_id):
             save_path = (checkpoint_dir / sh_obj.unique_key).with_suffix('.pt')
-            os.makedirs(save_path.parent, exist_ok=True)
-            torch.save(sh_obj.data, save_path)
+            save_path.parent.mkdir(exist_ok=True)
+            _save(sh_obj.data, save_path)
     return state_dict
 
 

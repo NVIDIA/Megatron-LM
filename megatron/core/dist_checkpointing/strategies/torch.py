@@ -6,7 +6,6 @@ import io
 import itertools
 from collections import defaultdict
 from logging import getLogger
-from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union, cast
 
 import torch
@@ -17,14 +16,13 @@ from torch.distributed._sharded_tensor import ShardedTensor as TorchShardedTenso
 from torch.distributed.checkpoint import (
     DefaultLoadPlanner,
     DefaultSavePlanner,
-    FileSystemReader,
-    FileSystemWriter,
     LoadPlan,
     SavePlan,
     TensorStorageMetadata,
     WriteItem,
     save_state_dict,
 )
+from torch.distributed.checkpoint._fsspec_filesystem import FsspecReader, FsspecWriter
 from torch.distributed.checkpoint._nested_dict import FLATTEN_MAPPING, unflatten_state_dict
 from torch.distributed.checkpoint._traverse import OBJ_PATH, traverse_state_dict
 from torch.distributed.checkpoint.default_planner import create_default_local_save_plan
@@ -345,7 +343,7 @@ class TorchDistSaveShardedStrategy(SaveShardedStrategy):
     """
 
     def __init__(
-        self, backend: str, version: int, keep_only_main_replica: bool = True, thread_count: int = 2
+        self, backend: str, version: int, keep_only_main_replica: bool = True, thread_count: int = 1
     ):
         """Adds parameters specific to PyT Distributed format
         Args:
@@ -361,12 +359,12 @@ class TorchDistSaveShardedStrategy(SaveShardedStrategy):
         self.keep_only_main_replica = keep_only_main_replica
         self.thread_count = thread_count
 
-    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: str):
         """ Translates MCore ShardedTensors to PyT ShardedTensors and saves in PyT Distributed format.
 
         Args:
             sharded_state_dict (ShardedStateDict): sharded state dict to save
-            checkpoint_dir (Path): checkpoint directory
+            checkpoint_dir (str): checkpoint directory
 
         Returns: None
         """
@@ -382,27 +380,27 @@ class TorchDistSaveShardedStrategy(SaveShardedStrategy):
         # Use PyT saving mechanism
         save_state_dict(
             pyt_state_dict,
-            FileSystemWriter(checkpoint_dir, thread_count=self.thread_count),
+            FsspecWriter(path=checkpoint_dir, thread_count=self.thread_count),
             planner=MCoreSavePlanner(dedup_replicated_tensors=not self.keep_only_main_replica),
         )
 
     def can_handle_sharded_objects(self):
         return True
 
-    def save_async(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    def save_async(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: str):
         raise NotImplementedError
 
 
 class TorchDistLoadShardedStrategy(LoadShardedStrategy):
     """Basic load strategy for the PyT Distributed format. """
 
-    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
+    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: str) -> StateDict:
         """Translates MCore ShardedTensors to PyT ShardedTensors and loads from PyT Distributed format.
 
         Args:
             sharded_state_dict (ShardedStateDict): sharded state dict with mapping
                 information to instruct loading
-            checkpoint_dir (Path): checkpoint directory
+            checkpoint_dir (str): checkpoint directory
 
         Returns: loaded state dict
         """
@@ -423,7 +421,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # Load PyT Distributed format
         checkpoint.load_state_dict(
             pyt_state_dict,
-            FileSystemReader(checkpoint_dir),
+            FsspecReader(checkpoint_dir),
             planner=MCoreLoadPlanner(
                 shapes_validation_sharded_tensors=flexible_shape_sharded_tensors
             ),
@@ -442,9 +440,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         _restore_dict_types(mcore_state_dict, orig_sharded_state_dict)
         return mcore_state_dict
 
-    def load_tensors_metadata(self, checkpoint_dir: Path):
+    def load_tensors_metadata(self, checkpoint_dir: str):
         """Uses tensors metadata stored in the metadata file."""
-        fs_reader = FileSystemReader(checkpoint_dir)
+        fs_reader = FsspecReader(checkpoint_dir)
         metadata = fs_reader.read_metadata()
 
         return {
