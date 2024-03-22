@@ -46,7 +46,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     # Custom arguments.
     if extra_args_provider is not None:
         parser = extra_args_provider(parser)
-    
+
     # Parse.
     if ignore_unknown_args:
         args, _ = parser.parse_known_args()
@@ -58,7 +58,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
         from .yaml_arguments import load_yaml
         assert args.yaml_cfg and args.use_mcore_models, "To use yaml, mcore must be enabled"
         args = load_yaml(args.yaml_cfg)
-        
+
 
     # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
@@ -1307,6 +1307,7 @@ def _add_validation_args(parser):
     group.add_argument('--eval-interval', type=int, default=1000,
                        help='Interval between running evaluation on '
                        'validation set.')
+    group.add_argument("--test-mode", action="store_true", help='Run all real-time test alongside the experiment.')
     group.add_argument('--skip-train', action='store_true',
                        default=False, help='If set, bypass the training loop, '
                        'optionally do evaluation for validation/test, and exit.')
@@ -1539,6 +1540,10 @@ def _add_vision_args(parser):
     group.add_argument('--dino-warmup-teacher-temp-epochs', type=int, default=30,
                        help='warmup teacher temperaure epochs')
 
+    # regularization arguments
+    group.add_argument('--qk-layernorm', action='store_true',
+                       help='Whether to layer normalize the q and k attention embeddings.')
+
     return parser
 
 def _add_moe_args(parser):
@@ -1576,7 +1581,7 @@ def _add_experimental_args(parser):
                        'To use local spec specify local as the argument.'
                        'For more details, see the model class, '
                        '`transformer_block.py`, or `transformer_layer.py`')
-    group.add_argument('--yaml-cfg', type=str, default=None, 
+    group.add_argument('--yaml-cfg', type=str, default=None,
                        help = 'Config file to add additional arguments')
 
     return parser

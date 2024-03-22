@@ -48,6 +48,8 @@ class TestSpecCustomization:
                 linear_qkv=TELayerNormColumnParallelLinear,
                 core_attention=TEDotProductAttention,
                 linear_proj=TERowParallelLinear,
+                q_layernorm=IdentityOp,
+                k_layernorm=IdentityOp,
             ),
         )
 
