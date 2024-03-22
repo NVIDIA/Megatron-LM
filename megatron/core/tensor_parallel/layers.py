@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 # Parts of the code here are adapted from PyTorch
 # repo: https://github.com/pytorch/pytorch
@@ -135,7 +135,9 @@ def _initialize_affine_weight_cpu(
     my_weight_list = weight_list[rank::world_size]
 
     with torch.no_grad():
-        torch.cat(my_weight_list, dim=partition_dim, out=weight)
+        # all tensors must live on the same device
+        cpu_weight = torch.cat(my_weight_list, dim=partition_dim).to_dense()
+        weight.data.copy_(cpu_weight)
     if return_master_weight:
         return master_weight
     return None
@@ -224,7 +226,10 @@ class VocabParallelEmbedding(torch.nn.Module):
         return output
 
     def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: Tuple[Tuple[int, int, int]] = ()
+        self,
+        prefix: str = '',
+        sharded_offsets: Tuple[Tuple[int, int, int]] = (),
+        metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
         """ Non-default implementation for embeddings due to `allow_shape_mismatch` param """
         state_dict = self.state_dict(prefix='', keep_vars=True)
@@ -787,7 +792,7 @@ class ColumnParallelLinear(torch.nn.Module):
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=()):
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """ Sharding along axis 0, bias sharded """
         state_dict = self.state_dict(prefix='', keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
@@ -983,7 +988,7 @@ class RowParallelLinear(torch.nn.Module):
             output_bias = self.bias
         return output, output_bias
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=()):
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """ Sharding along axis 1, bias not sharded """
         state_dict = self.state_dict(prefix='', keep_vars=True)
         return make_sharded_tensors_for_checkpoint(

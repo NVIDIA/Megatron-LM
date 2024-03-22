@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron arguments."""
 
@@ -15,10 +15,7 @@ import yaml, re, os
 from types import SimpleNamespace
 
 import torch.nn.functional as F
-from megatron.global_vars import set_retro_args, get_retro_args
-from tools.retro.utils import get_args_path as get_retro_args_path
 
-from megatron.core.models.retro import RetroConfig
 from megatron.core.transformer import TransformerConfig
 
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
@@ -331,6 +328,7 @@ def validate_yaml(args, defaults={}):
 
     # Retro checks.
     if getattr(args, 'retro_add_retriever', False):
+        raise Exception("Retro untested for yaml args. See arguments.py.")
 
         # Sequence parallelism unsupported.
         assert not args.sequence_parallel, \
@@ -342,16 +340,8 @@ def validate_yaml(args, defaults={}):
 
     #TODO: Retro args loading not tested
     # Load retro args (used by both Retro & GPT).
-    if getattr(args, 'retro_workdir', None) is not None:
-        retro_args_path = get_retro_args_path(args.retro_workdir)
-        assert os.path.exists(retro_args_path), "retro workdir missing args.json"
-        with open(retro_args_path) as f:
-            retro_args = types.SimpleNamespace(**json.load(f))
-            retro_args.retro_return_doc_ids = args.retro_return_doc_ids
-            retro_args.retro_gpt_retrieved_length = \
-                args.retro_num_retrieved_chunks * \
-                retro_args.retro_gpt_chunk_length
-            set_retro_args(retro_args)
+    if getattr(args, 'retro_project_dir', None) is not None:
+        raise Exception("Retro untested for yaml args. See arguments.py.")
 
     if args.language_model.rotary_interleaved and args.language_model.apply_rope_fusion:
         raise RuntimeError('--rotary-interleaved does not work with rope_fusion.')
@@ -373,9 +363,6 @@ def validate_yaml(args, defaults={}):
 
     # Print arguments.
     _print_args("arguments", args)
-    retro_args = get_retro_args()
-    if retro_args and args != retro_args:
-        _print_args("retro arguments", types.SimpleNamespace(**{k:v for k,v in vars(retro_args).items() if k.startswith("retro")}, rank=args.rank))
 
     #TODO: Added as much of the global initialization requires the model parallel arguments
     args = SimpleNamespace(**args.__dict__, **args.model_parallel.__dict__)
@@ -454,13 +441,6 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
         kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
     
-    #TODO: untested handling of retro
-    # If using Retro, return Retro config.
-    retro_args = get_retro_args()
-    if retro_args:
-        kw_args['retro_preprocess'] = retro_args
-        return RetroConfig(**kw_args)
-
     # Return Transformer config.
     return TransformerConfig(**kw_args)
 

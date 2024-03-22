@@ -1,10 +1,12 @@
-# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 
 """Retro Model."""
+from typing import Dict, Optional
 
 from torch import Tensor
 
 from megatron.core import InferenceParams
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.models.gpt import GPTModel
 
 
@@ -35,27 +37,19 @@ class RetroModel(GPTModel):
         Foward input tokens & mask, along with neighbor tokens & mask, through
         the Retro model..
 
-        Arguments:
-          input_ids (Tensor): Input token IDs.
+        Args:
+            input_ids (Tensor): Input token IDs.
+            position_ids (Tensor): Input position IDs.
+            attention_mask (Tensor): Input attention mask.
+            context_input_ids (Tensor): Context (i.e., neighbor) token IDs.
+            context_position_ids (Tensor): Context (i.e., neighbor) position IDs.
+            context_mask (Tensor): Context (i.e., neighbor) attention mask.
+            decoder_input (Tensor): When using pipeline parallelism, input_ids and position_ids will only be used on the first stage, and for all other stages decoder_input will be provided via communication from the previous stage.
+            labels (Tensor): The labels of dimension [batch size, seq length].
+            inference_params (InferenceParams): Parameters for inference.
 
-          position_ids (Tensor): Input position IDs.
-
-          attention_mask (Tensor): Input attention mask.
-
-          context_input_ids (Tensor): Context (i.e., neighbor) token IDs.
-
-          context_position_ids (Tensor): Context (i.e., neighbor) position IDs.
-
-          context_mask (Tensor): Context (i.e., neighbor) attention mask.
-
-          decoder_input (Tensor): When using pipeline parallelism, input_ids and
-          position_ids will only be used on the first stage, and for all other
-          stages decoder_input will be provided via communication from the
-          previous stage.
-
-          labels (Tensor): The labels of dimension [batch size, seq length].
-
-          inference_params (InferenceParams): Parameters for inference.
+        Returns:
+            Output tensor of forward pass.
         """
 
         # Argument shapes:
@@ -87,3 +81,20 @@ class RetroModel(GPTModel):
             inference_params=inference_params,
             extra_block_kwargs={"context": context, "context_mask": context_mask,},
         )
+
+    def sharded_state_dict(
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[Dict] = None
+    ) -> ShardedStateDict:
+        """Get sharded state dict.
+
+        Args:
+            prefix (str): Module name prefix.
+            sharded_offsets (tuple): Offsets of local shard within global tensor.
+            metadata (Optional[Dict]): Shard metadata.
+
+        Returns:
+            A <ShardedStateDict> ?
+        """
+        metadata = metadata or {}
+        metadata['non_homogeneous_layers'] = True
+        return super().sharded_state_dict(prefix, sharded_offsets, metadata)

@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Transformer."""
 from contextlib import nullcontext
@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from typing import Optional
 
-from megatron import get_timers, get_args, get_retro_args, core, get_num_microbatches
+from megatron import get_timers, get_args, core, get_num_microbatches
 from .module import MegatronModule
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
@@ -912,10 +912,10 @@ class ParallelTransformerLayer(MegatronModule):
                 nullcontext if use_nvfuser else torch.enable_grad
 
         if args.retro_add_retriever:
-            retro_args = get_retro_args()
             self.retro_num_neighbors = args.retro_num_neighbors
-            self.retro_chunk_length = retro_args.retro_gpt_chunk_length
-            self.retro_retrieved_length = retro_args.retro_gpt_retrieved_length
+            self.retro_chunk_length = args.retro_chunk_length
+            self.retro_retrieved_length = \
+                args.retro_num_retrieved_chunks * args.retro_chunk_length
 
         # Retriever (bi-directional transformer with cross attention)
         if layer_type == LayerType.retro_decoder_with_retriever:
@@ -1148,10 +1148,10 @@ class ParallelTransformerLayer(MegatronModule):
         # TODO: better redesign with inference param
         args = get_args()
         if args.retro_add_retriever:
-            retro_args = get_retro_args()
             self.retro_num_neighbors = args.retro_num_neighbors
-            self.retro_chunk_length = retro_args.retro_gpt_chunk_length
-            self.retro_retrieved_length = retro_args.retro_gpt_retrieved_length
+            self.retro_chunk_length = args.retro_chunk_length
+            self.retro_retrieved_length = \
+                args.retro_num_retrieved_chunks * args.retro_chunk_length
 
         # hidden_states: [s, b, h]
 
@@ -1802,6 +1802,10 @@ class ParallelTransformer(MegatronModule):
         # Handle renaming layernorm -> norm in component names
         state_dict_ = {}
         for key in state_dict.keys():
+            # Bypass TransformerEngine module parameters.
+            if "layernorm_qkv" in key or "layernorm_mlp" in key:
+                state_dict_[key] = state_dict[key]
+                continue
             newkey = key.replace("layernorm", "norm")
             state_dict_[newkey] = state_dict[key]
 

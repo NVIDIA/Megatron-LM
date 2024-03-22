@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import types
 from dataclasses import dataclass
@@ -15,7 +15,6 @@ from ..utils import init_method_normal, scaled_init_method_normal
 class TransformerConfig(ModelParallelConfig):
     """Configuration object for megatron-core transformers.
 
-        Args:
             num_layers (int): Number of transformer layers in a transformer block.
             hidden_size (int): Transformer hidden size.
             ffn_hidden_size (int): Transformer Feed-Forward Network hidden size. This is set to 4*hidden_size if not provided. Defaults to None.')
@@ -66,6 +65,8 @@ class TransformerConfig(ModelParallelConfig):
             moe_z_loss_coeff (float): Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended.
             moe_input_jitter_eps (float): Add noise to the input tensor by applying jitter with a specified epsilon value.
             moe_token_dropping (bool): This feature involves selectively dropping and padding tokens for each expert to achieve a specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note: Currently unsupported.
+            qk_layernorm (bool): Whether to apply LayerNorm to the query and key embeddings.
+            test_mode (bool): Whether to run real-time tests.
     """
 
     # model architecture
@@ -90,6 +91,9 @@ class TransformerConfig(ModelParallelConfig):
     num_moe_experts: int = None
     rotary_interleaved: bool = False
     window_size: Optional[Tuple[int, int]] = None
+
+    qk_layernorm: bool = False
+    test_mode: bool = False
 
     # initialization
     init_method: Callable = None
@@ -129,7 +133,7 @@ class TransformerConfig(ModelParallelConfig):
     disable_parameter_transpose_cache: bool = False
 
     # experimental section (TODO: move to apt. section above once stable)
-    normalization: bool = "LayerNorm"  # alt value supported by TE: "RMSNorm"
+    normalization: str = "LayerNorm"  # alt value supported by TE: "RMSNorm"
 
     # MoE related
     moe_router_load_balancing_type: str = "aux_loss"
@@ -248,9 +252,14 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "When bias_activation_fusion is True, activation function should be either gelu or swiglu"
                 )
-            if self.activation_func == F.gelu and not self.add_bias_linear:
+            if (
+                self.activation_func == F.gelu
+                and not self.gated_linear_unit
+                and not self.add_bias_linear
+            ):
                 raise ValueError(
-                    "When bias_activation_fusion is True and activation function is gelu, add_bias_linear must also be True."
+                    "When bias_activation_fusion is True, gated_linear_unit is False, "
+                    "and activation function is gelu, add_bias_linear must also be True."
                 )
         if self.apply_rope_fusion and self.rotary_interleaved:
             raise ValueError(f'rotary_interleaved does not work with apply_rope_fusion.')

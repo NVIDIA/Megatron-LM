@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from typing import Tuple
 
@@ -150,7 +150,7 @@ class GroupedMLP(MegatronModule):
 
         return fc2_output, None
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=()):
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         raise NotImplementedError(
             'Currently distributed checkpointing is not supported for GroupedMLP'
         )
@@ -194,7 +194,7 @@ class SequentialMLP(MegatronModule):
 
         return output_local, output_bias_local
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=()):
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """ Maps local expert to global experts. """
         sharded_state_dict = {}
         num_global_experts = (
@@ -214,7 +214,7 @@ class SequentialMLP(MegatronModule):
             )
 
             expert_state_dict = expert.sharded_state_dict(
-                expert_state_dict_prefix, expert_sharded_offsets
+                expert_state_dict_prefix, expert_sharded_offsets, metadata
             )
             # Remove expert layers indexing from sharded keys
             replace_prefix_for_sharding(

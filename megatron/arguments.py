@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron arguments."""
 
@@ -10,10 +10,10 @@ import torch
 import types
 
 import torch.nn.functional as F
-from megatron.global_vars import set_retro_args, get_retro_args
-from tools.retro.utils import get_args_path as get_retro_args_path
-
-from megatron.core.models.retro import RetroConfig
+from megatron.core.models.retro.utils import (
+    get_config_path as get_retro_config_path,
+    get_gpt_data_dir as get_retro_data_dir,
+)
 from megatron.core.transformer import TransformerConfig
 
 
@@ -46,7 +46,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     # Custom arguments.
     if extra_args_provider is not None:
         parser = extra_args_provider(parser)
-    
+
     # Parse.
     if ignore_unknown_args:
         args, _ = parser.parse_known_args()
@@ -58,7 +58,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
         from .yaml_arguments import load_yaml
         assert args.yaml_cfg and args.use_mcore_models, "To use yaml, mcore must be enabled"
         args = load_yaml(args.yaml_cfg)
-        
+
 
     # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
@@ -66,13 +66,94 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
 
     return args
 
+
+def load_retro_config(retro_project_dir):
+    '''Load Retro's config.json.'''
+
+    # Retro config path.
+    retro_config_path = get_retro_config_path(retro_project_dir)
+    assert os.path.exists(retro_config_path), \
+        "Retro project dir missing config.json."
+
+    # Load retro config.
+    with open(retro_config_path) as f:
+        retro_config = types.SimpleNamespace(**json.load(f))
+
+    return retro_config
+
+
+def load_retro_args(args):
+    """Load predefined args from Retro config (if applicable).
+
+    When using Retro (or GPT for comparison purposes), data arguments are
+    overridden by the saved config.json within the Retro project directory. This
+    is to ensure that the data used for pretraining is consistent with the data
+    that was preprocessed using the Retro preprocessing pipeline (see
+    `tools/retro/preprocess_data.py`).
+    """
+
+    # Return if no project directory is specified.
+    if args.retro_project_dir is None:
+        return
+
+    # Load retro config.
+    retro_config = load_retro_config(args.retro_project_dir)
+
+    # Retro data path is relative to project dir (via hard or soft links).
+    data_dir = get_retro_data_dir(args.retro_project_dir)
+    data_path = list(retro_config.retro_gpt_data_path)
+    if len(data_path) % 2 == 0:
+        for i in range(len(data_path) - 1, -1, -2):
+            data_path[i] = os.path.join(data_dir, data_path[i])
+    else:
+        assert len(data_path) == 1
+        data_path[0] = os.path.join(data_dir, data_path[0])
+
+    # Update args.
+    args.data_cache_path = retro_config.retro_gpt_data_cache_path
+    args.data_path = data_path if args.data_path is None else args.data_path
+    args.eval_interval = retro_config.retro_gpt_eval_interval
+    args.eval_iters = retro_config.retro_gpt_eval_iters
+    args.global_batch_size = retro_config.retro_gpt_global_batch_size
+    args.max_position_embeddings = retro_config.retro_gpt_seq_length
+    args.merge_file = os.path.join(
+        args.retro_project_dir,
+        retro_config.retro_gpt_merge_file,
+    ) if retro_config.retro_gpt_merge_file is not None else None
+    args.seed = retro_config.retro_gpt_seed
+    args.seq_length = retro_config.retro_gpt_seq_length
+    args.tokenizer_model = os.path.join(
+        args.retro_project_dir,
+        retro_config.retro_gpt_tokenizer_model,
+    ) if retro_config.retro_gpt_tokenizer_model is not None else None
+    args.tokenizer_type = retro_config.retro_gpt_tokenizer_type
+    args.train_samples = retro_config.retro_gpt_train_samples
+    args.vocab_file = os.path.join(
+        args.retro_project_dir,
+        retro_config.retro_gpt_vocab_file,
+    ) if retro_config.retro_gpt_vocab_file is not None else None
+
+    # Retro-specific args.
+    args.retro_block_size = retro_config.retro_block_size
+    args.retro_chunk_length = retro_config.retro_gpt_chunk_length
+    args.retro_neighbor_dirs = retro_config.retro_neighbor_dirs
+    args.retro_split_preprocessing = retro_config.retro_gpt_split
+    args.retro_bert_tokenizer_type = retro_config.retro_bert_tokenizer_type
+    args.retro_bert_vocab_file = retro_config.retro_bert_vocab_file
+
+
 def validate_args(args, defaults={}):
+
+    # Load saved args from Retro (if applicable).
+    load_retro_args(args)
+
     # Tensor model parallel size.
     args.tensor_model_parallel_size = min(
         args.tensor_model_parallel_size, args.world_size)
     assert args.world_size % args.tensor_model_parallel_size == 0, 'world size'\
         ' ({}) is not divisible by tensor model parallel size ({})'.format(
             args.world_size, args.tensor_model_parallel_size)
+
     # Pipeline model parallel size.
     args.pipeline_model_parallel_size = min(
         args.pipeline_model_parallel_size,
@@ -82,6 +163,7 @@ def validate_args(args, defaults={}):
         if args.standalone_embedding_stage else
         args.pipeline_model_parallel_size
     )
+
     # Checks.
     model_parallel_size = args.pipeline_model_parallel_size * \
                           args.tensor_model_parallel_size
@@ -110,8 +192,10 @@ def validate_args(args, defaults={}):
     if args.tp_comm_overlap:
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
 
-
     # Deprecated arguments
+    if args.use_gpu_initialization:
+        del args.use_gpu_initialization
+        args.use_cpu_initialization = False
     assert args.batch_size is None, '--batch-size argument is no longer ' \
         'valid, use --micro-batch-size instead'
     del args.batch_size
@@ -381,6 +465,10 @@ def validate_args(args, defaults={}):
     # Retro checks.
     if args.retro_add_retriever:
 
+        # Train samples should be auto-loaded.
+        assert args.train_samples is not None, \
+            "args.train_samples should be auto-loaded from the retro config."
+
         # Sequence parallelism unsupported.
         assert not args.sequence_parallel, \
             "retro currently does not support sequence parallelism."
@@ -388,18 +476,6 @@ def validate_args(args, defaults={}):
         # Pipeline parallelism unsupported.
         assert args.pipeline_model_parallel_size == 1, \
             "retro currently does not support pipeline parallelism."
-
-    # Load retro args (used by both Retro & GPT).
-    if args.retro_workdir:
-        retro_args_path = get_retro_args_path(args.retro_workdir)
-        assert os.path.exists(retro_args_path), "retro workdir missing args.json"
-        with open(retro_args_path) as f:
-            retro_args = types.SimpleNamespace(**json.load(f))
-            retro_args.retro_return_doc_ids = args.retro_return_doc_ids
-            retro_args.retro_gpt_retrieved_length = \
-                args.retro_num_retrieved_chunks * \
-                retro_args.retro_gpt_chunk_length
-            set_retro_args(retro_args)
 
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
@@ -435,9 +511,6 @@ def validate_args(args, defaults={}):
 
     # Print arguments.
     _print_args("arguments", args)
-    retro_args = get_retro_args()
-    if retro_args and args != retro_args:
-        _print_args("retro arguments", types.SimpleNamespace(**{k:v for k,v in vars(retro_args).items() if k.startswith("retro")}, rank=args.rank))
 
     return args
 
@@ -460,11 +533,15 @@ def _print_args(title, args):
 def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
 
-def core_transformer_config_from_args(args):
+
+def core_transformer_config_from_args(args, config_class=None):
+
+    # Config class.
+    config_class = config_class or TransformerConfig
 
     # Translate args to core transformer configuration
     kw_args = {}
-    for f in dataclasses.fields(TransformerConfig):
+    for f in dataclasses.fields(config_class):
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
@@ -472,7 +549,7 @@ def core_transformer_config_from_args(args):
     kw_args['layernorm_epsilon'] = args.norm_epsilon
     kw_args['deallocate_pipeline_outputs'] = True
     kw_args['pipeline_dtype'] = args.params_dtype
-    kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm 
+    kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
     kw_args['rotary_interleaved'] = args.rotary_interleaved
     if args.swiglu:
@@ -494,14 +571,8 @@ def core_transformer_config_from_args(args):
     else:
         kw_args['num_query_groups'] = None
 
-    # If using Retro, return Retro config.
-    retro_args = get_retro_args()
-    if retro_args:
-        kw_args['retro_preprocess'] = retro_args
-        return RetroConfig(**kw_args)
-
-    # Return Transformer config.
-    return TransformerConfig(**kw_args)
+    # Return config.
+    return config_class(**kw_args)
 
 
 def _add_transformer_engine_args(parser):
@@ -561,9 +632,9 @@ def _add_inference_args(parser):
 def _add_retro_args(parser):
     group = parser.add_argument_group(title='retro')
 
-    group.add_argument('--retro-workdir', default=None,
-                       help='Retro working directory, which contains the '
-                       'preprocessed data for for pretraining. This directory '
+    group.add_argument('--retro-project-dir', default=None,
+                       help='Retro project directory, which contains the '
+                       'preprocessed data for pretraining. This directory '
                        'is built during preprocessing (see '
                        'tools/retro/README.md), and contains subdirectories '
                        'for the chunk database and pretraining neighbors.')
@@ -589,8 +660,6 @@ def _add_retro_args(parser):
     group.add_argument("--retro-num-retrieved-chunks", type=int, default=2,
                        help='Number of chunks to retrieve from the retrieval '
                        'database.')
-    group.add_argument("--retro-return-doc-ids", action="store_true",
-                       help="Turn this on when preprocessing retro data.")
     group.add_argument("--retro-attention-gate", type=float, default=1,
                        help="Gated cross attention.")
     group.add_argument("--retro-no-verify-neighbor-count", action="store_false",
@@ -889,23 +958,26 @@ def _add_training_args(parser):
                        help='Global ranks to profile.')
     group.add_argument('--tp-comm-overlap', action='store_true', help = 'Enables the '
                        ' overlap of Tensor parallel communication and GEMM kernels.')
-    group.add_argument('--tp-comm-overlap-cfg', type=str, default=None, 
+    group.add_argument('--tp-comm-overlap-cfg', type=str, default=None,
                        help = 'Config file when tp_comm_overlap is enabled.')
-    group.add_argument('--disable-tp-comm-split-ag', action='store_false', 
+    group.add_argument('--disable-tp-comm-split-ag', action='store_false',
                        help = 'Disables the All-Gather overlap with fprop GEMM.',
                        dest='tp_comm_split_ag')
-    group.add_argument('--disable-tp-comm-split-rs', action='store_false', 
+    group.add_argument('--disable-tp-comm-split-rs', action='store_false',
                        help = 'Disables the Reduce-Scatter overlap with fprop GEMM.',
                        dest='tp_comm_split_rs')
-    group.add_argument('--disable-tp-comm-bulk-dgrad', action='store_false', 
+    group.add_argument('--disable-tp-comm-bulk-dgrad', action='store_false',
                        help = 'Disables the All-Gather overlap with bprop activation gradient GEMM.',
                        dest='tp_comm_bulk_dgrad')
-    group.add_argument('--disable-tp-comm-bulk-wgrad', action='store_false', 
+    group.add_argument('--disable-tp-comm-bulk-wgrad', action='store_false',
                        help = 'Disables the Reduce-Scatter overlap with bprop weight gradient GEMM.',
                        dest='tp_comm_bulk_wgrad')
 
 
     # deprecated
+    group.add_argument('--use-cpu-initialization', action='store_true', default=True,
+                       help=('If set, initialize all weights on the CPU. Deprecated because all init '
+                             'is done on the CPU, unless use-gpu-initialization is passed.'))
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '
                        'with larger models, sequences, and batch sizes.')
@@ -961,7 +1033,7 @@ def _add_training_args(parser):
                        choices=['adam', 'sgd'],
                        help='Optimizer function')
     group.add_argument('--dataloader-type', type=str, default=None,
-                       choices=['single', 'cyclic'],
+                       choices=['single', 'cyclic', 'external'],
                        help='Single pass vs multiple pass data loader')
     group.add_argument('--no-async-tensor-model-parallel-allreduce',
                        action='store_false',
@@ -1201,9 +1273,9 @@ def _add_distributed_args(parser):
                        'complete it instead.Also turns on '
                        '--use-cpu-initialization flag. This is for '
                        'external DDP manager.' )
-    group.add_argument('--use-cpu-initialization', action='store_true',
-                       default=None, help='If set, affine parallel weights '
-                       'initialization uses CPU' )
+    group.add_argument('--use-gpu-initialization', action='store_true',
+                       default=None,
+                       help='If set, initialize weights on the GPU')
     group.add_argument('--empty-unused-memory-level', default=0, type=int,
                        choices=[0, 1, 2],
                        help='Call torch.cuda.empty_cache() each iteration '
@@ -1235,6 +1307,7 @@ def _add_validation_args(parser):
     group.add_argument('--eval-interval', type=int, default=1000,
                        help='Interval between running evaluation on '
                        'validation set.')
+    group.add_argument("--test-mode", action="store_true", help='Run all real-time test alongside the experiment.')
     group.add_argument('--skip-train', action='store_true',
                        default=False, help='If set, bypass the training loop, '
                        'optionally do evaluation for validation/test, and exit.')
@@ -1467,6 +1540,10 @@ def _add_vision_args(parser):
     group.add_argument('--dino-warmup-teacher-temp-epochs', type=int, default=30,
                        help='warmup teacher temperaure epochs')
 
+    # regularization arguments
+    group.add_argument('--qk-layernorm', action='store_true',
+                       help='Whether to layer normalize the q and k attention embeddings.')
+
     return parser
 
 def _add_moe_args(parser):
@@ -1504,7 +1581,7 @@ def _add_experimental_args(parser):
                        'To use local spec specify local as the argument.'
                        'For more details, see the model class, '
                        '`transformer_block.py`, or `transformer_layer.py`')
-    group.add_argument('--yaml-cfg', type=str, default=None, 
+    group.add_argument('--yaml-cfg', type=str, default=None,
                        help = 'Config file to add additional arguments')
 
     return parser

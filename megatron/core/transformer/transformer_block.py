@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import re
 from contextlib import nullcontext
@@ -390,8 +390,13 @@ class TransformerBlock(MegatronModule):
 
         return hidden_states
 
-    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()) -> ShardedStateDict:
+    def sharded_state_dict(
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None
+    ) -> ShardedStateDict:
         assert not sharded_offsets, "Unexpected sharded offsets"
+        non_homogeneous_layers = metadata is not None and metadata.get(
+            'non_homogeneous_layers', False
+        )
         sharded_state_dict = {}
 
         layer_prefix = f'{prefix}layers.'
@@ -401,20 +406,28 @@ class TransformerBlock(MegatronModule):
 
             global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
             state_dict_prefix = f'{layer_prefix}{global_layer_offset - offset}.'  # module list index in TransformerBlock
-            sharded_pp_offset = [
-                (0, global_layer_offset, num_layers)
-            ]  # PP sharding offset for ShardedTensors
+            if non_homogeneous_layers:
+                sharded_prefix = f'{layer_prefix}{global_layer_offset}.'
+                sharded_pp_offset = []
+            else:
+                sharded_prefix = layer_prefix
+                sharded_pp_offset = [
+                    (0, global_layer_offset, num_layers)
+                ]  # PP sharding offset for ShardedTensors
             layer_sharded_state_dict = layer.sharded_state_dict(
-                prefix=state_dict_prefix, sharded_offsets=sharded_pp_offset
+                state_dict_prefix, sharded_pp_offset, metadata
             )
-            replace_prefix_for_sharding(layer_sharded_state_dict, state_dict_prefix, layer_prefix)
+            replace_prefix_for_sharding(layer_sharded_state_dict, state_dict_prefix, sharded_prefix)
+
             sharded_state_dict.update(layer_sharded_state_dict)
 
         # Add modules other than self.layers
         for name, module in self.named_children():
             if not module is self.layers:
                 sharded_state_dict.update(
-                    sharded_state_dict_default(module, f'{prefix}{name}.', sharded_offsets)
+                    sharded_state_dict_default(
+                        module, f'{prefix}{name}.', sharded_offsets, metadata
+                    )
                 )
 
         return sharded_state_dict
