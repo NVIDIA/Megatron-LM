@@ -224,5 +224,9 @@ class GPTModel(LanguageModule):
                 )
 
                 sharded_state_dict[output_layer_weight_key] = sharded_output_layer_tensor
+        else:
+            # We do this for backward compatibility. Old GPT checkpoints only stored the output layer weight key.
+            if f'{output_layer_prefix}_extra_state' in sharded_state_dict:
+                del sharded_state_dict[f'{output_layer_prefix}_extra_state']
 
         return sharded_state_dict
