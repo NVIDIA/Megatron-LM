@@ -107,12 +107,14 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
         self.maybe_init_gloo_group()
         all_tensors_sorted = self._build_load_plan(sharded_state_dict)
         self._exchange_loaded_tensors(all_tensors_sorted, sharded_state_dict, checkpoint_dir)
-        self.summarize_load_times()
+        # TODO: fix hang in summarize_load_times
+        # self.summarize_load_times()
         return sharded_state_dict
 
     def summarize_load_times(self):
         torch.distributed.barrier()
         logger.info('Checkpoint loading finished. Summary:')
+        # TODO: `timers` keys are not guaranteed to be the same across ranks which causes hangs
         for key, times in sorted(timers.items()):
             times_sum = sum(times)
             max_times = torch.tensor([times_sum], device='cuda')
