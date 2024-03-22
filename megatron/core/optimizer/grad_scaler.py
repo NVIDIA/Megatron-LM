@@ -3,12 +3,13 @@
 """Megatron grad scaler."""
 
 from abc import ABC, abstractmethod
+from typing import Dict
 
 import torch
 
 
 class MegatronGradScaler(ABC):
-    def __init__(self, initial_scale):
+    def __init__(self, initial_scale: float):
         """Initialize scale value with the input initial scale."""
         assert initial_scale > 0.0
         self._scale = torch.tensor([initial_scale], dtype=torch.float, device='cuda')
@@ -22,7 +23,7 @@ class MegatronGradScaler(ABC):
         return self._scale.double().reciprocal().float()
 
     @abstractmethod
-    def update(self, found_inf):
+    def update(self, found_inf: bool):
         pass
 
     @abstractmethod
@@ -30,12 +31,16 @@ class MegatronGradScaler(ABC):
         pass
 
     @abstractmethod
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict: Dict):
         pass
 
 
 class ConstantGradScaler(MegatronGradScaler):
-    def update(self, found_inf):
+    """
+    Constant grad scaler (loss scale is never adjusted regardless of NaNs seen in gradients).
+    """
+
+    def update(self, found_inf: bool):
         pass
 
     def state_dict(self):
@@ -46,11 +51,35 @@ class ConstantGradScaler(MegatronGradScaler):
 
 
 class DynamicGradScaler(MegatronGradScaler):
+    """
+    Grad scaler with dynamic scale that gets adjusted during training.
+
+    Reduces loss scale by `backoff_factor` if `hysteresis` number of NaNs are seen in a row. Increases
+    loss scale by `growth_factor` if NaNs are not seen for `growth_interval` iterations.
+    """
+
     def __init__(
-        self, initial_scale, min_scale, growth_factor, backoff_factor, growth_interval, hysteresis
+        self,
+        initial_scale: float,
+        min_scale: float,
+        growth_factor: float,
+        backoff_factor: float,
+        growth_interval: int,
+        hysteresis: int,
     ):
-        """"Grad scaler with dynamic scale that gets adjusted
-        during training."""
+        """
+        Grad scaler with dynamic scale that gets adjusted during training.
+
+        Arguments:
+            initial_scale (float): Initial loss scale value.
+            min_scale (float): Minimum loss scale value.
+            growth_factor (float): Factor to grow loss scale by if NaNs are not seen in `growth_interval`
+                training iterations. Must be greater than 1.
+            backoff_factor (float): Factor to decrease loss scale by if NaNs are seen in `hysteresis`
+                consecutive training iterations. Must be between 0 and 1.
+            growth_interval (int): Number of training iterations of no NaNs before loss scale is increased.
+            hysteresis (int): Number of training iterations of consecutive NaNs before loss scale is decreased.
+        """
         super(DynamicGradScaler, self).__init__(initial_scale)
 
         # Lower bound on the scale.
@@ -76,7 +105,10 @@ class DynamicGradScaler(MegatronGradScaler):
         self._growth_tracker = 0
         self._hysteresis_tracker = self.hysteresis
 
-    def update(self, found_inf):
+    def update(self, found_inf: bool):
+        """
+        Updates internal state in grad scaler based on whether NaNs are seen in grads or not.
+        """
 
         # If we have an inf/nan, growth tracker is set to 0
         # and hysterisis tracker is reduced by 1.
@@ -104,7 +136,7 @@ class DynamicGradScaler(MegatronGradScaler):
         state_dict['hysteresis_tracker'] = self._hysteresis_tracker
         return state_dict
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict: Dict):
         self._scale = state_dict['scale'].cuda(torch.cuda.current_device())
         self._growth_tracker = state_dict['growth_tracker']
         self._hysteresis_tracker = state_dict['hysteresis_tracker']

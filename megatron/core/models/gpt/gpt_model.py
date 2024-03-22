@@ -197,19 +197,23 @@ class GPTModel(LanguageModule):
 
         return loss
 
-    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()) -> ShardedStateDict:
+    def sharded_state_dict(
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
+    ) -> ShardedStateDict:
         assert not sharded_offsets, "Unexpected sharded offsets"
         sharded_state_dict = {}
 
         if self.pre_process:
             embedding_prefix = f'{prefix}embedding.'
             embedding_sharded_state_dict = self.embedding.sharded_state_dict(
-                prefix=embedding_prefix
+                prefix=embedding_prefix, metadata=metadata
             )
             sharded_state_dict.update(embedding_sharded_state_dict)
 
         decoder_prefix = f'{prefix}decoder.'
-        decoder_sharded_state_dict = self.decoder.sharded_state_dict(prefix=decoder_prefix)
+        decoder_sharded_state_dict = self.decoder.sharded_state_dict(
+            prefix=decoder_prefix, metadata=metadata
+        )
         sharded_state_dict.update(decoder_sharded_state_dict)
 
         if self.post_process:

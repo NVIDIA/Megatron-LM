@@ -1,4 +1,6 @@
-# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+
+"""Specs for Retro encoder."""
 
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -33,6 +35,9 @@ def get_retro_encoder_layer_te_spec() -> ModuleSpec:
     operators to encode neighboring chunks that are retrieved from the chunk
     database. Each operator is responsible for iterating the retrieved chunks
     and processing them individually.
+
+    Returns:
+        A module spec if Transformer Engine modules.
     """
     spec = get_gpt_layer_with_transformer_engine_spec()
     spec.submodules.pre_cross_attn_layernorm = TENorm
@@ -64,6 +69,9 @@ def get_retro_encoder_layer_local_spec() -> ModuleSpec:
     operators to encode neighboring chunks that are retrieved from the chunk
     database. Each operator is responsible for iterating the retrieved chunks
     and processing them individually.
+
+    Returns:
+        A module spec if local modules.
     """
     spec = get_gpt_layer_local_spec()
     spec.submodules.pre_cross_attn_layernorm = FusedLayerNorm
@@ -85,6 +93,9 @@ def get_retro_encoder_layer_local_spec() -> ModuleSpec:
         module=MLP,
         submodules=MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear,),
     )
+    spec.submodules.sharded_state_dict_keys_map = {
+        'input_layernorm.': 'self_attention.linear_qkv.layer_norm_',
+    }  # pre_mlp_layernorm doesn't need remapping
     return spec
 
 
@@ -99,9 +110,10 @@ def get_retro_encoder_block_spec(
 
     Arguments:
       config (RetroConfig): Retro config.
+      use_transformer_engine (bool): If True, use Transformer Engine (instead of local modules).
 
-      use_transformer_engine (bool): If True, use Transformer Engine (instead
-      of local modules.
+    Returns:
+        Transformer block submodules for the given spec.
     """
 
     # Num layers.

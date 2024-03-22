@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Retro's cross attention modules for the decoder block."""
 
@@ -13,6 +13,7 @@ from megatron.core import InferenceParams
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.retro.base_attention import BaseRetroCrossAttention
 from megatron.core.models.retro.config import RetroConfig
+from megatron.core.models.retro.utils import get_all_true_mask
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.attention import CrossAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
@@ -28,18 +29,27 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
     Neighboring chunks retrieved from the chunk database are used here for
     chunked-cross attention.
 
-    Arguments:
-      config (RetroConfig): Retro config.
+    ** Note about 'encoder_block_spec' **
 
-      submodules (CrossAttentionSubmodules): Cross attention submodules.
+    Retro is an encoder-decoder model that uses its encoder for encoding
+    neighboring chunks that are retrieved from a chunk database. These
+    encoded neighbors are then used in the decoder stack for performing
+    chunked-cross attention (see paper link above).
 
-      layer_number (int): Layer number within transformer block.
+    In contrast to the T5 model, the encoder and decoder are computationally
+    intertwined, since the input to the encoder is the output of the self-
+    attention of the first decoder layer. As such, the encoder block itself
+    is instantiated within the first Retro decoder layer, in order to receive
+    the self-attention's output. (Note, that only the first decoder layer
+    instantiates an encoder block, and the remaining decoder layers use the
+    encoder output from the first decoder layer.)
 
-      attn_mask_type (AttnMaskType): Mask type ('causal' or 'padding').
-
-      encoder_block_spec (ModuleSpec): The first Retro decoder
-      layer is provided with a transformer block spec to construct the
-      neighbor encoder.
+    Args:
+        config (RetroConfig): Retro config.
+        submodules (CrossAttentionSubmodules): Cross attention submodules.
+        layer_number (int): Layer number within transformer block.
+        attn_mask_type (AttnMaskType): Mask type ('causal' or 'padding').
+        encoder_block_spec (ModuleSpec): The first Retro decoder layer is provided with a transformer block spec to construct the neighbor encoder.
     """
 
     def __init__(
@@ -50,23 +60,6 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
         encoder_block_spec: ModuleSpec = None,
     ):
-        """
-        ** Note about 'encoder_block_spec' **
-
-        Retro is an encoder-decoder model that uses its encoder for encoding
-        neighboring chunks that are retrieved from a chunk database. These
-        encoded neighbors are then used in the decoder stack for performing
-        chunked-cross attention (see paper link above).
-
-        In contrast to the T5 model, the encoder and decoder are computationally
-        intertwined, since the input to the encoder is the output of the self-
-        attention of the first decoder layer. As such, the encoder block itself
-        is instantiated within the first Retro decoder layer, in order to receive
-        the self-attention's output. (Note, that only the first decoder layer
-        instantiates an encoder block, and the remaining decoder layers use the
-        encoder output from the first decoder layer.)
-        """
-
         super().__init__(
             config=config,
             submodules=submodules,
@@ -89,7 +82,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
         key_value_states: Tensor = None,
         inference_params: InferenceParams = None,
         # rotary_pos_emb: Tensor = None, # ... unsupported for retro.
-    ) -> Tensor:
+    ) -> dict:
         """Cross attention for Retro decoder.
 
         Notation:
@@ -101,15 +94,14 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
             k  : Number of neighbors.
             r  : Number of retrieved tokens (neighbors + continuation).
 
-        Arguments:
-          hidden_states (Tensor): Transformer layer hidden states.
+        Args:
+            hidden_states (Tensor): Transformer layer hidden states.
+            attention_mask (Tensor): Attention mask.
+            key_value_states (Tensor): Neighbor embeddings if first decoder layer, else encoder output.
+            inference_params (InferenceParams): Inference params.
 
-          attention_mask (Tensor): Attention mask.
-
-          key_value_states (Tensor): Neighbor embeddings if first decoder
-          layer, else encoder output.
-
-          inference_params (InferenceParams): Inference params.
+        Returns:
+            A dict consisting of the attention output and context, along with other scalars necessary for performing the downstream bias-dropout-add.
         """
 
         # hidden_states: [ ns, bs, d ]
@@ -152,12 +144,19 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
                 .contiguous()
             )
 
+            # flash attn: [ b, h, sq, sk ]
+            # fused attn: [ b, 1, 1, sq ]
+            chunked_output_mask = get_all_true_mask(
+                size=(1, 1, chunked_output.shape[0], key_value_states.shape[0]),
+                device=chunked_output.device,
+            )
+
             # Encode neighbors. (Note: 'key_value_states' re-assigned here.)
             key_value_states = self.encoder(
                 hidden_states=key_value_states,
                 attention_mask=attention_mask,
                 context=chunked_output,
-                context_mask=None,
+                context_mask=chunked_output_mask,
                 inference_params=inference_params,
             )  # [ r, k*bs*l, d ]
             key_value_states = key_value_states.reshape(
@@ -183,9 +182,18 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
             self.retro_chunk_length, bs * l, d
         ).contiguous()
 
+        # flash attn: [ b, h, sq, sk ]
+        # fused attn: [ b, 1, 1, sq ]
+        padded_chunked_output_mask = get_all_true_mask(
+            size=(1, 1, padded_chunked_output.shape[0], key_value_states.shape[0]),
+            device=padded_chunked_output.device,
+        )
+
         # Attend to encoded neighbors.
         attention_output, attention_bias = self.attn(
-            padded_chunked_output, None, key_value_states=key_value_states,
+            hidden_states=padded_chunked_output,
+            attention_mask=padded_chunked_output_mask,
+            key_value_states=key_value_states,
         )
 
         # Return dimensions for bias-dropout step.
@@ -208,15 +216,15 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
     This operator takes care of reshaping and permuting the output from the
     chunk dimension to the sequence dimension.
 
-    Arguments:
-      config (RetroConfig): Retro config.
+    Args:
+        config (RetroConfig): Retro config.
     """
 
     def __init__(
         self, config: RetroConfig,
     ):
         super().__init__(config=config)
-        self.retro_chunk_length = config.retro_preprocess.retro_gpt_chunk_length
+        self.retro_chunk_length = config.retro_chunk_length
 
     @classmethod
     def _forward(
@@ -229,17 +237,15 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
     ) -> Tensor:
         """Per-chunk bias-dropout-add.
 
-        Arguments:
-          x_with_bias (dict): Attention output and bias, along with other Retro
-          relevant parameters.
+        Args:
+            x_with_bias (dict): Attention output and bias, along with other Retro relevant parameters.
+            residual (Tensor): Transformer layer residual.
+            prob (float): Dropout probability.
+            retro_chunk_length (int): Retro chunk length (e.g., 64).
+            bias_dropout_add (Callable): Bias-dropout-add function.
 
-          residual (Tensor): Transformer layer residual.
-
-          prob (float): Dropout probability.
-
-          retro_chunk_length (int): Retro chunk length (e.g., 64).
-
-          bias_dropout_add (Callable): Bias-dropout-add function.
+        Returns:
+            Output of bias-dropout-add.
         """
 
         # Extract input dict.
@@ -286,13 +292,15 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
         # Output. [ ns, bs, d ]
         return x
 
-    def forward(self, training: bool, fused: bool) -> Tensor:
+    def forward(self, training: bool, fused: bool) -> partial:
         """Retro decoder bias-dropout-add.
 
-        Arguments:
-          training (bool): If training, then apply dropout.
+        Args:
+            training (bool): If training, then apply dropout.
+            fused (bool): Fuse bias-dropout-add.
 
-          fused (bool): Fuse bias-dropout-add.
+        Returns:
+            The partial function for performing bias-dropout-add.
         """
         return partial(
             self._forward,
