@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron global variables."""
 
@@ -12,7 +12,6 @@ from megatron.tokenizer import build_tokenizer
 from .microbatches import build_num_microbatches_calculator
 
 _GLOBAL_ARGS = None
-_GLOBAL_RETRO_ARGS = None
 _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
 _GLOBAL_TOKENIZER = None
 _GLOBAL_TENSORBOARD_WRITER = None
@@ -26,11 +25,6 @@ def get_args():
     """Return arguments."""
     _ensure_var_is_initialized(_GLOBAL_ARGS, 'args')
     return _GLOBAL_ARGS
-
-
-def get_retro_args():
-    """Return retro arguments."""
-    return _GLOBAL_RETRO_ARGS
 
 
 def get_num_microbatches():
@@ -117,11 +111,6 @@ def set_global_variables(args, build_tokenizer=True):
 def set_args(args):
     global _GLOBAL_ARGS
     _GLOBAL_ARGS = args
-
-
-def set_retro_args(retro_args):
-    global _GLOBAL_RETRO_ARGS
-    _GLOBAL_RETRO_ARGS = retro_args
 
 
 def _build_num_microbatches_calculator(args):

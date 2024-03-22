@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Pretrain utilities."""
 
@@ -252,7 +252,8 @@ def pretrain(train_valid_test_dataset_provider,
     if not args.skip_train:
         print_rank_0('training ...')
 
-        if args.dataloader_type == 'cyclic' and args.retro_add_retriever:
+        if args.dataloader_type == 'cyclic' and args.retro_project_dir:
+            assert args.retro_cyclic_train_iters is not None
             args.train_iters = args.retro_cyclic_train_iters
             print_rank_0("retro cyclic train iters : %d" % args.train_iters)
 
@@ -1258,8 +1259,8 @@ def cyclic_iter(iter):
             yield x
 
 
-def build_train_valid_test_datasets(build_train_valid_test_datasets_provider):
-    """Build pretraining datasets."""
+def get_train_valid_test_num_samples():
+    """Train/valid/test num samples."""
 
     args = get_args()
 
@@ -1271,16 +1272,22 @@ def build_train_valid_test_datasets(build_train_valid_test_datasets_provider):
     eval_iters = (args.train_iters // args.eval_interval + 1) * \
                  args.eval_iters
     test_iters = args.eval_iters
-    train_val_test_num_samples = [train_samples,
-                                  eval_iters * args.global_batch_size,
-                                  test_iters * args.global_batch_size]
-    print_rank_0(' > datasets target sizes (minimum size):')
-    print_rank_0('    train:      {}'.format(train_val_test_num_samples[0]))
-    print_rank_0('    validation: {}'.format(train_val_test_num_samples[1]))
-    print_rank_0('    test:       {}'.format(train_val_test_num_samples[2]))
 
-    # Build the datasets.
-    return build_train_valid_test_datasets_provider(train_val_test_num_samples)
+    return (
+        train_samples,
+        eval_iters * args.global_batch_size,
+        test_iters * args.global_batch_size,
+    )
+
+
+def build_train_valid_test_datasets(build_train_valid_test_datasets_provider):
+    """Build pretraining datasets."""
+    train_valid_test_num_samples = get_train_valid_test_num_samples()
+    print_rank_0(' > datasets target sizes (minimum size):')
+    print_rank_0('    train:      {}'.format(train_valid_test_num_samples[0]))
+    print_rank_0('    validation: {}'.format(train_valid_test_num_samples[1]))
+    print_rank_0('    test:       {}'.format(train_valid_test_num_samples[2]))
+    return build_train_valid_test_datasets_provider(train_valid_test_num_samples)
 
 
 def build_train_valid_test_data_loaders(

@@ -1,8 +1,8 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import Dict, Union
+from typing import Dict, Optional, Union
 
 import torch
 
@@ -240,8 +240,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         return output, context
 
-    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()) -> ShardedStateDict:
-        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets)
+    def sharded_state_dict(
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
+    ) -> ShardedStateDict:
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
         prefixed_map = {
             f'{prefix}{k}': f'{prefix}{v}'
             for k, v in self.submodules_config.sharded_state_dict_keys_map.items()

@@ -1,6 +1,7 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
 """Megatron Module."""
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 from torch.autograd import Variable
@@ -53,7 +54,10 @@ class MegatronModule(torch.nn.Module):
         return self.state_dict(prefix=prefix, keep_vars=keep_vars)
 
     def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: Tuple[Tuple[int, int, int]] = ()
+        self,
+        prefix: str = '',
+        sharded_offsets: Tuple[Tuple[int, int, int]] = (),
+        metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
         """Default implementation for sharded state dict for distributed checkpointing.
 
@@ -65,6 +69,7 @@ class MegatronModule(torch.nn.Module):
             prefix (str): prefix for the state dict keys
             sharded_offsets (Tuple[Tuple[int, int, int]], optional): sharding already
                 applied (e.g. PP related) by sup-modules. Passed along to ShardedTensor
+            metadata (dict, optional): metadata passed recursively to sharded_state_dict methods
 
         Returns:
             dict: dictionary of state dict keys mapped to ShardedTensors
@@ -78,7 +83,7 @@ class MegatronModule(torch.nn.Module):
         # Recurse into submodules
         for name, module in self.named_children():
             sharded_state_dict.update(
-                sharded_state_dict_default(module, f'{prefix}{name}.', sharded_offsets)
+                sharded_state_dict_default(module, f'{prefix}{name}.', sharded_offsets, metadata)
             )
         return sharded_state_dict
 

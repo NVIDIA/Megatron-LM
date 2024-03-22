@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron arguments."""
 
@@ -10,10 +10,10 @@ import torch
 import types
 
 import torch.nn.functional as F
-from megatron.global_vars import set_retro_args, get_retro_args
-from tools.retro.utils import get_args_path as get_retro_args_path
-
-from megatron.core.models.retro import RetroConfig
+from megatron.core.models.retro.utils import (
+    get_config_path as get_retro_config_path,
+    get_gpt_data_dir as get_retro_data_dir,
+)
 from megatron.core.transformer import TransformerConfig
 
 
@@ -66,7 +66,86 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
 
     return args
 
+
+def load_retro_config(retro_project_dir):
+    '''Load Retro's config.json.'''
+
+    # Retro config path.
+    retro_config_path = get_retro_config_path(retro_project_dir)
+    assert os.path.exists(retro_config_path), \
+        "Retro project dir missing config.json."
+
+    # Load retro config.
+    with open(retro_config_path) as f:
+        retro_config = types.SimpleNamespace(**json.load(f))
+
+    return retro_config
+
+
+def load_retro_args(args):
+    """Load predefined args from Retro config (if applicable).
+
+    When using Retro (or GPT for comparison purposes), data arguments are
+    overridden by the saved config.json within the Retro project directory. This
+    is to ensure that the data used for pretraining is consistent with the data
+    that was preprocessed using the Retro preprocessing pipeline (see
+    `tools/retro/preprocess_data.py`).
+    """
+
+    # Return if no project directory is specified.
+    if args.retro_project_dir is None:
+        return
+
+    # Load retro config.
+    retro_config = load_retro_config(args.retro_project_dir)
+
+    # Retro data path is relative to project dir (via hard or soft links).
+    data_dir = get_retro_data_dir(args.retro_project_dir)
+    data_path = list(retro_config.retro_gpt_data_path)
+    if len(data_path) % 2 == 0:
+        for i in range(len(data_path) - 1, -1, -2):
+            data_path[i] = os.path.join(data_dir, data_path[i])
+    else:
+        assert len(data_path) == 1
+        data_path[0] = os.path.join(data_dir, data_path[0])
+
+    # Update args.
+    args.data_cache_path = retro_config.retro_gpt_data_cache_path
+    args.data_path = data_path if args.data_path is None else args.data_path
+    args.eval_interval = retro_config.retro_gpt_eval_interval
+    args.eval_iters = retro_config.retro_gpt_eval_iters
+    args.global_batch_size = retro_config.retro_gpt_global_batch_size
+    args.max_position_embeddings = retro_config.retro_gpt_seq_length
+    args.merge_file = os.path.join(
+        args.retro_project_dir,
+        retro_config.retro_gpt_merge_file,
+    ) if retro_config.retro_gpt_merge_file is not None else None
+    args.seed = retro_config.retro_gpt_seed
+    args.seq_length = retro_config.retro_gpt_seq_length
+    args.tokenizer_model = os.path.join(
+        args.retro_project_dir,
+        retro_config.retro_gpt_tokenizer_model,
+    ) if retro_config.retro_gpt_tokenizer_model is not None else None
+    args.tokenizer_type = retro_config.retro_gpt_tokenizer_type
+    args.train_samples = retro_config.retro_gpt_train_samples
+    args.vocab_file = os.path.join(
+        args.retro_project_dir,
+        retro_config.retro_gpt_vocab_file,
+    ) if retro_config.retro_gpt_vocab_file is not None else None
+
+    # Retro-specific args.
+    args.retro_block_size = retro_config.retro_block_size
+    args.retro_chunk_length = retro_config.retro_gpt_chunk_length
+    args.retro_neighbor_dirs = retro_config.retro_neighbor_dirs
+    args.retro_split_preprocessing = retro_config.retro_gpt_split
+    args.retro_bert_tokenizer_type = retro_config.retro_bert_tokenizer_type
+    args.retro_bert_vocab_file = retro_config.retro_bert_vocab_file
+
+
 def validate_args(args, defaults={}):
+
+    # Load saved args from Retro (if applicable).
+    load_retro_args(args)
 
     # Tensor model parallel size.
     args.tensor_model_parallel_size = min(
@@ -74,6 +153,7 @@ def validate_args(args, defaults={}):
     assert args.world_size % args.tensor_model_parallel_size == 0, 'world size'\
         ' ({}) is not divisible by tensor model parallel size ({})'.format(
             args.world_size, args.tensor_model_parallel_size)
+
     # Pipeline model parallel size.
     args.pipeline_model_parallel_size = min(
         args.pipeline_model_parallel_size,
@@ -83,6 +163,7 @@ def validate_args(args, defaults={}):
         if args.standalone_embedding_stage else
         args.pipeline_model_parallel_size
     )
+
     # Checks.
     model_parallel_size = args.pipeline_model_parallel_size * \
                           args.tensor_model_parallel_size
@@ -110,7 +191,6 @@ def validate_args(args, defaults={}):
 
     if args.tp_comm_overlap:
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
-
 
     # Deprecated arguments
     if args.use_gpu_initialization:
@@ -385,6 +465,10 @@ def validate_args(args, defaults={}):
     # Retro checks.
     if args.retro_add_retriever:
 
+        # Train samples should be auto-loaded.
+        assert args.train_samples is not None, \
+            "args.train_samples should be auto-loaded from the retro config."
+
         # Sequence parallelism unsupported.
         assert not args.sequence_parallel, \
             "retro currently does not support sequence parallelism."
@@ -392,18 +476,6 @@ def validate_args(args, defaults={}):
         # Pipeline parallelism unsupported.
         assert args.pipeline_model_parallel_size == 1, \
             "retro currently does not support pipeline parallelism."
-
-    # Load retro args (used by both Retro & GPT).
-    if args.retro_workdir:
-        retro_args_path = get_retro_args_path(args.retro_workdir)
-        assert os.path.exists(retro_args_path), "retro workdir missing args.json"
-        with open(retro_args_path) as f:
-            retro_args = types.SimpleNamespace(**json.load(f))
-            retro_args.retro_return_doc_ids = args.retro_return_doc_ids
-            retro_args.retro_gpt_retrieved_length = \
-                args.retro_num_retrieved_chunks * \
-                retro_args.retro_gpt_chunk_length
-            set_retro_args(retro_args)
 
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
@@ -439,9 +511,6 @@ def validate_args(args, defaults={}):
 
     # Print arguments.
     _print_args("arguments", args)
-    retro_args = get_retro_args()
-    if retro_args and args != retro_args:
-        _print_args("retro arguments", types.SimpleNamespace(**{k:v for k,v in vars(retro_args).items() if k.startswith("retro")}, rank=args.rank))
 
     return args
 
@@ -464,11 +533,15 @@ def _print_args(title, args):
 def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
 
-def core_transformer_config_from_args(args):
+
+def core_transformer_config_from_args(args, config_class=None):
+
+    # Config class.
+    config_class = config_class or TransformerConfig
 
     # Translate args to core transformer configuration
     kw_args = {}
-    for f in dataclasses.fields(TransformerConfig):
+    for f in dataclasses.fields(config_class):
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
@@ -498,14 +571,8 @@ def core_transformer_config_from_args(args):
     else:
         kw_args['num_query_groups'] = None
 
-    # If using Retro, return Retro config.
-    retro_args = get_retro_args()
-    if retro_args:
-        kw_args['retro_preprocess'] = retro_args
-        return RetroConfig(**kw_args)
-
-    # Return Transformer config.
-    return TransformerConfig(**kw_args)
+    # Return config.
+    return config_class(**kw_args)
 
 
 def _add_transformer_engine_args(parser):
@@ -565,9 +632,9 @@ def _add_inference_args(parser):
 def _add_retro_args(parser):
     group = parser.add_argument_group(title='retro')
 
-    group.add_argument('--retro-workdir', default=None,
-                       help='Retro working directory, which contains the '
-                       'preprocessed data for for pretraining. This directory '
+    group.add_argument('--retro-project-dir', default=None,
+                       help='Retro project directory, which contains the '
+                       'preprocessed data for pretraining. This directory '
                        'is built during preprocessing (see '
                        'tools/retro/README.md), and contains subdirectories '
                        'for the chunk database and pretraining neighbors.')
@@ -593,8 +660,6 @@ def _add_retro_args(parser):
     group.add_argument("--retro-num-retrieved-chunks", type=int, default=2,
                        help='Number of chunks to retrieve from the retrieval '
                        'database.')
-    group.add_argument("--retro-return-doc-ids", action="store_true",
-                       help="Turn this on when preprocessing retro data.")
     group.add_argument("--retro-attention-gate", type=float, default=1,
                        help="Gated cross attention.")
     group.add_argument("--retro-no-verify-neighbor-count", action="store_false",

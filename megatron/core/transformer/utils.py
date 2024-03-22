@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Utilities for transformer layers."""
 from functools import lru_cache
@@ -152,7 +152,10 @@ def _get_extra_state_offsets(
 
 
 def sharded_state_dict_default(
-    module: torch.nn.Module, prefix: str = '', sharded_offsets: Tuple[Tuple[int, int, int]] = ()
+    module: torch.nn.Module,
+    prefix: str = '',
+    sharded_offsets: Tuple[Tuple[int, int, int]] = (),
+    metadata: Optional[dict] = None,
 ) -> ShardedStateDict:
     """Provides implementation for sharded_state_dict method for non-MegatronModules.
 
@@ -167,6 +170,7 @@ def sharded_state_dict_default(
         prefix (str): prefix for the state dict keys
         sharded_offsets (Tuple[Tuple[int, int, int]], optional): sharding already
             applied (e.g. PP related) by sup-modules. Passed along to ShardedTensor
+        metadata (dict, optional): metadata passed to module sharded_state_dict method
 
     Returns:
         dict: dictionary of state dict keys mapped to ShardedTensors
@@ -174,7 +178,7 @@ def sharded_state_dict_default(
 
     if hasattr(module, 'sharded_state_dict'):
         module_sharded_sd = module.sharded_state_dict(
-            prefix=prefix, sharded_offsets=sharded_offsets,
+            prefix=prefix, sharded_offsets=sharded_offsets, metadata=metadata
         )
     else:
         module_sd = module.state_dict(prefix='', keep_vars=True)
