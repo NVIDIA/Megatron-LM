@@ -28,10 +28,9 @@ class TestRetroAttention:
             num_attention_heads=4,
             use_cpu_initialization=True,
             retro_num_neighbors=2,
-            retro_preprocess=types.SimpleNamespace(
-                retro_gpt_chunk_length=4,
-                retro_gpt_retrieved_length=8,
-            ),
+            retro_chunk_length=4,
+            retro_retrieved_length=8,
+            retro_split_preprocessing="98,2,0",
         )
 
     @classmethod
@@ -108,7 +107,7 @@ class TestRetroAttention:
 
         seq_length = 32
         micro_batch_size = 2
-        n_chunks_per_sample = seq_length // config.retro_preprocess.retro_gpt_chunk_length
+        n_chunks_per_sample = seq_length // config.retro_chunk_length
 
         # Init tensors.
         hidden_states = torch.ones((
@@ -118,12 +117,12 @@ class TestRetroAttention:
         )).cuda()
         attention_mask = None
         decoder_context = torch.ones((
-            config.retro_preprocess.retro_gpt_retrieved_length,
+            config.retro_retrieved_length,
             config.retro_num_neighbors * micro_batch_size * n_chunks_per_sample,
             config.hidden_size,
         )).cuda()
         encoder_context = torch.ones((
-            config.retro_preprocess.retro_gpt_chunk_length,
+            config.retro_chunk_length,
             micro_batch_size * n_chunks_per_sample,
             config.hidden_size,
         )).cuda()
@@ -163,7 +162,7 @@ class TestRetroAttention:
         assert decoder_attn_output["l"] == n_chunks_per_sample
         assert decoder_attn_output["pad"] == 3
         assert tuple(decoder_attn_output["attention_output"].shape) == (
-            config.retro_preprocess.retro_gpt_chunk_length,
+            config.retro_chunk_length,
             micro_batch_size * n_chunks_per_sample,
             config.hidden_size,
         )
@@ -171,7 +170,7 @@ class TestRetroAttention:
             config.hidden_size,
         )
         assert decoder_attn_output["context"].shape == (
-            config.retro_preprocess.retro_gpt_retrieved_length * config.retro_num_neighbors,
+            config.retro_retrieved_length * config.retro_num_neighbors,
             micro_batch_size * n_chunks_per_sample,
             config.hidden_size,
         )
@@ -181,23 +180,23 @@ class TestRetroAttention:
         assert len(encoder_attn_output_tuples) == config.retro_num_neighbors
         for output, bias, residual in encoder_attn_output_tuples:
             assert tuple(output.shape) == (
-                config.retro_preprocess.retro_gpt_retrieved_length,
+                config.retro_retrieved_length,
                 micro_batch_size * n_chunks_per_sample,
                 config.hidden_size,
             )
             assert tuple(bias.shape) == (config.hidden_size,)
             assert tuple(residual.shape) == (
-                config.retro_preprocess.retro_gpt_retrieved_length,
+                config.retro_retrieved_length,
                 micro_batch_size * n_chunks_per_sample,
                 config.hidden_size,
             )
         assert encoder_bda_output.shape == (
-            config.retro_preprocess.retro_gpt_retrieved_length,
+            config.retro_retrieved_length,
             config.retro_num_neighbors * micro_batch_size * n_chunks_per_sample,
             config.hidden_size,
         )
         assert encoder_norm_output.shape == (
-            config.retro_preprocess.retro_gpt_retrieved_length,
+            config.retro_retrieved_length,
             config.retro_num_neighbors * micro_batch_size * n_chunks_per_sample,
             config.hidden_size,
         )
