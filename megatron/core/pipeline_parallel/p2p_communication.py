@@ -74,6 +74,7 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
                 torch.distributed.isend,
                 send_prev_shape_tensor,
                 get_pipeline_model_parallel_prev_rank(),
+                get_pipeline_model_parallel_group(),
             )
             ops.append(send_prev_op)
         if recv_prev_shape_tensor is not None:
@@ -81,6 +82,7 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
                 torch.distributed.irecv,
                 recv_prev_shape_tensor,
                 get_pipeline_model_parallel_prev_rank(),
+                get_pipeline_model_parallel_group(),
             )
             ops.append(recv_prev_op)
         if send_next_shape_tensor is not None:
@@ -88,6 +90,7 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
                 torch.distributed.isend,
                 send_next_shape_tensor,
                 get_pipeline_model_parallel_next_rank(),
+                get_pipeline_model_parallel_group(),
             )
             ops.append(send_next_op)
         if recv_next_shape_tensor is not None:
@@ -95,6 +98,7 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
                 torch.distributed.irecv,
                 recv_next_shape_tensor,
                 get_pipeline_model_parallel_next_rank(),
+                get_pipeline_model_parallel_group(),
             )
             ops.append(recv_next_op)
         if len(ops) > 0:
