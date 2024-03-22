@@ -317,11 +317,11 @@ def initialize_model_parallel(
                 "`#SBATCH_NETWORK=sharp` should be set in the sbatch script."
             )
         torch.distributed.barrier(
-            group=get_data_parallel_group(with_context_parallel=context_parallel_size > 1),
+            group=get_data_parallel_group(with_context_parallel=True),
             device_ids=[torch.cuda.current_device()],
         )
-        # Set `NCCL_SHARP_DISABLE=1` to restrict SHARP application to DP process groups
-        os.environ["NCCL_SHARP_DISABLE"] = "1"
+        # Set `NCCL_COLLNET_ENABLE=0` to restrict SHARP application to DP process groups
+        os.environ["NCCL_COLLNET_ENABLE"] = "0"
 
     # Build the context-parallel groups.
     global _CONTEXT_PARALLEL_GROUP
