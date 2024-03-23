@@ -1,7 +1,16 @@
+workflow:
+  rules:
+    # always run MR pipelines
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    # do not run branch pipelines if open MR exists
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    # run branch pipeline if no open MR
+    - if: $CI_COMMIT_BRANCH
+
 stages:
   - test
   - jet
-  - cleanup
 
 variables: &VARS
   SELENE_ADLR_CI_PATH: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron"
