@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+import random
 from typing import Literal, Optional, Union
 
 import torch
@@ -86,6 +87,12 @@ class GPTModel(LanguageModule):
         creat_lr=0.1,
         creat_max_norm=0.1,
         neft_reimplement=False,
+        embedmix=False,
+        embedmix_subset_p=0.0,
+        embedmix_embed_p=0.0,
+        embedmix_tokens_p=0.0,
+        embedmix_type=None,
+        embedmix_alpha=0.5,
     ) -> None:
         super().__init__(config=config)
 
@@ -118,6 +125,14 @@ class GPTModel(LanguageModule):
         self.creat_lr = creat_lr
         self.creat_max_norm = creat_max_norm
         self.neft_reimplement = neft_reimplement
+        
+
+        self.embedmix = embedmix
+        self.embedmix_subset_p = embedmix_subset_p
+        self.embedmix_embed_p = embedmix_embed_p
+        self.embedmix_tokens_p = embedmix_tokens_p
+        self.embedmix_type = embedmix_type
+        self.embedmix_alpha = embedmix_alpha
 
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
@@ -189,6 +204,38 @@ class GPTModel(LanguageModule):
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
         self.decoder.set_input_tensor(input_tensor[0])
 
+    def embedmix_forward(self, decoder_input: torch.Tensor) -> torch.Tensor:
+        if self.embedmix_subset_p == 0.0:
+            return decoder_input
+
+        decoder_input_clone = decoder_input.clone()
+        seq_length, batch_size, embed_size = decoder_input_clone.shape
+        
+        num_batches_to_perturb = max(1, round(self.embedmix_subset_p * batch_size))
+        num_tokens_to_perturb = max(2, round(self.embedmix_tokens_p * seq_length))
+        
+        if num_tokens_to_perturb % 2 == 1:
+            num_tokens_to_perturb += 1
+        
+        perturb_batches_indices = torch.randperm(batch_size)[:num_batches_to_perturb]
+        perturb_tokens_indices = torch.randperm(seq_length)[:num_tokens_to_perturb].view(-1, 2)
+        
+        for batch_idx in perturb_batches_indices:
+            for token_pair in perturb_tokens_indices:
+                if self.embedmix_type == 'swap':
+                    perturb_mask_len = round(embed_size * self.embedmix_embed_p)
+                    start_index = random.randint(0, embed_size - perturb_mask_len)
+                    end_index = start_index + perturb_mask_len
+
+                    decoder_input_clone[token_pair[0], batch_idx, start_index:end_index], \
+                    decoder_input_clone[token_pair[1], batch_idx, start_index:end_index] = \
+                    decoder_input_clone[token_pair[1], batch_idx, start_index:end_index].clone(), \
+                    decoder_input_clone[token_pair[0], batch_idx, start_index:end_index].clone()
+                elif self.embedmix_type == 'mix':
+                    decoder_input_clone[token_pair[0], batch_idx] = self.embedmix_alpha * decoder_input_clone[token_pair[0], batch_idx] + \
+                                                                    (1 - self.embedmix_alpha) * decoder_input_clone[token_pair[1], batch_idx]
+        return decoder_input_clone
+
     def forward(
         self,
         input_ids: Tensor,
@@ -247,6 +294,9 @@ class GPTModel(LanguageModule):
             loss.mean().backward(retain_graph=True)
             perturbation = self.adversarial_training_epsilon * decoder_input_clone.grad.sign()
             decoder_input = decoder_input + perturbation.detach()
+
+        if self.embedmix:
+            decoder_input = self.embedmix_forward(decoder_input)
 
         # Run decoder.
         hidden_states = self.decoder(
