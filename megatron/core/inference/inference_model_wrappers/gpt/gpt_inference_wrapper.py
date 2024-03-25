@@ -1,16 +1,12 @@
-import math
 from argparse import Namespace
-from typing import Iterable, List, Tuple, Union
+from typing import List, Tuple, Union
 
 import torch
 
 import megatron.model
-from megatron.core import parallel_state
-from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.inference_model_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
-from megatron.core.inference_params import InferenceParams
 from megatron.model import GPTModel
 
 
@@ -39,9 +35,6 @@ class GPTInferenceWrapper(AbstractModelInferenceWrapper):
         self.attention_mask, self.position_ids = self._build_attention_mask_and_position_ids(
             prompts_tokens
         )
-        self.prompts_tokens = prompts_tokens
-        batch_size, max_sequence_length = self.prompts_tokens.shape
-        self.inference_params = InferenceParams(batch_size, max_sequence_length)
 
     def _build_attention_mask_and_position_ids(
         self, prompts_tokens: torch.Tensor

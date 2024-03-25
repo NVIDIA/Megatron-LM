@@ -6,7 +6,6 @@ from typing import Iterable, List
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.communication_utils import (
     recv_from_prev_pipeline_rank_,
     send_to_next_pipeline_rank,
@@ -30,13 +29,13 @@ class AbstractModelInferenceWrapper:
         self.model = model
         self.args = args
 
-    def prep_model_for_inference(self):
+    def prep_model_for_inference(self, prompts_tokens: torch.Tensor):
         """A utility function for preparing model for inference
 
         The function gets called before you get the inference data and running forward pass. Use it to put the model in eval mode, build position ids ,attention mask etc, so that required slices can be extracted during the forward pass. 
 
         Args:
-            prompts_tokens (torch.Tensor, optional): A tensor of shape [batch_size, max_seq_len]. Defaults to None
+            prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_seq_len]
 
         """
         self.model.eval()
@@ -47,6 +46,9 @@ class AbstractModelInferenceWrapper:
         self.model_is_pipeline_parallel = not (
             parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
         )
+        self.prompts_tokens = prompts_tokens
+        batch_size, max_sequence_length = self.prompts_tokens.shape
+        self.inference_params = InferenceParams(batch_size, max_sequence_length)
 
     @abc.abstractclassmethod
     def get_batch_for_context_window(self) -> List:
@@ -97,7 +99,9 @@ class AbstractModelInferenceWrapper:
 
         tokens, position_ids, attention_mask = inference_input
         batch_size, seq_len = tokens.shape
-
+        print(
+            f'SHAN : GPU : {torch.distributed.get_rank()} COMING IN FOR TOKENS SHPE {tokens.shape}'
+        )
         recv_buffer = None
         if not self.is_pipeline_first_stage:
             recv_buffer = self._allocate_recv_buffer(batch_size, seq_len)
@@ -111,7 +115,9 @@ class AbstractModelInferenceWrapper:
             send_to_next_pipeline_rank(output_tensor)
 
         self.inference_params.sequence_len_offset += seq_len
-
+        print(
+            f'SHAN : GPU : {torch.distributed.get_rank()} COMING IN FOR TOKENS SHPE {tokens.shape}'
+        )
         logits = None
         if self.is_pipeline_last_stage:
             logits = output_tensor
