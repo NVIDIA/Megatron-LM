@@ -231,7 +231,7 @@ class GPTModel(LanguageModule):
                     decoder_input_clone[token_pair[1], batch_idx, start_index:end_index] = \
                     decoder_input_clone[token_pair[1], batch_idx, start_index:end_index].clone(), \
                     decoder_input_clone[token_pair[0], batch_idx, start_index:end_index].clone()
-                elif self.embedmix_type == 'mix':
+                elif self.embedmix_type == 'add':
                     decoder_input_clone[token_pair[0], batch_idx] = self.embedmix_alpha * decoder_input_clone[token_pair[0], batch_idx] + \
                                                                     (1 - self.embedmix_alpha) * decoder_input_clone[token_pair[1], batch_idx]
         return decoder_input_clone
