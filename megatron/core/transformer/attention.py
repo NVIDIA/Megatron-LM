@@ -188,7 +188,7 @@ class Attention(MegatronModule, ABC):
             inference_key_memory, inference_value_memory = inference_params.key_value_memory_dict[
                 self.layer_number
             ]
-            attn_mask_type = AttnMaskType.no_mask
+            attn_mask_type = AttnMaskType.causal
 
         batch_start = inference_params.batch_size_offset
         batch_end = batch_start + key.size(1)
@@ -211,7 +211,7 @@ class Attention(MegatronModule, ABC):
                 # In inference, we compute one token at a time.
                 # Select the correct positional embedding
                 # (only the last token in the sequence)
-                q_pos_emb = q_pos_emb[sequence_end - 1 : sequence_end]
+                q_pos_emb = q_pos_emb[sequence_start : sequence_end]
             else:
                 # In the first forward pass of inference,
                 # we use the entire provided prefix.
