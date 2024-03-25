@@ -59,9 +59,8 @@ def collect_train_test_metrics(logs_dir, run_name):
         },
         "iteration_timing_avg": iteration_time_avg,
     }
-    model_name = run_name.split('_')[0]
     str_train_metrics = str(train_metrics).replace("'", "\"")
-    print(f"\n ----------- Store the following metrics in tests/functional_tests/test_results/${model_name}/{run_name}.json ----------")
+    print(f"\n ----------- Store the following metrics in tests/functional_tests/test_results/jet/{run_name}.json ----------")
     print(f"\n {str_train_metrics}", flush=True)
 
 if __name__ == '__main__':
