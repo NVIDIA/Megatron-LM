@@ -208,7 +208,7 @@ class GPTModel(LanguageModule):
         output_extra_state = sharded_state_dict.pop(f'{output_layer_prefix}_extra_state', None)
 
         assert (
-            output_extra_state.data
+            not output_extra_state.data
         ), f'Expected output layer extra state to be empty, got: {output_extra_state}'
 
         assert (
