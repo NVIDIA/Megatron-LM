@@ -129,3 +129,21 @@ echo "--------------------------------------------------------------------------
 
 echo "$command" > $SCRIPTS_DIR/pretrain_t5_distributed_command.sh
 eval $command
+
+echo "Saving test results to $TENSORBOARD_DIR"
+python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $TENSORBOARD_DIR "$JOB_NAME" | \
+    tee ${TENSORBOARD_DIR}/results.json
+
+if [[ $SKIP_PYTEST != 1 ]]; then
+    echo "-----------------------------------------------------------------------------"
+    if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
+        echo "Running pytest 1st vs 2nd run comparison"
+        export LOGS_DIR=$TENSORBOARD_DIR
+        pytest ./tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py
+    else
+        echo "Running pytest checks against golden values"
+        export EXPECTED_METRICS_FILE="./tests/functional_tests/test_results/jet/${JOB_NAME}.json"
+        export LOGS_DIR=$TENSORBOARD_DIR
+        pytest ./tests/functional_tests/python_test_utils/test_ci_pipeline.py
+    fi
+fi

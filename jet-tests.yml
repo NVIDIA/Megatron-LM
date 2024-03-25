@@ -63,7 +63,7 @@ jet-trigger:
     JET_WORKLOADS_FILTER: "$_JET_FILTER"
 
 
-jet-functional-results:
+jet-results-summary:
   stage: jet
   image: gitlab-master.nvidia.com:5005/dl/jet/api:latest
   tags:
@@ -80,15 +80,3 @@ jet-functional-results:
     - if: $JET_CUSTOM_FILTER != "" && $CI_PIPELINE_SOURCE != 'merge_request_event'
       when: always
     - when: never
-
-jet-compare-metrics:
-  extends: .jet_common
-  image: gitlab-master.nvidia.com:5005/dl/jet/api:latest
-  tags:
-    - os/linux
-  needs: [ jet-functional-results ]
-  before_script:
-    - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $CI_JOB_JWT
-  script:
-    - python -m pip install -U --no-cache-dir pytest tensorboard
-    - python tests/functional_tests/python_test_utils/jet_test_pipeline.py ${CI_PIPELINE_ID} --test metrics
