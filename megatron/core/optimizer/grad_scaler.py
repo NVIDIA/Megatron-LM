@@ -70,7 +70,7 @@ class DynamicGradScaler(MegatronGradScaler):
         """
         Grad scaler with dynamic scale that gets adjusted during training.
 
-        Arguments:
+        Args:
             initial_scale (float): Initial loss scale value.
             min_scale (float): Minimum loss scale value.
             growth_factor (float): Factor to grow loss scale by if NaNs are not seen in `growth_interval`

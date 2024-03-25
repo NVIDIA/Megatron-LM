@@ -46,7 +46,7 @@ def bert_position_ids(token_ids):
 class BertLMHead(MegatronModule):
     """Masked LM head for Bert
 
-    Arguments:
+    Args:
         config: TransformerConfig object
         mpu_vocab_size: model parallel size of vocabulary.
         parallel_output: whether output logits being distributed or not.

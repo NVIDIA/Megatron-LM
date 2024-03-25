@@ -24,7 +24,7 @@ class VitMlpHead(MegatronModule):
     Pool hidden states of a specific token (for example start of the
     sequence) and add a linear transformation followed by a tanh.
 
-    Arguments:
+    Args:
         hidden_size: hidden size
         init_method: weight initialization method for the linear layer.
             bias is set to zero.

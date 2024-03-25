@@ -36,7 +36,7 @@ class Bucket:
     when params in the bucket have grads ready to be synced; an asynchronous communication call
     is automatically launched when _all_ params in the bucket have grads ready.
 
-    Arguments:
+    Args:
         params: List of parameters whose gradients are collated in this bucket.
         param_data: View in larger ParamAndGradBuffer.param_data that this bucket is responsible for.
         grad_data: View in larger ParamAndGradBuffer.grad_data that this bucket is responsible for.
@@ -183,7 +183,7 @@ class ParamAndGradBuffer:
     Groups parameters and gradients into a contiguous buffer, and then breaks the buffer into
     buckets with roughly `bucket_size` parameters each.
 
-    Arguments:
+    Args:
         param_dtype: Type of param tensor.
         grad_dtype: Type of grad tensor.
         params: List of parameters whose parameters and gradients are collated in the underlying

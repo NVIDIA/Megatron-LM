@@ -103,7 +103,7 @@ class FusedScaleMaskSoftmax(nn.Module):
     """
     fused operation: scaling + mask + softmax
 
-    Arguments:
+    Args:
         input_in_fp16: flag to indicate if input in fp16 data format.
         input_in_bf16: flag to indicate if input in bf16 data format.
         attn_mask_type: attention mask type (pad or causal)

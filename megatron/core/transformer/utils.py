@@ -117,7 +117,7 @@ def make_sharded_object_for_checkpoint(
 ):
     """ Helper for instantiating a non-sharded ShardedObject (replicated across TP and DP group).
 
-    Arguments:
+    Args:
         obj (object): any object to be sharded
         key (str): unique identifier of the object
         sharded_offsets (Iterable[Tuple[int, int, int]]): offsets normally

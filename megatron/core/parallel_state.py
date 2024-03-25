@@ -80,7 +80,7 @@ _GLOBAL_MEMORY_BUFFER = None
 def get_nccl_options(pg_name, nccl_comm_cfgs):
     """Set the NCCL process group options.
 
-    Arguments:
+    Args:
         pg_name (str): process group name
         nccl_comm_cfgs (dict): nccl communicator configurations
 
@@ -109,7 +109,7 @@ def initialize_model_parallel(
 ) -> None:
     """Initialize model data parallel groups.
 
-    Arguments:
+    Args:
         tensor_model_parallel_size (int, default = 1):
             The number of GPUs to split individual tensors across.
 

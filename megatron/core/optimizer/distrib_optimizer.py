@@ -163,7 +163,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         that this rank "owns" (the dp_rank'th shard of each bucket, where each
         shard is 1/dp_world_size of the bucket).
 
-        Arguments:
+        Args:
             param_and_grad_buffer (ParamAndGradBuffer): buffer to build mapping for.
         """
         return {
@@ -367,7 +367,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         param indexes and main parameter shard indexes. This method also updates the optimizer
         parameter groups with the newly created shards.
 
-        Arguments:
+        Args:
             optimizer (torch.optim.Optimizer): base optimizer such as Adam or SGD.
             config (OptimizerConfig): configuration object for optimizer.
             grad_scaler (MegatronGradScaler): used for scaling gradients. Note that
@@ -742,7 +742,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def save_parameter_state(self, filename: str):
         """Save the distributed parameter state on DP rank 0.
 
-        Arguments:
+        Args:
             filename (str): path to save parameter state to.
         """
 
@@ -929,7 +929,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def load_parameter_state(self, filename: str):
         """Load the distributed parameter state from disk.
 
-        Arguments:
+        Args:
             filename (str): path to load parameter state from.
         """
         state_dict = None
@@ -945,7 +945,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         memory optimization to reduce fragmentation; in the case of
         set_to_none==True, the space used by this field can be safely deallocated.
 
-        Arguments:
+        Args:
             set_to_none (bool): if true, set grads to None.
         """
         for groups in (
@@ -1069,7 +1069,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         Finishes all necessary param syncs for the model_index'th model chunk.
 
-        Arguments:
+        Args:
             model_index (int): index of model chunk to synchronize params.
         """
         if model_index not in self.model_index_to_all_gather_handle_index_map:

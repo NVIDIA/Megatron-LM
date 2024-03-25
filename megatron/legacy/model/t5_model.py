@@ -39,7 +39,7 @@ def t5_position_ids(token_ids):
 class T5LMHead(MegatronModule):
     """Masked LM head for T5
 
-    Arguments:
+    Args:
         mpu_vocab_size: model parallel size of vocabulary.
         parallel_output: wether output logits being distributed or not.
     """

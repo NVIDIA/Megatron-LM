@@ -85,7 +85,8 @@ class RampupBatchsizeNumMicroBatches(NumMicroBatchesCalculator):
         increment batch size from start-batch-size to global-batch-size using
           rampup-samples / steps
         samples.
-        Arguments:
+
+        Args:
             start_batch_size: global batch size to start with
             batch_size_increment: global batch size increments
             ramup_samples: number of samples to use ramp up global
