@@ -278,7 +278,8 @@ def get_batch_on_this_tp_rank(data_iterator):
     args = get_args()
 
     def _broadcast(item):
-       torch.distributed.broadcast(item, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group())
+       if item is not None:
+           torch.distributed.broadcast(item, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group())
 
     if mpu.get_tensor_model_parallel_rank() == 0:
 
@@ -291,7 +292,7 @@ def get_batch_on_this_tp_rank(data_iterator):
            'tokens': data["tokens"].cuda(non_blocking = True),
            'labels': data["labels"].cuda(non_blocking = True),
            'loss_mask': data["loss_mask"].cuda(non_blocking = True),
-           'attention_mask': data["attention_mask"].cuda(non_blocking = True),
+           'attention_mask': None if "attention_mask" not in data else data["attention_mask"].cuda(non_blocking = True),
            'position_ids': data["position_ids"].cuda(non_blocking = True)
        }
 
@@ -317,7 +318,12 @@ def get_batch_on_this_tp_rank(data_iterator):
        tokens=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
        labels=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
        loss_mask=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.float32 , device = torch.cuda.current_device())
-       attention_mask=torch.empty((args.micro_batch_size,1,args.seq_length,args.seq_length), dtype = torch.bool , device = torch.cuda.current_device())
+       if args.create_attention_mask_in_dataloader:
+           attention_mask=torch.empty(
+                (args.micro_batch_size,1,args.seq_length,args.seq_length), dtype = torch.bool , device = torch.cuda.current_device()
+            )
+       else:
+           attention_mask=None
        position_ids=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
 
        if args.pipeline_model_parallel_size == 1:

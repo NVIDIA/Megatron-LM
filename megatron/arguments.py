@@ -1402,6 +1402,9 @@ def _add_data_args(parser):
                        'end-of-document token.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
+    group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
+                       help='If set, do not create attention_masks in dataloader.',
+                       dest='create_attention_mask_in_dataloader')
 
     return parser
 
