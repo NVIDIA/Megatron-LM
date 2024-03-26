@@ -4,13 +4,12 @@ import functools
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
 from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
 from megatron.core.datasets.utils import Split, log_single_rank, normalize
-from megatron.core.parallel_state import get_virtual_pipeline_model_parallel_rank
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +19,6 @@ class BlendedMegatronDatasetConfig:
     """Configuration object for Megatron Core datasets
 
     Args:
-        is_built_on_rank (Callable): A callable which returns True if the dataset should be built on the current rank. It should be Megatron Core parallelism aware i.e. global rank, group rank, and virtual rank may inform its return value.
-
         random_seed (int): The seed for all RNG during dataset creation.
 
         sequence_length (int): The sequence length.
@@ -42,8 +39,6 @@ class BlendedMegatronDatasetConfig:
 
         tokenizer (Optional[MegatronTokenizer]): The MegatronTokenizer instance or None. Required for datasets which do online tokenization.
     """
-
-    is_built_on_rank: Callable
 
     random_seed: int
 
@@ -68,14 +63,6 @@ class BlendedMegatronDatasetConfig:
     def __post_init__(self) -> None:
         """Do asserts and set fields post init
         """
-        if torch.distributed.is_initialized():
-            gb_rank = torch.distributed.get_rank()
-            vp_rank = get_virtual_pipeline_model_parallel_rank()
-            if gb_rank == 0 and (vp_rank == 0 or vp_rank is None):
-                assert (
-                    self.is_built_on_rank()
-                ), "is_built_on_rank must return True when global rank = 0 and vp rank = 0"
-
         log_single_rank(logger, logging.INFO, f"mock = {self.mock}")
 
         if not self.mock:

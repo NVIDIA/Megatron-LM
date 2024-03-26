@@ -19,7 +19,6 @@ def sample_N(dataset, N, randomize):
 
 def test_builder_mock_data():
     config = GPTDatasetConfig(
-        is_built_on_rank=lambda: True,
         random_seed=1234,
         sequence_length=1024,
         mock=True,
@@ -29,7 +28,7 @@ def test_builder_mock_data():
         tokenizer=SimpleNamespace(),
     )
 
-    datasets = BlendedMegatronDatasetBuilder(MockGPTDataset, [100, 100, 100], config).build()
+    datasets = BlendedMegatronDatasetBuilder(MockGPTDataset, [100, 100, 100], lambda: True, config).build()
 
     N = 10
 

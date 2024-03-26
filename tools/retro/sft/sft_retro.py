@@ -232,7 +232,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         config_cls = JsonQADatasetConfig
 
     config = config_cls(
-        is_built_on_rank=is_dataset_built_on_rank,
         random_seed=args.seed,
         sequence_length=args.seq_length,
         blend_per_split=blend_per_split,
@@ -254,6 +253,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         dataset_cls,
         train_val_test_num_samples,
+        is_dataset_built_on_rank,
         config
     ).build()
     print_rank_0("> finished creating GPT datasets ...")

@@ -149,7 +149,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     tokenizer = get_tokenizer()
 
     config = BERTMaskedWordPieceDatasetConfig(
-        is_built_on_rank=lambda: mpu.get_tensor_model_parallel_rank() == 0,
         random_seed=args.seed,
         sequence_length=args.seq_length,
         blend=args.data_path,
@@ -178,6 +177,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         BERTMaskedWordPieceDataset,
         train_val_test_num_samples,
+        lambda: mpu.get_tensor_model_parallel_rank() == 0,
         config,
     ).build()
 
