@@ -79,7 +79,7 @@ class AbstractModelInferenceWrapper:
 
     def _allocate_recv_buffer(self, batch_size, seq_len):
         """Receive happens between the layers with size [seq_len, batch_size, hidden_size]."""
-        recv_size = (batch_size, seq_len, self.args.hidden_size)
+        recv_size = (seq_len, batch_size, self.args.hidden_size)
         dtype = torch.float if self.args.fp32_residual_connection else self.args.params_dtype
         return torch.empty(recv_size, dtype=dtype, device=torch.cuda.current_device())
 
@@ -99,9 +99,6 @@ class AbstractModelInferenceWrapper:
 
         tokens, position_ids, attention_mask = inference_input
         batch_size, seq_len = tokens.shape
-        print(
-            f'SHAN : GPU : {torch.distributed.get_rank()} COMING IN FOR TOKENS SHPE {tokens.shape}'
-        )
         recv_buffer = None
         if not self.is_pipeline_first_stage:
             recv_buffer = self._allocate_recv_buffer(batch_size, seq_len)
@@ -115,9 +112,7 @@ class AbstractModelInferenceWrapper:
             send_to_next_pipeline_rank(output_tensor)
 
         self.inference_params.sequence_len_offset += seq_len
-        print(
-            f'SHAN : GPU : {torch.distributed.get_rank()} COMING IN FOR TOKENS SHPE {tokens.shape}'
-        )
+
         logits = None
         if self.is_pipeline_last_stage:
             logits = output_tensor
@@ -215,6 +210,6 @@ class AbstractModelInferenceWrapper:
                 )
             else:
                 # If input batch is very small we can do a simple forward pass on the entire global batch
-                self.forward_pass_with_pipeline_parallel_small_input(inference_input)
+                return self.forward_pass_with_pipeline_parallel_small_input(inference_input)
         else:
             return self.forward_pass_without_pipeline_parallel(inference_input)

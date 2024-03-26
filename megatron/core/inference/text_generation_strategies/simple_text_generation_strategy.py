@@ -4,7 +4,6 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
-from megatron.core.datasets.gpt_dataset import _get_ltor_masks_and_position_ids
 from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.communication_utils import (
     copy_from_last_to_first_pipeline_stage,

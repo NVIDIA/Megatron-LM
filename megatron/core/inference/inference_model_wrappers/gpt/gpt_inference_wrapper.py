@@ -14,7 +14,7 @@ class GPTInferenceWrapper(AbstractModelInferenceWrapper):
     def __init__(self, model: Union[GPTModel, megatron.model.GPTModel], args: Namespace):
         """Constructor for the model inference wrapper
 
-        The wrapper is in charge of preparing the model for inference, providing the required in put data and running the forward pass
+        The wrapper is in charge of preparing the model for inference, providing the required in put data and running the forward passf
 
         Args:
             model (Union[GPTModel, megatron.model.GPTModel]): The actual GPT model (MCore or MLM)
@@ -31,7 +31,7 @@ class GPTInferenceWrapper(AbstractModelInferenceWrapper):
             prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_seq_len]
         """
 
-        super().prep_model_for_inference()
+        super().prep_model_for_inference(prompts_tokens=prompts_tokens)
         self.attention_mask, self.position_ids = self._build_attention_mask_and_position_ids(
             prompts_tokens
         )
