@@ -12,6 +12,8 @@ import torch.distributed as dist
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, is_main_replica
+from megatron.core.dist_checkpointing.serialization import \
+    validate_sharding_integrity
 from megatron.core.dist_checkpointing.strategies.base import SaveShardedStrategy
 
 logger = logging.getLogger(__name__)
@@ -87,12 +89,15 @@ class FullyParallelSaveStrategyWrapper(SaveShardedStrategy):
             precomputed_distribution = determine_main_replica_uniform_distribution(
                 sharded_state_dict, self.parallelization_group
             )
-            if self.do_cache_distribution:
-                self.cached_distribution = precomputed_distribution
 
         distribute_main_replicas_with_precomputed_distribution(
             sharded_state_dict, self.parallelization_group, precomputed_distribution
         )
+        if self.cached_distribution is None:
+            # First time applying the parallelization
+            validate_sharding_integrity(nested_values(sharded_state_dict))
+        if self.do_cache_distribution:
+            self.cached_distribution = precomputed_distribution
 
     @property
     def can_handle_sharded_objects(self):
