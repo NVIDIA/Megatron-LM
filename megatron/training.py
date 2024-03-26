@@ -65,6 +65,7 @@ def num_floating_point_operations(args, batch_size):
         args.num_query_groups = args.num_attention_heads
     # MoE.
     num_experts_routed_to = 1 if args.num_experts is None else args.moe_router_topk
+    gated_linear_multiplier = 3 / 2 if args.swiglu else 1
     return (
         12
         * batch_size
@@ -74,7 +75,11 @@ def num_floating_point_operations(args, batch_size):
         * args.hidden_size
         * (
             1
-            + ((args.ffn_hidden_size / args.hidden_size) * num_experts_routed_to)
+            + (
+                (args.ffn_hidden_size / args.hidden_size)
+                * num_experts_routed_to
+                * gated_linear_multiplier
+            )
             + (args.num_query_groups / args.num_attention_heads)
             + (args.seq_length / args.hidden_size)
             + (args.padded_vocab_size / (2 * args.num_layers * args.hidden_size))
