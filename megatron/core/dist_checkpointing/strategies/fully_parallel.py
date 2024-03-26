@@ -39,7 +39,7 @@ class FullyParallelSaveStrategyWrapper(SaveShardedStrategy):
         self,
         strategy: SaveShardedStrategy,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
-        do_cache_distribution: bool = True,
+        do_cache_distribution: bool = False,
     ):
         """ Initializes the wrapper.
 

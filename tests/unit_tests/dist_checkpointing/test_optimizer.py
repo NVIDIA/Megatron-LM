@@ -162,7 +162,8 @@ class TestDistributedOptimizer:
                     if use_fpsl:
                         save_strategy = FullyParallelSaveStrategyWrapper(
                             save_strategy,
-                            parallel_state.get_data_parallel_group(with_context_parallel=True)
+                            parallel_state.get_data_parallel_group(with_context_parallel=True),
+                            True
                         )
                     save(optimizer_A.sharded_state_dict(model[0].sharded_state_dict()), ckpt_dir, save_strategy)
                     optim_param_state_A = optimizer_A.get_parameter_state_dp_zero()

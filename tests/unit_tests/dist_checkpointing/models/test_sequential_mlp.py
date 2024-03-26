@@ -75,7 +75,8 @@ class TestSequentialMLPReconfiguration:
             if use_fpsl:
                 save_strategy = FullyParallelSaveStrategyWrapper(
                     save_strategy,
-                    parallel_state.get_data_parallel_group(with_context_parallel=True)
+                    parallel_state.get_data_parallel_group(with_context_parallel=True),
+                    True
                 )
             save(sharded_state_dict, ckpt_dir_A, save_strategy)
             Utils.destroy_model_parallel()

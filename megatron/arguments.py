@@ -1123,6 +1123,10 @@ def _add_checkpointing_args(parser):
                        help='Apply full save parallelization across DP for'
                             ' distributed checkpoints. Depending on ckpt format'
                             ' might increase number of files in the checkpoint.')
+    group.add_argument('--ckpt-assume-constant-structure', action='store_true',
+                       help='If the model and optimizer state dict structure is'
+                            'constant throughout the training, it allows for'
+                            'different checkpointing performance optimizations.')
 
     return parser
 

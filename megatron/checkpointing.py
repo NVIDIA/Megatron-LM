@@ -312,10 +312,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
                 if checkpointing_context is not None and 'save_strategy' in checkpointing_context:
                     save_strategy = checkpointing_context['save_strategy']
                     # Already saved once before - don't need to rerun sharding validation
-                    validate_sharding_integrity = False
+                    validate_sharding_integrity = not args.ckpt_assume_constant_structure
                 else:
                     save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, *save_strategy)
-                    save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, mpu.get_data_parallel_group(with_context_parallel=True))
+                    save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, mpu.get_data_parallel_group(with_context_parallel=True),
+                                                                     args.ckpt_assume_constant_structure)
                     if checkpointing_context is not None:
                         checkpointing_context['save_strategy'] = save_strategy
             dist_checkpointing.save(state_dict, checkpoint_name, save_strategy,
