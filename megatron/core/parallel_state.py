@@ -3,6 +3,7 @@
 """Model and data parallel groups."""
 
 import os
+import warnings
 from datetime import timedelta
 from typing import Optional
 
@@ -512,6 +513,18 @@ def initialize_model_parallel(
 def is_initialized():
     """Useful for code segments that may be accessed with or without mpu initialization"""
     return _DATA_PARALLEL_GROUP is not None
+
+
+def is_unitialized() -> bool:
+    """Check if parallel state has been initialized
+
+    Deprecated. Use is_initialized instead.
+
+    """
+    warnings.warn(
+        "is_unitialized is deprecated, use is_initialized instead", DeprecationWarning,
+    )
+    return not is_initialized()
 
 
 def model_parallel_is_initialized():
