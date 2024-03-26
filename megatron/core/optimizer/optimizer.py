@@ -690,6 +690,21 @@ class FP32Optimizer(MegatronOptimizer):
     def load_state_dict(self, state_dict):
         self.optimizer.load_state_dict(state_dict)
 
+    def sharded_state_dict(
+        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
+    ):
+        if is_loading:
+            self.init_state_fn(self.optimizer)
+
+        state_dict = self.state_dict()
+        id_to_sharded_param_map = get_param_id_to_sharded_param_map(
+            model_sharded_state_dict, self.get_parameters()
+        )
+        optim_state_to_sharding_state(state_dict, id_to_sharded_param_map)
+
+        return state_dict
+
+
 
 class ProxyDict:
     """
