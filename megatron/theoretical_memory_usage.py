@@ -5,7 +5,6 @@
 
 import math
 
-
 NUM_BYTES_IN_MEGABYTE = 1024 * 1024
 
 
@@ -15,6 +14,7 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
         args.num_query_groups = args.num_attention_heads
     # MoE.
     num_experts = 1 if args.num_experts is None else args.num_experts
+    gated_linear_multiplier = 3 / 2 if args.swiglu else 1
     num_parameters_in_transformer_layers = (
         2
         * args.num_layers
@@ -22,7 +22,7 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
         * args.hidden_size
         * (
             1
-            + ((args.ffn_hidden_size / args.hidden_size) * num_experts)
+            + ((args.ffn_hidden_size / args.hidden_size) * num_experts * gated_linear_multiplier)
             + (args.num_query_groups / args.num_attention_heads)
             + (2 / args.hidden_size)
             + (1 / (args.num_layers * args.hidden_size))
