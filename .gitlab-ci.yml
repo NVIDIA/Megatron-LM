@@ -2,6 +2,8 @@ workflow:
   rules:
     # always run MR pipelines
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    # always run web pipelines
+    - if: $CI_PIPELINE_SOURCE == "web"
     # do not run branch pipelines if open MR exists
     - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
       when: never
@@ -47,8 +49,121 @@ unit_tests:
       - coverage
     expire_in: 30 days
   rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+unit_tests-data:
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
+  tags:
+    - 8xL40S
+  stage: test
+  script:
+    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/data
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
     - when: always
 
+unit_tests-dist-checkpointing:
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
+  tags:
+    - 8xL40S
+  stage: test
+  script:
+    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/dist_checkpointing
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: always
+  
+unit_tests-fusions:
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
+  tags:
+    - 8xL40S
+  stage: test
+  script:
+    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/fusions
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: always
+  
+unit_tests-models:
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
+  tags:
+    - 8xL40S
+  stage: test
+  script:
+    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/models
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: always
+  
+unit_tests-pipeline-parallel:
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
+  tags:
+    - 8xL40S
+  stage: test
+  script:
+    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/pipeline_parallel
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: always
+  
+unit_tests-tensor-parallel:
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
+  tags:
+    - 8xL40S
+  stage: test
+  script:
+    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/tensor_parallel
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: always
+  
+unit_tests-transformer:
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
+  tags:
+    - 8xL40S
+  stage: test
+  script:
+    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/transformer
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: always
+  
+unit_tests-top-py:
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
+  tags:
+    - 8xL40S
+  stage: test
+  script:
+    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/*.py
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: always
+  
 docs_build_test:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/python-format:0.0.1
   stage: test
