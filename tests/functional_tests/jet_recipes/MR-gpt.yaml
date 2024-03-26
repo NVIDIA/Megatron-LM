@@ -26,7 +26,7 @@ spec:
   precision: bf16
   time_limit: 1200
   artifacts: {/workspace/data/gpt3_data: text/the_pile/shard00}
-  ckpt_format: torch
+  ckpt_format: torch_dist
   checkpoint_resume_test: 1
   script: |-
     ls
