@@ -6,20 +6,20 @@ from functools import partial
 import sys
 import torch
 
-from megatron import get_args, get_num_microbatches
-from megatron import print_rank_0
-from megatron import get_timers
+from megatron.training import get_args, get_num_microbatches
+from megatron.training import print_rank_0
+from megatron.training import get_timers
 from megatron.core import mpu
 from megatron.core.enums import ModelType
-from megatron.checkpointing import load_checkpoint
-from megatron.checkpointing import save_checkpoint
+from megatron.training.checkpointing import load_checkpoint
+from megatron.training.checkpointing import save_checkpoint
 from megatron.training import evaluate_and_print_results
 from megatron.training import setup_model_and_optimizer
 from megatron.training import train_step
 from megatron.training import training_log
-from megatron.utils import average_losses_across_data_parallel_group
-from megatron.utils import calc_params_l2_norm
-from megatron.utils import check_adlr_autoresume_termination
+from megatron.training.utils import average_losses_across_data_parallel_group
+from megatron.training.utils import calc_params_l2_norm
+from megatron.training.utils import check_adlr_autoresume_termination
 
 
 def process_batch(batch):

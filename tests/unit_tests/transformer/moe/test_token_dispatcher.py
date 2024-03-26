@@ -6,7 +6,7 @@ import torch
 
 from megatron.core.transformer.moe.router import Router, TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import MoEDroplessTokenDispatcher
-from megatron.initialize import _set_random_seed
+from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.transformer.transformer_config import TransformerConfig
 

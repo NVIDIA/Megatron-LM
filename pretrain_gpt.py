@@ -5,33 +5,33 @@ import os
 import torch
 from functools import partial
 from typing import Union
-from megatron import get_args
-from megatron import print_rank_0
-from megatron import get_timers
-from megatron import get_tokenizer
+from megatron.training import get_args
+from megatron.training import print_rank_0
+from megatron.training import get_timers
+from megatron.training import get_tokenizer
 from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
-import megatron.model
+import megatron.legacy.model
 from megatron.core.models.gpt import GPTModel
 from megatron.training import pretrain
 from megatron.core.transformer.spec_utils import import_module
-from megatron.utils import (
+from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     average_losses_across_data_parallel_group
 )
-from megatron.arguments import core_transformer_config_from_args
-from megatron.yaml_arguments import core_transformer_config_from_yaml
+from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
 
 
-def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.model.GPTModel]:
+def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
     """Builds the model.
 
     If you set the use_mcore_models to True, it will return the mcore GPT model and if not the legacy GPT model.
@@ -42,7 +42,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
 
 
     Returns:
-        Union[GPTModel, megatron.model.GPTModel]: The returned model
+        Union[GPTModel, megatron.legacy.model.GPTModel]: The returned model
     """
     args = get_args()
     use_te = args.transformer_impl == "transformer_engine"
@@ -79,7 +79,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
     else:
         assert(args.context_parallel_size == 1), "Context parallelism is only supported with Megatron Core!"
 
-        model = megatron.model.GPTModel(
+        model = megatron.legacy.model.GPTModel(
             config,
             num_tokentypes=0,
             parallel_output=True,

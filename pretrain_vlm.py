@@ -5,8 +5,8 @@ from functools import partial
 
 import torch
 
-from megatron import get_args, get_timers, get_tokenizer, print_rank_0
-from megatron.arguments import core_transformer_config_from_args
+from megatron.training import get_args, get_timers, get_tokenizer, print_rank_0
+from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core import tensor_parallel
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.multimodal_dataset import MockMultimodalDataset, MultimodalDatasetConfig

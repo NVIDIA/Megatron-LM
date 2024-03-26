@@ -11,7 +11,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir)))
 import time
 import torch
-from megatron.tokenizer import build_tokenizer
+from megatron.training.tokenizer import build_tokenizer
 from megatron.core.datasets import indexed_dataset
 
 

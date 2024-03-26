@@ -6,7 +6,7 @@ import os
 import typing as T
 from types import SimpleNamespace
 
-from megatron.arguments import load_retro_config, parse_args, validate_args
+from megatron.training.arguments import load_retro_config, parse_args, validate_args
 from megatron.core.datasets.retro.db.dataset import DBDataset
 from megatron.core.datasets.retro.db.utils import (
     get_indexed_dataset_infos as get_db_indexed_dataset_infos,

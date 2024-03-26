@@ -34,13 +34,13 @@ def _load_checkpoint(queue, args):
         sys.path.insert(0, args.megatron_path)
 
     try:
-        from megatron.arguments import parse_args, validate_args
-        from megatron.global_vars import set_args, set_global_variables
-        from megatron.checkpointing import load_args_from_checkpoint, load_checkpoint
-        from megatron.model import module
+        from megatron.training.arguments import parse_args, validate_args
+        from megatron.training.global_vars import set_args, set_global_variables
+        from megatron.training.checkpointing import load_args_from_checkpoint, load_checkpoint
+        from megatron.legacy.model import module
         from megatron.core import mpu
         from megatron.core.enums import ModelType
-        from megatron import fused_kernels
+        from megatron.training import fused_kernels
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
         queue.put("exit")

@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from megatron.core.transformer.moe.router import Router
-from megatron.initialize import _set_random_seed
+from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.moe.moe_layer import MoELayer

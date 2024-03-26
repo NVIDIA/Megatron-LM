@@ -9,16 +9,16 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from megatron import get_args
-from megatron import print_rank_0
-from megatron import get_timers
+from megatron.training import get_args
+from megatron.training import print_rank_0
+from megatron.training import get_timers
 from megatron.core import mpu
 from megatron.core.enums import ModelType
-from megatron.data.biencoder_dataset_utils import get_ict_batch
-from megatron.data.dataset_utils import build_train_valid_test_datasets
-from megatron.model.biencoder_model import biencoder_model_provider
+from megatron.legacy.data.biencoder_dataset_utils import get_ict_batch
+from megatron.legacy.data.dataset_utils import build_train_valid_test_datasets
+from megatron.legacy.model.biencoder_model import biencoder_model_provider
 from megatron.training import pretrain
-from megatron.utils import average_losses_across_data_parallel_group
+from megatron.training.utils import average_losses_across_data_parallel_group
 
 
 def pretrain_ict_model_provider(pre_process=True, post_process=True):

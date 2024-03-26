@@ -10,19 +10,19 @@ import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir, os.path.pardir)))
-from megatron import get_args
-from megatron import get_timers
-from megatron import get_tokenizer
-from megatron import print_rank_0
+from megatron.training import get_args
+from megatron.training import get_timers
+from megatron.training import get_tokenizer
+from megatron.training import print_rank_0
 from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.blended_megatron_dataset_config import GPTDatasetConfig
 from megatron.core.datasets.gpt_dataset import GPTDataset
-from megatron.model import GPTModel
+from megatron.legacy.model import GPTModel
 from megatron.core.enums import ModelType
 from megatron.training import pretrain
-from megatron.utils import get_ltor_masks_and_position_ids
-from megatron.utils import average_losses_across_data_parallel_group
+from megatron.training.utils import get_ltor_masks_and_position_ids
+from megatron.training.utils import average_losses_across_data_parallel_group
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""

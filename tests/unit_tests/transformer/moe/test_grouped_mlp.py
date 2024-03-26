@@ -5,13 +5,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from megatron.arguments import parse_args
+from megatron.training.arguments import parse_args
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.initialize import _set_random_seed
-from megatron.model import Float16Module
+from megatron.training.initialize import _set_random_seed
+from megatron.legacy.model import Float16Module
 from tests.unit_tests.test_utilities import Utils
 
 DEVICE_CAPABILITY = None

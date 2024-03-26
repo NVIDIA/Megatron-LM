@@ -5,11 +5,11 @@
 from functools import partial
 import torch
 
-from megatron import get_args
-from megatron import get_timers
-from megatron import get_tokenizer
-from megatron import print_rank_0
-from megatron.arguments import core_transformer_config_from_args
+from megatron.training import get_args
+from megatron.training import get_timers
+from megatron.training import get_tokenizer
+from megatron.training import print_rank_0
+from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core import tensor_parallel
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.retro.query.retro_dataset import get_retro_datasets
@@ -18,7 +18,7 @@ from megatron.core.enums import ModelType
 from megatron.core.models.retro import get_retro_decoder_block_spec, RetroConfig, RetroModel
 from megatron.core.models.retro.utils import get_all_true_mask
 from megatron.training import pretrain
-from megatron.utils import get_ltor_masks_and_position_ids
+from megatron.training.utils import get_ltor_masks_and_position_ids
 from pretrain_gpt import (
     is_dataset_built_on_rank,
     loss_func,
@@ -64,7 +64,7 @@ def model_provider(pre_process=True, post_process=True):
     """Build the model.
 
     Select between two different model classes:
-      1. Default model (uses megatron/models/gpt_model.py).
+      1. Default model (uses megatron.legacy.models/gpt_model.py).
       2. Core model (uses megatron/core/models/retro/model.py).
     """
 
