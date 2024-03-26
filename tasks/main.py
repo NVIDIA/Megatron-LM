@@ -7,8 +7,8 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir)))
 
-from megatron import get_args
-from megatron.initialize import initialize_megatron
+from megatron.training import get_args
+from megatron.training.initialize import initialize_megatron
 
 
 def get_tasks_args(parser):

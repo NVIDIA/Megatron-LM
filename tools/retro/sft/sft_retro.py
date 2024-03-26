@@ -8,16 +8,16 @@ import sys, os
 
 sys.path.append(os.path.abspath(os.path.join(
     os.path.join(os.path.dirname(__file__), "../../../"))))
-from megatron import get_args, get_retro_args
-from megatron import print_rank_0
-from megatron import get_timers
-from megatron import get_tokenizer
+from megatron.training import get_args, get_retro_args
+from megatron.training import print_rank_0
+from megatron.training import get_timers
+from megatron.training import get_tokenizer
 from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.training import pretrain
-from megatron.utils import get_ltor_masks_and_position_ids
-from megatron.utils import average_losses_across_data_parallel_group
+from megatron.training.utils import get_ltor_masks_and_position_ids
+from megatron.training.utils import average_losses_across_data_parallel_group
 from pretrain_gpt import model_provider, is_dataset_built_on_rank
 from tools.retro.sft.dataset_conv import JsonQADataset, JsonQADatasetConfig, RetroJsonQADataset, RetroJsonQADatasetConfig
 

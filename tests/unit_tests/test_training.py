@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
-from megatron.global_vars import set_args
-from megatron.training import build_train_valid_test_data_iterators
+from megatron.training.global_vars import set_args
+from megatron.training.training import build_train_valid_test_data_iterators
 from tests.unit_tests.test_utilities import Utils
 
 

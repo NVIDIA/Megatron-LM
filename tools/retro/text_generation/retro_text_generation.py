@@ -8,11 +8,11 @@ from typing import Union
 
 sys.path.append(os.path.abspath(os.path.join(
     os.path.join(os.path.dirname(__file__), "../../../"))))
-from megatron import get_args, get_retro_args
-from megatron import print_rank_0
-from megatron import get_tokenizer
-from megatron.checkpointing import load_checkpoint
-from megatron.initialize import initialize_megatron
+from megatron.training import get_args, get_retro_args
+from megatron.training import print_rank_0
+from megatron.training import get_tokenizer
+from megatron.training.checkpointing import load_checkpoint
+from megatron.training.initialize import initialize_megatron
 from megatron.core.models.gpt import GPTModel
 from megatron.training import get_model
 from tools.retro.text_generation.retro_api import retro_generate_and_post_process
@@ -20,12 +20,12 @@ from tools.retro.sft.sft_retro import get_tasks_args
 from tools.retro.sft.dataset_conv import reformat_prompt, preprocess, reformat_prompt_short
 import numpy as np
 import time
-import megatron.model
-from megatron.arguments import core_transformer_config_from_args
+import megatron.legacy.model
+from megatron.training.arguments import core_transformer_config_from_args
 
 
 
-def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.model.GPTModel]:
+def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
     """Builds the model.
 
     If you set the use_mcore_models to True, it will return the mcore GPT model and if not the legacy GPT model.
@@ -36,13 +36,13 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
 
 
     Returns:
-        Union[GPTModel, megatron.model.GPTModel]: The returned model
+        Union[GPTModel, megatron.legacy.model.GPTModel]: The returned model
     """
     print_rank_0('building GPT model ...')
     config = core_transformer_config_from_args(get_args())
 
     # not support core model yet
-    model = megatron.model.GPTModel(
+    model = megatron.legacy.model.GPTModel(
         config,
         num_tokentypes=0,
         parallel_output=False,

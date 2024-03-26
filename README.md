@@ -157,7 +157,7 @@ The [`examples/pretrain_bert.sh`](./examples/pretrain_bert.sh) script runs singl
 
 The logging, checkpoint-saving, and evaluation interval options are specified. Note that the `--data-path` now includes the additional `_text_sentence` suffix added in preprocessing, but does not include the file extensions.
 
-Further command line arguments are described in the source file [`arguments.py`](./megatron/arguments.py).
+Further command line arguments are described in the source file [`arguments.py`](./megatron/training/arguments.py).
 
 To run `examples/pretrain_bert.sh`, make any desired modifications including setting the environment variables for `CHECKPOINT_PATH`, `VOCAB_FILE`, and `DATA_PATH`. Make sure to set these variables to their paths in the container. Then launch the container with Megatron and necessary paths mounted (as explained in [Setup](#setup)) and run the example script.
 
@@ -167,7 +167,7 @@ The `examples/pretrain_gpt.sh` script runs single GPU 345M parameter GPT pretrai
 
 It follows largely the same format as the previous BERT script with a few notable differences: the tokenization scheme used is BPE (which requires a merge table and a `json` vocabulary file) instead of WordPiece, the model architecture allows for longer sequences (note that the max position embedding must be greater than or equal to the maximum sequence length), and the `--lr-decay-style` has been set to cosine decay.  Note that the `--data-path` now includes the additional `_text_document` suffix added in preprocessing, but does not include the file extensions.
 
-Further command line arguments are described in the source file [`arguments.py`](./megatron/arguments.py).
+Further command line arguments are described in the source file [`arguments.py`](./megatron/training/arguments.py).
 
 `examples/pretrain_gpt.sh` can be launched the same way as described for BERT. Set the env vars and make any other modifications, launch the container with appropriate mounts, and run the script.
 
@@ -290,7 +290,7 @@ python preprocess_data.py \
     --workers 5  # works well for 10 CPU cores. Scale up accordingly.
 </pre>
 
-2. Use a custom samples mapping function in place of `megatron/data/realm_dataset_utils.get_block_samples_mapping` if required. To do this, you will need to implement a new function in C++ inside of `megatron/data/helpers.cpp`. The samples mapping data structure is used to select the data that will constitute every training sample in advance of the training loop.
+2. Use a custom samples mapping function in place of `megatron/legacy/data/realm_dataset_utils.get_block_samples_mapping` if required. To do this, you will need to implement a new function in C++ inside of `megatron/core/datasets/helpers.cpp`. The samples mapping data structure is used to select the data that will constitute every training sample in advance of the training loop.
  The samples mapping is responsible for holding all of the required metadata needed to construct the sample from one or more indexed datasets. In REALM, the samples mapping contains the start and end sentence indices, as well as the document index (to find the correct title for a body) and a unique ID for every block.
 3. Pretrain a BERT language model using `pretrain_bert.py`, with the sequence length equal to the block size in token ids. This model should be trained on the same indexed dataset that is used to supply the blocks for the information retrieval task.
 In REALM, this is an uncased bert base model trained with the standard hyperparameters.
@@ -384,7 +384,7 @@ You can also use CURL or any other tools to query the server directly:
 curl 'http://localhost:5000/api' -X 'PUT' -H 'Content-Type: application/json; charset=UTF-8'  -d '{"prompts":["Hello world"], "tokens_to_generate":1}'
 </pre>
 
-See [megatron/text_generation_server.py](megatron/text_generation_server.py) for more API options.
+See [megatron/inference/text_generation_server.py](megatron/inference/text_generation_server.py) for more API options.
 
 ### Detoxify GPT via Self-generation
 We include an example in `examples/detxoify_lm/` to detoxify language models by leveraging the generative power of language models.
@@ -531,10 +531,10 @@ The Llama-2 [family of models](https://ai.meta.com/llama/) are an open-source se
 The Llama-2 checkpoints can be loaded into Megatron for inference and finetuning. See documentation [here](docs/llama2.md).
 
 # Model Optimization and Deployment
-Megatron-Core (MCore) `GPTModel` family supports advanced quantization algorithms and high-performance deployment through TensorRT-LLM.
+Megatron-Core (MCore) `GPTModel` family supports advanced quantization algorithms and high-performance inference through TensorRT-LLM.
 
 ## Quantization and TensorRT-LLM Deployment
-See [Megatron Model Optimization and Deployment](examples/deploy/README.md) for `llama2` and `nemotron3` examples.
+See [Megatron Model Optimization and Deployment](examples/inference/README.md) for `llama2` and `nemotron3` examples.
 
 # Datasets
 We do not host any datasets for GPT or BERT training, however, we detail their collection so that our results may be reproduced.

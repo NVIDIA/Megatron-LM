@@ -4,16 +4,16 @@
 """Generation utilities."""
 import torch
 import torch.nn.functional as F
-from megatron import get_args, get_tokenizer
-from megatron import get_retro_args
+from megatron.training import get_args, get_tokenizer
+from megatron.training import get_retro_args
 from megatron.core import mpu
-from megatron.utils import get_ltor_masks_and_position_ids, unwrap_model
-from megatron.text_generation.communication import (
+from megatron.training.utils import get_ltor_masks_and_position_ids, unwrap_model
+from megatron.inference.text_generation.communication import (
     copy_from_last_to_first_pipeline_stage,
     broadcast_from_last_pipeline_stage,
     broadcast_from_last_to_first_pipeline_stage, broadcast_int_list, broadcast_tensor)
-from megatron.text_generation.generation import _build_attention_mask_and_position_ids
-from megatron.text_generation.sampling import sample
+from megatron.inference.text_generation.generation import _build_attention_mask_and_position_ids
+from megatron.inference.text_generation.sampling import sample
 
 
 

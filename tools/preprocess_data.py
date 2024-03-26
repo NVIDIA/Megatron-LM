@@ -20,7 +20,7 @@ try:
 except ImportError:
     nltk_available = False
 
-from megatron.tokenizer import build_tokenizer
+from megatron.training.tokenizer import build_tokenizer
 from megatron.core.datasets import indexed_dataset
 
 
