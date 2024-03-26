@@ -101,7 +101,6 @@ def get_gpt_chunk_datasets(config):
     for i in range(len(blend) - 1, -1, -2):
         blend[i] = os.path.join(data_dir, blend[i])
     data_config = MultiSplitGPTDatasetConfig(
-        is_built_on_rank=is_dataset_built_on_rank,
         random_seed=config.retro_gpt_seed,
         sequence_length=config.retro_gpt_seq_length,
         blend=blend,
@@ -123,6 +122,7 @@ def get_gpt_chunk_datasets(config):
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         MultiSplitGPTDataset,
         train_valid_test_num_samples,
+        is_dataset_built_on_rank,
         data_config,
     ).build()
 

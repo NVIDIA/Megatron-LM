@@ -194,7 +194,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples: int):
     tokenizer = get_tokenizer()
 
     config = T5MaskedWordPieceDatasetConfig(
-        is_built_on_rank=lambda: mpu.get_tensor_model_parallel_rank() == 0,
         random_seed=args.seed,
         sequence_length=args.encoder_seq_length,
         sequence_length_decoder=args.decoder_seq_length,
@@ -223,6 +222,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples: int):
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         T5MaskedWordPieceDataset,
         train_val_test_num_samples,
+        lambda: mpu.get_tensor_model_parallel_rank() == 0,
         config,
     ).build()
 

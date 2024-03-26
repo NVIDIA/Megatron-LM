@@ -105,6 +105,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     train_ds, _, test_ds = BlendedMegatronDatasetBuilder(
         GPTDataset,
         train_val_test_num_samples,
+        lambda: True,
         GPTDatasetConfig(
             blend=args.data_path,
             split=args.split,
@@ -119,6 +120,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     _, valid_ds, _ = BlendedMegatronDatasetBuilder(
         GPTDataset,
         train_val_test_num_samples,
+        lambda: True,
         GPTDatasetConfig(
             blend=args.data_path2,
             split="98,2,0",

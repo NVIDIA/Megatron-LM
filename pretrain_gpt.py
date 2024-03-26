@@ -167,7 +167,6 @@ def core_gpt_dataset_config_from_args(args):
     tokenizer = get_tokenizer()
 
     return GPTDatasetConfig(
-        is_built_on_rank=is_dataset_built_on_rank,
         random_seed=args.seed,
         sequence_length=args.seq_length,
         blend=args.data_path,
@@ -204,6 +203,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         dataset_type,
         train_val_test_num_samples,
+        is_dataset_built_on_rank,
         config
     ).build()
 

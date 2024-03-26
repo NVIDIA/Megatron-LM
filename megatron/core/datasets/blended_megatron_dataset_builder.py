@@ -11,6 +11,7 @@ from megatron.core.datasets.blended_dataset import BlendedDataset
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset, MockDataset
 from megatron.core.datasets.utils import Split, normalize
+from megatron.core.parallel_state import get_virtual_pipeline_model_parallel_rank
 
 logger = logging.getLogger(__name__)
 
@@ -31,17 +32,32 @@ class BlendedMegatronDatasetBuilder(object):
 
         sizes (List[int]): The minimum number of total samples to draw from each split, varies with blend
 
+        is_built_on_rank (Callable): A callable which returns True if the dataset should be built on the current rank and False otherwise. It should be Megatron Core parallelism aware i.e. global rank, local group rank, and virtual rank may inform its return value.
+
         config (BlendedMegatronDatasetConfig): The config object which informs dataset creation
     """
 
     def __init__(
-        self, cls: Type[MidLevelDataset], sizes: List[int], config: BlendedMegatronDatasetConfig,
+        self,
+        cls: Type[MidLevelDataset],
+        sizes: List[int],
+        is_built_on_rank: Callable,
+        config: BlendedMegatronDatasetConfig,
     ):
         self.cls = cls
         self.sizes = sizes
+        self.is_built_on_rank = is_built_on_rank
         self.config = config
 
         assert not self.config.mock or issubclass(self.cls, MockDataset)
+
+        if torch.distributed.is_initialized():
+            gb_rank = torch.distributed.get_rank()
+            vp_rank = get_virtual_pipeline_model_parallel_rank()
+            if gb_rank == 0 and (vp_rank == 0 or vp_rank is None):
+                assert (
+                    self.is_built_on_rank()
+                ), "is_built_on_rank must return True when global rank = 0 and vp rank = 0"
 
     def build(self) -> List[Optional[TopLevelDataset]]:
         """Build all dataset splits according to the provided blend(s)
@@ -113,7 +129,7 @@ class BlendedMegatronDatasetBuilder(object):
                     blended_datasets.append(
                         self.build_generic_dataset(
                             BlendedDataset,
-                            self.config.is_built_on_rank,
+                            self.is_built_on_rank,
                             megatron_datasets[i],
                             weight_per_dataset,
                             size_per_split[i],
@@ -166,7 +182,7 @@ class BlendedMegatronDatasetBuilder(object):
                     blended_datasets.append(
                         self.build_generic_dataset(
                             BlendedDataset,
-                            self.config.is_built_on_rank,
+                            self.is_built_on_rank,
                             megatron_datasets,
                             weight_per_dataset,
                             size_per_split[i],
@@ -224,7 +240,7 @@ class BlendedMegatronDatasetBuilder(object):
                 mid_level_datasets.append(
                     self.build_generic_dataset(
                         self.cls,
-                        self.config.is_built_on_rank,
+                        self.is_built_on_rank,
                         low_level_dataset,
                         dataset_path,
                         split_indices[i],
