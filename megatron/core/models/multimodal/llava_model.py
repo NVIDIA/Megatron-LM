@@ -1,16 +1,18 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+import logging
 
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel
+from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-# Note: This is unused at the moment and may be missing features. Follow-up changes will use this.
+# Note: This is under development and may be missing features.
 class LLaVAModel(MegatronModule):
     """LLaVA multi-modal model.
 
@@ -21,6 +23,9 @@ class LLaVAModel(MegatronModule):
         max_sequence_length (int): maximum sequence length. This is used for positional embedding.
         vision_transformer_config (TransformerConfig): Transformer config for the vision model.
         vision_transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers of the vision model.
+        vision_projection_config (TransformerConfig): Config for the projection from vision model outputs to language model inputs.
+        vision_projection_layer_spec (ModuleSpec): Specifies the module to use for the vision projection.
+        vision_projection_type (str): Type of the vision projection to use. Default is a 2-layer MLP.
     """
 
     def __init__(
@@ -31,8 +36,15 @@ class LLaVAModel(MegatronModule):
         max_sequence_length: int,
         vision_transformer_config: TransformerConfig,
         vision_transformer_layer_spec: ModuleSpec,
+        vision_projection_config: TransformerConfig,
+        vision_projection_layer_spec: ModuleSpec,
+        vision_projection_type: str = "mlp",
     ) -> None:
         super().__init__(config=language_transformer_config)
+
+        logging.getLogger(__name__).warning(
+            "LLaVA model is under development and may be missing features."
+        )
 
         if parallel_state.get_pipeline_model_parallel_world_size() > 1:
             raise NotImplementedError("pipeline parallelism is not supported in this model yet.")
@@ -47,15 +59,11 @@ class LLaVAModel(MegatronModule):
         self.vision_model = CLIPViTModel(vision_transformer_config, vision_transformer_layer_spec)
 
         # Map (intermediate) vision model outputs to the language model input dimension.
-        # TODO: Separate work is adding a configurable multimodal projection layer. Replace this with that one.
-        self.vision_projection = tensor_parallel.ColumnParallelLinear(
-            vision_transformer_config.hidden_size,
-            language_transformer_config.hidden_size,
-            config=vision_transformer_config,
-            init_method=vision_transformer_config.init_method,
-            bias=False,
-            skip_bias_add=True,
-            gather_output=True,
+        self.vision_projection = MultimodalProjector(
+            vision_projection_config,
+            vision_projection_layer_spec,
+            vision_projection_type,
+            vision_transformer_config.hidden_size,  # input size to the projection.
         )
 
     def set_input_tensor(self, input_tensor: torch.Tensor) -> None:
@@ -91,9 +99,7 @@ class LLaVAModel(MegatronModule):
         image_embeddings = self.vision_model(images)  # [b, img_seq_len, h_vision]
 
         # map vision model output size to language model input size.
-        image_embeddings, _ = self.vision_projection(
-            image_embeddings
-        )  # [b, img_seq_len, h_language]
+        image_embeddings = self.vision_projection(image_embeddings)  # [b, img_seq_len, h_language]
 
         image_embeddings = image_embeddings.permute(1, 0, 2)  # [img_seq_len, b, h_language]
         language_embeddings = self.language_model.embedding(

@@ -3,7 +3,6 @@
 from dataclasses import dataclass
 from typing import Callable, Dict
 
-import numpy
 import torch
 
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset

@@ -13,8 +13,7 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-# Note: This is unused at the moment and is missing features like position embedding interpolation.
-# Follow-up changes will use this and expand the functionality.
+# Note: This is under development and is missing features like position embedding interpolation.
 class CLIPViTModel(VisionModule):
     """CLIP ViT vision model.
 
