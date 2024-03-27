@@ -18,13 +18,15 @@ from .beam_utils import BeamHypotheses
 
 def score_and_return_on_first_stage(model, tokens, lengths):
     """Function for just scoring.
-    Arguments:
+
+    Args:
         model: no interleaving is supported.
         tokens: prompt tokens extended to be of size [b, max_prompt_length]
         lengths: original prompt length, size: [b]
     Note: Outside of model, other parameters only need to be available on
           rank 0.
-    Outputs: 
+
+    Returns:
         output_log_probs: log probability of the selected tokens. size: [b, s]
     """
 
@@ -96,7 +98,8 @@ def generate_tokens_probs_and_return_on_first_stage(
         prevent_newline_after_colon=True
         ):
     """Main token generation function.
-    Arguments:
+
+    Args:
         model: no interleaving is supported.
         tokens: prompt tokens extended to be of size [b, max-sequence-length]
         lengths: original prompt length, size: [b]
@@ -114,7 +117,8 @@ def generate_tokens_probs_and_return_on_first_stage(
         prevent_newline_after_colon: if True, it will disable generating new line \n after :
     Note: Outside of model, other parameters only need to be available on
           rank 0.
-    Outputs: Note that is size is adjusted to a lower value than
+
+    Returns: Note that is size is adjusted to a lower value than
              max-sequence-length if generation is terminated early.
         tokens: prompt and generated tokens. size: [b, :]
         generated_sequence_lengths: total length (including prompt) of

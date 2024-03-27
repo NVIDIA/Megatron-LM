@@ -163,7 +163,7 @@ def pretrain(train_valid_test_dataset_provider,
         3) call train_val_test_data_provider to get train/val/test datasets.
         4) train the modle using the forward_step_func.
 
-    Arguments:
+    Args:
         train_valid_test_dataset_provider: a function that takes the size of
             train/valid/test dataset and returns `train, valid, test` datasets.
         model_provider: a function that returns a vanilla version of the

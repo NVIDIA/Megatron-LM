@@ -77,7 +77,7 @@ def load(
     4. (optional) Extract ShardedObjects, load and add
     5. Extract ShardedBase, load, apply factory merges and add
 
-    Arguments:
+    Args:
         sharded_state_dict (ShardedStateDict): state dict of the existing model
             populated with ShardedTensors. Used as a mapping to determine which
             parts of global tensors stored in the checkpoint should be loaded.
@@ -272,7 +272,7 @@ def save(
     5. (optional) Extract and save ShardedObjects
     6. Save all ShardedBase objects
 
-    Arguments:
+    Args:
         sharded_state_dict (ShardedStateDict): state dict of the populated with
             ShardedTensors. Used as a mapping to determine how local tensors
             should be saved as global tensors in the checkpoint.

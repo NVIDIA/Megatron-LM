@@ -31,7 +31,7 @@ class FusedLayerNorm(torch.nn.Module):
 
     """Layer Norm, fused into a single CUDA kernel.
 
-    Arguments:
+    Args:
       hidden_size (int): Transformer hidden dimension.
 
       eps (float): Epsilon added to denominator, for numerical stability.

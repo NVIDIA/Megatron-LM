@@ -25,7 +25,7 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
     This is required when the sequence lengths across micro batches
     are not uniform.
 
-    Takes the following arguments:
+    Args:
         tensor_send_next: tensor to send to next rank (no tensor sent if
                           set to None).
         tensor_send_prev: tensor to send to prev rank (no tensor sent if
@@ -240,7 +240,7 @@ def _communicate(
     """Communicate tensors between stages. Used as helper method in other
     communication methods that are used in megatron/schedules.py.
 
-    Arguments:
+    Args:
         tensor_send_next (torch.Tensor, optional):
             Tensor to send to next rank (no tensor sent if None)
 
@@ -349,7 +349,6 @@ def _communicate(
 
 def recv_forward(tensor_shape: Shape, config: ModelParallelConfig) -> torch.Tensor:
     """ Receive tensor from previous rank in pipeline (forward receive).
-
 
     See _communicate for argument details.
     """

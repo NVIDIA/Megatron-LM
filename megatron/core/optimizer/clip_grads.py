@@ -28,7 +28,7 @@ def clip_grad_norm_fp32(
     added functionality to handle model parallel parameters. Note that
     the gradients are modified in place.
 
-    Arguments:
+    Args:
         parameters (Iterable[Tensor] or Tensor): an iterable of Tensors or a
             single Tensor that will have gradients normalized.
         grads_for_norm (Iterable[Tensor]): an iterable of Tensors or a single
@@ -118,7 +118,7 @@ def count_zeros_fp32(
     """Counts the number of zeros in gradients associated with the passed-in list of
     parameters.
 
-    Arguments:
+    Args:
         parameters (Iterable[Tensor] or Tensor): an iterable of Tensors or a
             single Tensor that will have the number of zeros in its corresponding
             gradient counted.

@@ -87,7 +87,7 @@ class Pooler(MegatronModule):
     Pool hidden states of a specific token (for example start of the
     sequence) and add a linear transformation followed by a tanh.
 
-    Arguments:
+    Args:
         hidden_size: hidden size
         init_method: weight initialization method for the linear layer.
             bias is set to zero.
@@ -120,7 +120,7 @@ class Pooler(MegatronModule):
 class Embedding(MegatronModule):
     """Language model embeddings.
 
-    Arguments:
+    Args:
         hidden_size: hidden size
         vocab_size: vocabulary size
         max_sequence_length: maximum size of sequence. This
@@ -315,7 +315,7 @@ class Embedding(MegatronModule):
 class TransformerLanguageModel(MegatronModule):
     """Transformer language model.
 
-    Arguments:
+    Args:
         transformer_hparams: transformer hyperparameters
         vocab_size: vocabulary size
         max_sequence_length: maximum size of sequence. This

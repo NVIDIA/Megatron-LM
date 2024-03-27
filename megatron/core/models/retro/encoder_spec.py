@@ -108,7 +108,7 @@ def get_retro_encoder_block_spec(
     The retro encoder block consists of one customized Retro encoder layer
     (layer 1), and all of the following layers are standard GPT layers.
 
-    Arguments:
+    Args:
       config (RetroConfig): Retro config.
       use_transformer_engine (bool): If True, use Transformer Engine (instead of local modules).
 
