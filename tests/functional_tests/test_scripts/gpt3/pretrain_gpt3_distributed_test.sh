@@ -111,7 +111,6 @@ build_torch_run_cmd() {
        --tensor-model-parallel-size $TP_SIZE \
        --pipeline-model-parallel-size $PP_SIZE \
        --no-bias-swiglu-fusion \
-       --use-gpu-initialization \
        --no-rope-fusion \
        ${VP_SIZE:+--num-layers-per-virtual-pipeline-stage "$VP_SIZE"} \
        ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \

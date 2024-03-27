@@ -114,7 +114,6 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --save-interval $__SAVE_INTERVAL \
     --eval-interval 1000 \
     --eval-iters 10 \
-    --use-gpu-initialization \
     --distributed-backend nccl \
     ${DATA_CACHE:+--data-cache-path "$DATA_CACHE"} \
     ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS}"
