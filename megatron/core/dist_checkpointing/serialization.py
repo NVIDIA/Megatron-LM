@@ -97,6 +97,10 @@ def load(
     if not sharded_state_dict:
         return common_state_dict
 
+    # Create a copy of sharded_state_dict as the passed in state dict may have
+    # references that prevent tensors from being deallocated
+    sharded_state_dict, _ = extract_matching_values(sharded_state_dict, lambda x: True)
+
     sh_ten_factories, _ = extract_matching_values(
         sharded_state_dict,
         lambda x: isinstance(x, ShardedTensorFactory),
