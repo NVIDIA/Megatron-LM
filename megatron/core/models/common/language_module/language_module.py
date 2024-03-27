@@ -36,13 +36,20 @@ class LanguageModule(MegatronModule):
         loss = loss.transpose(0, 1).contiguous()
         return loss
 
-    def initialize_last_stage_with_word_embeddings(self) -> None:
-        """Intializes the word embeddings in the final stage.
+    def setup_embeddings_and_output_layer(self) -> None:
+        """Sets up embedding layer in first stage and output layer in last stage.
 
-        This function just initalizes word embeddings in the final stage, when we are
-        using pipeline parallelism and sharing word embeddings. Nothing to do if we
-        aren't sharing weights or aren't using pipeline parallelism.
+        This function initalizes word embeddings in the final stage when we are
+        using pipeline parallelism and sharing word embeddings, and sets up param
+        attributes on the embedding and output layers.
         """
+
+        # Set `is_embedding_or_output_parameter` attribute.
+        if self.pre_process:
+            self.embedding.word_embeddings.weight.is_embedding_or_output_parameter = True
+        if self.post_process and self.output_layer.weight is not None:
+            self.output_layer.weight.is_embedding_or_output_parameter = True
+
         if not self.share_embeddings_and_output_weights:
             return
 

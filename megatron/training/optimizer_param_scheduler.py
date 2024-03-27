@@ -76,16 +76,19 @@ class OptimizerParamScheduler(object):
         return self.start_wd + coeff * delta_wd
 
 
-    def get_lr(self):
+    def get_lr(self, param_group):
         """Learning rate decay functions from:
               https://openreview.net/pdf?id=BJYwwY9ll pg. 4"""
+
+        max_lr = param_group.get('max_lr', self.max_lr)
+        min_lr = param_group.get('min_lr', self.min_lr)
 
         # Use linear warmup for the initial part.
         if self.lr_warmup_steps > 0 and self.num_steps <= self.lr_warmup_steps:
             return (
                 self.init_lr
                 + (
-                    (self.max_lr - self.init_lr)
+                    (max_lr - self.init_lr)
                     * float(self.num_steps)
                     / float(self.lr_warmup_steps)
                 )
@@ -93,25 +96,25 @@ class OptimizerParamScheduler(object):
 
         # If the learning rate is constant, just return the initial value.
         if self.lr_decay_style == 'constant':
-            return self.max_lr
+            return max_lr
 
-        # For any steps larger than `self.lr_decay_steps`, use `self.min_lr`.
+        # For any steps larger than `self.lr_decay_steps`, use `min_lr`.
         if self.num_steps > self.lr_decay_steps:
-            return self.min_lr
+            return min_lr
 
         # If we are done with the warmup period, use the decay style.
         if self.lr_decay_style == 'inverse-square-root':
             warmup_steps = max(self.lr_warmup_steps, 1)
             num_steps = max(self.num_steps, 1)
-            lr = self.max_lr * warmup_steps ** 0.5 / (num_steps ** 0.5)
-            return max(self.min_lr, lr)
+            lr = max_lr * warmup_steps ** 0.5 / (num_steps ** 0.5)
+            return max(min_lr, lr)
 
         num_steps_ = self.num_steps - self.lr_warmup_steps
         decay_steps_ = self.lr_decay_steps - self.lr_warmup_steps
         decay_ratio = float(num_steps_) / float(decay_steps_)
         assert decay_ratio >= 0.0
         assert decay_ratio <= 1.0
-        delta_lr = self.max_lr - self.min_lr
+        delta_lr = max_lr - min_lr
 
         if self.lr_decay_style == 'linear':
             coeff = (1.0 - decay_ratio)
@@ -121,17 +124,17 @@ class OptimizerParamScheduler(object):
             raise Exception('{} decay style is not supported.'.format(
                 self.lr_decay_style))
 
-        return self.min_lr + coeff * delta_lr
+        return min_lr + coeff * delta_lr
 
 
     def step(self, increment):
         """Set lr for all parameters groups."""
         self.num_steps += increment
-        new_lr = self.get_lr()
         new_wd = self.get_wd()
-        for group in self.optimizer.param_groups:
-            group['lr'] = new_lr * group.get('lr_mult', 1.0)
-            group['weight_decay'] = new_wd * group.get('wd_mult', 1.0)
+        for param_group in self.optimizer.param_groups:
+            new_lr = self.get_lr(param_group)
+            param_group['lr'] = new_lr * param_group.get('lr_mult', 1.0)
+            param_group['weight_decay'] = new_wd * param_group.get('wd_mult', 1.0)
 
 
     def state_dict(self):
@@ -174,7 +177,7 @@ class OptimizerParamScheduler(object):
             max_lr_ = sd['max_lr']
         self.max_lr = self._check_and_set(self.max_lr, max_lr_,
                                           'learning rate')
-        
+
         self.min_lr = self._check_and_set(self.min_lr, sd['min_lr'],
                                           'minimum learning rate')
 
@@ -225,11 +228,3 @@ class OptimizerParamScheduler(object):
             self.wd_incr_style = self._check_and_set(self.wd_incr_style,
                                                 sd['wd_incr_style'],
                                                 "weight decay incr style")
-            
-
-
-
-
-
-
-

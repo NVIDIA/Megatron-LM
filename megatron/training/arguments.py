@@ -477,6 +477,10 @@ def validate_args(args, defaults={}):
         assert args.pipeline_model_parallel_size == 1, \
             "retro currently does not support pipeline parallelism."
 
+    if args.decoupled_lr is not None or args.decoupled_min_lr is not None:
+        assert args.use_mcore_models, \
+            '--decoupled-lr and --decoupled-min-lr only supported by Megatron Core, please add --use-mcore-models.'
+
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
         args.position_embedding_type = 'rope'
@@ -1125,7 +1129,7 @@ def _add_learning_rate_args(parser):
                        help='Old lr warmup argument, do not use. Use one of the'
                        '--lr-warmup-* arguments above')
     group.add_argument('--min-lr', type=float, default=0.0,
-                       help='Minumum value for learning rate. The scheduler'
+                       help='Minimum value for learning rate. The scheduler'
                        'clip values below this threshold.')
     group.add_argument('--override-opt_param-scheduler', action='store_true',
                        help='Reset the values of the scheduler (learning rate,'
@@ -1138,6 +1142,11 @@ def _add_learning_rate_args(parser):
                        '(learning rate, warmup iterations, minimum learning '
                        'rate, maximum number of iterations, and decay style '
                        'from checkpoint and ignore input arguments.')
+    group.add_argument('--decoupled-lr', type=float, default=None,
+                       help='Separate learning rate for the input and output layer')
+    group.add_argument('--decoupled-min-lr', type=float, default=None,
+                       help='Minimum value for learning rate for the input and output layer. The scheduler'
+                       'clip values below this threshold')
 
     return parser
 

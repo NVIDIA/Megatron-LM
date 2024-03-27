@@ -75,6 +75,7 @@ products:
   - {tp_size: [1], pp_size: [1], extra_args: ['"--use-distributed-optimizer --no-mmap-bin-files"'], args_meta: ["dist_optimizer_no_mmap_bin_files"]}
   - {tp_size: [4], pp_size: [1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce"'], args_meta: ["dist_optimizer_overlap_grad_reduce"]}
   - {tp_size: [4], pp_size: [1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather"'], args_meta: ["dist_optimizer_overlap_grad_reduce_param_gather"]}
+  - {tp_size: [1], pp_size: [4], vp_size: [1], extra_args: ['"--decoupled-lr 0.0002"'], args_meta: ["decoupled_lr"]}
   - {tp_size: [1], pp_size: [4], vp_size: [1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce"'], args_meta: ["dist_optimizer_overlap_grad_reduce"]}
   - {tp_size: [1], pp_size: [4], vp_size: [1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --untie-embeddings-and-output-weights"'], args_meta: ["dist_optimizer_overlap_grad_reduce_untied"]}
   - {tp_size: [1], pp_size: [4], vp_size: [1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather"'], args_meta: ["dist_optimizer_overlap_grad_reduce_param_gather"]}
