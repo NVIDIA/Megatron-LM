@@ -28,6 +28,7 @@ _DATA_PARALLEL_GROUP_GLOO = None
 # used for fp8 and moe training
 _TENSOR_AND_DATA_PARALLEL_GROUP = None
 # Expert parallel group that the current rank belongs to.
+_EXPERT_MODEL_PARALLEL_GROUP = None
 _TENSOR_AND_EXPERT_PARALLEL_GROUP = None
 _DATA_MODULO_EXPERT_PARALLEL_GROUP = None
 _DATA_MODULO_EXPERT_PARALLEL_GROUP_GLOO = None
@@ -466,6 +467,8 @@ def initialize_model_parallel(
                 _TENSOR_AND_DATA_PARALLEL_GROUP = group
 
     # Build the tensor + expert parallel groups
+    global _EXPERT_MODEL_PARALLEL_GROUP
+    assert _EXPERT_MODEL_PARALLEL_GROUP is None, 'Expert parallel group is already initialized'
     global _TENSOR_AND_EXPERT_PARALLEL_GROUP
     assert (
         _TENSOR_AND_EXPERT_PARALLEL_GROUP is None
@@ -481,6 +484,7 @@ def initialize_model_parallel(
     num_expert_groups: int = data_parallel_size // expert_model_parallel_size
     for i in range(num_tensor_and_data_groups):
         for j in range(num_expert_groups):
+            # TPxEP Group
             start_rank = i * tensor_and_data_group_size + j * tensor_and_expert_group_size
             end_rank = i * tensor_and_data_group_size + (j + 1) * tensor_and_expert_group_size
             ranks = range(start_rank, end_rank)
@@ -489,6 +493,15 @@ def initialize_model_parallel(
             )
             if rank in ranks:
                 _TENSOR_AND_EXPERT_PARALLEL_GROUP = group
+            for k in range(tensor_model_parallel_size * context_parallel_size):
+                ranks = range(
+                    start_rank + k, end_rank, tensor_model_parallel_size * context_parallel_size
+                )
+                group = torch.distributed.new_group(
+                    ranks, pg_options=get_nccl_options('exp', nccl_comm_cfgs)
+                )
+                if rank in ranks:
+                    _EXPERT_MODEL_PARALLEL_GROUP = group
 
     for i in range(num_tensor_and_data_groups):
         start_rank = i * tensor_and_data_group_size
@@ -639,6 +652,13 @@ def get_tensor_and_data_parallel_group(with_context_parallel=False):
             _TENSOR_AND_DATA_PARALLEL_GROUP is not None
         ), 'tensor and data parallel group is not initialized'
         return _TENSOR_AND_DATA_PARALLEL_GROUP
+
+
+def get_expert_model_parallel_group():
+    assert (
+        _EXPERT_MODEL_PARALLEL_GROUP is not None
+    ), 'expert model parallel group is not initialized'
+    return _EXPERT_MODEL_PARALLEL_GROUP
 
 
 def get_tensor_and_expert_parallel_group():
@@ -1028,6 +1048,8 @@ def destroy_model_parallel():
     _TENSOR_AND_DATA_PARALLEL_GROUP = None
     global _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
     _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
+    global _EXPERT_MODEL_PARALLEL_GROUP
+    _EXPERT_MODEL_PARALLEL_GROUP = None
     global _TENSOR_AND_EXPERT_PARALLEL_GROUP
     _TENSOR_AND_EXPERT_PARALLEL_GROUP = None
     global _DATA_MODULO_EXPERT_PARALLEL_GROUP

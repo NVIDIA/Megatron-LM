@@ -11,10 +11,15 @@ from .layers import (
     set_tensor_model_parallel_attributes,
 )
 from .mappings import (
+    all_gather_last_dim_from_tensor_parallel_region,
+    all_to_all,
+    all_to_all_hp2sp,
+    all_to_all_sp2hp,
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
     gather_from_sequence_parallel_region_to_moe,
     gather_from_tensor_model_parallel_region,
+    reduce_scatter_last_dim_to_tensor_parallel_region,
     reduce_scatter_to_sequence_parallel_region_from_moe,
     scatter_to_sequence_parallel_region,
     scatter_to_tensor_model_parallel_region,

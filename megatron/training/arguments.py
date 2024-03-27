@@ -1574,6 +1574,10 @@ def _add_moe_args(parser):
                        help='Add noise to the input tensor by applying jitter with a specified epsilon value.')
     group.add_argument('--moe-token-dropping', action='store_true',
                        help='This feature involves selectively dropping and padding tokens for each expert to achieve a specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note: Currently unsupported.')
+    group.add_argument('--moe-token-dispatcher-type', type=str,
+                       choices=['allgather', 'alltoall'],
+                       default='allgather',
+                       help='.')
 
     return parser
 
