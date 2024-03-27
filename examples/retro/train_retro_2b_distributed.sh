@@ -31,16 +31,15 @@ ADD_RETRIEVER=1
 
 ######## Megatron, Retro dirs. ########
 
-REPO_DIR="<path/to/megatron/repo>"
 RETRO_PROJECT_DIR="<path/to/retro/project/directory>"
 
 ######## Model, training args. ########
 
 # ** Note: --seq-length auto loaded from Retro project dir.
 RETRO_MODEL_ARGS=(
-    --num-layers 12
-    --hidden-size 768
-    --num-attention-heads 12
+    --num-layers 32
+    --hidden-size 2048
+    --num-attention-heads 32
 )
 
 # ** Note: --data-path, --tokenizer-type, and --tokenizer-model auto loaded from Retro project dir.
@@ -49,8 +48,8 @@ DATA_ARGS=(
 )
 
 MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size 2
-    --pipeline-model-parallel-size 2 
+    --tensor-model-parallel-size 8
+    --pipeline-model-parallel-size 1 
 )
 
 # ** Note: --eval-interval, --eval-iters auto loaded from Retro project dir.

@@ -21,7 +21,7 @@ docker run \
   -v /path/to/data:/path/to/data \
   -v /path/to/megatron-lm:/workspace/megatron-lm \
   megatron-lm nvcr.io/nvidia/pytorch:23.04-py3 \
-  bash examples/retro/train_retro_307m_distributed.sh $CHECKPOINT_PATH $TENSORBOARD_LOGS_PATH"
+  bash examples/retro/train_retro_2b_distributed.sh $CHECKPOINT_PATH $TENSORBOARD_LOGS_PATH"
 
 ```
 NOTE: Depending on the environment you are running it the above command might look slightly different.
@@ -50,7 +50,7 @@ Retro preprocesses and caches data prior to pretraining, to greatly speed up pre
 
 ## 3. Configurations
 <a id="markdown-configurations" name="configurations"></a>
-The example in this folder shows you how to run a 307M model. Below are a few other example configurations.
+The example in this folder shows you how to run a 2B model. Below are a few other example configurations.
 
 ### 857M 
 ```
