@@ -288,8 +288,14 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
             or mpu.get_data_modulo_expert_parallel_rank() == 0 \
             or args.use_dist_ckpt:
 
+        optim_sd_kwargs = {}
+        if args.use_dist_ckpt and args.use_distributed_optimizer:
+            optim_sd_kwargs['sharding_type'] = ('fully_sharded_bucket_space'
+                                                if args.ckpt_fully_parallel_save
+                                                else 'dp_zero_gather_scatter')
+            print_rank_0(f'Storing distributed optimizer sharded state of type {optim_sd_kwargs["sharding_type"]}')
         state_dict = generate_state_dict(args, model, optimizer, opt_param_scheduler, rng_state,
-                                         args.use_dist_ckpt, iteration)
+                                         args.use_dist_ckpt, iteration, optim_sd_kwargs=optim_sd_kwargs)
 
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if args.use_dist_ckpt:
@@ -324,7 +330,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
 
 def generate_state_dict(args, model, optimizer, opt_param_scheduler,
                         rng_state, use_dist_ckpt=False, iteration=None,
-                        is_loading=False):
+                        optim_sd_kwargs=None):
     # Arguments, iteration, and model.
     state_dict = {}
     state_dict['args'] = args
@@ -346,7 +352,7 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
     # Optimizer stuff.
     if not args.no_save_optim:
         if optimizer is not None:
-            state_dict['optimizer'] = (optimizer.sharded_state_dict(state_dict, is_loading)
+            state_dict['optimizer'] = (optimizer.sharded_state_dict(state_dict, **(optim_sd_kwargs or {}))
                                        if use_dist_ckpt else
                                        optimizer.state_dict())
         if opt_param_scheduler is not None:
@@ -633,8 +639,13 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
             if ckpt_tp_pp != run_tp_pp and not release and not args.finetune and not args.no_load_optim and args.use_distributed_optimizer:
                 raise RuntimeError("{}: not supported for DistributedOptimizer".format(mismatch_msg))
 
+            optim_sd_kwargs = dict(is_loading=True)
+            if args.use_distributed_optimizer:
+                optim_sd_kwargs['sharding_type'] = ('fully_sharded_bucket_space'
+                                                    if getattr(state_dict['args'], 'ckpt_fully_parallel_save', False)
+                                                    else 'dp_zero_gather_scatter')
             load_kwargs['sharded_state_dict'] = generate_state_dict(args, model, optimizer, opt_param_scheduler,
-                                                                    rng_state, args.use_dist_ckpt, is_loading=True)
+                                                                    rng_state, args.use_dist_ckpt, optim_sd_kwargs=optim_sd_kwargs)
             load_kwargs['exit_on_missing_checkpoint'] = args.exit_on_missing_checkpoint
 
     state_dict, checkpoint_name, release = _load_base_checkpoint(load_dir, rank0=False, **load_kwargs)

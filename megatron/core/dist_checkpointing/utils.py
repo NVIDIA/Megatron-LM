@@ -96,7 +96,7 @@ def add_prefix_for_sharding(sharded_state_dict: ShardedStateDict, prefix: str):
     """
 
     def add_prefix(t):
-        if isinstance(t, (ShardedTensor, ShardedTensorFactory, ShardedObject)):
+        if isinstance(t, ShardedBase):
             t.key = f'{prefix}{t.key}'
         return t
 

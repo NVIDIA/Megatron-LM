@@ -772,8 +772,8 @@ class ChainedOptimizer(MegatronOptimizer):
         save_states = False
         states = []
         for optimizer in self.chained_optimizers:
-            if hasattr(optimizer, 'get_parameter_state'):
-                state_dict = optimizer.get_parameter_state()
+            if hasattr(optimizer, 'get_parameter_state_dp_zero'):
+                state_dict = optimizer.get_parameter_state_dp_zero()
 
                 # Save checkpoint economically, only when DP rank = 0, state dict
                 # needs to be saved.
@@ -796,7 +796,7 @@ class ChainedOptimizer(MegatronOptimizer):
         """
         states = None
         for idx, optimizer in enumerate(self.chained_optimizers):
-            if not hasattr(optimizer, 'load_parameter_state_from_state_dict'):
+            if not hasattr(optimizer, 'load_parameter_state_from_dp_zero'):
                 continue
 
             # Lazy loading checkpoint, state dict is needed only when DP rank = 0.
@@ -804,7 +804,7 @@ class ChainedOptimizer(MegatronOptimizer):
                 states = torch.load(filename)
 
             state_dict = states[idx] if states else None
-            optimizer.load_parameter_state_from_state_dict(state_dict)
+            optimizer.load_parameter_state_from_dp_zero(state_dict)
 
     def finish_param_sync(self, model_index: int):
         """Finish parameter synchronization for all optimizers.
