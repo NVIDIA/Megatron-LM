@@ -118,7 +118,7 @@ class AbstractModelInferenceWrapper:
         return logits
 
     def forward_pass_with_pipeline_parallel_large_input_batch(
-        self, inference_input: List, micro_batch_size: int
+        self, inference_input: List
     ) -> torch.Tensor:
         """Utility to carry out forward pass PP models. 
 
@@ -126,13 +126,14 @@ class AbstractModelInferenceWrapper:
 
         Args:
             inference_input (List): A list containg the inputs for the gpt model [tokens, position ids, attention mask]
-            micro_batch_size (int): The micro batch size used for pipeline parallel
 
         Returns:
             torch.Tensor: The output logits of shape [batch_size, seq_len, padded_vocab_size]
         """
         tokens, position_ids, attention_mask = inference_input
-
+        micro_batch_size = max(
+            1, self.args.inference_batch_times_seqlen_threshold // tokens.size(1)
+        )
         batch_size, seq_len = tokens.shape
         # Round up to account for tge last partial micro batch if present
         num_micro_batches = math.ceil(batch_size / micro_batch_size)
@@ -200,12 +201,7 @@ class AbstractModelInferenceWrapper:
             current_batch_size, seq_len = tokens.shape
             # If input batch is large, we need to split into micro batches and run the forward pass
             if current_batch_size * seq_len > self.args.inference_batch_times_seqlen_threshold:
-                micro_batch_size = max(
-                    1, self.args.inference_batch_times_seqlen_threshold // tokens.size(1)
-                )
-                return self.forward_pass_with_pipeline_parallel_large_input_batch(
-                    inference_input, micro_batch_size
-                )
+                return self.forward_pass_with_pipeline_parallel_large_input_batch(inference_input)
             else:
                 # If input batch is very small we can do a simple forward pass on the entire global batch
                 return self.forward_pass_with_pipeline_parallel_small_input_batch(inference_input)
