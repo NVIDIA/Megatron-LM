@@ -590,7 +590,7 @@ def train_step(forward_step_func, data_iterator,
     return {}, skipped_iter, grad_norm, num_zeros_in_grad
 
 
-def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
+def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_rate, iteration,
                  loss_scale, report_memory_flag, skipped_iter,
                  grad_norm, params_norm, num_zeros_in_grad):
     """Log training information such as losses, timing, ...."""
@@ -681,6 +681,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                              iteration)
         if args.log_learning_rate_to_tensorboard:
             writer.add_scalar('learning-rate', learning_rate, iteration)
+            if args.decoupled_lr is not None:
+                writer.add_scalar('decoupled-learning-rate', decoupled_learning_rate, iteration)
             writer.add_scalar('learning-rate vs samples', learning_rate,
                               args.consumed_train_samples)
             if wandb_writer:
@@ -772,7 +774,15 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                     writer.add_scalar('throughput', throughput, iteration)
                 if wandb_writer:
                     wandb_writer.log({'throughput': throughput}, iteration)
-        log_string += ' learning rate: {:.3E} |'.format(learning_rate)
+        assert learning_rate is not None
+        # Decoupled_learning_rate should be not None only on first and last pipeline stage.
+        log_string += ' learning rate: {:.6E} |'.format(learning_rate)
+        if args.decoupled_lr is not None and (mpu.is_pipeline_first_stage(ignore_virtual=True) or
+                                              mpu.is_pipeline_last_stage(ignore_virtual=True)):
+            assert decoupled_learning_rate is not None
+            log_string += ' decoupled learning rate: {:.6E} |'.format(decoupled_learning_rate)
+        else:
+            assert decoupled_learning_rate is None
         log_string += ' global batch size: {:5d} |'.format(batch_size)
         for key in total_loss_dict:
             if key not in [advanced_iters_key, skipped_iters_key,
@@ -995,8 +1005,16 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if iteration % args.log_interval == 0:
             track_e2e_metrics()
 
+        learning_rate = None
+        decoupled_learning_rate = None
+        for param_group in optimizer.param_groups:
+            if param_group['is_decoupled_lr']:
+                decoupled_learning_rate = param_group['lr']
+            else:
+                learning_rate = param_group['lr']
         report_memory_flag = training_log(loss_dict, total_loss_dict,
-                                          optimizer.param_groups[0]['lr'],
+                                          learning_rate,
+                                          decoupled_learning_rate,
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
                                           grad_norm, params_norm, num_zeros_in_grad)

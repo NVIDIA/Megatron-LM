@@ -113,8 +113,8 @@ class GPTModel(LanguageModule):
                 and self.share_embeddings_and_output_weights,
             )
 
-        if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
-            self.initialize_last_stage_with_word_embeddings()
+        if self.pre_process or self.post_process:
+            self.setup_embeddings_and_output_layer()
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.

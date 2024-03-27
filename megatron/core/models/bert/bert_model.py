@@ -137,8 +137,8 @@ class BertModel(LanguageModule):
                     config.hidden_size, config.init_method, config, config.sequence_parallel
                 )
 
-        if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
-            self.initialize_last_stage_with_word_embeddings()
+        if self.pre_process or self.post_process:
+            self.setup_embeddings_and_output_layer()
 
     def bert_extended_attention_mask(self, attention_mask: Tensor) -> Tensor:
         """Creates the extended attention mask

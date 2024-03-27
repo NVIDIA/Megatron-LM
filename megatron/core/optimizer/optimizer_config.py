@@ -30,6 +30,14 @@ class OptimizerConfig:
     lr (float, optional): Initial learning rate. Depending on decay style and initial warmup, the learning
                           rate at each iteration would be different.
 
+    min_lr (float, optional): Minumum value for learning rate. The scheduler clip values below this threshold.
+
+    decoupled_lr (float, optional): Separate learning rate for the input and output layer.
+
+    decoupled_min_lr (float, optional): Minimum value for learning rate for the input and output layer. The scheduler
+                                        clip values below this threshold.
+
+
 
     Loss Scaler
     -----------
@@ -93,6 +101,9 @@ class OptimizerConfig:
 
     optimizer: str = 'adam'
     lr: Optional[float] = None
+    min_lr: Optional[float] = None
+    decoupled_lr: Optional[float] = None
+    decoupled_min_lr: Optional[float] = None
 
     # Loss scaling.
     loss_scale: Optional[float] = None

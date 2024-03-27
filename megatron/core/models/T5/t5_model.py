@@ -187,8 +187,8 @@ class T5Model(LanguageModule):
             )
             self.output_layer = self.lm_head.output_layer
 
-        if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
-            self.initialize_last_stage_with_word_embeddings()
+        if self.pre_process or self.post_process:
+            self.setup_embeddings_and_output_layer()
 
     def forward(
         self,
