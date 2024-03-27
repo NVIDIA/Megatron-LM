@@ -203,11 +203,11 @@ def main():
     """Main program."""
 
     # Note: The default args passed here can be overwridden by using appropriate params (check arguments.py file)
+    # Micro batch size is not needed to be set by user. (It is calculated based on inference-batch-times-seqlen-threshold argument)
     initialize_megatron(extra_args_provider=add_text_generate_args,
-                        args_defaults={'tokenizer_type': 'GPT2BPETokenizer',
-                                       'no_load_rng': True,
+                        args_defaults={'no_load_rng': True,
                                        'no_load_optim': True,
-                                       'seq_length': 2048})
+                                       'micro_batch_size': 1})
 
     # Set up model and load checkpoint
     model = get_model(model_provider, wrap_with_ddp=False)
