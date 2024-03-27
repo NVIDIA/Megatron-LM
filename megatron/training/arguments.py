@@ -957,21 +957,23 @@ def _add_training_args(parser):
                        help='Global step to stop profiling.')
     group.add_argument('--profile-ranks', nargs='+', type=int, default=[0],
                        help='Global ranks to profile.')
-    group.add_argument('--tp-comm-overlap', action='store_true', help = 'Enables the '
+    group.add_argument('--tp-comm-overlap', action='store_true', help='Enables the '
                        ' overlap of Tensor parallel communication and GEMM kernels.')
     group.add_argument('--tp-comm-overlap-cfg', type=str, default=None,
-                       help = 'Config file when tp_comm_overlap is enabled.')
-    group.add_argument('--disable-tp-comm-split-ag', action='store_false',
-                       help = 'Disables the All-Gather overlap with fprop GEMM.',
-                       dest='tp_comm_split_ag')
-    group.add_argument('--disable-tp-comm-split-rs', action='store_false',
-                       help = 'Disables the Reduce-Scatter overlap with fprop GEMM.',
-                       dest='tp_comm_split_rs')
+                       help='Config file when tp_comm_overlap is enabled.')
+    group.add_argument('--disable-tp-comm-overlap-ag', action='store_false', 
+                       help=('Disables the All-Gather overlap with GEMM by '
+                             'pipelining the GEMM and All-Gather.'),
+                       dest='tp_comm_overlap_ag')
+    group.add_argument('--disable-tp-comm-overlap-rs', action='store_false',
+                       help=('Disables the Reduce-Scatter overlap with GEMM by '
+                             'pipelining the GEMM and Reduce-Scatter.'),
+                       dest='tp_comm_overlap_rs')
     group.add_argument('--disable-tp-comm-bulk-dgrad', action='store_false',
-                       help = 'Disables the All-Gather overlap with bprop activation gradient GEMM.',
+                       help='Disables the All-Gather overlap with bprop activation gradient GEMM.',
                        dest='tp_comm_bulk_dgrad')
     group.add_argument('--disable-tp-comm-bulk-wgrad', action='store_false',
-                       help = 'Disables the Reduce-Scatter overlap with bprop weight gradient GEMM.',
+                       help='Disables the Reduce-Scatter overlap with bprop weight gradient GEMM.',
                        dest='tp_comm_bulk_wgrad')
     group.add_argument('--use-cpu-initialization', action='store_true',
                        default=None,
@@ -981,7 +983,6 @@ def _add_training_args(parser):
                        help='Call torch.cuda.empty_cache() each iteration '
                        '(training and eval), to reduce fragmentation.'
                        '0=off, 1=moderate, 2=aggressive.')
-
 
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
@@ -1077,6 +1078,12 @@ def _add_training_args(parser):
                        help='When using manual garbage collection, disable '
                        'garbage collection at the start and the end of each '
                        'evaluation run.', dest='manual_gc_eval')
+    group.add_argument('--disable-tp-comm-split-ag', action='store_false',
+                       help='Disables the All-Gather overlap with fprop GEMM.',
+                       dest='tp_comm_split_ag')
+    group.add_argument('--disable-tp-comm-split-rs', action='store_false',
+                       help='Disables the Reduce-Scatter overlap with fprop GEMM.',
+                       dest='tp_comm_split_rs')
 
     return parser
 
