@@ -30,9 +30,6 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         eod_mask_loss (bool): Option to enable the EOD mask loss
 
         create_attention_mask (bool): Option to enable the attention masks generation. Can be disabled if attention kernel generates masks by itself.
-
-        vocab_size (int): Size of vocabulary
-      
     """
 
     reset_position_ids: bool = None
@@ -42,8 +39,6 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     eod_mask_loss: bool = None
 
     create_attention_mask: bool = True
-
-    vocab_size: int = sys.maxsize
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init
@@ -184,9 +179,6 @@ class GPTDataset(MegatronDataset):
         super().__init__(
             indexed_dataset, dataset_path, indexed_indices, num_samples, index_split, config
         )
-
-        self.vocab_size = config.vocab_size
-
         self.masks_and_position_ids_are_cacheable = not any(
             [
                 self.config.reset_position_ids,
@@ -263,7 +255,7 @@ class GPTDataset(MegatronDataset):
         tokens = text[:-1].contiguous()
 
         assert not torch.any(
-            tokens >= self.vocab_size
+            tokens >= self.config.tokenizer.vocab_size
         ), "An input token is out of bounds of the tokenizer vocabulary"
 
         if (
