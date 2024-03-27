@@ -105,7 +105,6 @@ build_args() {
     --init-method-std 0.007 \
     --log-params-norm \
     --log-num-zeros-in-grad \
-    --use-gpu-initialization \
     --log-validation-ppl-to-tensorboard \
     --log-timers-to-tensorboard \
     --tensorboard-dir ${TENSORBOARD_DIR} \
