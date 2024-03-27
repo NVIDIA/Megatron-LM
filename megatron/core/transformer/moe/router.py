@@ -6,9 +6,11 @@ from typing import Callable, List
 
 import torch
 
-from megatron.core import parallel_state, tensor_parallel
-from megatron.core.parallel_state import get_tensor_and_expert_parallel_group
-from megatron.core.tensor_parallel import get_cuda_rng_tracker, get_data_parallel_rng_tracker_name
+from megatron.core.tensor_parallel import (
+    gather_from_sequence_parallel_region,
+    get_cuda_rng_tracker,
+    get_data_parallel_rng_tracker_name,
+)
 from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name,
@@ -227,6 +229,13 @@ class TopKRouter(Router):
         logits = self.apply_z_loss(logits)
         # Apply input jitter
         logits = self.apply_input_jitter(logits)
+
+        if (
+            self.config.tensor_model_parallel_size > 1
+            and self.config.moe_token_dispatcher_type == "alltoall"
+        ):
+            # Gather the logits from the TP region
+            logits = gather_from_sequence_parallel_region(logits)
 
         if self.routing_type == "sinkhorn":
             scores, indices = self.sinkhorn_load_balancing(logits)

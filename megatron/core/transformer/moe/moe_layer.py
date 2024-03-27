@@ -9,7 +9,10 @@ from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP
 from megatron.core.transformer.moe.router import TopKRouter
-from megatron.core.transformer.moe.token_dispatcher import MoEDroplessTokenDispatcher
+from megatron.core.transformer.moe.token_dispatcher import (
+    MoEAllGatherTokenDispatcher,
+    MoEAlltoAllTokenDispatcher,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -59,22 +62,25 @@ class MoELayer(BaseMoELayer):
         else:
             assert isinstance(self.submodules, MLPSubmodules)
             self.experts = SequentialMLP(self.num_local_experts, self.config, self.submodules)
-        self.token_dispatcher = MoEDroplessTokenDispatcher(
-            self.num_local_experts, self.local_expert_indices, config=self.config
-        )
+        if config.moe_token_dispatcher_type == "allgather":
+            self.token_dispatcher = MoEAllGatherTokenDispatcher(
+                self.num_local_experts, self.local_expert_indices, config=self.config
+            )
+        elif config.moe_token_dispatcher_type == "alltoall":
+            self.token_dispatcher = MoEAlltoAllTokenDispatcher(
+                self.num_local_experts, self.local_expert_indices, config=self.config
+            )
+        else:
+            raise ValueError(
+                f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
+            )
 
     def forward(self, hidden_states: torch.Tensor):
         # process MoE
         scores, indices = self.router(hidden_states)
-        (
-            dispatched_input,
-            tokens_per_expert,
-            scores,
-            indices,
-            global_local_map,
-        ) = self.token_dispatcher.token_permutation(hidden_states, scores, indices)
-        expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
-        output, mlp_bias = self.token_dispatcher.token_unpermutation(
-            expert_output, scores, indices, global_local_map, mlp_bias
+        (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
+            hidden_states, scores, indices
         )
+        expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
+        output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
         return output, mlp_bias

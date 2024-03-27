@@ -236,6 +236,9 @@ class TransformerConfig(ModelParallelConfig):
     specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note that this is
     currently unsupported so should remain False."""
 
+    moe_token_dispatcher_type: str = "allgather"
+    """The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather' and 'alltoall'."""
+
     ####################
     # miscellaneous
     ####################
