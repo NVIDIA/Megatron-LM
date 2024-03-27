@@ -54,7 +54,7 @@ class BlendedMegatronDatasetConfig:
 
     path_to_cache: Optional[str] = None
 
-    mmap_bin_files: bool = False
+    mmap_bin_files: bool = True
 
     mock: bool = False
 
