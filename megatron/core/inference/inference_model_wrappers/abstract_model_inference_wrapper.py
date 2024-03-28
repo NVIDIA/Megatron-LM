@@ -73,6 +73,7 @@ class AbstractModelInferenceWrapper:
             tokens, position_ids, attention_mask, inference_params=self.inference_params
         )
         self.inference_params.sequence_len_offset += tokens.size(1)
+        # TODO : Shouldnt we do a gather for the logits here for TP models
         return logits
 
     def _allocate_recv_buffer(self, batch_size, seq_len):
@@ -113,6 +114,7 @@ class AbstractModelInferenceWrapper:
 
         logits = None
         if mpu.is_pipeline_last_stage():
+            # TODO : Shouldnt we do a gather for the logits here for TP models
             logits = output_tensor
 
         return logits
@@ -135,7 +137,7 @@ class AbstractModelInferenceWrapper:
             1, self.args.inference_batch_times_seqlen_threshold // tokens.size(1)
         )
         batch_size, seq_len = tokens.shape
-        # Round up to account for tge last partial micro batch if present
+        # Round up to account for the last partial micro batch if present
         num_micro_batches = math.ceil(batch_size / micro_batch_size)
 
         logits = None
@@ -149,8 +151,7 @@ class AbstractModelInferenceWrapper:
 
         recv_buffer = None
         if not mpu.is_pipeline_first_stage():
-            recv_buffer = self._allocate_recv_buffer(batch_size, seq_len)
-
+            recv_buffer = self._allocate_recv_buffer(micro_batch_size, seq_len)
         for micro_batch_index in range(num_micro_batches):
             start = micro_batch_index * micro_batch_size
             end = min(start + micro_batch_size, batch_size)
@@ -176,6 +177,7 @@ class AbstractModelInferenceWrapper:
             self.inference_params.batch_size_offset += current_micro_batch_size
 
             if mpu.is_pipeline_last_stage():
+                # TODO : Shouldnt we do a gather for the logits here for TP models
                 logits[start:end, ...] = output_tensor
 
         # Once done with all micro batches, we reset batch size offset and seq len offset
