@@ -36,6 +36,7 @@ from .mappings import (
 )
 from .random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from .utils import VocabUtility, divide, split_tensor_along_last_dim
+from ..distributed import all_gather_into_tensor, reduce_scatter_tensor
 
 _grad_accum_fusion_available = True
 try:
@@ -348,7 +349,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             dim_size[0] = dim_size[0] * world_size
 
             all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
-            torch.distributed._all_gather_base(
+            all_gather_into_tensor(
                 all_gather_buffer, input, group=get_tensor_model_parallel_group()
             )
             total_input = all_gather_buffer
@@ -372,7 +373,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             dim_size[0] = dim_size[0] * world_size
 
             all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
-            handle = torch.distributed._all_gather_base(
+            handle = all_gather_into_tensor(
                 all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
             )
 
@@ -415,7 +416,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 dim_size, dtype=input.dtype, device=torch.cuda.current_device(), requires_grad=False
             )
             # reduce_scatter
-            handle = torch.distributed._reduce_scatter_base(
+            handle = reduce_scatter_tensor(
                 sub_grad_input, grad_input, group=get_tensor_model_parallel_group(), async_op=True
             )
             # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the

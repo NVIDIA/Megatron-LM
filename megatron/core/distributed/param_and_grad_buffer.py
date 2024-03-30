@@ -9,6 +9,7 @@ from typing import Dict, List, Optional
 import torch
 
 from .. import parallel_state
+from .comms import reduce_scatter_tensor
 
 logger = getLogger(__name__)
 
@@ -130,7 +131,7 @@ class Bucket:
             local_data_view = shard_buffer(self.grad_data, self.data_parallel_world_size)[
                 self.data_parallel_rank
             ]
-            self.communication_handle = torch.distributed._reduce_scatter_base(
+            self.communication_handle = reduce_scatter_tensor(
                 local_data_view,
                 self.grad_data,
                 group=self.data_parallel_group,

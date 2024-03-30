@@ -27,6 +27,7 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.parallel_state import get_tensor_model_parallel_group, get_tensor_and_expert_parallel_group
 from megatron.core.jit import jit_fuser
+from core.distributed import all_gather_into_tensor
 
 try:
     from einops import rearrange
@@ -219,7 +220,7 @@ class SwitchMLP(MegatronModule):
         # TODO pre allocate memory
         output = torch.empty(dim_size, dtype=local_indices.dtype,
                              device=torch.cuda.current_device())
-        torch.distributed._all_gather_base(
+        all_gather_into_tensor(
             output, local_indices.contiguous(), group=group
         )
         return output
