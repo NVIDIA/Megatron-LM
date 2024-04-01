@@ -378,9 +378,6 @@ class TransformerBlock(MegatronModule):
                 )
             else:
                 for l_no, layer in enumerate(self.layers):
-                    # Trigger pre_forward hook manually for CUDA graph
-                    for param in layer.parameters():
-                        param.data_ptr()
                     with self.offload_context:
                         skip_fp8_weight_update = torch.zeros(1, device="cuda")
                         if (len(self.cg) > l_no) and (self.current_microbatch < len(self.cg[l_no])) and self.training:
