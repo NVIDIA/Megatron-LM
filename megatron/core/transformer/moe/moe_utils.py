@@ -2,6 +2,8 @@
 
 import torch
 
+from megatron.core import parallel_state
+
 
 def switch_load_balancing_loss_func(gates, mask, moe_aux_loss_coeff):
     """Calculate the auxiliary loss for better load balacing. 
@@ -149,3 +151,79 @@ def unpermute(permuted_tokens, sorted_indices, probs: torch.Tensor = None, topk:
     unpermuted_tokens = unpermuted_tokens.sum(dim=1)
 
     return unpermuted_tokens
+
+
+def save_to_aux_losses_tracker(name: str, loss: torch.Tensor, layer_number: int, num_layers: int):
+    """Save the auxiliary loss for logging.
+    Args:
+        name (str): The name of the loss.
+        loss (torch.Tensor): The loss tensor.
+        layer_number (int): Layer index of the loss.
+        num_layers (int): The number of total layers.
+    """
+    # Skip aux loss logging if layer_number is None.
+    if layer_number is None:
+        return
+
+    if name not in parallel_state._MOE_AUX_LOSSES_LOGGING_TRACKER:
+        parallel_state._MOE_AUX_LOSSES_LOGGING_TRACKER[name] = torch.zeros(
+            num_layers, device=loss.device
+        )
+    parallel_state._MOE_AUX_LOSSES_LOGGING_TRACKER[name][layer_number - 1] += loss.detach()
+
+
+def clear_aux_losses_tracker():
+    """Clear the auxiliary losses."""
+    for name in parallel_state._MOE_AUX_LOSSES_LOGGING_TRACKER:
+        parallel_state._MOE_AUX_LOSSES_LOGGING_TRACKER[name].zero_()
+
+
+def get_aux_losses_tracker():
+    """Return the auxiliary losses."""
+    return parallel_state._MOE_AUX_LOSSES_LOGGING_TRACKER
+
+
+def aggregate_aux_losses_tracker_across_pipeline_parallel():
+    """Sum aux losses across PP."""
+    for name in parallel_state._MOE_AUX_LOSSES_LOGGING_TRACKER:
+        loss = parallel_state._MOE_AUX_LOSSES_LOGGING_TRACKER[name]
+        torch.distributed.all_reduce(loss, group=parallel_state.get_pipeline_model_parallel_group())
+
+
+def track_moe_metrics(
+    loss_scale, iteration, writer, wandb_writer=None, total_loss_dict=None, per_layer_logging=False
+):
+    # Aux loss logging
+    aggregate_aux_losses_tracker_across_pipeline_parallel()
+    if writer is not None:
+        aux_losses = {k: v.float() * loss_scale for k, v in get_aux_losses_tracker().items()}
+        for name, loss_list in aux_losses.items():
+            if total_loss_dict is not None:
+                if name not in total_loss_dict:
+                    total_loss_dict[name] = loss_list.mean()
+                else:
+                    total_loss_dict[name] += loss_list.mean()
+
+            # currently when using add_scalars,
+            # torch.utils.add_scalars makes each timer its own run, which
+            # polutes the runs list, so we just add each as a scalar
+            writer.add_scalar(name, loss_list.mean(), iteration)
+            if per_layer_logging:
+                for i, loss in enumerate(loss_list.tolist()):
+                    writer.add_scalar(f"moe/{name}_layer_{i}", loss, iteration)
+
+            # W&B logging lacks support for logging multiple scalars simultaneously.
+            # As a workaround, we log each scalar individually first, then we can create
+            # a custom panel to manually group them to a single plot.
+            if wandb_writer:
+                wandb_writer.log({f"{name}": loss_list.mean()}, iteration)
+                if per_layer_logging:
+                    wandb_writer.log(
+                        {
+                            f"moe/{name}_layer_{i}": loss
+                            for i, loss in enumerate(loss_list.tolist())
+                        },
+                        iteration,
+                    )
+
+    clear_aux_losses_tracker()

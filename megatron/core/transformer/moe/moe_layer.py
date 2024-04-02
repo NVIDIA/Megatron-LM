@@ -23,7 +23,7 @@ class BaseMoELayer(MegatronModule, ABC):
         config (TransformerConfig): Configuration object for the transformer model.
     """
 
-    def __init__(self, config: TransformerConfig):
+    def __init__(self, config: TransformerConfig, layer_number: int = None):
         super(BaseMoELayer, self).__init__(config)
         self.config = config
         self.expert_parallel_size = parallel_state.get_expert_model_parallel_world_size()
@@ -40,10 +40,15 @@ class BaseMoELayer(MegatronModule, ABC):
         self.router = None
         self.experts = None
         self.token_dispatcher = None
+        self.layer_number = layer_number
 
     @abstractmethod
     def forward(self, hidden_states):
         pass
+
+    def set_layer_number(self, layer_number: int):
+        self.layer_number = layer_number
+        self.router.set_layer_number(layer_number)
 
 
 class MoELayer(BaseMoELayer):
@@ -53,9 +58,11 @@ class MoELayer(BaseMoELayer):
         BaseMoELayer (MegatronModule): Base class for MoE layers
     """
 
-    def __init__(self, config: TransformerConfig, submodules: MLPSubmodules = None):
+    def __init__(
+        self, config: TransformerConfig, submodules: MLPSubmodules = None, layer_number: int = None
+    ):
         self.submodules = submodules
-        super(MoELayer, self).__init__(config=config)
+        super(MoELayer, self).__init__(config=config, layer_number=layer_number)
         self.router = TopKRouter(config=self.config)
         if self.config.moe_grouped_gemm:
             self.experts = GroupedMLP(self.num_local_experts, self.config)
