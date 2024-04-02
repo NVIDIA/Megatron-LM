@@ -29,16 +29,15 @@ class TestParallelGroupedMLP:
         num_layers = 1 # 2
         self.hidden_size = 2 # 12
         self.num_experts = 2
-        self.gated_linear_unit = True
+        self.gated_linear_unit = swiglu
+        self.activation_func = F.silu if swiglu else F.gelu
         self.use_cpu_initialization = use_cpu_initialization
-        self.gated_linear_unit = False
-        if swiglu:
-            self.gated_linear_unit = True
 
         tf_config = TransformerConfig(
             num_layers=num_layers, hidden_size=self.hidden_size, num_attention_heads=4,
             num_moe_experts=self.num_experts, use_cpu_initialization=self.use_cpu_initialization,
             add_bias_linear=False, gated_linear_unit=self.gated_linear_unit,
+            activation_func=self.activation_func,
             bias_activation_fusion=False,
             bf16=True, params_dtype=torch.bfloat16, moe_router_load_balancing_type="sinkhorn", moe_router_topk=1)
 
