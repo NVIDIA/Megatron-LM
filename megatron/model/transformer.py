@@ -381,7 +381,19 @@ class FlashSelfAttention(torch.nn.Module):
 
         # Use FlashAttention-2 when args.use_flash_attn_v2 is True
         args = get_args()
-        self.flash_attn_func = flash_attn_varlen_func if args.use_flash_attn_v2 else flash_attn_unpadded_func
+        self.use_flash_attn_builder_v1 = False
+        self.use_flash_attn_builder_v2 = False
+        self.use_flash_attn = False
+        if args.use_flash_attn_builder:
+            if hasattr(flash_attn_builder, 'flash_attn_func'):
+                self.flash_attn_func = flash_attn_builder.flash_attn_func
+                self.use_flash_attn_builder_v1 = True
+            else:
+                self.flash_attn_func = flash_attn_builder.flash_attn_func_v2
+                self.use_flash_attn_builder_v2 = True
+        else:
+            self.flash_attn_func = flash_attn_varlen_func if args.use_flash_attn_v2 else flash_attn_unpadded_func
+            self.use_flash_attn = True
 
     def forward(self, q, k, v):
         """Implements the multihead softmax attention.
@@ -392,22 +404,19 @@ class FlashSelfAttention(torch.nn.Module):
 
         assert all((i.dtype in [torch.float16, torch.bfloat16] for i in (q,k,v)))
         assert all((get_accelerator().on_accelerator(i) for i in (q, k, v)))
-        # if get_accelerator().device_name() == 'cuda':
-        #     assert all((i.is_cuda for i in (q,k,v)))
-        # else:
-        #     assert all((i.is_xpu for i in (q,k,v)))
 
         batch_size, seqlen_q = q.shape[0], q.shape[1]
         seqlen_k = k.shape[1]
 
-        if get_accelerator().device_name() == 'cuda':
-            # goes for cuda device
+        if self.use_flash_attn:
             q, k, v = [rearrange(x, 'b s ... -> (b s) ...') for x in [q, k, v]]
             cu_seqlens_q = torch.arange(0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32,
                                         device=q.device)
-        else:
-            # goes for other device
+        elif self.use_flash_attn_builder_v1:
             q, k, v = [rearrange(x, 'b s h d -> b h s d').contiguous() for x in [q, k, v]]
+        else:
+            # use_flash_attn_builder_v2
+            q, k, v = [rearrange(x, 'b s h d -> b h s d') for x in [q, k, v]]
 
         if self.training:
             # during training q,k,v always have same seqlen
@@ -424,16 +433,26 @@ class FlashSelfAttention(torch.nn.Module):
                         device=q.device) if get_accelerator().device_name() == 'cuda' else None
             dropout_p = 0
 
-        output = self.flash_attn_func(
-            q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
-            dropout_p,
-            softmax_scale=self.softmax_scale, causal=is_causal
-        ) if get_accelerator().device_name() == 'cuda' else flash_attn_builder.flash_attn_func(
-            q, k, v, self.dropout_p, self.softmax_scale, is_causal
-        )
+        if self.use_flash_attn:
+            output = self.flash_attn_func(
+                q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
+                dropout_p,
+                softmax_scale=self.softmax_scale, causal=is_causal
+            )
+        else:
+            # use_flash_attn_builder
+            output = self.flash_attn_func(
+                q, k, v, self.dropout_p, self.softmax_scale, is_causal
+            )
 
-        output = rearrange(output, '(b s) ... -> b s ...', b=batch_size) if get_accelerator().device_name() == 'cuda' else rearrange(
-            output, 'b h s d -> b s h d').contiguous()
+        if self.use_flash_attn:
+            output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
+        elif self.use_flash_attn_builder_v1:
+            output = rearrange(output, 'b h s d -> b s h d').contiguous()
+        else:
+            # use_flash_attn_builder_v2:
+            output = rearrange(output, 'b h s d -> b s h d')
+
         return output
 
 class FlashSelfAttentionTriton(torch.nn.Module):
@@ -492,7 +511,8 @@ class ParallelAttention(MegatronModule):
         self.num_key_value_heads = config.num_key_value_heads
         self.use_gqa = (self.num_attention_heads != self.num_key_value_heads)
 
-        self.use_flash_attn = (args.use_flash_attn_v1 or args.use_flash_attn_triton or args.use_flash_attn_v2) \
+        self.use_flash_attn = (args.use_flash_attn_v1 or args.use_flash_attn_triton or args.use_flash_attn_v2 or \
+            args.use_flash_attn_builder) \
             and attention_type == AttnType.self_attn \
             and self.attn_mask_type == AttnMaskType.causal
         self.use_flash_attn_triton = args.use_flash_attn_triton
@@ -504,12 +524,13 @@ class ParallelAttention(MegatronModule):
                 flash_attn_builder = None
 
             if args.use_flash_attn_v1:
-                assert flash_attn_unpadded_func != None or flash_attn_builder != None, ("Cannot import FlashAttention v1 "
-                                                                                        "and Cannot find FlashAttention Builder")
+                assert flash_attn_unpadded_func != None, "Cannot import FlashAttention v1 "
             if args.use_flash_attn_v2:
                 assert flash_attn_varlen_func != None, "Cannot import FlashAttention v2 "
             if args.use_flash_attn_triton:
                 assert flash_attn_func != None, "Cannot import FlashAttention triton "
+            if args.use_flash_attn_builder:
+                assert flash_attn_builder != None, "Cannot find FlashAttention op builder "
 
             assert attention_type == AttnType.self_attn, ('FlashAttention code path only supports '
                                                           'self-attention for now')
