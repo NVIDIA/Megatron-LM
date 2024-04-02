@@ -4,11 +4,13 @@ from typing import Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
+from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     _initialize_affine_weight_gpu,
@@ -37,10 +39,13 @@ class GroupedMLP(MegatronModule):
 
         self.expert_parallel = config.expert_model_parallel_size > 1
         if self.config.gated_linear_unit:
+            if self.config.activation_func != F.silu:
+                raise ValueError("Activation function must be silu when using GroupedMLP.")
 
+            @jit_fuser
             def glu(x):
                 x = torch.chunk(x, 2, dim=-1)
-                return self.config.activation_func(x[0]) * x[1]
+                return F.silu(x[0]) * x[1]
 
             self.activation_func = glu
         else:
