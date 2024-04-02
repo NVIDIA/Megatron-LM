@@ -284,8 +284,6 @@ class ParamAndGradBuffer:
             # and skip parameters that don't require gradients.
             if not param.requires_grad:
                 continue
-            this_numel = param.data.nelement()
-            data_end_index = data_start_index + this_numel
 
             def _does_param_require_new_bucket(param):
                 """
@@ -301,11 +299,13 @@ class ParamAndGradBuffer:
             if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
                 # We are creating a bucket for the already accumulated parameters, whose params
                 # end at the current data_start_index.
+                data_start_index = _create_new_bucket(data_start_index)
                 if use_distributed_optimizer:
                     # data_start_index should already be padded.
                     assert data_start_index % self.data_parallel_world_size == 0
-                _create_new_bucket(data_start_index)
 
+            this_numel = param.data.nelement()
+            data_end_index = data_start_index + this_numel
             self.param_index_map[param] = (
                 data_start_index,
                 data_end_index,
