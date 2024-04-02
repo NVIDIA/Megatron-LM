@@ -170,9 +170,12 @@ def validate_args(args, defaults={}):
 
     # If we use quantizer for weights or gradients, we need to use distributed optimizer.
     if args.quantized_weights or args.quantized_gradients:
-        assert args.use_distributed_optimizer is True
-        print('using quantizaiton during training, weight quantization group size = {}, gradient quantization group size = {}.'.format(args.wq_group_size, args.gq_group_size),
-              flush=True)
+        assert args.use_distributed_optimizer is True, 'Quantization only support Distributed Optimizer'
+        if args.quantized_weights:
+            print(f'Weight Quantization: True, group size = {args.wq_group_size}, bits = {args.weight_quantization_bits}', flush=True)
+        if args.quantized_gradients:
+            print(f'Gradient Quantization: True, gradient quantization intra-node group size = {args.gq_group_size_intra}, bits = {args.gradient_quantization_bits_intra}; inter-node group size = {args.gq_group_size_inter}, bits = {args.gradient_quantization_bits_inter}.',
+                flush=True)
         
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer, \
@@ -1196,12 +1199,19 @@ def _add_quantize_args(parser):
                        help='Group size for weight quantization.')
     group.add_argument('--quantized-gradients', action='store_true',
                        help='Quantize gradients before reduce scatter gradients. Only effecitve with distributed optimizer')
-    group.add_argument('--gradeint-quantization-bits', type=int, default=8,
-                       help='Gradients quantization bits, only support 8 and 4 bits, 4 bits gradients may have an accuracy drop.')
-    group.add_argument('--gq-group-size', type=int, default=2048,
-                       help='Group size for gradient quantization.')
+    group.add_argument('--gradient-quantization-bits-inter', type=int, default=4,
+                       help='Gradients quantization bits for inter-node gpus, only support 8 and 4 bits, 4 bits gradients may have an accuracy drop.')
+    group.add_argument('--gq-group-size-inter', type=int, default=128,
+                       help='Group size for inter-node gpus gradient quantization.')
+    group.add_argument('--gradient-quantization-bits-intra', type=int, default=8,
+                       help='Gradients quantization bits for intra-node gpus, only support 8 and 4 bits, 4 bits gradients may have an accuracy drop.')
+    group.add_argument('--gq-group-size-intra', type=int, default=512,
+                       help='Group size for intra-node gpus gradient quantization.')
     group.add_argument('--gradients-quantization-start-iteration', type=int, default=0,
                        help='Gradient quantization strat after this iteration.')
+    group.add_argument('--hadamard-transform', action='store_true',
+                       default=False,
+                       help='Hadamard Transformation before gradient reduction to decrease quantization error')
     return parser
 
 def _add_validation_args(parser):

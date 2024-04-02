@@ -116,7 +116,7 @@ class Bucket:
             if self.quantization_helper and self.quantization_helper.quantized_gradients:
                 torch.cuda.synchronize()
                 with torch.cuda.stream(stream):
-                    local_data_view.copy_(self.quantization_helper.quantize_reduce_gradients(self.data))
+                    self.quantization_helper.quantize_reduce_gradients(self.data, local_data_view)
                     event.record()
             else:
                 torch.cuda.synchronize()
@@ -246,7 +246,7 @@ class GradBuffer:
                     # Qantized weight requires the number of weights be a multiple of 8
                     weight_quantization_pad = quantization_helper.wq_group_size * 8
                 if quantization_helper.quantized_gradients:
-                    gradient_quantization_pad = quantization_helper.gq_group_size
+                    gradient_quantization_pad = least_common_multiple([quantization_helper.gq_group_size_intra, quantization_helper.gq_group_size_inter])
                 bucket_size_divisible_by = least_common_multiple([weight_quantization_pad, gradient_quantization_pad]) * self.data_parallel_world_size
                 return (
                     int(math.ceil(data_index / bucket_size_divisible_by))

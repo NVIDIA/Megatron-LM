@@ -395,11 +395,14 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                                                     weight_quantization_bits=args.weight_quantization_bits, 
                                                     wq_group_size=args.wq_group_size, 
                                                     quantized_gradients=args.quantized_gradients, 
-                                                    gradeint_quantization_bits=args.gradeint_quantization_bits,
-                                                    gq_group_size=args.gq_group_size,
+                                                    gradient_quantization_bits_inter=args.gradient_quantization_bits_inter,
+                                                    gq_group_size_inter=args.gq_group_size_inter,
+                                                    gradient_quantization_bits_intra=args.gradient_quantization_bits_intra,
+                                                    gq_group_size_intra=args.gq_group_size_intra,
                                                     data_parallel_group=mpu.get_data_parallel_group(with_context_parallel=True),
                                                     tensor_parallel_size=mpu.get_tensor_model_parallel_world_size(),
-                                                    pipeline_parallel_size=mpu.get_pipeline_model_parallel_world_size())
+                                                    pipeline_parallel_size=mpu.get_pipeline_model_parallel_world_size(),
+                                                    hadamard_transform=args.hadamard_transform)
 
     if wrap_with_ddp:
         config = get_model_config(model[0])
