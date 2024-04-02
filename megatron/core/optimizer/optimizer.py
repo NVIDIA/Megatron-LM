@@ -748,6 +748,11 @@ class ChainedOptimizer(MegatronOptimizer):
         for optimizer, state in zip(self.chained_optimizers, state_dict):
             optimizer.load_state_dict(state)
 
+        # Reset param_groups as load_state_dict reset chained optimizers's attribute.
+        self.param_groups = []
+        for optimizer in self.chained_optimizers:
+            self.param_groups += optimizer.param_groups
+
     def step(self):
         """ChainedOptimizer will step all optimizers one by one.
         """
