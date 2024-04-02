@@ -238,6 +238,8 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_token_dispatcher_type: str = "allgather"
     """The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather' and 'alltoall'."""
+    moe_per_layer_logging: bool = False
+    """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
     ####################
     # miscellaneous

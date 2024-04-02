@@ -116,6 +116,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # TODO how to set the gpt_layer_spec.py when we have moe_frequency > 1,
         #      where MLP and MoE layer both appear alternately?
         self.mlp = build_module(submodules.mlp, config=self.config)
+        if hasattr(self.mlp, 'set_layer_number'):
+            self.mlp.set_layer_number(self.layer_number)
 
         ## [Module 9: BiasDropoutFusion]
         self.mlp_bda = build_module(submodules.mlp_bda)

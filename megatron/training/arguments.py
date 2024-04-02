@@ -1593,6 +1593,8 @@ def _add_moe_args(parser):
                        choices=['allgather', 'alltoall'],
                        default='allgather',
                        help='.')
+    group.add_argument('--moe-per-layer-logging', action='store_true',
+                       help='Enable per-layer logging for MoE, currently supports auxiliary loss and z loss.')
 
     return parser
 

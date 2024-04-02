@@ -77,6 +77,9 @@ _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
 
+# MOE logging
+_MOE_AUX_LOSSES_LOGGING_TRACKER = {}
+
 
 def get_nccl_options(pg_name, nccl_comm_cfgs):
     """Set the NCCL process group options.
