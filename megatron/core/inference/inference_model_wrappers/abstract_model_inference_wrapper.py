@@ -5,7 +5,7 @@ from typing import Iterable, List
 
 import torch
 
-from megatron.core import parallel_state as mpu
+from megatron.core import parallel_state
 from megatron.core.inference.communication_utils import (
     recv_from_prev_pipeline_rank_,
     send_to_next_pipeline_rank,
@@ -42,7 +42,7 @@ class AbstractModelInferenceWrapper:
 
         # For TP only model both is_pp_first_stage and _is_pp_last_stage returns True
         self.model_is_pipeline_parallel = not (
-            mpu.is_pipeline_first_stage() and mpu.is_pipeline_last_stage()
+            parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
         )
         self.prompts_tokens = prompts_tokens
         batch_size, max_sequence_length = self.prompts_tokens.shape
@@ -98,7 +98,7 @@ class AbstractModelInferenceWrapper:
         tokens, position_ids, attention_mask = inference_input
         batch_size, seq_len = tokens.shape
         recv_buffer = None
-        if not mpu.is_pipeline_first_stage():
+        if not parallel_state.is_pipeline_first_stage():
             recv_buffer = self._allocate_recv_buffer(batch_size, seq_len)
             recv_from_prev_pipeline_rank_(recv_buffer)
 
@@ -106,13 +106,13 @@ class AbstractModelInferenceWrapper:
         output_tensor = self.model(
             tokens, position_ids, attention_mask, inference_params=self.inference_params
         )
-        if not mpu.is_pipeline_last_stage():
+        if not parallel_state.is_pipeline_last_stage():
             send_to_next_pipeline_rank(output_tensor)
 
         self.inference_params.sequence_len_offset += seq_len
 
         logits = None
-        if mpu.is_pipeline_last_stage():
+        if parallel_state.is_pipeline_last_stage():
             logits = output_tensor
 
         return logits
@@ -140,7 +140,7 @@ class AbstractModelInferenceWrapper:
 
         logits = None
         # Preallocate memory for output logits.
-        if mpu.is_pipeline_last_stage():
+        if parallel_state.is_pipeline_last_stage():
             logits = torch.empty(
                 (batch_size, seq_len, self.args.padded_vocab_size),
                 dtype=torch.float32,
@@ -148,7 +148,7 @@ class AbstractModelInferenceWrapper:
             )
 
         recv_buffer = None
-        if not mpu.is_pipeline_first_stage():
+        if not parallel_state.is_pipeline_first_stage():
             recv_buffer = self._allocate_recv_buffer(micro_batch_size, seq_len)
         for micro_batch_index in range(num_micro_batches):
             start = micro_batch_index * micro_batch_size
@@ -161,7 +161,7 @@ class AbstractModelInferenceWrapper:
             if current_micro_batch_size != micro_batch_size:
                 recv_buffer = self._allocate_recv_buffer(current_micro_batch_size, seq_len)
 
-            if not mpu.is_pipeline_first_stage():
+            if not parallel_state.is_pipeline_first_stage():
                 recv_from_prev_pipeline_rank_(recv_buffer)
 
             self.model.set_input_tensor(recv_buffer)
@@ -169,12 +169,12 @@ class AbstractModelInferenceWrapper:
                 tokens2use, position_ids2use, attention_mask, inference_params=self.inference_params
             )
 
-            if not mpu.is_pipeline_last_stage():
+            if not parallel_state.is_pipeline_last_stage():
                 send_to_next_pipeline_rank(output_tensor)
 
             self.inference_params.batch_size_offset += current_micro_batch_size
 
-            if mpu.is_pipeline_last_stage():
+            if parallel_state.is_pipeline_last_stage():
                 logits[start:end, ...] = output_tensor
 
         # Once done with all micro batches, we reset batch size offset and seq len offset

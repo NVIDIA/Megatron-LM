@@ -52,7 +52,7 @@ class MCoreBackend(AbstractBackend):
 
         (
             prompts_tokens_with_generations,
-            generated_sequence_lengths,
+            required_sequence_lengths,
             output_log_probs,
         ) = self.text_generation_strategy.generate_output_tokens(
             prompts_tokens, prompts_lengths, common_inference_params
@@ -62,10 +62,11 @@ class MCoreBackend(AbstractBackend):
         model_is_not_pipeline_parallel = (
             parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
         )
+
         # Returns the output in the first stage or in all GPUS for TP only models
         if model_is_not_pipeline_parallel or parallel_state.is_pipeline_first_stage():
             prompts_plus_generations_detokenized = self.text_generation_strategy.detokenize_generations(
-                prompts_tokens_with_generations, generated_sequence_lengths
+                prompts_tokens_with_generations, required_sequence_lengths
             )
 
             return {

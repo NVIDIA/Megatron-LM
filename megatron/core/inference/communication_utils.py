@@ -54,6 +54,21 @@ def copy_from_last_to_first_pipeline_stage(size, dtype, tensor=None):
             tensor[...] = tensor_
 
 
+def broadcast_from_last_pipeline_stage(size, dtype, tensor=None):
+    """Broadcast a tensor from last pipeline stage to all ranks."""
+
+    if parallel_state.is_pipeline_last_stage():
+        _is_cuda(tensor)
+        assert tensor.is_contiguous()
+    else:
+        tensor = torch.empty(size, dtype=dtype, device=torch.cuda.current_device())
+    # Get the group and corresponding source rank.
+    src = parallel_state.get_pipeline_model_parallel_last_rank()
+    group = parallel_state.get_pipeline_model_parallel_group()
+    torch.distributed.broadcast(tensor, src, group)
+    return tensor
+
+
 # TODO: Can use utilites from mcore itself I think
 def recv_from_prev_pipeline_rank_(recv_buffer=None):
     """Receive from previous pipeline stage and update the

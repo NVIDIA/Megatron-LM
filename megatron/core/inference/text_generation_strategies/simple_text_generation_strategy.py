@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from megatron.core import parallel_state
 from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.communication_utils import (
+    broadcast_from_last_pipeline_stage,
     copy_from_last_to_first_pipeline_stage,
     synchronize_list_across_all_ranks,
     synchronize_tensor_across_all_ranks,
@@ -181,6 +182,37 @@ class SimpleTextGenerationStrategy:
                 sampled_logits = torch.clamp(sampled_logits, min=0, max=(vocab_size - 1))
         return sampled_logits
 
+    def update_generation_status(
+        self,
+        updated_promps_tokens: torch.Tensor,
+        generation_started: torch.Tensor,
+        current_context_end_position: int,
+        is_generation_done_tensor: torch.Tensor,
+        actual_plus_generated_sequence_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """Function to check which prompts have reached an end condition
+
+        We check which prompts have reached an end condition and set the corresponding flags of the is_generation_done_tensor to True . The generated sequence lengths starts off with input prompt lengths values and increases as we keep generating, until that prompts hits an eod condition. The generation started status tensor helps us determine which are generated tokens, and which are input prompt tokens
+
+        Args:
+            updated_promps_tokens (torch.Tensor): The prompts tokens updated with the latest generated tokens. A tensor of shape [batch_size, max_seq_len] (i.e max_seq_len = max_prompt_len + tokens_to_generate)
+            generation_started (torch.Tensor): A boolean tensor of shape [batch_size]. True indicates the prompt at that index has started generating tokens. 
+            current_context_end_position (int): An intiger showing which position to extract from the prompts tokens to get the latest generated tokens. 
+            is_generation_done_tensor (torch.Tensor): A boolean tensor of shape [batch_size]. True indicates the prompt at that index has reached end condition.  
+            actual_plus_generated_sequence_lengths (torch.Tensor): A int tensor of shape [batch_size]. Each value represents the generated sequence lengths. Initial values are the lengths of each prompt
+
+        Returns:
+            torch.Tensor: Returns the boolean is_generation_done_tensor after updating it  
+        """
+        latest_samples = updated_promps_tokens[:, current_context_end_position]
+        # Make sure we are checking eod criterion only for prompts that have started generating (i.e) We only look at the generated tokenns and not the input tokens.
+        reached_eod = (latest_samples == self.tokenizer.eod) & generation_started
+        is_generation_done_tensor = is_generation_done_tensor | reached_eod
+        # We increase by 1 the generated sequence lengths whenever the corresponding prompt has not hit the eod criterion
+        actual_plus_generated_sequence_lengths += ~is_generation_done_tensor
+
+        return is_generation_done_tensor, actual_plus_generated_sequence_lengths
+
     def generate_output_tokens(
         self,
         prompts_tokens: torch.Tensor,
@@ -197,7 +229,7 @@ class SimpleTextGenerationStrategy:
             common_inference_params (CommonInferenceParams): The inference params used for generation
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Returns the output tokens, the generated sequence lengths and the output log probabilitites
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Returns the output tokens, the required sequence lengths and the output log probabilitites
         """
 
         batch_size, max_sequence_length = prompts_tokens.size(0), prompts_tokens.size(1)
@@ -225,6 +257,13 @@ class SimpleTextGenerationStrategy:
                     dtype=torch.float32,
                     device=torch.cuda.current_device(),
                 )
+        # An array to check which of the prompts have reached end of generation condition
+        is_generation_done_tensor = torch.zeros(
+            batch_size, dtype=torch.bool, device=torch.cuda.current_device()
+        )
+
+        # An array to act as a counter to keep track of generated sequence lengths
+        actual_plus_generated_sequence_lengths = prompts_lengths.clone().detach()
 
         with torch.no_grad():
             self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=prompts_tokens)
@@ -246,11 +285,12 @@ class SimpleTextGenerationStrategy:
                         last_token_logits, common_inference_params, self.tokenizer.vocab_size
                     )
 
-                    # Indicates which of the input prompts have started generating tokens. A 1D boolean tensor with [batch_size] elements
-                    started = prompts_lengths < context_end_position
-
+                    # Indicates which of the input prompts have started generating tokens. A 1D boolean tensor with [batch_size] elements (i.e) The shortest prompts will start generating first and so on
+                    generation_started = prompts_lengths <= context_end_position
                     # Substitute the sampled logits only for only the prompts that have started generating tokens
-                    prompts_tokens[started, context_end_position] = sampled_logits[started]
+                    prompts_tokens[generation_started, context_end_position] = sampled_logits[
+                        generation_started
+                    ]
 
                     if common_inference_params.return_log_probs:
                         log_probs = F.log_softmax(logits, dim=2)
@@ -267,11 +307,34 @@ class SimpleTextGenerationStrategy:
                         ] = torch.gather(log_probs, 2, indices).squeeze(2)
 
                 if model_is_pipeline_parallel:
-                    copy_from_last_to_first_pipeline_stage(batch_size, torch.int64, prompts_tokens)
+                    copy_from_last_to_first_pipeline_stage(
+                        size=batch_size, dtype=torch.int64, tensor=prompts_tokens
+                    )
 
                 context_start_position = context_end_position
 
-                # TODO : Need to add condition to check early stopping  and update generated sequence lengths (Send in the prompts, the tokenizer and the common inference params)
+                all_prompts_done = None
+                if model_is_not_pipeline_parallel or parallel_state.is_pipeline_last_stage():
+                    # Check end of generation status for each tensor and update generated sequence lengths
+                    (
+                        is_generation_done_tensor,
+                        actual_plus_generated_sequence_lengths,
+                    ) = self.update_generation_status(
+                        updated_promps_tokens=prompts_tokens,
+                        generation_started=generation_started,
+                        current_context_end_position=context_end_position,
+                        is_generation_done_tensor=is_generation_done_tensor,
+                        actual_plus_generated_sequence_lengths=actual_plus_generated_sequence_lengths,
+                    )
+                    all_prompts_done = torch.all(is_generation_done_tensor)
+
+                if model_is_pipeline_parallel:
+                    broadcast_from_last_pipeline_stage(
+                        size=[], dtype=torch.bool, tensor=all_prompts_done
+                    )
+
+                if all_prompts_done:
+                    break
 
         # Include all the generated tokens
         prompts_tokens_with_generations = prompts_tokens[:, : (context_end_position + 1)]
@@ -279,14 +342,25 @@ class SimpleTextGenerationStrategy:
             if common_inference_params.return_log_probs:
                 output_log_probs = output_log_probs[:, :context_end_position]
 
-        generated_sequence_lengths = (
+        # The max number of tokens to be generated for each prompt is prompt_length + num_tokens_to_generate
+        max_allowable_generated_sequence_lengths = (
             prompts_lengths + common_inference_params.num_tokens_to_generate
         )
+        required_sequence_lengths = torch.min(
+            torch.vstack(
+                (max_allowable_generated_sequence_lengths, actual_plus_generated_sequence_lengths)
+            ),
+            dim=0,
+        ).values.cuda()
+        if model_is_pipeline_parallel:
+            copy_from_last_to_first_pipeline_stage(
+                size=batch_size, dtype=torch.int64, tensor=required_sequence_lengths
+            )
 
-        return prompts_tokens_with_generations, generated_sequence_lengths, output_log_probs
+        return prompts_tokens_with_generations, required_sequence_lengths, output_log_probs
 
     def detokenize_generations(
-        self, prompt_tokens_with_generations: torch.Tensor, generated_sequence_lengths: torch.Tensor
+        self, prompt_tokens_with_generations: torch.Tensor, required_sequence_lengths: torch.Tensor
     ) -> List[str]:
         """Detokenize the output generations
 
@@ -294,7 +368,7 @@ class SimpleTextGenerationStrategy:
 
         Args:
             prompt_tokens_with_generations (torch.Tensor): The input prompt tokens plus the generated tokens of shape [batch_size, max_seq_len] (i.e max_seq_len = max_prompt_len + tokens_to_generate)
-            generated_sequence_lengths (torch.Tensor): A 1D tensor of with [batch_size]  elements consisting of the generated sequence lengths.
+            required_sequence_lengths (torch.Tensor): A 1D tensor of with [batch_size] elements consisting of the length of each prompt to use. (i.e Mostly it is input prompt length + num tokens to generate, but sometimes smaller than if prompt reached EOD criterion early)
 
         Returns:
             List[str]: The detokenized outputs
@@ -303,9 +377,9 @@ class SimpleTextGenerationStrategy:
         prompts_plus_generations_detokenized = []
 
         tokens = prompt_tokens_with_generations.cpu().numpy().tolist()
-        lengths = generated_sequence_lengths.cpu().numpy().tolist()
+        req_lengths = required_sequence_lengths.cpu().numpy().tolist()
 
-        for sequence_tokens, length in zip(tokens, lengths):
+        for sequence_tokens, length in zip(tokens, req_lengths):
             sequence_tokens = sequence_tokens[:length]
             prompts_plus_generations_detokenized.append(self.tokenizer.detokenize(sequence_tokens))
 
