@@ -183,6 +183,13 @@ def get_checkpoint_tracker_filename(checkpoints_path):
     return os.path.join(checkpoints_path, 'latest_checkpointed_iteration.txt')
 
 
+def checkpoint_exists(checkpoints_path):
+    if checkpoints_path is None:
+        return False
+    load_step = 'latest_checkpointed_iteration.txt'
+    return os.path.exists(os.path.join(checkpoints_path, load_step))
+
+
 def read_metadata(tracker_filename):
     # Read the tracker file and either set the iteration or
     # mark it as a release checkpoint.
@@ -435,7 +442,7 @@ def fix_query_key_value_ordering(model, checkpoint_version):
 
 
 def _load_base_checkpoint(load_dir, rank0=False, sharded_state_dict=None,
-                          exit_on_missing_checkpoint=False):
+                          exit_on_missing_checkpoint=False, checkpoint_step = None):
     """ Load the base state_dict from the given directory
 
     If rank0 is true, just loads rank 0 checkpoint, ignoring arguments.
@@ -463,7 +470,11 @@ def _load_base_checkpoint(load_dir, rank0=False, sharded_state_dict=None,
 
     # Otherwise, read the tracker file and either set the iteration or
     # mark it as a release checkpoint.
-    iteration, release = read_metadata(tracker_filename)
+    if checkpoint_step is not None:
+        iteration = checkpoint_step
+        release = False
+    else:
+        iteration, release = read_metadata(tracker_filename)
 
     # Checkpoint.
     if rank0:
@@ -541,6 +552,7 @@ def load_args_from_checkpoint(args, load_arg='load',
         load_dir,
         rank0=True,
         exit_on_missing_checkpoint=exit_on_missing_checkpoint,
+        checkpoint_step=args.ckpt_step
     )
 
     # Args.
@@ -616,6 +628,16 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     """
     args = get_args()
     load_dir = getattr(args, load_arg)
+
+    # Finetuning directories
+    pretrained_dir = getattr(args,'pretrained_checkpoint', None)
+    if pretrained_dir is not None and not checkpoint_exists(load_dir):
+        print_rank_0(f'Checkpoint file not found in load directory {load_dir} attempting to finetune with checkpoint in {pretrained_dir}')
+        load_dir = pretrained_dir
+        if not checkpoint_exists(load_dir):
+            raise FileNotFoundError("No checkpoint found in load directory or pretrained directory")
+        args.finetune = True
+
 
     model = unwrap_model(model)
 
@@ -775,7 +797,9 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    print_rank_0(f'  successfully loaded checkpoint from {args.load} [ t {mpu.get_tensor_model_parallel_rank()}, p {mpu.get_pipeline_model_parallel_rank()} ] '
+    print_rank_0(f'  successfully loaded checkpoint from {load_dir} '
+                 f'[ t {mpu.get_tensor_model_parallel_rank()}, '
+                 f'p {mpu.get_pipeline_model_parallel_rank()} ] '
                  f'at iteration {iteration}')
 
     return iteration, num_floating_point_operations_so_far
