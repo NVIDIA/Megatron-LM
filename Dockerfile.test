@@ -8,7 +8,7 @@ RUN pip install --no-cache-dir \
     "wrapt" \
     "zarr" \
     "tensorstore==0.1.45" \
-    "git+https://github.com/fanshiqing/grouped_gemm@main" \
+    "git+https://github.com/fanshiqing/grouped_gemm@v1.0" \
     "black==19.10b0" \
     "isort" \
     "click==8.0.2"
