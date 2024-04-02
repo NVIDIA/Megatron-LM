@@ -36,8 +36,8 @@ def model_provider(pre_process=True, post_process=True):
 
     args = get_args()
     config = core_transformer_config_from_args(args)
-    if hasattr(mpu, 'get_sequence_parallel_group'):
-        dpg = mpu.get_sequence_parallel_group()
+    if hasattr(mpu, 'get_sequence_data_parallel_group'):
+        dpg = mpu.get_sequence_data_parallel_group()
     elif hasattr(mpu, 'get_data_parallel_group'):
         dpg = mpu.get_data_parallel_group()
     else:
