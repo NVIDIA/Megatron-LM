@@ -85,3 +85,5 @@ products:
   - {use_mcore: [False], tp_size: [1], pp_size: [4], vp_size: [1]}
   # Checkpoint resume
   - {checkpoint_resume_test: [1], scope: [merge-request-resume], steps: [100], use_mcore: [False], tp_size: [1], pp_size: [2]}
+  - {checkpoint_resume_test: [1], scope: [merge-request-resume], steps: [100], use_mcore: [True], tp_size: [1], pp_size: [2], extra_args: ['"--moe-grouped-gemm --disable-bias-linear --sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --use-distributed-optimizer --moe-router-load-balancing-type sinkhorn --moe-router-topk 2"'], args_meta: ["te_8experts2parallel_dist_optimizer_groupedGEMM"]}
+  - {checkpoint_resume_test: [1], scope: [merge-request-resume], steps: [100], use_mcore: [True], tp_size: [1], pp_size: [2], extra_args: ['"--sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --moe-router-load-balancing-type sinkhorn --moe-router-topk 2"'], args_meta: ["te_8experts2parallel"]}
