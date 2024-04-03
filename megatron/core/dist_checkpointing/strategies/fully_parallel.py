@@ -18,7 +18,7 @@ from megatron.core.dist_checkpointing.strategies.base import SaveShardedStrategy
 logger = logging.getLogger(__name__)
 
 
-SaveDistributionT = Tuple[dict, dict]
+SaveDistribution = Tuple[dict, set]
 
 
 class FullyParallelSaveStrategyWrapper(SaveShardedStrategy):
@@ -34,6 +34,16 @@ class FullyParallelSaveStrategyWrapper(SaveShardedStrategy):
 
     Currently, the save distribution is realized with a greedy algorithm
     described in `distribute_chunks_to_ranks`.
+
+    Args:
+        strategy (SaveShardedStrategy): base strategy to wrap
+        parallelization_group (ProcessGroup, optional): process group to use for save
+            distribution. Note that this doesn't have to match exactly the
+            data distribution, but should cover the replication pattern
+            to maximize performance. Defaults to the whole world.
+        do_cache_distribution (bool, optional): whether to cache the save distribution
+            from previous calls. Should be set to True only if the state dict
+            structure between the calls is always the same. Defaults to True.
     """
 
     def __init__(
@@ -42,24 +52,12 @@ class FullyParallelSaveStrategyWrapper(SaveShardedStrategy):
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
         do_cache_distribution: bool = False,
     ):
-        """ Initializes the wrapper.
-
-        Args:
-            strategy (SaveShardedStrategy): base strategy to wrap
-            parallelization_group (ProcessGroup, optional): process group to use for save
-                distribution. Note that this doesn't have to match exactly the
-                data distribution, but should cover the replication pattern
-                to maximize performance. Defaults to the whole world.
-            do_cache_distribution (bool, optional): whether to cache the save distribution
-                from previous calls. Should be set to True only if the state dict
-                structure between the calls is always the same. Defaults to True.
-        """
         super().__init__(strategy.backend, strategy.version)
         self.base_strategy = strategy
         self.parallelization_group = parallelization_group
         self.do_cache_distribution = do_cache_distribution
 
-        self.cached_distribution: Optional[SaveDistributionT] = None
+        self.cached_distribution: Optional[SaveDistribution] = None
 
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         self.apply_saving_parallelization(sharded_state_dict)
@@ -132,7 +130,7 @@ def _shard_size(sh_ten: ShardedTensor):
 
 def determine_main_replica_uniform_distribution(
     sharded_state_dict: ShardedStateDict, parallelization_group: torch.distributed.ProcessGroup
-) -> Optional[SaveDistributionT]:
+) -> Optional[SaveDistribution]:
     """ Computes the save distribution.
 
     Should be used in conjunction with `distribute_main_replicas_with_precomputed_distribution`
@@ -146,7 +144,7 @@ def determine_main_replica_uniform_distribution(
         parallelization_group (ProcessGroup): distribution will be computed
             within this process group
 
-    Returns (SaveDistributionT, optional): distribution that can be used to apply the
+    Returns (SaveDistribution, optional): distribution that can be used to apply the
         parallelization. Returns None if the process_group is trivial (1 rank)
 
     """
@@ -167,7 +165,7 @@ def determine_main_replica_uniform_distribution(
 
     shard_to_ranks = defaultdict(list)
     shard_to_size = {}
-    is_saved_by_this_distributed_group = {}
+    shards_saved_by_this_parallelization_group = set()
     for rank, rank_shards in enumerate(all_shards):
         for sh_ten in rank_shards:
             shard_id = _sharded_tensor_chunk_id(sh_ten)
@@ -175,25 +173,28 @@ def determine_main_replica_uniform_distribution(
             if shard_id not in shard_to_size:
                 shard_to_size[shard_id] = _shard_size(sh_ten)
             if is_main_replica(sh_ten.replica_id):
-                is_saved_by_this_distributed_group[shard_id] = True
+                shards_saved_by_this_parallelization_group.add(shard_id)
 
     shard_to_ranks = {
-        k: v for k, v in shard_to_ranks.items() if is_saved_by_this_distributed_group.get(k, False)
+        k: v for k, v in shard_to_ranks.items() if k in shards_saved_by_this_parallelization_group
     }
 
     shard_to_saving_rank = distribute_chunks_to_ranks(
         shard_to_ranks, shard_to_size, len(all_shards)
     )
 
-    return shard_to_saving_rank, is_saved_by_this_distributed_group
+    return shard_to_saving_rank, shards_saved_by_this_parallelization_group
 
 
 def distribute_main_replicas_with_precomputed_distribution(
     sharded_state_dict: ShardedStateDict,
     parallelization_group: torch.distributed.ProcessGroup,
-    precomputed_distribution: Optional[SaveDistributionT],
+    precomputed_distribution: Optional[SaveDistribution],
 ):
-    """ Applies the save distribution computed with `determine_main_replica_uniform_distribution`
+    """ Applies the save distribution computed with `determine_main_replica_uniform_distribution`.
+
+    Based on rank assignment, sets replica ids of the shards saved by current rank to 0
+    and all the other replica ids to 1.
 
     Args:
         sharded_state_dict (ShardedStateDict): state dict to apply the save distribution to
@@ -204,9 +205,18 @@ def distribute_main_replicas_with_precomputed_distribution(
             `determine_main_replica_uniform_distribution`
 
     Returns: None
+
+    Example replica ids of tensors A, B, C before distribution:
+    rank0: A: (0, 0, 0), B: (0, 0, 0), C: (0, 0, 0)
+    rank1: A: (0, 0, 1), B: (0, 0, 1), C: (0, 0, 1)
+    rank2: A: (0, 0, 2), B: (0, 0, 2), C: (0, 0, 2)
+
+    Replicas after distribution for the example above:
+    rank0: A: 0, B: 1, C: 1
+    rank0: A: 1, B: 0, C: 1
+    rank0: A: 1, B: 1, C: 0
     """
-    group_size = torch.distributed.get_world_size(group=parallelization_group)
-    if group_size <= 1:
+    if torch.distributed.get_world_size(group=parallelization_group) <= 1:
         return
     if precomputed_distribution is None:
         raise ValueError(
@@ -219,18 +229,18 @@ def distribute_main_replicas_with_precomputed_distribution(
         if isinstance(sh_base, ShardedTensor)
     )
 
-    shard_to_saving_rank, is_saved_by_this_distributed_group = precomputed_distribution
+    shard_to_saving_rank, shards_saved_by_this_parallelization_group = precomputed_distribution
 
     rank_within_dp_group = torch.distributed.get_rank(parallelization_group)
     for sh_ten in local_shards:
         shard_id = _sharded_tensor_chunk_id(sh_ten)
         if (
-            is_saved_by_this_distributed_group.get(shard_id, False)
+            shard_id in shards_saved_by_this_parallelization_group
             and rank_within_dp_group == shard_to_saving_rank[shard_id]
         ):
             sh_ten.replica_id = 0
         else:
-            sh_ten.replica_id = 1  # TODO: consider something more informative
+            sh_ten.replica_id = 1
 
 
 T = TypeVar('T')
@@ -242,7 +252,8 @@ def distribute_chunks_to_ranks(
     """ Computes uniform distribution of workload across ranks, based on sizes.
 
     Currently, the assignment is greedy, based on:
-    1. Firstly, the coverage of each shard (lower coverage is assigned first)
+    1. Firstly, the coverage of each shard
+        (how many ranks the shard is available on; lower coverage is assigned first)
     2. Secondly, the size of each shard (larger size is assigned first)
     3. Finally, shard id for differentiation.
 
@@ -270,47 +281,11 @@ def distribute_chunks_to_ranks(
         ),
     ):
         # assign greedily to the least occupied rank
-
         size, rank = min((size, rank) for size, rank in rank_sizes if rank in shard_ranks)
 
         shard_to_saving_rank[shard_id] = rank
         rank_sizes[rank] = (size + shard_to_size[shard_id], rank)
 
     logger.debug(f'distribute_chunks_to_ranks distribution: {rank_sizes}')
-
-    return shard_to_saving_rank
-
-
-def distribute_chunks_to_ranks_heapq(
-    shard_to_ranks: Dict[T, List[int]], shard_to_size: Dict[T, int], num_ranks: int
-) -> Dict[T, int]:
-    """ Heapq implementation of `distribute_chunks_to_ranks`. *Not* required for efficiency now. """
-    shard_to_ranks = {k: tuple(v) for k, v in shard_to_ranks.items()}
-    shard_to_saving_rank = {}
-    rank_sizes = [(0, rank) for rank in range(num_ranks)]
-    heapq.heapify(rank_sizes)
-
-    # start from tensors with lowest coverage, then go by tensor size from largest
-    for shard_id, shard_ranks in sorted(
-        shard_to_ranks.items(),
-        key=lambda sh_id_ranks: (
-            len(sh_id_ranks[1]),
-            shard_to_size[sh_id_ranks[0]],
-            sh_id_ranks[0],
-        ),
-    ):
-        # assign greedily to the least occupied rank
-        popped = []
-        while True:
-            size, rank = heapq.heappop(rank_sizes)
-            if rank in shard_ranks:
-                break
-            popped.append((size, rank))
-
-        shard_to_saving_rank[shard_id] = rank
-        for p in popped:
-            heapq.heappush(rank_sizes, p)
-
-        heapq.heappush(rank_sizes, (size + shard_to_size[shard_id], rank))
 
     return shard_to_saving_rank
