@@ -15,13 +15,10 @@ from megatron.core.datasets.utils import Split
 
 @dataclass
 class BERTMaskedWordPieceDatasetConfig(MaskedWordPieceDatasetConfig):
-    """Configuration object for Megatron Core BERT WordPiece datasets
-
-    Args:
-        classification_head (bool): Option to perform the next sequence prediction during sampling
-    """
+    """Configuration object for Megatron Core BERT WordPiece datasets"""
 
     classification_head: bool = None
+    """Option to perform the next sequence prediction during sampling"""
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init
