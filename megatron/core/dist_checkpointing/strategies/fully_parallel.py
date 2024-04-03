@@ -163,7 +163,6 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
 
 
     def apply_loading_parallelization(self, sharded_state_dict: ShardedStateDict) -> Optional[SaveDistribution]:
-        print('Apply FPL')
         precomputed_distribution = determine_main_replica_uniform_distribution(
             sharded_state_dict, self.parallelization_group, True
         )
@@ -203,9 +202,6 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                 try:
                     x = loaded_tensors[_sharded_tensor_chunk_id(x)]
                 except KeyError as e:
-                    if torch.distributed.get_rank() == 0:
-                        breakpoint()
-                    torch.distributed.barrier()
                     raise CheckpointingException(f'Missing loaded tensor shard: {_sharded_tensor_chunk_id(x)}') from e
 
             return x
