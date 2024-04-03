@@ -182,7 +182,7 @@ def pretrain(
         1) initialize Megatron.
         2) setup model, optimizer and lr schedule using the model_provider.
         3) call train_val_test_data_provider to get train/val/test datasets.
-        4) train the modle using the forward_step_func.
+        4) train the model using the forward_step_func.
 
     Args:
         train_valid_test_dataset_provider: a function that takes the size of
@@ -241,9 +241,6 @@ def pretrain(
         time.time() - _TRAIN_START_TIME))
     print_datetime('after megatron is initialized')
     app_metrics['app_model_init_finish_time'] = one_logger_utils.get_timestamp_in_ms()
-
-    args = get_args()
-    timers = get_timers()
 
     # Track E2E metrics on pretrain start
     one_logger_utils.on_pretrain_start()
