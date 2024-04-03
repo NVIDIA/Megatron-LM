@@ -307,8 +307,13 @@ class ParamAndGradBuffer:
         # Next, create underlying storage for buffer (with numel elements that includes
         # padding as necessary).
         self.numel = data_end_index
+        self.numel_unpadded = sum(per_bucket_numel_unpadded)
+        assert self.numel_unpadded <= self.numel
         if self.ddp_config.use_distributed_optimizer:
             assert self.numel % self.data_parallel_world_size == 0
+        else:
+            assert self.numel == self.numel_unpadded
+
         self.param_data = None
         # Only re-map param tensors if using distributed optimizer.
         if self.ddp_config.use_distributed_optimizer:
