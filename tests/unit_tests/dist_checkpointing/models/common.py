@@ -58,6 +58,8 @@ def common_test_parallel_reconfiguration_e2e(initialize_model_fn, tmp_path_dist_
         if use_fpsl:
             load_strategy = get_default_load_sharded_strategy(ckpt_dir_A)
             load_strategy = FullyParallelLoadStrategyWrapper(load_strategy)
+        else:
+            load_strategy = None
         state_dict = load(gpt_model_B.sharded_state_dict(), ckpt_dir_A, load_strategy)
         gpt_model_B.load_state_dict(state_dict)
         save(gpt_model_B.sharded_state_dict(), ckpt_dir_B)
