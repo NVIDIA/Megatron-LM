@@ -63,6 +63,9 @@ def print_datetime(string):
 
 
 def num_floating_point_operations(args, batch_size):
+    # Attention projection size.
+    query_projection_size = args.kv_channels * args.num_attention_heads
+    query_projection_to_hidden_size_ratio = query_projection_size / args.hidden_size
     # Group Query Attention.
     if not args.group_query_attention:
         args.num_query_groups = args.num_attention_heads
@@ -77,14 +80,21 @@ def num_floating_point_operations(args, batch_size):
         * args.hidden_size
         * args.hidden_size
         * (
-            1
+            # Attention.
+            (
+                (
+                    1
+                    + (args.num_query_groups / args.num_attention_heads)
+                    + (args.seq_length / args.hidden_size)
+                ) * query_projection_to_hidden_size_ratio
+            )
+            # MLP.
             + (
                 (args.ffn_hidden_size / args.hidden_size)
                 * num_experts_routed_to
                 * gated_linear_multiplier
             )
-            + (args.num_query_groups / args.num_attention_heads)
-            + (args.seq_length / args.hidden_size)
+            # Logit.
             + (args.padded_vocab_size / (2 * args.num_layers * args.hidden_size))
         )
     )
