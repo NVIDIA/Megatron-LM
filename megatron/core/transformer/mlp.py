@@ -1,7 +1,7 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -13,6 +13,7 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedStateDict,
     ShardedTensorFactory,
 )
+from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
@@ -97,8 +98,11 @@ class MLP(MegatronModule):
 
         if self.config.bias_activation_fusion:
             if self.activation_func == F.gelu:
-                assert self.config.add_bias_linear is True
-                intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+                if self.config.gated_linear_unit:
+                    intermediate_parallel = bias_geglu_impl(intermediate_parallel, bias_parallel)
+                else:
+                    assert self.config.add_bias_linear is True
+                    intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
             elif self.activation_func == F.silu and self.config.gated_linear_unit:
                 intermediate_parallel = bias_swiglu_impl(intermediate_parallel, bias_parallel)
             else:
@@ -121,15 +125,17 @@ class MLP(MegatronModule):
 
         return output, output_bias
 
-    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()) -> ShardedStateDict:
+    def sharded_state_dict(
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
+    ) -> ShardedStateDict:
         sharded_state_dict = {}
         for name, module in self._modules.items():
             if name == 'linear_fc1' and self.config.gated_linear_unit:
-                sub_sd = self._sharded_state_dict_for_glu(name, module, prefix, sharded_offsets)
-            else:
-                sub_sd = module.sharded_state_dict(
-                    prefix=f'{prefix}{name}.', sharded_offsets=sharded_offsets,
+                sub_sd = self._sharded_state_dict_for_glu(
+                    name, module, prefix, sharded_offsets, metadata
                 )
+            else:
+                sub_sd = module.sharded_state_dict(f'{prefix}{name}.', sharded_offsets, metadata)
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
 
@@ -139,10 +145,11 @@ class MLP(MegatronModule):
         module: torch.nn.Module,
         prefix: str,
         sharded_offsets: Tuple[Tuple[int, int, int]],
+        metadata: Optional[dict] = None,
     ):
         assert module_name == 'linear_fc1', module_name
         sharded_state_dict = module.sharded_state_dict(
-            prefix=f'{prefix}{module_name}.', sharded_offsets=sharded_offsets,
+            f'{prefix}{module_name}.', sharded_offsets, metadata
         )
         weight_key = f'{prefix}{module_name}.weight'
         prev_sh_ten = sharded_state_dict[weight_key]

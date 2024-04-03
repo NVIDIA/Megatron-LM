@@ -4,13 +4,13 @@
 
 import torch.nn.functional as F
 from functools import partial
-from megatron import get_args, get_timers
-from megatron import print_rank_0
-from megatron.model.vision.classification import VitClassificationModel
-from megatron.data.vit_dataset import build_train_valid_datasets
+from megatron.training import get_args, get_timers
+from megatron.training import print_rank_0
+from megatron.legacy.model.vision.classification import VitClassificationModel
+from megatron.legacy.data.vit_dataset import build_train_valid_datasets
 from tasks.vision.classification.eval_utils import accuracy_func_provider
 from tasks.vision.finetune_utils import finetune
-from megatron.utils import average_losses_across_data_parallel_group
+from megatron.training.utils import average_losses_across_data_parallel_group
 
 
 def classification():

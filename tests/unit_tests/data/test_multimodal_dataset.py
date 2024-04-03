@@ -10,7 +10,6 @@ from megatron.core.datasets.multimodal_dataset import MockMultimodalDataset, Mul
 
 def test_mock_multimodal_dataset():
     config = MultimodalDatasetConfig(
-        is_built_on_rank=lambda: True,
         random_seed=1234,
         sequence_length=1024,
         mock=True,
@@ -23,7 +22,7 @@ def test_mock_multimodal_dataset():
     )
 
     datasets = BlendedMegatronDatasetBuilder(
-        MockMultimodalDataset, [100, 100, 100], config
+        MockMultimodalDataset, [100, 100, 100], lambda: True, config
     ).build()
 
     for ds in datasets:

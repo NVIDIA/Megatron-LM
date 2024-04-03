@@ -1,5 +1,8 @@
+context\_parallel package
+=========================
+
 Context parallelism overview 
-===========================
+----------------------------
 
 .. figure:: ../images/context_parallel/CP_overview.png
    :alt: cp_overview
@@ -12,7 +15,7 @@ Context Parallelism ("CP") is a parallelization scheme on the dimension of seque
 For example, in Figure 1, assuming sequence length is 8K, each GPU processes 4K tokens. GPU0 and GPU2 compose a CP group, they exchange KV with each other. Same thing also happens between GPU1 and GPU3. CP is similar to `Ring Attention <https://arxiv.org/abs/2310.01889>`_ but provides better performance by (1) leveraging the latest OSS and cuDNN flash attention kernels; (2) removing unnecessary computation resulted from low-triangle causal masking and achieving optimal load balance among GPUs.
 
 Context parallelism benefits 
-==============================
+----------------------------
 
 .. figure:: ../images/context_parallel/CP_results.png
    :alt: cp_results
@@ -25,7 +28,7 @@ LLM encounters OOM (out of memory) issue with long context (i.e., long sequence 
 CP can better address the issues. With CP, each GPU only computes on a part of the sequence, which reduces both computation and communication by CP times. Therefore, there are no concerns about the overlapping between them. The activation memory footprint per GPU is also CP times smaller, hence no OOM issue any more. As Figure 2 shows, the combinations of TP and CP can achieve optimal performance by eliminating recompute overheads and making the best tradeoff between computation and communications.
 
 Enabling context parallelism
-============================
+----------------------------
 
 CP support has been added to GPT. All models that share GPT code path also should be able to benefit from CP, such as Llama. CP can work with TP (tensor model parallelism), PP (pipeline model parallelism), and DP (data parallelism), where the total number of GPUs equals TPxCPxPPxDP. CP also can work with different attention variants, including MHA/MQA/GQA, uni-directional and bi-directional masking.
 

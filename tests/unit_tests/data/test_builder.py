@@ -100,62 +100,57 @@ def test_builder():
 
         # one dataset, one split AND multiple datasets, one split
         config = BlendedMegatronDatasetConfig(
-            is_built_on_rank=lambda: True,
             random_seed=1234,
             sequence_length=_SEQUENCE_LENGTH,
             blend_per_split=[[paths[Split.train][0]], blends[Split.valid], None,],
         )
-        datasets = BlendedMegatronDatasetBuilder(TestDataset, [100, 100, 100], config).build()
+        datasets = BlendedMegatronDatasetBuilder(TestDataset, [100, 100, 100], lambda: True, config).build()
         assert len(datasets[0]) == 100 and isinstance(datasets[0], TestDataset)
         assert len(datasets[1]) >= 100 and isinstance(datasets[1], BlendedDataset)
         assert datasets[2] is None
 
         # blend_per_split, all splits
         config = BlendedMegatronDatasetConfig(
-            is_built_on_rank=lambda: True,
             random_seed=1234,
             sequence_length=_SEQUENCE_LENGTH,
             blend_per_split=[blends[Split.train], blends[Split.valid], blends[Split.test],],
         )
-        datasets = BlendedMegatronDatasetBuilder(TestDataset, [100, 100, 100], config).build()
+        datasets = BlendedMegatronDatasetBuilder(TestDataset, [100, 100, 100], lambda: True, config).build()
         assert len(datasets[0]) >= 100
         assert len(datasets[1]) >= 100
         assert len(datasets[2]) >= 100
 
         # blend_per_split, one split
         config = BlendedMegatronDatasetConfig(
-            is_built_on_rank=lambda: True,
             random_seed=1234,
             sequence_length=_SEQUENCE_LENGTH,
             blend_per_split=[blends[Split.train], None, None,],
         )
-        datasets = BlendedMegatronDatasetBuilder(TestDataset, [100, 100, 100], config).build()
+        datasets = BlendedMegatronDatasetBuilder(TestDataset, [100, 100, 100], lambda: True, config).build()
         assert len(datasets[0]) >= 100
         assert datasets[1] is None
         assert datasets[2] is None
 
         # blend, 90,9,1 split
         config = BlendedMegatronDatasetConfig(
-            is_built_on_rank=lambda: True,
             random_seed=1234,
             sequence_length=_SEQUENCE_LENGTH,
             blend=blends[Split.train],
             split="90,9,1",
         )
-        datasets = BlendedMegatronDatasetBuilder(TestDataset, [100, 100, 100], config).build()
+        datasets = BlendedMegatronDatasetBuilder(TestDataset, [100, 100, 100], lambda: True, config).build()
         assert len(datasets[0]) >= 100
         assert len(datasets[1]) >= 100
         assert len(datasets[2]) >= 100
 
         # blend, 100,0,0 split
         config = BlendedMegatronDatasetConfig(
-            is_built_on_rank=lambda: True,
             random_seed=1234,
             sequence_length=_SEQUENCE_LENGTH,
             blend=blends[Split.train],
             split="100,0,0",
         )
-        datasets = BlendedMegatronDatasetBuilder(TestDataset, [100, 100, 100], config).build()
+        datasets = BlendedMegatronDatasetBuilder(TestDataset, [100, 100, 100], lambda: True, config).build()
         assert len(datasets[0]) >= 100
         assert datasets[1] is None
         assert datasets[2] is None

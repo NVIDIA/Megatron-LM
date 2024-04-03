@@ -1,17 +1,35 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from logging import getLogger
+from typing import Callable, Dict, List, Optional
+
 import torch
 from apex.optimizers import FusedAdam as Adam
 from apex.optimizers import FusedSGD as SGD
 
 from megatron.core import mpu
 
+from ..distributed import ParamAndGradBuffer
+from ..transformer.module import MegatronModule
 from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
-from .optimizer import ChainedOptimizer, Float16OptimizerWithFloat16Params, FP32Optimizer
+from .optimizer import (
+    ChainedOptimizer,
+    Float16OptimizerWithFloat16Params,
+    FP32Optimizer,
+    MegatronOptimizer,
+)
 from .optimizer_config import OptimizerConfig
 
+logger = getLogger(__name__)
 
-def get_param_groups(model_chunks, no_weight_decay_cond, scale_lr_cond, lr_mult):
+
+def _get_param_groups(
+    model_chunks: List[MegatronModule],
+    no_weight_decay_cond: Callable,
+    scale_lr_cond: Callable,
+    lr_mult: float,
+    use_decoupled_learning_rate: bool,
+) -> List[Dict]:
     """Create parameter groups for optimizer.
 
     Creates parameter groups based on weight decay condition (regularized vs
@@ -28,19 +46,14 @@ def get_param_groups(model_chunks, no_weight_decay_cond, scale_lr_cond, lr_mult)
             should have a scaled learning rate.
         lr_mult (float): learning rate multiplier for parameters that
             satisfy scale_lr_cond.
-    """
-    # map (wd_mult, lr_mult, is_expert_parallel) to params
-    params_map = {
-        (1.0, 1.0, False): [],
-        (1.0, 1.0, True): [],
-        (1.0, lr_mult, False): [],
-        (1.0, lr_mult, True): [],
-        (0.0, 1.0, False): [],
-        (0.0, 1.0, True): [],
-        (0.0, lr_mult, False): [],
-        (0.0, lr_mult, True): [],
-    }
+        use_decoupled_learning_rate (bool): true if using decoupled learning rate.
 
+    Returns:
+        List of parameter groups.
+    """
+
+    # Map (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr) to params.
+    params_map = {}
     for model_chunk in model_chunks:
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
@@ -51,7 +64,7 @@ def get_param_groups(model_chunks, no_weight_decay_cond, scale_lr_cond, lr_mult)
             if no_weight_decay_cond is not None:
                 no_wd = no_weight_decay_cond(name, param)
             else:
-                # do not regularize biases nor Norm parameters
+                # Do not regularize biases and norm parameters.
                 no_wd = name.endswith(".bias") or len(param.shape) == 1
 
             if scale_lr_cond is not None:
@@ -68,47 +81,96 @@ def get_param_groups(model_chunks, no_weight_decay_cond, scale_lr_cond, lr_mult)
             else:
                 wd_mult, lr_mult = 0.0, lr_mult
 
-            params_map[(wd_mult, lr_mult, is_expert_parallel)].append(param)
+            is_decoupled_lr = False
+            # For input/embedding and output layer: embedding.word_embeddings.weight / output_layer.weight.
+            if use_decoupled_learning_rate and getattr(
+                param, 'is_embedding_or_output_parameter', False
+            ):
+                is_decoupled_lr = True
+
+            key = (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr)
+            if key not in params_map:
+                params_map[key] = []
+            params_map[key].append(param)
 
     param_groups = []
-    for (wd_mult, lr_mult, is_expert_parallel), params in params_map.items():
-        if len(params) == 0:
-            continue
+    for (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr), params in params_map.items():
+        assert len(params) > 0
         param_groups.append(
             {
                 'params': params,
                 'wd_mult': wd_mult,
                 'lr_mult': lr_mult,
                 'is_expert_parallel': is_expert_parallel,
+                'is_decoupled_lr': is_decoupled_lr,
             }
         )
 
     return param_groups
 
 
-def get_megatron_optimizer_based_on_param_groups(
-    config,
-    param_groups,
-    per_model_buffers=None,
-    data_parallel_group=None,
-    data_parallel_group_gloo=None,
-    data_parallel_group_idx=None,
-):
-    """Get megatron optimizer based on parameter groups.
-
-    For distributed optimizer, we need the parameter gradients to be stored in a
-    contiguous grad_buffer.
+def _update_min_and_max_lr_in_param_groups(
+    param_groups: List[Dict],
+    lr: float,
+    min_lr: float,
+    decoupled_lr: Optional[float],
+    decoupled_min_lr: Optional[float],
+) -> List[Dict]:
+    """
+    Updates `max_lr` and `min_lr` values in each parameter group, and returns new list.
+    By default, each group will use `lr` / `min_lr` as `max_lr` / `min_lr`.
+    If `decoupled_lr` is provided, then `decoupled_lr` / `decoupled_min_lr` will be used
+    as `max_lr` / `min_lr` for the input and output layer.
 
     Args:
+        param_groups (List): parameter groups whose 'max_lr' and `min_lr` fields need to
+            be adjusted.
+        lr (float): learning rate.
+        min_lr (float): minimum learning rate.
+        decoupled_lr (Optional[float]): optional decoupled learning rate.
+        decoupled_min_lr (Optional[float]): optional decoupled minimum learning rate.
+
+    Returns:
+        List of adjusted parameter groups.
+    """
+
+    if decoupled_min_lr is None:
+        decoupled_min_lr = min_lr
+
+    for param_group in param_groups:
+        if param_group['is_decoupled_lr']:
+            assert decoupled_lr is not None
+            param_group['max_lr'] = decoupled_lr
+            param_group['min_lr'] = decoupled_min_lr
+        else:
+            param_group['max_lr'] = lr
+            param_group['min_lr'] = min_lr
+    return param_groups
+
+
+def _get_megatron_optimizer_based_on_param_groups(
+    config: OptimizerConfig,
+    param_groups: List,
+    per_model_buffers: Optional[Dict[int, List[ParamAndGradBuffer]]] = None,
+    data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    data_parallel_group_gloo: Optional[torch.distributed.ProcessGroup] = None,
+    data_parallel_group_idx: Optional[int] = None,
+) -> MegatronOptimizer:
+    """Get Megatron optimizer based on parameter groups.
+
+    Args:
+        config (OptimizerConfig): optimizer configuration object.
         param_groups (list): list of parameter groups.
-        per_model_buffers (list, optional): list of buffers for
+        per_model_buffers (dict, optional): buffers for distributed optimizer. Defaults to None.
+        data_parallel_group (torch.distributed.ProcessGroup, optional): data-parallel group for
             distributed optimizer. Defaults to None.
-        data_parallel_group (ProcessGroup, optional): data parallel group for
-            distributed optimizer. Defaults to None.
-        data_parallel_group_gloo (ProcessGroup, optional): data parallel
-            group-gloo for distributed optimizer. Defaults to None.
-        data_parallel_group_idx (int, optional): data parallel
-            group index for distributed optimizer. Defaults to None.
+        data_parallel_group_gloo (torch.distributed.ProcessGroup, optional): gloo data-parallel
+            group for distributed optimizer. Defaults to None.
+        data_parallel_group_idx (int, optional): data-parallel group index for distributed
+            optimizer. Defaults to None.
+
+    Returns:
+        Instance of MegatronOptimizer.
     """
     if config.optimizer == 'adam':
         optimizer = Adam(
@@ -136,9 +198,6 @@ def get_megatron_optimizer_based_on_param_groups(
         init_state_fn = None
     else:
         raise Exception('{} optimizer is not supported.'.format(config.optimizer))
-
-    # Determine whether the params have main-grad field.
-    params_have_main_grad = True
 
     # Mixed precision optimizer.
     # - Note: both the Float16Optimizer and the DistributedOptimizer inherit
@@ -172,12 +231,7 @@ def get_megatron_optimizer_based_on_param_groups(
 
         optimizer_args = [
             optimizer,
-            config.clip_grad,
-            config.log_num_zeros_in_grad,
-            params_have_main_grad,
-            config.fp16,
-            config.bf16,
-            config.params_dtype,
+            config,
             grad_scaler,
             init_state_fn,
         ]
@@ -187,7 +241,6 @@ def get_megatron_optimizer_based_on_param_groups(
                 per_model_buffers=per_model_buffers,
                 data_parallel_group=data_parallel_group,
                 data_parallel_group_gloo=data_parallel_group_gloo,
-                overlap_param_gather=config.overlap_param_gather,
                 data_parallel_group_idx=data_parallel_group_idx,
             )
         else:
@@ -196,23 +249,22 @@ def get_megatron_optimizer_based_on_param_groups(
         return optimizer
 
     # FP32.
-    return FP32Optimizer(
-        optimizer,
-        config.clip_grad,
-        config.log_num_zeros_in_grad,
-        params_have_main_grad,
-        init_state_fn,
-    )
+    return FP32Optimizer(optimizer, config, init_state_fn,)
 
 
 def get_megatron_optimizer(
-    config, model_chunks, no_weight_decay_cond=None, scale_lr_cond=None, lr_mult=1.0
-):
+    config: OptimizerConfig,
+    model_chunks: List[MegatronModule],
+    no_weight_decay_cond: Optional[Callable] = None,
+    scale_lr_cond: Optional[Callable] = None,
+    lr_mult: float = 1.0,
+) -> MegatronOptimizer:
     """Retrieve the Megatron optimizer for model chunks.
 
     We use separate optimizers for expert parameters and non-expert parameters.
 
     Args:
+        config (OptimizerConfig): optimizer configuration object.
         model_chunks (List[MegatronModule]): model chunks to get optimizer for.
         no_weight_decay_cond (func, optional): function to determine whether a parameter
             should not perform weight decay. Defaults to None.
@@ -220,9 +272,29 @@ def get_megatron_optimizer(
             should have a scaled learning rate. Defaults to None.
         lr_mult (float, optional): learning rate multiplier for parameters that
             satisfy scale_lr_cond. Defaults to 1.0.
+
+    Returns:
+        Instance of MegatronOptimizer.
     """
+
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        logger.info(f'Setting up optimizer with {config}')
+
     # Collect param groups.
-    param_groups = get_param_groups(model_chunks, no_weight_decay_cond, scale_lr_cond, lr_mult)
+    param_groups = _get_param_groups(
+        model_chunks,
+        no_weight_decay_cond,
+        scale_lr_cond,
+        lr_mult,
+        use_decoupled_learning_rate=config.decoupled_lr is not None,
+    )
+    param_groups = _update_min_and_max_lr_in_param_groups(
+        param_groups,
+        lr=config.lr,
+        min_lr=config.min_lr,
+        decoupled_lr=config.decoupled_lr,
+        decoupled_min_lr=config.decoupled_min_lr,
+    )
 
     # Collect grad buffers for distributed optimizer.
     per_model_buffers = {}
@@ -232,14 +304,15 @@ def get_megatron_optimizer(
             per_model_buffers[model_idx] = model_chunk.buffers
             per_model_ep_buffers[model_idx] = model_chunk.expert_parallel_buffers
 
-    # Split param groups into dense and moe.
+    # Split param groups into dense and MoE params (since data-parallel groups for MoE
+    # parameters can be different with expert parallelism).
     dense_param_groups = list(filter(lambda g: not g['is_expert_parallel'], param_groups))
     moe_param_groups = list(filter(lambda g: g['is_expert_parallel'], param_groups))
 
     # Create optimizers.
     model_parallel_rank = torch.distributed.get_rank(mpu.get_model_parallel_group())
     optimizers = [
-        get_megatron_optimizer_based_on_param_groups(
+        _get_megatron_optimizer_based_on_param_groups(
             config,
             param_groups=dense_param_groups,
             per_model_buffers=per_model_buffers,
@@ -248,11 +321,11 @@ def get_megatron_optimizer(
             data_parallel_group_idx=model_parallel_rank,
         )
     ]
-    if len(moe_param_groups):
+    if len(moe_param_groups) > 0:
         model_parallel_world_size = torch.distributed.get_world_size(mpu.get_model_parallel_group())
         expert_parallel_rank = mpu.get_expert_model_parallel_rank()
         optimizers.append(
-            get_megatron_optimizer_based_on_param_groups(
+            _get_megatron_optimizer_based_on_param_groups(
                 config,
                 param_groups=moe_param_groups,
                 per_model_buffers=per_model_ep_buffers,

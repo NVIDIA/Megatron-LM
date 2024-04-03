@@ -16,6 +16,7 @@ set -exo pipefail
 if [[ -z $MBS ]]; then MBS=4; fi
 if [[ -z $GBS ]]; then GBS=32; fi
 if [[ -z $MOE_GROUPED_GEMM ]]; then MOE_GROUPED_GEMM=0; fi
+if [[ -z $ALLOW_NONDETERMINISTIC ]]; then ALLOW_NONDETERMINISTIC=0; fi
 if [[ -z $VOCAB_FILE ]]; then VOCAB_FILE="/workspace/data/gpt3_data/vocab.json" ; fi
 if [[ -z $MERGE_FILE ]]; then MERGE_FILE="/workspace/data/gpt3_data/merges.txt" ; fi
 
@@ -35,8 +36,14 @@ if [[ $USE_CORE -eq 1 ]]; then
        echo "Running using megatron core"
        TRANSFORMER_IMPL=transformer_engine
        TRAINING_DTYPE=bf16
-       command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0;"
+       command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=$ALLOW_NONDETERMINISTIC;"
        USE_MCORE=1
+fi
+
+if [[ $USE_FP8 -eq 1 ]]; then
+       echo "Running FP8 Training using Transformer Engine ..."
+       ADDITIONAL_PARAMS+=" --fp8-format hybrid --fp8-amax-history-len 1024 --fp8-amax-compute-algo max"
+       USE_TE=1
 fi
 
 if [[ $MOE_GROUPED_GEMM -eq 1 ]]; then
@@ -112,7 +119,6 @@ build_torch_run_cmd() {
        --tensor-model-parallel-size $TP_SIZE \
        --pipeline-model-parallel-size $PP_SIZE \
        --no-bias-swiglu-fusion \
-       --use-gpu-initialization \
        --no-rope-fusion \
        ${VP_SIZE:+--num-layers-per-virtual-pipeline-stage "$VP_SIZE"} \
        ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
@@ -162,3 +168,26 @@ echo "--------------------------------------------------------------------------
 
 echo "$command" > $SCRIPTS_DIR/pretrain_gpt3_distributed_command.sh
 eval $command
+
+echo "Saving test results to $TENSORBOARD_DIR"
+python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $TENSORBOARD_DIR "$JOB_NAME" | \
+    tee ${TENSORBOARD_DIR}/results.json
+
+if [[ $SKIP_PYTEST != 1 ]]; then
+    echo "-----------------------------------------------------------------------------"
+    if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
+        echo "Running pytest 1st vs 2nd run comparison"
+        export LOGS_DIR=$TENSORBOARD_DIR
+        pytest ./tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py
+    else
+        echo "Running pytest checks against golden values"
+        export LOGS_DIR=$TENSORBOARD_DIR
+        if [[ $USE_FP8 -eq 1 ]]; then
+          export EXPECTED_METRICS_FILE="./tests/functional_tests/test_results/jet/gpt3-345m-weekly-dgx-h100-1n8g-mcore-tp1-pp1-bf16-baseline.json"
+          pytest ./tests/functional_tests/python_test_utils/test_fp8_ci_pipeline.py
+        else
+          export EXPECTED_METRICS_FILE="./tests/functional_tests/test_results/jet/${JOB_NAME}.json"
+          pytest ./tests/functional_tests/python_test_utils/test_ci_pipeline.py
+        fi
+    fi
+fi

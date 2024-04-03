@@ -44,10 +44,18 @@ def check_exitcodes(results):
     exit_codes = []
     log_urls = []
     names = []
+    metrics_file_urls = []
     for result in results:
         exit_codes.append(result.get('l_exit_code', -1))
         log_urls.append(select_asset(result, 'output_script-0.log'))
         names.append(result['obj_workload']['s_key'].split('basic/')[-1])
+        metrics_file_urls.append(select_asset(result, 'results.json'))
+
+    metrics_table = PrettyTable()
+    metrics_table.add_column("Job Key", names)
+    metrics_table.add_column("Results Data", metrics_file_urls)
+    metrics_table.align["Job Key"] = 'l'
+    print(metrics_table)
 
     table = PrettyTable()
     table.add_column("Job Key", names)

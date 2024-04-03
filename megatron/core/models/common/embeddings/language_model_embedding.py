@@ -13,7 +13,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 class LanguageModelEmbedding(MegatronModule):
     """Language model embeddings.
 
-    Arguments:
+    Args:
         config (TransformerConfig): config object with all necessary configs for TransformerBlock
         vocab_size (int): vocabulary size
         max_sequence_length (int): maximum size of sequence. This
@@ -81,7 +81,8 @@ class LanguageModelEmbedding(MegatronModule):
             self.tokentype_embeddings.weight.shared = True
 
     def forward(self, input_ids: Tensor, position_ids: Tensor, tokentype_ids: int = None) -> Tensor:
-        """Forward pass of the embedding module
+        """Forward pass of the embedding module.
+
         Args:
             input_ids (Tensor): The input tokens
             position_ids (Tensor): The position id's used to calculate position embeddings

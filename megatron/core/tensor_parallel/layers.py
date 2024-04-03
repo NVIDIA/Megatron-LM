@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 # Parts of the code here are adapted from PyTorch
 # repo: https://github.com/pytorch/pytorch
@@ -148,11 +148,12 @@ class VocabParallelEmbedding(torch.nn.Module):
 
     This is mainly adapted from torch.nn.Embedding and all the default
     values are kept.
-    Arguments:
+
+    Args:
         num_embeddings: vocabulary size.
         embedding_dim: size of hidden state.
 
-    Keyword Arguments:
+    Keyword Args:
         config: A megatron.core.ModelParallelConfig object
     """
 
@@ -226,7 +227,10 @@ class VocabParallelEmbedding(torch.nn.Module):
         return output
 
     def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: Tuple[Tuple[int, int, int]] = ()
+        self,
+        prefix: str = '',
+        sharded_offsets: Tuple[Tuple[int, int, int]] = (),
+        metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
         """ Non-default implementation for embeddings due to `allow_shape_mismatch` param """
         state_dict = self.state_dict(prefix='', keep_vars=True)
@@ -285,7 +289,7 @@ def linear_with_frozen_weight(
     In the backward, it does not perform weight gradient calculation, or 
     weight gradient allreduce. 
 
-    Arguments:
+    Args:
 
     input (torch.Tensor required): input like torch.nn.functional.linear
 
@@ -499,32 +503,32 @@ def linear_with_grad_accumulation_and_async_allreduce(
     CUDA_DEVICE_MAX_CONNECTIONS=1 forces the kernels to be scheduled
     in the order they are called.
 
-    Arguments:
+    Args:
 
-    input (torch.Tensor required): input like torch.nn.functional.linear
+        input (torch.Tensor required): input like torch.nn.functional.linear
 
-    weight (torch.Tensor required): weight like torch.nn.functional.linear
+        weight (torch.Tensor required): weight like torch.nn.functional.linear
 
-    bias (torch.Tensor optional): bias like torch.nn.functional.linear
+        bias (torch.Tensor optional): bias like torch.nn.functional.linear
 
-    gradient_accumulation_fusion (bool required): Perform the gradient
-        accumulation fusion, requires the custom CUDA extension
-        fused_weight_gradient_mlp_cuda module. To use
-        gradient_accumulation_fusion you must install APEX with
-        --cpp_ext and --cuda_ext. For example: "pip install
-        --global-option=\"--cpp_ext\" --global-option=\"--cuda_ext .\"
-        " Note that the extension requires CUDA>=11. Otherwise, you
-        must turn off gradient accumulation fusion."
+        gradient_accumulation_fusion (bool required): Perform the gradient
+            accumulation fusion, requires the custom CUDA extension
+            fused_weight_gradient_mlp_cuda module. To use
+            gradient_accumulation_fusion you must install APEX with
+            --cpp_ext and --cuda_ext. For example: "pip install
+            --global-option=\"--cpp_ext\" --global-option=\"--cuda_ext .\"
+            " Note that the extension requires CUDA>=11. Otherwise, you
+            must turn off gradient accumulation fusion."
 
-    async_grad_allreduce (bool required): Do the allreduce of input
-        gradients asyncronously with the computation of weight
-        gradients. If sequence_parallel is True, this must be
-        False, as no all reduce is performed.
+        async_grad_allreduce (bool required): Do the allreduce of input
+            gradients asyncronously with the computation of weight
+            gradients. If sequence_parallel is True, this must be
+            False, as no all reduce is performed.
 
-    sequence_parallel (bool required): Indicates that sequence
-        parallelism is used and thus in the forward pass the input is
-        all gathered, and the backward pass the input gradients are
-        reduce scattered.
+        sequence_parallel (bool required): Indicates that sequence
+            parallelism is used and thus in the forward pass the input is
+            all gathered, and the backward pass the input gradients are
+            reduce scattered.
     """
     args = [
         input,
@@ -789,7 +793,7 @@ class ColumnParallelLinear(torch.nn.Module):
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=()):
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """ Sharding along axis 0, bias sharded """
         state_dict = self.state_dict(prefix='', keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
@@ -985,7 +989,7 @@ class RowParallelLinear(torch.nn.Module):
             output_bias = self.bias
         return output, output_bias
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=()):
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """ Sharding along axis 1, bias not sharded """
         state_dict = self.state_dict(prefix='', keep_vars=True)
         return make_sharded_tensors_for_checkpoint(

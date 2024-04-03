@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -29,6 +29,14 @@ class OptimizerConfig:
 
     lr (float, optional): Initial learning rate. Depending on decay style and initial warmup, the learning
                           rate at each iteration would be different.
+
+    min_lr (float, optional): Minumum value for learning rate. The scheduler clip values below this threshold.
+
+    decoupled_lr (float, optional): Separate learning rate for the input and output layer.
+
+    decoupled_min_lr (float, optional): Minimum value for learning rate for the input and output layer. The scheduler
+                                        clip values below this threshold.
+
 
 
     Loss Scaler
@@ -69,6 +77,8 @@ class OptimizerConfig:
 
     use_distributed_optimizer (bool): Distribute optimizer state over data-parallel replicas.
 
+    overlap_grad_reduce (bool): If true, overlap grad reduce-scatter with backward compute in distributed optimizer.
+
     overlap_param_gather (bool): If true, overlap param all-gather with forward compute in distributed optimizer.
 
 
@@ -78,6 +88,10 @@ class OptimizerConfig:
     clip_grad (float): Gradient clipping based on global L2 norm.
 
     log_num_zeros_in_grad (bool): If true, calculate and log the number of zeros in gradient.
+
+    barrier_with_L1_time (bool): If true, use barrier with level 1 time measurements.
+
+    timers (optional, default=None): TODO.
     """
 
     # Precision.
@@ -87,6 +101,9 @@ class OptimizerConfig:
 
     optimizer: str = 'adam'
     lr: Optional[float] = None
+    min_lr: Optional[float] = None
+    decoupled_lr: Optional[float] = None
+    decoupled_min_lr: Optional[float] = None
 
     # Loss scaling.
     loss_scale: Optional[float] = None
@@ -106,8 +123,11 @@ class OptimizerConfig:
 
     # Distributed optimizer.
     use_distributed_optimizer: bool = False
+    overlap_grad_reduce: bool = False
     overlap_param_gather: bool = False
 
     # Miscellaneous.
     clip_grad: float = 1.0
     log_num_zeros_in_grad: bool = False
+    barrier_with_L1_time: bool = False
+    timers: Callable = None

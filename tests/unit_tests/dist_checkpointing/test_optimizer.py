@@ -25,7 +25,7 @@ from megatron.core.optimizer import DistributedOptimizer, OptimizerConfig, \
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import get_model_config
-from megatron.training import get_model
+from megatron.training.training import get_model
 from pretrain_gpt import model_provider
 
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -114,7 +114,7 @@ def init_mock_args(args):
 
 
 def setup_model_and_optimizer(seed):
-    with mock.patch('megatron.training.get_args', data_parallel_random_init=False) as mock_args:
+    with mock.patch('megatron.training.training.get_args', data_parallel_random_init=False) as mock_args:
         init_mock_args(mock_args.return_value)
         model = get_model(partial(initialize_gpt_model, seed=seed))
 

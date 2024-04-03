@@ -8,7 +8,7 @@ import torch
 from .. import parallel_state
 from ..transformer.module import MegatronModule
 from ..transformer.transformer_config import TransformerConfig
-from .grad_buffer import ParamAndGradBuffer
+from .param_and_grad_buffer import ParamAndGradBuffer
 
 
 class DistributedDataParallel(MegatronModule):
@@ -19,7 +19,7 @@ class DistributedDataParallel(MegatronModule):
     also provides the option to do the gradient accumulation in a type other than the param type
     (e.g., fp32 for a bf16 model).
 
-    Arguments:
+    Args:
         config: Transformer config object.
         module: Underlying model.
         data_parallel_group: Data-parallel process group.

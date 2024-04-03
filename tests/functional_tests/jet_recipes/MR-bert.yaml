@@ -45,9 +45,8 @@ spec:
         MBS={micro_batch_size} \
         GBS={batch_size} \
         CHECKPOINT_RESUME_TEST={checkpoint_resume_test} \
-        ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'} && \
-        python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py {assets_dir} "" | \
-        tee {assets_dir}/results.json
+        JOB_NAME={key.split("/")[1]} \
+        ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'}
 products:
   # MCore
   - {tp_size: [2], pp_size: [2]}

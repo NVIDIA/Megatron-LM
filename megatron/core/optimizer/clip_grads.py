@@ -3,6 +3,7 @@
 """Gradient clipping."""
 
 import os
+from typing import List, Optional, Union
 
 import amp_C
 import torch
@@ -14,8 +15,12 @@ from ..transformer.module import param_is_not_shared
 
 
 def clip_grad_norm_fp32(
-    parameters, grads_for_norm, max_norm, norm_type=2, model_parallel_group=None,
-):
+    parameters: Union[List[torch.Tensor], torch.Tensor],
+    grads_for_norm: Union[List[torch.Tensor], torch.Tensor],
+    max_norm: Union[int, float],
+    norm_type: Union[int, float] = 2,
+    model_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> float:
     """Clips gradient norm of an iterable of parameters whose gradients
        are in fp32.
 
@@ -23,16 +28,16 @@ def clip_grad_norm_fp32(
     added functionality to handle model parallel parameters. Note that
     the gradients are modified in place.
 
-    Arguments:
+    Args:
         parameters (Iterable[Tensor] or Tensor): an iterable of Tensors or a
-            single Tensor that will have gradients normalized
+            single Tensor that will have gradients normalized.
         grads_for_norm (Iterable[Tensor]): an iterable of Tensors or a single
             Tensor that will be used for calculating the grad norm.
         max_norm (float or int): max norm of the gradients.
         norm_type (float or int): type of the used p-norm. Can be ``'inf'`` for
             infinity norm.
-        model_parallel_group (group): given the nature of the distributed
-            optimizer, this is passed as an argument.
+        model_parallel_group (torch.distributed.ProcessGroup, optional): model-parallel
+            group over which grad norm needs to be aggregated.
 
     Returns:
         Total norm of the parameters (viewed as a single vector).
@@ -106,7 +111,20 @@ def clip_grad_norm_fp32(
     return total_norm
 
 
-def count_zeros_fp32(parameters, model_parallel_group):
+def count_zeros_fp32(
+    parameters: Union[List[torch.Tensor], torch.Tensor],
+    model_parallel_group: torch.distributed.ProcessGroup,
+) -> float:
+    """Counts the number of zeros in gradients associated with the passed-in list of
+    parameters.
+
+    Args:
+        parameters (Iterable[Tensor] or Tensor): an iterable of Tensors or a
+            single Tensor that will have the number of zeros in its corresponding
+            gradient counted.
+        model_parallel_group (torch.distributed.ProcessGroup, optional): model-parallel
+            group over which grad norm needs to be aggregated.
+    """
 
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]

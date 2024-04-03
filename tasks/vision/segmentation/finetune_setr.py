@@ -5,12 +5,12 @@
 import torch
 import torch.nn.functional as F
 from functools import partial
-from megatron import get_args, get_timers
-from megatron import print_rank_0, print_rank_last
+from megatron.training import get_args, get_timers
+from megatron.training import print_rank_0, print_rank_last
 from megatron.core import mpu
 from tasks.vision.finetune_utils import finetune
 from tasks.vision.finetune_utils import build_data_loader
-from megatron.utils import average_losses_across_data_parallel_group
+from megatron.training.utils import average_losses_across_data_parallel_group
 from megatron.schedules import get_forward_backward_func
 from tasks.vision.segmentation.metrics import CFMatrix
 from tasks.vision.segmentation.data import build_train_valid_datasets

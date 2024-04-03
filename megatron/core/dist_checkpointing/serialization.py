@@ -77,7 +77,7 @@ def load(
     4. (optional) Extract ShardedObjects, load and add
     5. Extract ShardedBase, load, apply factory merges and add
 
-    Arguments:
+    Args:
         sharded_state_dict (ShardedStateDict): state dict of the existing model
             populated with ShardedTensors. Used as a mapping to determine which
             parts of global tensors stored in the checkpoint should be loaded.
@@ -97,13 +97,22 @@ def load(
     if not sharded_state_dict:
         return common_state_dict
 
+    # Create a copy of sharded_state_dict as the passed in state dict may have
+    # references that prevent tensors from being deallocated
+    sharded_state_dict, _ = extract_matching_values(sharded_state_dict, lambda x: True)
+
     sh_ten_factories, _ = extract_matching_values(
         sharded_state_dict,
         lambda x: isinstance(x, ShardedTensorFactory),
         return_lists_as_dicts=True,
     )
     apply_factories(sharded_state_dict)
+    # Data inside sh_ten_factories no longer needed so delete them to reduce memory usage
+    def unlink_data(x):
+        x.data = None
+        return x
 
+    dict_list_map_inplace(unlink_data, sh_ten_factories)
     # Non-persistent objects
     nonpersistent_state_dict, sharded_state_dict = extract_nonpersistent(sharded_state_dict)
     dict_list_map_inplace(lambda o: o.unwrap(), nonpersistent_state_dict)
@@ -267,7 +276,7 @@ def save(
     5. (optional) Extract and save ShardedObjects
     6. Save all ShardedBase objects
 
-    Arguments:
+    Args:
         sharded_state_dict (ShardedStateDict): state dict of the populated with
             ShardedTensors. Used as a mapping to determine how local tensors
             should be saved as global tensors in the checkpoint.
