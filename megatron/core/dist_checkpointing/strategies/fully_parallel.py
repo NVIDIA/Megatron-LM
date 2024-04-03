@@ -114,10 +114,14 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             self,
             strategy: LoadShardedStrategy,
             parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
+            do_cache_distribution: bool = False,
     ):
         super().__init__()
         self.base_strategy = strategy
         self.parallelization_group = parallelization_group
+        self.do_cache_distribution = do_cache_distribution
+
+        self.cached_distribution: Optional[SaveDistribution] = None
 
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         if torch.distributed.get_world_size(self.parallelization_group) <= 1:
@@ -161,11 +165,14 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
     def apply_loading_parallelization(self, sharded_state_dict: ShardedStateDict) -> Optional[SaveDistribution]:
         print('Apply FPL')
         precomputed_distribution = determine_main_replica_uniform_distribution(
-            sharded_state_dict, self.parallelization_group
+            sharded_state_dict, self.parallelization_group, True
         )
         distribute_main_replicas_with_precomputed_distribution(
             sharded_state_dict, self.parallelization_group, precomputed_distribution
         )
+        if self.do_cache_distribution:
+            self.cached_distribution = precomputed_distribution
+
         return precomputed_distribution
 
     def exchange_loaded_tensors(self, loaded_tensors: Dict[ChunkId, torch.Tensor], unloaded_shards: Dict[ChunkId, ShardedTensor],
@@ -288,7 +295,8 @@ def _shard_size(sh_ten: ShardedTensor):
 
 
 def determine_main_replica_uniform_distribution(
-    sharded_state_dict: ShardedStateDict, parallelization_group: torch.distributed.ProcessGroup
+    sharded_state_dict: ShardedStateDict, parallelization_group: torch.distributed.ProcessGroup,
+    is_loading: bool = False
 ) -> Optional[SaveDistribution]:
     """ Computes the save distribution.
 
@@ -331,7 +339,7 @@ def determine_main_replica_uniform_distribution(
             shard_to_ranks[shard_id].append(rank)
             if shard_id not in shard_to_size:
                 shard_to_size[shard_id] = _shard_size(sh_ten)
-            if is_main_replica(sh_ten.replica_id):
+            if is_main_replica(sh_ten.replica_id) or is_loading:
                 shards_saved_by_this_parallelization_group.add(shard_id)
 
     shard_to_ranks = {
