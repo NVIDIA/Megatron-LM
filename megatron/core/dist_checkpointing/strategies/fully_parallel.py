@@ -12,8 +12,9 @@ import torch.distributed as dist
 
 from megatron.core.dist_checkpointing import ShardedTensor, \
     LocalNonpersitentObject
+from megatron.core.dist_checkpointing.core import CheckpointingException
 from megatron.core.dist_checkpointing.dict_utils import nested_values, \
-    dict_list_map_inplace
+    dict_list_map_inplace, extract_matching_values, merge
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, is_main_replica
 from megatron.core.dist_checkpointing.serialization import validate_sharding_integrity
 from megatron.core.dist_checkpointing.strategies.base import (
@@ -122,21 +123,27 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         if torch.distributed.get_world_size(self.parallelization_group) <= 1:
             return self.base_strategy.load(sharded_state_dict, checkpoint_dir)
 
-        self.apply_loading_parallelization(sharded_state_dict)
-        to_load_shards, unloaded_shards = self.defer_loading_sharded_tensors(sharded_state_dict)
+        precomputed_distribution = self.apply_loading_parallelization(sharded_state_dict)
+        sharded_tensors, sharded_state_dict, to_load_shards, unloaded_shards = self.defer_loading_sharded_tensors(sharded_state_dict)
         # Load only sharded objects
         loaded_state_dict = self.base_strategy.load(sharded_state_dict, checkpoint_dir)
+
         # Load sharded tensors separately
         loaded_tensors = self.base_strategy.load(to_load_shards, checkpoint_dir)
         all_loaded_tensors = self.exchange_loaded_tensors(loaded_tensors, unloaded_shards, self.parallelization_group)
-        self.fill_in_deferred_sharded_tensors(loaded_state_dict, all_loaded_tensors)
+        self.fill_in_deferred_sharded_tensors(sharded_tensors, all_loaded_tensors)
+        merge(loaded_state_dict, sharded_tensors)
         return loaded_state_dict
 
 
-    def defer_loading_sharded_tensors(self, sharded_state_dict: ShardedStateDict) -> Tuple[Dict[ChunkId, ShardedTensor], Dict[ChunkId, ShardedTensor]]:
+    def defer_loading_sharded_tensors(self, sharded_state_dict: ShardedStateDict) -> Tuple[ShardedStateDict, ShardedStateDict, Dict[ChunkId, ShardedTensor], Dict[ChunkId, ShardedTensor]]:
         """ Wrap non-main ShardedTenors with LocalNonpersitentObject """
         to_load_shards = {}
         unloaded_shards = {}
+
+        sharded_tensors, sharded_state_dict = extract_matching_values(
+            sharded_state_dict, lambda v: isinstance(v, ShardedTensor)
+        )
 
         def wrap_non_main_replicas(x):
             if isinstance(x, ShardedTensor):
@@ -145,12 +152,10 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                     to_load_shards[_sharded_tensor_chunk_id(x)] = x
                 else:
                     unloaded_shards[_sharded_tensor_chunk_id(x)] = x
-                # make sure the original load doesn't perform the load
-                x = LocalNonpersitentObject(x)
             return x
 
-        dict_list_map_inplace(wrap_non_main_replicas, sharded_state_dict)
-        return to_load_shards, unloaded_shards
+        dict_list_map_inplace(wrap_non_main_replicas, sharded_tensors)
+        return sharded_tensors, sharded_state_dict, to_load_shards, unloaded_shards
 
 
     def apply_loading_parallelization(self, sharded_state_dict: ShardedStateDict) -> Optional[SaveDistribution]:
@@ -178,17 +183,24 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             err_msg = 'Duplicate chunk ids loaded by different ranks'
             if torch.distributed.get_rank() == 0:
                 logger.error(f'{err_msg}. Chunks ids by rank: {[lt.keys() for lt in all_loaded_tensors_list]}')
-            raise RuntimeError(err_msg)
+            raise CheckpointingException(err_msg)
         if not set(unloaded_shards.keys()).issubset(all_loaded_tensors.keys()):
             missing_shards = set(unloaded_shards.keys()) - all_loaded_tensors.keys()
-            raise RuntimeError(f'Missing shards after fully parallel loading: {missing_shards}')
+            raise CheckpointingException(f'Missing shards after fully parallel loading: {missing_shards}')
 
-        return loaded_tensors
+        return all_loaded_tensors
 
     def fill_in_deferred_sharded_tensors(self, sharded_state_dict: ShardedStateDict, loaded_tensors: Dict[ChunkId, torch.Tensor]) -> None:
         def fill_in_sharded_tensor(x):
             if isinstance(x, ShardedTensor):
-                x = loaded_tensors[_sharded_tensor_chunk_id(x)]
+                try:
+                    x = loaded_tensors[_sharded_tensor_chunk_id(x)]
+                except KeyError as e:
+                    if torch.distributed.get_rank() == 0:
+                        breakpoint()
+                    torch.distributed.barrier()
+                    raise CheckpointingException(f'Missing loaded tensor shard: {_sharded_tensor_chunk_id(x)}') from e
+
             return x
         dict_list_map_inplace(fill_in_sharded_tensor, sharded_state_dict)
 
