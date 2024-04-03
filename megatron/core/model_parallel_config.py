@@ -34,7 +34,6 @@ class ModelParallelConfig:
     """Makes tensor parallelism more memory efficient for LLMs (20B+) by parallelizing layer norms
        and dropout sequentially.  See Reducing Activation Recomputation in Large Transformer Models
        (https://arxiv.org/abs/2205.05198) for more details.
-
     """
 
     context_parallel_size: int = 1
@@ -217,6 +216,11 @@ class ModelParallelConfig:
        Helps with saving memory, does nothing when pipeline parallel is not used.
     """
 
+    defer_embedding_wgrad_compute: bool = False
+    """If true, defers the embedding WGRAD GEMMs while pipeline flush is 
+       taking place enabling us to hide pipeline flush latency. Defaults to False.
+    """
+
     pipeline_model_parallel_split_rank: Optional[int] = None
     """If int, rank where encoder and decoder should be split in cases where the model has both an
        encoder and decoder (e.g., T5). Ignored if None.
@@ -268,6 +272,16 @@ class ModelParallelConfig:
 
         if self.autocast_dtype is None:
             self.autocast_dtype = self.params_dtype
+
+        if self.defer_embedding_wgrad_compute and self.pipeline_model_parallel_size == 1:
+            raise ValueError(
+                "Cannot defer embedding wgrad compute when pipeline model parallel is not used"
+            )
+
+        if self.defer_embedding_wgrad_compute and not self.gradient_accumulation_fusion:
+            raise ValueError(
+                "Cannot defer embedding wgrad compute when gradient accumulation fusion is not used"
+            )
 
         if self.expert_model_parallel_size > 1 and self.tensor_model_parallel_size > 1:
             if self.sequence_parallel is False:
