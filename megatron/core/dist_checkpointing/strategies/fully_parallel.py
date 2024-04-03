@@ -12,8 +12,7 @@ import torch.distributed as dist
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, is_main_replica
-from megatron.core.dist_checkpointing.serialization import \
-    validate_sharding_integrity
+from megatron.core.dist_checkpointing.serialization import validate_sharding_integrity
 from megatron.core.dist_checkpointing.strategies.base import SaveShardedStrategy
 
 logger = logging.getLogger(__name__)

@@ -19,7 +19,8 @@ from .core.dist_checkpointing.strategies.fully_parallel import \
 from .global_vars import get_args
 from .utils import (unwrap_model,
                     print_rank_0)
-
+from ..core.dist_checkpointing.serialization import \
+    get_default_save_sharded_strategy
 
 _CHECKPOINT_VERSION = None
 
@@ -271,7 +272,11 @@ def get_rng_state(use_dist_ckpt: bool = False):
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
                     num_floating_point_operations_so_far, checkpointing_context=None):
-    """Save a model checkpoint."""
+    """Save a model checkpoint.
+
+    Checkpointing context is used to persist some checkpointing state
+    throughout a single job. Must be initialized externally (not used if None).
+    """
     args = get_args()
 
     # Only rank zero of the data parallel writes to the disk.
@@ -311,21 +316,21 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if args.use_dist_ckpt:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                ensure_directory_exists(checkpoint_name,
-                                        check_parent=False)
-            save_strategy = (args.dist_ckpt_format, 1)
+                ensure_directory_exists(checkpoint_name, check_parent=False)
             validate_sharding_integrity = True
+            save_strategy = (checkpointing_context or {}).get('save_strategy',
+                                                              get_default_save_sharded_strategy(args.dist_ckpt_format))
             if args.ckpt_fully_parallel_save:
                 if checkpointing_context is not None and 'save_strategy' in checkpointing_context:
-                    save_strategy = checkpointing_context['save_strategy']
                     # Already saved once before - don't need to rerun sharding validation
                     validate_sharding_integrity = not args.ckpt_assume_constant_structure
                 else:
-                    save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, *save_strategy)
                     save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, mpu.get_data_parallel_group(with_context_parallel=True),
                                                                      args.ckpt_assume_constant_structure)
-                    if checkpointing_context is not None:
-                        checkpointing_context['save_strategy'] = save_strategy
+            # Store save strategy for future checkpoint saves
+            if checkpointing_context is not None:
+                checkpointing_context['save_strategy'] = save_strategy
+
             dist_checkpointing.save(state_dict, checkpoint_name, save_strategy,
                                     validate_access_integrity=validate_sharding_integrity)
 

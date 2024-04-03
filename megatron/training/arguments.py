@@ -1212,7 +1212,7 @@ def _add_checkpointing_args(parser):
                             ' might increase number of files in the checkpoint.')
     group.add_argument('--ckpt-assume-constant-structure', action='store_true',
                        help='If the model and optimizer state dict structure is'
-                            'constant throughout the training, it allows for'
+                            'constant throughout a *single training job*, it allows for'
                             'different checkpointing performance optimizations.')
 
     return parser

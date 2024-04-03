@@ -252,6 +252,7 @@ def pretrain(train_valid_test_dataset_provider,
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
 
+    # Context used for persisting some state between checkpoint saves.
     checkpointing_context = {}
 
     # Print setup timing.
