@@ -210,18 +210,16 @@ class VocabParallelEmbedding(torch.nn.Module):
 
     def forward(self, input_):
         if self.tensor_model_parallel_size > 1:
-            # Build the mask.
-            input_mask = (input_ < self.vocab_start_index) | (input_ >= self.vocab_end_index)
-            # Mask the input.
-            masked_input = input_.clone() - self.vocab_start_index
-            masked_input[input_mask] = 0
+            # Get the masked embeddings.
+            output_parallel = _get_masked_weight_jit(
+                input_,
+                self.vocab_start_index, self.vocab_end_index,
+                self.weight)
         else:
             masked_input = input_
-        # Get the embeddings.
-        output_parallel = self.weight[masked_input]
-        # Mask the output embedding.
-        if self.tensor_model_parallel_size > 1:
-            output_parallel[input_mask, :] = 0.0
+            # Get the embeddings.
+            output_parallel = self.weight[masked_input]
+
         # Reduce across all the model parallel GPUs.
         output = reduce_from_tensor_model_parallel_region(output_parallel)
         return output
@@ -244,6 +242,26 @@ class VocabParallelEmbedding(torch.nn.Module):
                 prepend_offsets=sharded_offsets,
             )
         }
+
+def _get_masked_weight(
+    input_,
+    vocab_start_index, vocab_end_index,
+    weight
+):
+    # Build the mask.
+    input_mask = (input_ < vocab_start_index) | (input_ >= vocab_end_index)
+    # Mask the input.
+    masked_input = input_.clone() - vocab_start_index
+    masked_input[input_mask] = 0
+
+    # Get the embeddings.
+    output_parallel = weight[masked_input]
+    # Mask the output embedding.
+    output_parallel[input_mask, :] = 0.0
+    # Reduce across all the model parallel GPUs.
+    return output_parallel
+
+_get_masked_weight_jit = torch.compile(_get_masked_weight)
 
 
 class LinearWithFrozenWeight(torch.autograd.Function):

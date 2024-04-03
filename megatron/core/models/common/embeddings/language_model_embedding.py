@@ -70,6 +70,9 @@ class LanguageModelEmbedding(MegatronModule):
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(self.config.hidden_dropout)
 
+        # Stream for overlapping position embeddings.
+        self.position_embed_stream = torch.cuda.Stream()
+
     def zero_parameters(self):
         """Zero out all parameters in embedding."""
         self.word_embeddings.weight.data.fill_(0)
@@ -93,7 +96,8 @@ class LanguageModelEmbedding(MegatronModule):
         """
         word_embeddings = self.word_embeddings(input_ids)
         if self.add_position_embedding:
-            position_embeddings = self.position_embeddings(position_ids)
+            with torch.cuda.stream(self.position_embed_stream):
+                position_embeddings = self.position_embeddings(position_ids)
             embeddings = word_embeddings + position_embeddings
         else:
             embeddings = word_embeddings
