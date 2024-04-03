@@ -16,49 +16,47 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class BlendedMegatronDatasetConfig:
-    """Configuration object for Megatron Core datasets
-
-    Args:
-        random_seed (int): The seed for all RNG during dataset creation.
-
-        sequence_length (int): The sequence length.
-
-        blend (Optional[List[str]]): The blend string, consisting of either a single dataset or a flattened sequential sequence of weight-dataset pairs. For exampe, ["dataset-path1"] and ["50", "dataset-path1", "50", "dataset-path2"] are both valid. Not to be used with 'blend_per_split'. Defaults to None.
-
-        blend_per_split (blend_per_split: Optional[List[Optional[List[str]]]]): A set of blend strings, as defined above, one for each split distribution. Not to be used with 'blend'. Defauls to None.
-
-        split (Optional[str]): The split string, a comma separated weighting for the dataset splits when drawing samples from a single distribution. Not to be used with 'blend_per_split'. Defaults to None.
-
-        split_matrix (Optional[List[Tuple[float, float]]]): The split matrix consisting of non-overlapping book-ends of each split in order. For more information, refer to 'convert_split_vector_to_split_matrix'. Created automatically from 'split'. Not to be passed in to the constructor.
-
-        path_to_cache (str): Where all re-useable dataset indices are to be cached.
-
-        mmap_bin_files (bool): Whether to mmap the .bin files or use file pointer.
-
-        mock (bool): Whether to bypass real data loading and validation in favor of mock data generation.
-
-        tokenizer (Optional[MegatronTokenizer]): The MegatronTokenizer instance or None. Required for datasets which do online tokenization.
-    """
+    """Configuration object for Megatron Core datasets"""
 
     random_seed: int
+    """The seed for all RNG during dataset creation."""
 
     sequence_length: int
+    """The sequence length."""
 
     blend: Optional[List[str]] = None
+    """The blend string, consisting of either a single dataset or a flattened sequential sequence of
+       weight-dataset pairs. For exampe, ["dataset-path1"] and ["50", "dataset-path1", "50",
+       "dataset-path2"] are both valid. Not to be used with 'blend_per_split'. Defaults to None.
+    """
 
     blend_per_split: Optional[List[Optional[List[str]]]] = None
+    """A set of blend strings, as defined above, one for each split distribution. Not to be used
+       with 'blend'.  Defauls to None.
+    """
 
     split: Optional[str] = None
+    """The split string, a comma separated weighting for the dataset splits when drawing samples
+       from a single distribution. Not to be used with 'blend_per_split'.  Defaults to None.
+    """
 
     split_matrix: Optional[List[Tuple[float, float]]] = field(init=False, default=None)
+    """The split matrix consisting of non-overlapping book-ends of each split in order. For more
+       information, refer to 'convert_split_vector_to_split_matrix'. Created automatically from
+       'split'. Not to be passed in to the constructor.
+    """
 
     path_to_cache: Optional[str] = None
+    """Where all re-useable dataset indices are to be cached."""
 
     mmap_bin_files: bool = True
+    """Whether to mmap the .bin files or use file pointer."""
 
     mock: bool = False
+    """Whether to bypass real data loading and validation in favor of mock data generation."""
 
     tokenizer: Optional[MegatronTokenizer] = None
+    """The MegatronTokenizer instance or None. Required for datasets which do online tokenization."""
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init
