@@ -12,7 +12,7 @@ import torch
 from megatron.training import update_num_microbatches
 from megatron.core import mpu, tensor_parallel, dist_checkpointing
 from megatron.core.dist_checkpointing.mapping import ShardedObject
-from megatron.core.dist_checkpointing.serialization import _verify_checkpoint_and_load_strategy
+from megatron.core.dist_checkpointing.serialization import get_default_load_sharded_strategy
 from megatron.core.dist_checkpointing.strategies.fully_parallel import \
     FullyParallelSaveStrategyWrapper, FullyParallelLoadStrategyWrapper
 from .global_vars import get_args
@@ -527,7 +527,7 @@ def _load_base_checkpoint(load_dir, rank0=False, sharded_state_dict=None,
             assert not args.auto_detect_ckpt_format and not args.use_dist_ckpt, (args.auto_detect_ckpt_format, args.use_dist_ckpt)
             raise RuntimeError('Detected load from a distributed checkpoint, but neither --use-dist-ckpt nor --auto-detect-ckpt-format is set.')
 
-        load_strategy = _verify_checkpoint_and_load_strategy(checkpoint_name)
+        load_strategy = get_default_load_sharded_strategy(checkpoint_name)
         if args.ckpt_fully_parallel_save:  # TODO: change to load
             load_strategy = FullyParallelLoadStrategyWrapper(load_strategy)
         state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name, load_strategy)
