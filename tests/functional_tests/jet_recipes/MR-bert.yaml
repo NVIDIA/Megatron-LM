@@ -52,7 +52,7 @@ products:
   - {tp_size: [2], pp_size: [2]}
   - {tp_size: [2], pp_size: [2], extra_args: ['"--spec local"'], args_meta: ["local_spec"]}
   # Non-MCore
-  - {use_mcore: [False], tp_size: [2], pp_size: [2]}
-  - {use_mcore: [False], tp_size: [1], pp_size: [4], vp_size: [2]}
+  - {use_mcore: [False], tp_size: [2], pp_size: [2], extra_args: ['"--transformer-impl local"']}
+  - {use_mcore: [False], tp_size: [1], pp_size: [4], vp_size: [2], extra_args: ['"--transformer-impl local"']}
   # Checkpoint resume
-  - {checkpoint_resume_test: [1], scope: [merge-request-resume], steps: [100], use_mcore: [False], tp_size: [1], pp_size: [2]}
+  - {checkpoint_resume_test: [1], scope: [merge-request-resume], steps: [100], use_mcore: [False], tp_size: [1], pp_size: [2], extra_args: ['"--transformer-impl local"']}
