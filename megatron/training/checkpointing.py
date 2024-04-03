@@ -11,10 +11,8 @@ import torch
 
 from megatron.training import update_num_microbatches
 from megatron.core import mpu, tensor_parallel, dist_checkpointing
-from ..core.dist_checkpointing.mapping import ShardedObject
-from .core.dist_checkpointing.strategies.base import get_default_strategy, \
-    StrategyAction
-from .core.dist_checkpointing.strategies.fully_parallel import \
+from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.strategies.fully_parallel import \
     FullyParallelSaveStrategyWrapper
 from .global_vars import get_args
 from .utils import (unwrap_model,
