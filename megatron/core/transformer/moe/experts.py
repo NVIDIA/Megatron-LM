@@ -144,9 +144,17 @@ class GroupedMLP(MegatronModule):
 
             fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
         else:
-            # None token is allocated for local experts.
+            # No token is allocated for local experts.
             assert torch.count_nonzero(tokens_per_expert) == 0
-            fc2_output = permuted_local_hidden_states
+
+            # Make sure parameters still have gradients when no tokens are routed to this set of experts.
+            w1 = self.weight1.view(self.config.hidden_size, -1)
+            w2 = self.weight2.view(-1, self.config.hidden_size)
+            h = torch.matmul(permuted_local_hidden_states, w1)
+            h = self.activation_func(h)
+            h = torch.matmul(h, w2)
+
+            fc2_output = h
 
         return fc2_output, None
 
