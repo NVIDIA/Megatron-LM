@@ -9,6 +9,9 @@ NUM_BYTES_IN_MEGABYTE = 1024 * 1024
 
 
 def compute_weight_and_optimizer_memory(args, verbose=False):
+    # Attention projection size.
+    query_projection_size = args.kv_channels * args.num_attention_heads
+    query_projection_to_hidden_size_ratio = query_projection_size / args.hidden_size
     # Group Query Attention.
     if not args.group_query_attention:
         args.num_query_groups = args.num_attention_heads
@@ -21,10 +24,16 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
         * args.hidden_size
         * args.hidden_size
         * (
-            1
+            # Attention.
+            (
+                (1 + (args.num_query_groups / args.num_attention_heads))
+                * query_projection_to_hidden_size_ratio
+            )
+            # MLP.
             + ((args.ffn_hidden_size / args.hidden_size) * num_experts * gated_linear_multiplier)
-            + (args.num_query_groups / args.num_attention_heads)
+            # Transformer layernorms.
             + (2 / args.hidden_size)
+            # Final layernorm.
             + (1 / (args.num_layers * args.hidden_size))
         )
     )
@@ -36,10 +45,12 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
     num_total_parameters = num_parameters_in_transformer_layers + num_parameters_in_embedding_layers
     if verbose:
         print(
-            f"Number of parameters in transformer layers in billions: {num_parameters_in_transformer_layers / 10**9: .2f}"
+            f"Number of parameters in transformer layers in billions: "
+            f"{num_parameters_in_transformer_layers / 10**9: .2f}"
         )
         print(
-            f"Number of parameters in embedding layers in billions: {num_parameters_in_embedding_layers / 10**9:.2f}"
+            f"Number of parameters in embedding layers in billions: "
+            f"{num_parameters_in_embedding_layers / 10**9:.2f}"
         )
         print(f"Total number of parameters in billions: {num_total_parameters / 10**9:.2f}")
 
@@ -53,7 +64,8 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
         )
     if verbose:
         print(
-            f"Number of parameters in most loaded shard in billions: {num_parameters_on_most_loaded_model_shard / 10**9:.4f}"
+            f"Number of parameters in most loaded shard in billions: "
+            f"{num_parameters_on_most_loaded_model_shard / 10**9:.4f}"
         )
 
     if args.pipeline_model_parallel_size > 1:
@@ -63,7 +75,8 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
         )
         if verbose:
             print(
-                f"Number of parameters in other shards in billions: {num_parameters_on_other_model_shards / 10**9:.4f}"
+                f"Number of parameters in other shards in billions: "
+                f"{num_parameters_on_other_model_shards / 10**9:.4f}"
             )
 
     num_bytes_per_parameter = (
@@ -78,8 +91,11 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
 
 def compute_activation_memory(args, num_microbatches, verbose=False):
     # Using formula in Table 2 of https://arxiv.org/pdf/2205.05198.pdf.
-    # We are trying to compute the maximum activation footprint, so all calculations in this function
-    # are for the first pipeline stage.
+    # We are trying to compute the maximum activation footprint, so all calculations in this
+    # function are for the first pipeline stage.
+
+    # TODO: This function needs to take into account query_projection_size potentially being
+    # different from hidden_size.
 
     # Memory footprint from transformer layer (self-attention and MLP).
     activation_memory = (args.seq_length * args.micro_batch_size * args.hidden_size) * (
@@ -148,13 +164,17 @@ def compute_activation_memory(args, num_microbatches, verbose=False):
 
 
 def report_theoretical_memory(args, num_microbatches=None, verbose=False):
-    # Formulae here assume sequence parallelism and selective activation recomputation.
-    if not args.sequence_parallel or args.recompute_granularity != 'selective':
-        return
-
     weight_and_optimizer_memory = (
         compute_weight_and_optimizer_memory(args, verbose=verbose) / NUM_BYTES_IN_MEGABYTE
     )
+
+    # Formulae here assume sequence parallelism and selective activation recomputation.
+    if not args.sequence_parallel or args.recompute_granularity != 'selective':
+        print(
+            f"Theoretical memory footprints: weight and optimizer={weight_and_optimizer_memory:.2f} MB"
+        )
+        return
+
     activation_memory = (
         compute_activation_memory(args, num_microbatches=num_microbatches, verbose=verbose)
         / NUM_BYTES_IN_MEGABYTE
@@ -163,6 +183,5 @@ def report_theoretical_memory(args, num_microbatches=None, verbose=False):
 
     print(
         f"Theoretical memory footprints: weight and optimizer={weight_and_optimizer_memory:.2f} MB, "
-        f"activation={activation_memory:.2f} MB, "
-        f"total={total_memory:.2f} MB\n"
+        f"activation={activation_memory:.2f} MB, total={total_memory:.2f} MB\n"
     )
