@@ -18,12 +18,10 @@ from torch.distributed.checkpoint import (
     DefaultLoadPlanner,
     DefaultSavePlanner,
     FileSystemReader,
-    FileSystemWriter,
     LoadPlan,
     SavePlan,
     TensorStorageMetadata,
     WriteItem,
-    save_state_dict,
 )
 from torch.distributed.checkpoint._nested_dict import FLATTEN_MAPPING, unflatten_state_dict
 from torch.distributed.checkpoint._traverse import OBJ_PATH, traverse_state_dict
@@ -41,6 +39,8 @@ from ..mapping import (
     is_main_replica,
 )
 from .base import LoadShardedStrategy, SaveShardedStrategy, StrategyAction, default_strategies
+from .filesystem_async import FileSystemWriterAsync
+from .state_dict_saver import save_state_dict_async_finalize, save_state_dict_async_plan
 
 _import_trigger = None
 
@@ -393,6 +393,9 @@ class TorchDistSaveShardedStrategy(SaveShardedStrategy):
         self.keep_only_main_replica = keep_only_main_replica
         self.thread_count = thread_count
 
+        # Intermediate state
+        self.save_state_dict_ret: Optional[Tuple[Any, ...]] = None
+
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         """ Translates MCore ShardedTensors to PyT ShardedTensors and saves in PyT Distributed format.
 
@@ -411,18 +414,35 @@ class TorchDistSaveShardedStrategy(SaveShardedStrategy):
             sharded_state_dict, self.keep_only_main_replica
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
-        # Use PyT saving mechanism
-        save_state_dict(
+
+        # Using async infrastructure for sync save
+        writer = FileSystemWriterAsync(checkpoint_dir, thread_count=self.thread_count)
+        self.save_state_dict_ret = save_state_dict_async_plan(
             pyt_state_dict,
-            FileSystemWriter(checkpoint_dir, thread_count=self.thread_count),
+            writer,
+            None,
             planner=MCoreSavePlanner(dedup_replicated_tensors=not self.keep_only_main_replica),
         )
+        fun_args = writer.get_save_function_and_args()
+        if fun_args is not None:
+            fun, args = fun_args
+            fun(*args)
+        self._finalize_save()
+
+    def _finalize_save(self) -> None:
+        """ Perform save finalization.
+
+        Breakdown into `save` and `save_finalize` cn be useful for async saving.
+        """
+        if self.save_state_dict_ret is None:
+            raise CheckpointingException('finalize_save called, but no ckpt save in progress')
+
+        save_state_dict_async_finalize(*self.save_state_dict_ret)
+        self.save_state_dict_ret = None
+        torch.distributed.barrier()
 
     def can_handle_sharded_objects(self):
         return True
-
-    def save_async(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
-        raise NotImplementedError
 
 
 class TorchDistLoadShardedStrategy(LoadShardedStrategy):
