@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Input/output checkpointing."""
 
@@ -517,9 +517,11 @@ def _load_base_checkpoint(load_dir, rank0=False, sharded_state_dict=None,
             'megatron.legacy.fp16_deprecated.loss_scaler']
         sys.modules['megatron.fp16.loss_scaler'] = sys.modules[
             'megatron.legacy.fp16_deprecated.loss_scaler']
+        sys.modules['megatron.model'] = sys.modules['megatron.legacy.model']
         state_dict = torch.load(checkpoint_name, map_location='cpu')
         sys.modules.pop('fp16.loss_scaler', None)
         sys.modules.pop('megatron.fp16.loss_scaler', None)
+        sys.modules.pop('megatron.model', None)
     except BaseException as e:
         print_rank_0('could not load the checkpoint')
         print_rank_0(e)
@@ -609,6 +611,7 @@ def load_args_from_checkpoint(args, load_arg='load',
     _set_arg('normalization', force=True)
     _set_arg('tokenizer_type')
     _set_arg('padded_vocab_size')
+    _set_arg('apply_query_key_layer_scaling', force=True)
     if checkpoint_version < 3.0:
         _set_arg('tensor_model_parallel_size',
                  'model_parallel_size')
