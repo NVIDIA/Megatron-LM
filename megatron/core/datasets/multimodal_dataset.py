@@ -12,19 +12,18 @@ from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
 class MultimodalDatasetConfig(GPTDatasetConfig):
     """Configuration object for Megatron Core Multimodal datasets.
 
-
     Note: This is unused at the moment and may be missing features. Follow-up changes will use this.
-
-    Attributes:
-        image_h (int): Image height.
-        image_w (int): Image width.
-        preprocess_func (callable): Optional function to preprocess data samples for a specific model.
     """
 
     image_h: int = None
+    """Image height."""
+
     image_w: int = None
+    """Image width."""
+
     # Function to preprocess the data sample to a format expected by a specific model. By default, do nothing.
     preprocess_func: Callable[[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]] = lambda x: x
+    """Optional function to preprocess data samples for a specific model."""
 
     def __post_init__(self) -> None:
         super().__post_init__()

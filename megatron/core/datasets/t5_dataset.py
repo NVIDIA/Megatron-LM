@@ -21,16 +21,13 @@ class T5MaskedWordPieceDatasetConfig(MaskedWordPieceDatasetConfig):
     NB: As a temporary holdover from Megatron-LM. The T5 tokenizer has an attribute which defines
     a number of special sentinel tokens used during sampling. The assert in __post_init__ serves to
     preserve compatibility with Megatron-LM until the T5 tokenizer is in Megatron Core.
-
-    Args:
-        sequence_length_encoder (Optional[int]): A sequence_length alias and the sequence length for the encoder
-
-        sequence_length_decoder (int): The sequence length for the decoder
     """
 
     sequence_length_encoder: Optional[int] = field(init=False, default=None)
+    """A sequence_length alias and the sequence length for the encoder"""
 
     sequence_length_decoder: int = None
+    """The sequence length for the decoder"""
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init

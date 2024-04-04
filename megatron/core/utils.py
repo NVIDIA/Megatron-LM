@@ -234,3 +234,107 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
         prepend_axis_num=prepend_axis_num,
         **kwargs,
     )
+
+
+def prepare_input_tensors_for_wgrad_compute(grad_output, all_gathered_input):
+
+    # Doing gather + slicing during the NeMo forward pass can make this tensor
+    # not be contiguous. PyTorch only checks if the tensor is contiguous, and only
+    # clones it if it's not contiguous:
+    # https://github.com/pytorch/pytorch/blob/c47cf9bc7f9e02f649ab4ed53fe4d35732c92ab6/torch/_refs/__init__.py#L2761
+    grad_output = grad_output.contiguous()
+    # Convert the tensor shapes to 2D for execution compatibility
+    if grad_output.dim() == 3:
+        grad_output = grad_output.view(
+            grad_output.shape[0] * grad_output.shape[1], grad_output.shape[2]
+        )
+        all_gathered_input = all_gathered_input.view(
+            all_gathered_input.shape[0] * all_gathered_input.shape[1], all_gathered_input.shape[2]
+        )
+
+    return grad_output, all_gathered_input
+
+
+def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_output_buffer, weight):
+    """ Helper for performing embedding wgrad GEMM's during the pipeline drain phase, pipelines the AllGather and GEMM's.
+
+    Should only be used when pipeline model parallelism and gradient accumulation fusion are enabled.
+    """
+
+    assert len(embedding_activation_buffer) == len(
+        grad_output_buffer
+    ), "Length of activation and gradient buffers need to be equal!"
+
+    import fused_weight_gradient_mlp_cuda
+
+    from megatron.core.parallel_state import (
+        get_global_memory_buffer,
+        get_tensor_model_parallel_group,
+        get_tensor_model_parallel_world_size,
+    )
+
+    input = embedding_activation_buffer.pop(0)
+    world_size = get_tensor_model_parallel_world_size()
+    dim_size = list(input.size())
+    dim_size[0] = dim_size[0] * world_size
+
+    all_gathered_input = [None, None]
+    if config.sequence_parallel:
+        all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu_0")
+        handle = torch.distributed._all_gather_base(
+            all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=False
+        )
+
+        all_gathered_input[0] = all_gather_buffer
+        all_gather_buffer = None
+    else:
+        all_gathered_input[0] = input
+
+    input = None
+
+    def wgrad_compute(all_gathered_input, grad_output, weight):
+
+        grad_output, all_gathered_input = prepare_input_tensors_for_wgrad_compute(
+            grad_output, all_gathered_input
+        )
+
+        if config.gradient_accumulation_fusion:
+            if weight.main_grad.dtype == torch.float32:
+                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
+                    all_gathered_input, grad_output, weight.main_grad
+                )
+            elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
+                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
+                    all_gathered_input, grad_output, weight.main_grad
+                )
+            else:
+                raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
+
+    # We have all_gathered_input list acting as a double buffer here,
+    # since we are pipelining the AllGather and GEMM,one buffer all gathers
+    # the input while the other buffer reads from it for the GEMM. We use i
+    # and (i+1) for indexing to enable this double buffering.
+    for i in range(len(embedding_activation_buffer)):
+        input = embedding_activation_buffer.pop(0)
+        if config.sequence_parallel:
+            name = "mpu_" + str((i + 1) % 2)
+            all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, name)
+            handle = torch.distributed._all_gather_base(
+                all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
+            )
+
+            all_gathered_input[(i + 1) % 2] = all_gather_buffer
+            all_gather_buffer = None
+        else:
+            all_gathered_input[(i + 1) % 2] = input
+
+        grad_output = grad_output_buffer.pop(0)
+        wgrad_compute(all_gathered_input[i % 2], grad_output, weight)
+        input, all_gathered_input[i % 2], grad_output = None, None, None
+
+        if config.sequence_parallel:
+            handle.wait()
+
+    grad_output = grad_output_buffer.pop(0)
+    wgrad_compute(all_gathered_input[1], grad_output, weight)
+    input, all_gathered_input[1], grad_output = None, None, None

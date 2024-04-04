@@ -101,6 +101,20 @@ class GPTModel(LanguageModule):
 
         # Output
         if post_process:
+            if self.config.defer_embedding_wgrad_compute:
+                # The embedding activation buffer preserves a reference to the input activations
+                # of the final embedding projection layer GEMM. It will hold the activations for
+                # all the micro-batches of a global batch for the last pipeline stage. Once we are
+                # done with all the back props for all the microbatches for the last pipeline stage,
+                # it will be in the pipeline flush stage. During this pipeline flush we use the
+                # input activations stored in embedding activation buffer and gradient outputs stored
+                # in gradient buffer to calculate the weight gradients for the embedding final linear layer.
+                self.embedding_activation_buffer = []
+                self.grad_output_buffer = []
+            else:
+                self.embedding_activation_buffer = None
+                self.grad_output_buffer = None
+
             self.output_layer = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
                 self.vocab_size,
@@ -111,6 +125,8 @@ class GPTModel(LanguageModule):
                 gather_output=not self.parallel_output,
                 skip_weight_param_allocation=self.pre_process
                 and self.share_embeddings_and_output_weights,
+                embedding_activation_buffer=self.embedding_activation_buffer,
+                grad_output_buffer=self.grad_output_buffer,
             )
 
         if self.pre_process or self.post_process:

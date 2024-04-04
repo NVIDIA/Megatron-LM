@@ -20,25 +20,21 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class GPTDatasetConfig(BlendedMegatronDatasetConfig):
-    """Configuration object for Megatron Core GPT datasets
-
-    Args:          
-        reset_position_ids (bool): Option to reset the position IDs in the dataset at an interval
-
-        reset_attention_mask (bool): Option to reset the attention mask from the dataset
-
-        eod_mask_loss (bool): Option to enable the EOD mask loss
-
-        create_attention_mask (bool): Option to enable the attention masks generation. Can be disabled if attention kernel generates masks by itself.
-    """
+    """Configuration object for Megatron Core GPT datasets"""
 
     reset_position_ids: bool = None
+    """Option to reset the position IDs in the dataset at an interval"""
 
     reset_attention_mask: bool = None
+    """Option to reset the attention mask from the dataset"""
 
     eod_mask_loss: bool = None
+    """Option to enable the EOD mask loss"""
 
     create_attention_mask: bool = True
+    """Option to enable the attention masks generation. Can be disabled if attention kernel
+       generates masks by itself.
+    """
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init
