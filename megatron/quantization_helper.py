@@ -4,6 +4,28 @@ from torch.distributed import ProcessGroup, all_to_all_single
 import math
 import os
 from .quantization_cuda_builder import find_module, build_module
+
+def build_or_import_siwzzle_quant_module():
+    pkg_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), '../','tools/jet_quant_cuda')
+    module_name = 'quantization_cuda'
+    module = find_module(pkg_path, module_name)
+    if module is not None:
+        return module
+    else:
+        if torch.distributed.is_initialized() and torch.distributed.get_rank()==0:
+            build_module(pkg_path)
+        torch.distributed.barrier()
+        module = find_module(pkg_path, module_name)
+        return module
+
+def analysis_diff(origin_tensor, quantized_tensor):
+
+    diff = origin_tensor - quantized_tensor
+    abs_error_norm = torch.norm(diff)
+    origin_norm = torch.norm(origin_tensor)
+    rela_error_norm = abs_error_norm / origin_norm
+    return abs_error_norm, rela_error_norm
+
 def get_hadamard_matrix(k):
     T = {}
     H = torch.ones((1, 1), device=torch.cuda.current_device(), dtype=torch.float)
@@ -37,7 +59,6 @@ class QuantizationHelper:
         self.gq_group_size_inter = gq_group_size_inter
         self.gradient_quantization_bits_intra = gradient_quantization_bits_intra
         self.gq_group_size_intra = gq_group_size_intra
-        self.cuda_quantizer = None
         self.data_parallel_group = data_parallel_group
         self.tensor_parallel_size = tensor_parallel_size
         self.pipeline_parallel_size = pipeline_parallel_size
@@ -75,9 +96,7 @@ class QuantizationHelper:
         self.local_world_size = local_dp_size
         num_local = data_parallel_world_size // local_dp_size
         self.num_nodes = num_local
-        # TODO only support data parallel across nodes, remove this assert in the future
-        assert data_parallel_world_size > 1, 'data parallel size must > 1, cannot initialize All-To-All'
-        assert num_local > 1, 'num_nodes<2 cannot initialize All-To-All'
+
         for i in range(num_local):
             local_rank = [j + local_dp_size * i for j in range(local_dp_size)]
             all_to_all_group[f"local_{i}"] = torch.distributed.new_group(ranks=local_rank)
@@ -89,7 +108,7 @@ class QuantizationHelper:
             all_to_all_group[f"global_{i}"] = torch.distributed.new_group(ranks=cur_rank)
         self.all2all_process_group = all_to_all_group
 
-    def quantize_gather_weights(self, weight_tensor):
+    def quantize_gather_weights(self, weight_tensor :torch.Tensor):
         """
         Quantize the given tensor using CUDAQuantizer.
 
@@ -100,13 +119,16 @@ class QuantizationHelper:
             quantized_param: The quantized tensor.
             scales: quantized scales
         """
-        if self.cuda_quantizer is None:
-            self.cuda_quantizer = CUDAQuantizer()
-            self.cuda_quantizer.target_group_size = self.wq_group_size
-        quantized_param, scales = self.cuda_quantizer.quantize(weight_tensor, quantization_bits=self.weight_quantization_bits)
-        return quantized_param, scales
 
-    def dequantize_gather_weights(self, quantized_weight_tensor, scale, received_buffer=None):
+        assert weight_tensor.nelement() % self.wq_group_size == 0
+        groups =  weight_tensor.nelement() // self.wq_group_size
+        quant_module = self.quant_module
+        if weight_tensor.dtype is not torch.half or weight_tensor.dtype is not torch.float:
+            weight_tensor = weight_tensor.to(torch.float)
+        quant_tensor, quant_scales = quant_module.stochastic_quantize(weight_tensor, groups, self.weight_quantization_bits, quant_module.Symmetric)
+        return quant_tensor, quant_scales
+
+    def dequantize_gather_weights(self, quantized_weight_tensor, scales, dequant_type, received_buffer=None):
         """
         Dequantize the given tensor using CUDAQuantizer.
 
@@ -117,14 +139,16 @@ class QuantizationHelper:
         Returns:
             torch.Tensor: The dequantized tensor.
         """
-        if self.cuda_quantizer is None:
-            self.cuda_quantizer = CUDAQuantizer()
-            self.cuda_quantizer.target_group_size = self.wq_group_size
+        if self.weight_quantization_bits == 4:
+            quantized_weight_tensor = self.use_2int4_represent_1int8(quantized_weight_tensor)
+        dequant_value = self.dequantize_nbits(quantized_weight_tensor, scales, groupsize=self.wq_group_size)
+        if dequant_value.dtype is not dequant_type:
+            dequant_value = dequant_value.to(dequant_type)
         if received_buffer is not None:
-            received_buffer.copy_(self.cuda_quantizer.dequantize(quantized_weight_tensor, scale, quantization_bits=self.weight_quantization_bits))
+            received_buffer.copy_(dequant_value)
             return received_buffer
         else:
-            return self.cuda_quantizer.dequantize(quantized_weight_tensor, scale, quantization_bits=self.weight_quantization_bits)
+            return dequant_value
 
     def quantize_reduce_gradients(self, tensor, received_buffer=None):
         world_size = torch.distributed.get_world_size(group=self.data_parallel_group)
@@ -190,18 +214,17 @@ class QuantizationHelper:
         return original_tensor.view(-1)
 
     def quantized_reduce_scatter(self, tensor):
-        N = tensor.nelement()
-        world_size = torch.distributed.get_world_size(group = self.data_parallel_group)
+        assert tensor.numel() % self.gq_group_size_inter == 0 # tensor size must be multiple of group size
+        assert self.gq_group_size_inter  % (8 // min(self.gradient_quantization_bits_inter, self.gradient_quantization_bits_intra)) == 0 # group size must be multiple of 2 when using 4bits
+        assert self.gq_group_size_inter % 8 == 0 # group size must be multiple of 8 when tensor is half type; must be multiple of 4 when type is float. 
+                                    # That is because cuda swizzle quant function will load 4 float or 8 half for each thread step to get better performance
+        # assert (tensor.numel() // self.gq_group_size_inter) % (num_nodes * local_world_size * pipeline) == 0
         groups = self.all2all_process_group
         global_world_size = torch.distributed.get_world_size(group=self.data_parallel_group)
         # group_size = self.gq_group_size
         intra_quant_group = max(math.ceil(tensor.numel() / self.gq_group_size_intra), global_world_size)
         local_world_size = self.local_world_size
         num_nodes = self.num_nodes
-        assert num_nodes > 1, 'number of nodes should > 1'
-        assert tensor.numel() % local_world_size == 0, 'tensor should be padded to multpiles of local_world_size'
-        assert tensor.numel() % num_nodes == 0, 'tensor should be padded to multpiles of num_nodes'
-        assert tensor.numel() % self.gq_group_size_intra ==0, 'tensor should be padded to multpilies of group size'
         inter_quant_group = intra_quant_group // local_world_size
         this_rank = torch.distributed.get_rank(
             group=self.data_parallel_group
@@ -284,8 +307,8 @@ class QuantizationHelper:
 
         # print('x_scale before tensor:', scale.view(torch.float32))
 
-        return torch.cat((x_quant, scale), 1)
-        # return x_quant, scale
+        # return torch.cat((x_quant, scale), 1)
+        return x_quant, scale
 
     def dequantize_4bits(self, x, s, groupsize=-1):
 
@@ -306,9 +329,9 @@ class QuantizationHelper:
 
         return x_dequant
 
-    def dequantize_nbits(self, x: torch.int8, s:torch.float32, groupsize=-1, bits=4):
+    def dequantize_nbits(self, x: torch.int8, s:torch.float32, groupsize=-1):
         x = x.to(torch.float32)
-        s = s.view(torch.float32)
+        s = s.view(torch.float32).view(-1, 1)
 
         if groupsize == -1:
             group_x = x
