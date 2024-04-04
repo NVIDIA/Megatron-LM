@@ -6,7 +6,7 @@ import sys
 import torch
 import types
 
-from utils import print_memory_usage
+from utils import get_mcore_transformer_block_key, print_memory_usage
 
 
 def add_arguments(parser):
@@ -24,6 +24,9 @@ def add_arguments(parser):
                        default='learned_absolute',
                        choices=['learned_absolute', 'rope'],
                        help='Position embedding type.')
+    group.add_argument('--loader-transformer-impl', default='transformer_engine',
+                       choices=['local', 'transformer_engine'],
+                       help='Which Transformer implementation to use.')
 
 
 def _load_checkpoint(queue, args):
@@ -78,6 +81,9 @@ def _load_checkpoint(queue, args):
 
     # Validate margs.
     margs = validate_args(margs)
+
+    margs.use_mcore_models = True
+    margs.transformer_impl = args.loader_transformer_impl
 
     def check_for_arg(arg_name, default=None):
         if getattr(margs, arg_name, None) is None:
@@ -168,9 +174,6 @@ def _load_checkpoint(queue, args):
 
         return models
 
-    margs.use_mcore_models = True
-    margs.transformer_impl = "transformer_engine"
-
     set_global_variables(margs, build_tokenizer=False)
     mpu.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
@@ -228,6 +231,11 @@ def _load_checkpoint(queue, args):
     md.checkpoint_args = checkpoint_args
     md.use_mcore_models = margs.use_mcore_models
 
+    # Get transformer block (named either 'encoder' or 'decoder').
+    transformer_block_key = get_mcore_transformer_block_key(md.model_type)
+    def get_transformer_block(_model):
+        return getattr(_model, transformer_block_key)
+
     # Get first pipe stage
     mpu.set_pipeline_model_parallel_rank(0)
     all_models = [get_models(tp_size, md.params_dtype)]
@@ -264,11 +272,11 @@ def _load_checkpoint(queue, args):
                 if vp_rank == 0:
                     all_models.append(get_models(tp_size, md.params_dtype))
             models = all_models[pp_rank][vp_rank]
-            for layer_num in range(len(models[0].decoder.layers)):
+            for layer_num in range(len(get_transformer_block(models[0]).layers)):
                 message = {}
 
                 # Get non-parallel tensors from tp_rank 0
-                layer = models[0].decoder.layers[layer_num]
+                layer = get_transformer_block(models[0]).layers[layer_num]
                 message["input norm weight"] = layer.self_attention.linear_qkv.layer_norm_weight.data
                 if norm_has_bias:
                     message["input norm bias"] = layer.self_attention.linear_qkv.layer_norm_bias.data
@@ -287,7 +295,7 @@ def _load_checkpoint(queue, args):
                 mlp_l0_bias = []
                 mlp_l1_weight = []
                 for tp_rank, model in enumerate(models):
-                    layer = model.decoder.layers[layer_num]
+                    layer = get_transformer_block(model).layers[layer_num]
                     qkv_weight.append(layer.self_attention.linear_qkv.weight.data)
                     dense_weight.append(layer.self_attention.linear_proj.weight.data)
                     mlp_l0_weight.append(layer.mlp.linear_fc1.weight.data)
@@ -326,10 +334,10 @@ def _load_checkpoint(queue, args):
 
     # Send final norm from tp_rank 0
     message = {
-        "weight": models[0].decoder.final_layernorm.weight.data,
+        "weight": get_transformer_block(models[0]).final_layernorm.weight.data,
     }
     if norm_has_bias:
-        message["bias"] = models[0].decoder.final_layernorm.bias.data
+        message["bias"] = get_transformer_block(models[0]).final_layernorm.bias.data
     queue_put("final norm", message)
 
     if md.output_layer:
@@ -352,10 +360,10 @@ def _load_checkpoint(queue, args):
         message = {
             "dense weight": models[0].lm_head.dense.weight.data,
             "dense bias": models[0].lm_head.dense.bias.data,
-            "norm weight": models[0].lm_head.norm.weight.data,
+            "norm weight": models[0].lm_head.layer_norm.weight.data,
         }
         if norm_has_bias:
-            message["norm bias"] = models[0].lm_head.norm.bias.data
+            message["norm bias"] = models[0].lm_head.layer_norm.bias.data
         queue_put("lm head", message)
 
         if md.bert_binary_head:
