@@ -492,7 +492,7 @@ def initialize_model_parallel(
     for i in range(num_tensor_and_data_groups):
         for j in range(num_expert_groups):
             # TPxEP Group
-            start_rank = i * tensor_and_data_group_size + j * tensor_and_expert_group_size 
+            start_rank = i * tensor_and_data_group_size + j * tensor_and_expert_group_size
             end_rank = i * tensor_and_data_group_size + (j + 1) * tensor_and_expert_group_size
             ranks = range(start_rank, end_rank)
             group = torch.distributed.new_group(
@@ -502,15 +502,13 @@ def initialize_model_parallel(
                 _TENSOR_AND_EXPERT_PARALLEL_GROUP = group
             for k in range(tensor_model_parallel_size):
                 # EP Group
-                ranks = range(
-                    start_rank + k, end_rank, tensor_model_parallel_size
-                )
+                ranks = range(start_rank + k, end_rank, tensor_model_parallel_size)
                 group = torch.distributed.new_group(
                     ranks, pg_options=get_nccl_options('exp', nccl_comm_cfgs)
                 )
                 if rank in ranks:
                     _EXPERT_MODEL_PARALLEL_GROUP = group
-    
+
     for i in range(num_tensor_and_data_groups):
         start_rank = i * tensor_and_data_group_size
         end_rank = (i + 1) * tensor_and_data_group_size
