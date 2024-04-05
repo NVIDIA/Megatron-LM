@@ -164,7 +164,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         embedding_dim: int,
         *,
         init_method: Callable,
-        reduce_scatter_embeddings: bool,
+        reduce_scatter_embeddings: bool = False,
         config: ModelParallelConfig,
     ):
         super(VocabParallelEmbedding, self).__init__()
