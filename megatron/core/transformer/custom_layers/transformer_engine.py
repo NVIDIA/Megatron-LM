@@ -508,6 +508,48 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             return core_attn_out
 
 
+def te_checkpoint(
+    forward_func,
+    distribute_saved_activations,
+    get_rng_state_tracker,
+    tp_group,
+    hidden_states,
+    attention_mask,
+    context,
+    context_mask,
+    rotary_pos_emb,
+    packed_seq_params,
+):
+    from transformer_engine.pytorch.distributed import checkpoint
+
+    if _te_version >= packaging.version.Version("1.5.0"):
+        return checkpoint(
+            forward_func,
+            hidden_states,
+            attention_mask,
+            context,
+            context_mask,
+            rotary_pos_emb,
+            packed_seq_params,
+            distribute_saved_activations=distribute_saved_activations,
+            get_rng_state_tracker=get_rng_state_tracker,
+            tp_group=tp_group,
+        )
+    else:
+        return checkpoint(
+            forward_func,
+            distribute_saved_activations,
+            get_rng_state_tracker,
+            tp_group,
+            hidden_states,
+            attention_mask,
+            context,
+            context_mask,
+            rotary_pos_emb,
+            packed_seq_params,
+        )
+
+
 try:
 
     from transformer_engine.pytorch.attention import _SplitAlongDim

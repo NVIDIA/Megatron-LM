@@ -16,6 +16,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.custom_layers.transformer_engine import (
     TENorm,
     get_cpu_offload_context,
+    te_checkpoint,
 )
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
@@ -216,8 +217,6 @@ class TransformerBlock(MegatronModule):
 
         def checkpoint_handler(forward_func):
             if self.config.fp8:
-                from transformer_engine.pytorch.distributed import checkpoint as te_checkpoint
-
                 return te_checkpoint(
                     forward_func,
                     self.config.distribute_saved_activations,
@@ -258,8 +257,17 @@ class TransformerBlock(MegatronModule):
             # Checkpoint the input activation of only a set number of individual
             # Transformer layers and skip the rest.
             # A method fully use the device memory removing redundant re-computation.
+            recompute_skip_num_layers = 0
             for l in range(self.num_layers_per_pipeline_rank):
-                if l < self.config.recompute_num_layers:
+                # Skip recomputation when input grad computation is not needed.
+                # Need to have at least one input tensor with gradient computation
+                # for re-enterant autograd engine.
+                if self.config.fp8 and not hidden_states.requires_grad:
+                    recompute_skip_num_layers += 1
+                if (
+                    l >= recompute_skip_num_layers
+                    and l < self.config.recompute_num_layers + recompute_skip_num_layers
+                ):
                     hidden_states, context = checkpoint_handler(custom(l, l + 1))
                 else:
                     hidden_states, context = custom(l, l + 1)(
