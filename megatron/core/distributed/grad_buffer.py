@@ -243,8 +243,7 @@ class GradBuffer:
                 weight_quantization_pad = 1
                 gradient_quantization_pad = 1
                 if quantization_helper.quantized_weights:
-                    # Qantized weight requires the number of weights be a multiple of 8
-                    weight_quantization_pad = quantization_helper.wq_group_size * 8
+                    weight_quantization_pad = quantization_helper.wq_group_size
                 if quantization_helper.quantized_gradients:
                     gradient_quantization_pad = least_common_multiple([quantization_helper.gq_group_size_intra, quantization_helper.gq_group_size_inter])
                 bucket_size_divisible_by = least_common_multiple([weight_quantization_pad, gradient_quantization_pad]) * self.data_parallel_world_size
