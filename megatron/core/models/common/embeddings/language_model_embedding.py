@@ -38,12 +38,14 @@ class LanguageModelEmbedding(MegatronModule):
         self.max_sequence_length: int = max_sequence_length
         self.add_position_embedding: bool = position_embedding_type == 'learned_absolute'
         self.num_tokentypes = num_tokentypes
+        self.reduce_scatter_embeddings = (not self.add_position_embedding) and self.num_tokentypes <= 0 and self.config.sequence_parallel
 
         # Word embeddings (parallel).
         self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
             num_embeddings=self.vocab_size,
             embedding_dim=self.config.hidden_size,
             init_method=self.config.init_method,
+            reduce_scatter_embeddings=self.reduce_scatter_embeddings,
             config=self.config,
         )
 
@@ -98,8 +100,9 @@ class LanguageModelEmbedding(MegatronModule):
         else:
             embeddings = word_embeddings
 
-        # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
-        embeddings = embeddings.transpose(0, 1).contiguous()
+        if not self.reduce_scatter_embeddings:
+            # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
+            embeddings = embeddings.transpose(0, 1).contiguous()
 
         if tokentype_ids is not None:
             assert self.tokentype_embeddings is not None
@@ -115,7 +118,8 @@ class LanguageModelEmbedding(MegatronModule):
 
         # Dropout.
         if self.config.sequence_parallel:
-            embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
+            if not self.reduce_scatter_embeddings:
+                embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
             # `scatter_to_sequence_parallel_region` returns a view, which prevents
             # the original tensor from being garbage collected. Clone to facilitate GC.
             # Has a small runtime cost (~0.5%).

@@ -152,6 +152,7 @@ class VocabParallelEmbedding(torch.nn.Module):
     Args:
         num_embeddings: vocabulary size.
         embedding_dim: size of hidden state.
+        reduce_scatter_embeddings: Decides whether to perform ReduceScatter after embedding lookup
 
     Keyword Args:
         config: A megatron.core.ModelParallelConfig object
@@ -163,12 +164,14 @@ class VocabParallelEmbedding(torch.nn.Module):
         embedding_dim: int,
         *,
         init_method: Callable,
+        reduce_scatter_embeddings: bool,
         config: ModelParallelConfig,
     ):
         super(VocabParallelEmbedding, self).__init__()
         # Keep the input dimensions.
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
+        self.reduce_scatter_embeddings = reduce_scatter_embeddings
         self.tensor_model_parallel_size = get_tensor_model_parallel_world_size()
         # Divide the weight matrix along the vocaburaly dimension.
         (
@@ -222,8 +225,14 @@ class VocabParallelEmbedding(torch.nn.Module):
         # Mask the output embedding.
         if self.tensor_model_parallel_size > 1:
             output_parallel[input_mask, :] = 0.0
-        # Reduce across all the model parallel GPUs.
-        output = reduce_from_tensor_model_parallel_region(output_parallel)
+
+        if self.reduce_scatter_embeddings:
+            # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
+            output_parallel = output_parallel.transpose(0, 1).contiguous()
+            output = reduce_scatter_to_sequence_parallel_region(output_parallel)
+        else:
+            # Reduce across all the model parallel GPUs.
+            output = reduce_from_tensor_model_parallel_region(output_parallel)
         return output
 
     def sharded_state_dict(
