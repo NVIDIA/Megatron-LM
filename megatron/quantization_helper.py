@@ -5,6 +5,8 @@ import math
 import os
 from .quantization_cuda_builder import find_module, build_module
 
+_GRADIENT_COMM_DEBUG = int(os.getenv("GRADIENT_COMM_DEBUG", -1))
+
 def build_or_import_siwzzle_quant_module():
     pkg_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), '../','tools/jet_quant_cuda')
     module_name = 'quantization_cuda'
@@ -153,6 +155,16 @@ class QuantizationHelper:
     def quantize_reduce_gradients(self, tensor, received_buffer=None):
         world_size = torch.distributed.get_world_size(group=self.data_parallel_group)
         # when grad type float16, should use fp32 to do transformation and quantization
+        if _GRADIENT_COMM_DEBUG == 1:
+            reduced_shape = list(tensor.shape)
+            reduced_shape[0] = reduced_shape[0] // torch.distributed.get_world_size(group=self.data_parallel_group)
+            reduced_tensor = torch.zeros(reduced_shape, dtype=tensor.dtype, device=torch.cuda.current_device())
+            torch.distributed._reduce_scatter_base(
+                        reduced_tensor,
+                        tensor,
+                        group=self.data_parallel_group,
+                        async_op=False,
+                    )
         original_grad_type = tensor.dtype
         if original_grad_type is not torch.float32:
             tensor = tensor.to(torch.float32)
@@ -164,7 +176,11 @@ class QuantizationHelper:
         if final_output.dtype is not original_grad_type:
             final_output = final_output.to(original_grad_type)
         received_buffer.copy_(final_output)
-    
+        if _GRADIENT_COMM_DEBUG == 1:
+            diff = received_buffer - reduced_tensor
+            print(f'Gradient Quantization DEBUG, dp rank: {torch.distributed.get_rank(group=self.data_parallel_group)}, '
+                  f'abs norm: {torch.norm(diff)}, '
+                  f'rel norm: {torch.norm(diff) / torch.norm(reduced_tensor)}')
     def _all_to_all_along_first_dim(self, input_, output=None):
         """All to All gather tensor"""
         world_size = torch.distributed.get_world_size(group=self.data_parallel_group)
