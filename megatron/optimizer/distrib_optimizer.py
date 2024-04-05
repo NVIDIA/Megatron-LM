@@ -18,12 +18,12 @@ from .utils import shard_buffer
 
 
 import os
-_COMM_QUANT_BITS_PARAMDIFF = int(os.getenv("COMM_QUANT_BITS_PARAMDIFF", -1))
-_COMM_QUANT_GROUPSIZE_PARAM = int(os.getenv("COMM_QUANT_GROUPSIZE_PARAM", -1))
+# _COMM_QUANT_BITS_PARAMDIFF = int(os.getenv("COMM_QUANT_BITS_PARAMDIFF", -1))
+# _COMM_QUANT_GROUPSIZE_PARAM = int(os.getenv("COMM_QUANT_GROUPSIZE_PARAM", -1))
 _COMM_QUANT_CHUNKNUM_PARAM = int(os.getenv("COMM_QUANT_CHUNKNUM_PARAM", 1))
 _COMM_QUANT_REC_ERROR = int(os.getenv("COMM_QUANT_REC_ERROR", 0))
 _COMM_QUANT_DEBUG_IDQUANT = int(os.getenv("COMM_QUANT_DEBUG_IDQUANT", 0))
-assert _COMM_QUANT_BITS_PARAMDIFF in [-1, 4, 8]
+# assert _COMM_QUANT_BITS_PARAMDIFF in [-1, 4, 8]
 
 
 def quantize(x, bits, groupsize=-1):
@@ -1174,7 +1174,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             (model_index, dtype, bucket_index, pbuf, pbuf_views) = self.pbuf_view_items[all_gather_handle_index]
             assert all_gather_handle_index < len(self.all_gather_handles)
 
-            if _COMM_QUANT_BITS_PARAMDIFF != -1:
+            if self.quantize_helper is not None and self.quantize_helper.quantized_weights:
+                quantize_bits = self.quantize_helper.weight_quantization_bits
+                quantize_group_size = self.quantize_helper.wq_group_size
                 self.param_diff_ops('cal_model_paramdiff') 
                 pdbuf_view_items = self.get_model_paramdiff_buffer_dp_views()
                 assert self.overlap_param_gather == False
@@ -1189,11 +1191,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         quant_copy = pbuf_views[data_parallel_rank].clone().detach()
                         pdbuf_views = pdbuf_view_items[all_gather_handle_index][3]
                         quant_copy_original_param = pdbuf_views[data_parallel_rank].clone().detach()
-                    param2send, s = quantize(pbuf_views[data_parallel_rank].to(torch.float32), bits=_COMM_QUANT_BITS_PARAMDIFF, groupsize=_COMM_QUANT_GROUPSIZE_PARAM)
+                    param2send, s = quantize(pbuf_views[data_parallel_rank].to(torch.float32), bits=quantize_bits, groupsize=quantize_group_size)
                     param2send = param2send.to(torch.int8)
                     scale2send = s
 
-                    if _COMM_QUANT_BITS_PARAMDIFF == 4: 
+                    if quantize_bits == 4: 
                         param2send = use_1int8_represent_2int4(int4_input=param2send)
                         # append fp32 scale2send as 4*int8 to param2send
                         assert list(scale2send.shape)[1] == 1
@@ -1215,7 +1217,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 )
 
                 # PDEF after allgather: allgather -> (use_2int4_represent_1int8) -> dequant
-                if _COMM_QUANT_BITS_PARAMDIFF == 4: 
+                if quantize_bits == 4: 
                     each_dp_rank_size = list(param2send.shape)[0]
                     to_unpack_param2recv = []
                     scales = []
@@ -1232,7 +1234,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 if model_index < _COMM_QUANT_CHUNKNUM_PARAM: 
                     for idx, p in enumerate(pbuf_views): 
-                        tmp = dequantize(pbuf_views[idx], scales[idx].to(pbuf_views[idx].device), groupsize=_COMM_QUANT_GROUPSIZE_PARAM)
+                        tmp = dequantize(pbuf_views[idx], scales[idx].to(pbuf_views[idx].device), groupsize=quantize_group_size)
                         pbuf_views[idx].copy_(tmp.to(torch.bfloat16))
                         if _COMM_QUANT_REC_ERROR == 1 and idx == data_parallel_rank:
                             abs_diff = torch.norm(quant_copy - pbuf_views[data_parallel_rank], p=2)
@@ -1241,8 +1243,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             rel_diff_wrt_original_param = abs_diff / torch.norm(quant_copy_original_param, p=2)
                             print(f"DEBUG after allgather param... dp rank: {data_parallel_rank}, model_index: {model_index}, rel_diff wrt original param: {rel_diff_wrt_original_param}", flush=True)
 
-                if _COMM_QUANT_BITS_PARAMDIFF != -1:
-                    self.param_diff_ops('calback_model_param')
+                self.param_diff_ops('calback_model_param')
 
             else:
                 all_gather_handle = torch.distributed._all_gather_base(
