@@ -595,6 +595,7 @@ class ColumnParallelLinear(torch.nn.Module):
         skip_weight_param_allocation: bool = False,
         is_expert: bool = False,
         tp_comm_buffer_name: str = None,  # Not used
+        skip_reduce_in_bprop: bool = False,
     ):
         super(ColumnParallelLinear, self).__init__()
 
@@ -609,6 +610,7 @@ class ColumnParallelLinear(torch.nn.Module):
         self.is_expert = is_expert
         self.expert_parallel = config.expert_model_parallel_size > 1
         self.config = config
+        self.skip_reduce_in_bprop = skip_reduce_in_bprop
 
         # Parameters.
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
@@ -760,6 +762,7 @@ class ColumnParallelLinear(torch.nn.Module):
             self.async_tensor_model_parallel_allreduce
             or self.sequence_parallel
             or self.explicit_expert_comm
+            or self.skip_reduce_in_bprop
         ):
             input_parallel = input_
         else:
