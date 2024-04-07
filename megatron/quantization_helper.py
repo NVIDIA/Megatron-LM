@@ -48,8 +48,8 @@ class QuantizationHelper:
                  gradient_quantization_bits_intra=8,
                  gq_group_size_intra=512,
                  data_parallel_group: torch.distributed.ProcessGroup = None,
-                 tensor_parallel_size: int = 1,
-                 pipeline_parallel_size: int = 1,
+                 tensor_parallel_group: torch.distributed.ProcessGroup = None,
+                 pipeline_parallel_group: torch.distributed.ProcessGroup = None,
                  hadamard_transform=False,
                  ):
 
@@ -62,8 +62,8 @@ class QuantizationHelper:
         self.gradient_quantization_bits_intra = gradient_quantization_bits_intra
         self.gq_group_size_intra = gq_group_size_intra
         self.data_parallel_group = data_parallel_group
-        self.tensor_parallel_size = tensor_parallel_size
-        self.pipeline_parallel_size = pipeline_parallel_size
+        self.tensor_parallel_group= tensor_parallel_group
+        self.pipeline_parallel_group = pipeline_parallel_group
         self.hadamard_transform = hadamard_transform
         self.hadamard_order = 5
         self.hadamard_group_size = 2**self.hadamard_order
@@ -88,26 +88,34 @@ class QuantizationHelper:
     def set_local_all_to_all_group(self):
         assert torch.distributed.is_initialized(), 'dist is not initialized'
         all_to_all_group = {}
+        tensor_model_parallel_size = torch.distributed.get_world_size(group=self.tensor_parallel_group)
+        pipeline_model_parallel_size = torch.distributed.get_world_size(group=self.pipeline_parallel_group)
         data_parallel_world_size = torch.distributed.get_world_size(group=self.data_parallel_group)
-        tensor_model_parallel_size = self.tensor_parallel_size
-        pipeline_model_parallel_size =self.pipeline_parallel_size
         gpus_per_node = int(os.environ['LOCAL_WORLD_SIZE'])
-        local_dp_size = gpus_per_node // (tensor_model_parallel_size * pipeline_model_parallel_size) # data parallel size in a node
-        if local_dp_size < 1:
-            local_dp_size = 1
-        self.local_world_size = local_dp_size
-        num_local = data_parallel_world_size // local_dp_size
-        self.num_nodes = num_local
+        intra_dp_size = gpus_per_node // (tensor_model_parallel_size) # data parallel size in a node
+        inter_dp_size = data_parallel_world_size // intra_dp_size
+        self.intra_dp_size = intra_dp_size
+        self.inter_dp_size = inter_dp_size
 
-        for i in range(num_local):
-            local_rank = [j + local_dp_size * i for j in range(local_dp_size)]
-            all_to_all_group[f"local_{i}"] = torch.distributed.new_group(ranks=local_rank)
-
-        for i in range(local_dp_size):
-            cur_rank = []
-            for j in range(num_local):
-                cur_rank.append(i + j * local_dp_size)
-            all_to_all_group[f"global_{i}"] = torch.distributed.new_group(ranks=cur_rank)
+        num_tensor_model_parallel_groups: int = torch.distributed.get_world_size() // tensor_model_parallel_size
+        num_pipeline_model_parallel_groups: int = torch.distributed.get_world_size() // pipeline_model_parallel_size
+        context_parallel_size = 1
+        for i in range(pipeline_model_parallel_size):
+            start_rank = i * num_pipeline_model_parallel_groups
+            end_rank = (i + 1) * num_pipeline_model_parallel_groups
+            for j in range(context_parallel_size * tensor_model_parallel_size):
+                ranks = range(
+                    start_rank + j, end_rank, context_parallel_size * tensor_model_parallel_size
+                )
+                for k in range(inter_dp_size):
+                    local_rank = [ranks[l + intra_dp_size * k] for l in range(intra_dp_size)]
+                    all_to_all_group[f"local_{i}_{j}_{k}"] = torch.distributed.new_group(ranks=local_rank)
+                for k in range(intra_dp_size):
+                    cur_rank = []
+                    for l in range(inter_dp_size):
+                        cur_rank.append(ranks[k + l * intra_dp_size])
+                    all_to_all_group[f"global_{i}_{j}_{k}"] = torch.distributed.new_group(ranks=cur_rank)
+    
         self.all2all_process_group = all_to_all_group
 
     def quantize_gather_weights(self, weight_tensor :torch.Tensor):
@@ -239,14 +247,17 @@ class QuantizationHelper:
         global_world_size = torch.distributed.get_world_size(group=self.data_parallel_group)
         # group_size = self.gq_group_size
         intra_quant_group = max(math.ceil(tensor.numel() / self.gq_group_size_intra), global_world_size)
-        local_world_size = self.local_world_size
-        num_nodes = self.num_nodes
-        inter_quant_group = intra_quant_group // local_world_size
+        intra_dp_size = self.intra_dp_size
+        inter_dp_size = self.inter_dp_size
+        inter_quant_group = intra_quant_group // intra_dp_size
         this_rank = torch.distributed.get_rank(
             group=self.data_parallel_group
         )
-        intra_idx = int(this_rank / local_world_size)
-        inter_idx = this_rank % local_world_size
+
+        pp_rank = torch.distributed.get_rank(group=self.pipeline_parallel_group)
+        tp_rank = torch.distributed.get_rank(group=self.tensor_parallel_group)
+        intra_idx = int(this_rank / intra_dp_size)
+        inter_idx = this_rank % intra_dp_size
         quant_module = self.quant_module
 
         """intra node quantization and all-to-all"""
@@ -255,17 +266,17 @@ class QuantizationHelper:
                                                                             self.gradient_quantization_bits_intra,
                                                                             quant_module.Symmetric, 
                                                                             1, 
-                                                                            num_nodes,
-                                                                            local_world_size)
+                                                                            inter_dp_size,
+                                                                            intra_dp_size)
         """all to all, dequantReduction"""
         all_to_all_output_tensor = torch.empty_like(output_tensor)
         all_to_all_output_scales = torch.empty_like(output_scales)
-        all_to_all_single(all_to_all_output_tensor, output_tensor, group=groups[f'local_{intra_idx}'])
-        all_to_all_single(all_to_all_output_scales, output_scales, group=groups[f'local_{intra_idx}'])
+        all_to_all_single(all_to_all_output_tensor, output_tensor, group=groups[f'local_{pp_rank}_{tp_rank}_{intra_idx}'])
+        all_to_all_single(all_to_all_output_scales, output_scales, group=groups[f'local_{pp_rank}_{tp_rank}_{intra_idx}'])
 
         reduced_tensor, = quant_module.quantized_reduction(
             all_to_all_output_tensor, all_to_all_output_scales, intra_quant_group, inter_quant_group, self.gradient_quantization_bits_intra, quant_module.Symmetric,
-            local_world_size)
+            intra_dp_size)
         
         """inter node quantization and all-to-all"""
         quant_tensor, quant_scales = quant_module.stochastic_quantize(reduced_tensor, inter_quant_group, self.gradient_quantization_bits_inter, quant_module.Symmetric)
@@ -273,17 +284,17 @@ class QuantizationHelper:
         """all to all"""
         all_to_all_output_tensor = torch.empty_like(quant_tensor)
         all_to_all_output_scales = torch.empty_like(quant_scales)
-        all_to_all_single(all_to_all_output_tensor, quant_tensor, group=groups[f'global_{inter_idx}'])
-        all_to_all_single(all_to_all_output_scales, quant_scales, group=groups[f'global_{inter_idx}'])
+        all_to_all_single(all_to_all_output_tensor, quant_tensor, group=groups[f'global_{pp_rank}_{tp_rank}_{inter_idx}'])
+        all_to_all_single(all_to_all_output_scales, quant_scales, group=groups[f'global_{pp_rank}_{tp_rank}_{inter_idx}'])
 
         """dequantizeReduction"""
         dquant_output, = quant_module.quantized_reduction(all_to_all_output_tensor, 
                                                             all_to_all_output_scales, 
                                                             inter_quant_group, 
-                                                            inter_quant_group // num_nodes, 
+                                                            inter_quant_group // inter_dp_size, 
                                                             self.gradient_quantization_bits_inter, 
                                                             quant_module.Symmetric,
-                                                            num_nodes)
+                                                            inter_dp_size)
 
         return dquant_output
 

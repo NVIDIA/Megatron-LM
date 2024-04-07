@@ -400,8 +400,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                                                     gradient_quantization_bits_intra=args.gradient_quantization_bits_intra,
                                                     gq_group_size_intra=args.gq_group_size_intra,
                                                     data_parallel_group=mpu.get_data_parallel_group(with_context_parallel=True),
-                                                    tensor_parallel_size=mpu.get_tensor_model_parallel_world_size(),
-                                                    pipeline_parallel_size=mpu.get_pipeline_model_parallel_world_size(),
+                                                    tensor_parallel_group=mpu.get_tensor_model_parallel_group(),
+                                                    pipeline_parallel_group=mpu.get_pipeline_model_parallel_group(),
                                                     hadamard_transform=args.hadamard_transform)
 
     if wrap_with_ddp:
