@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 ChunkId = Tuple[str, tuple, Optional[tuple]]
-SaveDistribution = Tuple[Dict[ChunkId, int], Set[ChunkId]]
+SaveDistribution = Tuple[Dict[ChunkId, int], Set[ChunkId], Dict[ChunkId, ShardedTensor]]
 
 
 class FullyParallelSaveStrategyWrapper(SaveShardedStrategy):
@@ -118,11 +118,13 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         strategy: LoadShardedStrategy,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
         do_cache_distribution: bool = False,
+        gather_algo: str = 'rounds'  # or 'object'
     ):
         super().__init__()
         self.base_strategy = strategy
         self.parallelization_group = parallelization_group
         self.do_cache_distribution = do_cache_distribution
+        self.gather_algo = gather_algo
 
         self.cached_distribution: Optional[SaveDistribution] = None
 
@@ -141,10 +143,18 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         loaded_state_dict = self.base_strategy.load(sharded_state_dict, checkpoint_dir)
 
         # Load sharded tensors separately
+        print(f'Applying parallel load with algo {self.gather_algo}')
         loaded_tensors = self.base_strategy.load(to_load_shards, checkpoint_dir)
-        all_loaded_tensors = self.exchange_loaded_tensors(
-            loaded_tensors, unloaded_shards, self.parallelization_group
-        )
+        if self.gather_algo == 'object':
+            all_loaded_tensors = self.exchange_loaded_tensors_gather_object(
+                loaded_tensors, unloaded_shards, precomputed_distribution, self.parallelization_group
+            )
+        elif self.gather_algo == 'rounds':
+            all_loaded_tensors = self.exchange_loaded_tensors_gather_rounds(
+                loaded_tensors, unloaded_shards, precomputed_distribution, self.parallelization_group
+            )
+        else:
+            raise NotImplementedError(f'Unrecognized gather algorithm: {self.gather_algo}')
         self.fill_in_deferred_sharded_tensors(sharded_tensors, all_loaded_tensors)
         merge(loaded_state_dict, sharded_tensors)
         return loaded_state_dict
@@ -191,12 +201,13 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
 
         return precomputed_distribution
 
-    def exchange_loaded_tensors(
+    def exchange_loaded_tensors_gather_object(
         self,
         loaded_tensors: Dict[ChunkId, torch.Tensor],
         unloaded_shards: Dict[ChunkId, ShardedTensor],
+        precomputed_distribution: SaveDistribution = None,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
-    ):
+    ) -> Dict[ChunkId, torch.Tensor]:
         """  """
         all_loaded_tensors_list = [None] * torch.distributed.get_world_size(
             group=parallelization_group
@@ -223,46 +234,47 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
 
         return all_loaded_tensors
 
-    def fill_in_deferred_sharded_tensors(
-        self, sharded_state_dict: ShardedStateDict, loaded_tensors: Dict[ChunkId, torch.Tensor]
-    ) -> None:
-        def fill_in_sharded_tensor(x):
-            if isinstance(x, ShardedTensor):
-                try:
-                    x = loaded_tensors[_sharded_tensor_chunk_id(x)]
-                except KeyError as e:
-                    raise CheckpointingException(
-                        f'Missing loaded tensor shard: {_sharded_tensor_chunk_id(x)}'
-                    ) from e
-
-            return x
-
-        dict_list_map_inplace(fill_in_sharded_tensor, sharded_state_dict)
-
-    def all_gather_shards(self, state_dict, shard_to_saving_rank, shard_to_shape):
-        local_shards = list(nested_values(state_dict))
-        local_shards_by_id = {_sharded_tensor_chunk_id(sh_ten): sh_ten for sh_ten in local_shards}
+    def exchange_loaded_tensors_gather_rounds(
+        self,
+        loaded_tensors: Dict[ChunkId, torch.Tensor],
+        unloaded_shards: Dict[ChunkId, ShardedTensor],
+        precomputed_distribution: SaveDistribution = None,
+        parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> Dict[ChunkId, torch.Tensor]:
+        """  """
+        # local_sh_tens = list(nested_values(sharded_state_dict))
+        # local_sh_tens_by_id = {_sharded_tensor_chunk_id(sh_ten): sh_ten for sh_ten in local_sh_tens}
+        shard_to_saving_rank, _, shard_to_metadata = precomputed_distribution
         local_rank = torch.distributed.get_rank(group=self.parallelization_group)
 
-        for dtype in sorted(set(map(lambda x: x[1], shard_to_shape.values())), key=str):
+        all_loaded_tensors = dict(loaded_tensors)
 
-            shards_by_rank = [
+        for dtype in sorted(set(map(lambda sh_ten: sh_ten.dtype, shard_to_metadata.values())), key=str):
+
+            shards_by_rank: List[List[torch.Tensor]] = [
                 []
-                for _ in range(torch.distributed.get_world_size(group=self.parallelization_group))
+                for _ in range(torch.distributed.get_world_size(group=parallelization_group))
             ]
             for shard_id, rank in shard_to_saving_rank.items():
-                if shard_to_shape[shard_id][1] != dtype:
+                if shard_to_metadata[shard_id].dtype != dtype:
                     continue
                 if rank == local_rank:
-                    shards_by_rank[rank].append(local_shards_by_id[shard_id].data)
+                    assert shard_id in loaded_tensors, (shard_id, loaded_tensors.keys())
+                    shards_by_rank[rank].append(loaded_tensors[shard_id])
                 else:
-                    shards_by_rank[rank].append(
-                        torch.empty(
-                            shard_to_shape[shard_id][0],
-                            dtype=shard_to_shape[shard_id][1],
+                    local_unloaded_sh_ten = unloaded_shards.get(shard_id)
+                    if local_unloaded_sh_ten is None:
+                        sh_ten = shard_to_metadata[shard_id]
+                        _ten = torch.empty(
+                            sh_ten.local_shape,
+                            dtype=sh_ten.dtype,
                             device='cuda',
                         )
-                    )
+                    else:
+                        local_unloaded_sh_ten.init_data('cuda')
+                        _ten = local_unloaded_sh_ten.data
+                        all_loaded_tensors[shard_id] = _ten
+                    shards_by_rank[rank].append(_ten)
 
             num_rounds = max(map(len, shards_by_rank))
             for rank_shards in shards_by_rank:
@@ -280,6 +292,31 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                     group=self.parallelization_group,
                     async_op=True,
                 )
+
+        # Error checks
+        if not set(unloaded_shards.keys()).issubset(all_loaded_tensors.keys()):
+            missing_shards = set(unloaded_shards.keys()) - all_loaded_tensors.keys()
+            raise CheckpointingException(
+                f'Missing shards after fully parallel loading: {missing_shards}'
+            )
+
+        return all_loaded_tensors
+
+    def fill_in_deferred_sharded_tensors(
+        self, sharded_state_dict: ShardedStateDict, loaded_tensors: Dict[ChunkId, torch.Tensor]
+    ) -> None:
+        def fill_in_sharded_tensor(x):
+            if isinstance(x, ShardedTensor):
+                try:
+                    x = loaded_tensors[_sharded_tensor_chunk_id(x)]
+                except KeyError as e:
+                    raise CheckpointingException(
+                        f'Missing loaded tensor shard: {_sharded_tensor_chunk_id(x)}'
+                    ) from e
+
+            return x
+
+        dict_list_map_inplace(fill_in_sharded_tensor, sharded_state_dict)
 
     @property
     def can_handle_sharded_objects(self):
@@ -361,6 +398,7 @@ def determine_main_replica_uniform_distribution(
 
     shard_to_ranks = defaultdict(list)
     shard_to_size = {}
+    shard_to_metadata = {}
     shards_saved_by_this_parallelization_group: Set[ChunkId] = set()
     for rank, rank_shards in enumerate(all_shards):
         for sh_ten in rank_shards:
@@ -368,6 +406,7 @@ def determine_main_replica_uniform_distribution(
             shard_to_ranks[shard_id].append(rank)
             if shard_id not in shard_to_size:
                 shard_to_size[shard_id] = _shard_size(sh_ten)
+                shard_to_metadata[shard_id] = sh_ten
             if is_main_replica(sh_ten.replica_id) or is_loading:
                 shards_saved_by_this_parallelization_group.add(shard_id)
 
@@ -379,7 +418,7 @@ def determine_main_replica_uniform_distribution(
         shard_to_ranks, shard_to_size, len(all_shards)
     )
 
-    return shard_to_saving_rank, shards_saved_by_this_parallelization_group
+    return shard_to_saving_rank, shards_saved_by_this_parallelization_group, shard_to_metadata
 
 
 def distribute_main_replicas_with_precomputed_distribution(
@@ -425,7 +464,7 @@ def distribute_main_replicas_with_precomputed_distribution(
         if isinstance(sh_base, ShardedTensor)
     )
 
-    shard_to_saving_rank, shards_saved_by_this_parallelization_group = precomputed_distribution
+    shard_to_saving_rank, shards_saved_by_this_parallelization_group, _ = precomputed_distribution
 
     rank_within_dp_group = torch.distributed.get_rank(parallelization_group)
     for sh_ten in local_shards:
