@@ -1,4 +1,3 @@
-from tools.deepspeed.ops.op_builder.quantizer import CUDAQuantizer, QuantizerBuilder
 import torch
 from torch.distributed import ProcessGroup, all_to_all_single
 import math
