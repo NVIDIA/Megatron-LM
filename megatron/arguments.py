@@ -171,9 +171,9 @@ def validate_args(args, defaults={}):
     # If we use quantizer for weights or gradients, we need to use distributed optimizer.
     if args.quantized_weights or args.quantized_gradients:
         assert args.use_distributed_optimizer is True, 'Quantization only support Distributed Optimizer'
-        if args.quantized_weights:
+        if args.quantized_weights and args.rank == 0:
             print(f'Weight Quantization: True, group size = {args.wq_group_size}, bits = {args.weight_quantization_bits}', flush=True)
-        if args.quantized_gradients:
+        if args.quantized_gradients and args.rank == 0:
             print(f'Gradient Quantization: True, gradient quantization intra-node group size = {args.gq_group_size_intra}, bits = {args.gradient_quantization_bits_intra}; inter-node group size = {args.gq_group_size_inter}, bits = {args.gradient_quantization_bits_inter}.',
                 flush=True)
         
