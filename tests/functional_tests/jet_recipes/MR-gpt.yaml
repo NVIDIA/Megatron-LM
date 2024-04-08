@@ -26,8 +26,8 @@ spec:
   precision: bf16
   time_limit: 1200
   artifacts: {/workspace/data/gpt3_data: text/the_pile/shard00}
-  ckpt_format: torch_dist
-  checkpoint_resume_test: 1
+  ckpt_format: torch
+  checkpoint_resume_test: 0
   script: |-
     ls
     cd /workspace/megatron-lm
