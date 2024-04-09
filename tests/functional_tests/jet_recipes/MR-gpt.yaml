@@ -6,7 +6,7 @@ spec:
   name: "{model}_{variant}_{scope}_{platforms}_{nodes}N{gpus}G_\
          {'mcore_' if use_mcore else ''}{'te_' if use_te else ''}\
          tp{tp_size}_pp{pp_size}{'_vp'+str(vp_size) if vp_size else ''}\
-         {'format_'+str(ckpt_format) if ckpt_format != 'torch' else ''}\
+         format_{ckpt_format}\
          {'_'+args_meta if args_meta else ''}"
   model: gpt3
   variant: 345m
