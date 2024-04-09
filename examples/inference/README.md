@@ -6,7 +6,8 @@ This guide will walk you through how you can use megatron core for inference on 
    1. Understanding The Code
    2. Running The Code
 2. A More Involved Example
-3. Customizing The Inference Pipeline
+3. Flow of Control In MCore Backend
+4. Customizing The Inference Pipeline
    1. Create Your Own Inference Backend 
    2. Create Your Own Text Generation Strategy
    3. Support Other Models
@@ -49,7 +50,8 @@ One of the important elements of the generate function is a backend. In this exa
 ```
 
 ***STEP 4 - Run the generate function and display results***
-We use default values for the [common inference params](../../megatron/core/inference/common_inference_params.py). Customize this if you want to change top_p, top_k, number of tokens to generate etc. Note that the result is returned as a dictionary only on rank 0. 
+We use default values for the [common inference params](../../megatron/core/inference/common_inference_params.py). Customize this if you want to change top_p, top_k, number of tokens to generate etc. 
+*Note that the result is returned as a dictionary only on rank 0.*
 ```python
     result = common_generate(
         inference_backend=inference_backend,
@@ -64,7 +66,9 @@ We use default values for the [common inference params](../../megatron/core/infe
 <br>
 
 ##### 1.2 Running The Code
-An example of running the file is shown below. Change TP,PP values, model spec , tokenizer etc according to your model . (NOTE: Most of these can be obtained from the script you used to train the model)
+An example of running the file is shown below. Change TP,PP values, model spec , tokenizer etc according to your model . 
+
+*NOTE: Most of these can be obtained from the script you used to train the model*
 ```
 
 TOKENIZER_ARGS=(
@@ -107,9 +111,25 @@ The example in [generate_mcore_samples_gpt.py](./gpt/generate_mcore_samples_gpt.
 * Customizing inference parameters using command line aruguments
 * Reading prompts in batches from a file and writing results to a file
 
+<br>  
+
+#### 3. Flow of Control In MCore Backend
+The following is what happens in the [generate_mcore_samples_gpt.py](./gpt/generate_mcore_samples_gpt.py) text generation part.
+* We call the [common_generate_function](../../megatron/core/inference/common_generate_function.py) with the megatron core backend and the list of input prompts and inference parameters
+* This in turn calls the [mcore_backend](../../megatron/core/inference/backends/mcore_backend.py) **generate()** function. 
+* This function uses the [simple_text_generation_strategy](../../megatron/core/inference/text_generation_strategies/simple_text_generation_strategy.py) to pad and tokenize input prompts 
+* The padded prompts are passed into the **generate_output_tokens()** of the text generation strategy . 
+* This function uses the [model_inference_wrappers](../../megatron/core/inference/inference_model_wrappers/abstract_model_inference_wrapper.py) **prep_model_for_inference()** , and then runs an auto regressive loop
+* In the auto regressive loop the inference wrappers **get_batch_for_context_window()** is called to get the required input, which is passed into the __call__ method, which takes care of calling the appropriate (PP, TP) model forward methods to get the output logits
+* The text generation strategy then samples from these logits and obtains the log probabilities based on the common inference parameters.
+* The input prompt tokens are updated with the results and then copied from last stage to first stage in case of PP models.  
+* The **update_generation_status** of the text generation strategy is called to check which of the prompts have completed generating , what the generation lengths are etc. 
+* The status of the prompts generations is broacasted so that in case of early stopping all ranks can break. 
+* Finally after the inference loop, the tokens are passed to the text generation strategies *detokenize_generations()* function to get the generated text . 
+
 <br>
 
-#### 3. Customizing The Inference Pipeline
+#### 4. Customizing The Inference Pipeline
 The following guide will walk you through how you can customize different parts of the inference pipeline. Broadly there are three levels at which you can customize the pipeline. 
 * **Inference backend** - Highest level of customization. (Currently we support MCore and TRTLLM backends). Change this if you completely want to add your own way of running inference.  
 * **Text generation strategy** - Extend this if you want to customize tokenization, text generation or detokenization
@@ -117,7 +137,7 @@ The following guide will walk you through how you can customize different parts 
 
 <br>
 
-##### 3.1. Create Your Own Inference Backend 
+##### 4.1. Create Your Own Inference Backend 
 This is the highest level of customization. The  [abstract_backend.py](./../../megatron/core/inference/backends/abstract_backend.py) file has a core generate method that you can extend to support your own backend. 
 
 ```python
@@ -134,7 +154,7 @@ Currently we support mcore backend. Soon we will suport TRT-LLM. The suggested f
 
 <br>
 
-##### 3.2. Create Your Own Text Generation Strategy
+##### 4.2. Create Your Own Text Generation Strategy
 In case you want to use the megatron core backend, but would like to overwrite the tokenization, text generation or detokenization extend the [simple_text_generation_strategy.py](../../megatron/core/inference/text_generation_strategies/simple_text_generation_strategy.py). The class has the following methods
 ``` python
 class SimpleTextGenerationStrategy:
@@ -193,7 +213,7 @@ class SimpleTextGenerationStrategy:
 
 <br>
 
-##### 3.3. Support Other Models
+##### 4.3. Support Other Models
 In order to support other models please extend the [abstract_model_inference_wrapper.py](./../../megatron/core/inference/inference_model_wrappers/abstract_model_inference_wrapper.py) file. The abstract wrapper already supports the following :
 * Forward method which automatically calls the appropriate forward method (PP or TP etc) depending on model parallel settings
 * Initalizes the model and puts it in eval mode
