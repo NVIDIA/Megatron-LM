@@ -36,7 +36,7 @@ from megatron.core.models.retro.utils import (
     get_config_path,
     get_gpt_data_dir,
 )
-from megatron.tokenizer.tokenizer import (
+from megatron.training.tokenizer.tokenizer import (
     _BertWordPieceTokenizer,
     _GPT2BPETokenizer,
     _GPTSentencePieceTokenizer,
