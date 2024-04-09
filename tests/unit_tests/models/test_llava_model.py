@@ -84,3 +84,15 @@ class TestLLaVAModel:
         torch.save(self.model.state_dict(), path)
 
         self.model.load_state_dict(torch.load(path))
+
+    def test_freeze(self):
+        self.model.freeze(
+            freeze_language_model=True, freeze_vision_model=True, freeze_vision_projection=False
+        )
+
+        for module in [self.model.language_model, self.model.vision_model]:
+            for param in module.parameters():
+                assert not param.requires_grad
+
+        for param in self.model.vision_projection.parameters():
+            assert param.requires_grad
