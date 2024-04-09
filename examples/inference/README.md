@@ -2,19 +2,19 @@
 This guide will walk you through how you can use megatron core for inference on your models. 
 
 ### Contents
-1. Quick start - Running Inference On GPT Models
-   1. Understanding The Code
-   2. Running The Code
-2. A More Involved Example
-3. Flow of Control In MCore Backend
-4. Customizing The Inference Pipeline
-   1. Create Your Own Inference Backend 
-   2. Create Your Own Text Generation Strategy
-   3. Support Other Models
+  - [1. Quick Start](#1-quick-start)
+    - [1.1 Understanding The Code](#11-understanding-the-code)
+    - [1.2 Running The Code](#12-running-the-code)
+  - [2. A More Involved Example](#2-a-more-involved-example)
+  - [3. Flow of Control In MCore Backend](#3-flow-of-control-in-mcore-backend)
+  - [4. Customizing The Inference Pipeline](#4-customizing-the-inference-pipeline)
+    - [4.1. Create Your Own Inference Backend](#41-create-your-own-inference-backend)
+    - [4.2. Create Your Own Text Generation Strategy](#42-create-your-own-text-generation-strategy)
+    - [4.3. Support Other Models](#43-support-other-models)
 
 <br>
 
-#### 1. QUICK START - Running Inference On GPT Models
+#### 1. Quick Start
 This will walk you through the flow of running inference on a GPT model trained using megatron core. The file can be found at [quick_start.py](./quick_start.py)
 
 <br>
