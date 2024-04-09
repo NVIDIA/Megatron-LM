@@ -68,7 +68,7 @@ def broadcast_data(keys, data, datatype):
     """Broadcast data from rank zero of each model parallel group to the
     members of the same model parallel group.
 
-    Arguments:
+    Args:
         keys: list of keys in the data disctionary to be broadcasted
         data: data dictionary of string keys and cpu tensor values.
         datatype: torch data type of all tensors in data associated

@@ -12,7 +12,7 @@ do
 done
 echo "---------------------------------"
 
-set -x
+set -exo pipefail
 if [[ -z $MBS ]]; then MBS=4; fi
 if [[ -z $GBS ]]; then GBS=32; fi
 if [[ -z $VOCAB_PATH ]]; then VOCAB_PATH="/workspace/data/t5_data/bert-large-cased-vocab.txt"; fi
@@ -50,6 +50,17 @@ if [[ $USE_TE -eq 1 ]]; then
        TRAINING_DTYPE=bf16
 else
        echo "Running with local transformer implementation ..."
+fi
+
+if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
+       echo "Running checkpoint resume test..."
+       __SAVE_INTERVAL=50
+       if [[ $MAX_STEPS -ne 100 ]]; then
+         echo "Overriding MAX_STEPS=100"
+         MAX_STEPS=100
+       fi
+else
+       __SAVE_INTERVAL=10000  # inf
 fi
 set +x
 
@@ -100,7 +111,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --log-timers-to-tensorboard \
     --timing-log-level 2 \
     --log-interval 1 \
-    --save-interval 5000 \
+    --save-interval $__SAVE_INTERVAL \
     --eval-interval 1000 \
     --eval-iters 10 \
     --distributed-backend nccl \
@@ -108,9 +119,30 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS}"
 
 command="$command $torch_run_cmd"
+if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
+  command="$command; rm -rf $CHECKPOINT_PATH/iter_0000100; echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt; $torch_run_cmd"
+fi
 echo "-------------------- THE FINAL PRETRAIN SCRIPT COMMAND THAT WILL BE RUN ------------"
 echo "$command"
 echo "-----------------------------------------------------------------------------"
 
 echo "$command" > $SCRIPTS_DIR/pretrain_t5_distributed_command.sh
 eval $command
+
+echo "Saving test results to $TENSORBOARD_DIR"
+python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $TENSORBOARD_DIR "$JOB_NAME" | \
+    tee ${TENSORBOARD_DIR}/results.json
+
+if [[ $SKIP_PYTEST != 1 ]]; then
+    echo "-----------------------------------------------------------------------------"
+    if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
+        echo "Running pytest 1st vs 2nd run comparison"
+        export LOGS_DIR=$TENSORBOARD_DIR
+        pytest ./tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py
+    else
+        echo "Running pytest checks against golden values"
+        export EXPECTED_METRICS_FILE="./tests/functional_tests/test_results/jet/${JOB_NAME}.json"
+        export LOGS_DIR=$TENSORBOARD_DIR
+        pytest ./tests/functional_tests/python_test_utils/test_ci_pipeline.py
+    fi
+fi

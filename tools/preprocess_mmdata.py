@@ -21,8 +21,8 @@ try:
 except ImportError:
     nltk_available = False
 
-from megatron.tokenizer import build_tokenizer
-from megatron.core.datasets.indexed_dataset import MMapIndexedDatasetBuilder
+from megatron.training.tokenizer import build_tokenizer
+from megatron.core.datasets.indexed_dataset import IndexedDatasetBuilder
 
 
 # https://stackoverflow.com/questions/33139531/preserve-empty-lines-with-nltks-punkt-tokenizer
@@ -141,7 +141,7 @@ def main():
     output_bin_files = "{}.bin".format(args.output_prefix)
     output_idx_files = "{}.idx".format(args.output_prefix)
 
-    builders = MMapIndexedDatasetBuilder(output_bin_files, dtype=np.int32, multimodal=True)
+    builders = IndexedDatasetBuilder(output_bin_files, dtype=np.int32, multimodal=True)
 
     startup_end = time.time()
     proc_start = time.time()

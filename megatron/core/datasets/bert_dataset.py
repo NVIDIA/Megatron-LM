@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Union
 
 import numpy
 
-from megatron.core.datasets.indexed_dataset import MMapIndexedDataset
+from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.masked_dataset import (
     MaskedWordPieceDataset,
     MaskedWordPieceDatasetConfig,
@@ -15,14 +15,10 @@ from megatron.core.datasets.utils import Split
 
 @dataclass
 class BERTMaskedWordPieceDatasetConfig(MaskedWordPieceDatasetConfig):
-    """Configuration object for Megatron Core BERT WordPiece datasets
-
-    Attributes:
-        classification_head (bool): Option to perform the next sequence prediction during
-        sampling
-    """
+    """Configuration object for Megatron Core BERT WordPiece datasets"""
 
     classification_head: bool = None
+    """Option to perform the next sequence prediction during sampling"""
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init
@@ -36,8 +32,7 @@ class BERTMaskedWordPieceDataset(MaskedWordPieceDataset):
     """The BERT dataset that assumes WordPiece tokenization
 
     Args:
-        indexed_dataset (MMapIndexedDataset): The MMapIndexedDataset around which to build the
-        MegatronDataset
+        indexed_dataset (IndexedDataset): The IndexedDataset around which to build the MegatronDataset
 
         dataset_path (str): The real path on disk to the dataset, for bookkeeping
 
@@ -52,7 +47,7 @@ class BERTMaskedWordPieceDataset(MaskedWordPieceDataset):
 
     def __init__(
         self,
-        indexed_dataset: MMapIndexedDataset,
+        indexed_dataset: IndexedDataset,
         dataset_path: str,
         indexed_indices: numpy.ndarray,
         num_samples: int,

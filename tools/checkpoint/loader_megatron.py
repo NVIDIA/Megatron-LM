@@ -7,6 +7,7 @@ import types
 
 import torch
 
+
 def add_arguments(parser):
     group = parser.add_argument_group(title='Megatron loader')
 
@@ -17,6 +18,14 @@ def add_arguments(parser):
                        'trim padding from the embedding table.')
     group.add_argument('--megatron-path', type=str, default=None,
                        help='Base directory of deepspeed repository')
+    group.add_argument('--position-embedding-type',
+                       type=str,
+                       default='learned_absolute',
+                       choices=['learned_absolute', 'rope'],
+                       help='Position embedding type.')
+    group.add_argument('--loader-transformer-impl', default='local',
+                       choices=['local', 'transformer_engine'],
+                       help='Which Transformer implementation to use.')
 
 def _load_checkpoint(queue, args):
 
@@ -28,13 +37,13 @@ def _load_checkpoint(queue, args):
         sys.path.insert(0, args.megatron_path)
 
     try:
-        from megatron.arguments import parse_args, validate_args
-        from megatron.global_vars import set_args, set_global_variables
-        from megatron.checkpointing import load_args_from_checkpoint, load_checkpoint
-        from megatron.model import module
+        from megatron.training.arguments import parse_args, validate_args
+        from megatron.training.global_vars import set_args, set_global_variables
+        from megatron.training.checkpointing import load_args_from_checkpoint, load_checkpoint
+        from megatron.legacy.model import module
         from megatron.core import mpu
         from megatron.core.enums import ModelType
-        from megatron import fused_kernels
+        from megatron.legacy import fused_kernels
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
         queue.put("exit")
@@ -53,17 +62,26 @@ def _load_checkpoint(queue, args):
                 '--no-save-optim',
                 '--no-save-rng',
                 '--no-initialization',
-                '--load', args.load_dir
+                '--load', args.load_dir,
+                '--position-embedding-type', args.position_embedding_type,
                 ]
 
     margs = parse_args()
-    margs, checkpoint_args = load_args_from_checkpoint(margs)
+    margs, checkpoint_args = load_args_from_checkpoint(margs, exit_on_missing_checkpoint=True)
 
     # Arguments do sanity checks on the world size, but we don't care,
     # so trick it into thinking we are plenty of processes
     margs.world_size = margs.tensor_model_parallel_size * margs.pipeline_model_parallel_size
 
+    # Explicitly copy data types from checkpoint.
+    margs.fp16 = checkpoint_args.fp16
+    margs.bf16 = checkpoint_args.bf16
+
+    # Validate margs.
     margs = validate_args(margs)
+
+    margs.use_mcore_models = False
+    margs.transformer_impl = args.loader_transformer_impl
 
     def check_for_arg(arg_name, default=None):
         if getattr(margs, arg_name, None) is None:
@@ -135,6 +153,7 @@ def _load_checkpoint(queue, args):
                 model_ = [model_provider(pre_process, post_process).to(dtype)]
             margs.consumed_train_samples = 0
             margs.consumed_valid_samples = 0
+            margs.exit_on_missing_checkpoint = True
             load_checkpoint(model_, None, None)
 
             if consumed_train_samples is not None:

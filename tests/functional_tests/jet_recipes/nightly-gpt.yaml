@@ -1,15 +1,19 @@
-type: recipe
+type: basic
 format_version: 1
 maintainers: [maanug]
 loggers: [stdout]
 spec:
+  name: "{model}_{variant}_{scope}_{platforms}_{nodes}N{gpus}G_\
+         {'mcore_' if use_mcore else ''}{'te_' if use_te else ''}\
+         tp{tp_size}_pp{pp_size}{'_vp'+str(vp_size) if vp_size else ''}\
+         {'_'+args_meta if args_meta else ''}"
   model: gpt3
   variant: 345m
   build: mcore-pyt 
   scope: nightly
   nodes: 1
   gpus: 8
-  platforms: [dgx_h100]
+  platforms: dgx_a100
   steps: 50
   use_te: False
   use_mcore: True
@@ -43,23 +47,17 @@ spec:
         MBS={micro_batch_size} \
         GBS={batch_size} \
         MOE_GROUPED_GEMM={moe_grouped_gemm} \
-        ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'} && \
-        python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py {assets_dir} "" | \
-        tee {assets_dir}/results.json
+        JOB_NAME={key.split("/")[1]} \
+        ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'}
 products:
   - {use_mcore: [True, False], tp_size: [4], pp_size: [1]}
   - {use_mcore: [True, False], tp_size: [1], pp_size: [2,4]}
   - {tp_size: [2], pp_size: [2], extra_args: ['"--num-experts 2 --sequence-parallel --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"'], args_meta: ["te_2experts"]}
   - {tp_size: [2], pp_size: [2], extra_args: ['"--sequence-parallel --num-experts 4 --expert-model-parallel-size 2 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"'], args_meta: ["te_4experts2parallel"]}
+  - {tp_size: [1], pp_size: [1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather"'], args_meta: ["dist_optimizer_overlap_grad_reduce_param_gather"]}
 # Non-MCore
   - {use_mcore: [False], tp_size: [1,4], pp_size: [1], extra_args: ["--overlap-grad-reduce"], args_meta: ["overlap_grad_reduce"]}
   - {use_mcore: [False], tp_size: [1], pp_size: [1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce"'], args_meta: ["dist_optimizer_overlap_grad_reduce"]}
-  - {use_mcore: [False], tp_size: [1], pp_size: [1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather"'], args_meta: ["dist_optimizer_overlap_grad_reduce_param_gather"]}
   - {use_mcore: [False], tp_size: [1], pp_size: [4], vp_size: [null, 1], extra_args: ["--overlap-grad-reduce"], args_meta: ["overlap_grad_reduce"]}
   - {use_mcore: [False], tp_size: [2], pp_size: [2], extra_args: ["--overlap-grad-reduce"], args_meta: ["overlap_grad_reduce"]}
   - {use_mcore: [False], tp_size: [2], pp_size: [2], extra_args: ['"--sequence-parallel --num-experts 4 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"'], args_meta: ["4experts"]}
-key_segments:
-  vp_size: vp
-  use_mcore: mcore
-  use_te: te
-  args_meta: args

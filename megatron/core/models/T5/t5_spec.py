@@ -16,6 +16,7 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
 )
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import (
@@ -39,6 +40,8 @@ def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
                     linear_qkv=TELayerNormColumnParallelLinear,
                     core_attention=TEDotProductAttention,
                     linear_proj=TERowParallelLinear,
+                    q_layernorm=IdentityOp,
+                    k_layernorm=IdentityOp,
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
@@ -66,6 +69,8 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
                     linear_qkv=TELayerNormColumnParallelLinear,
                     core_attention=TEDotProductAttention,
                     linear_proj=TERowParallelLinear,
+                    q_layernorm=IdentityOp,
+                    k_layernorm=IdentityOp,
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
@@ -105,6 +110,8 @@ def encoder_model_with_local_spec() -> ModuleSpec:
                     linear_qkv=ColumnParallelLinear,
                     core_attention=DotProductAttention,
                     linear_proj=RowParallelLinear,
+                    q_layernorm=IdentityOp,
+                    k_layernorm=IdentityOp,
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
@@ -138,6 +145,8 @@ def decoder_model_with_local_spec() -> ModuleSpec:
                     linear_qkv=ColumnParallelLinear,
                     core_attention=DotProductAttention,
                     linear_proj=RowParallelLinear,
+                    q_layernorm=IdentityOp,
+                    k_layernorm=IdentityOp,
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,

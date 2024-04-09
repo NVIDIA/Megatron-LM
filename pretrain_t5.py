@@ -6,7 +6,7 @@ from functools import partial
 
 import torch
 
-from megatron import (
+from megatron.training import (
     get_args,
     get_timers,
     get_tokenizer,
@@ -16,15 +16,15 @@ from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.T5 import T5Model
 from megatron.training import pretrain
-from megatron.utils import average_losses_across_data_parallel_group
-from megatron.arguments import core_transformer_config_from_args
+from megatron.training.utils import average_losses_across_data_parallel_group
+from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.t5_dataset import T5MaskedWordPieceDataset, T5MaskedWordPieceDatasetConfig
 from megatron.core.models.T5.t5_spec import (get_t5_encoder_with_transformer_engine_block_spec,
                                             get_t5_decoder_with_transformer_engine_block_spec,
                                             get_t5_encoder_with_local_block_spec,
                                             get_t5_decoder_with_local_block_spec)
-from megatron.model import T5Model as NonCoreT5Model
+from megatron.legacy.model import T5Model as NonCoreT5Model
 
 """
 Pipeline parallelism for T5
@@ -194,7 +194,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples: int):
     tokenizer = get_tokenizer()
 
     config = T5MaskedWordPieceDatasetConfig(
-        is_built_on_rank=lambda: mpu.get_tensor_model_parallel_rank() == 0,
         random_seed=args.seed,
         sequence_length=args.encoder_seq_length,
         sequence_length_decoder=args.decoder_seq_length,
@@ -223,6 +222,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples: int):
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         T5MaskedWordPieceDataset,
         train_val_test_num_samples,
+        lambda: mpu.get_tensor_model_parallel_rank() == 0,
         config,
     ).build()
 

@@ -5,29 +5,33 @@ import os
 import torch
 from functools import partial
 from typing import Union
-from megatron import get_args
-from megatron import print_rank_0
-from megatron import get_timers
-from megatron import get_tokenizer
+from megatron.training import get_args
+from megatron.training import print_rank_0
+from megatron.training import get_timers
+from megatron.training import get_tokenizer
 from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
-import megatron.model
+import megatron.legacy.model
 from megatron.core.models.gpt import GPTModel
 from megatron.training import pretrain
 from megatron.core.transformer.spec_utils import import_module
-from megatron.utils import (
+from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     average_losses_across_data_parallel_group
 )
-from megatron.arguments import core_transformer_config_from_args
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.yaml_arguments import core_transformer_config_from_yaml
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
 
 
-def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.model.GPTModel]:
+def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
     """Builds the model.
 
     If you set the use_mcore_models to True, it will return the mcore GPT model and if not the legacy GPT model.
@@ -38,18 +42,26 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
 
 
     Returns:
-        Union[GPTModel, megatron.model.GPTModel]: The returned model
+        Union[GPTModel, megatron.legacy.model.GPTModel]: The returned model
     """
     args = get_args()
+    use_te = args.transformer_impl == "transformer_engine"
 
     print_rank_0('building GPT model ...')
-    config = core_transformer_config_from_args(get_args())
+    # Experimental loading arguments from yaml
+    if args.yaml_cfg is not None:
+        config = core_transformer_config_from_yaml(args, "language_model")
+    else:
+        config = core_transformer_config_from_args(args)
 
     if args.use_mcore_models:
         if args.spec is not None:
             transformer_layer_spec = import_module(args.spec)
         else:
-            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm)
+            if use_te:
+                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm)
+            else:
+                transformer_layer_spec = get_gpt_layer_local_spec(args.num_experts, args.moe_grouped_gemm)
 
         model = GPTModel(
             config=config,
@@ -67,7 +79,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
     else:
         assert(args.context_parallel_size == 1), "Context parallelism is only supported with Megatron Core!"
 
-        model = megatron.model.GPTModel(
+        model = megatron.legacy.model.GPTModel(
             config,
             num_tokentypes=0,
             parallel_output=True,
@@ -86,7 +98,7 @@ def get_batch(data_iterator):
         return None, None, None, None, None
 
     # get batches based on the TP rank you are on
-    batch = get_batch_on_this_tp_rank(data_iterator) 
+    batch = get_batch_on_this_tp_rank(data_iterator)
 
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
@@ -99,7 +111,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     Args:
         loss_mask (torch.Tensor): Used to mask out some portions of the loss
         output_tensor (torch.Tensor): The tensor with the losses
-    """    
+    """
     args = get_args()
 
     losses = output_tensor.float()
@@ -155,7 +167,6 @@ def core_gpt_dataset_config_from_args(args):
     tokenizer = get_tokenizer()
 
     return GPTDatasetConfig(
-        is_built_on_rank=is_dataset_built_on_rank,
         random_seed=args.seed,
         sequence_length=args.seq_length,
         blend=args.data_path,
@@ -163,11 +174,12 @@ def core_gpt_dataset_config_from_args(args):
         split=args.split,
         path_to_cache=args.data_cache_path,
         mock=args.mock_data,
+        mmap_bin_files=args.mmap_bin_files,
         tokenizer=tokenizer,
         reset_position_ids=args.reset_position_ids,
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
-        vocab_size=get_tokenizer().vocab_size,
+        create_attention_mask=args.create_attention_mask_in_dataloader,
     )
 
 
@@ -191,6 +203,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         dataset_type,
         train_val_test_num_samples,
+        is_dataset_built_on_rank,
         config
     ).build()
 

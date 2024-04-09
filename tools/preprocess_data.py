@@ -20,7 +20,7 @@ try:
 except ImportError:
     nltk_available = False
 
-from megatron.tokenizer import build_tokenizer
+from megatron.training.tokenizer import build_tokenizer
 from megatron.core.datasets import indexed_dataset
 
 
@@ -165,7 +165,7 @@ class Partition(object):
                                                           key, level)
             output_idx_files[key] = "{}_{}_{}.idx".format(output_prefix,
                                                           key, level)
-            builders[key] = indexed_dataset.MMapIndexedDatasetBuilder(
+            builders[key] = indexed_dataset.IndexedDatasetBuilder(
                 output_bin_files[key],
                 dtype=indexed_dataset.DType.optimal_dtype(tokenizer.vocab_size),
             )
@@ -390,7 +390,7 @@ def main():
                                                       key, level)
         output_idx_files[key] = "{}_{}_{}.idx".format(args.output_prefix,
                                                       key, level)
-        builders[key] = indexed_dataset.MMapIndexedDatasetBuilder(
+        builders[key] = indexed_dataset.IndexedDatasetBuilder(
             output_bin_files[key],
             dtype=indexed_dataset.DType.optimal_dtype(tokenizer.vocab_size),
         )

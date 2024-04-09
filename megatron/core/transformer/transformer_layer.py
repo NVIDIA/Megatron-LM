@@ -1,7 +1,8 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+from abc import ABC
 from dataclasses import dataclass, field
-from typing import Dict, Union
+from typing import Dict, Optional, Union
 
 import torch
 
@@ -34,7 +35,23 @@ class TransformerLayerSubmodules:
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
 
 
-class TransformerLayer(MegatronModule):
+class BaseTransformerLayer(ABC):
+    """ A common parent class for `TransformerLayer` like implementations.
+
+    A dummy class that is subclassed by similar `TransformerLayer`s e.g. the
+    `TransformerLayer` in this file and possibly other `TransformerLayer`
+    implementations that aim to use `TransformerBlock` as the base module.
+    The main purpose is to check if any layer (or module) provided in the spec
+    is a subclass of this class to allow fanning-out of that spec for all the
+    layers in the `TransformerBlock`. See `_get_block_submodules` method
+    implementation in `transformer_block.py` file for more details.
+    """
+
+    def __init__(self):
+        pass
+
+
+class TransformerLayer(MegatronModule, BaseTransformerLayer):
     """A single transformer layer.
 
     Transformer layer takes input with size [s, b, h] and returns an
@@ -99,6 +116,8 @@ class TransformerLayer(MegatronModule):
         # TODO how to set the gpt_layer_spec.py when we have moe_frequency > 1,
         #      where MLP and MoE layer both appear alternately?
         self.mlp = build_module(submodules.mlp, config=self.config)
+        if hasattr(self.mlp, 'set_layer_number'):
+            self.mlp.set_layer_number(self.layer_number)
 
         ## [Module 9: BiasDropoutFusion]
         self.mlp_bda = build_module(submodules.mlp_bda)
@@ -223,8 +242,10 @@ class TransformerLayer(MegatronModule):
 
         return output, context
 
-    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()) -> ShardedStateDict:
-        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets)
+    def sharded_state_dict(
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
+    ) -> ShardedStateDict:
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
         prefixed_map = {
             f'{prefix}{k}': f'{prefix}{v}'
             for k, v in self.submodules_config.sharded_state_dict_keys_map.items()

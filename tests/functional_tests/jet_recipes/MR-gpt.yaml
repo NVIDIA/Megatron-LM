@@ -1,15 +1,19 @@
-type: recipe
+type: basic
 format_version: 1
 maintainers: [maanug]
 loggers: [stdout]
 spec:
+  name: "{model}_{variant}_{scope}_{platforms}_{nodes}N{gpus}G_\
+         {'mcore_' if use_mcore else ''}{'te_' if use_te else ''}\
+         tp{tp_size}_pp{pp_size}{'_vp'+str(vp_size) if vp_size else ''}\
+         {'_'+args_meta if args_meta else ''}"
   model: gpt3
   variant: 345m
   build: mcore-pyt 
   scope: merge-request
   nodes: 1
   gpus: 8
-  platforms: [dgx_h100]
+  platforms: dgx_a100
   steps: 50
   use_te: False
   use_mcore: True
@@ -22,6 +26,8 @@ spec:
   precision: bf16
   time_limit: 1200
   artifacts: {/workspace/data/gpt3_data: text/the_pile/shard00}
+  ckpt_format: torch
+  checkpoint_resume_test: 0
   script: |-
     ls
     cd /workspace/megatron-lm
@@ -43,13 +49,17 @@ spec:
         MBS={micro_batch_size} \
         GBS={batch_size} \
         MOE_GROUPED_GEMM={moe_grouped_gemm} \
-        ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'} && \
-        python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py {assets_dir} "" | \
-        tee {assets_dir}/results.json
+        CKPT_FORMAT={ckpt_format} \
+        CHECKPOINT_RESUME_TEST={checkpoint_resume_test} \
+        JOB_NAME={key.split("/")[1]} \
+        ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'}
 products:
   # MCore
   - {tp_size: [2], pp_size: [2]}
+  - {tp_size: [2], pp_size: [2], extra_args: ["--no-create-attention-mask-in-dataloader"], args_meta: ["no_create_attention_mask_in_dataloader"]}
+  - {tp_size: [2], pp_size: [2], extra_args: ["--no-mmap-bin-files"], args_meta: ["no_mmap_bin_files"]}
   - {tp_size: [1], pp_size: [4], vp_size: [1]}
+  - {tp_size: [4], pp_size: [1], extra_args: ["--qk-layernorm --test-mode"]}
   - {tp_size: [1], pp_size: [2], extra_args: ['"--position-embedding-type rope"'], args_meta: ["rope_embeddings"]}
   - {tp_size: [1], pp_size: [2], extra_args: ['"--position-embedding-type rope --rotary-interleaved --no-rope-fusion"'], args_meta: ["rope_embeddings_interleaved_no_fusion"]}
   - {tp_size: [1], pp_size: [4], extra_args: ["--swiglu"], args_meta: ["swiglu"]}
@@ -59,74 +69,22 @@ products:
   - {tp_size: [1], pp_size: [1], extra_args: ['"--recompute-granularity full --recompute-method uniform --recompute-num-layers 1"'], args_meta: ["uniform_full_recompute"]}
     # - {tp_size: [2], pp_size: [1,2], extra_args: ['"--context-parallel-size 2 --sequence-parallel --hidden-dropout 0.0 --attention-dropout 0.0"']}  # TODO: need updated container with TE > 1.0.0
   - {tp_size: [2], pp_size: [1], extra_args: ['"--sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"'], args_meta: ["te_8experts2parallel"]}
+  - {tp_size: [2], pp_size: [1], extra_args: ['"--sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --use-distributed-optimizer --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"'], args_meta: ["te_8experts2parallel_dist_optimizer"]}
+  - {tp_size: [2], pp_size: [1], extra_args: ['"--moe-grouped-gemm --disable-bias-linear --sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --use-distributed-optimizer --moe-router-load-balancing-type sinkhorn --moe-router-topk 1 --overlap-grad-reduce"'], moe_grouped_gemm: [1], args_meta: ["te_8experts2parallel_overlap_grad_reduce_groupedGEMM"]}
   - {tp_size: [2], pp_size: [1], extra_args: ['"--moe-grouped-gemm --disable-bias-linear --sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"'], moe_grouped_gemm: [1], args_meta: ["te_8experts2parallel_groupedGEMM"]}
   - {tp_size: [2], pp_size: [1], extra_args: ['"--disable-bias-linear --sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --moe-router-load-balancing-type aux_loss --moe-router-topk 2 --moe-aux-loss-coeff 1e-2"'], moe_grouped_gemm: [1], args_meta: ["te_8experts2parallel_top2router"]}
+  - {tp_size: [1], pp_size: [1], extra_args: ["--use-distributed-optimizer"], args_meta: ["dist_optimizer"]}
+  - {tp_size: [1], pp_size: [1], extra_args: ['"--use-distributed-optimizer --no-mmap-bin-files"'], args_meta: ["dist_optimizer_no_mmap_bin_files"]}
+  - {tp_size: [4], pp_size: [1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce"'], args_meta: ["dist_optimizer_overlap_grad_reduce"]}
+  - {tp_size: [4], pp_size: [1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather"'], args_meta: ["dist_optimizer_overlap_grad_reduce_param_gather"]}
+  - {tp_size: [1], pp_size: [4], vp_size: [1], extra_args: ['"--decoupled-lr 0.0002"'], args_meta: ["decoupled_lr"]}
+  - {tp_size: [1], pp_size: [4], vp_size: [1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce"'], args_meta: ["dist_optimizer_overlap_grad_reduce"]}
+  - {tp_size: [1], pp_size: [4], vp_size: [1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --untie-embeddings-and-output-weights"'], args_meta: ["dist_optimizer_overlap_grad_reduce_untied"]}
+  - {tp_size: [1], pp_size: [4], vp_size: [1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather"'], args_meta: ["dist_optimizer_overlap_grad_reduce_param_gather"]}
   # Non-MCore
   - {use_mcore: [False], use_te: [False, True], tp_size: [2], pp_size: [2]}
   - {use_mcore: [False], tp_size: [1], pp_size: [4], vp_size: [1]}
-  - {use_mcore: [False], tp_size: [1], pp_size: [1], extra_args: ["--use-distributed-optimizer"], args_meta: ["dist_optimizer"]}
-  - {use_mcore: [False], tp_size: [4], pp_size: [1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce"'], args_meta: ["dist_optimizer_overlap_grad_reduce"]}
-  - {use_mcore: [False], tp_size: [4], pp_size: [1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather"'], args_meta: ["dist_optimizer_overlap_grad_reduce_param_gather"]}
-  - {use_mcore: [False], tp_size: [1], pp_size: [4], vp_size: [1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce"'], args_meta: ["dist_optimizer_overlap_grad_reduce"]}
-  - {use_mcore: [False], tp_size: [1], pp_size: [4], vp_size: [1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather"'], args_meta: ["dist_optimizer_overlap_grad_reduce_param_gather"]}
-key_segments:
-  vp_size: vp
-  use_mcore: mcore
-  use_te: te
-  args_meta: args
-
-
----
-### Resume from ckpt ###
-type: recipe
-format_version: 1
-maintainers: [maanug]
-loggers: [stdout]
-spec:
-  model: gpt3
-  variant: 345m
-  build: mcore-pyt
-  scope: merge-request-resume
-  nodes: 1
-  gpus: 8
-  platforms: [dgx_h100]
-  steps: 100
-  use_te: False
-  use_mcore: True
-  vp_size: null
-  extra_args: null
-  args_meta: null
-  micro_batch_size: 4 # MBS
-  batch_size: 32 # GBS, JET schema requires 'batch_size'
-  precision: 16
-  time_limit: 1200
-  artifacts: {/workspace/data/gpt3_data: text/the_pile/shard00}
-  script: |-
-    ls
-    cd /workspace/megatron-lm
-
-    ./tests/functional_tests/test_scripts/gpt3/pretrain_gpt3_distributed_resume_checkpoint_test.sh \
-        DATA_PATH=/workspace/data/gpt3_data/my-gpt3_00_text_document \
-        CHECKPOINT_PATH=/workspace/checkpoints \
-        TENSORBOARD_DIR={assets_dir} \
-        VOCAB_FILE=/workspace/data/gpt3_data/bpe/vocab.json \
-        MERGE_FILE=/workspace/data/gpt3_data/bpe/merges.txt \
-        DATA_CACHE=/workspace/data/index-cache \
-        USE_TE={"1" if use_te else "0"} \
-        TP_SIZE={tp_size} \
-        PP_SIZE={pp_size} \
-        NUM_NODES={nodes} \
-        USE_CORE={"1" if use_mcore else "0"} \
-        VP_SIZE={vp_size if vp_size is not None else '""'} \
-        MBS={micro_batch_size} \
-        GBS={batch_size} \
-        ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'} && \
-        python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py {assets_dir} "" | \
-        tee {assets_dir}/results.json
-products:
-  - {use_mcore: [False], tp_size: [1], pp_size: [2]}
-key_segments:
-  vp_size: vp
-  use_mcore: mcore
-  use_te: te
-  args_meta: args
+  # Checkpoint resume
+  - {checkpoint_resume_test: [1], scope: [merge-request-resume], steps: [100], use_mcore: [False], tp_size: [1], pp_size: [2]}
+  - {checkpoint_resume_test: [1], scope: [merge-request-resume], steps: [100], use_mcore: [True], tp_size: [1], pp_size: [2], extra_args: ['"--moe-grouped-gemm --disable-bias-linear --sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --use-distributed-optimizer --moe-router-load-balancing-type sinkhorn --moe-router-topk 2"'], args_meta: ["te_8experts2parallel_dist_optimizer_groupedGEMM"]}
+  - {checkpoint_resume_test: [1], scope: [merge-request-resume], steps: [100], use_mcore: [True], tp_size: [1], pp_size: [2], extra_args: ['"--sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --moe-router-load-balancing-type sinkhorn --moe-router-topk 2"'], args_meta: ["te_8experts2parallel"]}

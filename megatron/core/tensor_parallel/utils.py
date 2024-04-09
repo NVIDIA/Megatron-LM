@@ -13,7 +13,7 @@ def split_tensor_along_last_dim(
 ) -> List[torch.Tensor]:
     """ Split a tensor along its last dimension.
 
-        Arguments:
+        Args:
             tensor: input tensor.
             num_partitions: number of partitions to split the tensor
             contiguous_split_chunks: If True, make each chunk contiguous
@@ -39,10 +39,10 @@ def split_tensor_into_1d_equal_chunks(tensor, new_buffer=False):
 
         Returns a Tensor or View with this rank's portion of the data.
 
-        Arguments:
+        Args:
             tensor: The tensor to split
 
-        Keyword Arguments:
+        Keyword Args:
             new_buffer (bool): If True, returns a new Tensor.
                                If False, returns a view into the existing Tensor.
                                Default is False
@@ -70,7 +70,7 @@ def gather_split_1d_tensor(tensor):
 
         Returns a new Tensor with the gathered data.
 
-        Arguments:
+        Args:
             tensor: A Tensor or view of this rank's portion of the data.
     """
     numel_gathered = torch.numel(tensor) * parallel_state.get_tensor_model_parallel_world_size()

@@ -2,6 +2,8 @@
 This guide will walk you through how you can use megatron core for inference on your models. 
 
 ### Contents
+- [Megatron Core Inference Documentation](#megatron-core-inference-documentation)
+- [Contents](#contents)
   - [1. Quick Start](#1-quick-start)
     - [1.1 Understanding The Code](#11-understanding-the-code)
     - [1.2 Running The Code](#12-running-the-code)

@@ -1,11 +1,7 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-import argparse
-from collections.abc import Mapping
-import concurrent.futures
 import os
 import sys
-
 import torch
 
 
@@ -21,6 +17,9 @@ def add_arguments(parser):
     group.add_argument('--target-pipeline-parallel-size', type=int,
                        help='Target tensor model parallel size, default to the pipeline parall size '
                        'in the input checkpoint if provided by the loader, otherwise to 1')
+    group.add_argument('--saver-transformer-impl', default='local',
+                       choices=['local', 'transformer_engine'],
+                       help='Which Transformer implementation to use.')
 
 def save_checkpoint(queue, args):
 
@@ -33,12 +32,12 @@ def save_checkpoint(queue, args):
         sys.path.insert(0, args.megatron_path)
 
     try:
-        from megatron.arguments import (parse_args, validate_args)
-        from megatron.checkpointing import save_checkpoint
-        from megatron.global_vars import set_global_variables, get_args
+        from megatron.training.arguments import (parse_args, validate_args)
+        from megatron.training.checkpointing import save_checkpoint
+        from megatron.training.global_vars import set_global_variables, get_args
         from megatron.core.enums import ModelType
-        from megatron.tokenizer.tokenizer import _vocab_size_with_padding
-        from megatron import fused_kernels
+        from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
+        from megatron.legacy import fused_kernels
         from megatron.core import mpu
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
@@ -166,6 +165,13 @@ def save_checkpoint(queue, args):
                 setattr(margs, arg, value)
 
     validate_args(margs)
+
+    # Use MLM models.
+    margs.use_mcore_models = False
+    margs.transformer_impl = args.saver_transformer_impl
+
+    # Do not instantiate Tensorboard
+    margs.tensorboard_dir = None
 
     set_global_variables(margs, build_tokenizer=False)
 

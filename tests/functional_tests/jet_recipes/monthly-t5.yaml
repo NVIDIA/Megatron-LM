@@ -1,15 +1,19 @@
-type: recipe
+type: basic
 format_version: 1
 maintainers: [maanug]
 loggers: [stdout]
 spec:
+  name: "{model}_{variant}_{scope}_{platforms}_{nodes}N{gpus}G_\
+         {'mcore_' if use_mcore else ''}{'te_' if use_te else ''}\
+         tp{tp_size}_pp{pp_size}{'_vp'+str(vp_size) if vp_size else ''}\
+         {'_'+args_meta if args_meta else ''}"
   model: t5
   variant: 220m
   build: mcore-pyt 
   scope: monthly
   nodes: 1
   gpus: 8
-  platforms: [dgx_h100]
+  platforms: dgx_a100
   steps: 100
   use_te: False
   use_mcore: True
@@ -21,6 +25,7 @@ spec:
   precision: bf16
   time_limit: 1800
   artifacts: {/workspace/data/t5_data: text/the_pile/t5_shard00}
+  checkpoint_resume_test: 0
   script: |-
     ls
     cd /workspace/megatron-lm
@@ -39,70 +44,12 @@ spec:
         VP_SIZE={vp_size if vp_size is not None else '""'} \
         MBS={micro_batch_size} \
         GBS={batch_size} \
-        ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'} && \
-        python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py {assets_dir} "" | \
-        tee {assets_dir}/results.json
+        CHECKPOINT_RESUME_TEST={checkpoint_resume_test} \
+        JOB_NAME={key.split("/")[1]} \
+        ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'}
 products:
   - { tp_size: [1,2], pp_size: [1], vp_size: [1] }
   - {use_te: [True], tp_size: [2], pp_size: [1], vp_size: [1]}
   - {use_te: [True], tp_size: [2], pp_size: [1], vp_size: [1], extra_args: ["--sequence-parallel"], args_meta: ["sequence_parallel"]}
-key_segments:
-  vp_size: vp
-  use_mcore: mcore
-  use_te: te
-  args_meta: args
-
-
----
-### Resume from ckpt ###
-type: recipe
-format_version: 1
-maintainers: [maanug]
-loggers: [stdout]
-spec:
-  model: t5
-  variant: 220m
-  build: mcore-pyt 
-  scope: monthly-resume
-  nodes: 1
-  gpus: 8
-  platforms: [dgx_h100]
-  steps: 100
-  use_te: False
-  use_mcore: True
-  vp_size: 1
-  extra_args: null
-  args_meta: null
-  micro_batch_size: 4 # MBS
-  batch_size: 32 # GBS, JET schema requires 'batch_size'
-  precision: bf16
-  time_limit: 1800
-  artifacts: {/workspace/data/t5_data: text/the_pile/t5_shard00}
-  script: |-
-    ls
-    cd /workspace/megatron-lm
-
-    ./tests/functional_tests/test_scripts/t5/pretrain_t5_distributed_resume_checkpoint_test.sh \
-        DATA_PATH="/workspace/data/t5_data/my-t5_00_text_document" \
-        CHECKPOINT_PATH=/workspace/checkpoints \
-        TENSORBOARD_DIR={assets_dir} \
-        VOCAB_PATH="/workspace/data/t5_data/bert-large-cased-vocab.txt" \
-        DATA_CACHE=/workspace/data/index-cache \
-        USE_TE={"1" if use_te else "0"} \
-        TP_SIZE={tp_size} \
-        PP_SIZE={pp_size} \
-        NUM_NODES={nodes} \
-        USE_CORE={"1" if use_mcore else "0"} \
-        VP_SIZE={vp_size if vp_size is not None else '""'} \
-        MBS={micro_batch_size} \
-        GBS={batch_size} \
-        ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'} && \
-        python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py {assets_dir} "" | \
-        tee {assets_dir}/results.json
-products:
-  - {use_te: [False, True], tp_size: [1], pp_size: [1], vp_size: [1]}
-key_segments:
-  vp_size: vp
-  use_mcore: mcore
-  use_te: te
-  args_meta: args
+  # Checkpoint resume
+  - {checkpoint_resume_test: [1], scope: [monthly-resume], use_te: [False, True], tp_size: [1], pp_size: [1], vp_size: [1]}

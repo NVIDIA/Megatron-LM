@@ -12,10 +12,11 @@ do
 done
 echo "---------------------------------"
 
-set -x
+set -exo pipefail
 if [[ -z $MBS ]]; then MBS=4; fi
 if [[ -z $GBS ]]; then GBS=32; fi
 if [[ -z $MOE_GROUPED_GEMM ]]; then MOE_GROUPED_GEMM=0; fi
+if [[ -z $ALLOW_NONDETERMINISTIC ]]; then ALLOW_NONDETERMINISTIC=0; fi
 if [[ -z $VOCAB_FILE ]]; then VOCAB_FILE="/workspace/data/gpt3_data/vocab.json" ; fi
 if [[ -z $MERGE_FILE ]]; then MERGE_FILE="/workspace/data/gpt3_data/merges.txt" ; fi
 
@@ -33,15 +34,20 @@ TRAINING_DTYPE=fp16
 
 if [[ $USE_CORE -eq 1 ]]; then
        echo "Running using megatron core"
-       TRANSFORMER_IMPL=local
+       TRANSFORMER_IMPL=transformer_engine
        TRAINING_DTYPE=bf16
-       command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0;"
+       command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=$ALLOW_NONDETERMINISTIC;"
        USE_MCORE=1
+fi
+
+if [[ $USE_FP8 -eq 1 ]]; then
+       echo "Running FP8 Training using Transformer Engine ..."
+       ADDITIONAL_PARAMS+=" --fp8-format hybrid --fp8-amax-history-len 1024 --fp8-amax-compute-algo max"
+       USE_TE=1
 fi
 
 if [[ $MOE_GROUPED_GEMM -eq 1 ]]; then
        echo "Running MoE with Grouped GEMM"
-       command="$command pip install git+https://github.com/fanshiqing/grouped_gemm@main;"
        TRAINING_DTYPE=bf16  # Currently GroupedGEMM for MoE only supports bf16 dtype
 fi
 
@@ -53,11 +59,29 @@ if [[ $USE_TE -eq 1 ]]; then
 else
        echo "Running with local transformer implementation ..."
 fi
+if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
+       echo "Running checkpoint resume test..."
+       __SAVE_INTERVAL=50
+       ADDITIONAL_PARAMS+=" --use-checkpoint-opt_param-scheduler"
+       if [[ $MAX_STEPS -ne 100 ]]; then
+         echo "Overriding MAX_STEPS=100"
+         MAX_STEPS=100
+       fi
+else
+       __SAVE_INTERVAL=${SAVE_INTERVAL:-10000}  # inf
+fi
+if [[ -n "$CKPT_FORMAT" ]] && [[ "$CKPT_FORMAT" != 'torch' ]]; then
+       echo "Using distributed checkpoint format $CKPT_FORMAT..."
+       [[ "$CKPT_FORMAT" == 'zarr' ]] && command="$command pip install zarr tensorstore==0.1.45;"
+       ADDITIONAL_PARAMS+=" --use-dist-ckpt --dist-ckpt-format $CKPT_FORMAT"
+fi
 set +x
 # Runs the "345M" parameter model
-DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 
-torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
+build_torch_run_cmd() {
+  DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
+  [[ -n "$RUN_CMD" ]] && run_cmd=$RUN_CMD || run_cmd="torchrun $DISTRIBUTED_ARGS"
+  torch_run_cmd="$run_cmd \
        pretrain_gpt.py \
        --num-layers 12 \
        --hidden-size 512 \
@@ -88,7 +112,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        --clip-grad 1.0 \
        --lr-warmup-fraction .01 \
        --log-interval 1 \
-       --save-interval 10000 \
+       --save-interval $__SAVE_INTERVAL \
        --eval-interval 1000 \
        --eval-iters 10 \
        --transformer-impl $TRANSFORMER_IMPL \
@@ -103,14 +127,67 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        ${DATA_CACHE:+--data-cache-path "$DATA_CACHE"} \
        --${TRAINING_DTYPE}"
 
-if [[ "${TRAINING_DTYPE}" == "fp16" ]]; then
-    torch_run_cmd+=" --apply-query-key-layer-scaling"
-fi
+  if [[ "${TRAINING_DTYPE}" == "fp16" ]]; then
+      torch_run_cmd+=" --apply-query-key-layer-scaling"
+  fi
+}
 
+build_torch_run_cmd
 command="$command $torch_run_cmd"
+if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
+  echo "------RESUME OVERRIDES ARGS LIST --------"
+  # apply all env vars starting from 'RESUME_OVERRIDE_' (after removing prefix)
+  _OVERRIDE_PREFIX="RESUME_OVERRIDE_"
+  _OVERRIDE_PREFIX_LENGTH=${#_OVERRIDE_PREFIX}
+  _NONEMPTY_OVERRIDES=0
+  for ARGUMENT in "$@"
+  do
+    KEY=$(echo $ARGUMENT | cut -f1 -d=)
+    if [[ $KEY == ${_OVERRIDE_PREFIX}* ]]; then
+      KEY_LENGTH=${#KEY}
+      VALUE="${ARGUMENT:$KEY_LENGTH+1}"
+      KEY="${KEY:$_OVERRIDE_PREFIX_LENGTH}"
+      if [[ -n "${VALUE}" ]]; then
+        export "$KEY"="$VALUE"
+        echo "$KEY=$VALUE"
+        _NONEMPTY_OVERRIDES=1
+      fi
+    fi
+  done
+  echo "---------------------------------"
+  if [[ $_NONEMPTY_OVERRIDES == 1 ]]; then
+    ADDITIONAL_PARAMS+=" --no-load-rng"  # assuming TPxPP mismatch
+  fi
+
+  build_torch_run_cmd
+  command="$command; rm -rf $CHECKPOINT_PATH/iter_0000100; echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt; $torch_run_cmd"
+fi
 echo "-------------------- THE FINAL PRETRAIN SCRIPT COMMAND THAT WILL BE RUN ------------"
 echo "$command"
 echo "-----------------------------------------------------------------------------"
 
 echo "$command" > $SCRIPTS_DIR/pretrain_gpt3_distributed_command.sh
 eval $command
+
+echo "Saving test results to $TENSORBOARD_DIR"
+python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $TENSORBOARD_DIR "$JOB_NAME" | \
+    tee ${TENSORBOARD_DIR}/results.json
+
+if [[ $SKIP_PYTEST != 1 ]]; then
+    echo "-----------------------------------------------------------------------------"
+    if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
+        echo "Running pytest 1st vs 2nd run comparison"
+        export LOGS_DIR=$TENSORBOARD_DIR
+        pytest ./tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py
+    else
+        echo "Running pytest checks against golden values"
+        export LOGS_DIR=$TENSORBOARD_DIR
+        if [[ $USE_FP8 -eq 1 ]]; then
+          export EXPECTED_METRICS_FILE="./tests/functional_tests/test_results/jet/gpt3-345m-weekly-dgx-h100-1n8g-mcore-tp1-pp1-bf16-baseline.json"
+          pytest ./tests/functional_tests/python_test_utils/test_fp8_ci_pipeline.py
+        else
+          export EXPECTED_METRICS_FILE="./tests/functional_tests/test_results/jet/${JOB_NAME}.json"
+          pytest ./tests/functional_tests/python_test_utils/test_ci_pipeline.py
+        fi
+    fi
+fi

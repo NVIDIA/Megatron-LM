@@ -1,4 +1,8 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
+"""Specs for Retro decoder."""
+
+import typing
 
 from megatron.core import parallel_state
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
@@ -28,7 +32,9 @@ from megatron.core.transformer.transformer_block import (
 )
 
 
-def get_retro_decoder_layer_te_spec(encoder_block_spec: ModuleSpec = None) -> ModuleSpec:
+def get_retro_decoder_layer_te_spec(
+    encoder_block_spec: typing.Union[ModuleSpec, TransformerBlockSubmodules, None] = None
+) -> ModuleSpec:
     """Retro decoder TE spec (uses Transformer Engine components).
 
     A Retro decoder layer uses custom attention and bias-dropout-add operators
@@ -37,9 +43,11 @@ def get_retro_decoder_layer_te_spec(encoder_block_spec: ModuleSpec = None) -> Mo
     cross attention module takes an optional encoder block spec, which is only
     provided for the first Retro decoder layer.
 
-    Arguments:
-      encoder_block_spec (ModuleSpec): Retro encoder block spec, to be provided
-      for the first Retro decoder layer.
+    Args:
+        encoder_block_spec (ModuleSpec): Retro encoder block spec, to be provided for the first Retro decoder layer.
+
+    Returns:
+        A module spec with Transformer Engine modules.
     """
     spec = get_gpt_layer_with_transformer_engine_spec()
     spec.submodules.pre_cross_attn_layernorm = TENorm
@@ -57,7 +65,9 @@ def get_retro_decoder_layer_te_spec(encoder_block_spec: ModuleSpec = None) -> Mo
     return spec
 
 
-def get_retro_decoder_layer_local_spec(encoder_block_spec: ModuleSpec = None) -> ModuleSpec:
+def get_retro_decoder_layer_local_spec(
+    encoder_block_spec: typing.Optional[ModuleSpec] = None,
+) -> ModuleSpec:
     """Retro decoder local spec (uses Megatron-Core components).
 
     A Retro decoder layer uses custom attention and bias-dropout-add operators
@@ -66,9 +76,11 @@ def get_retro_decoder_layer_local_spec(encoder_block_spec: ModuleSpec = None) ->
     cross attention module takes an optional encoder block spec, which is only
     provided for the first Retro decoder layer.
 
-    Arguments:
-      encoder_block_spec (ModuleSpec): Retro encoder block spec, to be provided
-      for the first Retro decoder layer.
+    Args:
+        encoder_block_spec (ModuleSpec): Retro encoder block spec, to be provided for the first Retro decoder layer.
+
+    Returns:
+        A module spec with local modules.
     """
     spec = get_gpt_layer_local_spec()
     spec.submodules.pre_cross_attn_layernorm = FusedLayerNorm
@@ -93,19 +105,16 @@ def get_retro_decoder_block_spec(
     """Retro decoder block spec.
 
     Retro decoder block implementation details:
-    - The retro decoder block consists of interleaved GPT layers and customized
-      Retro decoder layers.
-    - The Retro decoder layers are spaced three layers apart, and start on layer
-      6 or 9 (depending on the total number of layers).
-    - The first decoder layer instantiates an encoder block, and it therefore
-      passes in an encoder_block_spec.
+    - The retro decoder block consists of interleaved GPT layers and customized Retro decoder layers.
+    - The Retro decoder layers are spaced three layers apart, and start on layer 6 or 9 (depending on the total number of layers).
+    - The first decoder layer instantiates an encoder block, and it therefore passes in an encoder_block_spec.
 
+    Args:
+        config (RetroConfig): Retro config.
+        use_transformer_engine (bool): If True, use Transformer Engine (instead of local modules.
 
-    Arguments:
-      config (RetroConfig): Retro config.
-
-      use_transformer_engine (bool): If True, use Transformer Engine (instead
-      of local modules.
+    Returns:
+        Transformer block submodules for the given spec.
     """
 
     # Num layers.

@@ -1,11 +1,13 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 import os
-from typing import Literal, Optional
+from collections import OrderedDict
+from typing import Dict, Literal, Optional
 
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, tensor_parallel
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.models.bert.bert_lm_head import BertLMHead
 from megatron.core.models.bert.pooler import Pooler
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
@@ -16,6 +18,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import get_linear_layer
+from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
 
 class BertModel(LanguageModule):
@@ -110,16 +113,18 @@ class BertModel(LanguageModule):
         # Output
         if post_process:
             # TODO: Make sure you are passing in the mpu_vocab_size properly
-            self.lm_head = BertLMHead(
-                config.hidden_size,
-                config,
-                parallel_output,
-                self.vocab_size,
-                self.pre_process,
-                self.share_embeddings_and_output_weights,
-            )
+            self.lm_head = BertLMHead(config.hidden_size, config,)
 
-            self.output_layer = self.lm_head.output_layer
+            self.output_layer = tensor_parallel.ColumnParallelLinear(
+                config.hidden_size,
+                self.vocab_size,
+                config=config,
+                init_method=config.init_method,
+                bias=True,
+                skip_bias_add=False,
+                gather_output=not self.parallel_output,
+                skip_weight_param_allocation=pre_process and share_embeddings_and_output_weights,
+            )
 
             self.binary_head = None
             if self.add_binary_head:
@@ -132,8 +137,8 @@ class BertModel(LanguageModule):
                     config.hidden_size, config.init_method, config, config.sequence_parallel
                 )
 
-        if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
-            self.initialize_last_stage_with_word_embeddings()
+        if self.pre_process or self.post_process:
+            self.setup_embeddings_and_output_layer()
 
     def bert_extended_attention_mask(self, attention_mask: Tensor) -> Tensor:
         """Creates the extended attention mask
@@ -217,7 +222,7 @@ class BertModel(LanguageModule):
             )
         else:
             # intermediate stage of pipeline
-            # decoder will get hidden_states from encoder.input_tensor
+            # encoder will get hidden_states from encoder.input_tensor
             encoder_input = None
 
         # Rotary positional embeddings (Why not move this into BERT/GPTEmberdding ?)
@@ -228,7 +233,7 @@ class BertModel(LanguageModule):
             )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
-        # Run decoder.
+        # Run encoder.
         hidden_states = self.encoder(
             hidden_states=encoder_input,
             attention_mask=extended_attention_mask,
@@ -259,7 +264,8 @@ class BertModel(LanguageModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
-        logits = self.lm_head(hidden_states=hidden_states, word_embeddings_weight=output_weight)
+        hidden_states_after_lm_head = self.lm_head(hidden_states=hidden_states)
+        logits, _ = self.output_layer(hidden_states_after_lm_head, weight=output_weight)
 
         binary_logits = None
         if self.binary_head is not None:
@@ -272,11 +278,3 @@ class BertModel(LanguageModule):
         loss = self.compute_language_model_loss(lm_labels, logits)
 
         return loss, binary_logits
-
-    # TODO: add distributed checkpointing
-    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
-        pass
-
-    # TODO: add distributed checkpointing
-    def load_state_dict(self, state_dict, strict=True):
-        pass

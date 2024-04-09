@@ -9,11 +9,11 @@ import math
 import torch
 import torch.nn.functional as F
 
-from megatron import get_args, get_timers, get_tokenizer, print_rank_0
+from megatron.training import get_args, get_timers, get_tokenizer, print_rank_0
 from megatron.core import mpu
-from megatron.indexer import IndexBuilder
-from megatron.model.biencoder_model import biencoder_model_provider
-from megatron.utils import average_losses_across_data_parallel_group
+from megatron.legacy.indexer import IndexBuilder
+from megatron.legacy.model.biencoder_model import biencoder_model_provider
+from megatron.training.utils import average_losses_across_data_parallel_group
 from pretrain_ict import get_group_world_size_rank
 from tasks.finetune_utils import finetune
 from tasks.orqa.supervised.eval_utils import accuracy_func_provider

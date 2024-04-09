@@ -7,6 +7,7 @@ ShardedTensor class (mostly with the ShardedTensor.from_rank_offsets classmethod
 """
 
 import logging
+from abc import ABC
 from dataclasses import dataclass, replace
 from itertools import chain
 from typing import Any, Callable, Dict, Optional, Tuple, Union
@@ -27,8 +28,14 @@ ShardedStateDict = Dict[str, Any]
 ReplicaId = Union[int, Tuple[int, ...]]
 
 
+class ShardedBase(ABC):
+    key: str
+    data: object
+    replica_id: ReplicaId
+
+
 @dataclass
-class ShardedTensor:
+class ShardedTensor(ShardedBase):
     """Represents a mapping between a local tensor and a global tensor.
 
     Global tensor is assumed to consist of many local tensors distributed
@@ -126,7 +133,7 @@ class ShardedTensor:
         *rank_offsets: Tuple[int, int, int],
         replica_id: ReplicaId = 0,
         prepend_axis_num: int = 0,
-        allow_shape_mismatch: bool = False,
+        **init_kwargs,
     ):
         """Allows to construct the ShardedTensor given offset specified in process ranks.
 
@@ -136,7 +143,7 @@ class ShardedTensor:
             rank_offsets: each tuple (axis, axis_rank_offset, axis_fragm) says that if global tensor is divided into `axis_fragm` fragment along `axis` axis, then local tensor data corresponds to the `axis_rank_offset` chunk.
             replica_id: see ShardedTensor
             prepend_axis_num: see ShardedTensor
-            allow_shape_mismatch: see ShardedTensor
+            init_kwargs: passed to ShardedTensor.__init__
         """
         global_offset = [0] * (data.ndim + prepend_axis_num)
         global_shape = ([1] * prepend_axis_num) + list(data.shape)
@@ -170,8 +177,13 @@ class ShardedTensor:
             tuple(axis_fragmentations),
             replica_id,
             prepend_axis_num,
-            allow_shape_mismatch,
+            **init_kwargs,
         )
+
+    def init_data(self, device: torch.device, init_fn=torch.empty):
+        if self.data is not None:
+            return
+        self.data = init_fn(self.local_shape, dtype=self.dtype, device=device)
 
     def __str__(self):
         return f'{self.__class__.__name__}(key=\'{self.key}\')'
@@ -214,7 +226,7 @@ class LocalNonpersitentObject:
 
 
 @dataclass
-class ShardedObject:
+class ShardedObject(ShardedBase):
     """Represents a mapping between a local object and a global object.
 
     Global object is assumed to consist of many local objects distributed
@@ -250,7 +262,7 @@ class ShardedObject:
 
 
 @dataclass
-class ShardedTensorFactory:
+class ShardedTensorFactory(ShardedBase):
     """ Allows to apply transformations to tensors before/after serialization.
 
     The essence of those transformations is that they can be applied to

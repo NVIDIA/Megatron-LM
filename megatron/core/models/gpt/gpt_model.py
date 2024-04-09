@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-from typing import Literal, Optional, Tuple, Union
+from typing import Dict, Literal, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -70,6 +70,10 @@ class GPTModel(LanguageModule):
         # TODO: remove this dependency ?
         self.model_type = ModelType.encoder_or_decoder
 
+        # These 2 attributes are needed for TensorRT-LLM export.
+        self.max_position_embeddings = max_sequence_length
+        self.rotary_percent = rotary_percent
+
         if self.pre_process:
             self.embedding = LanguageModelEmbedding(
                 config=self.config,
@@ -97,6 +101,20 @@ class GPTModel(LanguageModule):
 
         # Output
         if post_process:
+            if self.config.defer_embedding_wgrad_compute:
+                # The embedding activation buffer preserves a reference to the input activations
+                # of the final embedding projection layer GEMM. It will hold the activations for
+                # all the micro-batches of a global batch for the last pipeline stage. Once we are
+                # done with all the back props for all the microbatches for the last pipeline stage,
+                # it will be in the pipeline flush stage. During this pipeline flush we use the
+                # input activations stored in embedding activation buffer and gradient outputs stored
+                # in gradient buffer to calculate the weight gradients for the embedding final linear layer.
+                self.embedding_activation_buffer = []
+                self.grad_output_buffer = []
+            else:
+                self.embedding_activation_buffer = None
+                self.grad_output_buffer = None
+
             self.output_layer = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
                 self.vocab_size,
@@ -107,10 +125,12 @@ class GPTModel(LanguageModule):
                 gather_output=not self.parallel_output,
                 skip_weight_param_allocation=self.pre_process
                 and self.share_embeddings_and_output_weights,
+                embedding_activation_buffer=self.embedding_activation_buffer,
+                grad_output_buffer=self.grad_output_buffer,
             )
 
-        if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
-            self.initialize_last_stage_with_word_embeddings()
+        if self.pre_process or self.post_process:
+            self.setup_embeddings_and_output_layer()
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
@@ -193,55 +213,27 @@ class GPTModel(LanguageModule):
 
         return loss
 
-    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()) -> ShardedStateDict:
-        assert not sharded_offsets, "Unexpected sharded offsets"
-        sharded_state_dict = {}
+    def sharded_state_dict(
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[Dict] = None
+    ) -> ShardedStateDict:
+        """ Sharded state dict implementation for GPTModel backward-compatibility (removing extra state).
 
-        if self.pre_process:
-            embedding_prefix = f'{prefix}embedding.'
-            embedding_sharded_state_dict = self.embedding.sharded_state_dict(
-                prefix=embedding_prefix
-            )
-            sharded_state_dict.update(embedding_sharded_state_dict)
+        Args:
+            prefix (str): Module name prefix.
+            sharded_offsets (tuple): PP related offsets, expected to be empty at this module level.
+            metadata (Optional[Dict]): metadata controlling sharded state dict creation.
 
-        decoder_prefix = f'{prefix}decoder.'
-        decoder_sharded_state_dict = self.decoder.sharded_state_dict(prefix=decoder_prefix)
-        sharded_state_dict.update(decoder_sharded_state_dict)
+        Returns:
+            ShardedStateDict: sharded state dict for the GPTModel
+        """
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        output_layer_extra_state_key = f'{prefix}output_layer._extra_state'
 
-        if self.post_process:
-            output_layer_prefix = f'{prefix}output_layer.'
-            output_layer_key = f'{output_layer_prefix}weight'
-            if self.share_embeddings_and_output_weights:
-                if not self.pre_process:
-                    # when sharing embeddings with last stage, we need to use the weights from the first stage
-                    # on pipeline first rank, word embeddings are saved to {prefix}embedding.word_embeddings.weight
-                    tensor = self.shared_embedding_or_output_weight()
-                    first_stage_word_emb_key = f'{prefix}embedding.word_embeddings.weight'
-                    last_stage_word_emb_replica_id = (
-                        1,  # copy of first stage embedding
-                        0,
-                        parallel_state.get_data_parallel_rank(with_context_parallel=True),
-                    )
-
-                    sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
-                        tensor=tensor,
-                        key=first_stage_word_emb_key,
-                        replica_id=last_stage_word_emb_replica_id,
-                        allow_shape_mismatch=True,
-                    )
-
-                    sharded_state_dict[output_layer_key] = sharded_output_layer_tensor
-
-            else:
-                output_layer_state_dict = self.output_layer.state_dict(
-                    prefix=output_layer_prefix, keep_vars=True
-                )
-                output_layer_tensor = output_layer_state_dict[output_layer_key]
-                # independent output layer
-                sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
-                    tensor=output_layer_tensor, key=output_layer_key, allow_shape_mismatch=True,
-                )
-
-                sharded_state_dict[output_layer_key] = sharded_output_layer_tensor
+        # Old GPT checkpoints only stored the output layer weight key. So we remove the _extra_state key
+        # but check that it doesn't contain any data anyway
+        output_extra_state = sharded_state_dict.pop(output_layer_extra_state_key, None)
+        assert not (
+            output_extra_state and output_extra_state.data
+        ), f'Expected output layer extra state to be empty, got: {output_extra_state}'
 
         return sharded_state_dict
