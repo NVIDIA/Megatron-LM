@@ -132,7 +132,11 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         if torch.distributed.get_world_size(self.parallelization_group) <= 1:
             return self.base_strategy.load(sharded_state_dict, checkpoint_dir)
 
+        start = time()
         precomputed_distribution = self.apply_loading_parallelization(sharded_state_dict)
+        end = time()
+        logger.debug(f'self.apply_loading_parallelization took {end - start}s')
+        start = end
         (
             sharded_tensors,
             sharded_state_dict,
@@ -142,9 +146,18 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         # Load only sharded objects
         loaded_state_dict = self.base_strategy.load(sharded_state_dict, checkpoint_dir)
 
+        end = time()
+        logger.debug(f'Base load of ShardedObjects took {end - start}s')
+        start = end
+
         # Load sharded tensors separately
-        print(f'Applying parallel load with algo {self.gather_algo}')
         loaded_tensors = self.base_strategy.load(to_load_shards, checkpoint_dir)
+
+        end = time()
+        logger.debug(f'Base load of ShardedTensors took {end - start}s')
+        start = end
+
+        logger.debug(f'Applying parallel load with algo {self.gather_algo}')
         if self.gather_algo == 'object':
             all_loaded_tensors = self.exchange_loaded_tensors_gather_object(
                 loaded_tensors, unloaded_shards, precomputed_distribution, self.parallelization_group
@@ -155,6 +168,13 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             )
         else:
             raise NotImplementedError(f'Unrecognized gather algorithm: {self.gather_algo}')
+
+        sync_start = time()
+        torch.cuda.synchronize()
+        end = time()
+        logger.debug(f'torch.cuda.synchronize took {end - sync_start}s')
+        logger.debug(f'self.exchange_loaded_tensors took {end - start}s')
+
         self.fill_in_deferred_sharded_tensors(sharded_tensors, all_loaded_tensors)
         merge(loaded_state_dict, sharded_tensors)
         return loaded_state_dict
@@ -251,6 +271,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
 
         for dtype in sorted(set(map(lambda sh_ten: sh_ten.dtype, shard_to_metadata.values())), key=str):
 
+            start = time()
             shards_by_rank: List[List[torch.Tensor]] = [
                 []
                 for _ in range(torch.distributed.get_world_size(group=parallelization_group))
@@ -285,6 +306,12 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                     ]
                 )
 
+            torch.distributed.barrier()
+            end = time()
+            if torch.distributed.get_rank() == 0:
+                logger.debug(f'{dtype} exchange rounds prep time took {end - start}s')
+            start = time()
+
             for round_idx, round_tensors in enumerate(zip(*shards_by_rank)):
                 torch.distributed.all_gather(
                     list(round_tensors),
@@ -292,6 +319,10 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                     group=self.parallelization_group,
                     async_op=True,
                 )
+            end = time()
+            if torch.distributed.get_rank() == 0:
+                logger.debug(
+                    f'{dtype} exchange rounds all_gather schedule took {end - start}s')
 
         # Error checks
         if not set(unloaded_shards.keys()).issubset(all_loaded_tensors.keys()):
