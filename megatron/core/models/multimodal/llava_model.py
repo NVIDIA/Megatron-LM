@@ -76,6 +76,30 @@ class LLaVAModel(MegatronModule):
         """
         self.vision_model.set_input_tensor(input_tensor)
 
+    def freeze(
+        self, freeze_language_model: bool, freeze_vision_model: bool, freeze_vision_projection: bool
+    ):
+        """Freeze model modules.
+
+        Make specific modules non-trainable by setting requires_grad to False for the module's parameters.
+
+        Args:
+            freeze_language_model (bool): Freeze the language model module.
+            freeze_vision_model (bool): Freeze the vision model module.
+            freeze_vision_projection (bool): Freeze the vision projection module.
+        """
+        modules = []
+        if freeze_language_model:
+            modules.append(self.language_model)
+        if freeze_vision_model:
+            modules.append(self.vision_model)
+        if freeze_vision_projection:
+            modules.append(self.vision_projection)
+
+        for module in modules:
+            for param in module.parameters():
+                param.requires_grad = False
+
     def forward(
         self,
         images: torch.Tensor,
