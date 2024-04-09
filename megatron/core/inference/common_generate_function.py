@@ -1,16 +1,11 @@
-from typing import List, Tuple, Union
+from typing import List
 
-import torch
-from torch import Tensor
-
-from megatron.core.inference.backends.mcore_backend import MCoreBackend
-from megatron.core.inference.backends.trt_llm_backend import TRTLLMBackend
+from megatron.core.inference.backends.abstract_backend import AbstractBackend
 from megatron.core.inference.common_inference_params import CommonInferenceParams
-from megatron.core.models.common.language_module.language_module import LanguageModule
 
 
 def common_generate(
-    inference_backend: Union[MCoreBackend, TRTLLMBackend],
+    inference_backend: AbstractBackend,
     prompts: List[str] = None,
     common_inference_params: CommonInferenceParams = None,
 ) -> dict:

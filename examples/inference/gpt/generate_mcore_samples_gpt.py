@@ -87,7 +87,6 @@ def add_text_generate_args(parser):
     """Text generation arguments."""
     group = parser.add_argument_group(title='text generation')
 
-
     group.add_argument("--greedy", action='store_true', default=False,
                        help='Use greedy sampling.')
     group.add_argument("--temperature", type=float, default=1.0,
@@ -151,26 +150,18 @@ def write_results_to_file(output_file:str, prompts:List[str], prompt_plus_genera
             f.write(json.dumps(write_data) + '\n')
             GLOBAL_PROMPT_IDX += 1
 
-def generate_and_write_results(model: MegatronModule, args:Namespace):
+def generate_and_write_results(inference_backend: AbstractBackend, common_inference_params: CommonInferenceParams):
     """Generates the output text and writes it to a file
 
     Generates the output tokens for the input prompts which are read from the input prompts file. We store these outputs in a text file
 
     Args:
-        model (MegatronModule): The transformer model on which generate function is called
-        args (Namespace): The arguments prased from the command line and default arguments (arguments.py)
+        inference_backend (AbstractBackend): The backend used for running inference
+        common_inference_params (CommonInferenceParams): The commo inference parameters like (top_p, top_k, num tokens to generate etc. )
     """    
-    inference_backend = get_inference_backend(args, model)
-
-    common_inference_params = CommonInferenceParams(
-        use_greedy=args.greedy, 
-        temperature=args.temperature, 
-        top_k=args.top_k, 
-        top_p=args.top_p, 
-        return_log_probs=args.return_log_probs, 
-        num_tokens_to_generate=args.num_tokens_to_generate)
-
-
+    args = get_args()
+    
+    # NOTE: We read only on rank 0 and write only on rank 0 to avoid synchronization issues. 
     if torch.distributed.get_rank() == 0:
         fname = open(args.prompts_input_file, "r")
         lines = fname.readlines()
@@ -216,7 +207,17 @@ def main():
 
     args = get_args()
 
-    generate_and_write_results(model, args)
+    inference_backend = get_inference_backend(args, model)
+
+    common_inference_params = CommonInferenceParams(
+        use_greedy=args.greedy, 
+        temperature=args.temperature, 
+        top_k=args.top_k, 
+        top_p=args.top_p, 
+        return_log_probs=args.return_log_probs, 
+        num_tokens_to_generate=args.num_tokens_to_generate)
+
+    generate_and_write_results(inference_backend, common_inference_params)
 
 if __name__ == "__main__":
     main()

@@ -13,7 +13,7 @@ from megatron.core.inference.communication_utils import (
 from megatron.core.inference_params import InferenceParams
 
 
-class AbstractModelInferenceWrapper:
+class AbstractModelInferenceWrapper(abc.ABC):
     def __init__(self, model, args: Namespace):
         """Constructor for the model inference wrapper
 
@@ -32,7 +32,7 @@ class AbstractModelInferenceWrapper:
     def prep_model_for_inference(self, prompts_tokens: torch.Tensor):
         """A utility function for preparing model for inference
 
-        The function gets called before you get the inference data and running forward pass. Use it to put the model in eval mode, build position ids ,attention mask etc, so that required slices can be extracted during the forward pass. 
+        The function gets called once before the auto regressive inference loop. It puts the model in eval mode , and gets some model and inference data parameters. Extend this to build position ids ,attention mask etc, so that required slices can be extracted during the forward pass. 
 
         Args:
             prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_seq_len]
