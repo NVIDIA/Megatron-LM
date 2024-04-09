@@ -1229,7 +1229,8 @@ class ParallelTransformerLayer(MegatronModule):
                 retriever_output=None,
                 retriever_attn_mask=None,
                 inference_params=None,
-                rotary_pos_emb=None):
+                rotary_pos_emb=None,
+                aggregated_moe_loss=None):
         # hidden_states: [s, b, h]
 
         # Layer norm at the beginning of the transformer layer.
@@ -1321,6 +1322,10 @@ class ParallelTransformerLayer(MegatronModule):
         else:
             mlp_output, moe_loss, _ = self.mlp(layernorm_output)
 
+        # when aggregated_moe_loss received, returned moe_loss is the aggregated moe loss
+        if aggregated_moe_loss is not None:
+            moe_loss += aggregated_moe_loss
+
         # Second residual connection.
         if self.apply_residual_connection_post_layernorm:
             residual = layernorm_output
@@ -1381,23 +1386,51 @@ class ParallelTransformerLayerPipe(ParallelTransformerLayer):
        If no mask is provided, the module will query `self._args.attn_mask`
        for the mask and only return `super().forward(...)`
     """
+    def __init__(self, config,
+                 layer_number, layer_type=LayerType.encoder,
+                 self_attn_mask_type=AttnMaskType.padding,
+                 drop_path_rate=0., num_experts=1,
+                 input_aggregated_moe_loss=False, return_aggregated_moe_loss=False):
+        self.input_aggregated_moe_loss = input_aggregated_moe_loss
+        self.return_aggregated_moe_loss = return_aggregated_moe_loss
+        super().__init__(config, layer_number, layer_type, self_attn_mask_type, drop_path_rate, num_experts)
+
     def forward(self, inputs, **kwargs):
         assert torch.is_tensor(inputs) or isinstance(inputs, tuple)
         if not hasattr(self, '_args'):
             self._args = get_args()
         rotary_pos_emb = self._args.rotary_pos_emb if self._args.use_rotary_position_embeddings else None
         if torch.is_tensor(inputs) or len(inputs) == 1:
+            assert not self.input_aggregated_moe_loss, f'Expecting an input tuple of size >= 2'
             # No attention mask forwarded, search for args.attn_mask
             hidden_states, attention_mask = inputs, self._args.attn_mask
-            # HACK: currently MoE model does not support pipeline parallel, so
-            # here we just ignore the moe_loss returned by forward()
-            return super().forward(hidden_states, attention_mask, **kwargs, rotary_pos_emb=rotary_pos_emb)[0]
-        elif len(inputs) == 2:
-            # Attention mask is an activation.
-            hidden_states, attention_mask = inputs[0], inputs[1]
-            # HACK: currently MoE model does not support pipeline parallel, so
-            # here we just ignore the moe_loss returned by forward()
-            return super().forward(*inputs, **kwargs, rotary_pos_emb=rotary_pos_emb)[0], attention_mask
+            output, moe_loss = super().forward(hidden_states, attention_mask, **kwargs, rotary_pos_emb=rotary_pos_emb)
+            return (output, moe_loss) if self.return_aggregated_moe_loss else output
+        elif len(inputs) in (2, 3):
+            # Attention mask and aggregated_moe can both be activations.
+            return_attention_mask = False
+            if len(inputs) == 2:
+                if self.input_aggregated_moe_loss:
+                    hidden_states, aggregated_moe_loss = inputs[0], inputs[1]
+                    attention_mask = self._args.attn_mask
+                else:
+                    hidden_states, attention_mask = inputs[0], inputs[1]
+                    return_attention_mask = True
+            else:
+                hidden_states, attention_mask, aggregated_moe_loss = inputs[0], inputs[1], inputs[2]
+
+            # Forward aggregated_moe_loss to ParallelTransformerLayer for further accumulation
+            if self.input_aggregated_moe_loss:
+                kwargs.update({'aggregated_moe_loss': aggregated_moe_loss})
+
+            output, moe_loss = super().forward(hidden_states, attention_mask, **kwargs, rotary_pos_emb=rotary_pos_emb)
+
+            ret = (output, )
+            if return_attention_mask:
+                ret += (attention_mask, )
+            if self.return_aggregated_moe_loss:
+                ret += (moe_loss, )
+            return ret
         else:
             raise RuntimeError('Received more inputs than understood.')
 
@@ -1497,6 +1530,19 @@ def _get_layer_type(model_type, default_layer_type, retro_layer_numbers,
             raise Exception("Unsupported model type, '%s'." % model_type)
     else:
         return default_layer_type
+
+
+def get_num_experts_per_layer(num_experts: list, num_layers: int, expert_interval: int, offset: int = 0) -> list:
+    assert len(num_experts) == 1 or len(num_experts) == num_layers // expert_interval, \
+        'num_experts must be either a single value or a list of the same length as the number of MoE layers'
+    if len(num_experts) == 1:
+        num_experts = num_experts * (num_layers // expert_interval)
+    experts_per_layer = []
+    for i in range(num_layers):
+        layer_num = i + 1 + offset
+        n_e = num_experts[(layer_num-1) // expert_interval] if layer_num % expert_interval == 0 else 1
+        experts_per_layer.append(n_e)
+    return experts_per_layer
 
 
 class ParallelTransformer(MegatronModule):
@@ -1682,21 +1728,12 @@ class ParallelTransformer(MegatronModule):
             self.num_layers = 1
             self.layers = torch.nn.ModuleList([ NoopTransformerLayer(1) ])
         else:
-            assert len(num_experts) == 1 or len(num_experts) == args.num_layers // args.expert_interval, \
-            'num_experts must be either a single value or a list of the same length as the number of MoE layers'
-
-            # Create the list of MoE experts
-            if len(num_experts) == 1:
-                num_experts = num_experts * (args.num_layers // args.expert_interval)
-
             # Build the layers
             self.layers = []
+            experts_per_layer = get_num_experts_per_layer(num_experts, self.num_layers, args.expert_interval, offset)
             for i in range(self.num_layers):
                 layer_num = i + 1 + offset
-                if layer_num % args.expert_interval == 0:
-                    n_e = num_experts[(layer_num-1) // args.expert_interval]
-                else:
-                    n_e = 1
+                n_e = experts_per_layer[i]
                 self.layers.append(build_layer(layer_num, n_e))
             self.layers = torch.nn.ModuleList(self.layers)
 

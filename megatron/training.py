@@ -10,6 +10,7 @@ import json
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 import torch
+from collections import OrderedDict
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
 from megatron import get_args
@@ -667,8 +668,13 @@ def train_step(forward_step_func, data_iterator,
         num_zeros_in_grad = 0
         assert isinstance(model[0], deepspeed.PipelineEngine)
         loss = model[0].train_batch(data_iter=data_iterator)
+        additional_losses = model[0].get_additional_losses()
+        loss_key = 'lm loss' if additional_losses is None else 'loss'  # use "lm loss" for backward compatibility
+        loss_dict = OrderedDict({loss_key: loss})
+        if additional_losses is not None:
+            loss_dict.update(additional_losses)
         grad_norm = model[0].get_global_grad_norm()
-        return {'lm loss' : loss}, skipped_iter, grad_norm, num_zeros_in_grad
+        return loss_dict, skipped_iter, grad_norm, num_zeros_in_grad
 
     # Set grad to zero.
     if not args.deepspeed:

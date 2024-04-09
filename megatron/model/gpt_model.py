@@ -3,6 +3,7 @@
 """GPT-2 model."""
 
 import torch
+from collections import OrderedDict
 
 from megatron import get_args
 from megatron.core import mpu, tensor_parallel, sequence_parallel
@@ -16,7 +17,7 @@ from .utils import scaled_init_method_normal
 
 from megatron.model import LayerNorm, RMSNorm
 from .language_model import EmbeddingPipe
-from .transformer import ParallelTransformerLayerPipe, LMHeadPipe
+from .transformer import ParallelTransformerLayerPipe, LMHeadPipe, get_num_experts_per_layer
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
 
 
@@ -360,12 +361,33 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                                             embedding_weights_in_fp32=args.embedding_weights_in_fp32,
                                             tied_weight_attr='word_embeddings_weight'))
 
+        experts_per_layer = get_num_experts_per_layer(args.num_experts, args.num_layers, args.expert_interval)
+        self.is_moe_model = any(n_experts > 1 for n_experts in experts_per_layer)
+
+        # Currently PipelineEngine does not support more than 1 pipe and/or grad partitioned tensors that
+        # require grads.
+        # When using MoE, we have 2 tensors that are passed along pipeline stages and both require grads.
+        # Therefore, verify that both pipe_partitioned / grad_partitioned are not enabled
+        if self.is_moe_model and args.pipeline_model_parallel_size > 1 and args.tensor_model_parallel_size > 1:
+            pipe_partitioned_enabled = args.deepspeed_config_dict.get('pipeline', {}).get('pipe_partitioned', False)
+            grad_partitioned_enabled = args.deepspeed_config_dict.get('pipeline', {}).get('grad_partitioned', False)
+            assert not pipe_partitioned_enabled and not grad_partitioned_enabled, \
+                'Pipe and/or Grad partitioning are not supported for MoE model'
+
         for layer_idx in range(args.num_layers):
             self.specs.append(
                 LayerSpec(ParallelTransformerLayerPipe,
-                    config,
-                    layer_number=layer_idx,
-                    self_attn_mask_type=AttnMaskType.causal))
+                          config,
+                          layer_number=layer_idx,
+                          self_attn_mask_type=AttnMaskType.causal,
+                          num_experts=experts_per_layer[layer_idx],
+                          input_aggregated_moe_loss=(self.is_moe_model and layer_idx > 0),
+                          return_aggregated_moe_loss=self.is_moe_model))
+
+        # if model has experts, add a layer to get and cache the aggregated moe loss from the
+        # last transformer layer
+        if self.is_moe_model:
+            self.specs.append(self._calculate_moe_loss)
 
         # Final layernorm after transformer layers
         if args.normalization == 'layernorm':
@@ -404,6 +426,11 @@ class GPTModelPipe(PipelineModule,MegatronModule):
         if args.fp16 or args.bf16:
             self.specs.append(float16_to_fp32)
 
+        # Cache losses
+        self.moe_loss = None
+        self.last_lm_loss = None    # detached, for display only
+        self.last_moe_loss = None   # detached, for display only
+
         if args.checkpoint_activations:
             interval = args.checkpoint_num_layers
         elif args.recompute_granularity == "full" and args.recompute_method == 'uniform':
@@ -418,10 +445,34 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                                              num_dp=mpu.get_data_parallel_world_size())
 
         super().__init__(layers=self.specs,
-                         loss_fn=CrossEntropy,
+                         loss_fn=self.loss_func,
                          topology=topo,
                          activation_checkpoint_interval=interval,
                          partition_method='type:transformer')
 
+    def _calculate_moe_loss(self, inputs):
+        """ Calculate MoE auxiliary loss """
+        assert isinstance(inputs, tuple) and len(inputs) == 2
+        hidden, aggregated_moe_loss = inputs[0], inputs[1]
+        args = get_args()
+        self.moe_loss = aggregated_moe_loss * args.moe_loss_coeff
+        return hidden
+
+    def loss_func(self, output, labels):
+        loss = CrossEntropy(output, labels)
+        self.last_lm_loss = loss.clone().detach()
+        if self.moe_loss is not None:
+            loss += self.moe_loss
+            self.last_moe_loss = self.moe_loss.clone().detach()
+        return loss
+
     def universal_checkpoint_info(self):
         return UniversalCheckpointInfo(using_model_pipe=True).get()
+
+    def get_additional_losses(self):
+        if not self.is_moe_model:
+            return None
+        return OrderedDict({
+            'lm loss': self.last_lm_loss,
+            'moe loss': self.last_moe_loss
+        })
