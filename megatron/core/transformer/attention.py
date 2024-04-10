@@ -372,19 +372,25 @@ class SelfAttention(Attention):
             tp_comm_buffer_name='qkv',
         )
 
-        self.q_layernorm = build_module(
-            submodules.q_layernorm,
-            hidden_size=self.hidden_size_per_attention_head,
-            config=self.config,
-            eps=self.config.layernorm_epsilon,
-        )
+        if submodules.q_layernorm is not None:
+            self.q_layernorm = build_module(
+                submodules.q_layernorm,
+                hidden_size=self.hidden_size_per_attention_head,
+                config=self.config,
+                eps=self.config.layernorm_epsilon,
+            )
+        else:
+            self.q_layernorm = None
 
-        self.k_layernorm = build_module(
-            submodules.k_layernorm,
-            hidden_size=self.hidden_size_per_attention_head,
-            config=self.config,
-            eps=self.config.layernorm_epsilon,
-        )
+        if submodules.k_layernorm is not None:
+            self.k_layernorm = build_module(
+                submodules.k_layernorm,
+                hidden_size=self.hidden_size_per_attention_head,
+                config=self.config,
+                eps=self.config.layernorm_epsilon,
+            )
+        else:
+            self.k_layernorm = None
 
     def run_realtime_tests(self):
         """Performs a consistency check.
@@ -494,8 +500,11 @@ class SelfAttention(Attention):
         # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
 
-        query = self.q_layernorm(query)
-        key = self.k_layernorm(key)
+        if self.q_layernorm is not None:
+            query = self.q_layernorm(query)
+
+        if self.k_layernorm is not None:
+            key = self.k_layernorm(key)
 
         if self.config.test_mode:
             self.run_realtime_tests()
