@@ -184,6 +184,8 @@ class ShardedTensor(ShardedBase):
         if self.data is not None:
             return
         self.data = init_fn(self.local_shape, dtype=self.dtype, device=device)
+        if self.flattened_range is not None:
+            self.data = self.data.flatten()[self.flattened_range.start: self.flattened_range.stop]
 
     def __str__(self):
         return f'{self.__class__.__name__}(key=\'{self.key}\')'

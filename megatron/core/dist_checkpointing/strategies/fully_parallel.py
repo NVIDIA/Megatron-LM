@@ -118,13 +118,13 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         strategy: LoadShardedStrategy,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
         do_cache_distribution: bool = False,
-        gather_algo: str = 'rounds'  # or 'object'
+        gather_algo: str = 'gather_rounds'  # or 'object'
     ):
         super().__init__()
         self.base_strategy = strategy
         self.parallelization_group = parallelization_group
         self.do_cache_distribution = do_cache_distribution
-        self.gather_algo = gather_algo
+        self.exchange_algo = gather_algo
 
         self.cached_distribution: Optional[SaveDistribution] = None
 
@@ -157,17 +157,21 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         logger.debug(f'Base load of ShardedTensors took {end - start}s')
         start = end
 
-        logger.debug(f'Applying parallel load with algo {self.gather_algo}')
-        if self.gather_algo == 'object':
+        logger.debug(f'Applying parallel load with algo {self.exchange_algo}')
+        if self.exchange_algo == 'gather_object':
             all_loaded_tensors = self.exchange_loaded_tensors_gather_object(
                 loaded_tensors, unloaded_shards, precomputed_distribution, self.parallelization_group
             )
-        elif self.gather_algo == 'rounds':
+        elif self.exchange_algo == 'gather_rounds':
             all_loaded_tensors = self.exchange_loaded_tensors_gather_rounds(
                 loaded_tensors, unloaded_shards, precomputed_distribution, self.parallelization_group
             )
+        elif self.exchange_algo == 'broadcast':
+            all_loaded_tensors = self.exchange_loaded_tensors_broadcast(
+                loaded_tensors, unloaded_shards, precomputed_distribution, self.parallelization_group
+            )
         else:
-            raise NotImplementedError(f'Unrecognized gather algorithm: {self.gather_algo}')
+            raise NotImplementedError(f'Unrecognized gather algorithm: {self.exchange_algo}')
 
         sync_start = time()
         torch.cuda.synchronize()
@@ -284,19 +288,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                     assert shard_id in loaded_tensors, (shard_id, loaded_tensors.keys())
                     shards_by_rank[rank].append(loaded_tensors[shard_id])
                 else:
-                    local_unloaded_sh_ten = unloaded_shards.get(shard_id)
-                    if local_unloaded_sh_ten is None:
-                        sh_ten = shard_to_metadata[shard_id]
-                        _ten = torch.empty(
-                            sh_ten.local_shape,
-                            dtype=sh_ten.dtype,
-                            device='cuda',
-                        )
-                    else:
-                        local_unloaded_sh_ten.init_data('cuda')
-                        _ten = local_unloaded_sh_ten.data
-                        all_loaded_tensors[shard_id] = _ten
-                    shards_by_rank[rank].append(_ten)
+                    shards_by_rank[rank].append(shard_id)
 
             num_rounds = max(map(len, shards_by_rank))
             for rank_shards in shards_by_rank:
@@ -313,17 +305,91 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                 logger.debug(f'{dtype} exchange rounds prep time took {end - start}s')
             start = time()
 
-            for round_idx, round_tensors in enumerate(zip(*shards_by_rank)):
+            shards_by_round = list(zip(*shards_by_rank))
+            del shards_by_rank
+            for round_idx, round_tensors in enumerate(shards_by_round):
+                round_tensors = list(round_tensors)
+                for rank in range(len(round_tensors)):
+                    if not isinstance(round_tensors[rank], torch.Tensor):
+                        shard_id = round_tensors[rank]
+                        assert isinstance(shard_id, tuple), type(shard_id)
+                        local_unloaded_sh_ten = unloaded_shards.get(shard_id)
+                        if local_unloaded_sh_ten is None:
+                            sh_ten = shard_to_metadata[shard_id]
+                            sh_ten.init_data('cuda')
+                            local_ten = sh_ten.data
+                            sh_ten.data = None  # won't be used. free memory
+                        else:
+                            local_unloaded_sh_ten.init_data('cuda')
+                            local_ten = local_unloaded_sh_ten.data
+                            all_loaded_tensors[shard_id] = local_ten
+
+                        round_tensors[rank] = local_ten
+
                 torch.distributed.all_gather(
                     list(round_tensors),
                     round_tensors[local_rank],
                     group=self.parallelization_group,
-                    async_op=True,
                 )
+
+                shards_by_round[round_idx] = None  # remove tensor references
+
             end = time()
             if torch.distributed.get_rank() == 0:
                 logger.debug(
                     f'{dtype} exchange rounds all_gather schedule took {end - start}s')
+
+        # Error checks
+        if not set(unloaded_shards.keys()).issubset(all_loaded_tensors.keys()):
+            missing_shards = set(unloaded_shards.keys()) - all_loaded_tensors.keys()
+            raise CheckpointingException(
+                f'Missing shards after fully parallel loading: {missing_shards}'
+            )
+
+        return all_loaded_tensors
+
+    @torch.no_grad()
+    def exchange_loaded_tensors_broadcast(
+        self,
+        loaded_tensors: Dict[ChunkId, torch.Tensor],
+        unloaded_shards: Dict[ChunkId, ShardedTensor],
+        precomputed_distribution: SaveDistribution = None,
+        parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> Dict[ChunkId, torch.Tensor]:
+        """  """
+        # local_sh_tens = list(nested_values(sharded_state_dict))
+        # local_sh_tens_by_id = {_sharded_tensor_chunk_id(sh_ten): sh_ten for sh_ten in local_sh_tens}
+        shard_to_saving_rank, _, shard_to_metadata = precomputed_distribution
+        local_rank = torch.distributed.get_rank(group=self.parallelization_group)
+
+        all_loaded_tensors = dict(loaded_tensors)
+
+        start = time()
+        for shard_id, rank in shard_to_saving_rank.items():
+            if rank == local_rank:
+                assert shard_id in loaded_tensors, (shard_id, loaded_tensors.keys())
+                tensor = loaded_tensors[shard_id]
+            else:
+                local_unloaded_sh_ten = unloaded_shards.get(shard_id)
+                if local_unloaded_sh_ten is None:
+                    sh_ten = shard_to_metadata[shard_id]
+                    sh_ten.init_data('cuda')
+                    tensor = sh_ten.data
+                    sh_ten.data = None  # won't be used. free memory
+                else:
+                    local_unloaded_sh_ten.init_data('cuda')
+                    tensor = local_unloaded_sh_ten.data
+                    all_loaded_tensors[shard_id] = tensor
+
+            global_src_rank = torch.distributed.get_global_rank(
+                parallelization_group, rank
+            )
+            torch.distributed.broadcast(tensor, src=global_src_rank, group=parallelization_group,
+                                        async_op=True)
+
+        end = time()
+        if torch.distributed.get_rank() == 0:
+            logger.debug(f'exchange broadcast schedule took {end - start}s')
 
         # Error checks
         if not set(unloaded_shards.keys()).issubset(all_loaded_tensors.keys()):
