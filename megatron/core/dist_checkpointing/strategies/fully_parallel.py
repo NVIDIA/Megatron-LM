@@ -254,6 +254,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
 
         return all_loaded_tensors
 
+    @torch.no_grad()
     def exchange_loaded_tensors_gather_rounds(
         self,
         loaded_tensors: Dict[ChunkId, torch.Tensor],
