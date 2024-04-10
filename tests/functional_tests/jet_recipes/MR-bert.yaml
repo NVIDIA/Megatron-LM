@@ -25,6 +25,7 @@ spec:
   precision: bf16
   time_limit: 1200
   artifacts: {/workspace/data/bert_data: text/the_pile/bert_shard00}
+  ckpt_format: torch_dist
   ckpt_resume: 0
   script: |-
     ls
@@ -49,10 +50,8 @@ spec:
         ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'}
 products:
   # MCore
-  - {tp_size: [2], pp_size: [2]}
-  - {tp_size: [2], pp_size: [2], extra_args: ['"--spec local"'], args_meta: ["local_spec"]}
+  - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1]}
+  - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], extra_args: ['"--spec local"'], args_meta: ["local_spec"]}
   # Non-MCore
-  - {use_mcore: [False], tp_size: [2], pp_size: [2], extra_args: ['"--transformer-impl local"']}
-  - {use_mcore: [False], tp_size: [1], pp_size: [4], vp_size: [2], extra_args: ['"--transformer-impl local"']}
-  # Checkpoint resume
-  - {ckpt_resume: [1], use_mcore: [False], tp_size: [1], pp_size: [2], extra_args: ['"--transformer-impl local"']}
+  - {use_mcore: [False], tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], ckpt_format: [torch], extra_args: ['"--transformer-impl local"']}
+  - {use_mcore: [False], tp_size: [1], pp_size: [4], vp_size: [2], ckpt_resume: [0, 1], ckpt_format: [torch], extra_args: ['"--transformer-impl local"']}
