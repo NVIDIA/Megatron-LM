@@ -25,6 +25,7 @@ spec:
   precision: bf16
   time_limit: 1800
   artifacts: {/workspace/data/t5_data: text/the_pile/t5_shard00}
+  ckpt_format: torch
   ckpt_resume: 0
   script: |-
     ls
@@ -48,7 +49,7 @@ spec:
         JOB_NAME={key.split("/")[1]} \
         ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'}
 products:
-  - { tp_size: [1,2], pp_size: [1], vp_size: [1] }
+  - {tp_size: [1,2], pp_size: [1], vp_size: [1] }
   - {use_te: [True], tp_size: [2], pp_size: [1], vp_size: [1]}
   - {use_te: [True], tp_size: [2], pp_size: [1], vp_size: [1], extra_args: ["--sequence-parallel"], args_meta: ["sequence_parallel"]}
   # Checkpoint resume

@@ -25,6 +25,7 @@ spec:
   allow_nondeterministic: False
   precision: bf16
   time_limit: 10000 # 2.5 hours
+  ckpt_format: torch
   ckpt_resume: 0
   artifacts: {/workspace/data/gpt3_data: text/the_pile/shard00}
   script: |-

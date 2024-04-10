@@ -24,6 +24,7 @@ spec:
   batch_size: 32 # GBS, JET schema requires 'batch_size'
   precision: bf16
   time_limit: 1800
+  ckpt_format: torch
   ckpt_resume: 0
   artifacts: {/workspace/data/t5_data: text/the_pile/t5_shard00}
   script: |-
