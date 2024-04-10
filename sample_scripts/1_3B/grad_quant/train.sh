@@ -79,7 +79,7 @@ OUTPUT_ARGS="
     --tensorboard-log-interval 1 \
     --wandb-project NeurIPS \
     --wandb-save-dir ${WANDB_DIR} \
-    --wandb-exp-name 1_3B-baseline \
+    --wandb-exp-name 1_3B-Grad-Quant \
 "
 
 QUANTIZE_ARGS="
@@ -87,6 +87,12 @@ QUANTIZE_ARGS="
     --recompute-activations \
     --recompute-granularity selective \
     --overlap-grad-reduce \
+    --quantized-gradients \
+    --gq-group-size-inter 128 \
+    --gradient-quantization-bits-inter 4 \
+    --gq-group-size-intra 128 \
+    --gradient-quantization-bits-intra 8 \
+    --hadamard-transform \
 "
 
 torchrun $DISTRIBUTED_ARGS pretrain_gpt.py \
