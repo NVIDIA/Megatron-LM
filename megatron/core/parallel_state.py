@@ -457,7 +457,6 @@ def initialize_model_parallel(
         if rank in ranks:
             _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = group
 
-
         for j in range(context_parallel_size):
             ranks = []
             for k in range(data_parallel_size):
