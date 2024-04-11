@@ -605,6 +605,7 @@ class ColumnParallelLinear(torch.nn.Module):
         is_expert: If True, the layer is treated as an MoE expert layer.
         config: ModelParallelConfig object
         tp_comm_buffer_name: Communication buffer name is not used in non-Transformer-Engine modules.
+        disable_grad_reduce: If True, reduction of output gradients across tensor-parallel ranks will be disabled. Defaults to False. This feature is used by Lora Adapter in Nemo to delay and fuse reduction along with other gradients for performance optimization.
     """
 
     def __init__(
@@ -624,6 +625,7 @@ class ColumnParallelLinear(torch.nn.Module):
         grad_output_buffer: Optional[List[torch.Tensor]] = None,
         is_expert: bool = False,
         tp_comm_buffer_name: str = None,  # Not used
+        disable_grad_reduce: bool = False,
     ):
         super(ColumnParallelLinear, self).__init__()
 
@@ -640,6 +642,7 @@ class ColumnParallelLinear(torch.nn.Module):
         self.embedding_activation_buffer = embedding_activation_buffer
         self.grad_output_buffer = grad_output_buffer
         self.config = config
+        self.disable_grad_reduce = disable_grad_reduce
 
         # Parameters.
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
@@ -791,6 +794,7 @@ class ColumnParallelLinear(torch.nn.Module):
             self.async_tensor_model_parallel_allreduce
             or self.sequence_parallel
             or self.explicit_expert_comm
+            or self.disable_grad_reduce
         ):
             input_parallel = input_
         else:

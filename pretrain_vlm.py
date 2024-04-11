@@ -12,6 +12,7 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.multimodal_dataset import MockMultimodalDataset, MultimodalDatasetConfig
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training import pretrain
@@ -41,10 +42,11 @@ def model_provider(pre_process=True, post_process=True) -> LLaVAModel:
         language_transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             args.num_experts, args.moe_grouped_gemm
         )
+    
+    vision_transformer_layer_spec = get_vit_layer_with_transformer_engine_spec()
 
     # TODO: Make these configurable via input .yaml config.
     vision_transformer_config = deepcopy(language_transformer_config)
-    vision_transformer_layer_spec = deepcopy(language_transformer_layer_spec)
 
     vision_projection_type = "mlp"
     vision_projection_config = deepcopy(language_transformer_config)

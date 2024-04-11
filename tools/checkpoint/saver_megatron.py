@@ -170,6 +170,9 @@ def save_checkpoint(queue, args):
     margs.use_mcore_models = False
     margs.transformer_impl = args.saver_transformer_impl
 
+    # Do not instantiate Tensorboard
+    margs.tensorboard_dir = None
+
     set_global_variables(margs, build_tokenizer=False)
 
     # margs = megatron args
