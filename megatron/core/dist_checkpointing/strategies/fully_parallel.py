@@ -443,6 +443,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                     list(round_tensors),
                     round_tensors[local_rank],
                     group=self.parallelization_group,
+                    async_op=True
                 )
 
                 shards_by_round[round_idx] = None  # remove tensor references
