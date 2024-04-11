@@ -7,7 +7,7 @@ import os
 rank = Utils.rank
 world_size = Utils.world_size
 
-def test_initialize__and_destroy_model_parallel():
+def test_initialize_and_destroy_model_parallel():
     with pytest.raises(AssertionError):
         assert(ps.initialize_model_parallel())
     Utils.initialize_distributed()
@@ -74,6 +74,18 @@ def test_pipeline_model_parallel_rank():
     assert(ps.get_pipeline_model_parallel_rank() == rank)
     ps.set_pipeline_model_parallel_rank(None)
     assert(ps.get_pipeline_model_parallel_rank() == rank)
+    Utils.destroy_model_parallel()
+
+def test_context_parallel_rank():
+    Utils.initialize_model_parallel(context_parallel_size=world_size)
+    assert(ps.get_context_parallel_rank() == rank)
+    Utils.destroy_model_parallel()
+
+def test_expert_model_parallel_rank():
+    Utils.initialize_model_parallel(expert_parallel_size=world_size)
+    assert(ps.get_expert_model_parallel_rank() == rank)
+    ps.set_expert_model_parallel_rank(None)
+    assert(ps.get_expert_model_parallel_rank() == rank)
     Utils.destroy_model_parallel()
     
 
