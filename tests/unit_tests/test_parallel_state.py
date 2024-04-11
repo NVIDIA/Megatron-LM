@@ -82,7 +82,7 @@ def test_context_parallel_rank():
     Utils.destroy_model_parallel()
 
 def test_expert_model_parallel_rank():
-    Utils.initialize_model_parallel(expert_parallel_size=world_size)
+    Utils.initialize_model_parallel(expert_model_parallel_size=world_size)
     assert(ps.get_expert_model_parallel_rank() == rank)
     ps.set_expert_model_parallel_rank(None)
     assert(ps.get_expert_model_parallel_rank() == rank)
