@@ -18,8 +18,7 @@ from megatron.core.dist_checkpointing.dict_utils import (
     merge,
     nested_values,
 )
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict, \
-    is_main_replica, StateDict
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict, StateDict, is_main_replica
 from megatron.core.dist_checkpointing.serialization import validate_sharding_integrity
 from megatron.core.dist_checkpointing.strategies.base import (
     LoadShardedStrategy,
@@ -138,6 +137,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             - gather_rounds (default) - ranks all gather individual tensors in rounds
             See method docs for more details.
     """
+
     def __init__(
         self,
         strategy: LoadShardedStrategy,
@@ -188,7 +188,9 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         # Step 1 and 2: exchange load metadata and distributed the load
         start = time()
         precomputed_distribution = self.apply_loading_parallelization(sharded_state_dict)
-        assert precomputed_distribution is not None, 'Expecting non-trivial distribution for non-trivial parallelization group'
+        assert (
+            precomputed_distribution is not None
+        ), 'Expecting non-trivial distribution for non-trivial parallelization group'
         end = time()
         logger.debug(f'self.apply_loading_parallelization took {end - start}s')
         start = end
@@ -226,10 +228,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             raise NotImplementedError(f'Unrecognized gather algorithm: {self.exchange_algo}')
 
         all_loaded_tensors = exchange_fn(
-            loaded_tensors,
-            unloaded_shards,
-            precomputed_distribution,
-            self.parallelization_group,
+            loaded_tensors, unloaded_shards, precomputed_distribution, self.parallelization_group,
         )
         if not set(unloaded_shards.keys()).issubset(all_loaded_tensors.keys()):
             missing_shards = set(unloaded_shards.keys()) - all_loaded_tensors.keys()
@@ -435,15 +434,16 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                             assert shard_id in loaded_tensors, (shard_id, loaded_tensors.keys())
                             local_ten = loaded_tensors[shard_id]
                         else:
-                            local_ten = self._get_empty_tensor_for_exchange(shard_id, shard_to_metadata,
-                                                                            unloaded_shards, all_loaded_tensors)
+                            local_ten = self._get_empty_tensor_for_exchange(
+                                shard_id, shard_to_metadata, unloaded_shards, all_loaded_tensors
+                            )
                     round_tensors.append(local_ten)
 
                 torch.distributed.all_gather(
                     list(round_tensors),
                     round_tensors[local_rank],
                     group=self.parallelization_group,
-                    async_op=True
+                    async_op=True,
                 )
 
                 shards_by_round[round_idx] = None  # remove tensor references
@@ -492,8 +492,9 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                 assert shard_id in loaded_tensors, (shard_id, loaded_tensors.keys())
                 local_ten = loaded_tensors[shard_id]
             else:
-                local_ten = self._get_empty_tensor_for_exchange(shard_id, shard_to_metadata,
-                                                                unloaded_shards, all_loaded_tensors)
+                local_ten = self._get_empty_tensor_for_exchange(
+                    shard_id, shard_to_metadata, unloaded_shards, all_loaded_tensors
+                )
 
             global_src_rank = torch.distributed.get_global_rank(parallelization_group, rank)
             torch.distributed.broadcast(
@@ -506,9 +507,13 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
 
         return all_loaded_tensors
 
-    def _get_empty_tensor_for_exchange(self, shard_id: ChunkId, needed_shards: Dict[ChunkId, ShardedTensor],
-                                       unneeded_shards: Dict[ChunkId, ShardedTensor],
-                                       loaded_tensors: Dict[ChunkId, torch.Tensor]) -> torch.Tensor:
+    def _get_empty_tensor_for_exchange(
+        self,
+        shard_id: ChunkId,
+        needed_shards: Dict[ChunkId, ShardedTensor],
+        unneeded_shards: Dict[ChunkId, ShardedTensor],
+        loaded_tensors: Dict[ChunkId, torch.Tensor],
+    ) -> torch.Tensor:
         """ Determines the empty tensor to use for exchange.
 
         If shard_id is needed by this rank, it will be in the `unloaded_shards`.
@@ -552,6 +557,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         Returns:
 
         """
+
         def fill_in_sharded_tensor(x):
             if isinstance(x, ShardedTensor):
                 try:
