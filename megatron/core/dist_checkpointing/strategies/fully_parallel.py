@@ -1,6 +1,7 @@
 import logging
 from collections import defaultdict
 from functools import reduce
+from itertools import zip_longest
 from pathlib import Path
 from time import time
 from typing import Dict, List, Optional, Set, Tuple, TypeVar, cast
@@ -418,54 +419,25 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                 [] for _ in range(torch.distributed.get_world_size(group=parallelization_group))
             ]
             for shard_id, rank in shard_to_saving_rank.items():
-                if shard_to_metadata[shard_id].dtype != dtype:
-                    continue
-                if rank == local_rank:
-                    assert shard_id in loaded_tensors, (shard_id, loaded_tensors.keys())
-                    shards_by_rank[rank].append(loaded_tensors[shard_id])
-                else:
-                    shards_by_rank[rank].append(shard_id)
+                shards_by_rank[rank].append(shard_id)
 
-            # fill ranks with fewer tensors with empty tensors
-            num_rounds = max(map(len, shards_by_rank))
-            for rank_shards in shards_by_rank:
-                rank_shards.extend(
-                    [
-                        torch.empty(0, dtype=dtype, device='cuda')
-                        for _ in range(num_rounds - len(rank_shards))
-                    ]
-                )
-
-            torch.distributed.barrier()
-            end = time()
-            if torch.distributed.get_rank() == 0:
-                logger.debug(f'{dtype} exchange rounds prep time took {end - start}s')
-            start = time()
-
-            # Transpose `shards_by_rank` and remove the original reference.
-            # This helps forget tensors that are not needed by this rank
-            shards_by_round = list(zip(*shards_by_rank))
-            assert len(shards_by_round) == num_rounds, (len(shards_by_round), num_rounds)
-            del shards_by_rank
-            # Exchange in rounds
-            for round_idx, round_tensors in enumerate(shards_by_round):
-                round_tensors = list(round_tensors)
-                for rank in range(len(round_tensors)):
-                    if not isinstance(round_tensors[rank], torch.Tensor):
-                        shard_id = round_tensors[rank]
+            # Transpose `shards_by_rank` to form exchange rounds
+            shards_by_round = zip_longest(*shards_by_rank, fillvalue=None)
+            for round_idx, round_shard_ids in enumerate(shards_by_round):
+                round_tensors = []
+                for rank, shard_id in enumerate(round_shard_ids):
+                    if round_tensors is None:
+                        # if no more useful data, the given rank will exchange empty tensor
+                        local_ten = torch.empty(0, dtype=dtype, device='cuda')
+                    else:
                         assert isinstance(shard_id, tuple), type(shard_id)
-                        local_unloaded_sh_ten = unloaded_shards.get(shard_id)
-                        if local_unloaded_sh_ten is None:
-                            sh_ten = shard_to_metadata[shard_id]
-                            sh_ten.init_data('cuda')
-                            local_ten = sh_ten.data
-                            sh_ten.data = None  # won't be used. free memory
+                        if rank == local_rank:
+                            assert shard_id in loaded_tensors, (shard_id, loaded_tensors.keys())
+                            local_ten = loaded_tensors[shard_id]
                         else:
-                            local_unloaded_sh_ten.init_data('cuda')
-                            local_ten = local_unloaded_sh_ten.data
-                            all_loaded_tensors[shard_id] = local_ten
-
-                        round_tensors[rank] = local_ten
+                            local_ten = self._get_empty_tensor_for_exchange(shard_id, shard_to_metadata,
+                                                                            unloaded_shards, all_loaded_tensors)
+                    round_tensors.append(local_ten)
 
                 torch.distributed.all_gather(
                     list(round_tensors),
@@ -517,22 +489,14 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         for shard_id, rank in shard_to_saving_rank.items():
             if rank == local_rank:
                 assert shard_id in loaded_tensors, (shard_id, loaded_tensors.keys())
-                tensor = loaded_tensors[shard_id]
+                local_ten = loaded_tensors[shard_id]
             else:
-                local_unloaded_sh_ten = unloaded_shards.get(shard_id)
-                if local_unloaded_sh_ten is None:
-                    sh_ten = shard_to_metadata[shard_id]
-                    sh_ten.init_data('cuda')
-                    tensor = sh_ten.data
-                    sh_ten.data = None  # won't be used. free memory
-                else:
-                    local_unloaded_sh_ten.init_data('cuda')
-                    tensor = local_unloaded_sh_ten.data
-                    all_loaded_tensors[shard_id] = tensor
+                local_ten = self._get_empty_tensor_for_exchange(shard_id, shard_to_metadata,
+                                                                unloaded_shards, all_loaded_tensors)
 
             global_src_rank = torch.distributed.get_global_rank(parallelization_group, rank)
             torch.distributed.broadcast(
-                tensor, src=global_src_rank, group=parallelization_group, async_op=True
+                local_ten, src=global_src_rank, group=parallelization_group, async_op=True
             )
 
         end = time()
@@ -540,6 +504,38 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             logger.debug(f'exchange broadcast schedule took {end - start}s')
 
         return all_loaded_tensors
+
+    def _get_empty_tensor_for_exchange(self, shard_id: ChunkId, needed_shards: Dict[ChunkId, ShardedTensor],
+                                       unneeded_shards: Dict[ChunkId, ShardedTensor],
+                                       loaded_tensors: Dict[ChunkId, torch.Tensor]) -> torch.Tensor:
+        """ Determines the empty tensor to use for exchange.
+
+        If shard_id is needed by this rank, it will be in the `unloaded_shards`.
+        Otherwise, the metadata for this tensor can be found in `shard_to_metadata`
+
+        Args:
+            shard_id (ChunkId): shard_id that will be exchanged
+            needed_shards (Dict[ChunkId, ShardedTensor]): mapping from shard ids
+                to metadata for shards needed by this rank
+            unneeded_shards (Dict[ChunkId, ShardedTensor]): mapping from shard ids
+                to metadata for shards that can be discarded after exchange
+            loaded_tensors (Dict[ChunkId, torch.Tensor]): mapping where useful tensors
+                are placed in
+
+        Returns:
+            torch.Tensor: empty tensor to be exchanged
+        """
+        local_unloaded_sh_ten = needed_shards.get(shard_id)
+        if local_unloaded_sh_ten is None:
+            sh_ten = unneeded_shards[shard_id]
+            sh_ten.init_data('cuda')
+            tensor = sh_ten.data
+            sh_ten.data = None  # won't be used. free memory
+        else:
+            local_unloaded_sh_ten.init_data('cuda')
+            tensor = local_unloaded_sh_ten.data
+            loaded_tensors[shard_id] = tensor
+        return tensor
 
     def fill_in_deferred_sharded_tensors(
         self, sharded_state_dict: ShardedStateDict, loaded_tensors: Dict[ChunkId, torch.Tensor]
