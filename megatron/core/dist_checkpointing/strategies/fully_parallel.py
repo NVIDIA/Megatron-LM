@@ -425,14 +425,18 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             for round_idx, round_shard_ids in enumerate(shards_by_round):
                 round_tensors = []
                 for rank, shard_id in enumerate(round_shard_ids):
-                    if round_tensors is None:
+                    if shard_id is None:
                         # if no more useful data, the given rank will exchange empty tensor
                         local_ten = torch.empty(0, dtype=dtype, device='cuda')
                     else:
                         assert isinstance(shard_id, tuple), type(shard_id)
                         if rank == local_rank:
-                            assert shard_id in loaded_tensors, (shard_id, loaded_tensors.keys())
-                            local_ten = loaded_tensors[shard_id]
+                            assert shard_id in all_loaded_tensors, (
+                                shard_id,
+                                all_loaded_tensors.keys(),
+                            )
+                            all_loaded_tensors[shard_id] = all_loaded_tensors[shard_id].cuda()
+                            local_ten = all_loaded_tensors[shard_id].cuda()
                         else:
                             local_ten = self._get_empty_tensor_for_exchange(
                                 shard_id, shard_to_metadata, unloaded_shards, all_loaded_tensors
@@ -446,7 +450,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                     async_op=True,
                 )
 
-                shards_by_round[round_idx] = None  # remove tensor references
+                del round_tensors  # remove tensor references
 
             end = time()
             if torch.distributed.get_rank() == 0:
@@ -489,8 +493,9 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         start = time()
         for shard_id, rank in shard_to_saving_rank.items():
             if rank == local_rank:
-                assert shard_id in loaded_tensors, (shard_id, loaded_tensors.keys())
-                local_ten = loaded_tensors[shard_id]
+                assert shard_id in all_loaded_tensors, (shard_id, all_loaded_tensors.keys())
+                all_loaded_tensors[shard_id] = all_loaded_tensors[shard_id].cuda()
+                local_ten = all_loaded_tensors[shard_id].cuda()
             else:
                 local_ten = self._get_empty_tensor_for_exchange(
                     shard_id, shard_to_metadata, unloaded_shards, all_loaded_tensors

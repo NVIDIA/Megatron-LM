@@ -120,7 +120,7 @@ class TestFullyParallelSaveAndLoad:
                                                          parallelization_group,
                                                          do_cache_distribution=True)
         save_strategy.save(state_dict, Path('mock_dir'))
-        shard_to_rank, shards_saved_by_this_dp_group = save_strategy.cached_distribution
+        shard_to_rank, shards_saved_by_this_dp_group, _ = save_strategy.cached_distribution
         key_to_saving_rank = dict(map_reduce(shard_to_rank.items(), lambda shard_rank: shard_rank[0][0], lambda shard_rank: shard_rank[1]))
         assert expected_key_to_saving_ranks == key_to_saving_rank
 
@@ -173,7 +173,7 @@ class TestFullyParallelSaveAndLoad:
                                                          parallelization_group,
                                                          do_cache_distribution=True)
         loaded_state_dict = load_strategy.load(state_dict, Path('mock_dir'))
-        shard_to_rank, shards_saved_by_this_dp_group = load_strategy.cached_distribution
+        shard_to_rank, shards_saved_by_this_dp_group, _ = load_strategy.cached_distribution
         key_to_saving_rank = dict(map_reduce(shard_to_rank.items(), lambda shard_rank: shard_rank[0][0], lambda shard_rank: shard_rank[1]))
         assert expected_key_to_saving_ranks == key_to_saving_rank
 
