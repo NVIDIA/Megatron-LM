@@ -1,5 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import logging
+from collections import namedtuple
+from functools import partial
+from typing import List
 
 import torch
 
@@ -26,6 +29,7 @@ class LLaVAModel(MegatronModule):
         vision_projection_config (TransformerConfig): Config for the projection from vision model outputs to language model inputs.
         vision_projection_layer_spec (ModuleSpec): Specifies the module to use for the vision projection.
         vision_projection_type (str): Type of the vision projection to use. Default is a 2-layer MLP.
+        allow_missing_vision_projection_checkpoint (bool): Allow vision projection weights to be missing when loading a checkpoint. Default False.
     """
 
     def __init__(
@@ -39,6 +43,7 @@ class LLaVAModel(MegatronModule):
         vision_projection_config: TransformerConfig,
         vision_projection_layer_spec: ModuleSpec,
         vision_projection_type: str = "mlp",
+        allow_missing_vision_projection_checkpoint: bool = False,
     ) -> None:
         super().__init__(config=language_transformer_config)
 
@@ -66,6 +71,17 @@ class LLaVAModel(MegatronModule):
             vision_transformer_config.hidden_size,  # input size to the projection.
         )
 
+        # This allows ignoring missing weights for the vision projection during checkpoint loading.
+        # This should be disabled by default but can be enabled if your checkpoint contains pretrained
+        # vision and language models but not the projection from vision model outputs to language model inputs.
+        if allow_missing_vision_projection_checkpoint:
+            vision_projection_param_names = [
+                f"vision_projection.{name}" for name in self.vision_projection.state_dict().keys()
+            ]
+            self.vision_projection.register_load_state_dict_post_hook(
+                partial(_load_state_dict_hook_ignore_param_names, vision_projection_param_names)
+            )
+
     def set_input_tensor(self, input_tensor: torch.Tensor) -> None:
         """Sets input tensor to the model.
 
@@ -75,6 +91,30 @@ class LLaVAModel(MegatronModule):
             input_tensor (Tensor): Sets the input tensor for the model.
         """
         self.vision_model.set_input_tensor(input_tensor)
+
+    def freeze(
+        self, freeze_language_model: bool, freeze_vision_model: bool, freeze_vision_projection: bool
+    ):
+        """Freeze model modules.
+
+        Make specific modules non-trainable by setting requires_grad to False for the module's parameters.
+
+        Args:
+            freeze_language_model (bool): Freeze the language model module.
+            freeze_vision_model (bool): Freeze the vision model module.
+            freeze_vision_projection (bool): Freeze the vision projection module.
+        """
+        modules = []
+        if freeze_language_model:
+            modules.append(self.language_model)
+        if freeze_vision_model:
+            modules.append(self.vision_model)
+        if freeze_vision_projection:
+            modules.append(self.vision_projection)
+
+        for module in modules:
+            for param in module.parameters():
+                param.requires_grad = False
 
     def forward(
         self,
@@ -123,3 +163,23 @@ class LLaVAModel(MegatronModule):
         )
 
         return output
+
+
+def _load_state_dict_hook_ignore_param_names(
+    param_names: List[str], module: torch.nn.Module, incompatible_keys: namedtuple
+):
+    """Hook to ignore missing keys during checkpoint loading.
+
+    By default, this should not be used to avoid accidentally missing weights in checkpoint loading.
+
+    Example use case: Use this for the vision projection if you want to load a checkpoint that contains vision and language model weights
+    but not the vision projection weights.
+
+    Args:
+        param_names (list of str): Parameter names allowed to be missing when calling load_state_dict.
+        module (torch.nn.Module): The torch module this hook applies to. Unused here but required by the torch API.
+        incompatible_keys (namedtuple): Namedtuple with fields missing_keys and unexpected_keys, which collect the missing and unexpected
+            keys when calling load_state_dict on this torch module, respectively.
+    """
+    for param_name in param_names:
+        incompatible_keys.missing_keys.remove(param_name)

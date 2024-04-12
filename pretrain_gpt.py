@@ -17,6 +17,7 @@ from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
 import megatron.legacy.model
 from megatron.core.models.gpt import GPTModel
 from megatron.training import pretrain
+from megatron.core.utils import StragglerDetector
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
@@ -30,6 +31,8 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
 )
 
+
+stimer = StragglerDetector()
 
 def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
     """Builds the model.
@@ -148,13 +151,16 @@ def forward_step(data_iterator, model: GPTModel):
     timers = get_timers()
 
     # Get the batch.
-    timers('batch-generator', log_level=2).start()
-    tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
-        data_iterator)
+    timers('batch-generator', log_level=2).start() 
+    global stimer
+    with stimer(bdata=True):
+        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
+            data_iterator)
     timers('batch-generator').stop()
 
-    output_tensor = model(tokens, position_ids, attention_mask,
-                          labels=labels)
+    with stimer:
+        output_tensor = model(tokens, position_ids, attention_mask,
+                              labels=labels)
 
     return output_tensor, partial(loss_func, loss_mask)
 

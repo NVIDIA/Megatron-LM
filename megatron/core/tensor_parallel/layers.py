@@ -248,11 +248,11 @@ class VocabParallelEmbedding(torch.nn.Module):
 
 class LinearWithFrozenWeight(torch.autograd.Function):
     """Linear operator that does not calculate gradient for weight.
-    This op and LinearWithGradAccumulationAndAsyncCommunication performs 
-    mathematically-identical forward and DGRAD. 
+    This op and LinearWithGradAccumulationAndAsyncCommunication performs
+    mathematically-identical forward and DGRAD.
 
     Conceptually this op is the same as torch.nn.functional.linear with
-    weight.requires_grad==False, but in experiments they are not identical 
+    weight.requires_grad==False, but in experiments they are not identical
     mathematically. """
 
     @staticmethod
@@ -281,13 +281,14 @@ def linear_with_frozen_weight(
     gradient_accumulation_fusion: bool,
     async_grad_allreduce: bool,
     sequence_parallel: bool,
+    grad_output_buffer: Optional[List[torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Linear layer execution with weight.requires_grad == False.
 
-    This function handles linear layers with weight frozen (untrainable). 
+    This function handles linear layers with weight frozen (untrainable).
     In the forward, it only saves weight and does not save input activations.
-    In the backward, it does not perform weight gradient calculation, or 
-    weight gradient allreduce. 
+    In the backward, it does not perform weight gradient calculation, or
+    weight gradient allreduce.
 
     Args:
 
@@ -297,17 +298,26 @@ def linear_with_frozen_weight(
 
     bias (torch.Tensor optional): bias like torch.nn.functional.linear
 
-    gradient_accumulation_fusion (bool required): dummy argument, used to 
+    gradient_accumulation_fusion (bool required): dummy argument, used to
     keep the API unified between all forward implementation functions.
 
-    async_grad_allreduce (bool required): dummy argument, used to 
+    async_grad_allreduce (bool required): dummy argument, used to
     keep the API unified between all forward implementation functions.
 
     sequence_parallel (bool required): Indicates that sequence
         parallelism is used and thus in the forward pass the input is
         all gathered, and the backward pass the input gradients are
         reduce scattered.
+
+    grad_output_buffer (List[torch.Tensor] optional): dummy argument, used to
+    keep the API unified between all forward implementation functions.
+
     """
+
+    assert grad_output_buffer is None, (
+        "grad_output_buffer kwarg is only supported with "
+        "linear_with_grad_accumulation_and_async_allreduce"
+    )
 
     if sequence_parallel:
         input = gather_from_sequence_parallel_region(input, tensor_parallel_output_grad=True)
@@ -595,6 +605,7 @@ class ColumnParallelLinear(torch.nn.Module):
         is_expert: If True, the layer is treated as an MoE expert layer.
         config: ModelParallelConfig object
         tp_comm_buffer_name: Communication buffer name is not used in non-Transformer-Engine modules.
+        disable_grad_reduce: If True, reduction of output gradients across tensor-parallel ranks will be disabled. Defaults to False. This feature is used by Lora Adapter in Nemo to delay and fuse reduction along with other gradients for performance optimization.
     """
 
     def __init__(
@@ -614,6 +625,7 @@ class ColumnParallelLinear(torch.nn.Module):
         grad_output_buffer: Optional[List[torch.Tensor]] = None,
         is_expert: bool = False,
         tp_comm_buffer_name: str = None,  # Not used
+        disable_grad_reduce: bool = False,
     ):
         super(ColumnParallelLinear, self).__init__()
 
@@ -630,6 +642,7 @@ class ColumnParallelLinear(torch.nn.Module):
         self.embedding_activation_buffer = embedding_activation_buffer
         self.grad_output_buffer = grad_output_buffer
         self.config = config
+        self.disable_grad_reduce = disable_grad_reduce
 
         # Parameters.
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
@@ -781,6 +794,7 @@ class ColumnParallelLinear(torch.nn.Module):
             self.async_tensor_model_parallel_allreduce
             or self.sequence_parallel
             or self.explicit_expert_comm
+            or self.disable_grad_reduce
         ):
             input_parallel = input_
         else:

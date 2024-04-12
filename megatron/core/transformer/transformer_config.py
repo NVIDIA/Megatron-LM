@@ -73,6 +73,10 @@ class TransformerConfig(ModelParallelConfig):
     activation_func: Callable = F.gelu
     """Activation function to use for the non-linearity in the MLP."""
 
+    activation_func_fp8_input_store: bool = False
+    """Store the input of MLP activation function in FP8 for backprop to save memory.
+    The stored input is casted back to the original precision before backprop compuatation."""
+
     num_moe_experts: int = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
@@ -251,6 +255,9 @@ class TransformerConfig(ModelParallelConfig):
     disable_parameter_transpose_cache: bool = False
     """When set to true, the parameter transposes are not cached for subsequent iterations."""
 
+    enable_cuda_graph: bool = False
+    """When set to true, TransformerLayer blocks are wrapped with CUDA graph."""
+
     # These 2 attributes are WAR for TRTLLM export. DO NOT USE!! WILL BE DEPRECATED SOON!!
     max_position_embeddings: int = 0
     """Deprecated. Do not use."""
@@ -371,6 +378,9 @@ class TransformerConfig(ModelParallelConfig):
                     "When bias_activation_fusion is True, gated_linear_unit is False, "
                     "and activation function is gelu, add_bias_linear must also be True."
                 )
+        if self.activation_func_fp8_input_store:
+            if self.activation_func != F.silu or not self.gated_linear_unit:
+                raise ValueError("Storing activation input in FP8 is supported only for SwiGLU.")
         if self.apply_rope_fusion and self.rotary_interleaved:
             raise ValueError(f'rotary_interleaved does not work with apply_rope_fusion.')
 
