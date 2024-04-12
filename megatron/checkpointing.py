@@ -6,6 +6,7 @@ import os
 import random
 import sys
 import numpy as np
+import subprocess
 
 import torch
 
@@ -17,6 +18,13 @@ from .utils import (unwrap_model,
 
 
 _CHECKPOINT_VERSION = None
+
+
+def run_rsync_checkpoints(script_path: str, iteration: int):
+    """シェルスクリプトをバックグラウンドで実行する"""
+    rank = torch.distributed.get_rank()
+    if rank % 8 == 0:
+        subprocess.Popen(['/bin/bash', script_path, str(iteration)])
 
 
 def set_checkpoint_version(value):
@@ -312,6 +320,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
+    # cfiken: Run rsync in the background to sync the checkpoints
+    if torch.distributed.is_initialized():
+        run_rsync_checkpoints("./script/sync_models.sh", iteration)
+
 
 def _transpose_first_dim(t, num_splits, num_splits_first, model):
     input_shape = t.size()
@@ -511,6 +523,13 @@ def load_args_from_checkpoint(args, load_arg='load'):
     _set_arg('normalization', force=True)
     _set_arg('tokenizer_type')
     _set_arg('padded_vocab_size')
+    # mixtral
+    _set_arg('num_experts', force=True)
+    _set_arg('num_experts_per_tok', force=True)
+    _set_arg('moe_type', force=True)
+    _set_arg('moe_load_balancing_mode', force=True)
+    _set_arg('router_aux_loss_coef', force=True)
+    _set_arg('sliding_window', force=True)
     if checkpoint_version < 3.0:
         _set_arg('tensor_model_parallel_size',
                  'model_parallel_size')

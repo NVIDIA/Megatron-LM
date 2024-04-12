@@ -1,0 +1,8 @@
+pybind11
+nltk
+python-dotenv
+transformers==4.37.2
+sentencepiece==0.1.99
+accelerate==0.26.1
+wandb==0.16.2
+flash-attn==2.5.6

@@ -1,3 +1,97 @@
+# 前提
+Megatron-LMのベースは
+`599f558dbd7580a5c47b23f6cc5afab22221dff7`時点のものを使用
+# ubuntuのインスタンスを使って開発用環境を作る場合
+## 環境準備
+並列で動かすノードの数だけDockerコンテナを立ち上げる。各コンテナ内で学習スクリプトの起動が必要。  
+ノード間で異なるのは.envの`NODE_RANK`のみ  
+## ファイル準備
+`.env`, `Makefile`, `docker-compose.yml`を作成
+```
+cp .env.example .env
+cp Makefike.sample Makefile
+cp docker-compose.yml.sample docker-compose.yml
+```
+.envの中身
+```
+# external
+WANDB_PROJECT=xxx
+WANDB_API_KEY=xxx
+HF_TOKEN=hf_xxx
+# distributed
+MASTER_ADDR=10.0.0.xx  # マルチノードのアドレス
+MASTER_PORT=6000
+NNODES=2  # いくつのノードで並列学習するか
+NODE_RANK=0  # このノードのRANK. NNODES=2の場合、MasterがNODE_RANK=0でもう一つのノードがNODE_RANK=1となる
+# path
+CHECKPOINT_PATH=/mnt/nfs/dev/xxx/checkpoints/mixtral
+CHECKPOINT_LOCAL_PATH="./checkpoints/mixtral"
+LOAD_CHECKPOINT_PATH="/mnt/nfs/models/Mixtral-8x7B-v0.1"
+TOKENIZER_MODEL=/mnt/nfs/models/Mixtral-8x7B-v0.1
+DATA_PATH=/mnt/nfs/data/xxx_text_document
+# model
+TMP_SIZE=4
+PMP_SIZE=4
+```
+
+## コンテナの起動
+NFSをマウントするのを先にしておくこと  
+```
+make init-env
+make docker-up
+```
+以降コンテナ内で作業  
+
+## データ作成
+jsonlのデータをtokenizeして保存する.
+```
+python tools/preprocess_data.py \
+	--input data/alpaca_cleaned_ja.jsonl \
+	--output-prefix data/mixtral \
+	--tokenizer-model /mnt/nfs/models/Mixtral-8x7B-v0.1 \
+	--tokenizer-type HFTokenizer \
+	--json-key text \
+	--append-eod \
+	--workers 80
+```
+
+## HuggingFaceのMixtralモデルの変換
+```
+python tools/checkpoint/util.py
+   --model-type GPT \
+   --loader mixtral_hf \
+	--saver mixtral \
+	--load-dir /mnt/nfs/models/Mixtral-8x7B-v0.1 \
+	--save-dir /mnt/nfs/models/Mixtral-8x7B-v0.1-tp4-pp4 \
+	--tokenizer-model /mnt/nfs/models/Mixtral-8x7B-v0.1 \
+	--target-tensor-parallel-size 4 \
+	--target-pipeline-parallel-size 4
+```
+
+## 学習
+test_groupがwandbのグループ名になる
+```
+. .env && ./examples/pretrain_mixtral_distributed.sh test_group
+```
+
+## MegatronのMixtralモデルをHuggingFaceに変換
+```
+python tools/checkpoint/util.py
+   --model-type GPT \
+	--saver mixtral_hf \
+	--load-dir /mnt/nfs/models/Mixtral-8x7B-v0.1-tp4-pp4 \
+	--save-dir /mnt/nfs/models/Mixtral-8x7B-v0.1-tp4-pp4-hf \
+	--target-tensor-parallel-size 4 \
+	--target-pipeline-parallel-size 4 \
+	--check-eq-with-hf /mnt/nfs/models/Mixtral-8x7B-v0.1
+```
+# GKEでの本番学習環境構築
+後ほど更新
+[README](kubernetes/README.md)
+
+
+
+========== 以下オリジナルのReadme ==========  
 Megatron ([1](https://arxiv.org/pdf/1909.08053.pdf), [2](https://arxiv.org/pdf/2104.04473.pdf), and [3](https://arxiv.org/pdf/2205.05198)) is a large, powerful transformer developed by the Applied Deep Learning Research team at NVIDIA. This repository is for ongoing research related to training large transformer language models at scale. We developed efficient, model-parallel ([tensor](https://arxiv.org/pdf/1909.08053.pdf), [sequence](https://arxiv.org/pdf/2205.05198), and [pipeline](https://arxiv.org/pdf/2104.04473.pdf)), and multi-node pre-training of transformer based models such as [GPT](https://arxiv.org/abs/2005.14165), [BERT](https://arxiv.org/pdf/1810.04805.pdf), and [T5](https://arxiv.org/abs/1910.10683) using mixed precision.
 
 Below are some of the projects where we have directly used Megatron:

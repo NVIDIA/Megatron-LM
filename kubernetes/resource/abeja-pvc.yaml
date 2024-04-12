@@ -1,0 +1,11 @@
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: abeja
+spec:
+  accessModes:
+  - ReadWriteMany
+  storageClassName: filestore-sc
+  resources:
+    requests:
+      storage: 50Ti
