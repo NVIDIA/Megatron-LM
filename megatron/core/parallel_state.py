@@ -178,6 +178,10 @@ def initialize_model_parallel(
             all-reduce is required in backward. For simplicity, we piggyback
             GPUs of context parallelism on data parallel group for
             weight gradient all-reduce.
+        
+        expert_model_parallel_size (int, default = 1):
+            The number of Mixture of Experts parallel GPUs in each expert
+            parallel group.
 
         nccl_communicator_config_path (str, default = None):
             Path to the yaml file of NCCL communicator configurations.
@@ -481,31 +485,53 @@ def initialize_model_parallel(
         _DATA_MODULO_EXPERT_PARALLEL_GROUP is None
     ), 'Data modulo expert group is already initialized'
     global _DATA_MODULO_EXPERT_PARALLEL_GROUP_GLOO
-    tensor_and_data_group_size: int = tensor_model_parallel_size * data_parallel_size
-    num_tensor_and_data_groups: int = world_size // tensor_and_data_group_size
-    tensor_and_expert_group_size: int = tensor_model_parallel_size * expert_model_parallel_size
     num_expert_groups: int = data_parallel_size // expert_model_parallel_size
-    for i in range(num_tensor_and_data_groups):
+    for i in range(num_tensor_and_data_groups_with_cp):
         for j in range(num_expert_groups):
             # TPxEP Group
-            start_rank = i * tensor_and_data_group_size + j * tensor_and_expert_group_size
-            end_rank = i * tensor_and_data_group_size + (j + 1) * tensor_and_expert_group_size
-            ranks = range(start_rank, end_rank)
+            ranks = []
+            for k in range(expert_model_parallel_size):
+                start_rank = (
+                    i * tensor_and_data_group_size_with_cp
+                    + j
+                    * tensor_model_parallel_size
+                    * context_parallel_size
+                    * expert_model_parallel_size
+                    + k * tensor_model_parallel_size
+                )
+                end_rank = (
+                    i * tensor_and_data_group_size_with_cp
+                    + j
+                    * tensor_model_parallel_size
+                    * context_parallel_size
+                    * expert_model_parallel_size
+                    + (k + 1) * tensor_model_parallel_size
+                )
+                ranks += list(range(start_rank, end_rank))
             group = torch.distributed.new_group(
                 ranks, timeout=timeout, pg_options=get_nccl_options('tp_exp', nccl_comm_cfgs)
             )
             if rank in ranks:
                 _TENSOR_AND_EXPERT_PARALLEL_GROUP = group
-            for k in range(tensor_model_parallel_size * context_parallel_size):
-                ranks = range(
-                    start_rank + k, end_rank, tensor_model_parallel_size * context_parallel_size
-                )
-                group = torch.distributed.new_group(
-                    ranks, pg_options=get_nccl_options('exp', nccl_comm_cfgs)
-                )
-                if rank in ranks:
-                    _EXPERT_MODEL_PARALLEL_GROUP = group
 
+    tensor_and_expert_group_size_with_cp: int = tensor_model_parallel_size * expert_model_parallel_size * context_parallel_size
+    num_tensor_and_expert_groups_with_cp: int = world_size // tensor_and_expert_group_size_with_cp
+    for i in range(num_tensor_and_expert_groups_with_cp):
+        for j in range(tensor_model_parallel_size * context_parallel_size):
+            start_rank = i * tensor_and_expert_group_size_with_cp + j
+            end_rank = (i + 1) * tensor_and_expert_group_size_with_cp + j
+            ranks = list(
+                range(start_rank, end_rank, tensor_model_parallel_size * context_parallel_size)
+            )
+            group = torch.distributed.new_group(
+                ranks, pg_options=get_nccl_options('exp', nccl_comm_cfgs)
+            )
+            if rank in ranks:
+                _EXPERT_MODEL_PARALLEL_GROUP = group
+
+    tensor_and_data_group_size: int = tensor_model_parallel_size * data_parallel_size
+    num_tensor_and_data_groups: int = world_size // tensor_and_data_group_size
+    tensor_and_expert_group_size: int = tensor_model_parallel_size * expert_model_parallel_size
     for i in range(num_tensor_and_data_groups):
         start_rank = i * tensor_and_data_group_size
         end_rank = (i + 1) * tensor_and_data_group_size
