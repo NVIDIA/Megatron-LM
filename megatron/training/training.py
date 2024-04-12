@@ -23,6 +23,7 @@ from megatron.core.utils import get_model_config
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.legacy.model import Float16Module
+from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
@@ -420,17 +421,20 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     if wrap_with_ddp:
         config = get_model_config(model[0])
+        ddp_config = DistributedDataParallelConfig(
+            grad_reduce_in_fp32=args.accumulate_allreduce_grads_in_fp32,
+            overlap_grad_reduce=args.overlap_grad_reduce,
+            use_distributed_optimizer=args.use_distributed_optimizer,
+            check_for_nan_in_grad=args.check_for_nan_in_loss_and_grad,
+            bucket_size=args.ddp_bucket_size)
         model = [DDP(config,
+                     ddp_config,
                      model_chunk,
                      data_parallel_group=mpu.get_data_parallel_group(with_context_parallel=True),
                      expert_data_parallel_group=mpu.get_data_modulo_expert_parallel_group(),
-                     accumulate_allreduce_grads_in_fp32=args.accumulate_allreduce_grads_in_fp32,
-                     overlap_grad_reduce=args.overlap_grad_reduce,
-                     use_distributed_optimizer=args.use_distributed_optimizer,
                      # Turn off bucketing for model_chunk 2 onwards, since communication for these
                      # model chunks is overlapped with compute anyway.
-                     disable_bucketing=(model_chunk_idx > 0),
-                     check_for_nan_in_grad=args.check_for_nan_in_loss_and_grad)
+                     disable_bucketing=(model_chunk_idx > 0))
                  for (model_chunk_idx, model_chunk) in enumerate(model)]
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
