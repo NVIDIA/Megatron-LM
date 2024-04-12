@@ -155,6 +155,11 @@ class ModelParallelConfig:
        Don't care if tp_comm_overlap is False.
     """
 
+    tp_comm_overlap_rs_dgrad: bool = False
+    """If true, allows Reduce-Scatter overlap with DGRAD GEMM by pipelining the
+       GEMM and Reduce-Scatter splits. Don't care if tp_comm_overlap is False.
+    """
+
     tp_comm_split_ag: bool = True
     """Deprecated from TransformerEngine v1.6.0.
        If true, allows All-Gather overlap with Fprop GEMM by pipelining the GEMM and All-Gather

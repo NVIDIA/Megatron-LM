@@ -981,6 +981,9 @@ def _add_training_args(parser):
                        help=('Disables the Reduce-Scatter overlap with GEMM by '
                              'pipelining the GEMM and Reduce-Scatter.'),
                        dest='tp_comm_overlap_rs')
+    group.add_argument('--tp-comm-overlap-rs-dgrad', action='store_true',
+                       help = 'Enables the Reduce-Scatter overlap with dgrad GEMM.',
+                       dest='tp_comm_overlap_rs_dgrad')
     group.add_argument('--disable-tp-comm-bulk-dgrad', action='store_false',
                        help='Disables the All-Gather overlap with bprop activation gradient GEMM.',
                        dest='tp_comm_bulk_dgrad')
