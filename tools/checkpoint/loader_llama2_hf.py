@@ -182,6 +182,8 @@ def _load_checkpoint(queue, args):
                 '--no-save-optim',
                 '--no-save-rng',
                 '--no-initialization',
+                '--attention-softmax-in-fp32',
+                '--transformer-impl', 'local',
                 '--load', args.load_dir
                 ]
 
