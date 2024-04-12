@@ -106,6 +106,12 @@ class TransformerBlock(MegatronModule):
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
+        # Dictionary to store CUDA graphs. Number of items in the dictionary = len(self.layers).
+        # Item `i` in the dictionary is a list of `N` CUDA graphs for layer 'i' where N is the
+        # number of microbatches. Multiple CUDA graphs per layer is required to support
+        # pipelining which requires running FWD graph of multiple microbatches before BWD graph.
+        self.cuda_graphs = {}
+        self.current_microbatch = -1
 
         # required for pipeline parallel schedules
         self.input_tensor = None
@@ -373,17 +379,35 @@ class TransformerBlock(MegatronModule):
                     packed_seq_params=packed_seq_params,
                 )
             else:
-                for layer in self.layers:
+                for l_no, layer in enumerate(self.layers):
                     with self.offload_context:
-                        hidden_states, context = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            context=context,
-                            context_mask=context_mask,
-                            rotary_pos_emb=rotary_pos_emb,
-                            inference_params=inference_params,
-                            packed_seq_params=packed_seq_params,
-                        )
+                        if (len(self.cuda_graphs) == 0) or (not self.training):
+                            hidden_states, context = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                context=context,
+                                context_mask=context_mask,
+                                rotary_pos_emb=rotary_pos_emb,
+                                inference_params=inference_params,
+                                packed_seq_params=packed_seq_params,
+                            )
+                            # CUDA graph doesn't output context and is expected to be None
+                            assert (
+                                (context is None)
+                                or (not self.config.enable_cuda_graph)
+                                or (not self.training)
+                            )
+                        else:
+                            # CUDA graph replay for layer `l_no` and microbatch `self.current_microbatch`
+                            # CUDA graph requires positional arguments with the exception of is_first_microbatch.
+                            # Also CUDA graph accepts only Tensor inputs and outputs. Hence, the arg list and
+                            # returned list is limited to `hidden_states`.
+                            assert (len(self.cuda_graphs) > l_no) and (
+                                self.current_microbatch < len(self.cuda_graphs[l_no])
+                            )
+                            hidden_states = self.cuda_graphs[l_no][self.current_microbatch](
+                                hidden_states, is_first_microbatch=(self.current_microbatch == 0),
+                            )
 
                     if (
                         torch.is_grad_enabled()

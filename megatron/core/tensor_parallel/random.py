@@ -4,8 +4,10 @@
 # repo: https://github.com/pytorch/pytorch
 
 import contextlib
+from importlib.metadata import version
 
 import torch
+from pkg_resources import packaging
 from torch import _C
 from torch.cuda import _lazy_call
 from torch.cuda import device as device_ctx_manager
@@ -153,11 +155,34 @@ class CudaRNGStatesTracker:
 
 
 # RNG tracker object.
-_CUDA_RNG_STATE_TRACKER = CudaRNGStatesTracker()
+_CUDA_RNG_STATE_TRACKER = None
+_CUDA_RNG_STATE_TRACKER_INITIALIZED = False
+
+
+def initialize_rng_tracker(use_te_rng_tracker: bool = False):
+    global _CUDA_RNG_STATE_TRACKER
+    global _CUDA_RNG_STATE_TRACKER_INITIALIZED
+    if _CUDA_RNG_STATE_TRACKER_INITIALIZED:
+        return
+    if use_te_rng_tracker:
+        try:
+            import transformer_engine.pytorch as te
+
+            _te_version = packaging.version.Version(version("transformer-engine"))
+            if _te_version < packaging.version.Version("1.5.0"):
+                raise RuntimeError("use_te_rng_tracker requires TransformerEngine version >= 1.5")
+        except:
+            raise RuntimeError("use_te_rng_tracker requires TransformerEngine, but not installed")
+    if use_te_rng_tracker:
+        _CUDA_RNG_STATE_TRACKER = te.distributed.CudaRNGStatesTracker()
+    else:
+        _CUDA_RNG_STATE_TRACKER = CudaRNGStatesTracker()
+    _CUDA_RNG_STATE_TRACKER_INITIALIZED = True
 
 
 def get_cuda_rng_tracker():
     """Get cuda rng tracker."""
+    initialize_rng_tracker()
     return _CUDA_RNG_STATE_TRACKER
 
 
@@ -178,6 +203,7 @@ def model_parallel_cuda_manual_seed(seed):
     # Data parallel gets the original seed.
     data_parallel_seed = seed
 
+    initialize_rng_tracker()
     _CUDA_RNG_STATE_TRACKER.reset()
     # Set the default state.
     torch.cuda.manual_seed(data_parallel_seed)

@@ -129,6 +129,11 @@ class ModelParallelConfig:
     """If true, enables asynchronous execution of tensor-model-parallel all-reduce with weight
        gradient compuation of a column-linear layer.
     """
+
+    use_te_rng_tracker: bool = False
+    """If true, uses RNG state tracker in TransformerEngine if exists.
+    """
+
     tp_comm_overlap: bool = False
     """If true, allows overlapping of Linear layer execution with tensor parallel communication
        collectives like AllGather/ReduceScatter. Overlapping is done for the linear layers wherever
