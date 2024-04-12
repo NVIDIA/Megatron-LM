@@ -52,10 +52,11 @@ class TestParallelTransformerLayer:
         assert hidden_states.shape[1] == micro_batch_size
         assert hidden_states.shape[2] == config.hidden_size
 
+    @pytest.mark.parametrize('order', ['tp-pp-dp', 'tp-dp-pp'])
     @pytest.mark.parametrize('tp_pp', [(4, 2), (1, 1), (8, 1), (2, 2)])
-    def test_sharded_state_dict(self, tp_pp):
+    def test_sharded_state_dict(self, tp_pp, order):
         Utils.destroy_model_parallel()
-        Utils.initialize_model_parallel(*tp_pp)
+        Utils.initialize_model_parallel(*tp_pp, order=order)
 
         model_parallel_cuda_manual_seed(123)
         transformer_config = TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=8, use_cpu_initialization=True)
