@@ -104,7 +104,11 @@ class MLP(MegatronModule):
                     assert self.config.add_bias_linear is True
                     intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
             elif self.activation_func == F.silu and self.config.gated_linear_unit:
-                intermediate_parallel = bias_swiglu_impl(intermediate_parallel, bias_parallel)
+                intermediate_parallel = bias_swiglu_impl(
+                    intermediate_parallel,
+                    bias_parallel,
+                    self.config.activation_func_fp8_input_store,
+                )
             else:
                 raise ValueError("Only support fusion of gelu and swiglu")
         else:
