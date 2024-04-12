@@ -5,27 +5,85 @@ import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir)))
-import socket
 from megatron.training import get_args
 from megatron.training import print_rank_0
 from megatron.core import mpu
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
-from megatron.legacy.model import GPTModel
+from megatron.core.models.gpt import GPTModel
 from megatron.training import get_model
 from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 from megatron.inference.text_generation_server import MegatronServer
 from megatron.inference.text_generation import generate_and_post_process
 from megatron.inference.text_generation import beam_search_and_post_process
+from megatron.core.transformer.spec_utils import import_module
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
+
 import torch
+from typing import Union
+import megatron
 
-def model_provider(pre_process=True, post_process=True):
-    """Build the model."""
 
-    config = core_transformer_config_from_args(get_args())
+def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
+    """Builds the model.
+
+        If you set the use_mcore_models to True, it will return the mcore GPT model and if not the legacy GPT model.
+
+        Args:
+            pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
+            post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
+
+
+        Returns:
+            Union[GPTModel, megatron.legacy.model.GPTModel]: The returned model
+        """
+
+    args = get_args()
+    use_te = args.transformer_impl == "transformer_engine"
 
     print_rank_0('building GPT model ...')
-    model = GPTModel(config, num_tokentypes=0, parallel_output=False, pre_process=pre_process, post_process=post_process)
+    # Experimental loading arguments from yaml
+    if args.yaml_cfg is not None:
+        config = core_transformer_config_from_yaml(args, "language_model")
+    else:
+        config = core_transformer_config_from_args(args)
+
+    if args.use_mcore_models:
+        if args.spec is not None:
+            transformer_layer_spec = import_module(args.spec)
+        else:
+            if use_te:
+                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm)
+            else:
+                transformer_layer_spec = get_gpt_layer_local_spec(args.num_experts, args.moe_grouped_gemm)
+
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=transformer_layer_spec,
+            vocab_size=args.padded_vocab_size,
+            max_sequence_length=args.max_position_embeddings,
+            pre_process=pre_process,
+            post_process=post_process,
+            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+            parallel_output=False,
+            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+            position_embedding_type=args.position_embedding_type,
+            rotary_percent=args.rotary_percent
+        )
+    else:
+        assert(args.context_parallel_size == 1), "Context parallelism is only supported with Megatron Core!"
+
+        model = megatron.legacy.model.GPTModel(
+            config,
+            num_tokentypes=0,
+            parallel_output=True,
+            pre_process=pre_process,
+            post_process=post_process
+        )
 
     return model
 
@@ -65,12 +123,12 @@ if __name__ == "__main__":
     while True:
         choice = torch.tensor(1, dtype=torch.long, device='cuda')
         torch.distributed.broadcast(choice, 0)
-        if choice[0].item() == 0:
+        if choice.item() == 0:
             try:
                 generate_and_post_process(model)
             except ValueError as ve:
                 pass
-        elif choice[0].item() == 1:
+        elif choice.item() == 1:
             try:
                 beam_search_and_post_process(model)
             except ValueError as ve:
