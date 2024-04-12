@@ -106,6 +106,7 @@ def init_mock_args(args):
     args.accumulate_allreduce_grads_in_fp32 = False
     args.overlap_grad_reduce = False
     args.use_distributed_optimizer = True
+    args.ddp_bucket_size = None
     return args
 
 

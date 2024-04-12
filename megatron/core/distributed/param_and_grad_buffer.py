@@ -9,6 +9,7 @@ from typing import Dict, List, Optional
 import torch
 
 from .. import parallel_state
+from .distributed_data_parallel_config import DistributedDataParallelConfig
 
 logger = getLogger(__name__)
 
@@ -37,6 +38,7 @@ class Bucket:
     is automatically launched when _all_ params in the bucket have grads ready.
 
     Args:
+        ddp_config: DistributedDataParallel config object.
         params: List of parameters whose gradients are collated in this bucket.
         param_data: View in larger ParamAndGradBuffer.param_data that this bucket is responsible for.
         grad_data: View in larger ParamAndGradBuffer.grad_data that this bucket is responsible for.
@@ -44,19 +46,14 @@ class Bucket:
         numel_unpadded: Number of unpadded elements in bucket.
         data_parallel_group: Data-parallel process group.
         data_parallel_world_size: World size using the data-parallel group group.
-        overlap_grad_reduce: If true, overlap communication with backprop computation by
-            breaking up grads into buckets. If false, single synchronous communication call
-            is used instead.
-        use_distributed_optimizer: If true, issue reduce-scatter communication calls as part
-            of distributed optimizer. If false, issue all-reduce communication calls.
         gradient_scaling_factor: This factor is utilized to scale gradients prior to their
             communication. Its application is twofold: it facilitates the averaging of gradients
             and the scaling of gradients in the context of the Mixture of Experts (MoE) model.
-        check_for_nan_in_grad: If true, check if local grad norm is NaN.
     """
 
     def __init__(
         self,
+        ddp_config: DistributedDataParallelConfig,
         params: List[torch.nn.Parameter],
         param_data: Optional[torch.Tensor],
         grad_data: torch.Tensor,
@@ -64,11 +61,10 @@ class Bucket:
         numel_unpadded: int,
         data_parallel_group: torch.distributed.ProcessGroup,
         data_parallel_world_size: int,
-        overlap_grad_reduce: bool,
-        use_distributed_optimizer: bool,
         gradient_scaling_factor: float,
-        check_for_nan_in_grad: bool,
     ):
+        self.ddp_config = ddp_config
+
         # State for bookkeeping: params is the set of parameters this bucket is
         # responsible for, params_with_grad is the set of parameters with grads
         # available. When overlap_grad_reduce is True, communication (all-reduce
@@ -85,10 +81,7 @@ class Bucket:
         self.data_parallel_group = data_parallel_group
         self.data_parallel_world_size = data_parallel_world_size
         self.data_parallel_rank = torch.distributed.get_rank(group=data_parallel_group)
-        self.overlap_grad_reduce = overlap_grad_reduce
-        self.use_distributed_optimizer = use_distributed_optimizer
         self.gradient_scaling_factor = gradient_scaling_factor
-        self.check_for_nan_in_grad = check_for_nan_in_grad
 
         self.reset()
 
@@ -115,7 +108,7 @@ class Bucket:
 
         # Make sure norm of grads in bucket are not NaN
         # prior to data-parallel all-reduce / reduce-scatter.
-        if self.check_for_nan_in_grad:
+        if self.ddp_config.check_for_nan_in_grad:
             global_rank = torch.distributed.get_rank()
             norm = self.grad_data.norm(p=2)
             assert not norm.isnan(), (
@@ -126,7 +119,7 @@ class Bucket:
 
         self.grad_data *= self.gradient_scaling_factor
         # Use async_op only when overlap_grad_reduce is True.
-        if self.use_distributed_optimizer:
+        if self.ddp_config.use_distributed_optimizer:
             local_data_view = shard_buffer(self.grad_data, self.data_parallel_world_size)[
                 self.data_parallel_rank
             ]
@@ -134,11 +127,13 @@ class Bucket:
                 local_data_view,
                 self.grad_data,
                 group=self.data_parallel_group,
-                async_op=self.overlap_grad_reduce,
+                async_op=self.ddp_config.overlap_grad_reduce,
             )
         else:
             self.communication_handle = torch.distributed.all_reduce(
-                self.grad_data, group=self.data_parallel_group, async_op=self.overlap_grad_reduce
+                self.grad_data,
+                group=self.data_parallel_group,
+                async_op=self.ddp_config.overlap_grad_reduce,
             )
         self.communication_issued = True
 
@@ -151,7 +146,7 @@ class Bucket:
         call to complete. When overlap_grad_reduce is set to False, makes synchronous call.
         """
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
-        if not self.overlap_grad_reduce:
+        if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync()
             return
         assert self.communication_handle is not None and self.communication_issued, (
@@ -170,7 +165,7 @@ class Bucket:
         assert param in self.params, 'Param is not in the bucket'
         assert param not in self.params_with_grad, 'Cannot set grad twice'
         assert (
-            self.overlap_grad_reduce
+            self.ddp_config.overlap_grad_reduce
         ), 'register_grad_ready() should be called only when overlapping grad reduce'
         self.params_with_grad.add(param)
         # If all params in bucket have grads available, issue communication call.
@@ -184,6 +179,7 @@ class ParamAndGradBuffer:
     buckets with roughly `bucket_size` parameters each.
 
     Args:
+        ddp_config: DistributedDataParallel config object.
         param_dtype: Type of param tensor.
         grad_dtype: Type of grad tensor.
         params: List of parameters whose parameters and gradients are collated in the underlying
@@ -191,30 +187,23 @@ class ParamAndGradBuffer:
         data_parallel_group: Data-parallel process group.
         bucket_size: The rough size of each bucket in terms of number of parameters.
         param_to_name: Mapping from `torch.nn.Parameter` to name (for logging purposes).
-        overlap_grad_reduce: If true, overlap communication with backprop computation by
-            breaking up grads into buckets. If false, single synchronous communication call
-            is used instead.
-        use_distributed_optimizer: If true, issue reduce-scatter communication calls as part
-            of distributed optimizer. If false, issue all-reduce communication calls.
         gradient_scaling_factor: This factor is utilized to scale gradients prior to their
             communication. Its application is twofold: it facilitates the averaging of gradients
             and the scaling of gradients in the context of the Mixture of Experts (MoE) model.
-        check_for_nan_in_grad: If true, check if local grad norm is NaN.
     """
 
     def __init__(
         self,
+        ddp_config: DistributedDataParallelConfig,
         param_dtype: torch.dtype,
         grad_dtype: torch.dtype,
         params: List[torch.nn.Parameter],
         data_parallel_group: torch.distributed.ProcessGroup,
         bucket_size: int,
         param_to_name: Dict[torch.nn.Parameter, str],
-        overlap_grad_reduce: bool,
-        use_distributed_optimizer: bool,
         gradient_scaling_factor: float,
-        check_for_nan_in_grad: bool,
     ):
+        self.ddp_config = ddp_config
 
         # Check that params are unique.
         unique_params = set()
@@ -230,10 +219,7 @@ class ParamAndGradBuffer:
         self.data_parallel_world_size = torch.distributed.get_world_size(
             group=self.data_parallel_group
         )
-        self.overlap_grad_reduce = overlap_grad_reduce
-        self.use_distributed_optimizer = use_distributed_optimizer
         self.gradient_scaling_factor = gradient_scaling_factor
-        self.check_for_nan_in_grad = check_for_nan_in_grad
         self.is_last_microbatch = True
 
         # Data structures to store underlying buckets and relevant indexing data.
@@ -245,7 +231,7 @@ class ParamAndGradBuffer:
             """
             Pads data indices if using distributed optimizer (to ensure uniform sharding).
             """
-            if use_distributed_optimizer:
+            if self.ddp_config.use_distributed_optimizer:
                 return (
                     int(math.ceil(data_index / self.data_parallel_world_size))
                     * self.data_parallel_world_size
@@ -295,13 +281,16 @@ class ParamAndGradBuffer:
                 for the shared embedding parameters the same way across DP replicas, allowing
                 the DP reduce-scatter to be before the embedding all-reduce.
                 """
-                return getattr(param, "shared_embedding", False) and self.use_distributed_optimizer
+                return (
+                    getattr(param, "shared_embedding", False)
+                    and self.ddp_config.use_distributed_optimizer
+                )
 
             # Create bucket with already collected parameters if current param needs its own bucket.
             if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
                 # We are creating a bucket for the already accumulated parameters, whose params
                 # end at the current data_start_index.
-                if use_distributed_optimizer:
+                if self.ddp_config.use_distributed_optimizer:
                     # data_start_index should already be padded.
                     assert data_start_index % self.data_parallel_world_size == 0
                 _create_new_bucket(data_start_index)
@@ -329,11 +318,11 @@ class ParamAndGradBuffer:
         # Next, create underlying storage for buffer (with numel elements that includes
         # padding as necessary).
         self.numel = data_end_index
-        if use_distributed_optimizer:
+        if self.ddp_config.use_distributed_optimizer:
             assert self.numel % self.data_parallel_world_size == 0
         self.param_data = None
         # Only re-map param tensors if using distributed optimizer.
-        if self.use_distributed_optimizer:
+        if self.ddp_config.use_distributed_optimizer:
             self.param_data = torch.zeros(
                 self.numel,
                 dtype=self.param_dtype,
@@ -445,7 +434,7 @@ class ParamAndGradBuffer:
 
         # Assert that indices are correctly padded (if needed), and that bucket
         # position is same as originally computed.
-        if self.use_distributed_optimizer:
+        if self.ddp_config.use_distributed_optimizer:
             assert start_index % self.data_parallel_world_size == 0
             assert end_index % self.data_parallel_world_size == 0
         assert (start_index, end_index) == self.bucket_indices[bucket_id]
@@ -460,6 +449,7 @@ class ParamAndGradBuffer:
             torch.Size([end_index - start_index]), start_index, buffer_type=BufferType.GRAD
         )
         bucket = Bucket(
+            ddp_config=self.ddp_config,
             params=bucket_params,
             param_data=bucketed_param_data,
             grad_data=bucketed_grad_data,
@@ -467,10 +457,7 @@ class ParamAndGradBuffer:
             numel_unpadded=numel_unpadded,
             data_parallel_group=self.data_parallel_group,
             data_parallel_world_size=self.data_parallel_world_size,
-            overlap_grad_reduce=self.overlap_grad_reduce,
-            use_distributed_optimizer=self.use_distributed_optimizer,
             gradient_scaling_factor=self.gradient_scaling_factor,
-            check_for_nan_in_grad=self.check_for_nan_in_grad,
         )
         self.buckets.append(bucket)
         for bucket_param in bucket_params:
@@ -519,7 +506,7 @@ class ParamAndGradBuffer:
         grads as ready when processing the last microbatch and overlap_grad_reduce is True.
         """
         assert (
-            self.overlap_grad_reduce
+            self.ddp_config.overlap_grad_reduce
         ), 'register_grad_ready() should only be called when overlap_grad_reduce is True'
         if self.is_last_microbatch:
             bucket = self.param_to_bucket[param]
