@@ -1241,6 +1241,10 @@ def _add_data_args(parser):
                        'single dataset used for all three: train, valid '
                        'and test. It is exclusive to the other '
                        '--*-data-path args')
+    group.add_argument('--distributed-storage', action='store_true',
+                       help='If distributed storage is enabled, data cache '
+                       'path should be given and point to different '
+                       'distributed storage path')
     group.add_argument('--split', type=str, default='969, 30, 1',
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '

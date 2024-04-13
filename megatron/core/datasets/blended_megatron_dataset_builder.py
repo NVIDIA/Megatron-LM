@@ -108,6 +108,7 @@ class BlendedMegatronDatasetBuilder(object):
                         self.build_generic_dataset(
                             BlendedDataset,
                             self.config.is_built_on_rank,
+                            self.config.is_distributed_storage,
                             megatron_datasets[i],
                             weight_per_dataset,
                             size_per_split[i],
@@ -160,6 +161,7 @@ class BlendedMegatronDatasetBuilder(object):
                         self.build_generic_dataset(
                             BlendedDataset,
                             self.config.is_built_on_rank,
+                            self.config.is_distributed_storage,
                             megatron_datasets,
                             weight_per_dataset,
                             size_per_split[i],
@@ -185,7 +187,7 @@ class BlendedMegatronDatasetBuilder(object):
             List[Optional[MegatronDataset]]: The MegatronDatset (or None) per split
         """
         indexed_dataset = self.build_generic_dataset(
-            MMapIndexedDataset, self.config.is_built_on_rank, path_prefix, self.cls.is_multimodal(),
+            MMapIndexedDataset, self.config.is_built_on_rank, self.config.is_distributed_storage, path_prefix, self.cls.is_multimodal(),
         )
 
         if indexed_dataset is not None:
@@ -216,6 +218,7 @@ class BlendedMegatronDatasetBuilder(object):
                     self.build_generic_dataset(
                         self.cls,
                         self.config.is_built_on_rank,
+                        self.config.is_distributed_storage,
                         indexed_dataset,
                         split_indices[i],
                         sizes[i],
@@ -228,7 +231,7 @@ class BlendedMegatronDatasetBuilder(object):
 
     @staticmethod
     def build_generic_dataset(
-        cls: Type[DistributedDataset], is_built_on_rank: Callable, *args: Any
+        cls: Type[DistributedDataset], is_built_on_rank: Callable,  is_distributed_storage: bool, *args: Any
     ) -> Optional[DistributedDataset]:
         """Build the DistributedDataset
 
@@ -248,7 +251,10 @@ class BlendedMegatronDatasetBuilder(object):
             Optional[DistributedDataset]: The DistributedDataset instantion or None
         """
         if torch.distributed.is_initialized():
-            rank = torch.distributed.get_rank()
+            if is_distributed_storage:
+                rank = torch.cuda.current_device()
+            else:
+                rank = torch.distributed.get_rank()
 
             dataset = None
 

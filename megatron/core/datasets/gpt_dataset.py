@@ -243,7 +243,11 @@ class GPTDataset(MegatronDataset):
         num_tokens_per_epoch = self._get_num_tokens_per_epoch()
         num_epochs = self._get_num_epochs(num_tokens_per_epoch)
 
-        if not cache_hit and torch.distributed.get_rank() == 0:
+        if self.config.is_distributed_storage:
+            rank = torch.cuda.current_device()
+        else:
+            rank = torch.distributed.get_rank()
+        if not cache_hit and rank == 0:
             log_single_rank(
                 logger,
                 logging.INFO,

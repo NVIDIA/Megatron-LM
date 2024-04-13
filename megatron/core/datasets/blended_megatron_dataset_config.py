@@ -50,6 +50,8 @@ class BlendedMegatronDatasetConfig:
 
     is_built_on_rank: Callable
 
+    is_distributed_storage: bool
+
     random_seed: int
 
     sequence_length: int
