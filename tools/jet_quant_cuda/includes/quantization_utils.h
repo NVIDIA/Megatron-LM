@@ -64,7 +64,7 @@ public:
         if (max == 0) {
             scale = 1.0;
         } else {
-            scale = (1 << numBits) / (2 * max);
+            scale = ((1 << (numBits-1)) - 1) / max; // Attention: we tried to use all 16 lattice, but the convergence at last phase is worse.
         }
     }
 
