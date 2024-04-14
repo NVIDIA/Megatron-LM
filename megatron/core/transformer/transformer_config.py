@@ -219,7 +219,7 @@ class TransformerConfig(ModelParallelConfig):
 
     fp8_multi_head_attention: bool = False
     """When set to True, use the FP8 implementation of Multi Head Attention."""
-      
+
     ####################
     # MoE related
     ####################
