@@ -216,7 +216,10 @@ class TransformerConfig(ModelParallelConfig):
 
     # experimental section (TODO: move to apt. section above once stable)
     normalization: bool = "LayerNorm"  # alt value supported by TE: "RMSNorm"
-    core_attention_bias_type: str = 'no_bias'
+    core_attention_bias_type: str = 'no_bias' 
+    """Bias type, {no_bias, pre_scale_bias, post_scale_bias, alibi} 
+    https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/pytorch.html#transformer_engine.pytorch.DotProductAttention.forward
+    """
       
     ####################
     # MoE related
