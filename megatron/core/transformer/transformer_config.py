@@ -84,7 +84,13 @@ class TransformerConfig(ModelParallelConfig):
     rotary_interleaved: bool = False
     """True is rotate pairs of even and odd dimensions (RoFormer style), False is rotate pairs of
     first half and second half (LLaMa style). Default to False."""
-
+    
+    core_attention_bias_type: str = 'no_bias' 
+    """Bias type, {no_bias, pre_scale_bias, post_scale_bias, alibi}
+    To use ALiBi, set core_attention_bias_type = 'alibi'
+    Please refer to the Attention with Linear Biases (https://arxiv.org/abs/2108.12409) for details.
+    """
+    
     window_size: Optional[Tuple[int, int]] = None
     """If not None, then will use sliding window attention. The size of the window is specified by
     the numbers inside the tuple; -1 is special value meaning "infinite window size"."""
@@ -213,13 +219,6 @@ class TransformerConfig(ModelParallelConfig):
 
     fp8_multi_head_attention: bool = False
     """When set to True, use the FP8 implementation of Multi Head Attention."""
-
-    # experimental section (TODO: move to apt. section above once stable)
-    normalization: bool = "LayerNorm"  # alt value supported by TE: "RMSNorm"
-    core_attention_bias_type: str = 'no_bias' 
-    """Bias type, {no_bias, pre_scale_bias, post_scale_bias, alibi} 
-    https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/pytorch.html#transformer_engine.pytorch.DotProductAttention.forward
-    """
       
     ####################
     # MoE related
