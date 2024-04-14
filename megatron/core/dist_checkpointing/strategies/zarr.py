@@ -3,6 +3,7 @@
 """ Strategies using Zarr as an underlying format. """
 import logging
 import os
+import threading
 from functools import partial
 from logging import getLogger
 from pathlib import Path
@@ -13,7 +14,7 @@ import torch
 import zarr
 
 from ..core import CheckpointingException
-from ..dict_utils import dict_list_map_inplace
+from ..dict_utils import dict_list_map_inplace, nested_values
 from ..mapping import ShardedStateDict, ShardedTensor, is_main_replica
 from .base import LoadShardedStrategy, SaveShardedStrategy, StrategyAction, default_strategies
 
@@ -51,7 +52,8 @@ logger = getLogger(__name__)
 
 
 class ZarrSaveShardedStrategy(SaveShardedStrategy):
-    def save(self, sharded_tensors: List[ShardedTensor], checkpoint_dir: Path):
+    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+        sharded_tensors = list(nested_values(sharded_state_dict))
         arrays = _create_or_open_zarr_arrays(sharded_tensors, checkpoint_dir)
         for ten, arr in zip(sharded_tensors, arrays):
             _save_to_existing_array(ten, arr)
@@ -268,7 +270,7 @@ def load_zarr_based_sharded_metadata(
 ) -> ShardedStateDict:
     """Load metadata of Zarr arrays.
 
-    Arguments:
+    Args:
         checkpoint_dir (str): checkpoint root directory
         get_shape_dtype_fn (str -> ((int, ...), np.dtype)): a function returning
             an array shape and dtype for a given Zarr array path

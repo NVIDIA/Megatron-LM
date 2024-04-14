@@ -48,5 +48,6 @@ class TempNamedDir(TemporaryDirectory):
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         raised = exc_type is not None
-        self.cleanup(False if raised else None)
+        if not raised:
+            self.cleanup()
 

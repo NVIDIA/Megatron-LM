@@ -78,7 +78,7 @@ class T5Model(LanguageModule):
         transformer_encoder_layer_spec (ModuleSpec): transformer layer customization specs for encoder
 
         transformer_decoder_layer_spec (ModuleSpec): transformer layer customization specs for decoder
-                
+
         vocab_size (int): vocabulary size
 
         max_sequence_length (int): maximum size of sequence. This is used for positional embedding
@@ -151,7 +151,10 @@ class T5Model(LanguageModule):
         # Rotary Position Embeddings
         if self.position_embedding_type == 'rope':
             self.rotary_pos_emb = RotaryEmbedding(
-                self.config.kv_channels, rotary_percent, seq_len_interpolation_factor
+                kv_channels=self.config.kv_channels,
+                rotary_percent=rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
             )
 
         # Transformer encoder
@@ -182,10 +185,10 @@ class T5Model(LanguageModule):
                 self.pre_process,
                 self.share_embeddings_and_output_weights,
             )
-        self.output_layer = self.lm_head.output_layer
+            self.output_layer = self.lm_head.output_layer
 
-        if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
-            self.initialize_last_stage_with_word_embeddings()
+        if self.pre_process or self.post_process:
+            self.setup_embeddings_and_output_layer()
 
     def forward(
         self,
@@ -333,23 +336,29 @@ class T5Model(LanguageModule):
             return self.lm_head.output_layer.weight
         return None
 
-    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()) -> ShardedStateDict:
+    def sharded_state_dict(
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
+    ) -> ShardedStateDict:
         assert not sharded_offsets, "Unexpected sharded offsets"
         sharded_state_dict = {}
 
         if self.pre_process:
             embedding_prefix = f'{prefix}embedding.'
             embedding_sharded_state_dict = self.embedding.sharded_state_dict(
-                prefix=embedding_prefix
+                prefix=embedding_prefix, metadata=metadata
             )
             sharded_state_dict.update(embedding_sharded_state_dict)
 
         encoder_prefix = f'{prefix}encoder.'
-        encoder_sharded_state_dict = self.encoder.sharded_state_dict(prefix=encoder_prefix)
+        encoder_sharded_state_dict = self.encoder.sharded_state_dict(
+            prefix=encoder_prefix, metadata=metadata
+        )
         sharded_state_dict.update(encoder_sharded_state_dict)
 
         decoder_prefix = f'{prefix}decoder.'
-        decoder_sharded_state_dict = self.decoder.sharded_state_dict(prefix=decoder_prefix)
+        decoder_sharded_state_dict = self.decoder.sharded_state_dict(
+            prefix=decoder_prefix, metadata=metadata
+        )
         sharded_state_dict.update(decoder_sharded_state_dict)
 
         if self.post_process:

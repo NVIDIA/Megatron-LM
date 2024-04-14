@@ -12,9 +12,10 @@ do
 done
 echo "---------------------------------"
 
-set -x 
+set -exo pipefail
 if [[ -z $MBS ]]; then MBS=4; fi
 if [[ -z $GBS ]]; then GBS=128; fi
+if [[ -z $VOCAB_FILE ]]; then VOCAB_FILE="/workspace/data/bert_data/vocab.txt" ; fi
 
 # Change for multinode config
 GPUS_PER_NODE=8
@@ -34,7 +35,17 @@ if [[ $USE_CORE -eq 1 ]]; then
        command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0;"
        USE_MCORE=1
 fi
-
+if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
+       echo "Running checkpoint resume test..."
+       __SAVE_INTERVAL=50
+       ADDITIONAL_PARAMS+=" --use-checkpoint-args --use-checkpoint-opt_param-scheduler"
+       if [[ $MAX_STEPS -ne 100 ]]; then
+         echo "Overriding MAX_STEPS=100"
+         MAX_STEPS=100
+       fi
+else
+       __SAVE_INTERVAL=10000  # inf
+fi
 # Runs the "345M" parameter model
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 
@@ -58,14 +69,14 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        --save $CHECKPOINT_PATH \
        --load $CHECKPOINT_PATH \
        --data-path $DATA_PATH \
-       --vocab-file /workspace/data/bert_data/vocab.txt \
+       --vocab-file $VOCAB_FILE \
        --split 949,50,1 \
        --distributed-backend nccl \
        --lr 0.0001 \
        --min-lr 0.00001 \
        --lr-warmup-fraction 0.01 \
        --log-interval 1 \
-       --save-interval 10000 \
+       --save-interval $__SAVE_INTERVAL \
        --eval-interval 1000 \
        --eval-iters 10 \
        --tensor-model-parallel-size $TP_SIZE \
@@ -74,6 +85,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        ${USE_MCORE:+--use-mcore-models} \
        ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
        --no-gradient-accumulation-fusion \
+       ${DATA_CACHE:+--data-cache-path "$DATA_CACHE"} \
        --${TRAINING_DTYPE}"
 
 if [[ "${TRAINING_DTYPE}" == "fp16" ]]; then
@@ -81,9 +93,30 @@ if [[ "${TRAINING_DTYPE}" == "fp16" ]]; then
 fi
 
 command="$command $torch_run_cmd"
+if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
+  command="$command; rm -rf $CHECKPOINT_PATH/iter_0000100; echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt; $torch_run_cmd"
+fi
 echo "-------------------- THE FINAL PRETRAIN SCRIPT COMMAND THAT WILL BE RUN ------------"
 echo "$command"
 echo "-----------------------------------------------------------------------------"
 
 echo "$command" > $SCRIPTS_DIR/pretrain_bert_distributed_command.sh
 eval $command
+
+echo "Saving test results to $TENSORBOARD_DIR"
+python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $TENSORBOARD_DIR "$JOB_NAME" | \
+    tee ${TENSORBOARD_DIR}/results.json
+
+if [[ $SKIP_PYTEST != 1 ]]; then
+    echo "-----------------------------------------------------------------------------"
+    if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
+        echo "Running pytest 1st vs 2nd run comparison"
+        export LOGS_DIR=$TENSORBOARD_DIR
+        pytest ./tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py
+    else
+        echo "Running pytest checks against golden values"
+        export EXPECTED_METRICS_FILE="./tests/functional_tests/test_results/jet/${JOB_NAME}.json"
+        export LOGS_DIR=$TENSORBOARD_DIR
+        pytest ./tests/functional_tests/python_test_utils/test_ci_pipeline.py
+    fi
+fi

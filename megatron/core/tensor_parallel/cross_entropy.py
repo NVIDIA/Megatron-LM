@@ -130,7 +130,7 @@ def vocab_parallel_cross_entropy(vocab_parallel_logits, target, label_smoothing=
     """
     Performs cross entropy loss when logits are split across tensor parallel ranks
 
-    Arguments:
+    Args:
         vocab_parallel_logits: logits split across tensor parallel ranks
                                dimension is [sequence_length, batch_size, hidden_size]
 

@@ -9,6 +9,7 @@ from torch.autograd.variable import Variable
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import p2p_communication
+from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import get_attr_wrapped_model, get_model_config, get_model_type
 
 # Types
@@ -149,6 +150,17 @@ def custom_backward(output, grad_output):
     )
 
 
+def set_current_microbatch(model, microbatch_id):
+    decoder_exists = True
+    decoder = None
+    try:
+        decoder = get_attr_wrapped_model(model, "decoder")
+    except RuntimeError:
+        decoder_exists = False
+    if decoder_exists and decoder is not None:
+        decoder.current_microbatch = microbatch_id
+
+
 def forward_step(
     forward_step_func,
     data_iterator,
@@ -160,6 +172,7 @@ def forward_step(
     collect_non_loss_data=False,
     checkpoint_activations_microbatch=None,
     is_first_microbatch=False,
+    current_microbatch=None,
 ):
 
     """Forward step for passed-in model.
@@ -173,6 +186,8 @@ def forward_step(
 
     if is_first_microbatch and hasattr(model, 'set_is_first_microbatch'):
         model.set_is_first_microbatch()
+    if current_microbatch is not None:
+        set_current_microbatch(model, current_microbatch)
 
     unwrap_output_tensor = False
     if not isinstance(input_tensor, list):
@@ -206,6 +221,18 @@ def forward_step(
 
     if config.timers is not None:
         config.timers('forward-compute').stop()
+
+    # Set the loss scale for the auxiliary loss of the MoE layer.
+    # Since we use a trick to do backward on the auxiliary loss, we need to set the scale explicitly.
+    if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
+        # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
+        loss_scale = (
+            config.grad_scale_func(torch.tensor(1.0, device=output_tensor.device))
+            if config.grad_scale_func is not None
+            else torch.tensor(1.0)
+        )
+        # Set the loss scale
+        MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
 
     # If T5 model (or other model with encoder and decoder)
     # and in decoder stack, then send encoder_hidden_state
@@ -350,6 +377,7 @@ def forward_backward_no_pipelining(
                 config,
                 collect_non_loss_data,
                 is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
+                current_microbatch=i,
             )
             if not forward_only:
                 backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
@@ -368,6 +396,7 @@ def forward_backward_no_pipelining(
         is_first_microbatch=check_first_val_step(
             first_val_step, forward_only, num_microbatches == 1
         ),
+        current_microbatch=num_microbatches - 1,
     )
 
     if not forward_only:
@@ -530,6 +559,15 @@ def forward_backward_pipelining_with_interleaving(
             model_chunk_id = num_model_chunks - model_chunk_id - 1
         return model_chunk_id
 
+    def get_microbatch_id_in_model_chunk(iteration_id, forward):
+        """Helper method to get the microbatch_id within model chunk given the iteration number."""
+        assert forward
+        iteration_group_id = iteration_id // (pipeline_parallel_size * num_model_chunks)
+        microbatch_id_in_model_chunk = (iteration_group_id * pipeline_parallel_size) + (
+            iteration_id % pipeline_parallel_size
+        )
+        return microbatch_id_in_model_chunk
+
     def is_first_microbatch_for_model_chunk(microbatch_id: int) -> bool:
         """Check if an iteration is the first for a model chunk."""
         microbatch_group_size = pipeline_parallel_size * num_model_chunks
@@ -552,7 +590,7 @@ def forward_backward_pipelining_with_interleaving(
         else:
             return False
 
-    def forward_step_helper(microbatch_id, checkpoint_activations_microbatch):
+    def forward_step_helper(microbatch_id, current_microbatch, checkpoint_activations_microbatch):
         """Helper method to run forward step with model split into chunks
         (run set_virtual_pipeline_model_parallel_rank() before calling
         forward_step())."""
@@ -595,6 +633,7 @@ def forward_backward_pipelining_with_interleaving(
             check_first_val_step(
                 first_val_step, forward_only, is_first_microbatch_for_model_chunk(microbatch_id),
             ),
+            current_microbatch=current_microbatch,
         )
         output_tensors[model_chunk_id].append(output_tensor)
 
@@ -658,6 +697,7 @@ def forward_backward_pipelining_with_interleaving(
             for req in fwd_wait_handles:
                 req.wait()
 
+        cur_model_chunk_id = get_model_chunk_id(k, forward=True)
         # Decide to checkpoint all layers' activations of the current micro-batch
         if max_outstanding_backprops is not None:
             checkpoint_activations_microbatch = (
@@ -667,7 +707,10 @@ def forward_backward_pipelining_with_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
-        output_tensor = forward_step_helper(k, checkpoint_activations_microbatch)
+        current_microbatch = get_microbatch_id_in_model_chunk(k, forward=True)
+        output_tensor = forward_step_helper(
+            k, current_microbatch, checkpoint_activations_microbatch
+        )
 
         # Determine if tensor should be received from previous stage.
         next_forward_model_chunk_id = get_model_chunk_id(k + 1, forward=True)
@@ -760,6 +803,8 @@ def forward_backward_pipelining_with_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
+        cur_model_chunk_id = get_model_chunk_id(forward_k, forward=True)
+        current_microbatch = get_microbatch_id_in_model_chunk(forward_k, forward=True)
         if config.overlap_p2p_comm:
             if fwd_wait_handles is not None:
                 for req in fwd_wait_handles:
@@ -767,7 +812,9 @@ def forward_backward_pipelining_with_interleaving(
 
             deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
 
-            output_tensor = forward_step_helper(forward_k, checkpoint_activations_microbatch)
+            output_tensor = forward_step_helper(
+                forward_k, current_microbatch, checkpoint_activations_microbatch
+            )
 
             # Determine if current stage has anything to send in either direction,
             # otherwise set tensor to None.
@@ -1206,6 +1253,7 @@ def forward_backward_pipelining_without_interleaving(
             collect_non_loss_data,
             checkpoint_activations_microbatch,
             check_first_val_step(first_val_step, forward_only, i == 0),
+            current_microbatch=i,
         )
         send_forward(output_tensor, send_tensor_shapes, config)
 
@@ -1245,6 +1293,7 @@ def forward_backward_pipelining_without_interleaving(
             check_first_val_step(
                 first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
             ),
+            current_microbatch=i + num_warmup_microbatches,
         )
 
         if forward_only:

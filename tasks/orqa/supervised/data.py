@@ -10,8 +10,8 @@ from abc import abstractmethod
 import numpy as np
 from torch.utils.data import Dataset
 
-from megatron import print_rank_0, get_args
-from megatron.data.biencoder_dataset_utils import make_attention_mask
+from megatron.training import print_rank_0, get_args
+from megatron.legacy.data.biencoder_dataset_utils import make_attention_mask
 
 def build_token_types_from_context_list(ctx_list, tokenizer, max_seq_length):
     ctx_id_list, ctx_types_list = [], []

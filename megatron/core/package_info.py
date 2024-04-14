@@ -2,7 +2,7 @@
 
 
 MAJOR = 0
-MINOR = 4
+MINOR = 6
 PATCH = 0
 PRE_RELEASE = 'rc0'
 

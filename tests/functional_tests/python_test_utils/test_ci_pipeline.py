@@ -28,10 +28,11 @@ class TestCIPipeline:
             raise FileNotFoundError("Expected data is none")
         expected = self.expected[loss_type]
         expected_list = expected["values"]
-        print(expected_list)
+        print(f"The list of expected values: {expected_list}")
         actual_list = self._get_actual(loss_type)
         assert actual_list is not None, f"No TensorBoard events file was found in the logs for {loss_type}."
         actual_list_sliced = actual_list[expected["start_step"]:expected["end_step"]:expected["step_interval"]]
+        print(f"The list of actual values: {actual_list_sliced}")
         for i, (expected_val, actual_val) in enumerate(zip(expected_list, actual_list_sliced)):
             step = i * expected["step_interval"]
             print(f"Checking step {step} against expected {i}")

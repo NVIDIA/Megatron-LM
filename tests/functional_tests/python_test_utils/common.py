@@ -14,11 +14,12 @@ def read_tb_logs_as_list(path, summary_name):
     """Reads a TensorBoard Events file from the input path, and returns the
     summary specified as input as a list.
 
-    Arguments:
-    path: str, path to the dir where the events file is located.
-    summary_name: str, name of the summary to read from the TB logs.
-    Output:
-    summary_list: list, the values in the read summary list, formatted as a list.
+    Args:
+        path: str, path to the dir where the events file is located.
+        summary_name: str, name of the summary to read from the TB logs.
+
+    Returns:
+        summary_list: list, the values in the read summary list, formatted as a list.
     """
     files = glob.glob(f"{path}/events*tfevents*")
     files += glob.glob(f"{path}/results/events*tfevents*")

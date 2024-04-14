@@ -6,15 +6,15 @@ import json
 import torch
 import requests
 from nltk import word_tokenize
-from megatron import get_args
-from megatron import print_rank_0
-from megatron import get_tokenizer
+from megatron.training import get_args
+from megatron.training import print_rank_0
+from megatron.training import get_tokenizer
 from megatron.core import mpu
-from megatron.model import GPTModel
+from megatron.legacy.model import GPTModel
 from megatron.training import get_model
-from megatron.checkpointing import load_checkpoint
-from megatron.initialize import initialize_megatron
-from megatron.text_generation import generate_and_post_process
+from megatron.training.checkpointing import load_checkpoint
+from megatron.training.initialize import initialize_megatron
+from megatron.inference.text_generation import generate_and_post_process
 
 
 def call_model_api(inputs, tokens_to_generate):

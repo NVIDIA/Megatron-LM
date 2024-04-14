@@ -1,6 +1,7 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Utilities for transformer layers."""
+from functools import lru_cache
 from operator import itemgetter
 from typing import Any, Dict, Iterable, Iterator, Optional, Tuple, Union
 
@@ -23,6 +24,12 @@ def get_linear_layer(rows, columns, init_method, perform_initialization=True):
     with torch.no_grad():
         layer.bias.zero_()
     return layer
+
+
+@lru_cache(maxsize=32)
+def get_default_causal_mask(sq: int) -> torch.Tensor:
+    """Return the causal upper triangular mask for softmax input."""
+    return torch.triu(torch.ones(sq, sq, device="cuda"), diagonal=1).bool()
 
 
 def attention_mask_func(attention_scores, attention_mask):
@@ -110,7 +117,7 @@ def make_sharded_object_for_checkpoint(
 ):
     """ Helper for instantiating a non-sharded ShardedObject (replicated across TP and DP group).
 
-    Arguments:
+    Args:
         obj (object): any object to be sharded
         key (str): unique identifier of the object
         sharded_offsets (Iterable[Tuple[int, int, int]]): offsets normally
@@ -145,7 +152,10 @@ def _get_extra_state_offsets(
 
 
 def sharded_state_dict_default(
-    module: torch.nn.Module, prefix: str = '', sharded_offsets: Tuple[Tuple[int, int, int]] = ()
+    module: torch.nn.Module,
+    prefix: str = '',
+    sharded_offsets: Tuple[Tuple[int, int, int]] = (),
+    metadata: Optional[dict] = None,
 ) -> ShardedStateDict:
     """Provides implementation for sharded_state_dict method for non-MegatronModules.
 
@@ -160,6 +170,7 @@ def sharded_state_dict_default(
         prefix (str): prefix for the state dict keys
         sharded_offsets (Tuple[Tuple[int, int, int]], optional): sharding already
             applied (e.g. PP related) by sup-modules. Passed along to ShardedTensor
+        metadata (dict, optional): metadata passed to module sharded_state_dict method
 
     Returns:
         dict: dictionary of state dict keys mapped to ShardedTensors
@@ -167,7 +178,7 @@ def sharded_state_dict_default(
 
     if hasattr(module, 'sharded_state_dict'):
         module_sharded_sd = module.sharded_state_dict(
-            prefix=prefix, sharded_offsets=sharded_offsets,
+            prefix=prefix, sharded_offsets=sharded_offsets, metadata=metadata
         )
     else:
         module_sd = module.state_dict(prefix='', keep_vars=True)
