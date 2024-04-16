@@ -15,7 +15,7 @@ class CommonInferenceParams:
 
         Use this method to pass in a custom dictonary to add more inference parameter attributes to the instance you created. Use as follows
         c = CommonInferenceParams
-        c.update({'min_length':4, 'eod_id':153})
+        c.add_attributes({'min_length':4, 'eod_id':153})
 
         Args:
             attribute_value_pair (dict): A dictionary containing attributes as the key names and their values as the values.

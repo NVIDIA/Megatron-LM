@@ -13,6 +13,7 @@ This guide will walk you through how you can use megatron core for inference on 
     - [4.1. Create Your Own Inference Backend](#41-create-your-own-inference-backend)
     - [4.2. Create Your Own Text Generation Strategy](#42-create-your-own-text-generation-strategy)
     - [4.3. Support Other Models](#43-support-other-models)
+    - [4.3. Modify Inference Parameters](#43-modify-inference-parameters)
 
 <br>
 
@@ -136,6 +137,7 @@ The following guide will walk you through how you can customize different parts 
 * **Inference backend** - Highest level of customization. (Currently we support MCore and TRTLLM backends). Change this if you completely want to add your own way of running inference.  
 * **Text generation strategy** - Extend this if you want to customize tokenization, text generation or detokenization
 * **Inference Wrapped Model** - Change this if you just want to support a new model 
+* **Modify Inference Parameters** - Change this to update top_p, top_k, number of tokens to be generated, temperature etc.
 
 <br>
 
@@ -238,3 +240,15 @@ class AbstractModelInferenceWrapper:
 ```
 
 To see an example of how we extend this for gpt please refer [gpt_inference_wrapper.py](../../megatron/core/inference/inference_model_wrappers/gpt/gpt_inference_wrapper.py)
+
+<br>
+
+##### 4.3. Modify Inference Parameters
+We use  [common inference params](../../megatron/core/inference/common_inference_params.py) for text generation. Customize this if you want to change top_p, top_k, number of tokens to generate etc. If you want to add other attributes that you would use in the inference loop, you can do that as shown below
+
+```
+from megatron.core.inference.common_inference_params import CommonInferenceParams
+
+c = CommonInferenceParams(temperature=0.5)
+c.add_attributes({'min_length':4, 'eod_id':153})
+```
