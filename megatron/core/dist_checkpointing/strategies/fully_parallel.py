@@ -213,8 +213,8 @@ def distribute_main_replicas_with_precomputed_distribution(
 
     Replicas after distribution for the example above:
     rank0: A: 0, B: 1, C: 1
-    rank0: A: 1, B: 0, C: 1
-    rank0: A: 1, B: 1, C: 0
+    rank1: A: 1, B: 0, C: 1
+    rank2: A: 1, B: 1, C: 0
     """
     if torch.distributed.get_world_size(group=parallelization_group) <= 1:
         return
