@@ -28,7 +28,8 @@ from megatron.core.dist_checkpointing.strategies.base import (
 logger = logging.getLogger(__name__)
 
 
-# uniquely identifies a given ShardedTensor
+# _ShardId uniquely identifies a ShardedTensor. This is a subset of ShardedTensor
+# attributes: key (str), global_offset (tuple) and flattened_range (optional tuple)
 _ShardId = Tuple[str, tuple, Optional[tuple]]
 
 
