@@ -28,8 +28,8 @@ from megatron.core.dist_checkpointing.strategies.base import (
 logger = logging.getLogger(__name__)
 
 
-# uniquely identifies a single chunk of a ShardedTensor
-ChunkId = Tuple[str, tuple, Optional[tuple]]
+# uniquely identifies a given ShardedTensor
+_ShardId = Tuple[str, tuple, Optional[tuple]]
 
 
 class SaveLoadDistribution(NamedTuple):
@@ -39,17 +39,17 @@ class SaveLoadDistribution(NamedTuple):
     which is implicit here (not referenced by this class).
 
     Args:
-        main_rank_for_shard (Dict[ChunkId, int]): specifies which rank should hold
+        main_rank_for_shard (Dict[_ShardId, int]): specifies which rank should hold
             the main replica for a given shard
-        shards_in_this_group (Set[ChunkId]): which shards have a main replica
+        shards_in_this_group (Set[_ShardId]): which shards have a main replica
             in this parallelization group
-        shard_to_metadata (Dict[ChunkId, ShardedTensor]): maps ShardedTensor
+        shard_to_metadata (Dict[_ShardId, ShardedTensor]): maps ShardedTensor
             identifier to the original ShardedTensor
 
     """
-    main_rank_for_shard: Dict[ChunkId, int]
-    shards_in_this_group: Set[ChunkId]
-    shard_to_metadata: Dict[ChunkId, ShardedTensor]
+    main_rank_for_shard: Dict[_ShardId, int]
+    shards_in_this_group: Set[_ShardId]
+    shard_to_metadata: Dict[_ShardId, ShardedTensor]
 
 
 class FullyParallelSaveStrategyWrapper(SaveShardedStrategy):
@@ -64,7 +64,7 @@ class FullyParallelSaveStrategyWrapper(SaveShardedStrategy):
     are set to 1.
 
     Currently, the save distribution is realized with a greedy algorithm
-    described in `distribute_chunks_to_ranks`.
+    described in `distribute_shards_to_ranks`.
 
     Args:
         strategy (SaveShardedStrategy): base strategy to wrap
@@ -180,14 +180,14 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         1. Load metadata is exchanged between the ranks in the parallelization group.
         2. Each rank deterministically plans the load for the whole workload
             so that the loads are as uniform as possible.
-        3. Each ranks loads its planned chunk of the checkpoint.
-        4. All ranks exchange the loaded chunks.
+        3. Each ranks loads its planned shard of the checkpoint.
+        4. All ranks exchange the loaded shards.
 
         Internode communication is involved in steps (1) (with metadata)
         and (4) (with actual data). Storage interaction is involved in step (3).
 
         Currently, the load distribution (step 2) is realized with a greedy algorithm
-        described in `distribute_chunks_to_ranks` (same as for saving distribution).
+        described in `distribute_shards_to_ranks` (same as for saving distribution).
 
         Currently, the shards are all gathered between all ranks in the parallelization
         group. This might not be optimal (some ranks do not need all tensors),
@@ -271,8 +271,8 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
     ) -> Tuple[
         ShardedStateDict,
         ShardedStateDict,
-        Dict[ChunkId, ShardedTensor],
-        Dict[ChunkId, ShardedTensor],
+        Dict[_ShardId, ShardedTensor],
+        Dict[_ShardId, ShardedTensor],
     ]:
         """ Divides state dict into parts loaded by this vs other ranks.
 
@@ -286,10 +286,10 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         Returns: a tuple of:
             - ShardedStateDict: sub-state dict only with ShardedTensors
             - ShardedStateDict: sub-state dict with non-ShardedTensors
-            - Dict[ChunkId, ShardedTensor]: ShardedTensor are uniquely identified
-                by chunk ids. This is a mapping from chunk id to a corresponding
+            - Dict[_ShardId, ShardedTensor]: ShardedTensor are uniquely identified
+                by shard ids. This is a mapping from shard id to a corresponding
                 ShardedTensor for tensors loaded by *this* rank
-            - Dict[ChunkId, ShardedTensor]: mapping from chunk id to a corresponding
+            - Dict[_ShardId, ShardedTensor]: mapping from shard id to a corresponding
                 ShardedTensor for tensors loaded by *other* ranks
         """
         to_load_shards = {}
@@ -303,9 +303,9 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             if isinstance(x, ShardedTensor):
                 # Assign shard to be loaded or not
                 if is_main_replica(x.replica_id):
-                    to_load_shards[_sharded_tensor_chunk_id(x)] = x
+                    to_load_shards[_sharded_tensor_shard_id(x)] = x
                 else:
-                    unloaded_shards[_sharded_tensor_chunk_id(x)] = x
+                    unloaded_shards[_sharded_tensor_shard_id(x)] = x
             return x
 
         dict_list_map_inplace(wrap_non_main_replicas, sharded_tensors)
@@ -344,27 +344,27 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
 
     def exchange_loaded_tensors_gather_object(
         self,
-        loaded_tensors: Dict[ChunkId, torch.Tensor],
-        unloaded_shards: Dict[ChunkId, ShardedTensor],
+        loaded_tensors: Dict[_ShardId, torch.Tensor],
+        unloaded_shards: Dict[_ShardId, ShardedTensor],
         precomputed_distribution: SaveLoadDistribution,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
-    ) -> Dict[ChunkId, torch.Tensor]:
+    ) -> Dict[_ShardId, torch.Tensor]:
         """ Exchange the tensors loaded by different ranks with a simple all_gather_object call.
 
         This version can be used for debugging purposes do to its simplistic
         implementation. Shouldn't be used if performance is important.
 
         Args:
-            loaded_tensors (Dict[ChunkId, torch.Tensor]): mapping from ShardedTensor
-                chunk ids to tensors already loaded by this rank.
-            unloaded_shards (Dict[ChunkId, torch.Tensor]): mapping from ShardedTensor
-                chunk ids to ShardedTensors that aren't loaded yet.
+            loaded_tensors (Dict[_ShardId, torch.Tensor]): mapping from ShardedTensor
+                shard ids to tensors already loaded by this rank.
+            unloaded_shards (Dict[_ShardId, torch.Tensor]): mapping from ShardedTensor
+                shard ids to ShardedTensors that aren't loaded yet.
             precomputed_distribution (SaveDistribution): uniform load distribution
             parallelization_group (ProcessGroup, optional): process group used for load
                 distribution. Tensors will be exchanged within this group
 
         Returns:
-            Dict[ChunkId, torch.Tensor]: dictionary mapping chunk ids to tensors
+            Dict[_ShardId, torch.Tensor]: dictionary mapping shard ids to tensors
                 needed by this rank to load a given state dict. Includes
                 previously loaded tensors (from `loaded_tensors` input)
 
@@ -375,15 +375,15 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         torch.distributed.all_gather_object(
             all_loaded_tensors_list, loaded_tensors, group=parallelization_group
         )
-        all_loaded_tensors_list = cast(List[Dict[ChunkId, torch.Tensor]], all_loaded_tensors_list)
+        all_loaded_tensors_list = cast(List[Dict[_ShardId, torch.Tensor]], all_loaded_tensors_list)
         all_loaded_tensors = reduce(lambda x, y: {**x, **y}, all_loaded_tensors_list)
 
         # Error checks
         if len(all_loaded_tensors) != sum(map(len, all_loaded_tensors_list)):
-            err_msg = 'Duplicate chunk ids loaded by different ranks'
+            err_msg = 'Duplicate shard ids loaded by different ranks'
             if torch.distributed.get_rank() == 0:
                 logger.error(
-                    f'{err_msg}. Chunks ids by rank: {[lt.keys() for lt in all_loaded_tensors_list]}'
+                    f'{err_msg}. Shards ids by rank: {[lt.keys() for lt in all_loaded_tensors_list]}'
                 )
             raise CheckpointingException(err_msg)
 
@@ -392,11 +392,11 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
     @torch.no_grad()
     def exchange_loaded_tensors_gather_rounds(
         self,
-        loaded_tensors: Dict[ChunkId, torch.Tensor],
-        unloaded_shards: Dict[ChunkId, ShardedTensor],
+        loaded_tensors: Dict[_ShardId, torch.Tensor],
+        unloaded_shards: Dict[_ShardId, ShardedTensor],
         precomputed_distribution: SaveLoadDistribution = None,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
-    ) -> Dict[ChunkId, torch.Tensor]:
+    ) -> Dict[_ShardId, torch.Tensor]:
         """ Exchange the tensors loaded by different ranks with several all_gather calls.
 
         Groups tensors by dtype, divide tensors that will be exchanged into rounds
@@ -409,16 +409,16 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         bytes tensor and do a single all_gather (with similarly sized messages).
 
         Args:
-            loaded_tensors (Dict[ChunkId, torch.Tensor]): mapping from ShardedTensor
-                chunk ids to tensors already loaded by this rank.
-            unloaded_shards (Dict[ChunkId, torch.Tensor]): mapping from ShardedTensor
-                chunk ids to ShardedTensors that aren't loaded yet.
+            loaded_tensors (Dict[_ShardId, torch.Tensor]): mapping from ShardedTensor
+                shard ids to tensors already loaded by this rank.
+            unloaded_shards (Dict[_ShardId, torch.Tensor]): mapping from ShardedTensor
+                shard ids to ShardedTensors that aren't loaded yet.
             precomputed_distribution (SaveDistribution): uniform load distribution
             parallelization_group (ProcessGroup, optional): process group used for load
                 distribution. Tensors will be exchanged within this group
 
         Returns:
-            Dict[ChunkId, torch.Tensor]: dictionary mapping chunk ids to tensors
+            Dict[_ShardId, torch.Tensor]: dictionary mapping shard ids to tensors
                 needed by this rank to load a given state dict. Includes
                 previously loaded tensors (from `loaded_tensors` input)
         """
@@ -481,27 +481,27 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
     @torch.no_grad()
     def exchange_loaded_tensors_broadcast(
         self,
-        loaded_tensors: Dict[ChunkId, torch.Tensor],
-        unloaded_shards: Dict[ChunkId, ShardedTensor],
+        loaded_tensors: Dict[_ShardId, torch.Tensor],
+        unloaded_shards: Dict[_ShardId, ShardedTensor],
         precomputed_distribution: SaveLoadDistribution = None,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
-    ) -> Dict[ChunkId, torch.Tensor]:
+    ) -> Dict[_ShardId, torch.Tensor]:
         """ Exchange the tensors loaded by different ranks by a series of broadcasts.
 
         For each rank for each loaded tensor do a broadcast to the whole group.
         A reasonable tradeoff in terms of performance and simplicity.
 
         Args:
-            loaded_tensors (Dict[ChunkId, torch.Tensor]): mapping from ShardedTensor
-                chunk ids to tensors already loaded by this rank.
-            unloaded_shards (Dict[ChunkId, torch.Tensor]): mapping from ShardedTensor
-                chunk ids to ShardedTensors that aren't loaded yet.
+            loaded_tensors (Dict[_ShardId, torch.Tensor]): mapping from ShardedTensor
+                shard ids to tensors already loaded by this rank.
+            unloaded_shards (Dict[_ShardId, torch.Tensor]): mapping from ShardedTensor
+                shard ids to ShardedTensors that aren't loaded yet.
             precomputed_distribution (SaveDistribution): uniform load distribution
             parallelization_group (ProcessGroup, optional): process group used for load
                 distribution. Tensors will be exchanged within this group
 
         Returns:
-            Dict[ChunkId, torch.Tensor]: dictionary mapping chunk ids to tensors
+            Dict[_ShardId, torch.Tensor]: dictionary mapping shard ids to tensors
                 needed by this rank to load a given state dict. Includes
                 previously loaded tensors (from `loaded_tensors` input)
         """
@@ -534,10 +534,10 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
 
     def _get_empty_tensor_for_exchange(
         self,
-        shard_id: ChunkId,
-        needed_shards: Dict[ChunkId, ShardedTensor],
-        unneeded_shards: Dict[ChunkId, ShardedTensor],
-        loaded_tensors: Dict[ChunkId, torch.Tensor],
+        shard_id: _ShardId,
+        needed_shards: Dict[_ShardId, ShardedTensor],
+        unneeded_shards: Dict[_ShardId, ShardedTensor],
+        loaded_tensors: Dict[_ShardId, torch.Tensor],
     ) -> torch.Tensor:
         """ Determines the empty tensor to use for exchange.
 
@@ -545,12 +545,12 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         Otherwise, the metadata for this tensor can be found in `shard_to_metadata`
 
         Args:
-            shard_id (ChunkId): shard_id that will be exchanged
-            needed_shards (Dict[ChunkId, ShardedTensor]): mapping from shard ids
+            shard_id (_ShardId): shard_id that will be exchanged
+            needed_shards (Dict[_ShardId, ShardedTensor]): mapping from shard ids
                 to metadata for shards needed by this rank
-            unneeded_shards (Dict[ChunkId, ShardedTensor]): mapping from shard ids
+            unneeded_shards (Dict[_ShardId, ShardedTensor]): mapping from shard ids
                 to metadata for shards that can be discarded after exchange
-            loaded_tensors (Dict[ChunkId, torch.Tensor]): mapping where useful tensors
+            loaded_tensors (Dict[_ShardId, torch.Tensor]): mapping where useful tensors
                 are placed in
 
         Returns:
@@ -569,14 +569,14 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         return tensor
 
     def fill_in_deferred_sharded_tensors(
-        self, sharded_state_dict: ShardedStateDict, loaded_tensors: Dict[ChunkId, torch.Tensor]
+        self, sharded_state_dict: ShardedStateDict, loaded_tensors: Dict[_ShardId, torch.Tensor]
     ) -> None:
         """ Fill in tensors not loaded by current rank with tensors from `loaded_tensors` map.
 
         Args:
             sharded_state_dict (ShardedStateDict): sharded state dict to fill in.
                 ShardedTensors are completely replaced with corresponding torch.Tensors.
-            loaded_tensors (Dict[ChunkId, torch.Tensor]): dict allowing to map
+            loaded_tensors (Dict[_ShardId, torch.Tensor]): dict allowing to map
                 ShardedTensor from the sharded_state_dict to loaded tensors.
 
         Returns:
@@ -586,10 +586,10 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         def fill_in_sharded_tensor(x):
             if isinstance(x, ShardedTensor):
                 try:
-                    x = loaded_tensors[_sharded_tensor_chunk_id(x)]
+                    x = loaded_tensors[_sharded_tensor_shard_id(x)]
                 except KeyError as e:
                     raise CheckpointingException(
-                        f'Missing loaded tensor shard: {_sharded_tensor_chunk_id(x)}'
+                        f'Missing loaded tensor shard: {_sharded_tensor_shard_id(x)}'
                     ) from e
 
             return x
@@ -610,15 +610,15 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         self.base_strategy.check_version_compatibility(loaded_version)
 
 
-def _sharded_tensor_chunk_id(sharded_tensor: ShardedTensor) -> ChunkId:
+def _sharded_tensor_shard_id(sharded_tensor: ShardedTensor) -> _ShardId:
     """ Unique id of the sharded tensor data.
 
     Should yield the same value for same data replicated on different ranks.
 
     Args:
-        sharded_tensor (ShardedTensor): sharded tensor representing the data chunk
+        sharded_tensor (ShardedTensor): sharded tensor representing the data shard
 
-    Returns (tuple): unique id of a data chunk
+    Returns (tuple): unique id of a data shard
     """
     f_range = sharded_tensor.flattened_range
     return (
@@ -680,10 +680,10 @@ def determine_main_replica_uniform_distribution(
     shard_to_ranks = defaultdict(list)
     shard_to_size = {}
     shard_to_metadata = {}
-    shards_saved_by_this_parallelization_group: Set[ChunkId] = set()
+    shards_saved_by_this_parallelization_group: Set[_ShardId] = set()
     for rank, rank_shards in enumerate(all_shards):
         for sh_ten in rank_shards:
-            shard_id = _sharded_tensor_chunk_id(sh_ten)
+            shard_id = _sharded_tensor_shard_id(sh_ten)
             shard_to_ranks[shard_id].append(rank)
             if shard_id not in shard_to_size:
                 shard_to_size[shard_id] = _shard_size(sh_ten)
@@ -695,7 +695,7 @@ def determine_main_replica_uniform_distribution(
         k: v for k, v in shard_to_ranks.items() if k in shards_saved_by_this_parallelization_group
     }
 
-    shard_to_saving_rank = distribute_chunks_to_ranks(
+    shard_to_saving_rank = distribute_shards_to_ranks(
         shard_to_ranks, shard_to_size, len(all_shards)
     )
 
@@ -749,7 +749,7 @@ def distribute_main_replicas_with_precomputed_distribution(
 
     rank_within_dp_group = torch.distributed.get_rank(parallelization_group)
     for sh_ten in local_shards:
-        shard_id = _sharded_tensor_chunk_id(sh_ten)
+        shard_id = _sharded_tensor_shard_id(sh_ten)
         if (
             shard_id in precomputed_distribution.shards_in_this_group
             and rank_within_dp_group == precomputed_distribution.main_rank_for_shard[shard_id]
@@ -762,7 +762,7 @@ def distribute_main_replicas_with_precomputed_distribution(
 T = TypeVar('T')
 
 
-def distribute_chunks_to_ranks(
+def distribute_shards_to_ranks(
     shard_to_ranks: Dict[T, List[int]], shard_to_size: Dict[T, int], num_ranks: int
 ) -> Dict[T, int]:
     """ Computes uniform distribution of workload across ranks, based on sizes.
@@ -802,6 +802,6 @@ def distribute_chunks_to_ranks(
         shard_to_saving_rank[shard_id] = rank
         rank_sizes[rank] = (size + shard_to_size[shard_id], rank)
 
-    logger.debug(f'distribute_chunks_to_ranks distribution: {rank_sizes}')
+    logger.debug(f'distribute_shards_to_ranks distribution: {rank_sizes}')
 
     return shard_to_saving_rank
