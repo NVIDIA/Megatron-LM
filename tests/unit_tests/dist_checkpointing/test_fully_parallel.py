@@ -120,12 +120,11 @@ class TestFullyParallelSaveAndLoad:
                                                          parallelization_group,
                                                          do_cache_distribution=True)
         save_strategy.save(state_dict, Path('mock_dir'))
-        shard_to_rank, shards_saved_by_this_dp_group, _ = save_strategy.cached_distribution
-        key_to_saving_rank = dict(map_reduce(shard_to_rank.items(), lambda shard_rank: shard_rank[0][0], lambda shard_rank: shard_rank[1]))
+        key_to_saving_rank = dict(map_reduce(save_strategy.cached_distribution.main_rank_for_shard.items(), lambda shard_rank: shard_rank[0][0], lambda shard_rank: shard_rank[1]))
         assert expected_key_to_saving_ranks == key_to_saving_rank
 
         for k, sh_ten in state_dict.items():
-            if _sharded_tensor_chunk_id(sh_ten) in shards_saved_by_this_dp_group:
+            if _sharded_tensor_chunk_id(sh_ten) in save_strategy.cached_distribution.shards_in_this_group:
                 is_expected_to_be_saved_by_this_rank = dp_rank in expected_key_to_saving_ranks.get(sh_ten.key, [])
                 assert sh_ten.replica_id == int(not is_expected_to_be_saved_by_this_rank), expected_key_to_saving_ranks
 
@@ -173,8 +172,7 @@ class TestFullyParallelSaveAndLoad:
                                                          parallelization_group,
                                                          do_cache_distribution=True)
         loaded_state_dict = load_strategy.load(state_dict, Path('mock_dir'))
-        shard_to_rank, shards_saved_by_this_dp_group, _ = load_strategy.cached_distribution
-        key_to_saving_rank = dict(map_reduce(shard_to_rank.items(), lambda shard_rank: shard_rank[0][0], lambda shard_rank: shard_rank[1]))
+        key_to_saving_rank = dict(map_reduce(load_strategy.cached_distribution.main_rank_for_shard.items(), lambda shard_rank: shard_rank[0][0], lambda shard_rank: shard_rank[1]))
         assert expected_key_to_saving_ranks == key_to_saving_rank
 
         assert mock_strategy.load_keys == expected_keys_saved_by_current_rank, (Utils.rank, mock_strategy.load_keys, expected_keys_saved_by_current_rank)

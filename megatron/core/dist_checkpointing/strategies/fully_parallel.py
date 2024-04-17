@@ -4,7 +4,7 @@ from functools import reduce
 from itertools import zip_longest
 from pathlib import Path
 from time import time
-from typing import Dict, List, Optional, Set, Tuple, TypeVar, cast
+from typing import Dict, List, Optional, Set, Tuple, TypeVar, cast, NamedTuple
 
 import numpy as np
 import torch
@@ -28,8 +28,28 @@ from megatron.core.dist_checkpointing.strategies.base import (
 logger = logging.getLogger(__name__)
 
 
+# uniquely identifies a single chunk of a ShardedTensor
 ChunkId = Tuple[str, tuple, Optional[tuple]]
-SaveDistribution = Tuple[Dict[ChunkId, int], Set[ChunkId], Dict[ChunkId, ShardedTensor]]
+
+
+class SaveLoadDistribution(NamedTuple):
+    """ Represents a save or load distribution of ShardedTensors.
+
+    Given distribution is valid only for a specific parallelization group,
+    which is implicit here (not referenced by this class).
+
+    Args:
+        main_rank_for_shard (Dict[ChunkId, int]): specifies which rank should hold
+            the main replica for a given shard
+        shards_in_this_group (Set[ChunkId]): which shards have a main replica
+            in this parallelization group
+        shard_to_metadata (Dict[ChunkId, ShardedTensor]): maps ShardedTensor
+            identifier to the original ShardedTensor
+
+    """
+    main_rank_for_shard: Dict[ChunkId, int]
+    shards_in_this_group: Set[ChunkId]
+    shard_to_metadata: Dict[ChunkId, ShardedTensor]
 
 
 class FullyParallelSaveStrategyWrapper(SaveShardedStrategy):
@@ -68,7 +88,7 @@ class FullyParallelSaveStrategyWrapper(SaveShardedStrategy):
         self.parallelization_group = parallelization_group
         self.do_cache_distribution = do_cache_distribution
 
-        self.cached_distribution: Optional[SaveDistribution] = None
+        self.cached_distribution: Optional[SaveLoadDistribution] = None
 
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         self.apply_saving_parallelization(sharded_state_dict)
@@ -151,7 +171,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         self.do_cache_distribution = do_cache_distribution
         self.exchange_algo = exchange_algo
 
-        self.cached_distribution: Optional[SaveDistribution] = None
+        self.cached_distribution: Optional[SaveLoadDistribution] = None
 
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
         """ Distributes the load and calls underlying strategy only for parts of the state dict.
@@ -293,7 +313,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
 
     def apply_loading_parallelization(
         self, sharded_state_dict: ShardedStateDict
-    ) -> Optional[SaveDistribution]:
+    ) -> Optional[SaveLoadDistribution]:
         """ Distributes the load across ranks by exchanging metadata.
 
         Exchanges metadata from the state dict and computes the uniform
@@ -326,7 +346,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         self,
         loaded_tensors: Dict[ChunkId, torch.Tensor],
         unloaded_shards: Dict[ChunkId, ShardedTensor],
-        precomputed_distribution: SaveDistribution,
+        precomputed_distribution: SaveLoadDistribution,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> Dict[ChunkId, torch.Tensor]:
         """ Exchange the tensors loaded by different ranks with a simple all_gather_object call.
@@ -374,7 +394,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         self,
         loaded_tensors: Dict[ChunkId, torch.Tensor],
         unloaded_shards: Dict[ChunkId, ShardedTensor],
-        precomputed_distribution: SaveDistribution = None,
+        precomputed_distribution: SaveLoadDistribution = None,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> Dict[ChunkId, torch.Tensor]:
         """ Exchange the tensors loaded by different ranks with several all_gather calls.
@@ -463,7 +483,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         self,
         loaded_tensors: Dict[ChunkId, torch.Tensor],
         unloaded_shards: Dict[ChunkId, ShardedTensor],
-        precomputed_distribution: SaveDistribution = None,
+        precomputed_distribution: SaveLoadDistribution = None,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> Dict[ChunkId, torch.Tensor]:
         """ Exchange the tensors loaded by different ranks by a series of broadcasts.
@@ -621,7 +641,7 @@ def determine_main_replica_uniform_distribution(
     sharded_state_dict: ShardedStateDict,
     parallelization_group: torch.distributed.ProcessGroup,
     is_loading: bool = False,
-) -> Optional[SaveDistribution]:
+) -> Optional[SaveLoadDistribution]:
     """ Computes the save distribution.
 
     Should be used in conjunction with `distribute_main_replicas_with_precomputed_distribution`
@@ -679,13 +699,15 @@ def determine_main_replica_uniform_distribution(
         shard_to_ranks, shard_to_size, len(all_shards)
     )
 
-    return shard_to_saving_rank, shards_saved_by_this_parallelization_group, shard_to_metadata
+    return SaveLoadDistribution(
+        shard_to_saving_rank, shards_saved_by_this_parallelization_group, shard_to_metadata
+    )
 
 
 def distribute_main_replicas_with_precomputed_distribution(
     sharded_state_dict: ShardedStateDict,
     parallelization_group: torch.distributed.ProcessGroup,
-    precomputed_distribution: Optional[SaveDistribution],
+    precomputed_distribution: Optional[SaveLoadDistribution],
 ):
     """ Applies the save distribution computed with `determine_main_replica_uniform_distribution`.
 
@@ -697,7 +719,7 @@ def distribute_main_replicas_with_precomputed_distribution(
         parallelization_group (ProcessGroup): distribution will be applied within this
             process group. Must match with the process group passed to
             `determine_main_replica_uniform_distribution`.
-        precomputed_distribution (DistributionT): distribution computed with
+        precomputed_distribution (SaveLoadDistribution): distribution computed with
             `determine_main_replica_uniform_distribution`
 
     Returns: None
@@ -725,14 +747,12 @@ def distribute_main_replicas_with_precomputed_distribution(
         if isinstance(sh_base, ShardedTensor)
     )
 
-    shard_to_saving_rank, shards_saved_by_this_parallelization_group, _ = precomputed_distribution
-
     rank_within_dp_group = torch.distributed.get_rank(parallelization_group)
     for sh_ten in local_shards:
         shard_id = _sharded_tensor_chunk_id(sh_ten)
         if (
-            shard_id in shards_saved_by_this_parallelization_group
-            and rank_within_dp_group == shard_to_saving_rank[shard_id]
+            shard_id in precomputed_distribution.shards_in_this_group
+            and rank_within_dp_group == precomputed_distribution.main_rank_for_shard[shard_id]
         ):
             sh_ten.replica_id = 0
         else:
