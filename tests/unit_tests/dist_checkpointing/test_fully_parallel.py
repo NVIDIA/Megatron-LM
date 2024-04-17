@@ -13,7 +13,7 @@ from megatron.core.dist_checkpointing.mapping import is_main_replica
 from megatron.core.dist_checkpointing.strategies.base import \
     SaveShardedStrategy, LoadShardedStrategy
 from megatron.core.dist_checkpointing.strategies.fully_parallel import \
-    FullyParallelSaveStrategyWrapper, _sharded_tensor_chunk_id, \
+    FullyParallelSaveStrategyWrapper, _sharded_tensor_shard_id, \
     FullyParallelLoadStrategyWrapper
 from tests.unit_tests.test_utilities import Utils
 
@@ -79,7 +79,7 @@ class TestFullyParallelSaveAndLoad:
         # Ranks assignment:
         # 1. Lowest coverage
         # 2. Largest tensor
-        # 3. Chunk id (key)
+        # 3. Shard id (key)
         if not parallelization_along_dp:
             expected_key_to_saving_ranks = {
                 'keyB': list(range(Utils.world_size)), # everyone must save (disjoint shards, coverage == 1)
@@ -124,7 +124,7 @@ class TestFullyParallelSaveAndLoad:
         assert expected_key_to_saving_ranks == key_to_saving_rank
 
         for k, sh_ten in state_dict.items():
-            if _sharded_tensor_chunk_id(sh_ten) in save_strategy.cached_distribution.shards_in_this_group:
+            if _sharded_tensor_shard_id(sh_ten) in save_strategy.cached_distribution.shards_in_this_group:
                 is_expected_to_be_saved_by_this_rank = dp_rank in expected_key_to_saving_ranks.get(sh_ten.key, [])
                 assert sh_ten.replica_id == int(not is_expected_to_be_saved_by_this_rank), expected_key_to_saving_ranks
 
@@ -139,7 +139,7 @@ class TestFullyParallelSaveAndLoad:
         # Ranks assignment:
         # 1. Lowest coverage
         # 2. Largest tensor
-        # 3. Chunk id (key)
+        # 3. Shard id (key)
         if not parallelization_along_dp:
             expected_key_to_saving_ranks = {
                 'keyB': list(range(Utils.world_size)), # everyone must save (disjoint shards, coverage == 1)
