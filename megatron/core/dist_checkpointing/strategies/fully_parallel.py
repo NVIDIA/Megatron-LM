@@ -463,7 +463,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                                 all_loaded_tensors.keys(),
                             )
                             all_loaded_tensors[shard_id] = all_loaded_tensors[shard_id].cuda()
-                            local_ten = all_loaded_tensors[shard_id].cuda()
+                            local_ten = all_loaded_tensors[shard_id]
                         else:
                             local_ten = self._get_empty_tensor_for_exchange(
                                 shard_id, shard_to_metadata, unloaded_shards, all_loaded_tensors
@@ -522,7 +522,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             if rank == local_rank:
                 assert shard_id in all_loaded_tensors, (shard_id, all_loaded_tensors.keys())
                 all_loaded_tensors[shard_id] = all_loaded_tensors[shard_id].cuda()
-                local_ten = all_loaded_tensors[shard_id].cuda()
+                local_ten = all_loaded_tensors[shard_id]
             else:
                 local_ten = self._get_empty_tensor_for_exchange(
                     shard_id, shard_to_metadata, unloaded_shards, all_loaded_tensors
