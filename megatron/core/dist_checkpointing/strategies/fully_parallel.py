@@ -4,7 +4,7 @@ from functools import reduce
 from itertools import zip_longest
 from pathlib import Path
 from time import time
-from typing import Dict, List, Optional, Set, Tuple, TypeVar, cast, NamedTuple
+from typing import Dict, List, NamedTuple, Optional, Set, Tuple, TypeVar, cast
 
 import numpy as np
 import torch
@@ -47,6 +47,7 @@ class SaveLoadDistribution(NamedTuple):
             identifier to the original ShardedTensor
 
     """
+
     main_rank_for_shard: Dict[_ShardId, int]
     shards_in_this_group: Set[_ShardId]
     shard_to_metadata: Dict[_ShardId, ShardedTensor]
