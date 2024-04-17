@@ -205,7 +205,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         if torch.distributed.get_world_size(self.parallelization_group) <= 1:
             return self.base_strategy.load(sharded_state_dict, checkpoint_dir)
 
-        # Step 1 and 2: exchange load metadata and distributed the load
+        # Step 1 and 2: exchange load metadata and distribute the load
         start = time()
         precomputed_distribution = self.apply_loading_parallelization(sharded_state_dict)
         assert (
@@ -214,15 +214,16 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         end = time()
         logger.debug(f'self.apply_loading_parallelization took {end - start}s')
         start = end
+
+        # Step 3: load part of the checkpoint.
+        # Load only sharded objects first. ShardedTensors will be loaded separately
+        # so that we can keep track of sharded tensors loaded by this rank
         (
             sharded_tensors,
             sharded_state_dict,
             to_load_shards,
             unloaded_shards,
         ) = self._defer_loading_sharded_tensors(sharded_state_dict)
-
-        # Step 3: load part of the checkpoint
-        # Load only sharded objects
         loaded_state_dict = self.base_strategy.load(sharded_state_dict, checkpoint_dir)
 
         end = time()
@@ -329,11 +330,17 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             sharded_state_dict (ShardedStateDict): state dict to distribute the loading
 
         Returns:
-            SaveDistribution (optional): the computed loading distribution
+            SaveLoadDistribution (optional): the computed loading distribution
         """
-        precomputed_distribution = determine_main_replica_uniform_distribution(
-            sharded_state_dict, self.parallelization_group, True
-        )
+        if self.do_cache_distribution and self.cached_distribution is not None:
+            logger.debug(f'Apply *cached* load parallelization')
+            precomputed_distribution = self.cached_distribution
+        else:
+            logger.debug(f'Apply load parallelization')
+            precomputed_distribution = determine_main_replica_uniform_distribution(
+                sharded_state_dict, self.parallelization_group, True
+            )
+
         distribute_main_replicas_with_precomputed_distribution(
             sharded_state_dict, self.parallelization_group, precomputed_distribution
         )
@@ -359,7 +366,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                 shard ids to tensors already loaded by this rank.
             unloaded_shards (Dict[_ShardId, torch.Tensor]): mapping from ShardedTensor
                 shard ids to ShardedTensors that aren't loaded yet.
-            precomputed_distribution (SaveDistribution): uniform load distribution
+            precomputed_distribution (SaveLoadDistribution): uniform load distribution
             parallelization_group (ProcessGroup, optional): process group used for load
                 distribution. Tensors will be exchanged within this group
 
@@ -413,7 +420,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                 shard ids to tensors already loaded by this rank.
             unloaded_shards (Dict[_ShardId, torch.Tensor]): mapping from ShardedTensor
                 shard ids to ShardedTensors that aren't loaded yet.
-            precomputed_distribution (SaveDistribution): uniform load distribution
+            precomputed_distribution (SaveLoadDistribution): uniform load distribution
             parallelization_group (ProcessGroup, optional): process group used for load
                 distribution. Tensors will be exchanged within this group
 
@@ -496,7 +503,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                 shard ids to tensors already loaded by this rank.
             unloaded_shards (Dict[_ShardId, torch.Tensor]): mapping from ShardedTensor
                 shard ids to ShardedTensors that aren't loaded yet.
-            precomputed_distribution (SaveDistribution): uniform load distribution
+            precomputed_distribution (SaveLoadDistribution): uniform load distribution
             parallelization_group (ProcessGroup, optional): process group used for load
                 distribution. Tensors will be exchanged within this group
 
@@ -658,7 +665,7 @@ def determine_main_replica_uniform_distribution(
             For loading, even non-main replicas must be loaded by this parallelization
             group. Defaults to False.
 
-    Returns (SaveDistribution, optional): distribution that can be used to apply the
+    Returns (SaveLoadDistribution, optional): distribution that can be used to apply the
         parallelization. Returns None if the process_group is trivial (1 rank)
 
     """
