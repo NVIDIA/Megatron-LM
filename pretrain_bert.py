@@ -22,6 +22,7 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec, bert_layer_local_spec
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.bert_dataset import BERTMaskedWordPieceDataset, BERTMaskedWordPieceDatasetConfig
+from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core import mpu, tensor_parallel
 
 
@@ -151,11 +152,11 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     config = BERTMaskedWordPieceDatasetConfig(
         random_seed=args.seed,
         sequence_length=args.seq_length,
-        blend=args.data_path,
+        blend=get_blend_from_list(args.data_path),
         blend_per_split=[
-            args.train_data_path,
-            args.valid_data_path,
-            args.test_data_path,
+            get_blend_from_list(args.train_data_path),
+            get_blend_from_list(args.valid_data_path),
+            get_blend_from_list(args.test_data_path)
         ],
         split=args.split,
         path_to_cache=args.data_cache_path,

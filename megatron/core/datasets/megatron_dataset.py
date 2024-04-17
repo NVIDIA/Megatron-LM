@@ -26,7 +26,7 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
 
         indices (numpy.ndarray): The set of the documents indices to expose
 
-        num_samples (int): The number of samples to draw from the indexed dataset
+        num_samples (Optional[int]): The minimum number of samples to build from the indexed dataset. When None, build as many samples as correspond to one epoch.
 
         index_split (Split): The indices Split
 
@@ -38,7 +38,7 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
         dataset: LowLevelDataset,
         dataset_path: str,
         indices: numpy.ndarray,
-        num_samples: int,
+        num_samples: Optional[int],
         index_split: Split,
         config: BlendedMegatronDatasetConfig,
     ) -> None:
