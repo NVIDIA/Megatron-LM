@@ -3,7 +3,6 @@
 import argparse
 import importlib
 import torch.multiprocessing as mp
-import os
 import sys
 
 # A loader is a python file with at least two functions
@@ -118,7 +117,7 @@ def main():
     parser.add_argument('--loader', type=str, default='megatron',
                         help='Module name to load checkpoint, should be on python path')
     parser.add_argument('--saver', type=str, default='megatron',
-                        help='Module name to save checkpoint, shdoul be on python path')
+                        help='Module name to save checkpoint, should be on python path')
     parser.add_argument('--load-dir', type=str, required=True,
                         help='Directory to load model checkpoint from')
     parser.add_argument('--save-dir', type=str, required=True,

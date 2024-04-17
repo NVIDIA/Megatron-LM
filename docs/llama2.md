@@ -27,24 +27,31 @@ Users must first apply for access to download the Llama-2 checkpoints either dir
 
 # Convert checkpoint format
 
-Depending on which checkpoint format is downloaded (Meta or HF), one or two steps must be taken to convert to Megatron format.
+We recommend passing `--dtype bf16` for training or finetuning. Inference can be done in bfloat16 or float16. 
 
 ### Meta format
 
-The Meta format checkpoints must first be converted to HF format before converting to Megatron format. The `transformers` package is required for the first step, and must have version >=4.31.0 (e.g., `pip install transformers>=4.31.0`). (**Note**: we have specifically tested with versions `4.31.0` and `4.32.0`; your experience may vary with newer versions.) Assuming the downloaded checkpoints are in `$CHECKPOINT_DIR` (with separate sub-directories for 7B, 13B, 70B, etc.), the following example command can be used to convert from Llama-2 format to HF format:
+The Meta format checkpoints are converted to HF format as an intermediate step before converting to Megatron format. The `transformers` package is required, and must have version >=4.31.0 (e.g., `pip install transformers>=4.31.0`). (**Note**: we have specifically tested with versions `4.31.0` and `4.32.0`; your experience may vary with newer versions.) Assuming the downloaded checkpoints are in `$CHECKPOINT_DIR` (with separate sub-directories for 7B, 13B, 70B, etc.), the following example command can be used to convert from Llama-2 format to HF format in bfloat16:
 
 ```
-$>: python $LIB_DIR/transformers/models/llama/convert_llama_weights_to_hf.py \
- >    --input_dir $LLAMA_FORMAT_DIR \
- >    --output_dir $HF_FORMAT_DIR \
- >    --model_size 7B`
+python tools/checkpoint/util.py --model-type GPT \ 
+>   --loader llama2 \
+>   --saver megatron \
+>   --checkpoint-type meta
+>   --model_size 7B \ 
+>   --load-dir $LLAMA_META_FORMAT_DIR \
+>   --save-dir ${MEGATRON_FORMAT_DIR} \
+>   --tokenizer-model ${TOKENIZER_MODEL} \
+>   --target-tensor-parallel-size ${TP} \
+>   --target-pipeline-parallel-size ${PP} \
+>   --bf16
 ```
 
-Valid values for `--model_size` include `7B`, `13B`, and `70B` (for pretrained-only models), and `7Bf`, `13Bf`, and `70Bf` (for chat-finetuned models). Use `python convert_llama_weights_to_hf.py --help` for additional argument details. Once the checkpoints have been converted to HF format, proceed to the Huggingface format section below.
+Valid values for `--model_size` include `7B`, `13B`, and `70B` (for pretrained-only models), and `7Bf`, `13Bf`, and `70Bf` (for chat-finetuned models).
 
 ### Huggingface format
 
-The HF checkpoints can be converted to Megatron format by using Megatron's own Llama-2 checkpoint converter for HF format (see script `tools/checkpoint/loader_llama2_hf.py`). One important argument that must be set correctly is the tensor parallel size (`TP`) for each model. The following table shows these values:
+The HF checkpoints can be converted to Megatron format by using Megatron's own Llama-2 checkpoint converter for HF format (see script `tools/checkpoint/loader_llama2.py`). One important argument that must be set correctly is the tensor parallel size (`TP`) for each model. The following table shows these values:
 
 | Model size | Tensor parallel size (`TP`) |
 | ---------- | --------------------------- |
@@ -57,9 +64,10 @@ Using these values for `TP`, along with the path to the Llama-2 tokenizer model 
 ```
 $>: python tools/checkpoint/util.py \
  >    --model-type GPT \
- >    --loader llama2_hf \
+ >    --loader llama2 \
  >    --saver megatron \
  >    --target-tensor-parallel-size ${TP} \
+ >    --checkpoint-type hf
  >    --load-dir ${HF_FORMAT_DIR} \
  >    --save-dir ${MEGATRON_FORMAT_DIR} \
  >    --tokenizer-model ${TOKENIZER_MODEL}
@@ -85,7 +93,6 @@ If loading for either inference or finetuning, use the following arguments:
 --use-checkpoint-args \
 --no-load-optim \
 --no-load-rng \
---fp16 \
 --untie-embeddings-and-output-weights \
 --use-rotary-position-embeddings \
 --normalization RMSNorm \
