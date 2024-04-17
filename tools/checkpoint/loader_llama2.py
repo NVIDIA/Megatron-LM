@@ -33,6 +33,9 @@ def add_arguments(parser):
                        help='Sentencepiece tokenizer model.')
     group.add_argument('--megatron-path', type=str, default=None,
                        help='Base directory of deepspeed repository')
+    group.add_argument('--loader-transformer-impl', default='local',
+                       choices=['local', 'transformer_engine'],
+                       help='Which Transformer implementation to use.')
 
 
 def verify_transformers_version():
@@ -429,6 +432,9 @@ def _load_checkpoint(queue, args):
     margs.world_size = margs.tensor_model_parallel_size * margs.pipeline_model_parallel_size
 
     margs = validate_args(margs)
+
+    margs.use_mcore_models = False
+    margs.transformer_impl = args.loader_transformer_impl
 
     def check_for_arg(arg_name, default=None):
         if getattr(margs, arg_name, None) is None:
