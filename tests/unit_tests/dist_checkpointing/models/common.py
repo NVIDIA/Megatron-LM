@@ -33,12 +33,13 @@ def common_test_simple_sharded_state_dict_save_load(initialize_model_fn, tmp_pat
 
 
 def common_test_parallel_reconfiguration_e2e(initialize_model_fn, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp,
-                                      src_layer_spec_fn, dst_layer_spec_fn, use_fpsl):
+                                      src_layer_spec_fn, dst_layer_spec_fn, use_fpsl,
+                                      load_order="tp-dp-pp", store_order="tp-dp-pp"):
     """ Test model saving and loading with different TP/PP """
     with TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_A') as ckpt_dir_A, \
          TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_B') as ckpt_dir_B:
         # Save checkpoint A
-        Utils.initialize_model_parallel(*src_tp_pp)
+        Utils.initialize_model_parallel(*src_tp_pp, order=load_order)
         gpt_model_A = initialize_model_fn(1, src_layer_spec_fn)
         save_strategy = get_default_save_sharded_strategy()
         if use_fpsl:
@@ -53,7 +54,7 @@ def common_test_parallel_reconfiguration_e2e(initialize_model_fn, tmp_path_dist_
 
         # Load checkpoint A with different TP/PP and save as checkpoint B
         # No FPS this time
-        Utils.initialize_model_parallel(*dest_tp_pp)
+        Utils.initialize_model_parallel(*dest_tp_pp, order=store_order)
         gpt_model_B = initialize_model_fn(2, dst_layer_spec_fn)
         state_dict = load(gpt_model_B.sharded_state_dict(), ckpt_dir_A)
         gpt_model_B.load_state_dict(state_dict)

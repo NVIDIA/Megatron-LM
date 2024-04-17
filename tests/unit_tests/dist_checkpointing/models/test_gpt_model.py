@@ -44,6 +44,11 @@ class TestGPTModel:
 
 class TestGPTModelReconfiguration:
     @pytest.mark.parametrize("use_fpsl", [False, True])
+    @pytest.mark.parametrize("load_order,store_order", [
+        ('tp-dp-pp', 'tp-dp-pp'),
+        ('tp-pp-dp', 'tp-pp-dp'),
+        ('tp-dp-pp', 'tp-pp-dp'),
+    ])
     @pytest.mark.parametrize("src_tp_pp,dest_tp_pp,src_layer_spec_fn,dst_layer_spec_fn", [
         ((2, 4), (4, 2), gpt_te_spec, gpt_te_spec),
         ((1, 8), (8, 1), gpt_te_spec, gpt_te_spec),
@@ -54,10 +59,10 @@ class TestGPTModelReconfiguration:
         ((1, 8), (2, 1), gpt_local_spec, gpt_te_spec),
     ])
     def test_parallel_reconfiguration_e2e(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp,
-                                          src_layer_spec_fn, dst_layer_spec_fn, use_fpsl):
+                                          src_layer_spec_fn, dst_layer_spec_fn, use_fpsl, load_order, store_order):
         """ Test model saving and loading with different TP/PP """
         common_test_parallel_reconfiguration_e2e(initialize_gpt_model, tmp_path_dist_ckpt, src_tp_pp,
-                                                 dest_tp_pp, src_layer_spec_fn, dst_layer_spec_fn, use_fpsl)
+                                                 dest_tp_pp, src_layer_spec_fn, dst_layer_spec_fn, use_fpsl, load_order, store_order)
 
 
     def test_state_dict_comparison(self, tmp_path_dist_ckpt):

@@ -14,6 +14,7 @@ from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.custom_layers.transformer_engine import (
+    TEDelayedScaling,
     TENorm,
     get_cpu_offload_context,
     te_checkpoint,
@@ -350,12 +351,9 @@ class TransformerBlock(MegatronModule):
             else:
                 raise ValueError("E4M3 and HYBRID are the only supported FP8 formats.")
 
-            fp8_recipe = transformer_engine.common.recipe.DelayedScaling(
-                margin=self.config.fp8_margin,
-                interval=self.config.fp8_interval,
+            fp8_recipe = TEDelayedScaling(
+                config=self.config,
                 fp8_format=fp8_format,
-                amax_compute_algo=self.config.fp8_amax_compute_algo,
-                amax_history_len=self.config.fp8_amax_history_len,
                 override_linear_precision=(False, False, not self.config.fp8_wgrad),
             )
             fp8_group = None

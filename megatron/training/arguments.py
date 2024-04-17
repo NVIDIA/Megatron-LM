@@ -511,6 +511,10 @@ def validate_args(args, defaults={}):
     if args.use_dist_ckpt and not args.use_mcore_models:
         raise RuntimeError('--use-dist-ckpt only support Megatron Core, please add --use-mcore-models.')
 
+    if args.use_tp_pp_dp_mapping:
+        assert args.context_parallel_size * args.expert_model_parallel_size <= 1, \
+            "context_parallel and expert_model_parallel can't be used with tp-pp-dp mapping."
+
     # Print arguments.
     _print_args("arguments", args)
 
@@ -1334,6 +1338,10 @@ def _add_distributed_args(parser):
                        'configurations. The number of min/max thread groups and thread '
                        'group cluster size of each communicator can be configured by '
                        'setting `min_ctas`, `max_ctas`, and `cga_cluster_size`.')
+    group.add_argument('--use-tp-pp-dp-mapping', action='store_true', default=False,
+                        help='If set, distributed ranks initialize order is changed '
+                        'from tp-dp-pp to tp-pp-dp. Make sure EP and CP aren\'t used '
+                        'with this option enabled')
     return parser
 
 
