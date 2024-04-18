@@ -754,21 +754,27 @@ class ChainedOptimizer(MegatronOptimizer):
             self.param_groups += optimizer.param_groups
 
     def disable_pre_hook(self):
-        if not self.config.use_distributed_optimizer or not self.config.overlap_param_gather:
-            raise ValueError(
-                "disable_pre_hook should only be called with 'use_distributed_optimizer' "
-                "and 'overlap_param_gather' are both enabled."
-            )
         for optimizer in self.chained_optimizers:
+            if (
+                not optimizer.config.use_distributed_optimizer
+                or not optimizer.config.overlap_param_gather
+            ):
+                raise ValueError(
+                    "disable_pre_hook should only be called with 'use_distributed_optimizer' "
+                    "and 'overlap_param_gather' both enabled."
+                )
             optimizer.disable_pre_hook()
 
     def enable_pre_hook(self):
-        if not self.config.use_distributed_optimizer or not self.config.overlap_param_gather:
-            raise ValueError(
-                "enable_pre_hook should only be called with 'use_distributed_optimizer' "
-                "and 'overlap_param_gather' are both enabled."
-            )
         for optimizer in self.chained_optimizers:
+            if (
+                not optimizer.config.use_distributed_optimizer
+                or not optimizer.config.overlap_param_gather
+            ):
+                raise ValueError(
+                    "enable_pre_hook should only be called with 'use_distributed_optimizer' "
+                    "and 'overlap_param_gather' both enabled."
+                )
             optimizer.enable_pre_hook()
 
     def step(self):
