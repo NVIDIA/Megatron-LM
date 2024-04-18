@@ -15,6 +15,7 @@ from megatron.training import get_tokenizer
 from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.utils import get_blend_from_list
 from megatron.training import pretrain
 from megatron.training.utils import get_ltor_masks_and_position_ids
 from megatron.training.utils import average_losses_across_data_parallel_group
@@ -219,6 +220,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
             None,
             None,
         ]
+
+    blend_per_split = [get_blend_from_list(blend) for blend in blend_per_split]
 
     extra_kwargs = {}
 

@@ -18,6 +18,7 @@ from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.blended_megatron_dataset_config import GPTDatasetConfig
 from megatron.core.datasets.gpt_dataset import GPTDataset
+from megatron.core.datasets.utils import get_blend_from_list
 from megatron.legacy.model import GPTModel
 from megatron.core.enums import ModelType
 from megatron.training import pretrain
@@ -107,7 +108,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         train_val_test_num_samples,
         lambda: True,
         GPTDatasetConfig(
-            blend=args.data_path,
+            blend=get_blend_from_list(args.data_path),
             split=args.split,
             random_seed=args.seed,
             sequence_length=args.seq_length,
@@ -122,7 +123,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         train_val_test_num_samples,
         lambda: True,
         GPTDatasetConfig(
-            blend=args.data_path2,
+            blend=get_blend_from_list(args.data_path2),
             split="98,2,0",
             random_seed=1234,
             sequence_length=2048,

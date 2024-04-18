@@ -19,10 +19,11 @@ _TRAIN_START_TIME = time.time()
 import torch
 
 from megatron.core import mpu, tensor_parallel
-from megatron.core.utils import get_model_config
+from megatron.core.utils import get_model_config, StragglerDetector
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.legacy.model import Float16Module
+from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
@@ -54,6 +55,8 @@ from .global_vars import (
     get_num_microbatches,
     update_num_microbatches)
 
+
+stimer = StragglerDetector()
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -420,17 +423,20 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     if wrap_with_ddp:
         config = get_model_config(model[0])
+        ddp_config = DistributedDataParallelConfig(
+            grad_reduce_in_fp32=args.accumulate_allreduce_grads_in_fp32,
+            overlap_grad_reduce=args.overlap_grad_reduce,
+            use_distributed_optimizer=args.use_distributed_optimizer,
+            check_for_nan_in_grad=args.check_for_nan_in_loss_and_grad,
+            bucket_size=args.ddp_bucket_size)
         model = [DDP(config,
+                     ddp_config,
                      model_chunk,
                      data_parallel_group=mpu.get_data_parallel_group(with_context_parallel=True),
                      expert_data_parallel_group=mpu.get_data_modulo_expert_parallel_group(),
-                     accumulate_allreduce_grads_in_fp32=args.accumulate_allreduce_grads_in_fp32,
-                     overlap_grad_reduce=args.overlap_grad_reduce,
-                     use_distributed_optimizer=args.use_distributed_optimizer,
                      # Turn off bucketing for model_chunk 2 onwards, since communication for these
                      # model chunks is overlapped with compute anyway.
-                     disable_bucketing=(model_chunk_idx > 0),
-                     check_for_nan_in_grad=args.check_for_nan_in_loss_and_grad)
+                     disable_bucketing=(model_chunk_idx > 0))
                  for (model_chunk_idx, model_chunk) in enumerate(model)]
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
@@ -950,6 +956,18 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         gc.disable()
         gc.collect()
 
+    # Singleton Initialization
+    if args.log_straggler:
+        global stimer
+        world = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        mmcnt = args.straggler_minmax_count
+        stimer.configure(world, rank,
+                mmcnt = mmcnt,
+                enabled = not args.disable_straggler_on_startup,
+                port = args.straggler_ctrlr_port)
+    total_flops = 0.0
+
     num_microbatches = get_num_microbatches()
     eval_duration = 0.0
     eval_iterations = 0
@@ -1008,7 +1026,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                      args.micro_batch_size * \
                      get_num_microbatches()
         args.consumed_train_samples += batch_size
-        num_floating_point_operations_so_far += num_floating_point_operations(args, batch_size)
+        num_fp_ops = num_floating_point_operations(args, batch_size)
+        num_floating_point_operations_so_far += num_fp_ops
+        total_flops += num_fp_ops
 
         # Logging.
         loss_scale = optimizer.get_loss_scale().item()
@@ -1032,6 +1052,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
                                           grad_norm, params_norm, num_zeros_in_grad)
+        # StragglerDetector
+        if iteration % args.log_interval == 0 and args.log_straggler:
+            stimer.report(total_flops, args.log_interval)
+            total_flops = 0.0
 
         # Autoresume
         if args.adlr_autoresume and \

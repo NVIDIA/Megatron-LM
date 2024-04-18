@@ -119,8 +119,17 @@ class TELinear(te.pytorch.Linear):
         if _te_version >= packaging.version.Version("0.8.0"):
             if self.config.tp_comm_overlap:
                 if _te_version > packaging.version.Version("1.5.0"):
-                    extra_kwargs["ub_overlap_rs"] = self.config.tp_comm_overlap_rs
-                    extra_kwargs["ub_overlap_ag"] = self.config.tp_comm_overlap_ag
+                    # Use old overlap flags if they were supplied instead
+                    extra_kwargs["ub_overlap_ag"] = (
+                        self.config.tp_comm_overlap_ag
+                        if hasattr(self.config, "tp_comm_overlap_ag")
+                        else self.config.tp_comm_split_ag or self.config.tp_comm_atomic_ag
+                    )
+                    extra_kwargs["ub_overlap_rs"] = (
+                        self.config.tp_comm_overlap_rs
+                        if hasattr(self.config, "tp_comm_overlap_rs")
+                        else self.config.tp_comm_split_rs or self.config.tp_comm_atomic_rs
+                    )
                 else:
                     extra_kwargs["ub_split_ag"] = self.config.tp_comm_split_ag
                     extra_kwargs["ub_atomic_gemm_ag"] = self.config.tp_comm_atomic_ag
@@ -220,7 +229,18 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 extra_kwargs["ub_bulk_wgrad"] = self.config.tp_comm_bulk_wgrad
                 extra_kwargs["ub_bulk_dgrad"] = self.config.tp_comm_bulk_dgrad
                 if _te_version > packaging.version.Version("1.5.0"):
-                    extra_kwargs["ub_overlap_ag"] = self.config.tp_comm_overlap_ag
+                    # Use old overlap flags if they were supplied instead
+                    extra_kwargs["ub_overlap_ag"] = (
+                        self.config.tp_comm_overlap_ag
+                        if hasattr(self.config, "tp_comm_overlap_ag")
+                        else self.config.tp_comm_split_ag or self.config.tp_comm_atomic_ag
+                    )
+                    if _te_version > packaging.version.Version("1.6.0.dev0"):
+                        extra_kwargs["ub_overlap_rs_dgrad"] = (
+                            self.config.tp_comm_overlap_rs_dgrad
+                            if hasattr(self.config, "tp_comm_overlap_rs_dgrad")
+                            else False
+                        )
                 else:
                     extra_kwargs["ub_atomic_gemm_ag"] = self.config.tp_comm_atomic_ag
                     extra_kwargs["ub_split_ag"] = self.config.tp_comm_split_ag
@@ -506,6 +526,33 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             return core_attn_out.transpose(0, 1)
         else:
             return core_attn_out
+
+
+class TEDelayedScaling(te.common.recipe.DelayedScaling):
+    """
+    Wrapper for the Transformer-Engine's `DelayedScaling` layer.
+    """
+
+    def __init__(
+        self,
+        config: ModelParallelConfig,
+        fp8_format: int,
+        override_linear_precision: tuple = (False, False, False),
+    ):
+        extra_kwargs = _get_extra_te_kwargs(config)
+        if _te_version >= packaging.version.Version("1.6.0.dev0"):
+            extra_kwargs["fp8_dpa"] = config.fp8_dot_product_attention
+            extra_kwargs["fp8_mha"] = config.fp8_multi_head_attention
+
+        super().__init__(
+            margin=config.fp8_margin,
+            interval=config.fp8_interval,
+            fp8_format=fp8_format,
+            amax_compute_algo=config.fp8_amax_compute_algo,
+            amax_history_len=config.fp8_amax_history_len,
+            override_linear_precision=override_linear_precision,
+            **extra_kwargs,
+        )
 
 
 def te_checkpoint(

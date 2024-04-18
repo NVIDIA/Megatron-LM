@@ -24,15 +24,16 @@ class BlendedMegatronDatasetConfig:
     sequence_length: int
     """The sequence length."""
 
-    blend: Optional[List[str]] = None
-    """The blend string, consisting of either a single dataset or a flattened sequential sequence of
-       weight-dataset pairs. For exampe, ["dataset-path1"] and ["50", "dataset-path1", "50",
-       "dataset-path2"] are both valid. Not to be used with 'blend_per_split'. Defaults to None.
+    blend: Optional[Tuple[List[str], Optional[List[float]]]] = None
+    """The blend, consisting of a list of dataset prefixes and optionally a list of dataset
+       weights. For example, [["dataset-path1", "dataset-path2"], [0.3, 0.7]]. When the weights are
+       None, they are inferred from the lengths of the contributing datasets. Not to be used with
+       'blend_per_split'. Defaults to None.
     """
 
-    blend_per_split: Optional[List[Optional[List[str]]]] = None
-    """A set of blend strings, as defined above, one for each split distribution. Not to be used
-       with 'blend'.  Defauls to None.
+    blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]] = None
+    """A set of blends, as defined above, one for each split distribution. Not to be used with
+       'blend'. Defauls to None.
     """
 
     split: Optional[str] = None
@@ -50,7 +51,7 @@ class BlendedMegatronDatasetConfig:
     """Where all re-useable dataset indices are to be cached."""
 
     mmap_bin_files: bool = True
-    """Whether to mmap the .bin files or use file pointer."""
+    """Whether to mmap the .bin files or use file pointers."""
 
     mock: bool = False
     """Whether to bypass real data loading and validation in favor of mock data generation."""
@@ -70,11 +71,25 @@ class BlendedMegatronDatasetConfig:
                 assert len(self.blend_per_split) == len(
                     Split
                 ), f"blend_per_split must contain {len(Split)} blends"
+                for split in Split:
+                    if self.blend_per_split[split.value] is None:
+                        log_single_rank(
+                            logger, logging.INFO, f"blend not provided for {split.name} split"
+                        )
+                    else:
+                        assert self.blend_per_split[split.value][1] is None or len(
+                            self.blend_per_split[split.value][0]
+                        ) == len(
+                            self.blend_per_split[split.value][1]
+                        ), "blend per split prefixes and weights must be equal in number"
             else:
                 assert (
                     self.blend is not None
                 ), "one of either blend or blend_per_split must be provided"
                 assert self.split is not None, "both blend and split must be provided"
+                assert self.blend[1] is None or len(self.blend[0]) == len(
+                    self.blend[1]
+                ), "blend prefixes and weights must be equal in number"
                 split_vector = parse_and_normalize_split(self.split)
                 self.split_matrix = convert_split_vector_to_split_matrix(split_vector)
                 log_single_rank(logger, logging.INFO, f"Let split_matrix = {self.split_matrix}")
