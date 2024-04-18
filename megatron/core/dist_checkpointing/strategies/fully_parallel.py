@@ -447,7 +447,8 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                 [] for _ in range(torch.distributed.get_world_size(group=parallelization_group))
             ]
             for shard_id, rank in shard_to_saving_rank.items():
-                shards_by_rank[rank].append(shard_id)
+                if shard_to_metadata[shard_id].dtype == dtype:
+                    shards_by_rank[rank].append(shard_id)
 
             # Transpose `shards_by_rank` to form exchange rounds
             shards_by_round = zip_longest(*shards_by_rank, fillvalue=None)
