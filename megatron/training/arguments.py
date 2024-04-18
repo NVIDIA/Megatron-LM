@@ -566,6 +566,11 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['bias_activation_fusion'] = args.bias_gelu_fusion
     if args.squared_relu:
         assert not args.swiglu
+        try:
+            jit_fuser = torch.compile
+        except:
+            jit_fuser = torch.jit.script
+        @jit_fuser
         def squared_relu(x):
             return torch.pow(F.relu(x), 2)
         kw_args['activation_func'] = squared_relu
@@ -1369,33 +1374,27 @@ def _add_data_args(parser):
     group = parser.add_argument_group(title='data and dataloader')
 
     group.add_argument('--data-path', nargs='*', default=None,
-                       help='Path to the training dataset. Accepted format:'
-                       '1) a single data path, 2) multiple datasets in the'
-                       'form: dataset1-weight dataset1-path dataset2-weight '
-                       'dataset2-path ... It is used with --split when a '
-                       'single dataset used for all three: train, valid '
-                       'and test. It is exclusive to the other '
-                       '--*-data-path args')
+                       help='The weight and prefix list for a set of train, validation, and test'
+                       'datasets which split according to --split. The accepted formats are: '
+                       '(1) a single prefix, '
+                       '(2) a list of weight prefix pairs e.g. weight1 prefix1 weight2 prefix2, '
+                       '(3) a list of prefixes e.g. prefix1 prefix2. '
+                       'For (3), weights are inferred from the lengths of the contributing datasets. '
+                       'This argument is exclusive to the other independent --*-data-path arguments.')
     group.add_argument('--split', type=str, default='969, 30, 1',
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
                        '`90,5,5` will use 90%% of data for training, 5%% for '
                        'validation and 5%% for test.')
     group.add_argument('--train-data-path', nargs='*', default=None,
-                       help='Path to the training dataset. Accepted format:'
-                       '1) a single data path, 2) multiple datasets in the'
-                       'form: dataset1-weight dataset1-path dataset2-weight '
-                       'dataset2-path ...')
+                       help='The weight and prefix list for an independent train dataset. '
+                       'Follows the same pattern rules as --data-path.')
     group.add_argument('--valid-data-path', nargs='*', default=None,
-                       help='Path to the validation dataset. Accepted format:'
-                       '1) a single data path, 2) multiple datasets in the'
-                       'form: dataset1-weight dataset1-path dataset2-weight '
-                       'dataset2-path ...')
+                       help='The weight and prefix list for an independent validation dataset. '
+                       'Follows the same pattern rules as --data-path.')
     group.add_argument('--test-data-path', nargs='*', default=None,
-                       help='Path to the test dataset. Accepted format:'
-                       '1) a single data path, 2) multiple datasets in the'
-                       'form: dataset1-weight dataset1-path dataset2-weight '
-                       'dataset2-path ...')
+                       help='The weight and prefix list for an independent test dataset. '
+                       'Follows the same pattern rules as --data-path.')
     group.add_argument('--data-cache-path', default=None,
                        help='Path to a directory to hold cached index files.')
     group.add_argument('--no-mmap-bin-files', action='store_false',
@@ -1404,7 +1403,6 @@ def _add_data_args(parser):
     group.add_argument('--mock-data', action='store_true',
                        help='Skip data loading and validation and opt for artificial '
                        'generation of mock data when an implementation is available.')
-
     group.add_argument('--vocab-size', type=int, default=None,
                        help='Size of vocab before EOD or padding.')
     group.add_argument('--vocab-file', type=str, default=None,
