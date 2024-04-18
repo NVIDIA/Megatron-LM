@@ -469,8 +469,6 @@ def _load_base_checkpoint(load_dir, rank0=False, sharded_state_dict=None,
 
     If rank0 is true, just loads rank 0 checkpoint, ignoring arguments.
     """
-    args = get_args()
-
     # Read the tracker file and set the iteration.
     tracker_filename = get_checkpoint_tracker_filename(load_dir)
 
@@ -522,6 +520,8 @@ def _load_base_checkpoint(load_dir, rank0=False, sharded_state_dict=None,
             state_dict = dist_checkpointing.load_common_state_dict(checkpoint_name)
             return state_dict, checkpoint_name, release
 
+        # at this point args are available
+        args = get_args()
         if sharded_state_dict is None:
             assert not args.auto_detect_ckpt_format and not args.use_dist_ckpt, (args.auto_detect_ckpt_format, args.use_dist_ckpt)
             raise RuntimeError('Detected load from a distributed checkpoint, but neither --use-dist-ckpt nor --auto-detect-ckpt-format is set.')
