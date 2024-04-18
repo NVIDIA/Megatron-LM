@@ -92,10 +92,8 @@ class MockGPTDataset(MockDataset):
         pad = 2
         eod = 0
 
-        assert (
-            idx < self.num_samples,
-            "Exceeded the available number of samples ({self.num_samples})",
-        )
+        if idx >= self.num_samples:
+            raise IndexError("Exceeded the available number of samples ({self.num_samples})")
 
         rng = numpy.random.default_rng(seed=[self.index_split.value, idx])
         length = rng.integers(low=0, high=self.config.sequence_length)
@@ -372,7 +370,8 @@ class GPTDataset(MegatronDataset):
             )
 
         get_path_to = lambda suffix: os.path.join(
-            path_to_cache, f"{self.unique_description_hash}-{type(self).__name__}-{suffix}"
+            path_to_cache,
+            f"{self.unique_description_hash}-{type(self).__name__}-{self.index_split.name}-{suffix}",
         )
         path_to_description = get_path_to("description.txt")
         path_to_document_index = get_path_to("document_index.npy")
@@ -567,14 +566,16 @@ class GPTDataset(MegatronDataset):
         Returns:
             int: The number of epochs
         """
-        num_epochs = 0
-        num_tokens = 0
-        num_tokens_requested = (self.num_samples * self.config.sequence_length) + 1
-        while True:
-            num_epochs += 1
-            num_tokens += num_tokens_per_epoch
-            if num_tokens >= num_tokens_requested:
-                return num_epochs
+        num_epochs = 1
+        num_tokens = num_tokens_per_epoch
+        if self.num_samples is None:
+            return num_epochs
+        else:
+            num_tokens_requested = (self.num_samples * self.config.sequence_length) + 1
+            while num_tokens < num_tokens_requested:
+                num_epochs += 1
+                num_tokens += num_tokens_per_epoch
+        return num_epochs
 
 
 def _build_document_index(

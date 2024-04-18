@@ -3,7 +3,7 @@
 import re
 import json
 import os
-from typing import Any, Iterable, Dict
+from typing import Any, Iterable, Dict, Optional
 
 from numpy import ndarray
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
@@ -62,7 +62,7 @@ class RetroJsonQADatasetConfig(JsonQADatasetConfig):
 
 class JsonQADataset(MegatronDataset):
 
-    def __init__(self, dataset: Any, dataset_path: str, indices: ndarray, num_samples: int, index_split: Split, config: BlendedMegatronDatasetConfig) -> None:
+    def __init__(self, dataset: Any, dataset_path: str, indices: ndarray, num_samples: Optional[int], index_split: Split, config: BlendedMegatronDatasetConfig) -> None:
         super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
         matches = re.findall(_DATASET_NAME_PATTERNS[index_split], dataset_path)
         assert len(matches) == 1

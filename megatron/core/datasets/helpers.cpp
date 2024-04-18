@@ -6,6 +6,7 @@
 #include <iostream>
 #include <limits>
 #include <math.h>
+#include <set>
 #include <stdexcept>
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -15,6 +16,61 @@ namespace py = pybind11;
 using namespace std;
 
 const int32_t LONG_SENTENCE_LEN = 512;
+
+
+void build_exhaustive_blending_indices(py::array_t<int16_t> &dataset_index, py::array_t<int64_t> &dataset_sample_index, const py::array_t<int64_t> &sizes, const int32_t num_datasets) {
+  /*
+      Build blending indices by sampling exactly as many samples from dataset[i]
+      as is requested by sizes[i] for all i in the range [0, num_datasets).
+  */
+  auto dataset_index_ptr = dataset_index.mutable_unchecked<1>();
+  auto dataset_sample_index_ptr = dataset_sample_index.mutable_unchecked<1>();
+  auto sizes_ptr = sizes.unchecked<1>();
+
+  int64_t total_size = 0;
+  int64_t dataset_sample_counts[num_datasets];
+  std::set<int32_t> dataset_unspent_indices;
+  for (int32_t i = 0; i < num_datasets; ++i) {
+    total_size += sizes_ptr[i];
+    dataset_sample_counts[i] = 0;
+    dataset_unspent_indices.insert(i);
+  }
+
+  // still need fractional weights to sample in proportion to sizes
+  double weights[num_datasets];
+  for (int32_t i = 0; i < num_datasets; ++i) {
+    weights[i] = sizes_ptr[i] / static_cast<double>(total_size);
+  }
+
+  int64_t index_sample = 0;
+  while (dataset_unspent_indices.size() > 0) {
+    double index_sample_double = std::max(static_cast<double>(index_sample), 1.0);
+
+    int64_t error_argmax;
+    double error_max = std::numeric_limits<double>::lowest();
+
+    for (int32_t index_dataset : dataset_unspent_indices) {
+      double error = weights[index_dataset] * index_sample_double - static_cast<double>(dataset_sample_counts[index_dataset]);
+      if (error > error_max) {
+        error_argmax = index_dataset;
+        error_max = error;
+      }
+    }
+
+    // Populate the indices.
+    dataset_index_ptr[index_sample] = static_cast<int16_t>(error_argmax);
+    dataset_sample_index_ptr[index_sample] = dataset_sample_counts[error_argmax];
+
+    // Update the total samples.
+    dataset_sample_counts[error_argmax] += 1;
+
+    if (sizes_ptr[error_argmax] - static_cast<double>(dataset_sample_counts[error_argmax]) == 0) {
+      dataset_unspent_indices.erase(error_argmax);
+    }
+
+    index_sample += 1;
+  }
+}
 
 void build_blending_indices(py::array_t<int16_t> &dataset_index,
                             py::array_t<int64_t> &dataset_sample_index,
@@ -762,4 +818,5 @@ PYBIND11_MODULE(helpers, m)
   m.def("build_blocks_mapping", &build_blocks_mapping);
   m.def("build_sample_idx", &build_sample_idx);
   m.def("build_blending_indices", &build_blending_indices);
+  m.def("build_exhaustive_blending_indices", &build_exhaustive_blending_indices);
 }
