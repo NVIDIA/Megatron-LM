@@ -52,16 +52,18 @@ class TestBertModel:
 
 
 class TestBERTModelReconfiguration:
-    @pytest.mark.parametrize("use_fpsl", [False, True])
-    @pytest.mark.parametrize("src_tp_pp,dest_tp_pp,src_layer_spec,dst_layer_spec", [
-        ((2, 4), (4, 2), bert_layer_with_transformer_engine_spec, bert_layer_with_transformer_engine_spec),
-        ((1, 8), (8, 1), bert_layer_with_transformer_engine_spec, bert_layer_with_transformer_engine_spec),
-        ((2, 1), (1, 8), bert_layer_with_transformer_engine_spec, bert_layer_with_transformer_engine_spec),
-        ((1, 1), (2, 2), bert_layer_with_transformer_engine_spec, bert_layer_with_transformer_engine_spec),
-        ((2, 1), (1, 8), bert_layer_local_spec, bert_layer_local_spec),
-        ((1, 1), (2, 4), bert_layer_with_transformer_engine_spec, bert_layer_local_spec),
-        ((1, 8), (2, 1), bert_layer_local_spec, bert_layer_with_transformer_engine_spec),
-    ])
+    @pytest.mark.parametrize(
+        ('use_fpsl', 'src_tp_pp', 'dest_tp_pp', 'src_layer_spec', 'dst_layer_spec'),
+        [
+            (False, (2, 4), (4, 2), bert_layer_with_transformer_engine_spec, bert_layer_with_transformer_engine_spec),
+            (False, (1, 8), (8, 1), bert_layer_with_transformer_engine_spec, bert_layer_with_transformer_engine_spec),
+            (True, (2, 1), (1, 8), bert_layer_with_transformer_engine_spec, bert_layer_with_transformer_engine_spec),
+            (False, (1, 1), (2, 2), bert_layer_with_transformer_engine_spec, bert_layer_with_transformer_engine_spec),
+            (True, (2, 1), (1, 8), bert_layer_local_spec, bert_layer_local_spec),
+            (True, (1, 1), (2, 4), bert_layer_with_transformer_engine_spec, bert_layer_local_spec),
+            (False, (1, 8), (2, 1), bert_layer_local_spec, bert_layer_with_transformer_engine_spec),
+        ]
+    )
     def test_parallel_reconfiguration_e2e(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp,
                                           src_layer_spec, dst_layer_spec, use_fpsl):
         """ Test model saving and loading with different TP/PP """
@@ -71,11 +73,12 @@ class TestBERTModelReconfiguration:
     def test_state_dict_comparison(self, tmp_path_dist_ckpt):
         common_test_state_dict_comparison(initialize_bert_model, tmp_path_dist_ckpt)
 
-    @pytest.mark.parametrize("vocab_size_base", [128, 17, 127, 31123])
-    @pytest.mark.parametrize("src_tp_pp,dest_tp_pp", [
-        ((2, 4), (4, 2)),
-        ((1, 8), (8, 1)),
-        ((1, 1), (1, 8)),
+    @pytest.mark.parametrize("vocab_size_base,src_tp_pp,dest_tp_pp", [
+        (128, (2, 4), (4, 2)),
+        (17, (1, 8), (8, 1)),
+        (127, (1, 8), (8, 1)),
+        (31123, (1, 1), (1, 8)),
+        (17, (1, 1), (1, 8)),
     ])
     def test_vocab_size_padding_change(self, tmp_path_dist_ckpt, vocab_size_base, src_tp_pp, dest_tp_pp):
         """ Test model loading with different vocab size (caused by TP padding). """

@@ -528,6 +528,33 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             return core_attn_out
 
 
+class TEDelayedScaling(te.common.recipe.DelayedScaling):
+    """
+    Wrapper for the Transformer-Engine's `DelayedScaling` layer.
+    """
+
+    def __init__(
+        self,
+        config: ModelParallelConfig,
+        fp8_format: int,
+        override_linear_precision: tuple = (False, False, False),
+    ):
+        extra_kwargs = _get_extra_te_kwargs(config)
+        if _te_version >= packaging.version.Version("1.6.0.dev0"):
+            extra_kwargs["fp8_dpa"] = config.fp8_dot_product_attention
+            extra_kwargs["fp8_mha"] = config.fp8_multi_head_attention
+
+        super().__init__(
+            margin=config.fp8_margin,
+            interval=config.fp8_interval,
+            fp8_format=fp8_format,
+            amax_compute_algo=config.fp8_amax_compute_algo,
+            amax_history_len=config.fp8_amax_history_len,
+            override_linear_precision=override_linear_precision,
+            **extra_kwargs,
+        )
+
+
 def te_checkpoint(
     forward_func,
     distribute_saved_activations,

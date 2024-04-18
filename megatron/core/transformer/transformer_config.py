@@ -208,6 +208,12 @@ class TransformerConfig(ModelParallelConfig):
     fp8_wgrad: bool = True
     """When set to False, override FP8 config options and do the wgrad computation in higher precision."""
 
+    fp8_dot_product_attention: bool = False
+    """When set to True, use the FP8 implementation of Dot Product Attention."""
+
+    fp8_multi_head_attention: bool = False
+    """When set to True, use the FP8 implementation of Multi Head Attention."""
+
     ####################
     # MoE related
     ####################

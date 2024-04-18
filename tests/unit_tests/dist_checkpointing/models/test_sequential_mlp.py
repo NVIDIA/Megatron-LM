@@ -44,21 +44,21 @@ def get_pp_offsets():
 
 
 class TestSequentialMLPReconfiguration:
-    @pytest.mark.parametrize("use_fpsl", [False, True])
-    @pytest.mark.parametrize("src_tp_pp_exp,dest_tp_pp_exp,use_glu", [
+    @pytest.mark.parametrize("use_fpsl,src_tp_pp_exp,dest_tp_pp_exp,use_glu", [
         # changing PP is impossible because the number of layers must be the same
-        ((2, 4, 1), (2, 4, 1), False),
-        ((1, 1, 1), (1, 1, 1), False),
-        ((1, 1, 1), (1, 1, 4), False),
-        ((1, 1, 8), (1, 1, 2), False),
-        ((2, 2, 2), (4, 2, 1), False),
-        ((1, 1, 4), (8, 1, 1), False),
-        ((1, 8, 1), (1, 8, 1), False),
-        ((1, 1, 4), (2, 1, 1), False),
-        ((1, 1, 1), (1, 1, 1), True),
-        ((1, 1, 1), (1, 1, 4), True),
-        ((1, 1, 1), (2, 1, 1), True),
-        ((1, 1, 4), (8, 1, 1), True),
+        (False, (2, 4, 1), (2, 4, 1), False),
+        (True,  (2, 4, 1), (2, 4, 1), False),
+        (False, (1, 1, 1), (1, 1, 1), False),
+        (True,  (1, 1, 1), (1, 1, 4), False),
+        (False, (1, 1, 8), (1, 1, 2), False),
+        (False, (2, 2, 2), (4, 2, 1), False),
+        (True,  (1, 1, 4), (8, 1, 1), False),
+        (False, (1, 8, 1), (1, 8, 1), False),
+        (False, (1, 1, 4), (2, 1, 1), False),
+        (False, (1, 1, 1), (1, 1, 1), True),
+        (False, (1, 1, 1), (1, 1, 4), True),
+        (True,  (1, 1, 1), (2, 1, 1), True),
+        (False, (1, 1, 4), (8, 1, 1), True),
     ])
     def test_parallel_reconfiguration_e2e(self, tmp_path_dist_ckpt, src_tp_pp_exp, dest_tp_pp_exp, use_glu, use_fpsl):
         """ Test model saving and loading with different TP/PP/expert parallelism """

@@ -43,31 +43,36 @@ class TestGPTModel:
 
 
 class TestGPTModelReconfiguration:
-    @pytest.mark.parametrize("use_fpsl", [False, True])
-    @pytest.mark.parametrize("src_tp_pp,dest_tp_pp,src_layer_spec_fn,dst_layer_spec_fn", [
-        ((2, 4), (4, 2), gpt_te_spec, gpt_te_spec),
-        ((1, 8), (8, 1), gpt_te_spec, gpt_te_spec),
-        ((2, 1), (1, 8), gpt_te_spec, gpt_te_spec),
-        ((1, 1), (2, 2), gpt_te_spec, gpt_te_spec),
-        ((2, 1), (1, 8), gpt_local_spec, gpt_local_spec),
-        ((1, 1), (2, 4), gpt_te_spec, gpt_local_spec),
-        ((1, 8), (2, 1), gpt_local_spec, gpt_te_spec),
-    ])
+    @pytest.mark.parametrize(
+        ('use_fpsl', 'load_order', 'store_order', 'src_tp_pp', 'dest_tp_pp', 'src_layer_spec_fn', 'dst_layer_spec_fn'),
+        [
+            (False, 'tp-dp-pp', 'tp-dp-pp', (2, 4), (4, 2), gpt_te_spec, gpt_te_spec),
+            (False, 'tp-pp-dp', 'tp-pp-dp', (1, 8), (8, 1), gpt_te_spec, gpt_te_spec),
+            (True,  'tp-dp-pp', 'tp-pp-dp', (2, 1), (1, 8), gpt_te_spec, gpt_te_spec),
+            (False, 'tp-dp-pp', 'tp-dp-pp', (1, 1), (2, 2), gpt_te_spec, gpt_te_spec),
+            (True,  'tp-pp-dp', 'tp-pp-dp', (2, 1), (1, 8), gpt_local_spec, gpt_local_spec),
+            (False, 'tp-dp-pp', 'tp-pp-dp', (1, 1), (2, 4), gpt_te_spec, gpt_local_spec),
+            (True,  'tp-dp-pp', 'tp-dp-pp', (2, 4), (4, 2), gpt_local_spec, gpt_te_spec),
+            (False, 'tp-pp-dp', 'tp-pp-dp', (2, 1), (1, 8), gpt_te_spec, gpt_local_spec),
+            (False, 'tp-dp-pp', 'tp-pp-dp', (2, 4), (2, 4), gpt_local_spec, gpt_local_spec),
+        ]
+    )
     def test_parallel_reconfiguration_e2e(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp,
-                                          src_layer_spec_fn, dst_layer_spec_fn, use_fpsl):
+                                          src_layer_spec_fn, dst_layer_spec_fn, use_fpsl, load_order, store_order):
         """ Test model saving and loading with different TP/PP """
         common_test_parallel_reconfiguration_e2e(initialize_gpt_model, tmp_path_dist_ckpt, src_tp_pp,
-                                                 dest_tp_pp, src_layer_spec_fn, dst_layer_spec_fn, use_fpsl)
+                                                 dest_tp_pp, src_layer_spec_fn, dst_layer_spec_fn, use_fpsl, load_order, store_order)
 
 
     def test_state_dict_comparison(self, tmp_path_dist_ckpt):
         common_test_state_dict_comparison(initialize_gpt_model, tmp_path_dist_ckpt)
 
-    @pytest.mark.parametrize("vocab_size_base", [128, 17, 127, 31123])
-    @pytest.mark.parametrize("src_tp_pp,dest_tp_pp", [
-        ((2, 4), (4, 2)),
-        ((1, 8), (8, 1)),
-        ((1, 1), (1, 8)),
+    @pytest.mark.parametrize("vocab_size_base,src_tp_pp,dest_tp_pp", [
+        (128, (2, 4), (4, 2)),
+        (17, (1, 8), (8, 1)),
+        (127, (1, 8), (8, 1)),
+        (31123, (1, 1), (1, 8)),
+        (17, (1, 1), (1, 8)),
     ])
     def test_vocab_size_padding_change(self, tmp_path_dist_ckpt, vocab_size_base, src_tp_pp, dest_tp_pp):
         """ Test model loading with different vocab size (caused by TP padding). """

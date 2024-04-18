@@ -73,10 +73,17 @@ jet-results-summary:
     - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $CI_JOB_JWT
   script: 
     - python -m pip install -U --no-cache-dir prettytable
-    - python tests/functional_tests/python_test_utils/jet_test_pipeline.py ${CI_PIPELINE_ID} --test exit
+    - rc=0
+    - python tests/functional_tests/python_test_utils/jet_test_pipeline.py ${CI_PIPELINE_ID} --test exit --artifact_links $CI_JOB_ID || rc=$?
+    - python tests/functional_tests/python_test_utils/jet_test_pipeline.py ${CI_PIPELINE_ID} --download_scripts_dir ./scripts || rc=$?
+    - exit $rc
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
       when: always
     - if: $JET_CUSTOM_FILTER != "" && $CI_PIPELINE_SOURCE != 'merge_request_event'
       when: always
     - when: never
+  artifacts:
+    when: always
+    paths:
+      - scripts
