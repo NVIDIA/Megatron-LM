@@ -566,6 +566,11 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['bias_activation_fusion'] = args.bias_gelu_fusion
     if args.squared_relu:
         assert not args.swiglu
+        try:
+            jit_fuser = torch.compile
+        except:
+            jit_fuser = torch.jit.script
+        @jit_fuser
         def squared_relu(x):
             return torch.pow(F.relu(x), 2)
         kw_args['activation_func'] = squared_relu
