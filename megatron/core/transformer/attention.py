@@ -9,6 +9,14 @@ from pkg_resources import packaging
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.common.embeddings.rotary_pos_embedding import apply_rotary_pos_emb
+from megatron.core.parallel_state import (
+    get_data_parallel_group,
+    get_data_parallel_rank,
+    get_data_parallel_world_size,
+    get_tensor_model_parallel_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from megatron.core.transformer.custom_layers.transformer_engine import SplitAlongDim
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
@@ -26,6 +34,8 @@ class SelfAttentionSubmodules:
     linear_qkv: Union[ModuleSpec, type] = None
     core_attention: Union[ModuleSpec, type] = None
     linear_proj: Union[ModuleSpec, type] = None
+    q_layernorm: Union[ModuleSpec, type] = None
+    k_layernorm: Union[ModuleSpec, type] = None
 
 
 @dataclass
@@ -362,6 +372,95 @@ class SelfAttention(Attention):
             tp_comm_buffer_name='qkv',
         )
 
+        if submodules.q_layernorm is not None:
+            self.q_layernorm = build_module(
+                submodules.q_layernorm,
+                hidden_size=self.hidden_size_per_attention_head,
+                config=self.config,
+                eps=self.config.layernorm_epsilon,
+            )
+        else:
+            self.q_layernorm = None
+
+        if submodules.k_layernorm is not None:
+            self.k_layernorm = build_module(
+                submodules.k_layernorm,
+                hidden_size=self.hidden_size_per_attention_head,
+                config=self.config,
+                eps=self.config.layernorm_epsilon,
+            )
+        else:
+            self.k_layernorm = None
+
+    def run_realtime_tests(self):
+        """Performs a consistency check.
+
+        This function makes sure that tensors across devices are the same during an experiment.
+        This is often not guaranteed to be so because of silent hardware failures (eg, memory
+        corruption loading a checkpoint, network traffic corruption encountered during data transmission).
+
+        (TODO) In the future, more tensors should be checked across the training run and
+        checked every X iterations. This is left for future work. Equality of tensors is probably not
+        required; transmitting hashes is sufficient."""
+
+        if self.config.qk_layernorm:
+            # check that all tensor parallel and data parallel ranks have the same
+            # Q & K layernorm parameters.
+            rank = get_data_parallel_rank()
+            inputs = torch.stack(
+                [
+                    self.q_layernorm.weight.data,
+                    self.q_layernorm.bias.data,
+                    self.k_layernorm.weight.data,
+                    self.k_layernorm.bias.data,
+                ]
+            )
+            dp_list = [torch.empty_like(inputs) for _ in range(get_data_parallel_world_size())]
+            dp_list[rank] = inputs
+            torch.distributed.all_gather(dp_list, inputs, group=get_data_parallel_group())
+
+            def _compare(srcs, tgts, names, parallelism):
+                assert len(srcs) == len(tgts) == len(names)
+                for src, tgt, name in zip(srcs, tgts, names):
+                    assert torch.all(
+                        src == tgt
+                    ), f"Discrepancy between {name} in {parallelism} ranks {i} and {rank}. Diff: {torch.norm(src - tgt)}"
+
+            for i, dp in enumerate(dp_list):
+                q_w, q_b, k_w, k_b = torch.unbind(dp)
+                _compare(
+                    [q_w, q_b, k_w, k_b],
+                    [
+                        self.q_layernorm.weight.data,
+                        self.q_layernorm.bias.data,
+                        self.k_layernorm.weight.data,
+                        self.k_layernorm.bias.data,
+                    ],
+                    ["q_w", "q_b", "k_w", "k_b"],
+                    "DP",
+                )
+
+            rank = get_tensor_model_parallel_rank()
+            tp_list = [
+                torch.empty_like(inputs) for _ in range(get_tensor_model_parallel_world_size())
+            ]
+            tp_list[rank] = inputs
+            torch.distributed.all_gather(tp_list, inputs, group=get_tensor_model_parallel_group())
+
+            for i, tp in enumerate(tp_list):
+                q_w, q_b, k_w, k_b = torch.unbind(tp)
+                _compare(
+                    [q_w, q_b, k_w, k_b],
+                    [
+                        self.q_layernorm.weight.data,
+                        self.q_layernorm.bias.data,
+                        self.k_layernorm.weight.data,
+                        self.k_layernorm.bias.data,
+                    ],
+                    ["q_w", "q_b", "k_w", "k_b"],
+                    "TP",
+                )
+
     def get_query_key_value_tensors(self, hidden_states, key_value_states=None):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
@@ -400,6 +499,15 @@ class SelfAttention(Attention):
 
         # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
+
+        if self.q_layernorm is not None:
+            query = self.q_layernorm(query)
+
+        if self.k_layernorm is not None:
+            key = self.k_layernorm(key)
+
+        if self.config.test_mode:
+            self.run_realtime_tests()
 
         return query, key, value
 

@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 import os
 from collections import OrderedDict
-from typing import Literal, Optional
+from typing import Dict, Literal, Optional
 
 import torch
 from torch import Tensor
@@ -137,8 +137,8 @@ class BertModel(LanguageModule):
                     config.hidden_size, config.init_method, config, config.sequence_parallel
                 )
 
-        if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
-            self.initialize_last_stage_with_word_embeddings()
+        if self.pre_process or self.post_process:
+            self.setup_embeddings_and_output_layer()
 
     def bert_extended_attention_mask(self, attention_mask: Tensor) -> Tensor:
         """Creates the extended attention mask
@@ -278,42 +278,3 @@ class BertModel(LanguageModule):
         loss = self.compute_language_model_loss(lm_labels, logits)
 
         return loss, binary_logits
-
-    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()) -> ShardedStateDict:
-        """Sharded state dict used during dist checkpointing
-
-        This is the utility that returns the sharded state dict thats used with distributed checkpoint
-
-        Args:
-            prefix (str, optional): The layer name prefix. Defaults to ''.
-            sharded_offsets(tuple, optional): Sharding already applied (e.g. PP related) by sub-modules. Passed along to ShardedTensor . defaults to ()
-        Returns:
-            ShardedStateDict: The sharded state dictionary
-        """
-        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets)
-
-        output_layer_prefix = f'{prefix}output_layer.'
-        # Depending on share_embeddings_and_output_weights , the weights tensor is obtained either from the weight matrix of word embeddings or the output layer state dict.
-        output_layer_weight_key = f'{output_layer_prefix}weight'
-        if self.share_embeddings_and_output_weights:
-            if not self.pre_process:
-                # when sharing embeddings with last stage, we need to use the weights from the first stage
-                # on pipeline first rank, word embeddings are saved to {prefix}embedding.word_embeddings.weight
-                del sharded_state_dict[output_layer_weight_key]
-                tensor = self.shared_embedding_or_output_weight()
-                first_stage_word_emb_key = f'{prefix}embedding.word_embeddings.weight'
-                last_stage_word_emb_replica_id = (
-                    1,  # copy of first stage embedding
-                    0,
-                    parallel_state.get_data_parallel_rank(with_context_parallel=True),
-                )
-
-                sharded_output_layer_weight_tensor = make_tp_sharded_tensor_for_checkpoint(
-                    tensor=tensor,
-                    key=first_stage_word_emb_key,
-                    replica_id=last_stage_word_emb_replica_id,
-                    allow_shape_mismatch=True,
-                )
-                sharded_state_dict[output_layer_weight_key] = sharded_output_layer_weight_tensor
-
-        return sharded_state_dict

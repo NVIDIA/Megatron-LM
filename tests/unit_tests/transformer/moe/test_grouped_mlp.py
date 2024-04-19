@@ -5,13 +5,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from megatron.arguments import parse_args
+from megatron.training.arguments import parse_args
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.initialize import _set_random_seed
-from megatron.model import Float16Module
+from megatron.training.initialize import _set_random_seed
+from megatron.legacy.model import Float16Module
 from tests.unit_tests.test_utilities import Utils
 
 DEVICE_CAPABILITY = None
@@ -27,18 +27,17 @@ class TestParallelGroupedMLP:
         print("============")
         Utils.initialize_model_parallel(1,1)
         num_layers = 1 # 2
-        self.hidden_size = 2 # 12
+        self.hidden_size = 16 # must be an multiple of 16, otherwise trigger CUTLASS misaligned issue
         self.num_experts = 2
-        self.gated_linear_unit = True
+        self.gated_linear_unit = swiglu
+        self.activation_func = F.silu if swiglu else F.gelu
         self.use_cpu_initialization = use_cpu_initialization
-        self.gated_linear_unit = False
-        if swiglu:
-            self.gated_linear_unit = True
 
         tf_config = TransformerConfig(
             num_layers=num_layers, hidden_size=self.hidden_size, num_attention_heads=4,
             num_moe_experts=self.num_experts, use_cpu_initialization=self.use_cpu_initialization,
             add_bias_linear=False, gated_linear_unit=self.gated_linear_unit,
+            activation_func=self.activation_func,
             bias_activation_fusion=False,
             bf16=True, params_dtype=torch.bfloat16, moe_router_load_balancing_type="sinkhorn", moe_router_topk=1)
 
@@ -161,6 +160,24 @@ class TestParallelGroupedMLP:
         except Exception as e:
             print("Expected error message from groupedGEMM:", e)
             assert str(e) == "Input batch_sizes should not be all zeros!"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(
+        not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8, reason='GroupedGEMM kernels are not supported on this device.'
+    )
+    def test_gradient_with_no_tokens_allocated(self):
+        """Test that when no token is passed in, the parameters of the grouped MLP will also have gradients."""
+        self.grouped_mlp.cuda()
+        num_allocated_tokens = 0
+        tokens_per_expert = torch.zeros(self.num_experts)
+        hidden_states = torch.rand((num_allocated_tokens, self.hidden_size), dtype=torch.bfloat16)
+        hidden_states = hidden_states.cuda()
+        output_gmm, _ = self.grouped_mlp.experts(
+            hidden_states,
+            tokens_per_expert=tokens_per_expert,
+        )
+        output_gmm.mean().backward()
+        assert self.grouped_mlp.experts.weight1.grad is not None
 
 
 if __name__ == "__main__":

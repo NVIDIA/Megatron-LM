@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import os
 import sys
@@ -13,13 +13,15 @@ def add_arguments(parser):
 
     group.add_argument('--target-tensor-parallel-size', type=int,
                        help='Target tensor model parallel size, defaults to the tensor parallel size '
-                       'in the input checkpoint if provided by the loader, otherwise to 1')
+                            'in the input checkpoint if provided by the loader, otherwise to 1')
     group.add_argument('--target-pipeline-parallel-size', type=int,
                        help='Target tensor model parallel size, default to the pipeline parall size '
                        'in the input checkpoint if provided by the loader, otherwise to 1')
+    group.add_argument('--saver-transformer-impl', default='local',
+                       choices=['local', 'transformer_engine'],
+                       help='Which Transformer implementation to use.')
 
 def save_checkpoint(queue, args):
-
     # Search in directory above this
     sys.path.append(os.path.abspath(
         os.path.join(os.path.dirname(__file__),
@@ -29,12 +31,12 @@ def save_checkpoint(queue, args):
         sys.path.insert(0, args.megatron_path)
 
     try:
-        from megatron.arguments import (parse_args, validate_args)
-        from megatron.checkpointing import save_checkpoint
-        from megatron.global_vars import set_global_variables, get_args
+        from megatron.training.arguments import (parse_args, validate_args)
+        from megatron.training.checkpointing import save_checkpoint
+        from megatron.training.global_vars import set_global_variables, get_args
         from megatron.core.enums import ModelType
-        from megatron.tokenizer.tokenizer import _vocab_size_with_padding
-        from megatron import fused_kernels
+        from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
+        from megatron.legacy import fused_kernels
         from megatron.core import mpu
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
@@ -64,25 +66,25 @@ def save_checkpoint(queue, args):
             print(f"Exiting. If you want to ignore this, use the argument --no-checking.")
             exit(1)
 
-
     md = queue_get()
 
     if args.target_tensor_parallel_size is None:
         if hasattr(md, 'previous_tensor_parallel_size'):
             args.target_tensor_parallel_size = md.previous_tensor_parallel_size
         else:
-            print("loader did not provide a tensor parallel size and --target-tensor-parallel-size not provided on command line. "
-                  "Default to 1.")
+            print(
+                "loader did not provide a tensor parallel size and --target-tensor-parallel-size not provided on command line. "
+                "Default to 1.")
             args.target_tensor_parallel_size = 1
 
     if args.target_pipeline_parallel_size is None:
         if hasattr(md, 'previous_pipeline_parallel_size'):
             args.target_pipeline_parallel_size = md.previous_pipeline_parallel_size
         else:
-            print("loader did not provide a pipeline parallel size and --target-pipeline-parallel-size not provided on command line. "
-                  "Default to 1.")
+            print(
+                "loader did not provide a pipeline parallel size and --target-pipeline-parallel-size not provided on command line. "
+                "Default to 1.")
             args.target_pipeline_parallel_size = 1
-
 
     # Arguments do sanity checks on the world size, but we don't care,
     # so trick it into thinking we are plenty of processes
@@ -132,8 +134,7 @@ def save_checkpoint(queue, args):
 
     margs = parse_args()
 
-
-    if hasattr (md, 'checkpoint_args'):
+    if hasattr(md, 'checkpoint_args'):
         # These are arguments that we are either changing, or cause problems for validation if they are set
         # Note that some of these deal with T5 so will need to be changed if we support T5.
         args_to_keep = ['tensor_model_parallel_size', 'pipeline_model_parallel_size', 'world_size', 'params_dtype',
@@ -148,7 +149,7 @@ def save_checkpoint(queue, args):
                         'encoder_num_layers', 'encoder_seq_length',
                         'distribute_saved_activations',
                         'train_iters', 'lr_decay_iters', 'lr_warmup_iters', 'lr_warmup_fraction',
-                        'start_weight_decay', 'end_weight_decay']
+                        'start_weight_decay', 'end_weight_decay', 'bf16', 'fp16']
 
 
         for arg, value in vars(md.checkpoint_args).items():
@@ -162,6 +163,13 @@ def save_checkpoint(queue, args):
                 setattr(margs, arg, value)
 
     validate_args(margs)
+
+    # Use MLM models.
+    margs.use_mcore_models = False
+    margs.transformer_impl = args.saver_transformer_impl
+
+    # Do not instantiate Tensorboard
+    margs.tensorboard_dir = None
 
     set_global_variables(margs, build_tokenizer=False)
 
@@ -198,7 +206,7 @@ def save_checkpoint(queue, args):
     fused_kernels.load(margs)
 
     # Embeddings
-    #-----------
+    # -----------
     embeddings_msg = queue_get("embeddings")
 
     pos_embed = None
@@ -215,7 +223,7 @@ def save_checkpoint(queue, args):
 
         # Cut out extra padding we don't need
         if orig_vocab_size > margs.padded_vocab_size:
-            full_word_embed = orig_word_embed[0:margs.padded_vocab_size,:]
+            full_word_embed = orig_word_embed[0:margs.padded_vocab_size, :]
 
         # Expanding embedding to larger size by replicating final entry
         elif orig_vocab_size < margs.padded_vocab_size:
@@ -249,7 +257,7 @@ def save_checkpoint(queue, args):
             assert not hasattr(model.language_model.embedding, "position_embeddings")
 
     # Transformer layers
-    #-------------------
+    # -------------------
     total_layer_num = 0
     for pp_rank in range(args.target_pipeline_parallel_size):
         # For later pipeline parallel ranks, make the new models
@@ -315,7 +323,6 @@ def save_checkpoint(queue, args):
 
             total_layer_num = total_layer_num + 1
             check_message(msg)
-
 
         if post_process:
             msg = queue_get("final norm")

@@ -7,21 +7,22 @@ from functools import partial
 import torch
 import torch.nn.functional as F
 
-from megatron import get_args
-from megatron import get_tokenizer
-from megatron import print_rank_0
-from megatron import get_timers
+from megatron.training import get_args
+from megatron.training import get_tokenizer
+from megatron.training import print_rank_0
+from megatron.training import get_timers
 from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
-import megatron.model
+import megatron.legacy.model
 from megatron.core.models.bert.bert_model import BertModel
 from megatron.training import pretrain
-from megatron.utils import average_losses_across_data_parallel_group
-from megatron.arguments import core_transformer_config_from_args
+from megatron.training.utils import average_losses_across_data_parallel_group
+from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec, bert_layer_local_spec
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.bert_dataset import BERTMaskedWordPieceDataset, BERTMaskedWordPieceDatasetConfig
+from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core import mpu, tensor_parallel
 
 
@@ -58,7 +59,7 @@ def model_provider(pre_process=True, post_process=True):
             pre_process=pre_process,
             post_process=post_process)
     else:
-        model = megatron.model.BertModel(
+        model = megatron.legacy.model.BertModel(
             config=config,
             num_tokentypes=num_tokentypes,
             add_binary_head=args.bert_binary_head,
@@ -149,14 +150,13 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     tokenizer = get_tokenizer()
 
     config = BERTMaskedWordPieceDatasetConfig(
-        is_built_on_rank=lambda: mpu.get_tensor_model_parallel_rank() == 0,
         random_seed=args.seed,
         sequence_length=args.seq_length,
-        blend=args.data_path,
+        blend=get_blend_from_list(args.data_path),
         blend_per_split=[
-            args.train_data_path,
-            args.valid_data_path,
-            args.test_data_path,
+            get_blend_from_list(args.train_data_path),
+            get_blend_from_list(args.valid_data_path),
+            get_blend_from_list(args.test_data_path)
         ],
         split=args.split,
         path_to_cache=args.data_cache_path,
@@ -178,6 +178,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         BERTMaskedWordPieceDataset,
         train_val_test_num_samples,
+        lambda: mpu.get_tensor_model_parallel_rank() == 0,
         config,
     ).build()
 

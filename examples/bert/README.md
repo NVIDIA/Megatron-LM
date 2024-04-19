@@ -22,7 +22,7 @@ docker run \
   -v /path/to/data:/path/to/data \
   -v /path/to/megatron-lm:/workspace/megatron-lm \
   megatron-lm nvcr.io/nvidia/pytorch:23.04-py3 \
-  bash /examples/bert/train_bert_340m_distributed.sh $CHECKPOINT_PATH $TENSORBOARD_LOGS_PATH $VOCAB_FILE $DATA_PATH "
+  bash examples/bert/train_bert_340m_distributed.sh $CHECKPOINT_PATH $TENSORBOARD_LOGS_PATH $VOCAB_FILE $DATA_PATH "
 
 ```
 NOTE: Depending on the environment you are running it the above command might like slightly different.

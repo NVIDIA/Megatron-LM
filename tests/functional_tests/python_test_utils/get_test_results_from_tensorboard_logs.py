@@ -9,11 +9,12 @@ def read_tb_logs_as_list(path, summary_name):
     """Reads a TensorBoard Events file from the input path, and returns the
     summary specified as input as a list.
 
-    Arguments:
-    path: str, path to the dir where the events file is located.
-    summary_name: str, name of the summary to read from the TB logs.
-    Output:
-    summary_list: list, the values in the read summary list, formatted as a list.
+    Args:
+        path: str, path to the dir where the events file is located.
+        summary_name: str, name of the summary to read from the TB logs.
+
+    Returns:
+        summary_list: list, the values in the read summary list, formatted as a list.
     """
     files = glob.glob(f"{path}/events*tfevents*")
     files += glob.glob(f"{path}/results/events*tfevents*")
@@ -59,9 +60,8 @@ def collect_train_test_metrics(logs_dir, run_name):
         },
         "iteration_timing_avg": iteration_time_avg,
     }
-    model_name = run_name.split('_')[0]
     str_train_metrics = str(train_metrics).replace("'", "\"")
-    print(f"\n ----------- Store the following metrics in tests/functional_tests/test_results/${model_name}/{run_name}.json ----------")
+    print(f"\n ----------- Store the following metrics in tests/functional_tests/test_results/jet/{run_name}.json ----------")
     print(f"\n {str_train_metrics}", flush=True)
 
 if __name__ == '__main__':

@@ -4,16 +4,16 @@
 """Generation utilities."""
 import torch
 import torch.nn.functional as F
-from megatron import get_args, get_tokenizer
-from megatron import get_retro_args
+from megatron.training import get_args, get_tokenizer
+from megatron.training import get_retro_args
 from megatron.core import mpu
-from megatron.utils import get_ltor_masks_and_position_ids, unwrap_model
-from megatron.text_generation.communication import (
+from megatron.training.utils import get_ltor_masks_and_position_ids, unwrap_model
+from megatron.inference.text_generation.communication import (
     copy_from_last_to_first_pipeline_stage,
     broadcast_from_last_pipeline_stage,
     broadcast_from_last_to_first_pipeline_stage, broadcast_int_list, broadcast_tensor)
-from megatron.text_generation.generation import _build_attention_mask_and_position_ids
-from megatron.text_generation.sampling import sample
+from megatron.inference.text_generation.generation import _build_attention_mask_and_position_ids
+from megatron.inference.text_generation.sampling import sample
 
 
 
@@ -27,7 +27,8 @@ def retro_generate_tokens_probs_and_return_on_first_stage(
         stop_on_eol=False,
         logits_mask=None):
     """Main token generation function.
-    Arguments:
+
+    Args:
         model: no interleaving is supported.
         tokens: prompt tokens extended to be of size [b, max-sequence-length]
         lengths: original prompt length, size: [b]
@@ -45,7 +46,8 @@ def retro_generate_tokens_probs_and_return_on_first_stage(
             all the sequences have reached this token.
     Note: Outside of model, other parameters only need to be available on
           rank 0.
-    Outputs: Note that is size is adjusted to a lower value than
+
+    Returns: Note that is size is adjusted to a lower value than
              max-sequence-length if generation is terminated early.
         tokens: prompt and generated tokens. size: [b, :]
         generated_sequence_lengths: total length (including prompt) of

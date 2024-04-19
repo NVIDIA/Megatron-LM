@@ -5,13 +5,13 @@
 import numpy as np
 import torch
 from megatron.core import mpu
-from megatron import print_rank_0, get_retro_args, get_args, get_tokenizer
-from megatron.text_generation.communication import broadcast_float_list, broadcast_tensor, broadcast_int_list
-from megatron.text_generation.generation import (
+from megatron.training import print_rank_0, get_retro_args, get_args, get_tokenizer
+from megatron.inference.text_generation.communication import broadcast_float_list, broadcast_tensor, broadcast_int_list
+from megatron.inference.text_generation.generation import (
     score_and_return_on_first_stage)
 from tools.retro.text_generation.retro_generation import (
     retro_generate_tokens_probs_and_return_on_first_stage)
-from megatron.text_generation.tokenization import (
+from megatron.inference.text_generation.tokenization import (
     detokenize_generations)
 
 

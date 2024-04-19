@@ -2,8 +2,8 @@
 
 """Main tasks functionality."""
 
-from megatron import get_args, print_rank_0
-from megatron.indexer import IndexBuilder
+from megatron.training import get_args, print_rank_0
+from megatron.legacy.indexer import IndexBuilder
 from tasks.orqa.evaluate_utils import ORQAEvaluator
 
 def main():

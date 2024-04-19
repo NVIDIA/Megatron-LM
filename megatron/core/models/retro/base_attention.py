@@ -1,4 +1,6 @@
-# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+
+"""Base class for decoder and encoder attention modules."""
 
 from megatron.core.models.retro.config import RetroConfig
 from megatron.core.transformer.attention import CrossAttention, CrossAttentionSubmodules
@@ -14,14 +16,11 @@ class BaseRetroCrossAttention(MegatronModule):
     length, and retrieve length) for use in Retro's custom cross attention
     operators.
 
-    Arguments:
-      config (RetroConfig): Retro config.
-
-      submodules (CrossAttentionSubmodules): Cross attention submodules.
-
-      layer_number (int): Layer number within transformer block.
-
-      attn_mask_type (AttnMaskType): Mask type ('causal' or 'padding').
+    Args:
+        config (RetroConfig): Retro config.
+        submodules (CrossAttentionSubmodules): Cross attention submodules.
+        layer_number (int): Layer number within transformer block.
+        attn_mask_type (AttnMaskType): Mask type ('causal' or 'padding').
     """
 
     def __init__(
@@ -41,5 +40,5 @@ class BaseRetroCrossAttention(MegatronModule):
         )
 
         self.retro_num_neighbors = config.retro_num_neighbors
-        self.retro_chunk_length = config.retro_preprocess.retro_gpt_chunk_length
-        self.retro_retrieved_length = config.retro_preprocess.retro_gpt_retrieved_length
+        self.retro_chunk_length = config.retro_chunk_length
+        self.retro_retrieved_length = config.retro_retrieved_length

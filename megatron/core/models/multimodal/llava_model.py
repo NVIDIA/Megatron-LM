@@ -1,16 +1,21 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+import logging
+from collections import namedtuple
+from functools import partial
+from typing import List
 
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel
+from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-# Note: This is unused at the moment and may be missing features. Follow-up changes will use this.
+# Note: This is under development and may be missing features.
 class LLaVAModel(MegatronModule):
     """LLaVA multi-modal model.
 
@@ -21,6 +26,10 @@ class LLaVAModel(MegatronModule):
         max_sequence_length (int): maximum sequence length. This is used for positional embedding.
         vision_transformer_config (TransformerConfig): Transformer config for the vision model.
         vision_transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers of the vision model.
+        vision_projection_config (TransformerConfig): Config for the projection from vision model outputs to language model inputs.
+        vision_projection_layer_spec (ModuleSpec): Specifies the module to use for the vision projection.
+        vision_projection_type (str): Type of the vision projection to use. Default is a 2-layer MLP.
+        allow_missing_vision_projection_checkpoint (bool): Allow vision projection weights to be missing when loading a checkpoint. Default False.
     """
 
     def __init__(
@@ -31,8 +40,16 @@ class LLaVAModel(MegatronModule):
         max_sequence_length: int,
         vision_transformer_config: TransformerConfig,
         vision_transformer_layer_spec: ModuleSpec,
+        vision_projection_config: TransformerConfig,
+        vision_projection_layer_spec: ModuleSpec,
+        vision_projection_type: str = "mlp",
+        allow_missing_vision_projection_checkpoint: bool = False,
     ) -> None:
         super().__init__(config=language_transformer_config)
+
+        logging.getLogger(__name__).warning(
+            "LLaVA model is under development and may be missing features."
+        )
 
         if parallel_state.get_pipeline_model_parallel_world_size() > 1:
             raise NotImplementedError("pipeline parallelism is not supported in this model yet.")
@@ -47,16 +64,23 @@ class LLaVAModel(MegatronModule):
         self.vision_model = CLIPViTModel(vision_transformer_config, vision_transformer_layer_spec)
 
         # Map (intermediate) vision model outputs to the language model input dimension.
-        # TODO: Separate work is adding a configurable multimodal projection layer. Replace this with that one.
-        self.vision_projection = tensor_parallel.ColumnParallelLinear(
-            vision_transformer_config.hidden_size,
-            language_transformer_config.hidden_size,
-            config=vision_transformer_config,
-            init_method=vision_transformer_config.init_method,
-            bias=False,
-            skip_bias_add=True,
-            gather_output=True,
+        self.vision_projection = MultimodalProjector(
+            vision_projection_config,
+            vision_projection_layer_spec,
+            vision_projection_type,
+            vision_transformer_config.hidden_size,  # input size to the projection.
         )
+
+        # This allows ignoring missing weights for the vision projection during checkpoint loading.
+        # This should be disabled by default but can be enabled if your checkpoint contains pretrained
+        # vision and language models but not the projection from vision model outputs to language model inputs.
+        if allow_missing_vision_projection_checkpoint:
+            vision_projection_param_names = [
+                f"vision_projection.{name}" for name in self.vision_projection.state_dict().keys()
+            ]
+            self.vision_projection.register_load_state_dict_post_hook(
+                partial(_load_state_dict_hook_ignore_param_names, vision_projection_param_names)
+            )
 
     def set_input_tensor(self, input_tensor: torch.Tensor) -> None:
         """Sets input tensor to the model.
@@ -67,6 +91,30 @@ class LLaVAModel(MegatronModule):
             input_tensor (Tensor): Sets the input tensor for the model.
         """
         self.vision_model.set_input_tensor(input_tensor)
+
+    def freeze(
+        self, freeze_language_model: bool, freeze_vision_model: bool, freeze_vision_projection: bool
+    ):
+        """Freeze model modules.
+
+        Make specific modules non-trainable by setting requires_grad to False for the module's parameters.
+
+        Args:
+            freeze_language_model (bool): Freeze the language model module.
+            freeze_vision_model (bool): Freeze the vision model module.
+            freeze_vision_projection (bool): Freeze the vision projection module.
+        """
+        modules = []
+        if freeze_language_model:
+            modules.append(self.language_model)
+        if freeze_vision_model:
+            modules.append(self.vision_model)
+        if freeze_vision_projection:
+            modules.append(self.vision_projection)
+
+        for module in modules:
+            for param in module.parameters():
+                param.requires_grad = False
 
     def forward(
         self,
@@ -91,9 +139,7 @@ class LLaVAModel(MegatronModule):
         image_embeddings = self.vision_model(images)  # [b, img_seq_len, h_vision]
 
         # map vision model output size to language model input size.
-        image_embeddings, _ = self.vision_projection(
-            image_embeddings
-        )  # [b, img_seq_len, h_language]
+        image_embeddings = self.vision_projection(image_embeddings)  # [b, img_seq_len, h_language]
 
         image_embeddings = image_embeddings.permute(1, 0, 2)  # [img_seq_len, b, h_language]
         language_embeddings = self.language_model.embedding(
@@ -117,3 +163,23 @@ class LLaVAModel(MegatronModule):
         )
 
         return output
+
+
+def _load_state_dict_hook_ignore_param_names(
+    param_names: List[str], module: torch.nn.Module, incompatible_keys: namedtuple
+):
+    """Hook to ignore missing keys during checkpoint loading.
+
+    By default, this should not be used to avoid accidentally missing weights in checkpoint loading.
+
+    Example use case: Use this for the vision projection if you want to load a checkpoint that contains vision and language model weights
+    but not the vision projection weights.
+
+    Args:
+        param_names (list of str): Parameter names allowed to be missing when calling load_state_dict.
+        module (torch.nn.Module): The torch module this hook applies to. Unused here but required by the torch API.
+        incompatible_keys (namedtuple): Namedtuple with fields missing_keys and unexpected_keys, which collect the missing and unexpected
+            keys when calling load_state_dict on this torch module, respectively.
+    """
+    for param_name in param_names:
+        incompatible_keys.missing_keys.remove(param_name)

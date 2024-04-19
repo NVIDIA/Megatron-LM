@@ -6,6 +6,7 @@ spec:
   name: "{model}_{variant}_{scope}_{platforms}_{nodes}N{gpus}G_\
          {'mcore_' if use_mcore else ''}{'te_' if use_te else ''}\
          tp{tp_size}_pp{pp_size}{'_vp'+str(vp_size) if vp_size else ''}\
+         {'_resume_'+str(ckpt_format) if ckpt_resume else ''}\
          {'_'+args_meta if args_meta else ''}"
   model: t5
   variant: 220m
@@ -14,7 +15,6 @@ spec:
   nodes: 1
   gpus: 8
   platforms: dgx_a100
-  steps: 100
   use_te: False
   use_mcore: True
   vp_size: null
@@ -24,6 +24,8 @@ spec:
   batch_size: 32 # GBS, JET schema requires 'batch_size'
   precision: bf16
   time_limit: 1800
+  ckpt_format: torch
+  ckpt_resume: 0
   artifacts: {/workspace/data/t5_data: text/the_pile/t5_shard00}
   script: |-
     ls
@@ -38,13 +40,12 @@ spec:
         TP_SIZE={tp_size} \
         PP_SIZE={pp_size} \
         NUM_NODES={nodes} \
-        MAX_STEPS={steps} \
+        MAX_STEPS=100 \
         USE_CORE={"1" if use_mcore else "0"} \
         VP_SIZE={vp_size if vp_size is not None else '""'} \
         MBS={micro_batch_size} \
         GBS={batch_size} \
-        ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'} && \
-        python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py {assets_dir} "" | \
-        tee {assets_dir}/results.json
+        JOB_NAME={key.split("/")[1]} \
+        ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'}
 products:
   - {use_te: [True], tp_size: [1],  pp_size: [1], vp_size: [1]}

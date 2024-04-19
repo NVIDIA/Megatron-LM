@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 
 from functools import partial
 import numpy as np
@@ -9,92 +9,19 @@ from torch.utils.data import BatchSampler, DataLoader, SequentialSampler, Subset
 from torch.utils.data._utils.collate import default_collate
 from tqdm import tqdm
 
-from megatron import get_args, get_tokenizer, print_rank_0
+from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron import core
-from megatron.arguments import core_transformer_config_from_args
+from megatron.training.arguments import core_transformer_config_from_args
+from megatron.core.datasets.retro.utils import get_blocks_by_rank
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.model import BertModel
+from megatron.legacy.model import BertModel
 from megatron.training import setup_model_and_optimizer
+from pretrain_bert import model_provider, get_batch, loss_func, forward_step
 
 from .dataset import BertEmbeddingDataset
 from .external_libs import h5py
 from .huggingface import HuggingfaceEmbedder
-from .utils import get_missing_blocks_by_rank
-
-
-def model_provider(pre_process=True, post_process=True):
-    """Build the model."""
-
-    print_rank_0(" > build Bert model.")
-
-    args = get_args()
-    config = core_transformer_config_from_args(args)
-    num_tokentypes = 2 if args.bert_binary_head else 0
-    model = BertModel(
-        config=config,
-        num_tokentypes=num_tokentypes,
-        add_binary_head=args.bert_binary_head,
-        parallel_output=True,
-        pre_process=pre_process,
-        post_process=post_process)
-
-    return model
-
-
-def get_batch(data_iterator):
-    """Build the batch."""
-
-    # Items and their type.
-    keys = ['text', 'types', 'labels', 'is_random', 'loss_mask', 'padding_mask',
-            'seq_length']
-    datatype = torch.int64
-
-    # Broadcast data.
-    if data_iterator is not None:
-        data = next(data_iterator)
-    else:
-        data = None
-    data_b = core.tensor_parallel.broadcast_data(keys, data, datatype)
-
-    # Unpack.
-    tokens = data_b['text'].long()
-    types = data_b['types'].long()
-    sentence_order = data_b['is_random'].long()
-    loss_mask = data_b['loss_mask'].float()
-    lm_labels = data_b['labels'].long()
-    padding_mask = data_b['padding_mask'].long()
-    seq_lengths = data_b['seq_length'].long()
-
-    return tokens, types, sentence_order, loss_mask, lm_labels, padding_mask, \
-        seq_lengths
-
-
-def loss_func(loss_mask, sentence_order, seq_lengths,
-              output_tensor, non_loss_data):
-    """Loss function. Sequence lengths returned here for progress print-outs."""
-    assert non_loss_data
-    return seq_lengths, output_tensor
-
-
-def forward_step(data_iterator, model):
-    """Forward step."""
-
-    args = get_args()
-
-    # Get the batch.
-    tokens, types, sentence_order, loss_mask, lm_labels, padding_mask, \
-        seq_lengths = get_batch(data_iterator)
-
-    if not args.bert_binary_head:
-        types = None
-
-    # Forward pass through the model.
-    output_tensor = model(tokens, padding_mask, tokentype_ids=types,
-                          lm_labels=lm_labels)
-
-    return output_tensor, partial(loss_func, loss_mask, sentence_order,
-                                  seq_lengths)
 
 
 def collate_batch(samples):
@@ -166,7 +93,7 @@ def get_data_loader(dataset, batch_size):
     return data_loader
 
 
-def embed_data_loader(models, data_loader):
+def embed_data_loader(models, data_loader, tag):
     '''Iterate data loader and compute embeddings.'''
 
     # Verify no model parallelism.
@@ -184,7 +111,12 @@ def embed_data_loader(models, data_loader):
 
     # Embed.
     embeddings = []
-    for _ in tqdm(range(len(data_loader)), "mt embed"):
+    for _ in tqdm(
+        range(len(data_loader)),
+        "  embed%s" % ("" if tag is None else " / '%s'" % tag),
+        miniters=len(data_loader) // 10,
+        disable=torch.distributed.get_rank() != 0,
+    ):
         with torch.no_grad():
             result = forward_step(data_iterator, models[0])
             embeddings.append(result[0].detach().cpu().numpy())
@@ -195,10 +127,26 @@ def embed_data_loader(models, data_loader):
     return embeddings
 
 
+class TextDataset(torch.utils.data.Dataset):
+    '''Dataset that holds a list of strings.'''
+
+    def __init__(self, texts):
+        assert isinstance(texts, list)
+        for t in texts:
+            assert isinstance(t, str)
+        self.texts = texts
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, i):
+        return {"text": self.texts[i]}
+
+
 class BertEmbedder:
     '''Compute Bert embeddings, from a text dataset.'''
 
-    def __init__(self, batch_size, max_bert_seq_length, embedder_type):
+    def __init__(self, batch_size, max_bert_seq_length, embedder_type, warmup=True):
 
         args = get_args()
 
@@ -219,7 +167,25 @@ class BertEmbedder:
         else:
             raise Exception("specialize for embedder type '%s'." % embedder_type)
 
-    def embed_text_dataset(self, text_dataset):
+        # Warm-up JIT.
+        # - Important to separately warm up:
+        #   1. batch_size == 1
+        #   2. batch_size > 1
+        if warmup:
+            warmup_dataset = TextDataset([
+                "great fleas have lesser fleas, upon their backs to bite’em,",
+                "and lesser fleas have lesser fleas, and so, ad infinitum,",
+                "and those great fleas, themselves, in turn have greater fleas to go on,",
+                "while those again have greater still, and greater still, and so on.",
+            ])
+            print_rank_0("bert / warmup single.")
+            for _ in range(3):
+                self.embed_text("hi, bert.")            # batch size == 1
+            print_rank_0("bert / warmup batch.")
+            for _ in range(3):
+                self.embed_text_dataset(warmup_dataset) # batch size > 1
+
+    def embed_text_dataset(self, text_dataset, tag=None):
         '''Embed a text dataset.'''
 
         # Huggingface.
@@ -232,7 +198,7 @@ class BertEmbedder:
 
         # Embed.
         data_loader = get_data_loader(bert_dataset, self.batch_size)
-        embeddings = embed_data_loader(self.models, data_loader)
+        embeddings = embed_data_loader(self.models, data_loader, tag)
 
         return embeddings
 
@@ -243,18 +209,8 @@ class BertEmbedder:
         analysis or debugging. For large scale, use 'embed_text_dataset()'.
         '''
 
-        class SingleTextDataset(torch.utils.data.Dataset):
-            '''Dataset that holds single string.'''
-            def __init__(self, text):
-                assert isinstance(text, str)
-                self.text = text
-            def __len__(self):
-                return 1
-            def __getitem__(self, i):
-                return {"text": self.text}
-
         # Embed text.
-        text_ds = SingleTextDataset(text)
+        text_ds = TextDataset([ text ])
         embed = self.embed_text_dataset(text_ds)[0]
 
         return embed
@@ -263,13 +219,12 @@ class BertEmbedder:
 class DiskDataParallelBertEmbedder:
     '''Process embeddings in blocks & save to disk.'''
 
-    def __init__(self, batch_size, max_bert_seq_length, block_size,
-                 embedder_type):
-        self.embedder = BertEmbedder(batch_size, max_bert_seq_length,
-                                     embedder_type)
+    def __init__(self, embedder, block_size):
+        assert isinstance(embedder, BertEmbedder)
+        self.embedder = embedder
         self.block_size = block_size
 
-    def embed_text_blocks(self, name, workdir, text_dataset,
+    def embed_text_blocks(self, name, dirname, text_dataset,
                           missing_embedding_blocks):
         '''Process a text dataset in blocks.'''
 
@@ -301,17 +256,17 @@ class DiskDataParallelBertEmbedder:
             print_rank_0(" > waiting for other ranks to finish block.")
             torch.distributed.barrier()
 
-    def embed_text_dataset(self, name, workdir, text_dataset):
+    def embed_text_dataset(self, name, dirname, text_dataset):
         '''Embed a text dataset.'''
 
-        # Dataset workdir.
-        os.makedirs(workdir, exist_ok=True)
+        # Dataset dir.
+        os.makedirs(dirname, exist_ok=True)
 
         # Missing embedding blocks (stored on disk).
         def validate(f):
             assert f["data"].shape[1] == 1024
-        n_missing_world, missing_embedding_blocks = get_missing_blocks_by_rank(
-            workdir,
+        blocks = get_blocks_by_rank(
+            dirname,
             len(text_dataset),
             self.block_size,
             validate=validate)
@@ -320,5 +275,4 @@ class DiskDataParallelBertEmbedder:
         torch.distributed.barrier()
 
         # Embed batches.
-        self.embed_text_blocks(name, workdir, text_dataset,
-                               missing_embedding_blocks)
+        self.embed_text_blocks(name, dirname, text_dataset, blocks.missing)

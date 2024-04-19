@@ -18,12 +18,10 @@ from torch.distributed.checkpoint import (
     DefaultLoadPlanner,
     DefaultSavePlanner,
     FileSystemReader,
-    FileSystemWriter,
     LoadPlan,
     SavePlan,
     TensorStorageMetadata,
     WriteItem,
-    save_state_dict,
 )
 from torch.distributed.checkpoint._nested_dict import FLATTEN_MAPPING, unflatten_state_dict
 from torch.distributed.checkpoint._traverse import OBJ_PATH, traverse_state_dict
@@ -41,6 +39,8 @@ from ..mapping import (
     is_main_replica,
 )
 from .base import LoadShardedStrategy, SaveShardedStrategy, StrategyAction, default_strategies
+from .filesystem_async import FileSystemWriterAsync
+from .state_dict_saver import save_state_dict_async_finalize, save_state_dict_async_plan
 
 _import_trigger = None
 
@@ -81,6 +81,9 @@ def sharded_tensor_to_torch_sharded_tensor(
     """Convert MCore ShardedTensor to PyT ShardedTensor. PyT requires information about all chunks.
 
     NOTE: this function assumes regular (grid) sharding of the MCore ShardedTensor.
+    The only local irregularities could be introduced with a `flattened_range` attribute.
+
+    NOTE: `flattened_range` is currently supported only for 1D tensors.
 
     This function follows the logic of torch.distributed.fsdp._shard_utils._create_chunk_sharded_tensor.
     Additionally, it saves `prepend_axis_num` (specific to MCore) as an attribute
@@ -97,39 +100,68 @@ def sharded_tensor_to_torch_sharded_tensor(
     if rank is None:
         rank = torch.distributed.get_rank()
 
+    some_sh_ten = sh_tens[0]
+    has_flattened_range = some_sh_ten.flattened_range is not None
+
     prepend_axis_num = sh_tens[0].prepend_axis_num
-    if prepend_axis_num:
+    # Determine local shards
+    if has_flattened_range:
+        if prepend_axis_num:
+            raise NotImplementedError(
+                '`prepend_axis_num` attribute of ShardedTensor not supported'
+                'together with `flattened_range` for PyT Distributed format'
+            )
         for sh_ten in sh_tens:
-            sh_ten.data = sh_ten.data.view((1,) * prepend_axis_num + sh_ten.local_shape)
+            assert sh_ten.flattened_range is not None
+            assert len(sh_ten.global_offset) == 1, sh_ten
 
-    local_shards = [
-        Shard.from_tensor_and_offsets(sh_ten.data, list(sh_ten.global_offset), rank)
-        for sh_ten in sh_tens
-    ]
-    local_offsets = {sh_ten.global_offset for sh_ten in sh_tens}
-    sh_ten = sh_tens[0]
+        local_shards = [
+            Shard.from_tensor_and_offsets(
+                sh_ten.data, [sh_ten.global_offset[0] + sh_ten.flattened_range.start], rank
+            )
+            for sh_ten in sh_tens
+        ]
+        offsets_shape = some_sh_ten.local_shape  # used to determine local offsets
+    else:
+        # Apply extra axes `prepend_axis_num` with a view
+        for sh_ten in sh_tens:
+            assert sh_ten.flattened_range is None, sh_ten.flattened_range
+            if prepend_axis_num:
+                sh_ten.data = sh_ten.data.view((1,) * prepend_axis_num + sh_ten.local_shape)
 
-    # Create a ShardedTensor without invoking communication.
-    chunk_offsets = [
-        tuple(map(lambda x: x[0] * x[1], zip(fragment_offsets, sh_ten.data.shape)))
-        for fragment_offsets in itertools.product(*map(range, sh_ten.axis_fragmentations))
-    ]
-    chunk_sizes = [sh_ten.data.shape for _ in chunk_offsets]
+        local_shards = [
+            Shard.from_tensor_and_offsets(sh_ten.data, list(sh_ten.global_offset), rank)
+            for sh_ten in sh_tens
+        ]
+        offsets_shape = some_sh_ten.data.shape  # includes prepended axes
 
-    # NOTE: for shards from other ranks we simply specify "cuda", this information will be discarded
-    # during TorchShardedTensor._init_from_local_shards_and_global_metadata call
-    placements = [
-        (f"rank:{rank}/cuda" if offsets in local_offsets else "cuda") for offsets in chunk_offsets
-    ]
-    assert len(chunk_sizes) == len(chunk_offsets) == len(placements)
-    shard_metadata = [
-        ShardMetadata(offset, size, placement)
-        for offset, size, placement in zip(chunk_offsets, chunk_sizes, placements)
-    ]
-    tensor = sh_ten.data
+    local_global_offsets = {}
+    for sh_ten in sh_tens:
+        local_global_offsets.setdefault(sh_ten.global_offset, []).append(sh_ten)
+
+    # Create a ShardedTensor without invoking communication. Determine global shards
+    shard_metadata = []
+    # NOTE: here we assume a regular grid of shards
+    for fragment_offsets in itertools.product(*map(range, some_sh_ten.axis_fragmentations)):
+        offset = tuple(map(lambda x: x[0] * x[1], zip(fragment_offsets, offsets_shape)))
+        if offset in local_global_offsets:
+            # local shard
+            placement = f"rank:{rank}/cuda"
+            for sh_ten in local_global_offsets[offset]:
+                if has_flattened_range:
+                    offset = (sh_ten.global_offset[0] + sh_ten.flattened_range.start,)
+                size = sh_ten.data.shape
+                shard_metadata.append(ShardMetadata(offset, size, placement))
+
+        else:
+            # for shards from other ranks we provide simplistic data - this information will be discarded
+            # during TorchShardedTensor._init_from_local_shards_and_global_metadata call
+            shard_metadata.append(ShardMetadata(offset, offsets_shape, "cuda"))
+
+    tensor = some_sh_ten.data
     sharded_tensor_metadata = ShardedTensorMetadata(
         shards_metadata=shard_metadata,
-        size=torch.Size(sh_ten.global_shape),
+        size=torch.Size(some_sh_ten.global_shape),
         tensor_properties=TensorProperties(
             dtype=tensor.dtype,
             layout=tensor.layout,
@@ -361,6 +393,9 @@ class TorchDistSaveShardedStrategy(SaveShardedStrategy):
         self.keep_only_main_replica = keep_only_main_replica
         self.thread_count = thread_count
 
+        # Intermediate state
+        self.save_state_dict_ret: Optional[Tuple[Any, ...]] = None
+
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         """ Translates MCore ShardedTensors to PyT ShardedTensors and saves in PyT Distributed format.
 
@@ -379,18 +414,35 @@ class TorchDistSaveShardedStrategy(SaveShardedStrategy):
             sharded_state_dict, self.keep_only_main_replica
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
-        # Use PyT saving mechanism
-        save_state_dict(
+
+        # Using async infrastructure for sync save
+        writer = FileSystemWriterAsync(checkpoint_dir, thread_count=self.thread_count)
+        self.save_state_dict_ret = save_state_dict_async_plan(
             pyt_state_dict,
-            FileSystemWriter(checkpoint_dir, thread_count=self.thread_count),
+            writer,
+            None,
             planner=MCoreSavePlanner(dedup_replicated_tensors=not self.keep_only_main_replica),
         )
+        fun_args = writer.get_save_function_and_args()
+        if fun_args is not None:
+            fun, args = fun_args
+            fun(*args)
+        self._finalize_save()
+
+    def _finalize_save(self) -> None:
+        """ Perform save finalization.
+
+        Breakdown into `save` and `save_finalize` cn be useful for async saving.
+        """
+        if self.save_state_dict_ret is None:
+            raise CheckpointingException('finalize_save called, but no ckpt save in progress')
+
+        save_state_dict_async_finalize(*self.save_state_dict_ret)
+        self.save_state_dict_ret = None
+        torch.distributed.barrier()
 
     def can_handle_sharded_objects(self):
         return True
-
-    def save_async(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
-        raise NotImplementedError
 
 
 class TorchDistLoadShardedStrategy(LoadShardedStrategy):

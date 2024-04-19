@@ -302,8 +302,9 @@ class _IndexReader(object):
     def __del__(self) -> None:
         """Clean up the object
         """
-        self.bin_buffer_mmap._mmap.close()
-        del self.bin_buffer_mmap
+        if hasattr(self, "bin_buffer_mmap"):
+            self.bin_buffer_mmap._mmap.close()
+            del self.bin_buffer_mmap
 
     def __len__(self) -> int:
         """Return the length of the dataset
@@ -347,10 +348,6 @@ class IndexedDataset(torch.utils.data.Dataset):
         self.multimodal = None
         self.mmap = None
 
-        self.index = None
-        self.bin_buffer = None
-        self.bin_buffer_mmap = None
-
         self.initialize(path_prefix, multimodal, mmap)
 
     def initialize(self, path_prefix: str, multimodal: bool, mmap: bool) -> None:
@@ -366,12 +363,21 @@ class IndexedDataset(torch.utils.data.Dataset):
 
             mmap (bool): Whether to mmap the .bin file
         """
+        idx_path = get_idx_path(path_prefix)
+        bin_path = get_bin_path(path_prefix)
+        assert os.path.exists(idx_path) and os.path.exists(
+            bin_path
+        ), f"One or both of the .idx and .bin files cannot be found at the path prefix {path_prefix}"
+
         self.path_prefix = path_prefix
         self.multimodal = multimodal
         self.mmap = mmap
-        self.index = _IndexReader(get_idx_path(self.path_prefix), self.multimodal)
+
+        self.index = _IndexReader(idx_path, self.multimodal)
+        self.bin_buffer = None
+        self.bin_buffer_mmap = None
         if mmap:
-            self.bin_buffer_mmap = numpy.memmap(get_bin_path(self.path_prefix), mode="r", order="C")
+            self.bin_buffer_mmap = numpy.memmap(bin_path, mode="r", order="C")
             self.bin_buffer = memoryview(self.bin_buffer_mmap)
 
     def __getstate__(self) -> Tuple[str, bool, bool]:

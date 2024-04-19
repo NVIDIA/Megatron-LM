@@ -67,7 +67,7 @@ class MegatronOptimizer(ABC):
     """
     Base class for all Megatron optimizers.
 
-    Arguments:
+    Args:
         optimizer (torch.optim.Optimizer): base optimizer such as Adam or SGD.
         config (OptimizerConfig): configuration object for optimizer.
         init_state_fn (Callable, optional): function to initialize state in the optimizer.
@@ -206,7 +206,7 @@ class MegatronOptimizer(ABC):
     ) -> ShardedStateDict:
         """ Builds sharded state dict for the optimizer, based on model's sharded state dict.
 
-        Arguments:
+        Args:
             model_sharded_state_dict (ShardedStateDict): sharded state dict of the model
             is_loading (bool, optional): flag indicating whether the state dict will be used to save or load the optimizer state.
                 Defaults to False.
@@ -218,7 +218,7 @@ class MegatronOptimizer(ABC):
 class MixedPrecisionOptimizer(MegatronOptimizer):
     """Base class for both the float-16 and the distributed optimizer.
 
-    Arguments:
+    Args:
         optimizer (torch.optim.Optimizer): base optimizer such as Adam or SGD.
         config (OptimizerConfig): configuration object for optimizer.
         grad_scaler (MegatronGradScaler): used for scaling gradients. Note that
@@ -376,7 +376,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
     """Float16 optimizer for fp16 and bf16 data types.
 
-    Arguments:
+    Args:
         optimizer (torch.optim.Optimizer): base optimizer such as Adam or SGD.
         config (OptimizerConfig): configuration object for optimizer.
         grad_scaler (MegatronGradScaler): used for scaling gradients. Note that
@@ -606,7 +606,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 class FP32Optimizer(MegatronOptimizer):
     """Float32 optimizer.
 
-    Arguments:
+    Args:
         optimizer (torch.optim.Optimizer): base optimizer such as Adam or SGD.
         config (OptimizerConfig): configuration object for optimizer.
         init_state_fn (Callable, optional): function to initialize state in the optimizer.
@@ -697,7 +697,7 @@ class ChainedOptimizer(MegatronOptimizer):
     These optimizers are responsible for different parts of multiple models for
     a training task and will be executed one-by-one when the model is updated.
 
-    Arguments:
+    Args:
         chained_optimizers: a list of optimizers.
     """
 
@@ -748,6 +748,35 @@ class ChainedOptimizer(MegatronOptimizer):
         for optimizer, state in zip(self.chained_optimizers, state_dict):
             optimizer.load_state_dict(state)
 
+        # Reset param_groups as load_state_dict reset chained optimizers's attribute.
+        self.param_groups = []
+        for optimizer in self.chained_optimizers:
+            self.param_groups += optimizer.param_groups
+
+    def disable_pre_hook(self):
+        for optimizer in self.chained_optimizers:
+            if (
+                not optimizer.config.use_distributed_optimizer
+                or not optimizer.config.overlap_param_gather
+            ):
+                raise ValueError(
+                    "disable_pre_hook should only be called with 'use_distributed_optimizer' "
+                    "and 'overlap_param_gather' both enabled."
+                )
+            optimizer.disable_pre_hook()
+
+    def enable_pre_hook(self):
+        for optimizer in self.chained_optimizers:
+            if (
+                not optimizer.config.use_distributed_optimizer
+                or not optimizer.config.overlap_param_gather
+            ):
+                raise ValueError(
+                    "enable_pre_hook should only be called with 'use_distributed_optimizer' "
+                    "and 'overlap_param_gather' both enabled."
+                )
+            optimizer.enable_pre_hook()
+
     def step(self):
         """ChainedOptimizer will step all optimizers one by one.
         """
@@ -766,14 +795,14 @@ class ChainedOptimizer(MegatronOptimizer):
     def save_parameter_state(self, filename: str):
         """Save the distributed parameter states of all optimizers to a file.
 
-        Arguments:
+        Args:
             filename (str): path to save parameter state to.
         """
         save_states = False
         states = []
         for optimizer in self.chained_optimizers:
-            if hasattr(optimizer, 'get_parameter_state'):
-                state_dict = optimizer.get_parameter_state()
+            if hasattr(optimizer, 'get_parameter_state_dp_zero'):
+                state_dict = optimizer.get_parameter_state_dp_zero()
 
                 # Save checkpoint economically, only when DP rank = 0, state dict
                 # needs to be saved.
@@ -791,12 +820,12 @@ class ChainedOptimizer(MegatronOptimizer):
     def load_parameter_state(self, filename: str):
         """Load the distributed parameter states of all optimizers from a file.
 
-        Arguments:
+        Args:
             filename (str): path to load parameter state from.
         """
         states = None
         for idx, optimizer in enumerate(self.chained_optimizers):
-            if not hasattr(optimizer, 'load_parameter_state_from_state_dict'):
+            if not hasattr(optimizer, 'load_parameter_state_from_dp_zero'):
                 continue
 
             # Lazy loading checkpoint, state dict is needed only when DP rank = 0.
@@ -804,7 +833,7 @@ class ChainedOptimizer(MegatronOptimizer):
                 states = torch.load(filename)
 
             state_dict = states[idx] if states else None
-            optimizer.load_parameter_state_from_state_dict(state_dict)
+            optimizer.load_parameter_state_from_dp_zero(state_dict)
 
     def finish_param_sync(self, model_index: int):
         """Finish parameter synchronization for all optimizers.

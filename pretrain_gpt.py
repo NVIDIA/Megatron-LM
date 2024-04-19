@@ -5,33 +5,37 @@ import os
 import torch
 from functools import partial
 from typing import Union
-from megatron import get_args
-from megatron import print_rank_0
-from megatron import get_timers
-from megatron import get_tokenizer
+from megatron.training import get_args
+from megatron.training import print_rank_0
+from megatron.training import get_timers
+from megatron.training import get_tokenizer
 from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
-import megatron.model
+import megatron.legacy.model
 from megatron.core.models.gpt import GPTModel
 from megatron.training import pretrain
+from megatron.core.utils import StragglerDetector
 from megatron.core.transformer.spec_utils import import_module
-from megatron.utils import (
+from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     average_losses_across_data_parallel_group
 )
-from megatron.arguments import core_transformer_config_from_args
-from megatron.yaml_arguments import core_transformer_config_from_yaml
+from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
 
 
-def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.model.GPTModel]:
+stimer = StragglerDetector()
+
+def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
     """Builds the model.
 
     If you set the use_mcore_models to True, it will return the mcore GPT model and if not the legacy GPT model.
@@ -42,7 +46,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
 
 
     Returns:
-        Union[GPTModel, megatron.model.GPTModel]: The returned model
+        Union[GPTModel, megatron.legacy.model.GPTModel]: The returned model
     """
     args = get_args()
     use_te = args.transformer_impl == "transformer_engine"
@@ -79,7 +83,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
     else:
         assert(args.context_parallel_size == 1), "Context parallelism is only supported with Megatron Core!"
 
-        model = megatron.model.GPTModel(
+        model = megatron.legacy.model.GPTModel(
             config,
             num_tokentypes=0,
             parallel_output=True,
@@ -148,13 +152,16 @@ def forward_step(data_iterator, model: GPTModel):
     timers = get_timers()
 
     # Get the batch.
-    timers('batch-generator', log_level=2).start()
-    tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
-        data_iterator)
+    timers('batch-generator', log_level=2).start() 
+    global stimer
+    with stimer(bdata=True):
+        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
+            data_iterator)
     timers('batch-generator').stop()
 
-    output_tensor = model(tokens, position_ids, attention_mask,
-                          labels=labels)
+    with stimer:
+        output_tensor = model(tokens, position_ids, attention_mask,
+                              labels=labels)
 
     return output_tensor, partial(loss_func, loss_mask)
 
@@ -167,11 +174,14 @@ def core_gpt_dataset_config_from_args(args):
     tokenizer = get_tokenizer()
 
     return GPTDatasetConfig(
-        is_built_on_rank=is_dataset_built_on_rank,
         random_seed=args.seed,
         sequence_length=args.seq_length,
-        blend=args.data_path,
-        blend_per_split=[args.train_data_path, args.valid_data_path, args.test_data_path],
+        blend=get_blend_from_list(args.data_path),
+        blend_per_split=[
+            get_blend_from_list(args.train_data_path),
+            get_blend_from_list(args.valid_data_path),
+            get_blend_from_list(args.test_data_path)
+        ],
         split=args.split,
         path_to_cache=args.data_cache_path,
         mock=args.mock_data,
@@ -180,7 +190,7 @@ def core_gpt_dataset_config_from_args(args):
         reset_position_ids=args.reset_position_ids,
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
-        vocab_size=get_tokenizer().vocab_size,
+        create_attention_mask=args.create_attention_mask_in_dataloader,
     )
 
 
@@ -204,6 +214,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         dataset_type,
         train_val_test_num_samples,
+        is_dataset_built_on_rank,
         config
     ).build()
 

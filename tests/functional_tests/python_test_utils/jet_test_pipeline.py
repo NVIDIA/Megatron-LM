@@ -26,6 +26,7 @@ def query_results(triggering_pipeline_id):
     )
     return service.query(query, flatten=False)
 
+
 def dedupe_results(results):
     deduped = {}
     for result in results:
@@ -38,29 +39,52 @@ def dedupe_results(results):
 
     return deduped.values()
 
-def check_exitcodes(results):
+
+def check_exitcodes(results, summary_jobid):
     from prettytable import PrettyTable
 
     exit_codes = []
     log_urls = []
     names = []
+    metrics_file_urls = []
     for result in results:
         exit_codes.append(result.get('l_exit_code', -1))
         log_urls.append(select_asset(result, 'output_script-0.log'))
         names.append(result['obj_workload']['s_key'].split('basic/')[-1])
+        metrics_file_urls.append(select_asset(result, 'results.json'))
 
-    table = PrettyTable()
-    table.add_column("Job Key", names)
-    table.add_column("Exit Code", exit_codes)
-    table.add_column("Log URL", log_urls)
-    table.align["Job Key"] = 'l'
+    # Results metrics table
+    metrics_table = PrettyTable()
+    metrics_table.add_column("Job Key", names)
+    metrics_table.add_column("Results Data", metrics_file_urls)
+    metrics_table.align["Job Key"] = 'l'
+    print(metrics_table)
+
+    # Job script artifacts table
+    if summary_jobid:
+        url_template = 'https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/jobs/{}/artifacts/raw/scripts/{}.sh'
+        script_artifact_urls = [url_template.format(summary_jobid, name) for name in names]
+        art_table = PrettyTable()
+        art_table.add_column("Job Key", names)
+        art_table.add_column("Exit Code", exit_codes)
+        art_table.add_column("Script", script_artifact_urls)
+        art_table.align["Job Key"] = 'l'
+        art_table.align["Script"] = 'l'
+        print(art_table)
+
+    # Exit codes table
+    ec_table = PrettyTable()
+    ec_table.add_column("Job Key", names)
+    ec_table.add_column("Exit Code", exit_codes)
+    ec_table.add_column("Log URL", log_urls)
+    ec_table.align["Job Key"] = 'l'
     exit_codes_good = [ec == 0 for ec in exit_codes]
     if exit_codes_good == []:
-        raise Exception("Can't find any jobs, something went wrong.\n" + table.get_string())
+        raise Exception("Can't find any jobs, something went wrong.\n" + ec_table.get_string())
     if exit_codes_good == [] or not all(exit_codes_good):
-        raise Exception("Some jobs failed to complete successfully\n" + table.get_string())
+        raise Exception("Some jobs failed to complete successfully\n" + ec_table.get_string())
     else:
-        print(table)
+        print(ec_table)
         print("All jobs completed successfully!")
 
 
@@ -76,6 +100,37 @@ def _download_log(url, save_dir):
             f.write(r.content)
     else:
         print(f"WARNING: Unable to download file at {url}. Received status {r.status_code}")
+
+
+def save_scripts(results, save_dir):
+    if not os.path.exists(save_dir):
+        os.mkdir(save_dir)
+
+    for result in results:
+        script = result['obj_workload']['obj_spec']['s_script']
+        target_path = result['obj_workload']['s_key'].split('basic/')[-1] + '.sh'
+        target_path = os.path.join(save_dir, target_path)
+
+        from textwrap import dedent
+        if result['obj_workload']['obj_spec']['flat_artifacts']:
+            dataset_mount = list(result['obj_workload']['obj_spec']['flat_artifacts'].keys())[0]
+            content = f'''
+            srun --container-image nvcr.io/nvidia/pytorch:23.04-py3 \\
+                 --container-mounts "/path/to/data:{dataset_mount},/path/to/megatron-lm:/workspace/megatron-lm" \\
+                 bash -c'''
+            content = dedent(content)
+            content += f' \'\n{script}\n\''
+        else:
+            content = '''
+            srun --container-image nvcr.io/nvidia/pytorch:23.04-py3 \\
+                 --container-mounts "/path/to/megatron-lm:/workspace/megatron-lm" \\
+                 bash -c'''
+            content = dedent(content)
+            content += f' \'\n{script}\n\''
+
+        with open(target_path, 'w') as script_file:
+            script_file.write('#!/bin/bash')
+            script_file.write(content)
 
 
 def check_baselines(results):
@@ -116,7 +171,11 @@ if __name__ == '__main__':
         'pipeline_id', help="Pipeline ID for pipeline in MLM repo that triggers the JET CI")
     parser.add_argument('--test', required=False, choices=[
                         'exit', 'metrics'], help="Check exit status of jobs with 'exit' or perf and loss with 'metrics'")
-    parser.add_argument('--download_metrics_dir', help="Directory in which to save the results.json files from jobs. Will not save files if not set. Set this if you want to update golden values.")
+    parser.add_argument('--download_metrics_dir', required=False,
+                        help="Directory in which to save the results.json files from jobs. Will not save files if not set. Set this if you want to update golden values.")
+    parser.add_argument('--download_scripts_dir', required=False,
+                        help="Directory in which to save the job script.")
+    parser.add_argument('--artifact_links', required=False, help="Enables job script artifact link table. Provide results summary job's ID.")
     args = parser.parse_args()
 
     results = query_results(args.pipeline_id)
@@ -125,7 +184,10 @@ if __name__ == '__main__':
     if args.download_metrics_dir:
         fetch_metrics_files(results, args.download_metrics_dir)
 
+    if args.download_scripts_dir:
+        save_scripts(results, args.download_scripts_dir)
+
     if args.test == 'exit':
-        check_exitcodes(results)
+        check_exitcodes(results, args.artifact_links)
     elif args.test == 'metrics':
         check_baselines(results)

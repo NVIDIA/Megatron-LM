@@ -1,4 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from copy import deepcopy
 
 import pytest
 import torch
@@ -14,20 +15,34 @@ class TestLLaVAModel:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
+
         language_config = TransformerConfig(
             num_layers=3, hidden_size=128, num_attention_heads=8, use_cpu_initialization=True
         )
         vision_config = TransformerConfig(
             num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
         )
-        layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        vision_projection_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            ffn_hidden_size=72,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+        )
+
+        language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        vision_layer_spec = deepcopy(language_layer_spec)
+        vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
+
         self.model = LLaVAModel(
             language_transformer_config=language_config,
-            language_transformer_layer_spec=layer_spec,
+            language_transformer_layer_spec=language_layer_spec,
             vocab_size=2048,
             max_sequence_length=1024,
             vision_transformer_config=vision_config,
-            vision_transformer_layer_spec=layer_spec,
+            vision_transformer_layer_spec=vision_layer_spec,
+            vision_projection_config=vision_projection_config,
+            vision_projection_layer_spec=vision_projection_spec,
         )
 
     def teardown_method(self, method):
@@ -37,7 +52,7 @@ class TestLLaVAModel:
         assert isinstance(self.model, LLaVAModel)
 
         num_weights = sum([p.numel() for p in self.model.parameters()])
-        assert num_weights == 1433472
+        assert num_weights == 1439432
 
     def test_set_input_tensor(self):
         expected_shape = (1, 2, 3, 4)
@@ -69,3 +84,15 @@ class TestLLaVAModel:
         torch.save(self.model.state_dict(), path)
 
         self.model.load_state_dict(torch.load(path))
+
+    def test_freeze(self):
+        self.model.freeze(
+            freeze_language_model=True, freeze_vision_model=True, freeze_vision_projection=False
+        )
+
+        for module in [self.model.language_model, self.model.vision_model]:
+            for param in module.parameters():
+                assert not param.requires_grad
+
+        for param in self.model.vision_projection.parameters():
+            assert param.requires_grad

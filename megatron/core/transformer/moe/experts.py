@@ -1,14 +1,16 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from typing import Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
+from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     _initialize_affine_weight_gpu,
@@ -37,10 +39,13 @@ class GroupedMLP(MegatronModule):
 
         self.expert_parallel = config.expert_model_parallel_size > 1
         if self.config.gated_linear_unit:
+            if self.config.activation_func != F.silu:
+                raise ValueError("Activation function must be silu when using GroupedMLP.")
 
+            @jit_fuser
             def glu(x):
                 x = torch.chunk(x, 2, dim=-1)
-                return self.config.activation_func(x[0]) * x[1]
+                return F.silu(x[0]) * x[1]
 
             self.activation_func = glu
         else:
@@ -144,13 +149,21 @@ class GroupedMLP(MegatronModule):
 
             fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
         else:
-            # None token is allocated for local experts.
+            # No token is allocated for local experts.
             assert torch.count_nonzero(tokens_per_expert) == 0
-            fc2_output = permuted_local_hidden_states
+
+            # Make sure parameters still have gradients when no tokens are routed to this set of experts.
+            w1 = self.weight1.view(self.config.hidden_size, -1)
+            w2 = self.weight2.view(-1, self.config.hidden_size)
+            h = torch.matmul(permuted_local_hidden_states, w1)
+            h = self.activation_func(h)
+            h = torch.matmul(h, w2)
+
+            fc2_output = h
 
         return fc2_output, None
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=()):
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         raise NotImplementedError(
             'Currently distributed checkpointing is not supported for GroupedMLP'
         )
@@ -179,7 +192,7 @@ class SequentialMLP(MegatronModule):
 
         cumsum_num_tokens = torch.cumsum(tokens_per_expert, dim=0)
         # Insert zero at the begining for offset index's convenience
-        zero_tensor = torch.zeros(1, dtype=torch.long)
+        zero_tensor = torch.zeros(1, dtype=torch.long, device=cumsum_num_tokens.device)
         cumsum_num_tokens = torch.cat((zero_tensor, cumsum_num_tokens))
         for expert_num, expert in enumerate(self.local_experts):
             start = cumsum_num_tokens[expert_num]
@@ -194,7 +207,7 @@ class SequentialMLP(MegatronModule):
 
         return output_local, output_bias_local
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=()):
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """ Maps local expert to global experts. """
         sharded_state_dict = {}
         num_global_experts = (
@@ -214,7 +227,7 @@ class SequentialMLP(MegatronModule):
             )
 
             expert_state_dict = expert.sharded_state_dict(
-                expert_state_dict_prefix, expert_sharded_offsets
+                expert_state_dict_prefix, expert_sharded_offsets, metadata
             )
             # Remove expert layers indexing from sharded keys
             replace_prefix_for_sharding(
