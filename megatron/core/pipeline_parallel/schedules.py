@@ -892,7 +892,9 @@ def forward_backward_pipelining_with_interleaving(
             )
 
         else:  # no p2p overlap
-            output_tensor = forward_step_helper(forward_k, current_microbatch, checkpoint_activations_microbatch)
+            output_tensor = forward_step_helper(
+                forward_k, current_microbatch, checkpoint_activations_microbatch
+            )
 
             # Backward pass.
             backward_k = k
