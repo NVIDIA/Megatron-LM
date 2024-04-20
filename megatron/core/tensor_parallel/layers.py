@@ -729,7 +729,7 @@ class ColumnParallelLinear(torch.nn.Module):
             or self.sequence_parallel
             or self.explicit_expert_comm
         ):
-            input_parallel = input_
+            input_parallel = input_ # input_: [seq_len, 1, 4096]
         else:
             input_parallel = copy_to_tensor_model_parallel_region(input_)
 
@@ -738,6 +738,9 @@ class ColumnParallelLinear(torch.nn.Module):
             self._forward_impl = linear_with_frozen_weight
         else:
             self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
+        # cfiken memo:
+        # self.explicit_expert_comm == False
+        # self.sequence_parallel == False
         output_parallel = self._forward_impl(
             input=input_parallel,
             weight=weight,
@@ -748,7 +751,7 @@ class ColumnParallelLinear(torch.nn.Module):
             else self.async_tensor_model_parallel_allreduce,
             sequence_parallel=False if self.explicit_expert_comm else self.sequence_parallel,
         )
-        if self.gather_output:
+        if self.gather_output:  # self.gather_output: False
             # All-gather across the partitions.
             assert not self.sequence_parallel
             output = gather_from_tensor_model_parallel_region(output_parallel)

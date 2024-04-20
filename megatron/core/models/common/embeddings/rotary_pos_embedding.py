@@ -43,7 +43,7 @@ class RotaryEmbedding(nn.Module):
         kv_channels: int,
         rotary_percent: float,
         seq_len_interpolation_factor: float = None,
-        rotary_base: int = 10000,
+        rotary_base: int = 1000000,
     ) -> None:
         super().__init__()
 

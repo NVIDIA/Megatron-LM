@@ -41,6 +41,9 @@ def build_tokenizer(args):
     elif args.tokenizer_type == 'NullTokenizer':
         assert args.vocab_size is not None
         tokenizer = _NullTokenizer(args.vocab_size)
+    elif args.tokenizer_type == 'HFTokenizer':
+        assert args.tokenizer_model is not None
+        tokenizer = _HFTokenizer(args.tokenizer_model)
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
@@ -586,3 +589,63 @@ class _NullTokenizer:
     @property
     def additional_special_tokens_ids(self):
         return None
+
+
+class _HFTokenizer(AbstractTokenizer):
+    """
+    HuggingFace AutoTokenizer-Megatron wrapper
+    ref: https://github.com/EleutherAI/gpt-neox/blob/main/megatron/tokenizer/tokenizer.py#L223
+    ↑あんまり参考にならなかったけど、一応残しておく
+    """
+
+    def __init__(self, tokenizer_name: str):
+        name = "HFTokenizer"
+        super().__init__(name)
+
+        from transformers import AutoTokenizer
+        import os
+        import dotenv
+        dotenv.load_dotenv(verbose=False)
+
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, token=os.environ.get("HF_PERSONAL_TOKEN"))
+        self._initalize()
+
+    def _initalize(self):
+        self.pad_id = self.tokenizer.pad_token_id
+        self.bos_id = self.tokenizer.bos_token_id
+        self.eos_id = self.tokenizer.eos_token_id
+        self.pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else -1
+
+    @property
+    def vocab_size(self):
+        return self.tokenizer.vocab_size
+
+    @property
+    def vocab(self):
+        return self.tokenizer.get_vocab()
+
+    @property
+    def inv_vocab(self):
+        return self.tokenizer.decoder
+
+    def tokenize(self, text: str):
+        return self.tokenizer.encode(text)
+
+    def detokenize(self, token_ids):
+        return self.tokenizer.decode(token_ids, skip_special_tokens=True)
+
+    @property
+    def cls(self):
+        return -1
+
+    @property
+    def sep(self):
+        return -1
+
+    @property
+    def mask(self):
+        return -1
+
+    @property
+    def eod(self):
+        return self.eos_id

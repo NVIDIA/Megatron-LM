@@ -449,6 +449,7 @@ def core_transformer_config_from_args(args):
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
+    kw_args['moe_type'] = args.moe_type
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
@@ -659,8 +660,20 @@ def _add_network_size_args(parser):
                        'launch to improve the utilization and performance by '
                        'leveraging the Grouped GEMM feature introduced since '
                        'CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).')
+    group.add_argument('--num-experts-per-tok', type=int, default=2,
+                       help='The num-experts-per-tok parameter specifies the number of MLP experts'
+                            ' to use for each input token in the Switch Transformer model')
+    group.add_argument('--moe-type', type=str, default=None,
+                       help='Extra type of MOE network to use, default None means switch transformers, Optional: mixtral')
+    group.add_argument('--moe-load-balancing-mode', default=None,
+                       help="Balancing the probability of each expert's vote suppored in mixtral moe."
+                            "Only sinkhorn and None supported now.")
+    group.add_argument('--router-aux-loss-coef', type=float, default=0.001,
+                       help='The coefficient for the auxiliary loss of the router in mixtral moe.')
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
                        help='Untie embeddings and output weights.'),
+    group.add_argument('--sliding-window-size', type=int, default=None,
+                       help='Sliding window size.'),
     return parser
 
 
@@ -733,6 +746,10 @@ def _add_logging_args(parser):
                        help='The wandb experiment name.')
     group.add_argument('--wandb-save-dir', type=str, default='',
                        help='Path to save the wandb results locally.')
+    group.add_argument('--wandb-entity', type=str, default='abeja-geniac',
+                       help='The wandb entity name for nedo project')
+    group.add_argument('--wandb-group-name', type=str, default='',
+                       help='The wandb group name using multi node training')
     return parser
 
 
@@ -1252,7 +1269,8 @@ def _add_data_args(parser):
                                 'SentencePieceTokenizer',
                                 'GPTSentencePieceTokenizer',
                                 'Llama2Tokenizer',
-                                'NullTokenizer'],
+                                'NullTokenizer',
+                                'HFTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='Sentencepiece tokenizer model.')

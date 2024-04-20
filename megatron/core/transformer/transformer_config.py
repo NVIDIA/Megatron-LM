@@ -77,6 +77,7 @@ class TransformerConfig(ModelParallelConfig):
     gated_linear_unit: bool = False
     activation_func: Callable = F.gelu
     num_moe_experts: int = None
+    moe_type: str = None
     window_size: Optional[Tuple[int, int]] = None
 
     # initialization

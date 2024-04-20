@@ -3,6 +3,7 @@
 """Transformer."""
 from contextlib import nullcontext
 import os
+import inspect
 import math
 import numpy as np
 import torch
@@ -30,6 +31,12 @@ try:
     from einops import rearrange
 except ImportError:
     rearrange = None
+
+try:
+    from flash_attn import flash_attn_func
+    _flash_supports_window_size = "window_size" in list(inspect.signature(flash_attn_func).parameters)
+except ImportError:
+    _flash_supports_window_size = None
 
 try:
     from flash_attn.flash_attn_interface import flash_attn_unpadded_func
@@ -173,6 +180,26 @@ def sinkhorn(cost, tol=0.0001):
     return d1*cost*d0.unsqueeze(1)
 
 
+def faster_sinkhorn(cost, tol=0.0001):
+    # https://arxiv.org/pdf/2402.01771.pdf
+    # Appendix F
+    cost = 2 * torch.exp(cost)
+    d0 = torch.ones(cost.size(0), device=cost.device, dtype=cost.dtype)
+    d1 = torch.ones(cost.size(1), device=cost.device, dtype=cost.dtype)
+    d0 = d0 * (1/d0.size(0)) * torch.sum(cost, dim=1)
+    d1 = d1 * (1/d1.size(0))
+
+    eps = 0.00000001
+    error = 1e9
+    d1_old = d1
+    while error > tol:
+        d0 = (1/d0.size(0))*1/(torch.sum(d1*cost,1) + eps)
+        d1 = (1/d1.size(0))*1/(torch.sum(d0.unsqueeze(1)*cost,0)+eps)
+        error = torch.mean(torch.abs(d1_old-d1))
+        d1_old = d1
+    return d1*cost*d0.unsqueeze(1)
+
+
 def get_router_linear_layer(config):
     args = get_args()
     router = torch.nn.Linear(args.hidden_size, args.num_experts, bias=False)
@@ -292,6 +319,126 @@ class SwitchMLP(MegatronModule):
             output_bias_total = None
 
         return output_total, output_bias_total
+
+
+class MixtralParallelMLP(torch.nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.ffn_dim = config.ffn_hidden_size
+        self.hidden_dim = config.hidden_size
+
+        self.w1 = tensor_parallel.ColumnParallelLinear(
+            config.hidden_size,
+            config.ffn_hidden_size,
+            config=config,
+            init_method=config.init_method,
+            bias=False,
+            gather_output=False,
+            skip_bias_add=True,
+            is_expert=False,
+        )
+
+        self.w3 = tensor_parallel.ColumnParallelLinear(
+            config.hidden_size,
+            config.ffn_hidden_size,
+            config=config,
+            init_method=config.init_method,
+            bias=False,
+            gather_output=False,
+            skip_bias_add=True,
+            is_expert=False,
+        )
+
+        self.w2 = tensor_parallel.RowParallelLinear(
+            config.ffn_hidden_size,
+            config.hidden_size,
+            config=config,
+            init_method=config.output_layer_init_method,
+            bias=False,
+            skip_bias_add=True,
+            input_is_parallel=True,
+            is_expert=False,
+        )
+
+        self.act_fn = F.silu
+
+    def forward(self, hidden_states):
+        selects, h = hidden_states.shape
+        hidden_states = hidden_states.view(selects, 1, h)
+        # glueの式通り。w1がgate_proj, w2がup_proj, w3がdown_proj
+        # https://github.com/huggingface/transformers/blob/v4.37.2/src/transformers/models/mistral/modeling_mistral.py#L177
+        current_hidden_states = self.act_fn(self.w1(hidden_states)[0]) * self.w3(hidden_states)[0]
+        current_hidden_states = self.w2(current_hidden_states)[0].view(selects, h)
+        return current_hidden_states
+
+
+class MixtralSparseMoeBlock(MegatronModule):
+    """
+    This is a megatron implementation refer to HuggingFace Mixtral Model.
+    Which strictly equivalent to standard MoE with full capacity (no
+    dropped tokens). It's faster since it formulates MoE operations
+    in terms of block-sparse operations to accomodate imbalanced
+    assignments of tokens to experts, whereas standard MoE either
+    (1) drop tokens at the cost of reduced performance or (2) set
+    capacity factor to number of experts and thus waste computation
+    and memory on padding.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        args = get_args()
+        self.hidden_dim = args.hidden_size
+        self.ffn_dim = args.ffn_hidden_size
+        self.num_experts = getattr(args, "num_experts", 8)
+        self.top_k = getattr(args, "num_experts_per_tok", 2)
+        self.moe_load_balancing_mode = getattr(args, "moe_load_balancing_mode", None)
+
+        # gating
+        self.gate = torch.nn.Linear(self.hidden_dim, self.num_experts, bias=False)
+
+        self.experts = torch.nn.ModuleList(
+            [MixtralParallelMLP(config) for _ in range(self.num_experts)]
+        )
+
+    def forward(self, hidden_states: torch.Tensor):
+        s, b, h = hidden_states.shape
+        hidden_states = hidden_states.view(-1, h)
+
+        # route: (batch * sequence_length, n_experts)
+        router_logits = self.gate(hidden_states)
+        if self.moe_load_balancing_mode == "sinkhorn":
+            router_logits = sinkhorn(router_logits)
+        elif self.moe_load_balancing_mode == "faster-sinkhorn":
+            router_logits = faster_sinkhorn(router_logits)
+
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(hidden_states.dtype)
+
+        output_total = torch.zeros_like(hidden_states)
+
+        # One hot encode the selected experts to create an expert mask
+        # this will be used to easily index which expert is going to be solicited
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+
+        # Loop over all available experts in the model and perform the computation on each expert
+        for expert_idx in range(self.num_experts):
+            expert_layer = self.experts[expert_idx]
+            selected_expert_id_for_each_token, selected_tokens = torch.where(expert_mask[expert_idx])
+
+            if selected_tokens.shape[0] == 0:
+                continue
+
+            # Index the correct hidden states and compute the expert hidden state for
+            # the current expert. We need to make sure to multiply the output hidden
+            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
+            current_hidden_states = expert_layer(hidden_states[selected_tokens]) * routing_weights[selected_tokens, selected_expert_id_for_each_token, None]
+            output_total[selected_tokens] = output_total[selected_tokens] + current_hidden_states.to(hidden_states.dtype)
+
+        output_total = output_total.view(s, b, h).contiguous()
+
+        return output_total, router_logits.view(s, b, -1)
 
 
 class CoreAttention(MegatronModule):
@@ -439,7 +586,7 @@ class FlashSelfAttention(torch.nn.Module):
         attention_dropout: The dropout rate to apply to the attention
                            (default: 0.0)
     """
-    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0,
+    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0, sliding_window_size=None,
                  device=None, dtype=None):
         super().__init__()
         assert flash_attn_unpadded_func is not None, ('Please install FlashAttention first, '
@@ -448,8 +595,9 @@ class FlashSelfAttention(torch.nn.Module):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.dropout_p = attention_dropout
+        self.sliding_window_size = sliding_window_size
 
-    def forward(self, q, k, v):
+    def forward(self, q, k, v, use_sliding_windows=False):
         """Implements the multihead softmax attention.
         Arguments
         ---------
@@ -481,11 +629,19 @@ class FlashSelfAttention(torch.nn.Module):
                         device=q.device)
             dropout_p = 0
 
-        output = flash_attn_unpadded_func(
-            q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
-            dropout_p,
-            softmax_scale=self.softmax_scale, causal=is_causal
-        )
+        if not use_sliding_windows:
+            output = flash_attn_unpadded_func(
+                q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
+                dropout_p,
+                softmax_scale=self.softmax_scale, causal=is_causal
+            )
+        else:
+            output = flash_attn_unpadded_func(
+                q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
+                dropout_p,
+                softmax_scale=self.softmax_scale, causal=is_causal,
+                window_size=(self.sliding_window_size, 0)
+            )
 
         output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
         return output
@@ -511,6 +667,8 @@ class ParallelAttention(MegatronModule):
 
         self.group_query_attention = args.group_query_attention
         self.num_query_groups = args.num_query_groups
+        self.sliding_window_size = args.sliding_window_size
+
 
         query_projection_size = config.kv_channels * config.num_attention_heads
         if self.group_query_attention:
@@ -547,6 +705,15 @@ class ParallelAttention(MegatronModule):
                         args.num_query_groups, world_size)
         else:
             self.num_query_groups_per_partition = self.num_attention_heads_per_partition
+
+        # cfiken memo:
+            # kv_channels=128, num_attention_heasd=32, num_query_groups=8
+            # query_projection_size=4096
+            # mpu.get_tensor_model_parallel_world_size()=4 (tp=2)
+            # world_size=4
+            # self.hidden_size_per_attention_head = 128
+            # self.num_attention_heads_per_partition = 8
+            # self.num_query_groups_per_partition = 2
 
         # Strided linear layer.
         if attention_type == AttnType.self_attn:
@@ -586,7 +753,8 @@ class ParallelAttention(MegatronModule):
 
         if self.use_flash_attn:
             self.core_attention_flash = FlashSelfAttention(
-                causal=True, attention_dropout=config.attention_dropout
+                causal=True, attention_dropout=config.attention_dropout,
+                sliding_window_size=self.sliding_window_size
             )
 
         # Output.
@@ -665,7 +833,6 @@ class ParallelAttention(MegatronModule):
 
             # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
             mixed_x_layer, _ = self.query_key_value(hidden_states)
-
             # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
             new_tensor_shape = mixed_x_layer.size()[:-1] + (
                 self.num_query_groups_per_partition,
@@ -691,8 +858,9 @@ class ParallelAttention(MegatronModule):
                 ],
                 dim=3)
 
-            # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn] -
-            query_layer = query_layer.view(query_layer.size(0), query_layer.size(1), -1, self.hidden_size_per_attention_head)
+            # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
+            query_layer = query_layer.reshape(query_layer.size(0), query_layer.size(1), -1, self.hidden_size_per_attention_head)
+            # query_layer = query_layer.view(query_layer.size(0), query_layer.size(1), -1, self.hidden_size_per_attention_head)
         else:
             # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
             mixed_kv_layer, _ = self.key_value(encoder_output)
@@ -789,6 +957,13 @@ class ParallelAttention(MegatronModule):
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
 
+        q_len = query_layer.shape[0]
+        use_sliding_windows = (
+            _flash_supports_window_size
+            and self.sliding_window_size is not None
+            and q_len > self.sliding_window_size
+        )
+
         if not self.use_flash_attn:
             if self.checkpoint_core_attention:
                 context_layer = self._checkpointed_attention_forward(
@@ -801,9 +976,9 @@ class ParallelAttention(MegatronModule):
                        for x in (query_layer, key_layer, value_layer)]
             if not self.sequence_parallel:
                 with tensor_parallel.get_cuda_rng_tracker().fork():
-                    context_layer = self.core_attention_flash(q, k, v)
+                    context_layer = self.core_attention_flash(q, k, v, use_sliding_windows)
             else:
-                context_layer = self.core_attention_flash(q, k, v)
+                context_layer = self.core_attention_flash(q, k, v, use_sliding_windows)
             context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
 
         # =================
@@ -898,8 +1073,13 @@ class ParallelTransformerLayer(MegatronModule):
             self.post_inter_attention_norm = get_norm(config)
 
         # MLP
+        self.use_router_logits = False
         if args.num_experts is not None:
-            self.mlp = SwitchMLP(config)
+            if args.moe_type == "mixtral":
+                self.mlp = MixtralSparseMoeBlock(config)
+                self.use_router_logits = True
+            else:
+                self.mlp = SwitchMLP(config)
         else:
             self.mlp = ParallelMLP(config)
 
@@ -1235,7 +1415,11 @@ class ParallelTransformerLayer(MegatronModule):
                             self.layer_type.name)
 
         # MLP.
-        mlp_output, mlp_bias = self.mlp(norm_output)
+        if self.use_router_logits:
+            mlp_output, router_logits = self.mlp(norm_output)
+            mlp_bias = None
+        else:
+            mlp_output, mlp_bias = self.mlp(norm_output)
 
         # Second residual connection.
         if self.apply_residual_connection_post_norm:
@@ -1272,8 +1456,12 @@ class ParallelTransformerLayer(MegatronModule):
             output = residual + self.drop_path(out)
 
         if self.layer_type == LayerType.retro_decoder_with_retriever:
+            if self.use_router_logits:
+                return output, retriever_output, router_logits
             return output, retriever_output
         else:
+            if self.use_router_logits:
+                return output, router_logits
             return output
 
 
@@ -1407,6 +1595,9 @@ class ParallelTransformer(MegatronModule):
             config.distribute_saved_activations and not config.sequence_parallel
 
         self.sequence_parallel = config.sequence_parallel
+
+        self.num_total_layers = args.num_layers
+        self.num_experts = args.num_experts
 
         # Transformer Engine Init.
         self.transformer_engine_v_0_10 = False
@@ -1561,6 +1752,8 @@ class ParallelTransformer(MegatronModule):
             else:
                 offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
 
+        self.offset = offset
+
         if self.num_layers == 0:
             # When a standalone embedding stage is used (e.g.,
             # args.standalone_embedding_stage == True), virtual pipeline ranks
@@ -1591,6 +1784,8 @@ class ParallelTransformer(MegatronModule):
             # Final layer norm before output.
             self.final_norm = get_norm(config)
 
+        self.output_router_logits = True if args.moe_type == "mixtral" else False
+
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
 
@@ -1601,10 +1796,11 @@ class ParallelTransformer(MegatronModule):
         def custom(start, end):
             def custom_forward(*args, **kwargs):
                 x_, *args = args
+                all_router_logits = []
                 for index in range(start, end):
                     layer = self._get_layer(index)
                     x_ = layer(x_, *args, **kwargs)
-                return x_
+                return (x_, all_router_logits)
             return custom_forward
 
         te_forward_kwargs = {}
@@ -1613,6 +1809,7 @@ class ParallelTransformer(MegatronModule):
             if self.transformer_engine_v_0_10:
                 te_forward_kwargs['rotary_pos_emb'] = rotary_pos_emb
 
+        all_router_logits = []
         if self.recompute_method == 'uniform':
             # Uniformly divide the total number of Transformer layers and
             # checkpoint the input activation of each divided chunk.
@@ -1620,7 +1817,7 @@ class ParallelTransformer(MegatronModule):
             l = 0
             while l < self.num_layers:
                 if self.transformer_impl == 'transformer_engine':
-                    hidden_states = transformer_engine.pytorch.checkpoint(
+                    hidden_states, local_router_logits = transformer_engine.pytorch.checkpoint(
                         custom(l, l + self.recompute_num_layers),
                         self.distribute_saved_activations,
                         tensor_parallel.get_cuda_rng_tracker,
@@ -1628,23 +1825,24 @@ class ParallelTransformer(MegatronModule):
                         hidden_states, attention_mask, encoder_output,
                         enc_dec_attn_mask, **te_forward_kwargs)
                 else:
-                    hidden_states = tensor_parallel.checkpoint(
+                    hidden_states, local_router_logits = tensor_parallel.checkpoint(
                         custom(l, l + self.recompute_num_layers),
                         self.distribute_saved_activations,
                         hidden_states, attention_mask,
                         encoder_output, enc_dec_attn_mask,
                         None, None, None, None, rotary_pos_emb)
-
+                all_router_logits.append(local_router_logits)
                 l += self.recompute_num_layers
 
         elif self.recompute_method == 'block':
             # Checkpoint the input activation of only a set number of individual
             # Transformer layers and skip the rest.
             # A method fully use the device memory removing redundant re-computation.
+            raise ValueError("Block recompute method not supported yet for mixtral.")
             for l in range(self.num_layers):
                 if l < self.recompute_num_layers:
                     if self.transformer_impl == 'transformer_engine':
-                        hidden_states = transformer_engine.pytorch.checkpoint(
+                        hidden_states, local_router_logits = transformer_engine.pytorch.checkpoint(
                             custom(l, l + 1),
                             self.distribute_saved_activations,
                             tensor_parallel.get_cuda_rng_tracker,
@@ -1652,7 +1850,7 @@ class ParallelTransformer(MegatronModule):
                             hidden_states, attention_mask, encoder_output,
                             enc_dec_attn_mask, **te_forward_kwargs)
                     else:
-                        hidden_states = tensor_parallel.checkpoint(
+                        hidden_states, local_router_logits = tensor_parallel.checkpoint(
                             custom(l, l + 1),
                             self.distribute_saved_activations,
                             hidden_states, attention_mask,
@@ -1660,18 +1858,19 @@ class ParallelTransformer(MegatronModule):
                             None, None, None, None, rotary_pos_emb)
                 else:
                     if self.transformer_impl == 'transformer_engine':
-                        hidden_states = custom(l, l + 1)(
+                        hidden_states, local_router_logits = custom(l, l + 1)(
                             hidden_states, attention_mask, encoder_output,
                             enc_dec_attn_mask, **te_forward_kwargs)
                     else:
-                        hidden_states = custom(l, l + 1)(
+                        hidden_states, local_router_logits = custom(l, l + 1)(
                             hidden_states, attention_mask,
                             encoder_output, enc_dec_attn_mask,
                             None, None, None, None, rotary_pos_emb)
+                all_router_logits.append(local_router_logits)
         else:
             raise ValueError("Invalid activation recompute method.")
 
-        return hidden_states
+        return hidden_states, all_router_logits
 
     def set_input_tensor(self, input_tensor):
         """Set input tensor to be used instead of forward()'s input.
@@ -1699,7 +1898,22 @@ class ParallelTransformer(MegatronModule):
 
         if not self.pre_process:
             # See set_input_tensor()
-            hidden_states = self.input_tensor
+
+            # num_router_logits_dim (total number of expters = number of layers * number of experts)
+            num_router_logits_dim = self.num_experts * self.num_total_layers
+
+            # recieve prev pipeline's roter logits = number of experts * offset
+            # self.offset is number of processed layers
+            num_prev_logits_dim = self.num_experts * self.offset
+
+            # input tensor: [s, b, (hidden size + num router logits dim)], num route logits dim = num_prev_logits_dim + rest
+            hidden_states = self.input_tensor[:,:,:-num_router_logits_dim]
+            all_router_logits = self.input_tensor[:,:,-num_router_logits_dim:-num_router_logits_dim + num_prev_logits_dim]
+
+            # split tensor to list
+            all_router_logits = list(all_router_logits.split(self.num_experts, dim=2))
+        else:
+            all_router_logits = [] if self.output_router_logits else None
 
         # Viewless tensor.
         # - We only need to create a viewless tensor in the case of micro batch
@@ -1745,7 +1959,7 @@ class ParallelTransformer(MegatronModule):
 
                 # Forward pass.
                 if self.recompute_granularity == 'full':
-                    hidden_states = self._checkpointed_forward(hidden_states,
+                    hidden_states, all_router_logits = self._checkpointed_forward(hidden_states,
                                                                attention_mask,
                                                                encoder_output,
                                                                enc_dec_attn_mask,
@@ -1781,9 +1995,12 @@ class ParallelTransformer(MegatronModule):
                         # and retriever_output. Make retriever_output available
                         # to subsequence Retro layers.
                         if isinstance(hidden_states, tuple):
-                            assert len(hidden_states) == 2
-                            hidden_states, retriever_output = hidden_states
-                            forward_kwargs["retriever_output"] = retriever_output
+                            if len(hidden_states) == 2:
+                                # 一旦retriever_outputは無視
+                                # hidden_states, retriever_output = hidden_states
+                                # forward_kwargs["retriever_output"] = retriever_output
+                                hidden_states, local_router_logits = hidden_states
+                                all_router_logits.append(local_router_logits)
 
                 # Skip counter update for eval and activation checkpointing
                 if torch.is_grad_enabled() and self.training:
@@ -1793,6 +2010,8 @@ class ParallelTransformer(MegatronModule):
         if self.post_process and self.post_norm:
             hidden_states = self.final_norm(hidden_states)
 
+        if self.output_router_logits:
+            return hidden_states, all_router_logits
         return hidden_states
 
     def load_state_dict(self, state_dict, strict=True):
