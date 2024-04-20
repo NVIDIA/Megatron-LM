@@ -353,6 +353,7 @@ class TransformerLanguageModel(MegatronModule):
         self.encoder_hidden_state = None
         self.add_retriever = args.retro_add_retriever
         self.untie_embeddings_and_output_weights = args.untie_embeddings_and_output_weights
+        self.output_router_logits = True if args.moe_type == "mixtral" else False
 
         # Embeddings.
         if self.pre_process:
@@ -490,13 +491,22 @@ class TransformerLanguageModel(MegatronModule):
         # Run encoder.
         if enc_hidden_states is None:
             if self.encoder is not None:
-                encoder_output = self.encoder(
-                    encoder_input,
-                    enc_attn_mask,
-                    retriever_input=retriever_input,
-                    retriever_attn_mask=retriever_attn_mask,
-                    inference_params=inference_params,
-                    rotary_pos_emb=rotary_pos_emb)
+                if self.output_router_logits:
+                    encoder_output, encoder_all_router_logits = self.encoder(
+                        encoder_input,
+                        enc_attn_mask,
+                        retriever_input=retriever_input,
+                        retriever_attn_mask=retriever_attn_mask,
+                        inference_params=inference_params,
+                        rotary_pos_emb=rotary_pos_emb)
+                else:
+                    encoder_output = self.encoder(
+                        encoder_input,
+                        enc_attn_mask,
+                        retriever_input=retriever_input,
+                        retriever_attn_mask=retriever_attn_mask,
+                        inference_params=inference_params,
+                        rotary_pos_emb=rotary_pos_emb)
             else:
                 encoder_output = self.encoder_hidden_state
         else:
@@ -511,10 +521,16 @@ class TransformerLanguageModel(MegatronModule):
         # output. For example, it is helpful to compute
         # similarity between two sequences by average pooling
         if not self.add_decoder or output_enc_hidden:
-            if self.add_pooler and self.post_process:
-                return encoder_output, pooled_output
+            if self.output_router_logits:
+                if self.add_pooler and self.post_process:
+                    return encoder_output, pooled_output, encoder_all_router_logits
+                else:
+                    return encoder_output, encoder_all_router_logits
             else:
-                return encoder_output
+                if self.add_pooler and self.post_process:
+                    return encoder_output, pooled_output
+                else:
+                    return encoder_output
 
         # Decoder embedding.
         if self.pre_process:
@@ -524,17 +540,31 @@ class TransformerLanguageModel(MegatronModule):
             decoder_input = None
 
         # Run decoder.
-        decoder_output = self.decoder(
-            decoder_input,
-            dec_attn_mask,
-            encoder_output=encoder_output,
-            enc_dec_attn_mask=enc_dec_attn_mask,
-            inference_params=inference_params,
-            rotary_pos_emb=rotary_pos_emb)
+        if self.output_router_logits:
+            # all_router_logitsが各layerのrouterの出力
+            decoder_output, decoder_all_router_logits = self.decoder(
+                decoder_input,
+                dec_attn_mask,
+                encoder_output=encoder_output,
+                enc_dec_attn_mask=enc_dec_attn_mask,
+                inference_params=inference_params,
+                rotary_pos_emb=rotary_pos_emb)
+        else:
+            decoder_output = self.decoder(
+                decoder_input,
+                dec_attn_mask,
+                encoder_output=encoder_output,
+                enc_dec_attn_mask=enc_dec_attn_mask,
+                inference_params=inference_params,
+                rotary_pos_emb=rotary_pos_emb)
 
         if self.add_pooler and self.post_process:
+            if self.output_router_logits:
+                return decoder_output, encoder_output, pooled_output, encoder_all_router_logits, decoder_all_router_logits
             return decoder_output, encoder_output, pooled_output
         else:
+            if self.output_router_logits:
+                return decoder_output, encoder_output, encoder_all_router_logits, decoder_all_router_logits
             return decoder_output, encoder_output
 
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):

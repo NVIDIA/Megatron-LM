@@ -1,0 +1,56 @@
+.PHONY: init-env docker-build-no-cache docker-build docker-up docker-bash docker-down
+
+init-env:
+	@echo -n > .env_project
+	@echo "PROJECT=$(shell basename $(shell pwd) | tr '[:upper:]' '[:lower:]')" >> ./.env_project
+	@echo "DOCKER_BUILDKIT=1" >> ./.env_project
+	@echo "RUNTIME=gpu" >> ./.env_project
+
+docker-build-no-cache:
+	@. ./.env_project && docker build --no-cache --tag $${PROJECT}:latest -f Dockerfile ./
+
+docker-build:
+	@. ./.env_project && docker build --tag $${PROJECT}:latest -f Dockerfile ./
+
+docker-up:
+	@. ./.env_project && docker compose --env-file .env_project -f docker-compose.yml -p $${PROJECT} up -d
+
+docker-bash:
+	@. ./.env_project && docker compose -f docker-compose.yml -p $${PROJECT} exec app bash
+
+docker-down:
+	@. ./.env_project && docker compose -f docker-compose.yml -p $${PROJECT} down
+
+preprocess-data:
+	python tools/preprocess_data.py \
+	--input data/alpaca_cleaned_ja.jsonl \
+	--output-prefix data/mixtral \
+	--tokenizer-model /mnt/nfs/models/Mixtral-8x7B-v0.1 \
+	--tokenizer-type HFTokenizer \
+	--json-key text \
+	--append-eod \
+	--workers 80
+
+convert-model-hf2meg:
+	python tools/checkpoint/util.py --model-type GPT \
+	--loader mixtral_hf \
+	--saver mixtral \
+	--load-dir /mnt/nfs/models/Mixtral-8x7B-v0.1 \
+	--save-dir /mnt/nfs/models/Mixtral-8x7B-v0.1-tp4-pp8 \
+	--tokenizer-model /mnt/nfs/models/Mixtral-8x7B-v0.1 \
+	--target-tensor-parallel-size 4 \
+	--target-pipeline-parallel-size 8
+
+# --weight-checkはMixtral-8x7B-v0.1とweightが全く同じかどうかを判定するために使う
+convert-model-meg2hf:
+	python tools/checkpoint/util.py --model-type GPT \
+	--saver mixtral_hf \
+	--load-dir /mnt/nfs/models/Mixtral-8x7B-v0.1-tp4-pp8 \
+	--save-dir /mnt/nfs/models/Mixtral-8x7B-v0.1-tp4-pp8-hf \
+	--target-tensor-parallel-size 4 \
+	--target-pipeline-parallel-size 8 \
+	--check-eq-with-hf /mnt/nfs/models/Mixtral-8x7B-v0.1 \
+	--weight-check
+
+pretrain-mixtral-distributed:
+	. .env && ./examples/pretrain_mixtral_distributed.sh test_group

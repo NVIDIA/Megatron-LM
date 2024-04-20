@@ -1046,7 +1046,7 @@ def evaluate_and_print_results(prefix, forward_step_func,
                                   iteration)
                 writer.add_scalar('{} validation ppl vs samples'.format(key),
                                   ppl, args.consumed_train_samples)
-            if wandb_writer and is_last_rank():
+            if wandb_writer and wandb_writer.run is not None and is_last_rank():
                 wandb_writer.log({
                     '{} validation'.format(key): total_loss_dict[key].item()},
                     iteration)

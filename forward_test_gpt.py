@@ -7,7 +7,7 @@ from torch import Tensor
 from functools import partial
 from typing import Union
 from megatron import get_args
-from megatron import print_rank_0
+from megatron import print_rank_0, print_rank_last
 from megatron import get_timers
 from megatron import get_tokenizer
 from megatron.core import mpu, tensor_parallel
@@ -26,6 +26,12 @@ from megatron.utils import (
 )
 from megatron.arguments import core_transformer_config_from_args
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.initialize import initialize_megatron
+from megatron.training import get_model
+from megatron.core.utils import get_model_config
+from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron import get_num_microbatches
+from megatron.checkpointing import _load_base_checkpoint
 
 
 def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.model.GPTModel]:
@@ -79,21 +85,6 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
     return model
 
 
-def get_batch(data_iterator):
-    """Generate a batch."""
-
-    # TODO: this is pretty hacky, find a better way
-    if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
-        return None, None, None, None, None
-
-    # get batches based on the TP rank you are on
-    batch = get_batch_on_this_tp_rank(data_iterator) 
-
-    # slice batch along sequence dimension for context parallelism
-    batch = get_batch_on_this_cp_rank(batch)
-
-    return batch.values()
-
 def loss_func(loss_mask: Tensor, output_tensor: Tensor):
     """Loss function.
 
@@ -103,11 +94,6 @@ def loss_func(loss_mask: Tensor, output_tensor: Tensor):
     """    
     args = get_args()
 
-    if args.moe_type == "mixtral" and output_tensor.shape[0] == 2:
-        # 1st element is the lm loss + load balanced loss, 2nd element is the load balanced loss only.
-        output_tensor, aux_loss_tensor = torch.chunk(output_tensor, 2, dim=0)
-        aux_losses = aux_loss_tensor.float()
-        aux_loss = torch.mean(aux_losses.view(-1))
     losses = output_tensor.float()
     loss_mask = loss_mask.view(-1).float()
     if args.context_parallel_size > 1:
@@ -127,9 +113,8 @@ def loss_func(loss_mask: Tensor, output_tensor: Tensor):
 
     # Reduce loss for logging.
     averaged_loss = average_losses_across_data_parallel_group([loss])
-    averaged_aux_loss = average_losses_across_data_parallel_group([aux_loss])
 
-    return loss * args.context_parallel_size, {'lm loss': averaged_loss[0], 'lb loss': averaged_aux_loss[0]}
+    return loss * args.context_parallel_size, {'lm loss': averaged_loss[0]}
 
 
 def forward_step(data_iterator, model: GPTModel):
@@ -142,67 +127,67 @@ def forward_step(data_iterator, model: GPTModel):
     args = get_args()
     timers = get_timers()
 
-    # Get the batch.
-    timers('batch-generator', log_level=2).start()
-    tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
-        data_iterator)
-    timers('batch-generator').stop()
+    # BATCH SIZE PER SINGLE GPU MUST BE ONE!!!!
+    tokens = torch.tensor([[    1, 20811,   349,   396, 13126,   369, 13966,   264]], device=torch.cuda.current_device())
+    position_ids = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7]], device=torch.cuda.current_device())
+    loss_mask = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1]], device=torch.cuda.current_device())
+    attention_mask = torch.tensor([[[[False,  True,  True,  True,  True,  True,  True,  True],
+              [False, False,  True,  True,  True,  True,  True,  True],
+              [False, False, False,  True,  True,  True,  True,  True],
+              [False, False, False, False,  True,  True,  True,  True],
+              [False, False, False, False, False,  True,  True,  True],
+              [False, False, False, False, False, False,  True,  True],
+              [False, False, False, False, False, False, False,  True],
+              [False, False, False, False, False, False, False, False]]]], device=torch.cuda.current_device())
+    #labels = torch.tensor([[32000, 32000, 32000, 32000, 32000, 32000, 32000, 32000]], device=torch.cuda.current_device())
+    labels = torch.tensor([[20896, 26570, 20896, 21876, 25931, 25931, 20896, 20896]], device=torch.cuda.current_device())
 
     output_tensor = model(tokens, position_ids, attention_mask,
                           labels=labels)
 
-    return output_tensor, partial(loss_func, loss_mask)
-
-
-def is_dataset_built_on_rank():
-    return (mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()) and mpu.get_tensor_model_parallel_rank() == 0
-
-
-def core_gpt_dataset_config_from_args(args):
-    return GPTDatasetConfig(
-        is_built_on_rank=is_dataset_built_on_rank,
-        random_seed=args.seed,
-        sequence_length=args.seq_length,
-        blend=args.data_path,
-        blend_per_split=[args.train_data_path, args.valid_data_path, args.test_data_path],
-        split=args.split,
-        path_to_cache=args.data_cache_path,
-        return_document_ids=args.retro_return_doc_ids,
-        reset_position_ids=args.reset_position_ids,
-        reset_attention_mask=args.reset_attention_mask,
-        eod_mask_loss=args.eod_mask_loss,
-        eod_id=get_tokenizer().eod
-    )
-
-
-def train_valid_test_datasets_provider(train_val_test_num_samples):
-    """Build the train test and validation datasets.
-
-    Args:
-        train_val_test_num_samples : A list containing the number of samples in train test and validation.
-    """
-    args = get_args()
-
-    print_rank_0("> building train, validation, and test datasets for GPT ...")
-
-    train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-        GPTDataset,
-        train_val_test_num_samples,
-        core_gpt_dataset_config_from_args(args)
-    ).build()
-
-    print_rank_0("> finished creating GPT datasets ...")
-
-    return train_ds, valid_ds, test_ds
+    if isinstance(output_tensor, tuple):
+        return list(output_tensor), partial(loss_func, loss_mask)
+    else:
+        return output_tensor, partial(loss_func, loss_mask)
 
 
 if __name__ == "__main__":
+    # Initalize and get arguments, timers, and Tensorboard writer.
+    initialize_megatron(extra_args_provider=None, args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
 
-    # Temporary for transition to core datasets
-    train_valid_test_datasets_provider.is_distributed = True
+    args = get_args()
+    args.model_type = ModelType.encoder_or_decoder
+    model = get_model(model_provider, ModelType.encoder_or_decoder)
+    print_rank_0(model)
 
-    pretrain(train_valid_test_datasets_provider,
-             model_provider,
-             ModelType.encoder_or_decoder,
-             forward_step,
-             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
+    config = get_model_config(model[0])
+
+    if args.load is not None:
+        load_dir = getattr(args, 'load')
+        state_dict, _, _ = _load_base_checkpoint(load_dir, rank0=False)
+        model[0].module.load_state_dict(state_dict['model'], strict=True)
+
+    for model_module in model:
+        model_module.eval()
+        #model_module.train()
+
+    total_loss_dict = {}
+
+    for model_chunk in model:
+        model_chunk.zero_grad_buffer(zero_buffer=(not args.use_distributed_optimizer))
+
+    forward_backward_func = get_forward_backward_func()
+    losses_reduced = forward_backward_func(
+        forward_step_func=forward_step,
+        data_iterator=None,
+        model=model,
+        num_microbatches=get_num_microbatches(),
+        seq_length=args.seq_length,
+        micro_batch_size=args.micro_batch_size,
+        decoder_seq_length=args.decoder_seq_length,
+        forward_only=False)
+
+    #print(model[0].module.module.language_model.encoder.layers[-1].mlp.experts[0].w1.weight)
+    #print(model[0].module.module.language_model.encoder.layers[-1].mlp.gate.weight.main_grad)
+
+    #print_rank_last(losses_reduced)

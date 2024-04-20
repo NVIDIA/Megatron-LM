@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: abeja
+  annotations:
+    pv.kubernetes.io/provisioned-by: filestore.csi.storage.gke.io
+spec:
+  storageClassName: filestore-sc
+  capacity:
+    storage: 50Ti
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Delete
+  volumeMode: Filesystem
+  csi:
+    driver: filestore.csi.storage.gke.io
+    # Modify this to use the zone, filestore instance and share name.
+    volumeHandle: "modeInstance/asia-southeast1/abeja/abeja"
+    volumeAttributes:
+      ip: 10.0.0.10
+      volume: abeja

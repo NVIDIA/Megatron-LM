@@ -1,0 +1,98 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: megatron-lm-worker-1
+  labels:
+    app: megatron-lm-worker
+spec:
+  template:
+    metadata:
+      labels:
+        app: megatron-lm-worker
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      restartPolicy: Never
+      containers:
+      - name: megatron-lm
+        image: asia-southeast1-docker.pkg.dev/abeja-geniac/megatron-lm/megatron-lm:latest
+        imagePullPolicy: Always
+        command: ["/bin/sh", "-c", "./script/pretrain_mixtral_distributed.sh ${RUN_NAME}"]
+        workingDir: /app
+        envFrom:
+        - configMapRef:
+            name: megatron-lm-config
+        - secretRef:
+            name: megatron-lm-secret
+        env:
+        - name: NODE_RANK
+          value: "1"
+        - name: LD_LIBRARY_PATH
+          value: /usr/local/nvidia/lib64
+        volumeMounts:
+        - name: fileserver
+          mountPath: /mnt/nfs
+        - name: tcpx-socket
+          mountPath: /tmp
+        - name: libraries
+          mountPath: /usr/local/nvidia/lib64
+        - mountPath: /dev/shm
+          name: dshm
+        resources:
+          requests:
+            cpu: "150"
+            memory: "1300Gi"
+            nvidia.com/gpu: 8
+          limits:
+            cpu: "150"
+            memory: "1300Gi"
+            nvidia.com/gpu: 8
+      - name: tcpx-daemon
+        image: us-docker.pkg.dev/gce-ai-infra/gpudirect-tcpx/tcpgpudmarxd-dev:v2.0.9
+        command:
+          - /tcpgpudmarxd/build/app/tcpgpudmarxd
+          - --gpu_nic_preset
+          - a3vm
+          - --gpu_shmem_type
+          - fd
+          - --uds_path
+          - /run/tcpx
+          - --setup_param
+          - \"--verbose 128 2 0 \"
+        securityContext:
+          privileged: true
+        volumeMounts:
+          - name: libraries
+            mountPath: /usr/local/nvidia/lib64
+          - name: tcpx-socket
+            mountPath: /run/tcpx
+        env:
+          - name: LD_LIBRARY_PATH
+            value: /usr/local/nvidia/lib64
+      volumes:
+      - name: fileserver
+        persistentVolumeClaim:
+          claimName: cfiken-test
+      - name: libraries
+        hostPath:
+          path: /home/kubernetes/bin/nvidia/lib64
+      - name: tcpx-socket
+        hostPath:
+          path: /run/tcpx
+      - name: dshm
+        emptyDir:
+            medium: Memory
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: cloud.google.com/gke-accelerator
+                operator: In
+                values:
+                - nvidia-h100-80gb
+              - key: topology.kubernetes.io/zone
+                operator: In
+                values:
+                - asia-southeast1-b

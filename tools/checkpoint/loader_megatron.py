@@ -23,6 +23,7 @@ def _load_checkpoint(queue, args):
     # Search in directory above this
     sys.path.append(os.path.abspath(
         os.path.join(os.path.dirname(__file__),
+                     os.path.pardir,
                      os.path.pardir)))
     if args.megatron_path is not None:
         sys.path.insert(0, args.megatron_path)
@@ -89,6 +90,7 @@ def _load_checkpoint(queue, args):
     check_for_arg('disable_bias_linear', False)
     check_for_arg('params_dtype')
     check_for_arg('swiglu', False)
+    check_for_arg('sliding_window', "Null")
 
     # Determine how to make our models
     if args.model_type == 'GPT':
@@ -204,6 +206,12 @@ def _load_checkpoint(queue, args):
     md.true_vocab_size = true_vocab_size
     md.make_vocab_size_divisible_by = margs.make_vocab_size_divisible_by
     md.checkpoint_args = checkpoint_args
+    # mixtral
+    md.num_experts = margs.num_experts
+    md.num_experts_per_tok = margs.num_experts_per_tok
+    md.moe_type = margs.moe_type
+    md.moe_load_balancing_mode = margs.moe_load_balancing_mode
+    md.sliding_window = margs.sliding_window
 
     # Get first pipe stage
     mpu.set_pipeline_model_parallel_rank(0)
@@ -260,33 +268,73 @@ def _load_checkpoint(queue, args):
                 qkv_weight = []
                 qkv_bias = []
                 dense_weight = []
-                mlp_l0_weight = []
-                mlp_l0_bias = []
-                mlp_l1_weight = []
-                for tp_rank, model in enumerate(models):
-                    layer = model.language_model.encoder.layers[layer_num]
-                    qkv_weight.append(layer.self_attention.query_key_value.weight.data)
-                    dense_weight.append(layer.self_attention.dense.weight.data)
-                    mlp_l0_weight.append(layer.mlp.dense_h_to_4h.weight.data)
-                    mlp_l1_weight.append(layer.mlp.dense_4h_to_h.weight.data)
-                    if md.linear_bias:
-                        qkv_bias.append(layer.self_attention.query_key_value.bias.data)
-                        mlp_l0_bias.append(layer.mlp.dense_h_to_4h.bias.data)
-
-                # Handle gated linear units
-                if md.swiglu:
-                    # concat all the first halves ('W's) and all the second halves ('V's)
-                    for tp_rank in range(tp_size):
-                        mlp_l0_weight[tp_rank] = torch.chunk(mlp_l0_weight[tp_rank], 2, dim=0)
-                    message["mlp l0 weight W"] = torch.cat([w[0] for w in mlp_l0_weight], dim=0)
-                    message["mlp l0 weight V"] = torch.cat([w[1] for w in mlp_l0_weight], dim=0)
+                if md.moe_type == "mixtral":
+                    mlp_gate_weight = []
+                    mlp_expert_w1 = []
+                    mlp_expert_w2 = []
+                    mlp_expert_w3 = []
+                    mlp_l0_bias = []
+                    for tp_rank, model in enumerate(models):
+                        layer = model.language_model.encoder.layers[layer_num]
+                        qkv_weight.append(layer.self_attention.query_key_value.weight.data)
+                        dense_weight.append(layer.self_attention.dense.weight.data)
+                        mlp_gate_weight.append(layer.mlp.gate.weight.data)
+                        # tpの数 * expertの数のリストができる[tp1のexpert1.w1, tp1のexpert2.w1, ..., tp2のexpert1.w1, tp2のexpert2.w1, ...]
+                        for expert in layer.mlp.experts:
+                            mlp_expert_w1.append(expert.w1.weight.data)
+                            mlp_expert_w2.append(expert.w2.weight.data)
+                            mlp_expert_w3.append(expert.w3.weight.data)
+                        # これは入らない
+                        if md.linear_bias:
+                            qkv_bias.append(layer.self_attention.query_key_value.bias.data)
+                            mlp_l0_bias.append(layer.mlp.dense_h_to_4h.bias.data)
                 else:
-                    message["mlp l0 weight"] = torch.cat(mlp_l0_weight, dim=0)
+                    mlp_l0_weight = []
+                    mlp_l0_bias = []
+                    mlp_l1_weight = []
+                    for tp_rank, model in enumerate(models):
+                        layer = model.language_model.encoder.layers[layer_num]
+                        qkv_weight.append(layer.self_attention.query_key_value.weight.data)
+                        dense_weight.append(layer.self_attention.dense.weight.data)
+                        mlp_l0_weight.append(layer.mlp.dense_h_to_4h.weight.data)
+                        mlp_l1_weight.append(layer.mlp.dense_4h_to_h.weight.data)
+                        if md.linear_bias:
+                            qkv_bias.append(layer.self_attention.query_key_value.bias.data)
+                            mlp_l0_bias.append(layer.mlp.dense_h_to_4h.bias.data)
+
+                if md.moe_type == "mixtral":
+                    # gateはparallelしていないので全く同じ重みになるので片っぽを取得すればOK
+                    assert torch.equal(torch.mean(torch.stack(mlp_gate_weight), dim=0), mlp_gate_weight[0]), "gate weight is not equal"
+                    message["mlp gate weight"] = mlp_gate_weight[0]
+                    for expert_idx in range(md.num_experts):
+                        message[f"mlp expert{expert_idx} w1"] = torch.cat(
+                            [mlp_expert_w1[expert_idx + md.num_experts * tp_rank] for tp_rank in range(tp_size)],
+                            dim=0
+                        )
+                        message[f"mlp expert{expert_idx} w2"] = torch.cat(
+                            [mlp_expert_w2[expert_idx + md.num_experts * tp_rank] for tp_rank in range(tp_size)],
+                            dim=1
+                        )
+                        message[f"mlp expert{expert_idx} w3"] = torch.cat(
+                            [mlp_expert_w3[expert_idx + md.num_experts * tp_rank] for tp_rank in range(tp_size)],
+                            dim=0
+                        )
+                else:
+                    # Handle gated linear units
+                    if md.swiglu:
+                        # concat all the first halves ('W's) and all the second halves ('V's)
+                        for tp_rank in range(tp_size):
+                            mlp_l0_weight[tp_rank] = torch.chunk(mlp_l0_weight[tp_rank], 2, dim=0)
+                        message["mlp l0 weight W"] = torch.cat([w[0] for w in mlp_l0_weight], dim=0)
+                        message["mlp l0 weight V"] = torch.cat([w[1] for w in mlp_l0_weight], dim=0)
+                    else:
+                        message["mlp l0 weight"] = torch.cat(mlp_l0_weight, dim=0)
 
                 # simple concat of the rest
                 message["qkv weight"] = torch.cat(qkv_weight, dim=0)
                 message["dense weight"] = torch.cat(dense_weight, dim=1)
-                message["mlp l1 weight"] = torch.cat(mlp_l1_weight, dim=1)
+                if not md.moe_type == "mixtral":
+                    message["mlp l1 weight"] = torch.cat(mlp_l1_weight, dim=1)
                 if md.linear_bias:
                     message["qkv bias"] = torch.cat(qkv_bias, dim=0)
                     if md.swiglu:
@@ -341,6 +389,7 @@ def _load_checkpoint(queue, args):
                 "bias": models[0].binary_head.bias.data
             }
             queue_put("binary head", message)
+    print("loading done!!!")
     queue.put("done")
 
 def load_checkpoint(queue, args):

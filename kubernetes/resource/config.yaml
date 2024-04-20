@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: megatron-lm-config
+data:
+  WANDB_PROJECT: "mixtral-distributed"
+  MASTER_ADDR: "megatron-lm-master"
+  MASTER_PORT: "6000"
+  RUN_NAME: "RUN_NAME"
+  NNODES: "8"
+  CHECKPOINT_PATH: "/mnt/nfs/prd/checkpoints/default"
+  CHECKPOINT_LOCAL_PATH: "./checkpoints"
+  TOKENIZER_MODEL: "/mnt/nfs/models/Mixtral-8x7B-v0.1"
+  # 継続学習を行う元モデルを指定
+  LOAD_CHECKPOINT_PATH: "/mnt/nfs/models/Mixtral-8x7B-v0.1-tp8-pp8"
+  LD_LIBRARY_PATH: "/usr/local/nvidia/lib64"
+  TMP_SIZE: "8"
+  PMP_SIZE: "8"
+  NCCL_DEBUG: "WARN"
+  NCCL_NET: "GPUDirectTCPX_v7"
+  OMP_NUM_THREADS: "1"
+  # LOGLEVEL: "DEBUG"
+  NCCL_SOCKET_IFNAME: "eth0"
+  NCCL_CROSS_NIC: "0"
+  NCCL_ALGO: "Ring"
+  NCCL_PROTO: "Simple"
+  NCCL_NSOCKS_PERTHREAD: "4"
+  NCCL_SOCKET_NTHREADS: "1"
+  NCCL_MAX_NCHANNELS: "8"
+  NCCL_MIN_NCHANNELS: "8"
+  NCCL_DYNAMIC_CHUNK_SIZE: "524288"
+  NCCL_BUFFSIZE: "4194304"
+  CUDA_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+  NCCL_GPUDIRECTTCPX_SOCKET_IFNAME: "eth1,eth2,eth3,eth4"
+  NCCL_GPUDIRECTTCPX_CTRL_DEV: "eth0"
+  NCCL_NET_GDR_LEVEL: "PIX"
+  NCCL_P2P_PXN_LEVEL: "0"
+  NCCL_GPUDIRECTTCPX_UNIX_CLIENT_PREFIX: "/tmp"
+  NCCL_GPUDIRECTTCPX_PROGRAM_FLOW_STEERING_WAIT_MICROS: "1000000"
+  NCCL_GPUDIRECTTCPX_FORCE_ACK: "0"
+  # NCCL_P2P_DISABLE: "1" # from google
+  # NCCL_IB_DISABLE: "1" # from google

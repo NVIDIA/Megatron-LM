@@ -163,9 +163,10 @@ def _set_tensorboard_writer(args):
 
 def _set_wandb_writer(args):
     global _GLOBAL_WANDB_WRITER
-    _ensure_var_is_not_initialized(_GLOBAL_WANDB_WRITER,
-                                   'wandb writer')
-    if getattr(args, 'wandb_project', '') and args.rank == (args.world_size - 1):
+    _ensure_var_is_not_initialized(_GLOBAL_WANDB_WRITER, 'wandb writer')
+    gpus_per_node = int(os.getenv('GPUS_PER_NODE', '1'))
+    if getattr(args, 'wandb_project', '') and ((args.rank + 1) % gpus_per_node == 0):
+    # if getattr(args, 'wandb_project', ''):
         if args.wandb_exp_name == '':
             raise ValueError("Please specify the wandb experiment name!")
 
@@ -179,10 +180,14 @@ def _set_wandb_writer(args):
             'dir': save_dir,
             'name': args.wandb_exp_name,
             'project': args.wandb_project,
+            'entity': args.wandb_entity,
+            'group': args.wandb_group_name if args.wandb_group_name else None,
             'config': vars(args)}
         os.makedirs(wandb_kwargs['dir'], exist_ok=True)
         wandb.init(**wandb_kwargs)
-        _GLOBAL_WANDB_WRITER = wandb
+        # use last rank node for logging
+        if args.rank == (args.world_size - 1):
+            _GLOBAL_WANDB_WRITER = wandb
 
 
 def _set_adlr_autoresume(args):
@@ -218,6 +223,3 @@ def _ensure_var_is_initialized(var, name):
 def _ensure_var_is_not_initialized(var, name):
     """Make sure the input variable is not None."""
     assert var is None, '{} is already initialized.'.format(name)
-
-
-

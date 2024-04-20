@@ -107,8 +107,9 @@ def load_plugin(plugin_type, name):
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Megatron Checkpoint Utility Arguments",
-                                     allow_abbrev=False, conflict_handler='resolve')
+    parser = argparse.ArgumentParser(
+        description="Megatron Checkpoint Utility Arguments",
+        allow_abbrev=False, conflict_handler='resolve')
 
     parser.add_argument('--model-type', type=str, required=True,
                         choices=['GPT', 'BERT'],

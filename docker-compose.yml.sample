@@ -1,0 +1,37 @@
+version: "3"
+services:
+  app:
+    image: megatron-lm-abeja
+    container_name: megatron-lm-abeja
+    network_mode: host
+
+    build:
+      context: ./
+      dockerfile: Dockerfile
+      args:
+        USERNAME: ubuntu
+
+    env_file:
+      - .env
+
+    volumes:
+      - type: bind
+        source: .
+        target: /app
+      - type: bind
+        source: /mnt/nfs
+        target: /mnt/nfs
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 8
+              capabilities: [gpu]
+
+    working_dir: /app
+    tty: true
+    shm_size: '2tb'
+    ulimits:
+      memlock: -1

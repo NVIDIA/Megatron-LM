@@ -2,8 +2,11 @@
 """Pretrain GPT."""
 
 import os
+import contextlib
+from typing import Callable, Iterator, List, Optional, Union
 import torch
 from torch import Tensor
+from transformers import AutoTokenizer
 from functools import partial
 from typing import Union
 from megatron import get_args
@@ -12,12 +15,13 @@ from megatron import get_timers
 from megatron import get_tokenizer
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
+from megatron.core.utils import get_model_config
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.gpt_dataset import GPTDataset
 import megatron.model
 from megatron.core.models.gpt import GPTModel
-from megatron.training import pretrain
+from megatron.training import pretrain, get_model
 from megatron.core.transformer.spec_utils import import_module
 from megatron.utils import (
     get_batch_on_this_cp_rank,
@@ -26,6 +30,15 @@ from megatron.utils import (
 )
 from megatron.arguments import core_transformer_config_from_args
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.training import (
+    setup_model_and_optimizer, evaluate_and_print_results, print_datetime,
+    build_train_valid_test_data_iterators
+)
+
+from megatron import print_rank_0
+from megatron.initialize import initialize_megatron
+from megatron.custom_forward_func import get_forward_func
+from megatron.checkpointing import load_checkpoint
 
 
 def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.model.GPTModel]:
@@ -45,36 +58,15 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
 
     print_rank_0('building GPT model ...')
     config = core_transformer_config_from_args(get_args())
+    assert(args.context_parallel_size == 1), "Context parallelism is only supported with Megatron Core!"
 
-    if args.use_mcore_models:
-        if args.spec is not None:
-            transformer_layer_spec = import_module(args.spec)
-        else:
-            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm)
-
-        model = GPTModel(
-            config=config,
-            transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.padded_vocab_size,
-            max_sequence_length=args.max_position_embeddings,
-            pre_process=pre_process,
-            post_process=post_process,
-            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
-            parallel_output=True,
-            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-            position_embedding_type=args.position_embedding_type,
-            rotary_percent=args.rotary_percent
-        )
-    else:
-        assert(args.context_parallel_size == 1), "Context parallelism is only supported with Megatron Core!"
-
-        model = megatron.model.GPTModel(
-            config,
-            num_tokentypes=0,
-            parallel_output=True,
-            pre_process=pre_process,
-            post_process=post_process
-        )
+    model = megatron.model.GPTModel(
+        config,
+        num_tokentypes=0,
+        parallel_output=True,
+        pre_process=pre_process,
+        post_process=post_process
+    )
 
     return model
 
@@ -94,6 +86,7 @@ def get_batch(data_iterator):
 
     return batch.values()
 
+
 def loss_func(loss_mask: Tensor, output_tensor: Tensor):
     """Loss function.
 
@@ -103,11 +96,6 @@ def loss_func(loss_mask: Tensor, output_tensor: Tensor):
     """    
     args = get_args()
 
-    if args.moe_type == "mixtral" and output_tensor.shape[0] == 2:
-        # 1st element is the lm loss + load balanced loss, 2nd element is the load balanced loss only.
-        output_tensor, aux_loss_tensor = torch.chunk(output_tensor, 2, dim=0)
-        aux_losses = aux_loss_tensor.float()
-        aux_loss = torch.mean(aux_losses.view(-1))
     losses = output_tensor.float()
     loss_mask = loss_mask.view(-1).float()
     if args.context_parallel_size > 1:
@@ -127,9 +115,8 @@ def loss_func(loss_mask: Tensor, output_tensor: Tensor):
 
     # Reduce loss for logging.
     averaged_loss = average_losses_across_data_parallel_group([loss])
-    averaged_aux_loss = average_losses_across_data_parallel_group([aux_loss])
 
-    return loss * args.context_parallel_size, {'lm loss': averaged_loss[0], 'lb loss': averaged_aux_loss[0]}
+    return loss * args.context_parallel_size, {'lm loss': averaged_loss[0]}
 
 
 def forward_step(data_iterator, model: GPTModel):
@@ -150,7 +137,6 @@ def forward_step(data_iterator, model: GPTModel):
 
     output_tensor = model(tokens, position_ids, attention_mask,
                           labels=labels)
-
     return output_tensor, partial(loss_func, loss_mask)
 
 
@@ -200,9 +186,51 @@ if __name__ == "__main__":
 
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
+    extra_args_provider = None
+    args_defaults = {'tokenizer_type': 'GPT2BPETokenizer'}
+    initialize_megatron(extra_args_provider=extra_args_provider,
+                    args_defaults=args_defaults)
 
-    pretrain(train_valid_test_datasets_provider,
-             model_provider,
-             ModelType.encoder_or_decoder,
-             forward_step,
-             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
+    args = get_args()
+    print_rank_0('Args: {}'.format(args))
+    timers = get_timers()
+    model_type = ModelType.encoder_or_decoder
+
+    # Model, optimizer, and learning rate.
+    timers('model-setup', log_level=0).start(barrier=True)
+    model = get_model(model_provider, model_type)
+    if args.load is not None:
+        timers = get_timers()
+        timers('load-checkpoint', log_level=0).start(barrier=True)
+        args.iteration = load_checkpoint(model, optimizer=None, opt_param_scheduler=None)
+        timers('load-checkpoint').stop(barrier=True)
+        timers.log(['load-checkpoint'])
+    else:
+        args.iteration = 0
+    timers('model-setup').stop()
+    print_datetime('after model is built')
+    config = get_model_config(model[0])
+
+    # Data stuff.
+    timers('train/valid/test-data-iterators-setup', log_level=0).start(
+        barrier=True)
+    train_data_iterator, valid_data_iterator, test_data_iterator \
+        = build_train_valid_test_data_iterators(
+            train_valid_test_datasets_provider)
+    timers('train/valid/test-data-iterators-setup').stop()
+    print_datetime('after dataloaders are built')
+
+    forward_func = get_forward_func()
+    
+    output_tensor = forward_func(
+        forward_step_func=forward_step,
+        data_iterator=test_data_iterator,
+        model=model,
+        num_microbatches=8,
+        seq_length=args.seq_length,
+        micro_batch_size=args.micro_batch_size,
+        decoder_seq_length=args.decoder_seq_length,
+        forward_only=True
+    )
+    print(output_tensor)
+    

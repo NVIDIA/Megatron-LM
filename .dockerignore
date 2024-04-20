@@ -1,0 +1,6 @@
+models
+data
+checkpoints
+training_results
+wandb
+notebook
