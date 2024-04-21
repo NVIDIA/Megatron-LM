@@ -675,6 +675,8 @@ class ColumnParallelLinear(torch.nn.Module):
                         dtype=config.params_dtype,
                     )
                 )
+                if config.use_normhead:
+                    init.kaiming_uniform_(self.weight, a=math.sqrt(5))
                 if config.perform_initialization:
                     _initialize_affine_weight_gpu(
                         self.weight,
@@ -773,6 +775,8 @@ class ColumnParallelLinear(torch.nn.Module):
                     "and skip_weight_param_allocation is True."
                 )
             weight = self.weight
+            if self.config.use_normhead:
+                weight = F.normalize(weight) 
         else:
             # Check the weight passed in is the correct shape
             expected_shape = (self.output_size_per_partition, self.input_size)

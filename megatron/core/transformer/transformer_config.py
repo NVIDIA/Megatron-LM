@@ -98,6 +98,9 @@ class TransformerConfig(ModelParallelConfig):
     test_mode: bool = False
     """Whether to run real-time tests."""
 
+    use_normhead: bool = False
+    """Whether to use normalization for the output layer."""
+
     ####################
     # initialization
     ####################
