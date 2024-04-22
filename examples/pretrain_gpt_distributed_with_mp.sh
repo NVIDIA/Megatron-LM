@@ -28,6 +28,7 @@ DISTRIBUTED_ARGS="
 GPT_ARGS="
     --tensor-model-parallel-size 2 \
     --pipeline-model-parallel-size 2 \
+    --attention-softmax-in-fp32 \
     --sequence-parallel \
     --num-layers 24 \
     --hidden-size 1024 \
@@ -44,7 +45,7 @@ GPT_ARGS="
     --weight-decay 1e-2 \
     --lr-warmup-fraction .01 \
     --clip-grad 1.0 \
-    --fp16
+    --bf16
 "
 
 DATA_ARGS="
