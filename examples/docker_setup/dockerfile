@@ -1,0 +1,11 @@
+# Use NVIDIA's PyTorch image as the base
+FROM nvcr.io/nvidia/pytorch:24.03-py3
+
+# Set the working directory in the container
+WORKDIR /app
+
+# Copy the requirements file into the container at /app
+COPY requirements.txt /app/
+
+# Install any needed packages specified in requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
