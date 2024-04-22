@@ -2,10 +2,10 @@
 FROM nvcr.io/nvidia/pytorch:24.03-py3
 
 # Set the working directory in the container
-WORKDIR /app
+WORKDIR /workspace
 
 # Copy the requirements file into the container at /app
-COPY requirements.txt /app/
+COPY requirements.txt /workspace
 
 # Install any needed packages specified in requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
