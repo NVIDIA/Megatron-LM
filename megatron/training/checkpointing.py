@@ -670,7 +670,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                                                     if getattr(state_dict['args'], 'ckpt_fully_parallel_save', False)
                                                     else 'dp_zero_gather_scatter')
             load_kwargs['sharded_state_dict'] = generate_state_dict(args, model, optimizer, opt_param_scheduler,
-                                                                    rng_state, args.use_dist_ckpt, optim_sd_kwargs=optim_sd_kwargs)
+                                                                    rng_state, True, optim_sd_kwargs=optim_sd_kwargs)
             load_kwargs['exit_on_missing_checkpoint'] = args.exit_on_missing_checkpoint
 
     state_dict, checkpoint_name, release = _load_base_checkpoint(load_dir, rank0=False, **load_kwargs)
