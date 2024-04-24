@@ -1,9 +1,10 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import re
+import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -65,6 +66,7 @@ def get_num_layers_to_build(config: TransformerConfig) -> int:
 @dataclass
 class TransformerBlockSubmodules:
     layer_specs: List[ModuleSpec] = None
+    layer_norm: Optional[Union[ModuleSpec, torch.nn.Module]] = None
 
 
 def _get_block_submodules(
@@ -83,7 +85,7 @@ def _get_block_submodules(
             return spec.submodules
         elif issubclass(spec.module, BaseTransformerLayer):
             num_layers = get_num_layers_to_build(config)
-            return TransformerBlockSubmodules(layer_specs=[spec] * num_layers)
+            return TransformerBlockSubmodules(layer_specs=[spec] * num_layers, layer_norm=TENorm,)
         else:
             raise Exception(f"specialize for {spec.module.__name__}.")
     else:
@@ -176,13 +178,17 @@ class TransformerBlock(MegatronModule):
         # else:
         #     self.layers = torch.nn.ModuleList([build_layer(i + 1 + offset) for i in range(self.num_layers)])
 
-        if self.post_process and self.post_layer_norm:
-            # Final layer norm before output.
-            self.final_layernorm = TENorm(
+        # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
+        # self.post_process and self.post_layer_norm guide this behavior
+        if self.submodules.layer_norm and self.post_process and self.post_layer_norm:
+            self.final_layernorm = build_module(
+                self.submodules.layer_norm,
                 config=self.config,
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
+        else:
+            self.final_layernorm = None  # Either this or nn.Identity
 
     def _get_layer(self, layer_number: int):
         return self.layers[layer_number]
@@ -415,7 +421,7 @@ class TransformerBlock(MegatronModule):
                         hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
 
         # Final layer norm.
-        if self.post_process and self.post_layer_norm:
+        if self.final_layernorm is not None:
             hidden_states = self.final_layernorm(hidden_states)
 
         return hidden_states

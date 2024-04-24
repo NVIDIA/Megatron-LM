@@ -209,7 +209,8 @@ class TestSpecCustomization:
             layer_specs=[
                 ModuleSpec(module=TransformerLayer, submodules=layer_local_spec.submodules)
             ]
-            * transformer_config.num_layers
+            * transformer_config.num_layers,
+            layer_norm=TENorm,
         )
         # make sure the model init conditions are identical
         model_parallel_cuda_manual_seed(123)
