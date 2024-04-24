@@ -79,7 +79,7 @@ OUTPUT_ARGS="
     --tensorboard-log-interval 1 \
     --wandb-project NeurIPS \
     --wandb-save-dir ${WANDB_DIR} \
-    --wandb-exp-name 6_7B-quant \
+    --wandb-exp-name 6_7B-quant-weightDiff&grad \
 "
 
 QUANTIZE_ARGS="
