@@ -234,7 +234,38 @@ def get_batch_on_this_cp_rank(batch):
     cp_size = args.context_parallel_size
     if cp_size > 1:
         cp_rank = mpu.get_context_parallel_rank()
-        for key, val in batch.items():
+        for key, val in list(batch.items()):
+            if 'external' in key:
+                continue
+            elif key == 'indices':
+                """
+                There are four indices in my design:
+                1. src_indices_b
+                2. src_indices_s
+                3. tgt_indices_b
+                4. tgt_indices_s
+                The input of data has tgt_indices with shape (2, src_batch_size, src_seq_length). The original src_indices_b is arange(batch).unsqueeze(1).repeat(seq_length), original img_indices_s is arange(seq_length).unsqueeze(0).repeat(batch).
+                You need to obtain new src_indices and tgt_indices after context parallel processing.
+                After getting those, you can just `word_embeddings[tgt_indices[0], tgt_indices[1]] = features[src_indices[0], src_indices[1]]`.
+                An index tgt_indices[i] is perserved if and only if tgt_indices_s[i] in calibration_index.
+
+                For brevity, the input has only one indices key, and with shape (img_batch_size, 2, img_seq_length).
+                """
+                calibration_index = torch.arange(args.seq_length, device='cuda').view(2 * cp_size, args.seq_length // (2 * cp_size))[[cp_rank, (2 * cp_size - cp_rank - 1)]].view(-1)
+                indices_b, indices_s = val.unbind(dim=0) # how to deal with dynamic num_image
+                mask = torch.isin(indices_s, calibration_index)
+                if mask.any():
+                    src_indices_b = torch.arange(indices_b.shape[0], device='cuda').unsqueeze(1).repeat(1, indices_b.shape[1])
+                    src_indices_s = torch.arange(indices_s.shape[1], device='cuda').unsqueeze(0).repeat(indices_s.shape[0], 1)
+                    src_indices_b = src_indices_b[mask]
+                    src_indices_s = src_indices_s[mask]
+                    tgt_indices_b = indices_b[mask]
+                    tgt_indices_s = indices_s[mask]
+                    tgt_indices_s = (tgt_indices_s.view(-1, 1) == calibration_index).int().argmax(dim=1)
+                    batch['src_indices'] = torch.stack([src_indices_b, src_indices_s])
+                    batch['tgt_indices'] = torch.stack([tgt_indices_b, tgt_indices_s])
+                batch.pop(key)
+                continue
             if val is not None:
                 seq_dim = 1 if key != 'attention_mask' else 2
                 val = val.view(
@@ -272,6 +303,75 @@ def print_rank_last(message):
     else:
         print(message, flush=True)
 
+from collections import OrderedDict
+
+def _broadcast(item):
+    torch.distributed.broadcast(item, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group())
+
+def send_data(tensor):
+    dtypes = [torch.long, torch.float16, torch.bfloat16, torch.float32, torch.float64, torch.int32, torch.bool]
+    info = torch.empty(1, dtype = torch.int64 , device = torch.cuda.current_device())
+    if tensor is None:
+        info[0] = -1
+        _broadcast(info)
+        return None
+    else:
+        info[0] = dtypes.index(tensor.dtype)
+        _broadcast(info)
+    shape_dim = torch.empty(1, dtype = torch.int64 , device = torch.cuda.current_device())
+    shape_dim[0] = len(tensor.shape)
+    _broadcast(shape_dim)
+    if shape_dim[0] == 0:
+        _broadcast(tensor)
+        return tensor
+    assert tensor.numel() > 0, "You can never broadcast a tensor with no data!"
+    shape = torch.tensor(tensor.shape, dtype = torch.int64 , device = torch.cuda.current_device())
+    _broadcast(shape)
+    _broadcast(tensor)
+    return tensor
+
+def recv_data():
+    info = torch.empty(1, dtype = torch.int64 , device = torch.cuda.current_device())
+    _broadcast(info)
+    if info[0] == -1:
+        return None
+    dtypes = [torch.long, torch.float16, torch.bfloat16, torch.float32, torch.float64, torch.int32, torch.bool]
+    dtype = dtypes[info[0]]
+    shape_dim = torch.empty(1, dtype = torch.int64 , device = torch.cuda.current_device())
+    _broadcast(shape_dim)
+    if shape_dim[0] == 0:
+        tensor = torch.tensor(0, dtype = dtype, device=torch.cuda.current_device())
+        _broadcast(tensor)
+        return tensor
+    shape = torch.empty(shape_dim, dtype = torch.int64, device = torch.cuda.current_device())
+    _broadcast(shape)
+    tensor = torch.empty(shape.tolist(), dtype = dtype, device = torch.cuda.current_device())
+    _broadcast(tensor)
+    return tensor
+
+def get_batch_on_this_tp_rank_auto(data_iterator, keys=[]):
+    """
+    Using get_batch_auto, we can broadcast data without speicifying tensor shapes.
+    """
+    args = get_args()
+    batch = OrderedDict()
+    if mpu.get_tensor_model_parallel_rank() == 0:
+        data = next(data_iterator)
+        if type(data) is not dict:
+            data = data[1]
+        for k in keys:
+            if data[k] is not None and data[k].dtype is torch.float32:
+                if args.bf16:
+                    data[k] = data[k].bfloat16()
+                elif args.fp16:
+                    data[k] = data[k].float16()
+            data[k] = data[k].cuda(non_blocking = True)
+        for k in keys:
+            batch[k] = send_data(data[k])
+    else:
+        for k in keys:
+            batch[k] = recv_data()
+    return batch
 
 def get_batch_on_this_tp_rank(data_iterator):
 

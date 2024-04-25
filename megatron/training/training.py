@@ -1393,6 +1393,8 @@ def build_train_valid_test_data_loaders(
             valid_dataloader = build_pretraining_data_loader(
                 valid_ds, args.consumed_valid_samples)
         test_dataloader = build_pretraining_data_loader(test_ds, 0)
+        if hasattr(args, 'collate_fn'):
+            delattr(args, 'collate_fn')
 
         # Flags to know if we need to do training/validation/testing.
         do_train = train_dataloader is not None and args.train_iters > 0

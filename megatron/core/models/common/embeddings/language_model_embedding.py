@@ -80,7 +80,7 @@ class LanguageModelEmbedding(MegatronModule):
             self.tokentype_embeddings.weight.data.fill_(0)
             self.tokentype_embeddings.weight.shared = True
 
-    def forward(self, input_ids: Tensor, position_ids: Tensor, tokentype_ids: int = None) -> Tensor:
+    def forward(self, input_ids: Tensor, position_ids: Tensor, tokentype_ids: int = None, external_feature_dict: dict = {}) -> Tensor:
         """Forward pass of the embedding module.
 
         Args:
@@ -92,6 +92,26 @@ class LanguageModelEmbedding(MegatronModule):
             Tensor: The output embeddings
         """
         word_embeddings = self.word_embeddings(input_ids)
+        if external_feature_dict:
+            assert 'features' in external_feature_dict \
+                and (len(external_feature_dict) ==1 \
+                     or len(external_feature_dict) == 2 and 'pre_len' in external_feature_dict \
+                     or len(external_feature_dict) == 2 and 'indices' in external_feature_dict \
+                     or len(external_feature_dict) == 3 and 'src_indices' in external_feature_dict and 'tgt_indices' in external_feature_dict), "The format of external_feature_dict is not right!"
+            word_embeddings = word_embeddings.clone()
+            features = external_feature_dict['features']
+            if 'indices' in external_feature_dict:
+                indices_b, indices_s = external_feature_dict['indices'].unbind(dim=0)
+                word_embeddings[indices_b.view(-1), indices_s.view(-1)] = features.view(-1, features.shape[-1])
+            elif 'pre_len' in external_feature_dict:
+                pre_len = external_feature_dict['pre_len']
+                word_embeddings[:,pre_len:pre_len+features.shape[1]] = features
+            elif "src_indices" in external_feature_dict and "tgt_indices" in external_feature_dict:
+                src_indices_b, src_indices_s = external_feature_dict['src_indices']
+                tgt_indices_b, tgt_indices_s = external_feature_dict['tgt_indices']
+                word_embeddings[tgt_indices_b, tgt_indices_s] = features[src_indices_b, src_indices_s]
+            else:
+                word_embeddings += features.mean() * 0 # To avoid backward hanging.
         if self.add_position_embedding:
             position_embeddings = self.position_embeddings(position_ids)
             embeddings = word_embeddings + position_embeddings

@@ -131,6 +131,17 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
     def _get_layer_offset(self):
+        config = self.config
+        if hasattr(config, 'first_pipeline_num_layers') and config.first_pipeline_num_layers > 0:
+            assert parallel_state.get_virtual_pipeline_model_parallel_world_size() is None, "We don't support virtual model parallel if you use uneven pipeline parallel!"
+            pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+            if pp_rank == 0:
+                return 0
+
+            num_layers_per_pipeline_rank = (
+                (config.num_layers - config.first_pipeline_num_layers) // (parallel_state.get_pipeline_model_parallel_world_size() - 1)
+            )
+            return config.first_pipeline_num_layers + num_layers_per_pipeline_rank * (pp_rank-1)
 
         pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
 

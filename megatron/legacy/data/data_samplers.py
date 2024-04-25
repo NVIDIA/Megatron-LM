@@ -9,6 +9,7 @@ import numpy as np
 from torch.utils.data import Dataset
 from megatron.training import get_args
 from megatron.core import mpu
+from torch.utils.data import IterableDataset
 
 
 def build_pretraining_data_loader(dataset, consumed_samples):
@@ -17,6 +18,24 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     if dataset is None:
         return None
     args = get_args()
+    if isinstance(dataset, IterableDataset):
+        if hasattr(args, 'collate_fn'):
+            return torch.utils.data.DataLoader(
+                dataset,
+                batch_size=args.micro_batch_size,
+                num_workers=args.num_workers,
+                pin_memory=True,
+                persistent_workers=True if args.num_workers > 0 else False,
+                collate_fn=args.collate_fn
+                )
+        else:
+            return torch.utils.data.DataLoader(
+                dataset,
+                batch_size=args.micro_batch_size,
+                num_workers=args.num_workers,
+                pin_memory=True,
+                persistent_workers=True if args.num_workers > 0 else False,
+                )
 
     # Megatron sampler
     if args.dataloader_type == 'single':
@@ -44,12 +63,21 @@ def build_pretraining_data_loader(dataset, consumed_samples):
                 args.dataloader_type))
 
     # Torch dataloader.
-    return torch.utils.data.DataLoader(dataset,
-                                       batch_sampler=batch_sampler,
-                                       num_workers=args.num_workers,
-                                       pin_memory=True,
-                                       persistent_workers=True if args.num_workers > 0 else False,
-                                       )
+    if hasattr(args, 'collate_fn'):
+        return torch.utils.data.DataLoader(dataset,
+                                        batch_sampler=batch_sampler,
+                                        num_workers=args.num_workers,
+                                        pin_memory=True,
+                                        persistent_workers=True if args.num_workers > 0 else False,
+                                        collate_fn=args.collate_fn
+                                        )
+    else:
+        return torch.utils.data.DataLoader(dataset,
+                                        batch_sampler=batch_sampler,
+                                        num_workers=args.num_workers,
+                                        pin_memory=True,
+                                        persistent_workers=True if args.num_workers > 0 else False,
+                                        )
 
 class MegatronPretrainingSampler:
 

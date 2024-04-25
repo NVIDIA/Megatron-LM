@@ -24,6 +24,9 @@ class TransformerConfig(ModelParallelConfig):
     num_layers: int = 0
     """Number of transformer layers in a transformer block."""
 
+    first_pp_num_layer: int = 0
+    """Used when you want to split pipeline parallel unevenly. 0 means even partition."""
+
     hidden_size: int = 0
     """Transformer hidden size."""
 

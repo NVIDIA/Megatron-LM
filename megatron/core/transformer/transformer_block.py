@@ -29,6 +29,18 @@ from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewles
 
 
 def get_num_layers_to_build(config: TransformerConfig) -> int:
+    if hasattr(config, 'first_pipeline_num_layers') and config.first_pipeline_num_layers > 0:
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        if pp_rank == 0:
+            if parallel_state.get_pipeline_model_parallel_world_size() == 1:
+                return config.num_layers
+            else:
+                return config.first_pipeline_num_layers
+
+        num_layers_per_pipeline_rank = (
+            (config.num_layers - config.first_pipeline_num_layers) // (parallel_state.get_pipeline_model_parallel_world_size() - 1)
+        )
+        return num_layers_per_pipeline_rank
 
     num_layers_per_pipeline_rank = (
         config.num_layers // parallel_state.get_pipeline_model_parallel_world_size()
