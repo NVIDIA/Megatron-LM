@@ -14,6 +14,7 @@ from .generation import (
 from .tokenization import (
     tokenize_prompts,
     detokenize_generations)
+from torch.distributed import broadcast_object_list
 
 def generate_and_post_process(model,
                               prompts=None,
@@ -30,7 +31,8 @@ def generate_and_post_process(model,
                               stop_on_eol=False,
                               prevent_newline_after_colon=False,
                               random_seed=-1,
-                              return_logits=False):
+                              return_logits=False,
+                              image=None):
     """Run inference and post-process outputs, i.e., detokenize,
     move to cpu and convert to list."""
 
@@ -50,7 +52,8 @@ def generate_and_post_process(model,
         stop_on_double_eol=stop_on_double_eol,
         stop_on_eol=stop_on_eol,
         prevent_newline_after_colon=prevent_newline_after_colon,
-        random_seed=random_seed)
+        random_seed=random_seed,
+        image=image)
 
     # Only post-process on first stage.
     if mpu.is_pipeline_first_stage():
@@ -87,7 +90,8 @@ def generate(model,
              stop_on_double_eol=False,
              stop_on_eol=False,
              prevent_newline_after_colon=False,
-             random_seed=-1):
+             random_seed=-1,
+             image=None):
     """Given prompts and input parameters, run inference and return:
        tokens: prompts plus the generated tokens.
        lengths: length of the prompt + generations. Note that we can
@@ -122,6 +126,10 @@ def generate(model,
 
     if random_seed != -1:
         torch.random.manual_seed(random_seed)
+    
+    images = [image]
+    broadcast_object_list(images)
+    image = images[0]
 
     # Tokenize prompts and get the batch.
     # Note that these tensors are broadcaseted to all ranks.
@@ -133,7 +141,7 @@ def generate(model,
 
     if tokens_to_generate == 0:
         return score_and_return_on_first_stage(
-            model, context_tokens_tensor, context_length_tensor)
+            model, context_tokens_tensor, context_length_tensor, image=image)
     
     # Main inference function.
     # Note that the outputs are available on the first stage.
@@ -148,7 +156,7 @@ def generate(model,
         use_eod_token_for_early_termination=use_eod_token_for_early_termination,
         stop_on_double_eol=stop_on_double_eol,
         stop_on_eol=stop_on_eol,
-        prevent_newline_after_colon=prevent_newline_after_colon)
+        prevent_newline_after_colon=prevent_newline_after_colon, image=image)
 
 def beam_search_and_post_process(model,
                                  prompts=None,
@@ -158,7 +166,8 @@ def beam_search_and_post_process(model,
                                  stop_token=50256,
                                  num_return_gen=1,
                                  length_penalty=1,
-                                 prevent_newline_after_colon=False):
+                                 prevent_newline_after_colon=False,
+                                 image=None):
     """Run beam search and post-process outputs, i.e., detokenize,
     move to cpu and convert to list."""
 
@@ -171,7 +180,7 @@ def beam_search_and_post_process(model,
                                  stop_token=stop_token,
                                  num_return_gen=num_return_gen,
                                  length_penalty=length_penalty,
-                                 prevent_newline_after_colon=prevent_newline_after_colon)
+                                 prevent_newline_after_colon=prevent_newline_after_colon, image=image)
     # Only post-process on first stage.
     if mpu.is_pipeline_first_stage():
         lengths = tokens.size(1)*torch.ones(beam_size, dtype=torch.int64, device=torch.cuda.current_device()) 
@@ -181,7 +190,7 @@ def beam_search_and_post_process(model,
 
     return None
 
-def beam_search(model, prompts=None, tokens_to_generate=0, beam_size=0, add_BOS=False, stop_token=50256, num_return_gen=1, length_penalty=1, prevent_newline_after_colon=False):
+def beam_search(model, prompts=None, tokens_to_generate=0, beam_size=0, add_BOS=False, stop_token=50256, num_return_gen=1, length_penalty=1, prevent_newline_after_colon=False, image=None):
     # Make sure input params are avaialble to all ranks.
     values = [tokens_to_generate,
               beam_size,
@@ -204,4 +213,4 @@ def beam_search(model, prompts=None, tokens_to_generate=0, beam_size=0, add_BOS=
     
     return beam_search_and_return_on_first_stage(model, context_tokens_tensor, context_length_tensor, 
             beam_size, stop_token=stop_token, num_return_gen=num_return_gen, length_penalty=length_penalty,
-            prevent_newline_after_colon=prevent_newline_after_colon)
+            prevent_newline_after_colon=prevent_newline_after_colon, image=image)

@@ -16,7 +16,7 @@ from .forward_step import ForwardStep
 from .sampling import sample
 from .beam_utils import BeamHypotheses
 
-def score_and_return_on_first_stage(model, tokens, lengths):
+def score_and_return_on_first_stage(model, tokens, lengths, image=None):
     """Function for just scoring.
 
     Args:
@@ -65,7 +65,7 @@ def score_and_return_on_first_stage(model, tokens, lengths):
         attention_mask, position_ids = _build_attention_mask_and_position_ids(tokens)
         
         # logits will be meanigful only in the last pipeline stage.
-        logits = forward_step(tokens, position_ids, attention_mask)
+        logits = forward_step(tokens, position_ids, attention_mask, image=image)
 
         if mpu.is_pipeline_last_stage():
             # Always the last stage should have an output.
@@ -95,7 +95,8 @@ def generate_tokens_probs_and_return_on_first_stage(
         use_eod_token_for_early_termination=True,
         stop_on_double_eol=False,
         stop_on_eol=False,
-        prevent_newline_after_colon=True
+        prevent_newline_after_colon=True,
+        image=None
         ):
     """Main token generation function.
 
@@ -188,7 +189,7 @@ def generate_tokens_probs_and_return_on_first_stage(
                 ..., prev_context_length:context_length, :context_length]
 
             # logits will be meanigful only in the last pipeline stage.
-            logits = forward_step(tokens2use, positions2use, attention_mask2use)
+            logits = forward_step(tokens2use, positions2use, attention_mask2use, image=image)
 
             if mpu.is_pipeline_last_stage():
                 if prevent_newline_after_colon:
@@ -288,7 +289,7 @@ def generate_tokens_probs_and_return_on_first_stage(
 
     return tokens, generated_sequence_lengths, output_log_probs, None
 
-def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, stop_token, num_return_gen, length_penalty, prevent_newline_after_colon=True):
+def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, stop_token, num_return_gen, length_penalty, prevent_newline_after_colon=True, image=None):
     args = get_args()
     tokenizer = get_tokenizer()
 
@@ -328,7 +329,7 @@ def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, sto
                 ..., prev_context_length:context_length, :context_length]
 
             # logits will be meanigful only in the last pipeline stage.
-            logits = forward_step(tokens2use, positions2use, attention_mask2use)
+            logits = forward_step(tokens2use, positions2use, attention_mask2use, image=image)
 
             if mpu.is_pipeline_last_stage():
                 if prevent_newline_after_colon:

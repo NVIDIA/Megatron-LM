@@ -12,6 +12,7 @@ from .communication import (
     send_to_next_pipeline_rank,
     recv_from_prev_pipeline_rank_)
 
+_IMAGE_PROCESSOR = None
 
 class ForwardStep:
     """Forward step function with all the communications.
@@ -37,7 +38,13 @@ class ForwardStep:
             args.inference_batch_times_seqlen_threshold
 
 
-    def __call__(self, tokens, position_ids, attention_mask):
+    def __call__(self, tokens, position_ids, attention_mask, image=None):
+        global _IMAGE_PROCESSOR
+        if image is not None and _IMAGE_PROCESSOR is not None:
+            from PIL import Image
+            if type(image) is str:
+                image = Image.open(image).convert("RGB")
+            self.inference_params.external_inputs = _IMAGE_PROCESSOR(image)
         """Invocation of the forward methods. Note that self.inference_params
         is being modified by the forward step."""
         # Pipelining case.

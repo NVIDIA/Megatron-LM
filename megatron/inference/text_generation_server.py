@@ -176,6 +176,12 @@ class MegatronGenerate(Resource):
             if not isinstance(length_penalty, float):
                 return "length_penalty must be a float"
         
+        image = None
+        if "image_path" in request.get_json():
+            image = request.get_json()["image_path"]
+            if not isinstance(image, str):
+                return "image_path must be a string"
+        
         with lock:  # Need to get lock to keep multiple threads from hitting code
             
             if not no_log:
@@ -196,7 +202,8 @@ class MegatronGenerate(Resource):
                         stop_token=stop_token,
                         num_return_gen=beam_width,  # Returning whole beam
                         length_penalty=length_penalty,
-                        prevent_newline_after_colon=prevent_newline_after_colon
+                        prevent_newline_after_colon=prevent_newline_after_colon,
+                        image=image
                         )
                     
                     return jsonify({"text": response,
@@ -220,7 +227,8 @@ class MegatronGenerate(Resource):
                         stop_on_double_eol=stop_on_double_eol,
                         stop_on_eol=stop_on_eol,
                         prevent_newline_after_colon=prevent_newline_after_colon,
-                        random_seed=random_seed)
+                        random_seed=random_seed,
+                        image=image)
 
                     return jsonify({"text": response,
                         "segments": response_seg,
