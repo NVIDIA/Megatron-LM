@@ -2,3 +2,6 @@ ARG FROM_IMAGE_NAME
 FROM ${FROM_IMAGE_NAME}
 
 COPY . megatron-lm
+
+RUN cp -r /workspace/megatron-lm /opt && \
+    pip install /opt/megatron-lm
