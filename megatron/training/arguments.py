@@ -1007,6 +1007,8 @@ def _add_training_args(parser):
                        help='Call torch.cuda.empty_cache() each iteration '
                        '(training and eval), to reduce fragmentation.'
                        '0=off, 1=moderate, 2=aggressive.')
+    group.add_argument('--check-weight-hash-across-dp-replicas-interval', type=int, default=None,
+                       help='Interval to check weight hashes are same across DP replicas. If not specified, weight hashes not checked.')
 
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',

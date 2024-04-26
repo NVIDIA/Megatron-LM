@@ -2,11 +2,11 @@
 
 """Pretrain utilities."""
 
-import gc
 import dataclasses
 from datetime import datetime
-import math
+import gc
 import logging
+import math
 import os
 import sys
 from .log_handler import CustomHandler
@@ -19,7 +19,7 @@ _TRAIN_START_TIME = time.time()
 import torch
 
 from megatron.core import mpu, tensor_parallel
-from megatron.core.utils import get_model_config, StragglerDetector
+from megatron.core.utils import check_param_hashes_across_dp_replicas, get_model_config, StragglerDetector
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.legacy.model import Float16Module
@@ -1056,6 +1056,17 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if iteration % args.log_interval == 0 and args.log_straggler:
             stimer.report(total_flops, args.log_interval)
             total_flops = 0.0
+
+        if args.check_weight_hash_across_dp_replicas_interval is not None and \
+                iteration % args.check_weight_hash_across_dp_replicas_interval == 0:
+            if args.use_distributed_optimizer and args.overlap_param_gather:
+                optimizer.disable_pre_hook()
+            assert check_param_hashes_across_dp_replicas(model), \
+                "Parameter hashes not matching across DP replicas"
+            torch.distributed.barrier()
+            print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
+            if args.use_distributed_optimizer and args.overlap_param_gather:
+                optimizer.enable_pre_hook()
 
         # Autoresume
         if args.adlr_autoresume and \
