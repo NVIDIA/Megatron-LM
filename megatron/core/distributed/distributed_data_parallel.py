@@ -263,13 +263,13 @@ class DistributedDataParallel(MegatronModule):
             if is_expert_parallel:
                 torch.distributed.broadcast(
                     param.data,
-                    src=torch.distributed.get_process_group_ranks(self.expert_data_parallel_group),
+                    src=torch.distributed.get_process_group_ranks(self.expert_data_parallel_group)[0],
                     group=self.expert_data_parallel_group,
                 )
             else:
                 torch.distributed.broadcast(
                     param.data,
-                    src=torch.distributed.get_process_group_ranks(self.data_parallel_group),
+                    src=torch.distributed.get_process_group_ranks(self.data_parallel_group)[0],
                     group=self.data_parallel_group,
                 )
 
