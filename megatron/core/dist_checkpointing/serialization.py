@@ -336,6 +336,10 @@ def get_default_save_sharded_strategy(
     return get_default_strategy(StrategyAction.SAVE_SHARDED, backend, version)
 
 
+def get_default_load_sharded_strategy(checkpoint_dir: str) -> LoadShardedStrategy:
+    return _verify_checkpoint_and_load_strategy(checkpoint_dir)
+
+
 # TODO: implement it as common torch strategy
 def _save_common_dict(
     state_dict: StateDict, checkpoint_dir: Path, validate_consistency: bool = False

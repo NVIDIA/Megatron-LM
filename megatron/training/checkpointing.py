@@ -12,8 +12,9 @@ import torch
 from megatron.training import update_num_microbatches
 from megatron.core import mpu, tensor_parallel, dist_checkpointing
 from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.serialization import get_default_load_sharded_strategy
 from megatron.core.dist_checkpointing.strategies.fully_parallel import \
-    FullyParallelSaveStrategyWrapper
+    FullyParallelSaveStrategyWrapper, FullyParallelLoadStrategyWrapper
 from .global_vars import get_args
 from .utils import (unwrap_model,
                     print_rank_0)
@@ -468,7 +469,6 @@ def _load_base_checkpoint(load_dir, rank0=False, sharded_state_dict=None,
 
     If rank0 is true, just loads rank 0 checkpoint, ignoring arguments.
     """
-
     # Read the tracker file and set the iteration.
     tracker_filename = get_checkpoint_tracker_filename(load_dir)
 
@@ -520,11 +520,17 @@ def _load_base_checkpoint(load_dir, rank0=False, sharded_state_dict=None,
             state_dict = dist_checkpointing.load_common_state_dict(checkpoint_name)
             return state_dict, checkpoint_name, release
 
+        # at this point args are available
+        args = get_args()
         if sharded_state_dict is None:
-            args = get_args()
             assert not args.auto_detect_ckpt_format and not args.use_dist_ckpt, (args.auto_detect_ckpt_format, args.use_dist_ckpt)
             raise RuntimeError('Detected load from a distributed checkpoint, but neither --use-dist-ckpt nor --auto-detect-ckpt-format is set.')
-        state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name)
+
+        load_strategy = get_default_load_sharded_strategy(checkpoint_name)
+        if args.ckpt_fully_parallel_load:
+            load_strategy = FullyParallelLoadStrategyWrapper(load_strategy,
+                                                             mpu.get_data_parallel_group(with_context_parallel=True))
+        state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name, load_strategy)
         return state_dict, checkpoint_name, release
 
     try:

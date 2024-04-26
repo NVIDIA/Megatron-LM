@@ -7,9 +7,9 @@ from megatron.core.dist_checkpointing import save, load, load_plain_tensors
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.serialization import \
-    get_default_save_sharded_strategy
+    get_default_save_sharded_strategy, get_default_load_sharded_strategy
 from megatron.core.dist_checkpointing.strategies.fully_parallel import \
-    FullyParallelSaveStrategyWrapper
+    FullyParallelSaveStrategyWrapper, FullyParallelLoadStrategyWrapper
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -53,10 +53,15 @@ def common_test_parallel_reconfiguration_e2e(initialize_model_fn, tmp_path_dist_
         Utils.destroy_model_parallel()
 
         # Load checkpoint A with different TP/PP and save as checkpoint B
-        # No FPS this time
+        # No FPS this time, only FPL
         Utils.initialize_model_parallel(*dest_tp_pp, order=store_order)
         gpt_model_B = initialize_model_fn(2, dst_layer_spec_fn)
-        state_dict = load(gpt_model_B.sharded_state_dict(), ckpt_dir_A)
+        if use_fpsl:
+            load_strategy = get_default_load_sharded_strategy(ckpt_dir_A)
+            load_strategy = FullyParallelLoadStrategyWrapper(load_strategy)
+        else:
+            load_strategy = None
+        state_dict = load(gpt_model_B.sharded_state_dict(), ckpt_dir_A, load_strategy)
         gpt_model_B.load_state_dict(state_dict)
         save(gpt_model_B.sharded_state_dict(), ckpt_dir_B)
         regular_state_dict_B = gpt_model_A.state_dict()

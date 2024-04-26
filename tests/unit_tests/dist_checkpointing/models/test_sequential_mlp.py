@@ -7,9 +7,9 @@ from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import save, load, load_plain_tensors
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.serialization import \
-    get_default_save_sharded_strategy
+    get_default_save_sharded_strategy, get_default_load_sharded_strategy
 from megatron.core.dist_checkpointing.strategies.fully_parallel import \
-    FullyParallelSaveStrategyWrapper
+    FullyParallelSaveStrategyWrapper, FullyParallelLoadStrategyWrapper
 from megatron.core.models.gpt.gpt_layer_specs import \
     get_gpt_layer_with_transformer_engine_spec
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -82,10 +82,16 @@ class TestSequentialMLPReconfiguration:
             Utils.destroy_model_parallel()
 
             # Load checkpoint A with different TP/PP/expert and save as checkpoint B
-            # No FPS this time
+            # No FPS this time, only FPL
             Utils.initialize_model_parallel(dest_tp, dest_pp, expert_model_parallel_size=dest_exp)
             model_B = initialize_sequential_mlp(2, use_glu)
-            state_dict = load(model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_A)
+            if use_fpsl:
+                load_strategy = get_default_load_sharded_strategy(ckpt_dir_A)
+                load_strategy = FullyParallelLoadStrategyWrapper(load_strategy,
+                                                                 parallel_state.get_data_parallel_group(with_context_parallel=True))
+            else:
+                load_strategy = None
+            state_dict = load(model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_A, load_strategy)
             model_B.load_state_dict(state_dict)
             save(model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_B)
             Utils.destroy_model_parallel()
