@@ -209,11 +209,17 @@ def forward_step(
                 data_iterator, model, checkpoint_activations_microbatch
             )
 
+    num_tokens = torch.tensor(0, dtype=torch.int)
     if parallel_state.is_pipeline_last_stage():
         if not collect_non_loss_data:
-            output_tensor = loss_func(output_tensor)
-            loss, loss_reduced = output_tensor
-            output_tensor = loss / num_microbatches
+            outputs = loss_func(output_tensor)
+            if len(outputs) == 3:
+                output_tensor, num_tokens, loss_reduced = outputs
+            else:
+                # preserve legacy loss averaging behavior (ie, over the number of microbatches)
+                assert len(outputs) == 2
+                output_tensor, loss_reduced = outputs
+                output_tensor = output_tensor / num_microbatches
             forward_data_store.append(loss_reduced)
         else:
             data = loss_func(output_tensor, non_loss_data=True)
@@ -242,10 +248,11 @@ def forward_step(
         parallel_state.is_pipeline_stage_after_split()
         and model_type == ModelType.encoder_and_decoder
     ):
-        return [output_tensor, input_tensor[-1]]
+        return [output_tensor, input_tensor[-1]], num_tokens
+
     if unwrap_output_tensor:
-        return output_tensor
-    return [output_tensor]
+        return output_tensor, num_tokens
+    return [output_tensor], num_tokens
 
 
 def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
@@ -365,9 +372,10 @@ def forward_backward_no_pipelining(
 
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
+    total_num_tokens = torch.tensor(0, dtype=torch.int).cuda()
     with no_sync_func():
         for i in range(num_microbatches - 1):
-            output_tensor = forward_step(
+            output_tensor, num_tokens = forward_step(
                 forward_step_func,
                 data_iterator,
                 model,
@@ -379,12 +387,13 @@ def forward_backward_no_pipelining(
                 is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
                 current_microbatch=i,
             )
+            total_num_tokens += num_tokens.item()
             if not forward_only:
                 backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
 
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).
-    output_tensor = forward_step(
+    output_tensor, num_tokens = forward_step(
         forward_step_func,
         data_iterator,
         model,
@@ -398,17 +407,18 @@ def forward_backward_no_pipelining(
         ),
         current_microbatch=num_microbatches - 1,
     )
+    total_num_tokens += num_tokens.item()
 
     if not forward_only:
         backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
 
-    if config.timers is not None:
-        config.timers('forward-backward').stop()
-
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism and layernorm all-reduce for sequence parallelism).
-        config.finalize_model_grads_func([model])
+        config.finalize_model_grads_func([model], total_num_tokens)
+
+    if config.timers is not None:
+        config.timers('forward-backward').stop()
 
     return forward_data_store
 
@@ -485,6 +495,8 @@ def forward_backward_pipelining_with_interleaving(
 
     input_tensors = [[] for _ in range(len(model))]
     output_tensors = [[] for _ in range(len(model))]
+    total_num_tokens = torch.tensor(0, dtype=torch.int).cuda()
+
     forward_data_store = []
     if not forward_only:
         output_tensor_grads = [[] for _ in range(len(model))]
@@ -620,7 +632,7 @@ def forward_backward_pipelining_with_interleaving(
                 input_tensors[model_chunk_id].append(None)
         input_tensor = input_tensors[model_chunk_id][-1]
 
-        output_tensor = forward_step(
+        output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator[model_chunk_id],
             model[model_chunk_id],
@@ -636,6 +648,9 @@ def forward_backward_pipelining_with_interleaving(
             current_microbatch=current_microbatch,
         )
         output_tensors[model_chunk_id].append(output_tensor)
+
+        nonlocal total_num_tokens
+        total_num_tokens += num_tokens.item()
 
         # if forward-only, no need to save tensors for a backward pass
         if forward_only:
@@ -1000,14 +1015,14 @@ def forward_backward_pipelining_with_interleaving(
                     config.grad_sync_func[model_chunk_id](model[model_chunk_id].parameters())
                     synchronized_model_chunks.add(model_chunk_id)
 
-    if config.timers is not None:
-        config.timers('forward-backward').stop()
-
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism, layernorm all-reduce for sequence parallelism, and
         # embedding all-reduce for pipeline parallelism).
-        config.finalize_model_grads_func(model)
+        config.finalize_model_grads_func(model, total_num_tokens)
+
+    if config.timers is not None:
+        config.timers('forward-backward').stop()
 
     return forward_data_store
 
@@ -1225,6 +1240,8 @@ def forward_backward_pipelining_without_interleaving(
     # Input, output tensors only need to be saved when doing backward passes
     input_tensors = None
     output_tensors = None
+    total_num_tokens = torch.tensor(0, dtype=torch.int).cuda()
+
     if not forward_only:
         input_tensors = []
         output_tensors = []
@@ -1242,7 +1259,7 @@ def forward_backward_pipelining_without_interleaving(
             checkpoint_activations_microbatch = None
 
         input_tensor = recv_forward(recv_tensor_shapes, config)
-        output_tensor = forward_step(
+        output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
             model,
@@ -1256,6 +1273,7 @@ def forward_backward_pipelining_without_interleaving(
             current_microbatch=i,
         )
         send_forward(output_tensor, send_tensor_shapes, config)
+        total_num_tokens += num_tokens.item()
 
         if not forward_only:
             input_tensors.append(input_tensor)
@@ -1280,7 +1298,7 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
-        output_tensor = forward_step(
+        output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
             model,
@@ -1295,6 +1313,7 @@ def forward_backward_pipelining_without_interleaving(
             ),
             current_microbatch=i + num_warmup_microbatches,
         )
+        total_num_tokens += num_tokens.item()
 
         if forward_only:
             send_forward(output_tensor, send_tensor_shapes, config)
@@ -1365,13 +1384,13 @@ def forward_backward_pipelining_without_interleaving(
             if config.grad_sync_func is not None:
                 config.grad_sync_func(model.parameters())
 
-    if config.timers is not None:
-        config.timers('forward-backward').stop()
-
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism, layernorm all-reduce for sequence parallelism, and
         # embedding all-reduce for pipeline parallelism).
-        config.finalize_model_grads_func([model])
+        config.finalize_model_grads_func([model], total_num_tokens)
+
+    if config.timers is not None:
+        config.timers('forward-backward').stop()
 
     return forward_data_store

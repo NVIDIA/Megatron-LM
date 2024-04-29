@@ -46,9 +46,6 @@ class Bucket:
         numel_unpadded: Number of unpadded elements in bucket.
         data_parallel_group: Data-parallel process group.
         data_parallel_world_size: World size using the data-parallel group group.
-        gradient_scaling_factor: This factor is utilized to scale gradients prior to their
-            communication. Its application is twofold: it facilitates the averaging of gradients
-            and the scaling of gradients in the context of the Mixture of Experts (MoE) model.
     """
 
     def __init__(
@@ -61,7 +58,6 @@ class Bucket:
         numel_unpadded: int,
         data_parallel_group: torch.distributed.ProcessGroup,
         data_parallel_world_size: int,
-        gradient_scaling_factor: float,
     ):
         self.ddp_config = ddp_config
 
@@ -81,7 +77,6 @@ class Bucket:
         self.data_parallel_group = data_parallel_group
         self.data_parallel_world_size = data_parallel_world_size
         self.data_parallel_rank = torch.distributed.get_rank(group=data_parallel_group)
-        self.gradient_scaling_factor = gradient_scaling_factor
 
         self.reset()
 
@@ -117,7 +112,6 @@ class Bucket:
                 f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
             )
 
-        self.grad_data *= self.gradient_scaling_factor
         # Use async_op only when overlap_grad_reduce is True.
         if self.ddp_config.use_distributed_optimizer:
             local_data_view = shard_buffer(self.grad_data, self.data_parallel_world_size)[
@@ -187,9 +181,6 @@ class ParamAndGradBuffer:
         data_parallel_group: Data-parallel process group.
         bucket_size: The rough size of each bucket in terms of number of parameters.
         param_to_name: Mapping from `torch.nn.Parameter` to name (for logging purposes).
-        gradient_scaling_factor: This factor is utilized to scale gradients prior to their
-            communication. Its application is twofold: it facilitates the averaging of gradients
-            and the scaling of gradients in the context of the Mixture of Experts (MoE) model.
     """
 
     def __init__(
@@ -201,7 +192,6 @@ class ParamAndGradBuffer:
         data_parallel_group: torch.distributed.ProcessGroup,
         bucket_size: int,
         param_to_name: Dict[torch.nn.Parameter, str],
-        gradient_scaling_factor: float,
     ):
         self.ddp_config = ddp_config
 
@@ -219,7 +209,6 @@ class ParamAndGradBuffer:
         self.data_parallel_world_size = torch.distributed.get_world_size(
             group=self.data_parallel_group
         )
-        self.gradient_scaling_factor = gradient_scaling_factor
         self.is_last_microbatch = True
 
         # Data structures to store underlying buckets and relevant indexing data.
@@ -402,6 +391,10 @@ class ParamAndGradBuffer:
                 for param in bucket.params:
                     logger.info(f'    {param_to_name[param]}')
 
+    def scale_gradients(self, scaling_factor: float) -> None:
+        """Scale the gradient data by `scaling_factor`."""
+        self.grad_data *= scaling_factor
+
     def _get(self, shape: torch.Size, start_index: int, buffer_type: BufferType) -> torch.Tensor:
         """
         Return a tensor with the input `shape` as a view into the 1-D data starting at
@@ -457,7 +450,6 @@ class ParamAndGradBuffer:
             numel_unpadded=numel_unpadded,
             data_parallel_group=self.data_parallel_group,
             data_parallel_world_size=self.data_parallel_world_size,
-            gradient_scaling_factor=self.gradient_scaling_factor,
         )
         self.buckets.append(bucket)
         for bucket_param in bucket_params:

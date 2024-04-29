@@ -94,9 +94,7 @@ class DistributedDataParallel(MegatronModule):
             else:
                 expert_parallel_params.append(param)
 
-        def allocate_buffers_for_parameters(
-            input_params, data_parallel_group, gradient_scaling_factor=1.0,
-        ):
+        def allocate_buffers_for_parameters(input_params, data_parallel_group):
             param_and_grad_dtype_to_params = {}
 
             # Group parameters by their gradient type.
@@ -123,7 +121,6 @@ class DistributedDataParallel(MegatronModule):
                         data_parallel_group,
                         self.bucket_size,
                         param_to_name,
-                        gradient_scaling_factor,
                     )
                 )
                 for param in params:
@@ -131,20 +128,12 @@ class DistributedDataParallel(MegatronModule):
 
             return buffers
 
-        data_parallel_world_size = torch.distributed.get_world_size(data_parallel_group)
-
         # Allocate the param+grad buffers for dense params' grads.
-        self.buffers = allocate_buffers_for_parameters(
-            dense_params,
-            data_parallel_group,
-            gradient_scaling_factor=1.0 / data_parallel_world_size,
-        )
+        self.buffers = allocate_buffers_for_parameters(dense_params, data_parallel_group,)
 
         # Allocate separate param+grad buffers for expert parallel params' grads.
         self.expert_parallel_buffers = allocate_buffers_for_parameters(
-            expert_parallel_params,
-            expert_data_parallel_group,
-            gradient_scaling_factor=1.0 / data_parallel_world_size,
+            expert_parallel_params, expert_data_parallel_group,
         )
 
         # Delete references to weight_tensor if they exist since we don't want two parameter copies
@@ -229,6 +218,11 @@ class DistributedDataParallel(MegatronModule):
         """
         for buffer in self.buffers + self.expert_parallel_buffers:
             buffer.start_grad_sync()
+
+    def scale_gradients(self, scaling_factor: float) -> None:
+        """Scale all gradients inside the buffers by `scaling_factor`."""
+        for buffer in self.buffers + self.expert_parallel_buffers:
+            buffer.scale_gradients(scaling_factor)
 
     def finish_grad_sync(self):
         """

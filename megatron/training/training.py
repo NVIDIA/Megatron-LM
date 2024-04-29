@@ -603,9 +603,22 @@ def train_step(forward_step_func, data_iterator,
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         # Average loss across microbatches.
         loss_reduced = {}
-        for key in losses_reduced[0]:
-            losses_reduced_for_key = [x[key] for x in losses_reduced]
-            loss_reduced[key] = sum(losses_reduced_for_key) / len(losses_reduced_for_key)
+        for key in losses_reduced[0].keys():
+            numerator = 0
+            denominator = 0
+            for x in losses_reduced:
+                val = x[key]
+                # there is one dict per microbatch. in new reporting, we average
+                # over the total number of tokens across the global batch.
+                if isinstance(val, tuple) or isinstance(val, list):
+                    numerator += val[0]
+                    denominator += val[1]
+                else:
+                    # legacy behavior. we average over the number of microbatches,
+                    # and so the denominator is 1.
+                    numerator += val
+                    denominator += 1
+            loss_reduced[key] = numerator / denominator
         return loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad
     return {}, skipped_iter, grad_norm, num_zeros_in_grad
 
@@ -1245,8 +1258,15 @@ def evaluate(forward_step_func,
                 # Reduce across processes.
                 for loss_dict in loss_dicts:
                     for key in loss_dict:
-                        total_loss_dict[key] = total_loss_dict.get(
-                            key, torch.tensor([0.0], dtype=torch.float, device='cuda')) + loss_dict[key]
+                        if key not in total_loss_dict:
+                            total_loss_dict[key] = torch.tensor([0.0, 0.0], dtype=torch.float).cuda()
+                        val = loss_dict[key]
+                        if isinstance(val, tuple) or isinstance(val, list):
+                            total_loss_dict[key][0] += val[0]
+                            total_loss_dict[key][1] += val[1]
+                        else:
+                            total_loss_dict[key][0] += val
+                            total_loss_dict[key][1] += 1
 
             args.consumed_valid_samples += eval_batch_size
 
@@ -1280,7 +1300,8 @@ def evaluate(forward_step_func,
         model_module.train()
 
     for key in total_loss_dict:
-        total_loss_dict[key] /= args.eval_iters * eval_num_microbatches
+        numerator, denominator = total_loss_dict[key]
+        total_loss_dict[key] = numerator / denominator
 
     timers('evaluate').stop()
     timers.log(['evaluate'])
