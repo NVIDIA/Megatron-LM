@@ -265,6 +265,9 @@ def pretrain(train_valid_test_dataset_provider,
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
 
+    # Context used for persisting some state between checkpoint saves.
+    checkpointing_context = {}
+
     # Print setup timing.
     print_rank_0('done with setup ...')
     timers.log(['model-and-optimizer-setup',
@@ -284,13 +287,13 @@ def pretrain(train_valid_test_dataset_provider,
                 forward_step_func,
                 model, optimizer, opt_param_scheduler,
                 train_data_iterator, valid_data_iterator,
-                process_non_loss_data_func, config)
+                process_non_loss_data_func, config, checkpointing_context)
 
         print_datetime('after training is done')
 
         if args.save and iteration != 0 and iteration % args.save_interval != 0:
             save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
-                            num_floating_point_operations_so_far)
+                            num_floating_point_operations_so_far, checkpointing_context)
     else:
         print_rank_0('skipping training (--skip-train is on) ...')
 
@@ -874,13 +877,13 @@ def compute_throughputs_and_append_to_progress_log(iteration,
 
 
 def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
-                             num_floating_point_operations_so_far):
+                             num_floating_point_operations_so_far, checkpointing_context):
     args = get_args()
     timers = get_timers()
     # Extra barrier is added to make sure all ranks report the max time.
     timers('save-checkpoint', log_level=0).start(barrier=True)
     save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
-                    num_floating_point_operations_so_far)
+                    num_floating_point_operations_so_far, checkpointing_context)
     timers('save-checkpoint').stop(barrier=True)
     timers.log(['save-checkpoint'])
 
@@ -891,7 +894,7 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
 
 def train(forward_step_func, model, optimizer, opt_param_scheduler,
           train_data_iterator, valid_data_iterator,
-          process_non_loss_data_func, config):
+          process_non_loss_data_func, config, checkpointing_context):
     """Train the model function."""
     args = get_args()
     timers = get_timers()
@@ -1009,7 +1012,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 "number of microbatches should be increasing due to batch size rampup"
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler,
-                                     num_floating_point_operations_so_far)
+                                     num_floating_point_operations_so_far,
+                                     checkpointing_context)
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True)
 
@@ -1106,7 +1110,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             if any(signal_handler.signals_received()):
                 save_checkpoint_and_time(iteration, model, optimizer,
                                          opt_param_scheduler,
-                                         num_floating_point_operations_so_far)
+                                         num_floating_point_operations_so_far,
+                                         checkpointing_context)
                 print_datetime('exiting program after receiving SIGTERM.')
                 exit = True
                 break
@@ -1116,7 +1121,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             timers('interval-time').stop()
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler,
-                                     num_floating_point_operations_so_far)
+                                     num_floating_point_operations_so_far,
+                                     checkpointing_context)
             saved_checkpoint = True
             timers('interval-time', log_level=0).start(barrier=True)
 
@@ -1133,7 +1139,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 if not saved_checkpoint:
                     save_checkpoint_and_time(iteration, model, optimizer,
                                              opt_param_scheduler,
-                                             num_floating_point_operations_so_far)
+                                             num_floating_point_operations_so_far,
+                                             checkpointing_context)
                 print_datetime('exiting program after {} minutes'.format(train_time))
                 exit = True
                 break
@@ -1143,7 +1150,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             if args.save and not saved_checkpoint:
                 save_checkpoint_and_time(iteration, model, optimizer,
                                          opt_param_scheduler,
-                                         num_floating_point_operations_so_far)
+                                         num_floating_point_operations_so_far,
+                                         checkpointing_context)
             torch.distributed.barrier()
             print_datetime('exiting program at iteration {}'.format(iteration))
             exit = True
