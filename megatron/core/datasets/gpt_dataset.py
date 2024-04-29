@@ -674,9 +674,9 @@ def _get_ltor_masks_and_position_ids(
     seq_length = data.numel()
 
     if create_attention_mask:
-        attention_mask = torch.tril(
+        attention_mask = (
             torch.ones((seq_length, seq_length), device=data.device)
-        ).unsqueeze(0)
+        ).tril_().unsqueeze(0)
     else:
         attention_mask = None
 
