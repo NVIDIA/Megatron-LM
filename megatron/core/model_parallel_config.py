@@ -126,9 +126,7 @@ class ModelParallelConfig:
     """
 
     async_tensor_model_parallel_allreduce: bool = False
-    """If true, enables asynchronous execution of tensor-model-parallel all-reduce with weight
-       gradient compuation of a column-linear layer.
-    """
+    """NOTE: Deprecated. This flag is ignored."""
 
     use_te_rng_tracker: bool = False
     """If true, uses RNG state tracker in TransformerEngine if exists.
@@ -227,7 +225,7 @@ class ModelParallelConfig:
     """
 
     defer_embedding_wgrad_compute: bool = False
-    """If true, defers the embedding WGRAD GEMMs while pipeline flush is 
+    """If true, defers the embedding WGRAD GEMMs while pipeline flush is
        taking place enabling us to hide pipeline flush latency. Defaults to False.
     """
 
@@ -270,9 +268,6 @@ class ModelParallelConfig:
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:
                 raise ValueError("Can not use sequence paralllelism without tensor parallelism")
-            if self.async_tensor_model_parallel_allreduce:
-                # sequence_parallelism already does this async
-                self.async_tensor_model_parallel_allreduce = False
 
         if self.pipeline_model_parallel_size > 1:
             if self.pipeline_dtype is None:
