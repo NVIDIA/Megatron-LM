@@ -982,7 +982,7 @@ def _add_training_args(parser):
                        ' overlap of Tensor parallel communication and GEMM kernels.')
     group.add_argument('--tp-comm-overlap-cfg', type=str, default=None,
                        help='Config file when tp_comm_overlap is enabled.')
-    group.add_argument('--disable-tp-comm-overlap-ag', action='store_false', 
+    group.add_argument('--disable-tp-comm-overlap-ag', action='store_false',
                        help=('Disables the All-Gather overlap with GEMM by '
                              'pipelining the GEMM and All-Gather.'),
                        dest='tp_comm_overlap_ag')
@@ -1070,9 +1070,7 @@ def _add_training_args(parser):
                        help='Single pass vs multiple pass data loader')
     group.add_argument('--no-async-tensor-model-parallel-allreduce',
                        action='store_false',
-                       help='Disable asynchronous execution of '
-                       'tensor-model-parallel all-reduce with weight '
-                       'gradient compuation of a column-linear layer.',
+                       help='DEPRECATED. This flag is ignored.',
                        dest='async_tensor_model_parallel_allreduce')
     group.add_argument('--no-persist-layer-norm', action='store_true',
                        help='Disable using persistent fused layer norm kernel. '
