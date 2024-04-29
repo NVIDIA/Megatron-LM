@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Sample Generate GPT"""
 import os
@@ -46,6 +46,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
     use_te = args.transformer_impl == "transformer_engine"
 
     print_rank_0('building GPT model ...')
+
     # Experimental loading arguments from yaml
     if args.yaml_cfg is not None:
         config = core_transformer_config_from_yaml(args, "language_model")
@@ -80,13 +81,12 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
         model = megatron.legacy.model.GPTModel(
             config,
             num_tokentypes=0,
-            parallel_output=True,
+            parallel_output=False,
             pre_process=pre_process,
             post_process=post_process
         )
 
     return model
-
 
 def add_text_generate_args(parser):
     group = parser.add_argument_group(title='text generation')

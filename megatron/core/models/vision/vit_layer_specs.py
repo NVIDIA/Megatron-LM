@@ -23,7 +23,9 @@ def get_vit_layer_with_transformer_engine_spec() -> ModuleSpec:
         submodules=TransformerLayerSubmodules(
             self_attention=ModuleSpec(
                 module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.no_mask},
+                params={
+                    "attn_mask_type": AttnMaskType.causal
+                },  # TODO: This should be no_mask when CI is upgraded
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=TELayerNormColumnParallelLinear,
                     core_attention=TEDotProductAttention,
