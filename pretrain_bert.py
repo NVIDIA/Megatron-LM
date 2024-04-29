@@ -37,7 +37,7 @@ def model_provider(pre_process=True, post_process=True):
 
     if args.use_mcore_models:
 
-        
+
         if args.spec is None:
             transformer_layer_spec = bert_layer_with_transformer_engine_spec #default spec
         elif args.spec[0] == 'local':
@@ -45,14 +45,14 @@ def model_provider(pre_process=True, post_process=True):
             transformer_layer_spec = bert_layer_local_spec
         else :
             transformer_layer_spec = import_module(args.spec)
-            
+
 
         model = BertModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
             vocab_size=args.padded_vocab_size,
             max_sequence_length=args.max_position_embeddings,
-            num_tokentypes=num_tokentypes, 
+            num_tokentypes=num_tokentypes,
             add_binary_head=args.bert_binary_head,
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             parallel_output=True,
@@ -114,7 +114,6 @@ def loss_func(loss_mask, sentence_order, output_tensor):
             [lm_loss, sop_loss])
         return loss, {'lm loss': averaged_losses[0],
                       'sop loss': averaged_losses[1]}
-
     else:
         loss = lm_loss
         averaged_losses = average_losses_across_data_parallel_group(
