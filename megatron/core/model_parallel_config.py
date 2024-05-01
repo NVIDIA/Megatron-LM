@@ -189,6 +189,16 @@ class ModelParallelConfig:
        Reduce-Scatter both done atomically. Don't care if tp_comm_overlap is False.
     """
 
+    tp_comm_disable_qkv: bool = False
+    """
+       If true, the AllGather -> Gemm overlap for QKV gets disabled
+    """
+
+    tp_comm_disable_fc1: bool = False
+    """
+       If true, the AllGather -> Gemm overlap for FC1 layer of MLP gets disabled
+    """
+
     ###################
     # Pipeline Parallel
     ###################
