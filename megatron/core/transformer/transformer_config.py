@@ -251,6 +251,9 @@ class TransformerConfig(ModelParallelConfig):
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
+    moe_layer_recompute: bool = False
+    """Memory optimization: checkpointing moe_layer to save actiavtion memory."""
+
     ####################
     # miscellaneous
     ####################
@@ -397,3 +400,14 @@ class TransformerConfig(ModelParallelConfig):
             self.output_layer_init_method = scaled_init_method_normal(
                 self.init_method_std, self.num_layers
             )
+
+        if self.moe_extended_tp:
+            if self.moe_token_dispatcher_type != 'allgather':
+                raise ValueError(
+                    "Moe extended TP parallelism only applies to allgather based token dispatcher."
+                )
+            extended_tp_size = self.tensor_model_parallel_size * self.expert_model_parallel_size
+            if self.ffn_hidden_size % extended_tp_size != 0:
+                raise ValueError(
+                    f'ffn_hidden_size: {self.ffn_hidden_size} must be divisible by extended_tp_size {extended_tp_size}'
+                )
