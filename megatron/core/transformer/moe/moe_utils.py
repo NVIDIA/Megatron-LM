@@ -227,3 +227,44 @@ def track_moe_metrics(
                     )
 
     clear_aux_losses_tracker()
+
+
+class moe_gather(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input_, map_):
+        ctx.input_size = input_.size()
+        ctx.map = map_
+        return torch.gather(input_, 0, map_)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input_size = ctx.input_size
+        map_ = ctx.map
+
+        output = torch.zeros(
+            input_size, dtype=grad_output.dtype, device=torch.cuda.current_device()
+        )
+        output.scatter_add_(0, map_, grad_output)
+        return output, None, None
+
+
+class moe_scatter(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input_, map_, output_size=None):
+        ctx.map = map_
+
+        if output_size is not None:
+            output = torch.zeros(
+                output_size, dtype=input_.dtype, device=torch.cuda.current_device()
+            )
+        else:
+            output = torch.zeros_like(input_)
+
+        output.scatter_add_(0, map_, input_)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        map_ = ctx.map
+        grad_input = torch.gather(grad_output, 0, map_)
+        return grad_input, None, None, None

@@ -7,7 +7,7 @@ import torch
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.tensor_parallel.mappings import _gather_along_first_dim_expert_parallel
-from megatron.core.transformer.moe.moe_utils import permute, unpermute
+from megatron.core.transformer.moe.moe_utils import moe_gather, moe_scatter, permute, unpermute
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -108,10 +108,6 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
 
         # Permute the tokens across the expert parallel devices.
         if self.config.sequence_parallel or (self.config.expert_model_parallel_size > 1):
-            # [S*B/TP, H] -> [S*B, H]
-            global_hidden_states = tensor_parallel.gather_from_sequence_parallel_region_to_moe(
-                hidden_states
-            )
             with torch.no_grad():
                 global_indices = tensor_parallel.gather_from_sequence_parallel_region_to_moe(
                     max_ind
@@ -129,10 +125,14 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             else:
                 self.local_probs = max_prob
 
+            # [S*B/TP, H] -> [S*B, H]
+            global_hidden_states = tensor_parallel.gather_from_sequence_parallel_region_to_moe(
+                hidden_states, use_global_buffer=True
+            )
             # Reshape global_local_mask to be compatible with Tensor.gather
             global_local_map = global_local_mask.nonzero()[:, 0]
             self.global_local_map = global_local_map.view(-1, 1).expand(-1, hidden_states.shape[-1])
-            local_hidden_states = torch.gather(global_hidden_states, 0, self.global_local_map)
+            local_hidden_states = moe_gather.apply(global_hidden_states, self.global_local_map)
         else:
             if self.router_topk > 1:
                 global_local_mask = torch.ones_like(max_ind).bool()
@@ -163,7 +163,10 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         # Stage2: permute the tokens locally so that they are grouped by their expert assignment
         # Reshape indices to be compatible with Tensor.gather
         self.indices = self.indices.view(-1, 1).expand(-1, hidden_states.shape[-1])
-        permuted_local_hidden_states = torch.gather(local_hidden_states, 0, self.indices)
+        if self.num_local_experts > 1:
+            permuted_local_hidden_states = moe_gather.apply(local_hidden_states, self.indices)
+        else:
+            permuted_local_hidden_states = local_hidden_states
         return (
             permuted_local_hidden_states,
             tokens_per_expert,
@@ -188,9 +191,11 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         """
         # Stage1: unpermute the tokens and bias locally respectively.
         scores = self.local_probs.to(dtype=hidden_states.dtype)
-        unpermuted_local_hidden = torch.zeros_like(hidden_states)
-        assert self.indices.shape == hidden_states.shape
-        unpermuted_local_hidden = unpermuted_local_hidden.scatter(0, self.indices, hidden_states)
+        if self.num_local_experts > 1:
+            assert self.indices.shape == hidden_states.shape
+            unpermuted_local_hidden = moe_scatter.apply(hidden_states, self.indices)
+        else:
+            unpermuted_local_hidden = hidden_states
 
         # Scale the expert output prior to reduction and subsequent to local unpermutation if k > 1.
         if self.router_topk > 1:
@@ -217,13 +222,9 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             # hidden_shape: [SeqLen/TP, MBS, HiddenSize], glboal_num_tokens = SeqLen/TP*MBS*(TP*EP)
             global_num_tokens = self.hidden_shape[0] * self.hidden_shape[1] * ep_group_size
             global_hidden_shape = [global_num_tokens, hidden_states.shape[-1]]
-            unpermuted_global_hidden = torch.zeros(
-                global_hidden_shape, dtype=hidden_states.dtype, device=torch.cuda.current_device()
-            )
-            # Reshape global_local_map to be compatible with Tensor.scatter
             assert self.global_local_map.shape == unpermuted_local_hidden.shape
-            unpermuted_global_hidden = unpermuted_global_hidden.scatter_add(
-                0, self.global_local_map, unpermuted_local_hidden
+            unpermuted_global_hidden = moe_scatter.apply(
+                unpermuted_local_hidden, self.global_local_map, global_hidden_shape
             )
             output_total = tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
                 unpermuted_global_hidden

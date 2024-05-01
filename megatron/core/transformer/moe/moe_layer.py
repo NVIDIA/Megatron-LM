@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 
 import torch
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP
@@ -28,11 +28,17 @@ class BaseMoELayer(MegatronModule, ABC):
         self.config = config
         self.expert_parallel_size = parallel_state.get_expert_model_parallel_world_size()
         assert self.expert_parallel_size > 0, "Expected non-negative expert parallel size"
-        assert self.config.num_moe_experts % self.expert_parallel_size == 0
-        self.num_local_experts = self.config.num_moe_experts // self.expert_parallel_size
-        local_expert_indices_offset = (
-            parallel_state.get_expert_model_parallel_rank() * self.num_local_experts
-        )
+
+        if self.config.moe_extended_tp:
+            self.num_local_experts = self.config.num_moe_experts
+            local_expert_indices_offset = 0
+        else:
+            assert self.config.num_moe_experts % self.expert_parallel_size == 0
+            self.num_local_experts = self.config.num_moe_experts // self.expert_parallel_size
+            local_expert_indices_offset = (
+                parallel_state.get_expert_model_parallel_rank() * self.num_local_experts
+            )
+
         self.local_expert_indices = [
             local_expert_indices_offset + i for i in range(self.num_local_experts)
         ]
@@ -81,13 +87,22 @@ class MoELayer(BaseMoELayer):
             raise ValueError(
                 f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
             )
+        self.moe_layer_recompute = config.moe_layer_recompute
 
     def forward(self, hidden_states: torch.Tensor):
         # process MoE
-        scores, indices = self.router(hidden_states)
-        (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
-            hidden_states, scores, indices
-        )
-        expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
-        output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
+        def custom_forward(hidden_states):
+            scores, indices = self.router(hidden_states)
+            (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
+                hidden_states, scores, indices
+            )
+            expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
+            output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
+            return output, mlp_bias
+
+        if self.moe_layer_recompute:
+            output, mlp_bias = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
+        else:
+            output, mlp_bias = custom_forward(hidden_states)
+
         return output, mlp_bias

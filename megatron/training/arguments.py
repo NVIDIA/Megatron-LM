@@ -1625,6 +1625,10 @@ def _add_moe_args(parser):
                        help='.')
     group.add_argument('--moe-per-layer-logging', action='store_true',
                        help='Enable per-layer logging for MoE, currently supports auxiliary loss and z loss.')
+    group.add_argument('--moe-layer-recompute', action='store_true',
+                       help='Enable checkpointing for moe_layer, should be used when memory is not sufficient.')
+    group.add_argument('--moe-extended-tp', action='store_true',
+                       help='Alternative to expert parallelism, all experts are sharded across TPXEP domain.')
 
     return parser
 

@@ -47,6 +47,8 @@ class MoEModelTestContainer:
             moe_router_load_balancing_type=moe_router_load_balancing_type,
             moe_token_dispatcher_type=moe_token_dispatcher_type,
             num_layers=1,
+            moe_extended_tp=kwargs.get("moe_extended_tp", False),
+            moe_grouped_gemm=kwargs.get("moe_grouped_gemm", False),
             hidden_size=kwargs.get("hidden_size", 1024),
             num_attention_heads=kwargs.get("num_attention_heads", 8),
             use_cpu_initialization=kwargs.get("use_cpu_initialization", True),
@@ -56,7 +58,7 @@ class MoEModelTestContainer:
 
         # init moe layer
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            num_experts=num_moe_experts, moe_grouped_gemm=False
+            num_experts=num_moe_experts, moe_grouped_gemm=kwargs.get("moe_grouped_gemm", False)
         )
         self.moe_layer = MoELayer(
             self.config, transformer_layer_spec.submodules.mlp.submodules
@@ -78,7 +80,7 @@ class TestAllgatherDispatcher:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_tp_forward(self):
+    def test_tp_forward_backward(self):
         container = MoEModelTestContainer(
             tp_size=8,
             ep_size=1,
@@ -103,6 +105,50 @@ class TestAllgatherDispatcher:
             tokens_per_expert,
         ) = moe_layer.token_dispatcher.token_permutation(hidden_states, scores, indices)
         permuted_local_hidden_states /= moe_layer.config.tensor_model_parallel_size
+        restored_hidden_states, restored_bias = moe_layer.token_dispatcher.token_unpermutation(
+            permuted_local_hidden_states, bias=torch.zeros_like(permuted_local_hidden_states),
+        )
+
+        assert torch.allclose(
+            restored_hidden_states, hidden_states
+        ), "Restored hidden states do not match original hidden states"
+
+        # check if the grad of the hidden states is same as the hidden states
+        torch.autograd.backward(restored_hidden_states, restored_hidden_states)
+        assert torch.allclose(
+            hidden_states.grad, hidden_states
+        ), "Gradient of hidden states should be same as hidden states"
+        container.destroy()
+        
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_extended_tp_forward_backward(self):
+        container = MoEModelTestContainer(
+            tp_size=2,
+            ep_size=4,
+            pp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="allgather",
+            sequence_parallel=True,
+            moe_extended_tp=True,
+            moe_grouped_gemm=True,
+            use_cpu_initialization=False,
+        )
+        moe_layer = container.moe_layer
+        # [bs, seql, hidden size]
+        hidden_states = torch.randn((32, 8, moe_layer.router.config.hidden_size))
+        hidden_states = hidden_states.cuda()
+        hidden_states.requires_grad = True
+        scores, indices = moe_layer.router(hidden_states)
+        assert scores.shape == (256, moe_layer.router.topk), "Scores shape is not correct"
+        assert indices.shape == (256, moe_layer.router.topk), "Indices shape is not correct"
+        scores = torch.ones_like(scores) / 2
+        (
+            permuted_local_hidden_states,
+            tokens_per_expert,
+        ) = moe_layer.token_dispatcher.token_permutation(hidden_states, scores, indices)
+        permuted_local_hidden_states /= moe_layer.config.tensor_model_parallel_size * moe_layer.config.expert_model_parallel_size
         restored_hidden_states, restored_bias = moe_layer.token_dispatcher.token_unpermutation(
             permuted_local_hidden_states, bias=torch.zeros_like(permuted_local_hidden_states),
         )
