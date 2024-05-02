@@ -184,7 +184,6 @@ def core_gpt_dataset_config_from_args(args):
         ],
         split=args.split,
         path_to_cache=args.data_cache_path,
-        mock=args.mock_data,
         mmap_bin_files=args.mmap_bin_files,
         tokenizer=tokenizer,
         reset_position_ids=args.reset_position_ids,
@@ -204,7 +203,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
     config = core_gpt_dataset_config_from_args(args)
 
-    if config.mock:
+    if args.mock_data:
         dataset_type = MockGPTDataset
     else:
         dataset_type = GPTDataset

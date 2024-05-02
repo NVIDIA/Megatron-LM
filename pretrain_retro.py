@@ -194,7 +194,6 @@ def train_valid_test_datasets_provider(train_valid_test_num_samples):
         reset_position_ids=args.reset_position_ids,
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
-        mock=args.mock_data,
     )
 
     # GPT datasets.

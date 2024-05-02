@@ -9,7 +9,7 @@ import torch
 
 from megatron.core.datasets.blended_dataset import BlendedDataset
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
-from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset, MockDataset
+from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
 from megatron.core.datasets.utils import Split, log_single_rank, normalize
 from megatron.core.parallel_state import get_virtual_pipeline_model_parallel_rank
 
@@ -51,13 +51,11 @@ class BlendedMegatronDatasetBuilder(object):
 
         log_single_rank(
             logger,
-            logging.WARNING,
+            logging.INFO,
             f"Building dataset splits with cls={cls.__name__}, sizes={self.sizes}, and config={self.config}",
         )
 
-        if self.config.mock:
-            assert issubclass(self.cls, MockDataset)
-        else:
+        if not self.config.mock:
             for split in Split:
                 size_is_none = self.sizes[split.value] is None
                 if self.config.blend_per_split is None:
@@ -151,7 +149,13 @@ class BlendedMegatronDatasetBuilder(object):
         # Return fake "mock" datasets
         ##
         if self.config.mock:
-            return self._build_megatron_dataset_splits(None, None, self.sizes)
+            split = self.config.split_matrix
+            try:
+                return self._build_megatron_dataset_splits(None, split, self.sizes)
+            except Exception as error:
+                raise Exception(
+                    f"{self.cls.__name__} failed to build as a mock data generator"
+                ) from error
 
         ##
         # All splits come from the same distribution
@@ -282,7 +286,7 @@ class BlendedMegatronDatasetBuilder(object):
         """Build each MidLevelDataset split from a single LowLevelDataset
 
         Args:
-            dataset_path (Optional[str]): The path on disk which defines the underlying LowLevelDataset, e.g. the .bin and .idx file prefix when self.cls is of type IndexedMegatronDataset or None when self.cls is of type MockDataset
+            dataset_path (Optional[str]): The path on disk which defines the underlying LowLevelDataset, or None for mock dataset classes
 
             split (List[Tuple[float, float]]): The dataset split matrix
 
@@ -292,33 +296,23 @@ class BlendedMegatronDatasetBuilder(object):
             List[Optional[MidLevelDataset]]: The MidLevelDataset (or None) per split
         """
         # Build the low level dataset
-        if issubclass(self.cls, MockDataset):
-            low_level_dataset = None
-        elif issubclass(self.cls, MegatronDataset):
-            low_level_dataset = self.cls.build_low_level_dataset(dataset_path, self.config)
-        else:
-            raise NotImplementedError
+        low_level_dataset = self.cls.build_low_level_dataset(dataset_path, self.config)
 
         # Build the split indices for the low level dataset
-        if low_level_dataset is not None:
-            num_elements = self.cls.numel_low_level_dataset(low_level_dataset)
-            split_indices = []
-            for i, _ in enumerate(Split):
-                if split[i] is not None:
-                    beg = int(round(split[i][0] * float(num_elements)))
-                    end = int(round(split[i][1] * float(num_elements)))
-                    split_indices.append(
-                        numpy.arange(start=beg, stop=end, step=1, dtype=numpy.int32)
-                    )
-                else:
-                    split_indices.append(None)
-        else:
-            split_indices = [None for _ in Split]
+        num_elements = self.cls.numel_low_level_dataset(low_level_dataset)
+        split_indices = []
+        for i, _ in enumerate(Split):
+            if split[i] is not None:
+                beg = int(round(split[i][0] * float(num_elements)))
+                end = int(round(split[i][1] * float(num_elements)))
+                split_indices.append(numpy.arange(start=beg, stop=end, step=1, dtype=numpy.int32))
+            else:
+                split_indices.append(None)
 
         # Build the mid level dataset
         mid_level_datasets = []
         for i, _split in enumerate(Split):
-            if not self.config.mock and split[i] is None:
+            if split[i] is None:
                 mid_level_datasets.append(None)
             else:
                 mid_level_datasets.append(

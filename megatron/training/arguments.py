@@ -511,6 +511,12 @@ def validate_args(args, defaults={}):
     if args.use_dist_ckpt and not args.use_mcore_models:
         raise RuntimeError('--use-dist-ckpt only support Megatron Core, please add --use-mcore-models.')
 
+    # Data blend checks
+    assert args.mock_data + \
+           bool(args.data_path) + \
+           any([args.train_data_path, args.valid_data_path, args.test_data_path]) \
+           == 1, "A single data source must be provided"
+
     if args.use_tp_pp_dp_mapping:
         assert args.context_parallel_size * args.expert_model_parallel_size <= 1, \
             "context_parallel and expert_model_parallel can't be used with tp-pp-dp mapping."
