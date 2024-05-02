@@ -1617,14 +1617,19 @@ def _add_moe_args(parser):
                        help='Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended.')
     group.add_argument('--moe-input-jitter-eps', type=float, default=None,
                        help='Add noise to the input tensor by applying jitter with a specified epsilon value.')
-    group.add_argument('--moe-token-dropping', action='store_true',
-                       help='This feature involves selectively dropping and padding tokens for each expert to achieve a specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note: Currently unsupported.')
     group.add_argument('--moe-token-dispatcher-type', type=str,
                        choices=['allgather', 'alltoall'],
                        default='allgather',
                        help='.')
     group.add_argument('--moe-per-layer-logging', action='store_true',
                        help='Enable per-layer logging for MoE, currently supports auxiliary loss and z loss.')
+    # Token dropping arguments
+    group.add_argument('--moe-expert-capacity-factor', type=float, default=None,
+                       help='The capacity factor for each expert, None means no token will be dropped.')
+    group.add_argument('--moe-pad-expert-input-to-capacity', action='store_true',
+                       help='Pads the input for each expert to match the expert capacity length, effective only after the --moe-expert-capacity-factor is set.')
+    group.add_argument('--moe-token-drop-policy', type=str, default='probs', choices=['probs', 'position'],
+                       help='The policy to drop tokens. Can be either "prob" or "position". If "prob", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.')
     group.add_argument('--moe-layer-recompute', action='store_true',
                        help='Enable checkpointing for moe_layer, should be used when memory is not sufficient.')
     group.add_argument('--moe-extended-tp', action='store_true',
