@@ -357,7 +357,7 @@ We provide several command line arguments, detailed in the scripts listed below,
 Because evaluation requires substantially less memory than training, it may be advantageous to merge a model trained in parallel for use on fewer GPUs in downstream tasks. The following script accomplishes this. This example reads in a GPT model with 4-way tensor and 4-way pipeline model parallelism and writes out a model with 2-way tensor and 2-way pipeline model parallelism.
 
 <pre>
-python tools/checkpoint/util.py \
+python tools/checkpoint/convert.py \
         --model-type GPT \
         --load-dir checkpoints/gpt3_tp4_pp4 \
         --save-dir checkpoints/gpt3_tp2_pp2 \
