@@ -76,31 +76,30 @@ def _gather_along_last_dim(input_):
     if world_size == 1:
         return input_
 
-    # Size and dimension.
-    last_dim = input_.dim() - 1
-    rank = get_tensor_model_parallel_rank()
+    dim_size = list(input_.size())
+    dim_size[0] = dim_size[0] * world_size
 
-    tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
-    tensor_list[rank] = input_
-    torch.distributed.all_gather(tensor_list, input_, group=get_tensor_model_parallel_group())
-
-    # Note: torch.cat already creates a contiguous tensor.
-    output = torch.cat(tensor_list, dim=last_dim).contiguous()
+    output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
+    torch.distributed.all_gather_into_tensor(
+        output, input_.contiguous(), group=get_tensor_model_parallel_group()
+    )
+    tensor_list = output.chunk(world_size, dim=0)
+    output = torch.cat(tensor_list, dim=-1).contiguous()
 
     return output
 
 
 def _reduce_scatter_along_last_dim(input_):
     """Reduce-scatter tensors on the last dimension."""
-    num_dims = input_.dim()
-    permute_order = (num_dims - 1,) + tuple(range(num_dims - 1))
-    input_ = input_.permute(permute_order).contiguous()
-
-    output = _reduce_scatter_along_first_dim(input_)
-
-    permute_order = tuple(range(1, num_dims)) + (0,)
-    output = output.permute(permute_order).contiguous()
-
+    world_size = get_tensor_model_parallel_world_size()
+    target_shape = list(input_.size())
+    target_shape[-1] = target_shape[-1] // world_size
+    input_ = input_.reshape(-1, input_.shape[-1])
+    split_tensors = torch.split(
+        input_, split_size_or_sections=input_.shape[-1] // world_size, dim=1
+    )
+    concat_tensor = torch.cat(split_tensors, dim=0)
+    output = _reduce_scatter_along_first_dim(concat_tensor).reshape(target_shape)
     return output
 
 
