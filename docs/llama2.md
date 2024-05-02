@@ -34,11 +34,11 @@ We recommend passing `--dtype bf16` for training or finetuning. Inference can be
 The Meta format checkpoints are converted to HF format as an intermediate step before converting to Megatron format. The `transformers` package is required, and must have version >=4.31.0 (e.g., `pip install transformers>=4.31.0`). (**Note**: we have specifically tested with versions `4.31.0` and `4.32.0`; your experience may vary with newer versions.) Assuming the downloaded checkpoints are in `$CHECKPOINT_DIR` (with separate sub-directories for 7B, 13B, 70B, etc.), the following example command can be used to convert from Llama-2 format to HF format in bfloat16:
 
 ```
-python tools/checkpoint/util.py --model-type GPT \ 
+python tools/checkpoint/convert.py --model-type GPT \ 
 >   --loader llama2 \
 >   --saver megatron \
->   --checkpoint-type meta
->   --model_size 7B \ 
+>   --checkpoint-type meta \
+>   --model-size 7B \ 
 >   --load-dir $LLAMA_META_FORMAT_DIR \
 >   --save-dir ${MEGATRON_FORMAT_DIR} \
 >   --tokenizer-model ${TOKENIZER_MODEL} \
@@ -62,7 +62,7 @@ The HF checkpoints can be converted to Megatron format by using Megatron's own L
 Using these values for `TP`, along with the path to the Llama-2 tokenizer model (automatically downloaded with original checkpoint download; see `${TOKENIZER_MODEL}` below), run the following command from the root of your Megatron source code to convert from HF format to Megatron format:
 
 ```
-$>: python tools/checkpoint/util.py \
+$>: python tools/checkpoint/convert.py \
  >    --model-type GPT \
  >    --loader llama2 \
  >    --saver megatron \
