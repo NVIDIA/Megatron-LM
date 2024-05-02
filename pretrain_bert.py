@@ -159,7 +159,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         ],
         split=args.split,
         path_to_cache=args.data_cache_path,
-        mock=False,
         tokenizer=tokenizer,
         masking_probability=args.mask_prob,
         short_sequence_probability=args.short_seq_prob,

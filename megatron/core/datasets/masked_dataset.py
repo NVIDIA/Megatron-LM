@@ -90,7 +90,7 @@ class MaskedWordPieceDataset(MegatronDataset):
 
         indexed_indices (numpy.ndarray): The set of the documents indices to expose
 
-        num_samples (int): The number of samples to draw from the indexed dataset
+        num_samples (Optional[int]): The number of samples to draw from the indexed dataset. When None, build as many samples as correspond to one epoch.
 
         index_split (Split): The indexed_indices Split
 
@@ -102,7 +102,7 @@ class MaskedWordPieceDataset(MegatronDataset):
         indexed_dataset: IndexedDataset,
         dataset_path: str,
         indexed_indices: numpy.ndarray,
-        num_samples: int,
+        num_samples: Optional[int],
         index_split: Split,
         config: MaskedWordPieceDatasetConfig,
     ) -> None:
