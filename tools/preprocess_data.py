@@ -11,6 +11,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
 import time
 import gzip
 import glob
+from itertools import chain
 import torch
 import numpy as np
 import multiprocessing
@@ -141,7 +142,8 @@ class Partition(object):
         fout.close()
 
 
-    def process_json_file(self, file_name):
+    def process_json_file(self, file_name, batch_size_for_packing=None, block_size=None):
+
         input_file_name, output_prefix = file_name
         print("Opening", input_file_name)
         fin = open(input_file_name, 'r', encoding='utf-8')
@@ -156,6 +158,7 @@ class Partition(object):
         if self.args.split_sentences:
             level = "sentence"
 
+    
         output_bin_files = {}
         output_idx_files = {}
         builders = {}
@@ -173,16 +176,64 @@ class Partition(object):
         startup_end = time.time()
         proc_start = time.time()
         total_bytes_processed = 0
+
+        # Initialize temporary storage for batch processing
+        if batch_size_for_packing and block_size:
+            key =  self.args.json_keys[0]
+            batch_docs = {key: []}
+            num_docs_in_batch = 0
+
         print("Time to startup:", startup_end - startup_start)
         for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
+
+
+            # Update the total bytes processed with the bytes from the current document
             total_bytes_processed += bytes_processed
-            for key in doc.keys():
-                builders[key].add_document(doc[key], sentence_lens[key])
-            self.print_processing_stats(i, proc_start, total_bytes_processed)
+
+            if batch_size_for_packing and block_size:
+
+                # Append tokens from current doc to the batch under the "text" key
+                batch_docs[key].extend(doc[key])
+                num_docs_in_batch += 1
+
+
+                # Once we have enough documents in the batch or it's the last document, process the batch
+                if num_docs_in_batch >= batch_size_for_packing:
+                    packed_blocks = self.pack_tokens(batch_docs, block_size)
+
+                    # Process each packed block
+                    for block in packed_blocks:
+                        builders[key].add_document(block, [len(block)])
+
+                    # Reset batch_docs and num_docs_in_batch for the next batch
+                    batch_docs = {"text": []}
+                    num_docs_in_batch = 0
+
+
+                    # Optional: Update stats and progress
+                    self.print_processing_stats(i, proc_start, total_bytes_processed)
+            else:
+                for key in doc.keys():
+                    builders[key].add_document(doc[key], sentence_lens[key])
+                    self.print_processing_stats(i, proc_start, total_bytes_processed)
+
 
         fin.close()
         builders[key].finalize(output_idx_files[key])
 
+
+    # Function to handle the concatenation and packing of tokens into blocks
+    def pack_tokens(self,docs, block_size):
+        # Concatenate all tokens from all documents in the batch
+        concatenated_tokens = list(chain(*docs.values()))
+
+        # Calculate the number of full blocks that can be formed
+        num_full_blocks = len(concatenated_tokens) // block_size
+
+        # Generate each full block
+        blocks = [concatenated_tokens[i * block_size: (i + 1) * block_size] for i in range(num_full_blocks)]
+
+        return blocks
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -207,7 +258,7 @@ def get_args():
                        help='YTTM tokenizer model.')
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file')
-    group.add_argument('--vocab-size', default=786,
+    group.add_argument('--vocab-size', default=None,
                        help='size of vocab for use with NullTokenizer')
     group.add_argument('--merge-file', type=str, default=None,
                        help='Path to the BPE merge file (if necessary).')
@@ -231,6 +282,9 @@ def get_args():
     group.add_argument('--keep-sequential-samples', action='store_true',
                        help='Ensure ordering of samples in .jsonl files is '
                             'preserved when using partitions>1.')
+    parser.add_argument('--block-size', type=int, default=2048, help='Block size for token packing')
+    parser.add_argument('--batch-size-for-packing', type=int, default=1000, help='Number of documents to concatenate before packing')
+
     args = parser.parse_args()
     args.keep_empty = False
 
@@ -365,7 +419,7 @@ def main():
     input_key = 'sentence_split' if args.split_sentences else 'partition'
     for name in in_ss_out_names:
         p = multiprocessing.Process(target=partition.process_json_file,
-                                    args=((name[input_key], name['output_prefix']),))
+                                    args=((name[input_key], name['output_prefix']),args.batch_size_for_packing, args.block_size))
         p.start()
         processes.append(p)
 
@@ -406,4 +460,3 @@ def main():
 if __name__ == '__main__':
 
     main()
-
