@@ -488,6 +488,16 @@ def all_to_all(group, input_, output_split_sizes_=None, input_split_sizes_=None)
 
 
 def all_to_all_sp2hp(input_):
+    """
+    Perform AlltoAll communication on tensor parallel group, transform the input tensor from shape [num_tokens/TP, H] to [num_tokens, H/TP].
+
+    Args:
+        input_ (torch.Tensor): The input tensor which has been distributed along the sequence dimension.
+
+    Returns:
+        torch.Tensor: The output tensor with shape [num_tokens, H/TP].
+
+    """
     world_size = get_tensor_model_parallel_world_size()
     tp_group = get_tensor_model_parallel_group()
     input_ = input_.reshape(-1, input_.shape[-1])
@@ -500,6 +510,15 @@ def all_to_all_sp2hp(input_):
 
 
 def all_to_all_hp2sp(input_):
+    """
+    Perform AlltoAll communication on tensor parallel group, transform the input tensor from shape [num_tokens, H/TP] to [num_tokens/TP, H].
+
+    Args:
+        input_ (torch.Tensor): The input tensor which has been distributed along the hidden dimension.
+        
+    Returns:
+        torch.Tensor: The output tensor with shape [num_tokens/TP, H].
+    """
     world_size = get_tensor_model_parallel_world_size()
     input_ = input_.reshape(-1, input_.shape[-1])
     tp_group = get_tensor_model_parallel_group()

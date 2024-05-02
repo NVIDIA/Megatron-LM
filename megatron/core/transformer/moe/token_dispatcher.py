@@ -39,13 +39,13 @@ class MoETokenDispatcher:
 
     @abstractmethod
     def token_unpermutation(
-        self, expert_output: torch.Tensor, scores: torch.Tensor, indices: torch.Tensor,
+        self, expert_output: torch.Tensor, probs: torch.Tensor, indices: torch.Tensor,
     ):
         """Restores the expert output to its original ordering.
 
         Args:
             expert_output (torch.Tensor): The output tensor from the expert models.
-            scores (torch.Tensor): Each token's score with each expert.
+            probs (torch.Tensor): Each token's score with each expert.
             indices (torch.Tensor): The indices used to reorder the expert output.
 
         Returns: 
@@ -292,6 +292,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             config (TransformerConfig): Configuration for the transformer model.
         """
         super().__init__(config=config)
+        self.hidden_shape = None
+        self.num_input_tokens = None
         self.num_local_experts = num_local_experts
         self.num_experts = config.num_moe_experts
         assert self.num_local_experts > 0, "Expected at least one expert"
@@ -302,10 +304,19 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.router_topk = config.moe_router_topk
         self.add_bias = config.add_bias_linear
         self.ep_size = config.expert_model_parallel_size
-        self.scores: torch.Tensor = None
+        self.probs = None
         self.input_splits = None
         self.output_splits = None
         self.num_global_tokens_per_local_expert = None
+
+        # Token drop and padding.
+        # We need to keep track of the token num if we drop tokens without padding them.
+        self.num_out_tokens = None
+        # Drop and pad the input to capacity.
+        self.drop_and_pad = self.config.moe_pad_expert_input_to_capacity
+        if self.drop_and_pad:
+            assert self.config.moe_expert_capacity_factor is not None
+        self.capacity = None
 
     def preprocess(self, indices: torch.Tensor) -> torch.Tensor:
         """
@@ -325,6 +336,16 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # num_local_tokens_per_expert: [num_experts]
 
         ep_size = self.config.expert_model_parallel_size
+        if self.drop_and_pad:
+            # probs: [num_experts, capacity]
+            self.capacity = self.probs.size(1)
+            num_tokens_per_local_expert = torch.full(
+                (self.num_local_experts,), self.capacity * self.ep_size, dtype=torch.long
+            )
+            return num_tokens_per_local_expert
+        elif self.config.moe_expert_capacity_factor is not None:
+            self.num_out_tokens = num_local_tokens_per_expert.sum().cpu()
+
         if ep_size > 1:
             # ===================================================
             # Calculate input_splits, output_splits for alltoall-v.
@@ -373,14 +394,14 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         return num_tokens_per_local_expert
 
     def token_permutation(
-        self, hidden_states: torch.Tensor, scores: torch.Tensor, indices: torch.Tensor,
+        self, hidden_states: torch.Tensor, probs: torch.Tensor, indices: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Dispatch tokens to local experts using AlltoAll communication.
 
         Args:
             hidden_states (torch.Tensor): Input token embeddings.
-            scores (torch.Tensor): Scores of tokens assigned to experts.
+            probs (torch.Tensor): Probs of tokens assigned to experts.
             indices (torch.Tensor): Indices of tokens assigned to experts.
 
         Returns:
@@ -388,16 +409,13 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 - Permuted token embeddings for local experts.
                 - Number of tokens per expert.
         """
+        # Preprocess: Get the metadata for communication, permutation and computation operations.
         self.hidden_shape = hidden_states.shape
-        self.scores = scores
-        assert scores.dim() == 2, "Expected 2D tensor for scores"
+        self.probs = probs
+        assert probs.dim() == 2, "Expected 2D tensor for probs"
         assert indices.dim() == 2, "Expected 2D tensor for indices"
-        tokens_per_expert = self.preprocess(indices)
-
-        # TODO Optimize EP=1 case
-        # Flatten the input tensor
-        # hidden_states: [S/TP, B, H] -> [S*B/TP, H]
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
+        tokens_per_expert = self.preprocess(indices)
 
         # Perform tensor parallel AlltoAll communication
         # hidden_states: [S*B/TP, H] -> [S*B, H/TP]
@@ -405,9 +423,12 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             hidden_states = tensor_parallel.all_to_all_sp2hp(hidden_states)
 
         # Permutation 1: input to AlltoAll input
-        self.local_input_tokens_global_experts_indices = indices
+        self.hiddden_shape_before_permute = hidden_states.shape
         permutated_local_input_tokens, self.reversed_local_input_permutation_mapping = permute(
-            hidden_states, self.local_input_tokens_global_experts_indices, topk=self.router_topk,
+            hidden_states,
+            indices,
+            num_out_tokens=self.num_out_tokens,
+            padded_mode=self.drop_and_pad,
         )
 
         # Perform expert parallel AlltoAll communication
@@ -418,13 +439,23 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.input_splits,
         )
 
-        # Permutation 2: AlltoAll output to expert input if num_local_experts > 1
+        # Permutation 2: Sort alltoall output by local experts when num_local_experts > 1.
         if self.num_local_experts > 1:
-            global_input_tokens, self.reversed_global_input_permutation_mapping = permute(
-                global_input_tokens, self.global_input_tokens_local_experts_indices
-            )
+            if not self.drop_and_pad:
+                global_input_tokens, self.reversed_global_input_permutation_mapping = permute(
+                    global_input_tokens, self.global_input_tokens_local_experts_indices
+                )
+            else:
+                global_input_tokens = global_input_tokens.reshape(
+                    self.ep_size, self.num_local_experts, self.capacity, -1
+                )
+                global_input_tokens = (
+                    global_input_tokens.transpose(0, 1)
+                    .reshape(self.num_local_experts * self.ep_size * self.capacity, -1)
+                    .contiguous()
+                )
 
-        # Perform tensor parallel All-Gather
+        # Perform tensor parallel AllGather on the hidden dimension to obtain the input tokens.
         # global_input_tokens: [SEQL, H/TP] -> [SEQL, H]
         if parallel_state.get_tensor_model_parallel_world_size() > 1:
             global_input_tokens = tensor_parallel.all_gather_last_dim_from_tensor_parallel_region(
@@ -458,13 +489,23 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             )
 
         # Unpermutation 2: expert output to AlltoAll input
-        # hidden_states: [SEQL, H] -> [SEQL, H/TP]
         if self.num_local_experts > 1:
-            hidden_states = unpermute(
-                hidden_states, self.reversed_global_input_permutation_mapping,
-            )
+            if not self.drop_and_pad:
+                hidden_states = unpermute(
+                    hidden_states, self.reversed_global_input_permutation_mapping,
+                )
+            else:
+                hidden_states = hidden_states.reshape(
+                    self.num_local_experts, self.ep_size, self.capacity, -1
+                )
+                hidden_states = (
+                    hidden_states.transpose(0, 1)
+                    .reshape(self.ep_size * self.num_local_experts * self.capacity, -1)
+                    .contiguous()
+                )
 
         # Perform expert parallel AlltoAll communication
+        # hidden_states: [SEQL, H] -> [SEQL, H/TP]
         permutated_local_input_tokens = tensor_parallel.all_to_all(
             parallel_state.get_expert_model_parallel_group(),
             hidden_states,
@@ -476,13 +517,14 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         output = unpermute(
             permutated_local_input_tokens,
             self.reversed_local_input_permutation_mapping,
-            probs=self.scores,
-            topk=self.router_topk,
+            probs=self.probs,
+            padded_mode=self.drop_and_pad,
+            restore_shape=self.hiddden_shape_before_permute,
         )
 
         # Perform tensor parallel AlltoAll communication
+        # output: [S*B, H/TP] -> [S*B/TP, H]
         if parallel_state.get_tensor_model_parallel_world_size() > 1:
-            # output: [S*B, H/TP] -> [S*B/TP, H]
             output = tensor_parallel.all_to_all_hp2sp(output)
 
         # Reshape the output tensor

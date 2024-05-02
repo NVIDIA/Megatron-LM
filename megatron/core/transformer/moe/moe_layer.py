@@ -92,9 +92,9 @@ class MoELayer(BaseMoELayer):
     def forward(self, hidden_states: torch.Tensor):
         # process MoE
         def custom_forward(hidden_states):
-            scores, indices = self.router(hidden_states)
+            probs, indices = self.router(hidden_states)
             (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
-                hidden_states, scores, indices
+                hidden_states, probs, indices
             )
             expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
             output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
