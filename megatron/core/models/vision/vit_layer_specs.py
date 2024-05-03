@@ -50,3 +50,34 @@ def _get_mlp_module_spec(use_te: bool = True,) -> ModuleSpec:
             linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
         ),
     )
+
+from .eva_clip_model import EVAClipTransformerLayer
+from megatron.core.transformer.custom_layers.transformer_engine import (
+    TEColumnParallelLinear,
+    TENorm,
+)
+
+def get_vit_layer_with_transformer_engine_spec_for_eva_clip(use_te=True) -> ModuleSpec:
+    return ModuleSpec(
+        module=EVAClipTransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            self_attention=ModuleSpec(
+                module=SelfAttention,
+                params={"attn_mask_type": AttnMaskType.no_mask},
+                submodules=SelfAttentionSubmodules(
+                    linear_qkv=TEColumnParallelLinear,
+                    core_attention=TEDotProductAttention,
+                    linear_proj=TERowParallelLinear,
+                ),
+            ),
+            mlp=ModuleSpec(
+                module=MLP,
+                submodules=MLPSubmodules(
+                    linear_fc1=TEColumnParallelLinear if use_te else ColumnParallelLinear,
+                    linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
+                ),
+            ),
+            pre_mlp_layernorm=TENorm,
+            input_layernorm=TENorm,
+        ),
+    )

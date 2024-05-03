@@ -30,6 +30,7 @@ class LanguageModelEmbedding(MegatronModule):
         max_sequence_length: int,
         position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
         num_tokentypes: int = 0,
+        parallel_word_embedding: bool = True,
     ):
         super().__init__(config=config)
 
@@ -39,13 +40,19 @@ class LanguageModelEmbedding(MegatronModule):
         self.add_position_embedding: bool = position_embedding_type == 'learned_absolute'
         self.num_tokentypes = num_tokentypes
 
-        # Word embeddings (parallel).
-        self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
-            num_embeddings=self.vocab_size,
-            embedding_dim=self.config.hidden_size,
-            init_method=self.config.init_method,
-            config=self.config,
-        )
+        # Word embeddings (parallel or not).
+        if parallel_word_embedding:
+            self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
+                num_embeddings=self.vocab_size,
+                embedding_dim=self.config.hidden_size,
+                init_method=self.config.init_method,
+                config=self.config,
+            )
+        else:
+            self.word_embeddings = torch.nn.Embedding(
+                num_embeddings=vocab_size,
+                embedding_dim=self.config.hidden_size,
+            )
 
         # Position embedding (serial).
         if self.add_position_embedding:

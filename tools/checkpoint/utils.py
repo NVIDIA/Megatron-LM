@@ -20,4 +20,5 @@ def get_mcore_transformer_block_key(model_key):
     return {
         "GPT" : "decoder",
         "BERT" : "encoder",
+        "EVA": "encoder"
     }[model_key]

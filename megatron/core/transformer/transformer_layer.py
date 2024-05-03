@@ -132,6 +132,9 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
     def _get_layer_offset(self):
         config = self.config
+        if config.independent_parallel:
+            assert config.pipeline_model_parallel_size == 1, "Independent parallel is incompatible with global parallel states!"
+            return 0
         if hasattr(config, 'first_pipeline_num_layers') and config.first_pipeline_num_layers > 0:
             assert parallel_state.get_virtual_pipeline_model_parallel_world_size() is None, "We don't support virtual model parallel if you use uneven pipeline parallel!"
             pp_rank = parallel_state.get_pipeline_model_parallel_rank()

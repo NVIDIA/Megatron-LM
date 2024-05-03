@@ -15,6 +15,7 @@ from ..core.dist_checkpointing.mapping import ShardedObject
 from .global_vars import get_args
 from .utils import (unwrap_model,
                     print_rank_0)
+from megatron.core.parallel_state import get_tensor_model_parallel_group
 
 
 _CHECKPOINT_VERSION = None
@@ -211,7 +212,7 @@ def read_metadata(tracker_filename):
     # Get the max iteration retrieved across the ranks.
     if torch.distributed.is_initialized():
         iters_cuda = torch.tensor([iteration], dtype=torch.long, device='cuda')
-        torch.distributed.all_reduce(iters_cuda, op=torch.distributed.ReduceOp.MAX)
+        torch.distributed.all_reduce(iters_cuda, op=torch.distributed.ReduceOp.MAX, group=get_tensor_model_parallel_group())
         max_iter = iters_cuda[0].item()
 
         # We should now have all the same iteration.
@@ -442,7 +443,7 @@ def fix_query_key_value_ordering(model, checkpoint_version):
 
 
 def _load_base_checkpoint(load_dir, rank0=False, sharded_state_dict=None,
-                          exit_on_missing_checkpoint=False, checkpoint_step = None):
+                          exit_on_missing_checkpoint=False, checkpoint_step = None, independent_parallel = False):
     """ Load the base state_dict from the given directory
 
     If rank0 is true, just loads rank 0 checkpoint, ignoring arguments.
@@ -482,11 +483,11 @@ def _load_base_checkpoint(load_dir, rank0=False, sharded_state_dict=None,
         is_dist_ckpt = checkpoint_name is not None and dist_checkpointing.check_is_distributed_checkpoint(checkpoint_name)
     else:
         checkpoint_name = get_checkpoint_name(load_dir, iteration, release,
-                                              return_base_dir=True)
+                                              return_base_dir=True, pipeline_parallel=False if independent_parallel else None)
         is_dist_ckpt = dist_checkpointing.check_is_distributed_checkpoint(checkpoint_name)
         if not is_dist_ckpt:
             checkpoint_name = get_checkpoint_name(load_dir, iteration, release,
-                                                  return_base_dir=False)
+                                                  return_base_dir=False, pipeline_parallel=False if independent_parallel else None)
         dist_infix = "distributed " if is_dist_ckpt else ""
         if release:
             print_rank_0(f' loading release {dist_infix}checkpoint from {load_dir}')
@@ -623,14 +624,16 @@ def load_args_from_checkpoint(args, load_arg='load',
     return args, checkpoint_args
 
 
-def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', strict=True):
+def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', strict=True, args=None):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
         :attr:`state_dict` of the checkpoint match the names of
         parameters and buffers in model.
     """
-    args = get_args()
+    if args is None:
+        args = get_args()
     load_dir = getattr(args, load_arg)
+    independent_parallel = hasattr(args, "independent_parallel") and args.independent_parallel
 
     # Finetuning directories
     pretrained_dir = getattr(args,'pretrained_checkpoint', None)
@@ -673,7 +676,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                                                                     rng_state, args.use_dist_ckpt, optim_sd_kwargs=optim_sd_kwargs)
             load_kwargs['exit_on_missing_checkpoint'] = args.exit_on_missing_checkpoint
 
-    state_dict, checkpoint_name, release = _load_base_checkpoint(load_dir, rank0=False, **load_kwargs)
+    state_dict, checkpoint_name, release = _load_base_checkpoint(load_dir, rank0=False, **load_kwargs, independent_parallel=independent_parallel)
 
     # Checkpoint not loaded.
     if state_dict is None:
@@ -701,7 +704,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     # Check arguments.
     assert args.consumed_train_samples == 0
     assert args.consumed_valid_samples == 0
-    if 'args' in state_dict and not args.finetune:
+    if 'args' in state_dict and not args.finetune and not independent_parallel:
         checkpoint_args = state_dict['args']
         check_checkpoint_args(checkpoint_args)
         args.consumed_train_samples = getattr(checkpoint_args,
@@ -798,7 +801,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
 
     # Some utilities want to load a checkpoint without distributed being initialized
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=get_tensor_model_parallel_group())
 
     print_rank_0(f'  successfully loaded checkpoint from {load_dir} '
                  f'[ t {mpu.get_tensor_model_parallel_rank()}, '

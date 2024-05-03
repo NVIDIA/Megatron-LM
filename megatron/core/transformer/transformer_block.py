@@ -29,6 +29,9 @@ from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewles
 
 
 def get_num_layers_to_build(config: TransformerConfig) -> int:
+    if config.independent_parallel:
+        assert config.pipeline_model_parallel_size == 1, "Independent parallel is incompatible with global parallel states!"
+        return config.num_layers
     if hasattr(config, 'first_pipeline_num_layers') and config.first_pipeline_num_layers > 0:
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         if pp_rank == 0:

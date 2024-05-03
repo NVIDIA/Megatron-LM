@@ -27,6 +27,9 @@ class TransformerConfig(ModelParallelConfig):
     first_pipeline_num_layers: int = 0
     """Used when you want to split pipeline parallel unevenly. 0 means even partition."""
 
+    independent_parallel: bool = False
+    """Set to True if you want to disable pipeline parallel for the model."""
+
     hidden_size: int = 0
     """Transformer hidden size."""
 
@@ -400,3 +403,17 @@ class TransformerConfig(ModelParallelConfig):
             self.output_layer_init_method = scaled_init_method_normal(
                 self.init_method_std, self.num_layers
             )
+
+@dataclass
+class VisionTransformerConfig(TransformerConfig):
+    """Configuration object for megatron-core vision transformers.
+
+    The initialization function has an argument for each parameter, including those in ModelParallelConfig.
+    """
+
+    ####################
+    # model architecture
+    ####################
+    img_w: int = 224
+    img_h: int = 224
+    patch_dim: int = 14

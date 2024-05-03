@@ -1285,6 +1285,8 @@ def _add_distributed_args(parser):
                        help='Degree of pipeline model parallelism.')
     group.add_argument('--first-pipeline-num-layers', type=int, default=0,
                        help='Used when you want to split pipeline parallel unevenly. 0 means even partition.')
+    group.add_argument('--independent-parallel', action='store_true',
+                       help='Set to True if you want to disable pipeline parallel for the model.')
     group.add_argument('--pipeline-model-parallel-split-rank',
                        type=int, default=None,
                        help='Rank where encoder and decoder should be split.')
