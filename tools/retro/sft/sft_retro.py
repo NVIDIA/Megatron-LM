@@ -240,7 +240,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         blend_per_split=blend_per_split,
         split=args.split,
         path_to_cache=args.data_cache_path,
-        mock=args.mock_data,
         tokenizer=tokenizer,
         ft_neighbours=args.ft_neighbours,
         bert_retriever_neighbours=args.bert_retriever_neighbours,

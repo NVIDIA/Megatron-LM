@@ -11,11 +11,15 @@ import torch
 
 from megatron.training import update_num_microbatches
 from megatron.core import mpu, tensor_parallel, dist_checkpointing
-from ..core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.serialization import get_default_load_sharded_strategy
+from megatron.core.dist_checkpointing.strategies.fully_parallel import \
+    FullyParallelSaveStrategyWrapper, FullyParallelLoadStrategyWrapper
 from .global_vars import get_args
 from .utils import (unwrap_model,
                     print_rank_0)
-
+from ..core.dist_checkpointing.serialization import \
+    get_default_save_sharded_strategy
 
 _CHECKPOINT_VERSION = None
 
@@ -266,8 +270,12 @@ def get_rng_state(use_dist_ckpt: bool = False):
 
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
-                    num_floating_point_operations_so_far):
-    """Save a model checkpoint."""
+                    num_floating_point_operations_so_far, checkpointing_context=None):
+    """Save a model checkpoint.
+
+    Checkpointing context is used to persist some checkpointing state
+    throughout a single job. Must be initialized externally (not used if None).
+    """
     args = get_args()
 
     # Only rank zero of the data parallel writes to the disk.
@@ -307,9 +315,23 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if args.use_dist_ckpt:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                ensure_directory_exists(checkpoint_name,
-                                        check_parent=False)
-            dist_checkpointing.save(state_dict, checkpoint_name, (args.dist_ckpt_format, 1))
+                ensure_directory_exists(checkpoint_name, check_parent=False)
+            validate_sharding_integrity = True
+            save_strategy = (checkpointing_context or {}).get('save_strategy',
+                                                              get_default_save_sharded_strategy(args.dist_ckpt_format))
+            if args.ckpt_fully_parallel_save:
+                if checkpointing_context is not None and 'save_strategy' in checkpointing_context:
+                    # Already saved once before - don't need to rerun sharding validation
+                    validate_sharding_integrity = not args.ckpt_assume_constant_structure
+                else:
+                    save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, mpu.get_data_parallel_group(with_context_parallel=True),
+                                                                     args.ckpt_assume_constant_structure)
+            # Store save strategy for future checkpoint saves
+            if checkpointing_context is not None:
+                checkpointing_context['save_strategy'] = save_strategy
+
+            dist_checkpointing.save(state_dict, checkpoint_name, save_strategy,
+                                    validate_access_integrity=validate_sharding_integrity)
 
         else:
             # Save.
@@ -447,7 +469,6 @@ def _load_base_checkpoint(load_dir, rank0=False, sharded_state_dict=None,
 
     If rank0 is true, just loads rank 0 checkpoint, ignoring arguments.
     """
-
     # Read the tracker file and set the iteration.
     tracker_filename = get_checkpoint_tracker_filename(load_dir)
 
@@ -499,11 +520,17 @@ def _load_base_checkpoint(load_dir, rank0=False, sharded_state_dict=None,
             state_dict = dist_checkpointing.load_common_state_dict(checkpoint_name)
             return state_dict, checkpoint_name, release
 
+        # at this point args are available
+        args = get_args()
         if sharded_state_dict is None:
-            args = get_args()
             assert not args.auto_detect_ckpt_format and not args.use_dist_ckpt, (args.auto_detect_ckpt_format, args.use_dist_ckpt)
             raise RuntimeError('Detected load from a distributed checkpoint, but neither --use-dist-ckpt nor --auto-detect-ckpt-format is set.')
-        state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name)
+
+        load_strategy = get_default_load_sharded_strategy(checkpoint_name)
+        if args.ckpt_fully_parallel_load:
+            load_strategy = FullyParallelLoadStrategyWrapper(load_strategy,
+                                                             mpu.get_data_parallel_group(with_context_parallel=True))
+        state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name, load_strategy)
         return state_dict, checkpoint_name, release
 
     try:

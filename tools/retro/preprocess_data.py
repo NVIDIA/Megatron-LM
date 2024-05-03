@@ -115,7 +115,6 @@ def get_gpt_chunk_datasets(config):
         path_to_cache=config.retro_gpt_data_cache_path,
         return_document_ids=True,
         tokenizer=config.retro_tokenizers.gpt,
-        mock=args.mock_data,
         reset_position_ids=args.reset_position_ids,
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,

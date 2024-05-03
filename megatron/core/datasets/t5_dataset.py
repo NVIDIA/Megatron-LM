@@ -52,7 +52,7 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
 
         indexed_indices (numpy.ndarray): The set of the documents indices to expose
 
-        num_samples (int): The number of samples to draw from the indexed dataset
+        num_samples (Optional[int]): The number of samples to draw from the indexed dataset. When None, build as many samples as correspond to one epoch.
 
         index_split (Split): The indexed_indices Split
 
@@ -64,7 +64,7 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
         indexed_dataset: IndexedDataset,
         dataset_path: str,
         indexed_indices: numpy.ndarray,
-        num_samples: int,
+        num_samples: Optional[int],
         index_split: Split,
         config: T5MaskedWordPieceDatasetConfig,
     ) -> None:
@@ -72,9 +72,6 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
             indexed_dataset, dataset_path, indexed_indices, num_samples, index_split, config
         )
 
-    def _finalize(self) -> None:
-        """Abstract method implementation
-        """
         self.token_lookup = list(self.config.tokenizer.inv_vocab.keys())
         # Account for the single <bos> and single <eos> token ids
         self.sample_index = self._build_sample_index(self.config.sequence_length - 2, 1)

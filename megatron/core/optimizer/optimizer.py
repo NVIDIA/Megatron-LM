@@ -693,7 +693,7 @@ class FP32Optimizer(MegatronOptimizer):
 
 class ChainedOptimizer(MegatronOptimizer):
     """ChainedOptimizer is designed for a collection of optimizers.
-    
+
     These optimizers are responsible for different parts of multiple models for
     a training task and will be executed one-by-one when the model is updated.
 
