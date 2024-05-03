@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
     get_cuda_rng_tracker,
@@ -172,12 +173,15 @@ class TopKRouter(Router):
         Returns:
             torch.Tensor: The activation tensor with the attached gradient function.
         """
+        moe_aux_loss_coeff = (
+            self.config.moe_aux_loss_coeff / parallel_state.get_tensor_model_parallel_world_size()
+        )
         aux_loss = switch_load_balancing_loss_func(
-            probs, num_local_tokens_per_expert, self.topk, self.config.moe_aux_loss_coeff
+            probs, num_local_tokens_per_expert, self.topk, moe_aux_loss_coeff
         )
         save_to_aux_losses_tracker(
             "load_balancing_loss",
-            aux_loss / self.config.moe_aux_loss_coeff,
+            aux_loss / moe_aux_loss_coeff,
             self.layer_number,
             self.config.num_layers,
         )
@@ -195,7 +199,10 @@ class TopKRouter(Router):
             torch.Tensor: The logits after applying the z-loss.
         """
         if self.config.moe_z_loss_coeff is not None:
-            z_loss = z_loss_func(logits, self.config.moe_z_loss_coeff)
+            moe_z_loss_coeff = (
+                self.config.moe_z_loss_coeff / parallel_state.get_tensor_model_parallel_world_size()
+            )
+            z_loss = z_loss_func(logits, moe_z_loss_coeff)
             logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
             save_to_aux_losses_tracker(
                 "z_loss",
@@ -242,7 +249,7 @@ class TopKRouter(Router):
         logits = self.apply_z_loss(logits)
 
         if (
-            self.config.tensor_model_parallel_size > 1
+            parallel_state.get_tensor_model_parallel_world_size() > 1
             and self.config.moe_token_dispatcher_type == "alltoall"
         ):
             # Gather the logits from the TP region
