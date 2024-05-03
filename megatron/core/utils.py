@@ -1141,7 +1141,7 @@ class StragglerDetector:
         # Should not suppress errors even if turned off
         ret = False
         if ex_type is not None:
-            err = traceback.format_exception(ex_tb)
+            err = traceback.format_exception(ex_type, ex_val, ex_tb)
             logger.warning(f"{str(ex_val)}\n{err}")
             ret = True
         self.stop()
