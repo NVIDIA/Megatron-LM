@@ -1,8 +1,9 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """General utilities."""
-
+import os
 import sys
+from datetime import datetime
 
 import torch
 
@@ -271,6 +272,22 @@ def print_rank_last(message):
             print(message, flush=True)
     else:
         print(message, flush=True)
+
+
+def append_to_progress_log(string, barrier=True):
+    """ Append given string to progress log. """
+    args = get_args()
+    if args.save is None:
+        return
+    progress_log_filename = os.path.join(args.save, "progress.txt")
+    if barrier:
+        torch.distributed.barrier()
+    if torch.distributed.get_rank() == 0:
+        with open(progress_log_filename, 'a') as f:
+            job_id = os.getenv('SLURM_JOB_ID', '')
+            num_gpus = args.world_size
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\tJob ID: {job_id}\t"
+                    f"# GPUs: {num_gpus}\t{string}\n")
 
 
 def get_batch_on_this_tp_rank(data_iterator):

@@ -21,6 +21,7 @@ from megatron.core.dist_checkpointing.dict_utils import (
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, StateDict, is_main_replica
 from megatron.core.dist_checkpointing.serialization import validate_sharding_integrity
 from megatron.core.dist_checkpointing.strategies.base import (
+    AsyncSaveShardedStrategy,
     LoadShardedStrategy,
     SaveShardedStrategy,
 )
@@ -54,7 +55,7 @@ class SaveLoadDistribution(NamedTuple):
     shard_to_metadata: Dict[_ShardId, ShardedTensor]
 
 
-class FullyParallelSaveStrategyWrapper(SaveShardedStrategy):
+class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
     """ Wraps arbitrary strategy and distributes the save during `save`.
 
     The save distribution happens without any *data* communication.
@@ -91,6 +92,14 @@ class FullyParallelSaveStrategyWrapper(SaveShardedStrategy):
         self.do_cache_distribution = do_cache_distribution
 
         self.cached_distribution: Optional[SaveLoadDistribution] = None
+
+    def async_save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+        if not isinstance(self.base_strategy, AsyncSaveShardedStrategy):
+            raise CheckpointingException(
+                f'Cannot apply async_save to non-async base strategy {self.base_strategy}'
+            )
+        self.apply_saving_parallelization(sharded_state_dict)
+        return self.base_strategy.async_save(sharded_state_dict, checkpoint_dir)
 
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         self.apply_saving_parallelization(sharded_state_dict)

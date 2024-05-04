@@ -113,7 +113,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             self.write_results = {}
         logger.debug(f"D2H and push, time: {time() - start}")
 
-    def get_save_function_and_args(self) -> Optional[Tuple[Callable, Tuple]]:
+    def get_save_function_and_args(self) -> Tuple[Optional[Callable], Tuple]:
         """
         Get function that saves the data to storage along with its arguments.
         Allows the external caller to apply the save function synchronously or asynchronously.
@@ -123,7 +123,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             - arguments to that function
         """
         if not self.write_buckets:
-            return None
+            return None, ()
         return (self.write_preloaded_data_multiproc, (self.write_buckets, self.write_results))
 
     @staticmethod

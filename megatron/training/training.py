@@ -35,7 +35,7 @@ from megatron.training.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
 from megatron.core.pipeline_parallel import get_forward_backward_func
-
+from .async_utils import maybe_finalize_async_save
 from .utils import (
     calc_params_l2_norm,
     check_adlr_autoresume_termination,
@@ -43,7 +43,9 @@ from .utils import (
     print_rank_0,
     print_rank_last,
     report_memory,
-    unwrap_model)
+    unwrap_model,
+    append_to_progress_log,
+)
 from .global_vars import (
     get_args,
     get_signal_handler,
@@ -101,20 +103,6 @@ def num_floating_point_operations(args, batch_size):
             + (args.padded_vocab_size / (2 * args.num_layers * args.hidden_size))
         )
     )
-
-
-def append_to_progress_log(string):
-    args = get_args()
-    if args.save is None:
-        return
-    progress_log_filename = os.path.join(args.save, "progress.txt")
-    torch.distributed.barrier()
-    if torch.distributed.get_rank() == 0:
-        with open(progress_log_filename, 'a') as f:
-            job_id = os.getenv('SLURM_JOB_ID', '')
-            num_gpus = args.world_size
-            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\tJob ID: {job_id}\t"
-                    f"# GPUs: {num_gpus}\t{string}\n")
 
 
 def get_start_time_from_progress_log():
@@ -312,6 +300,8 @@ def pretrain(train_valid_test_dataset_provider,
                                    test_data_iterator, model,
                                    iteration, process_non_loss_data_func, config,
                                    verbose=True, write_to_tensorboard=not args.skip_train)
+
+    maybe_finalize_async_save(blocking=True)
 
 
 
@@ -881,8 +871,8 @@ def compute_throughputs_and_append_to_progress_log(iteration,
             elapsed_time * 10**12 * args.world_size)
 
     tokens_so_far = args.consumed_train_samples * args.seq_length
-
-    append_to_progress_log(f"Saved checkpoint\tIteration: {iteration}\t"
+    saved_ckpt_prefix = 'Saving async checkpoint' if args.async_save else 'Saved checkpoint'
+    append_to_progress_log(f"{saved_ckpt_prefix}\tIteration: {iteration}\t"
                            f"Job throughput: {job_throughput:.1f} TFLOP/s/GPU\t"
                            f"Cumulative throughput: {cumulative_throughput:.1f} TFLOP/s/GPU\t"
                            f"Floating-point operations: {num_floating_point_operations_so_far:.2e}\t"
@@ -1014,6 +1004,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
            torch.distributed.get_rank() in args.profile_ranks:
             torch.cuda.cudart().cudaProfilerStart()
             torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
+
+        maybe_finalize_async_save(False)
 
         # Update number of microbatches first without consistency check to decide if a
         # checkpoint should be saved. If the number of microbatches is different
@@ -1192,6 +1184,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if args.use_distributed_optimizer and args.overlap_param_gather:
         optimizer.disable_pre_hook()
+
+    maybe_finalize_async_save(True)
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if exit:
