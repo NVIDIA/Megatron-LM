@@ -37,11 +37,27 @@ def write_json(text, path):
         json.dump(text, f)
 
 def load_args_from_checkpoint(args):
-
+    llama_args_path = os.path.join(os.path.join(os.environ.get("SAT_HOME", "~/.sat_models"), args.load), "model_config.json")
     # Read Llama args.
-    llama_args_path = os.path.join(args.load, "model_config.json")
-    with open(llama_args_path) as f:
-        llama_args = json.load(f)
+    try:
+        with open(llama_args_path) as f:
+            llama_args = json.load(f)
+    except:
+        from sat import AutoModel
+        import argparse
+        hf_model, _ = AutoModel.from_pretrained(
+                args.load,
+                args=argparse.Namespace(
+                    skip_init=True,
+                    bf16=args.bf16,
+                    fp16=args.fp16,
+                    hidden_dropout=0.,
+                    attention_dropout=0.
+                ),
+                overwrite_args={'hidden_dropout': 0., 'attention_dropout': 0.}
+            )
+        with open(llama_args_path) as f:
+            llama_args = json.load(f)
     # Update Megatron args.
     args.seq_length = llama_args["max_sequence_length"]
     args.max_position_embeddings = llama_args["max_sequence_length"]
@@ -142,9 +158,9 @@ def load_checkpoint_to_model(args):
     from pretrain_gpt import model_provider
 
     # Load Huggingface model.
-    from eva_clip_model import EVA2CLIPModel
+    from sat import AutoModel
     import argparse
-    hf_model, _ = EVA2CLIPModel.from_pretrained(
+    hf_model, _ = AutoModel.from_pretrained(
             args.load,
             args=argparse.Namespace(
                 skip_init=True,
