@@ -45,6 +45,9 @@ class BlendedMegatronDatasetConfig:
        'split'. Not to be passed in to the constructor.
     """
 
+    num_dataset_builder_threads: int = 1
+    """The number of threads to use for dataset building."""
+
     path_to_cache: Optional[str] = None
     """Where all re-useable dataset indices are to be cached."""
 

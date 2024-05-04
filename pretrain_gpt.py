@@ -198,6 +198,7 @@ def core_gpt_dataset_config_from_args(args):
             get_blend_from_list(args.test_data_path)
         ],
         split=args.split,
+        num_dataset_builder_threads=args.num_dataset_builder_threads,
         path_to_cache=args.data_cache_path,
         mmap_bin_files=args.mmap_bin_files,
         tokenizer=tokenizer,
