@@ -166,8 +166,8 @@ class TopKRouter(Router):
         """Applies auxiliary loss to the MoE layer.
 
         Args:
-            probs (torch.Tensor): The probabilities output by the MoE layer.
-            num_local_tokens_per_expert (torch.Tensor): The number of tokens per expert.
+            probs (torch.Tensor): The probs output by the router for each token. [num_tokens, num_experts]
+            num_local_tokens_per_expert (torch.Tensor): The number of tokens per expert. [num_experts]
             activation (torch.Tensor): The activation tensor to attach the gradient function to.
 
         Returns:
@@ -191,10 +191,10 @@ class TopKRouter(Router):
     def apply_z_loss(self, logits):
         """Encourages the router's logits to remain small to enhance stability.
         Please refer to the ST-MoE paper (https://arxiv.org/pdf/2202.08906.pdf) for details.
-        
+
         Args:
             logits (torch.Tensor): The logits of the router.
-        
+
         Returns:
             torch.Tensor: The logits after applying the z-loss.
         """

@@ -7,23 +7,26 @@ import torch
 from megatron.core import parallel_state
 
 
-def switch_load_balancing_loss_func(gates, tokens_per_expert, topk, moe_aux_loss_coeff):
-    """Calculate the auxiliary loss for better load balancing. 
+def switch_load_balancing_loss_func(
+    probs: torch.Tensor, tokens_per_expert: torch.Tensor, topk: int, moe_aux_loss_coeff: float
+):
+    """Calculate the auxiliary loss for better load balacing. 
     Please refer to the Switch Transformer paper (https://arxiv.org/abs/2101.03961) for details.
 
     Args:
-        gates (torch.Tensor): The gates tensor representing the routing probabilities for each expert.
-        mask (torch.Tensor): The 2D mask tensor indicating which experts are selected.
+        probs (torch.Tensor): The softmax probs output by the router for each token. [num_tokens, num_experts]
+        tokens_per_expert (torch.Tensor): The number of assigned tokens for each expert. [num_experts]
 
     Returns:
         torch.Tensor: The auxiliary loss for load balancing.
     """
-    num_experts = gates.size(1)
-    num_tokens = gates.size(0) * topk
-    gates_mean = gates.mean(dim=0)
-    selection_mean = tokens_per_expert.float() / num_tokens
-    aux_loss = torch.sum(gates_mean * selection_mean) * num_experts
-    aux_loss *= moe_aux_loss_coeff
+    num_tokens = probs.shape[0] * topk
+    num_experts = probs.shape[1]
+
+    probs_mean_per_expert = probs.mean(dim=0)
+    aux_loss = torch.sum(probs_mean_per_expert * tokens_per_expert) * (
+        num_experts / num_tokens * moe_aux_loss_coeff
+    )
     return aux_loss
 
 
