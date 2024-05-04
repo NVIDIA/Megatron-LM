@@ -15,9 +15,9 @@ from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.dist_checkpointing.serialization import get_default_load_sharded_strategy
 from megatron.core.dist_checkpointing.strategies.fully_parallel import \
     FullyParallelSaveStrategyWrapper, FullyParallelLoadStrategyWrapper
+from .async_utils import schedule_async_save
 from .global_vars import get_args
-from .utils import (unwrap_model,
-                    print_rank_0)
+from .utils import unwrap_model, print_rank_0, append_to_progress_log
 from ..core.dist_checkpointing.serialization import \
     get_default_save_sharded_strategy
 
@@ -298,6 +298,13 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
         ensure_directory_exists(optim_checkpoint_name)
         optimizer.save_parameter_state(optim_checkpoint_name)
 
+    async_save_request = None
+    if args.async_save:
+        if not args.use_dist_ckpt:
+            raise NotImplementedError('Async checkpoint save not implemented for legacy checkpoints')
+        elif args.dist_ckpt_format != 'torch_dist':
+            raise NotImplementedError(f'Async checkpoint save not implemented for {args.dist_ckpt_format} distributed checkpoint format')
+
     # Collect args, model, RNG.
     if not torch.distributed.is_initialized() \
             or mpu.get_data_modulo_expert_parallel_rank() == 0 \
@@ -329,28 +336,43 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
             # Store save strategy for future checkpoint saves
             if checkpointing_context is not None:
                 checkpointing_context['save_strategy'] = save_strategy
-
-            dist_checkpointing.save(state_dict, checkpoint_name, save_strategy,
-                                    validate_access_integrity=validate_sharding_integrity)
-
+            async_save_request = dist_checkpointing.save(state_dict, checkpoint_name, save_strategy,
+                                                         async_sharded_save=args.async_save)
         else:
             # Save.
             ensure_directory_exists(checkpoint_name)
             torch.save(state_dict, checkpoint_name)
 
-    # Wait so everyone is done (necessary)
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-
-    print_rank_0('  successfully saved checkpoint at iteration {:7d} to {}' \
-                 .format(iteration, args.save))
+    if not args.async_save:
+        assert async_save_request is None
+        # Wait so everyone is done (necessary)
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
     # And update the latest iteration
     if not torch.distributed.is_initialized() \
        or torch.distributed.get_rank() == 0:
         tracker_filename = get_checkpoint_tracker_filename(args.save)
-        with open(tracker_filename, 'w') as f:
-            f.write(str(iteration))
+
+        def iter_finalize_fn():
+            with open(tracker_filename, 'w') as f:
+                f.write(str(iteration))
+            print_rank_0('  successfully saved checkpoint from iteration {:7d} to {}'
+                         .format(iteration, args.save))
+            if args.log_progress and args.async_save:
+                append_to_progress_log(f'Saved async checkpoint\tIteration: {iteration}',
+                                       barrier=False)
+
+        if args.async_save:
+            assert async_save_request is not None
+            async_save_request.add_finalize_fn(iter_finalize_fn)
+        else:
+            iter_finalize_fn()
+
+    if args.async_save:
+        schedule_async_save(async_save_request)
+        print_rank_0('  scheduled an async checkpoint save at iteration {:7d} to {}' \
+                     .format(iteration, args.save))
 
     # Wait so everyone is done (not necessary)
     if torch.distributed.is_initialized():
