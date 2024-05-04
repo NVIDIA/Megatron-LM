@@ -6,7 +6,7 @@ import math
 from abc import ABC, abstractmethod
 from itertools import chain
 from logging import getLogger
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional, Tuple
 
 import amp_C
 import torch
@@ -691,9 +691,46 @@ class FP32Optimizer(MegatronOptimizer):
         self.optimizer.load_state_dict(state_dict)
 
 
+class ProxyDict:
+    """
+    A dictionary-like object that proxies to a list of dictionaries.
+
+    e.g., ProxyDict([{'a': 1}, {'b': 2}]) behaves like:
+    {
+        (0, 'a'): 1,
+        (1, 'b'): 2,
+    }
+    We use tuples as keys to avoid ambiguity with the keys of the inner dicts.
+    """
+
+    def __init__(self, inner_dicts: List[dict]):
+        self._inner_dicts = inner_dicts
+
+    def __getitem__(self, key: Tuple[int, str]):
+        idx, inner_key = key
+        return self._inner_dicts[idx].get(inner_key)
+
+    def __setitem__(self, key: Tuple[int, str], value: Any):
+        idx, inner_key = key
+        self._inner_dicts[idx][inner_key] = value
+
+    def __len__(self) -> int:
+        return sum([len(inner_dict) for inner_dict in self._inner_dicts])
+
+    def __iter__(self):
+        for idx, inner_dict in enumerate(self._inner_dicts):
+            for inner_key in inner_dict:
+                yield (idx, inner_key)
+
+    def items(self):
+        for idx, inner_dict in enumerate(self._inner_dicts):
+            for inner_key, value in inner_dict.items():
+                yield (idx, inner_key), value
+
+
 class ChainedOptimizer(MegatronOptimizer):
     """ChainedOptimizer is designed for a collection of optimizers.
-    
+
     These optimizers are responsible for different parts of multiple models for
     a training task and will be executed one-by-one when the model is updated.
 
@@ -701,15 +738,23 @@ class ChainedOptimizer(MegatronOptimizer):
         chained_optimizers: a list of optimizers.
     """
 
-    # Remove these attributes which inherits from MegatronOptimizer.
-    state = None
-    param_groups = None
-
     def __init__(self, chained_optimizers: List[MegatronOptimizer]):
         self.chained_optimizers = chained_optimizers
-        self.param_groups = []
+
+    @property
+    def param_groups(self) -> List[dict]:
+        param_groups = []
         for optimizer in self.chained_optimizers:
-            self.param_groups += optimizer.param_groups
+            param_groups += optimizer.param_groups
+        return param_groups
+
+    @property
+    def state(self) -> ProxyDict:
+        """
+        Return optimizer state with tuple keys, where the first element is the
+        index of the optimizer in the list of chained optimizers.
+        """
+        return ProxyDict([opt.state for opt in self.chained_optimizers])
 
     def zero_grad(self, set_to_none=True):
         for optimizer in self.chained_optimizers:
@@ -747,11 +792,6 @@ class ChainedOptimizer(MegatronOptimizer):
             state_dict = (v for k, v in sorted(state_dict.items()))
         for optimizer, state in zip(self.chained_optimizers, state_dict):
             optimizer.load_state_dict(state)
-
-        # Reset param_groups as load_state_dict reset chained optimizers's attribute.
-        self.param_groups = []
-        for optimizer in self.chained_optimizers:
-            self.param_groups += optimizer.param_groups
 
     def disable_pre_hook(self):
         for optimizer in self.chained_optimizers:

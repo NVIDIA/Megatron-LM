@@ -6,8 +6,6 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-import torch
-
 from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
 from megatron.core.datasets.utils import Split, log_single_rank, normalize
 
@@ -47,14 +45,20 @@ class BlendedMegatronDatasetConfig:
        'split'. Not to be passed in to the constructor.
     """
 
+    num_dataset_builder_threads: int = 1
+    """The number of threads to use for dataset building."""
+
     path_to_cache: Optional[str] = None
     """Where all re-useable dataset indices are to be cached."""
 
     mmap_bin_files: bool = True
     """Whether to mmap the .bin files or use file pointers."""
 
-    mock: bool = False
-    """Whether to bypass real data loading and validation in favor of mock data generation."""
+    mock: bool = field(init=False, default=False)
+    """Whether to bypass real data loading and validation in favor of mock data generation.
+       Created automatically from 'blend' and 'blend_per_split'. Not to be passed in to the
+       constructor.
+    """
 
     tokenizer: Optional[MegatronTokenizer] = None
     """The MegatronTokenizer instance or None. Required for datasets which do online tokenization."""
@@ -62,37 +66,39 @@ class BlendedMegatronDatasetConfig:
     def __post_init__(self) -> None:
         """Do asserts and set fields post init
         """
-        log_single_rank(logger, logging.INFO, f"mock = {self.mock}")
-
-        if not self.mock:
-            if self.blend_per_split is not None and any(self.blend_per_split):
-                assert self.blend is None, "blend and blend_per_split are incompatible"
-                assert self.split is None, "split and blend_per_split are incompatible"
-                assert len(self.blend_per_split) == len(
-                    Split
-                ), f"blend_per_split must contain {len(Split)} blends"
-                for split in Split:
-                    if self.blend_per_split[split.value] is None:
-                        log_single_rank(
-                            logger, logging.INFO, f"blend not provided for {split.name} split"
-                        )
-                    else:
-                        assert self.blend_per_split[split.value][1] is None or len(
-                            self.blend_per_split[split.value][0]
-                        ) == len(
-                            self.blend_per_split[split.value][1]
-                        ), "blend per split prefixes and weights must be equal in number"
-            else:
-                assert (
-                    self.blend is not None
-                ), "one of either blend or blend_per_split must be provided"
-                assert self.split is not None, "both blend and split must be provided"
+        if self.blend_per_split is not None and any(self.blend_per_split):
+            assert self.blend is None, "blend and blend_per_split are incompatible"
+            assert self.split is None, "split and blend_per_split are incompatible"
+            assert len(self.blend_per_split) == len(
+                Split
+            ), f"blend_per_split must contain {len(Split)} blends"
+            for split in Split:
+                if self.blend_per_split[split.value] is None:
+                    log_single_rank(
+                        logger, logging.INFO, f"blend not provided for {split.name} split"
+                    )
+                else:
+                    assert self.blend_per_split[split.value][1] is None or len(
+                        self.blend_per_split[split.value][0]
+                    ) == len(
+                        self.blend_per_split[split.value][1]
+                    ), "blend per split prefixes and weights must be equal in number"
+        else:
+            assert self.split is not None, "split must be provided in absence of blend_per_split"
+            split_vector = parse_and_normalize_split(self.split)
+            self.split_matrix = convert_split_vector_to_split_matrix(split_vector)
+            log_single_rank(logger, logging.INFO, f"Let split_matrix = {self.split_matrix}")
+            if self.blend is not None:
                 assert self.blend[1] is None or len(self.blend[0]) == len(
                     self.blend[1]
                 ), "blend prefixes and weights must be equal in number"
-                split_vector = parse_and_normalize_split(self.split)
-                self.split_matrix = convert_split_vector_to_split_matrix(split_vector)
-                log_single_rank(logger, logging.INFO, f"Let split_matrix = {self.split_matrix}")
+            else:
+                self.mock = True
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    f"Let mock = True, as both blend and blend_per_split are None",
+                )
 
 
 def parse_and_normalize_split(split: str) -> List[float]:

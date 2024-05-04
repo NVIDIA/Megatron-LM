@@ -19,3 +19,26 @@ spec:
     repo: https://gitlab-master.nvidia.com/ADLR/megatron-lm.git
     ref: main
     dockerfile: Dockerfile.ci
+
+---
+type: build
+format_version: 1
+maintainers: [maanug]
+spec:
+  name: nemo
+  platforms: [linux/amd64]
+  source:
+    image: nvcr.io/nvidian/bignlp-train:nemofw-nightly
+
+---
+type: build
+format_version: 1
+maintainers: [maanug]
+spec:
+  name: mcore-nemo
+  platforms: [linux/amd64]
+  parent: nemo
+  source:
+    repo: https://gitlab-master.nvidia.com/ADLR/megatron-lm.git
+    ref: main
+    dockerfile: Dockerfile.ci

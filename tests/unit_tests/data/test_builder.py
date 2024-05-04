@@ -22,7 +22,7 @@ else:
 import os
 import tempfile
 from collections import defaultdict
-from typing import Dict
+from typing import Dict, Optional
 
 import numpy
 import torch
@@ -66,7 +66,17 @@ def test_builder():
     # Define the class here to avoid pytest warnings
 
     class TestDataset(MegatronDataset):
-        def _finalize(self) -> None:
+        def __init__(
+            self,
+            dataset: LowLevelDataset,
+            dataset_path: Optional[str],
+            indices: numpy.ndarray,
+            num_samples: Optional[int],
+            index_split: Split,
+            config: BlendedMegatronDatasetConfig,
+        ) -> None:
+            super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
+
             if self.num_samples is None:
                 self.num_samples = len(self.indices)
 

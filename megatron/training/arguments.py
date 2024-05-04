@@ -295,6 +295,9 @@ def validate_args(args, defaults={}):
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
 
+    # data
+    assert args.num_dataset_builder_threads > 0
+
     # Consumed tokens.
     args.consumed_train_samples = 0
     args.consumed_valid_samples = 0
@@ -510,6 +513,12 @@ def validate_args(args, defaults={}):
     # Distributed checkpointing checks
     if args.use_dist_ckpt and not args.use_mcore_models:
         raise RuntimeError('--use-dist-ckpt only support Megatron Core, please add --use-mcore-models.')
+
+    # Data blend checks
+    assert args.mock_data + \
+           bool(args.data_path) + \
+           any([args.train_data_path, args.valid_data_path, args.test_data_path]) \
+           == 1, "A single data source must be provided"
 
     if args.use_tp_pp_dp_mapping:
         assert args.context_parallel_size * args.expert_model_parallel_size <= 1, \
@@ -982,7 +991,7 @@ def _add_training_args(parser):
                        ' overlap of Tensor parallel communication and GEMM kernels.')
     group.add_argument('--tp-comm-overlap-cfg', type=str, default=None,
                        help='Config file when tp_comm_overlap is enabled.')
-    group.add_argument('--disable-tp-comm-overlap-ag', action='store_false', 
+    group.add_argument('--disable-tp-comm-overlap-ag', action='store_false',
                        help=('Disables the All-Gather overlap with GEMM by '
                              'pipelining the GEMM and All-Gather.'),
                        dest='tp_comm_overlap_ag')
@@ -1007,6 +1016,8 @@ def _add_training_args(parser):
                        help='Call torch.cuda.empty_cache() each iteration '
                        '(training and eval), to reduce fragmentation.'
                        '0=off, 1=moderate, 2=aggressive.')
+    group.add_argument('--check-weight-hash-across-dp-replicas-interval', type=int, default=None,
+                       help='Interval to check weight hashes are same across DP replicas. If not specified, weight hashes not checked.')
 
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
@@ -1068,9 +1079,7 @@ def _add_training_args(parser):
                        help='Single pass vs multiple pass data loader')
     group.add_argument('--no-async-tensor-model-parallel-allreduce',
                        action='store_false',
-                       help='Disable asynchronous execution of '
-                       'tensor-model-parallel all-reduce with weight '
-                       'gradient compuation of a column-linear layer.',
+                       help='DEPRECATED. This flag is ignored.',
                        dest='async_tensor_model_parallel_allreduce')
     group.add_argument('--no-persist-layer-norm', action='store_true',
                        help='Disable using persistent fused layer norm kernel. '
@@ -1234,7 +1243,16 @@ def _add_checkpointing_args(parser):
                        help='Apply full save parallelization across DP for'
                             ' distributed checkpoints. Depending on ckpt format'
                             ' might increase number of files in the checkpoint.')
-
+    group.add_argument('--async-save', action='store_true', default=None,
+                       help='Apply async checkpointing save. Currently works only with'
+                            '`torch_dist` distributed checkpoint format.')
+    group.add_argument('--ckpt-fully-parallel-load', action='store_true',
+                       help='Apply full load parallelization across DP for'
+                            ' distributed checkpoints.')
+    group.add_argument('--ckpt-assume-constant-structure', action='store_true',
+                       help='If the model and optimizer state dict structure is'
+                            'constant throughout a *single training job*, it allows for'
+                            'different checkpointing performance optimizations.')
     return parser
 
 
@@ -1446,7 +1464,8 @@ def _add_data_args(parser):
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
                        help='If set, do not create attention_masks in dataloader.',
                        dest='create_attention_mask_in_dataloader')
-
+    group.add_argument('--num-dataset-builder-threads', type=int, default=1,
+                       help='Number of parallel threads per rank for dataset builder')
     return parser
 
 
@@ -1610,14 +1629,23 @@ def _add_moe_args(parser):
                        help='Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended.')
     group.add_argument('--moe-input-jitter-eps', type=float, default=None,
                        help='Add noise to the input tensor by applying jitter with a specified epsilon value.')
-    group.add_argument('--moe-token-dropping', action='store_true',
-                       help='This feature involves selectively dropping and padding tokens for each expert to achieve a specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note: Currently unsupported.')
     group.add_argument('--moe-token-dispatcher-type', type=str,
                        choices=['allgather', 'alltoall'],
                        default='allgather',
                        help='.')
     group.add_argument('--moe-per-layer-logging', action='store_true',
                        help='Enable per-layer logging for MoE, currently supports auxiliary loss and z loss.')
+    # Token dropping arguments
+    group.add_argument('--moe-expert-capacity-factor', type=float, default=None,
+                       help='The capacity factor for each expert, None means no token will be dropped.')
+    group.add_argument('--moe-pad-expert-input-to-capacity', action='store_true',
+                       help='Pads the input for each expert to match the expert capacity length, effective only after the --moe-expert-capacity-factor is set.')
+    group.add_argument('--moe-token-drop-policy', type=str, default='probs', choices=['probs', 'position'],
+                       help='The policy to drop tokens. Can be either "prob" or "position". If "prob", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.')
+    group.add_argument('--moe-layer-recompute', action='store_true',
+                       help='Enable checkpointing for moe_layer, should be used when memory is not sufficient.')
+    group.add_argument('--moe-extended-tp', action='store_true',
+                       help='Alternative to expert parallelism, all experts are sharded across TPXEP domain.')
 
     return parser
 

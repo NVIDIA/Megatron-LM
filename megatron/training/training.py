@@ -2,11 +2,11 @@
 
 """Pretrain utilities."""
 
-import gc
 import dataclasses
 from datetime import datetime
-import math
+import gc
 import logging
+import math
 import os
 import sys
 from .log_handler import CustomHandler
@@ -19,7 +19,7 @@ _TRAIN_START_TIME = time.time()
 import torch
 
 from megatron.core import mpu, tensor_parallel
-from megatron.core.utils import get_model_config, StragglerDetector
+from megatron.core.utils import check_param_hashes_across_dp_replicas, get_model_config, StragglerDetector
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.legacy.model import Float16Module
@@ -35,7 +35,7 @@ from megatron.training.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
 from megatron.core.pipeline_parallel import get_forward_backward_func
-
+from .async_utils import maybe_finalize_async_save
 from .utils import (
     calc_params_l2_norm,
     check_adlr_autoresume_termination,
@@ -43,7 +43,9 @@ from .utils import (
     print_rank_0,
     print_rank_last,
     report_memory,
-    unwrap_model)
+    unwrap_model,
+    append_to_progress_log,
+)
 from .global_vars import (
     get_args,
     get_signal_handler,
@@ -101,20 +103,6 @@ def num_floating_point_operations(args, batch_size):
             + (args.padded_vocab_size / (2 * args.num_layers * args.hidden_size))
         )
     )
-
-
-def append_to_progress_log(string):
-    args = get_args()
-    if args.save is None:
-        return
-    progress_log_filename = os.path.join(args.save, "progress.txt")
-    torch.distributed.barrier()
-    if torch.distributed.get_rank() == 0:
-        with open(progress_log_filename, 'a') as f:
-            job_id = os.getenv('SLURM_JOB_ID', '')
-            num_gpus = args.world_size
-            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\tJob ID: {job_id}\t"
-                    f"# GPUs: {num_gpus}\t{string}\n")
 
 
 def get_start_time_from_progress_log():
@@ -265,6 +253,9 @@ def pretrain(train_valid_test_dataset_provider,
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
 
+    # Context used for persisting some state between checkpoint saves.
+    checkpointing_context = {}
+
     # Print setup timing.
     print_rank_0('done with setup ...')
     timers.log(['model-and-optimizer-setup',
@@ -284,13 +275,13 @@ def pretrain(train_valid_test_dataset_provider,
                 forward_step_func,
                 model, optimizer, opt_param_scheduler,
                 train_data_iterator, valid_data_iterator,
-                process_non_loss_data_func, config)
+                process_non_loss_data_func, config, checkpointing_context)
 
         print_datetime('after training is done')
 
         if args.save and iteration != 0 and iteration % args.save_interval != 0:
             save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
-                            num_floating_point_operations_so_far)
+                            num_floating_point_operations_so_far, checkpointing_context)
     else:
         print_rank_0('skipping training (--skip-train is on) ...')
 
@@ -309,6 +300,8 @@ def pretrain(train_valid_test_dataset_provider,
                                    test_data_iterator, model,
                                    iteration, process_non_loss_data_func, config,
                                    verbose=True, write_to_tensorboard=not args.skip_train)
+
+    maybe_finalize_async_save(blocking=True)
 
 
 
@@ -600,9 +593,22 @@ def train_step(forward_step_func, data_iterator,
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         # Average loss across microbatches.
         loss_reduced = {}
-        for key in losses_reduced[0]:
-            losses_reduced_for_key = [x[key] for x in losses_reduced]
-            loss_reduced[key] = sum(losses_reduced_for_key) / len(losses_reduced_for_key)
+        for key in losses_reduced[0].keys():
+            numerator = 0
+            denominator = 0
+            for x in losses_reduced:
+                val = x[key]
+                # there is one dict per microbatch. in new reporting, we average
+                # over the total number of tokens across the global batch.
+                if isinstance(val, tuple) or isinstance(val, list):
+                    numerator += val[0]
+                    denominator += val[1]
+                else:
+                    # legacy behavior. we average over the number of microbatches,
+                    # and so the denominator is 1.
+                    numerator += val
+                    denominator += 1
+            loss_reduced[key] = numerator / denominator
         return loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad
     return {}, skipped_iter, grad_norm, num_zeros_in_grad
 
@@ -865,8 +871,8 @@ def compute_throughputs_and_append_to_progress_log(iteration,
             elapsed_time * 10**12 * args.world_size)
 
     tokens_so_far = args.consumed_train_samples * args.seq_length
-
-    append_to_progress_log(f"Saved checkpoint\tIteration: {iteration}\t"
+    saved_ckpt_prefix = 'Saving async checkpoint' if args.async_save else 'Saved checkpoint'
+    append_to_progress_log(f"{saved_ckpt_prefix}\tIteration: {iteration}\t"
                            f"Job throughput: {job_throughput:.1f} TFLOP/s/GPU\t"
                            f"Cumulative throughput: {cumulative_throughput:.1f} TFLOP/s/GPU\t"
                            f"Floating-point operations: {num_floating_point_operations_so_far:.2e}\t"
@@ -874,13 +880,13 @@ def compute_throughputs_and_append_to_progress_log(iteration,
 
 
 def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
-                             num_floating_point_operations_so_far):
+                             num_floating_point_operations_so_far, checkpointing_context):
     args = get_args()
     timers = get_timers()
     # Extra barrier is added to make sure all ranks report the max time.
     timers('save-checkpoint', log_level=0).start(barrier=True)
     save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
-                    num_floating_point_operations_so_far)
+                    num_floating_point_operations_so_far, checkpointing_context)
     timers('save-checkpoint').stop(barrier=True)
     timers.log(['save-checkpoint'])
 
@@ -891,7 +897,7 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
 
 def train(forward_step_func, model, optimizer, opt_param_scheduler,
           train_data_iterator, valid_data_iterator,
-          process_non_loss_data_func, config):
+          process_non_loss_data_func, config, checkpointing_context):
     """Train the model function."""
     args = get_args()
     timers = get_timers()
@@ -999,6 +1005,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             torch.cuda.cudart().cudaProfilerStart()
             torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
 
+        maybe_finalize_async_save(False)
+
         # Update number of microbatches first without consistency check to decide if a
         # checkpoint should be saved. If the number of microbatches is different
         # from the previous iteration, save a checkpoint. Then run consistency check
@@ -1009,7 +1017,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 "number of microbatches should be increasing due to batch size rampup"
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler,
-                                     num_floating_point_operations_so_far)
+                                     num_floating_point_operations_so_far,
+                                     checkpointing_context)
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True)
 
@@ -1057,6 +1066,17 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             stimer.report(total_flops, args.log_interval)
             total_flops = 0.0
 
+        if args.check_weight_hash_across_dp_replicas_interval is not None and \
+                iteration % args.check_weight_hash_across_dp_replicas_interval == 0:
+            if args.use_distributed_optimizer and args.overlap_param_gather:
+                optimizer.disable_pre_hook()
+            assert check_param_hashes_across_dp_replicas(model), \
+                "Parameter hashes not matching across DP replicas"
+            torch.distributed.barrier()
+            print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
+            if args.use_distributed_optimizer and args.overlap_param_gather:
+                optimizer.enable_pre_hook()
+
         # Autoresume
         if args.adlr_autoresume and \
            (iteration % args.adlr_autoresume_interval == 0):
@@ -1095,7 +1115,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             if any(signal_handler.signals_received()):
                 save_checkpoint_and_time(iteration, model, optimizer,
                                          opt_param_scheduler,
-                                         num_floating_point_operations_so_far)
+                                         num_floating_point_operations_so_far,
+                                         checkpointing_context)
                 print_datetime('exiting program after receiving SIGTERM.')
                 exit = True
                 break
@@ -1105,7 +1126,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             timers('interval-time').stop()
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler,
-                                     num_floating_point_operations_so_far)
+                                     num_floating_point_operations_so_far,
+                                     checkpointing_context)
             saved_checkpoint = True
             timers('interval-time', log_level=0).start(barrier=True)
 
@@ -1122,7 +1144,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 if not saved_checkpoint:
                     save_checkpoint_and_time(iteration, model, optimizer,
                                              opt_param_scheduler,
-                                             num_floating_point_operations_so_far)
+                                             num_floating_point_operations_so_far,
+                                             checkpointing_context)
                 print_datetime('exiting program after {} minutes'.format(train_time))
                 exit = True
                 break
@@ -1132,7 +1155,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             if args.save and not saved_checkpoint:
                 save_checkpoint_and_time(iteration, model, optimizer,
                                          opt_param_scheduler,
-                                         num_floating_point_operations_so_far)
+                                         num_floating_point_operations_so_far,
+                                         checkpointing_context)
             torch.distributed.barrier()
             print_datetime('exiting program at iteration {}'.format(iteration))
             exit = True
@@ -1160,6 +1184,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if args.use_distributed_optimizer and args.overlap_param_gather:
         optimizer.disable_pre_hook()
+
+    maybe_finalize_async_save(True)
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if exit:
@@ -1226,8 +1252,15 @@ def evaluate(forward_step_func,
                 # Reduce across processes.
                 for loss_dict in loss_dicts:
                     for key in loss_dict:
-                        total_loss_dict[key] = total_loss_dict.get(
-                            key, torch.tensor([0.0], dtype=torch.float, device='cuda')) + loss_dict[key]
+                        if key not in total_loss_dict:
+                            total_loss_dict[key] = torch.tensor([0.0, 0.0], dtype=torch.float).cuda()
+                        val = loss_dict[key]
+                        if isinstance(val, tuple) or isinstance(val, list):
+                            total_loss_dict[key][0] += val[0]
+                            total_loss_dict[key][1] += val[1]
+                        else:
+                            total_loss_dict[key][0] += val
+                            total_loss_dict[key][1] += 1
 
             args.consumed_valid_samples += eval_batch_size
 
@@ -1261,7 +1294,8 @@ def evaluate(forward_step_func,
         model_module.train()
 
     for key in total_loss_dict:
-        total_loss_dict[key] /= args.eval_iters * eval_num_microbatches
+        numerator, denominator = total_loss_dict[key]
+        total_loss_dict[key] = numerator / denominator
 
     timers('evaluate').stop()
     timers.log(['evaluate'])
