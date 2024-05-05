@@ -107,6 +107,10 @@ class ModelParallelConfig:
        be synchronized.
     """
 
+    deterministic_mode: bool = False
+    """If true, code that has deterministic execution will be chosen. This usually
+       means slower execution, but is good for debugging and testing. Defaults to False."""
+
     enable_autocast: bool = False
     """If true runs the forward step function inside torch.autocast context."""
 

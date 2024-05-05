@@ -481,6 +481,7 @@ def validate_args(args, defaults={}):
     if args.decoupled_lr is not None or args.decoupled_min_lr is not None:
         assert args.use_mcore_models, \
             '--decoupled-lr and --decoupled-min-lr only supported by Megatron Core, please add --use-mcore-models.'
+        assert not args.use_dist_ckpt, "Distributed checkpointing does not work with decoupled LR yet."
 
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
@@ -523,6 +524,14 @@ def validate_args(args, defaults={}):
     if args.use_tp_pp_dp_mapping:
         assert args.context_parallel_size * args.expert_model_parallel_size <= 1, \
             "context_parallel and expert_model_parallel can't be used with tp-pp-dp mapping."
+
+    # Deterministic mode
+    if args.deterministic_mode:
+        assert not args.use_flash_attn, 'Flash attention can not be used in deterministic mode.'
+
+        all_reduce_choices = ["Tree", "Ring", "CollnetDirect", "CollnetChain", "^NVLS"]
+        assert os.getenv("NCCL_ALGO", -1) != -1 and os.getenv("NCCL_ALGO") in all_reduce_choices, \
+            f"NCCL_ALGO must be one of {all_reduce_choices}."
 
     # Print arguments.
     _print_args("arguments", args)
@@ -1016,6 +1025,9 @@ def _add_training_args(parser):
                        help='Call torch.cuda.empty_cache() each iteration '
                        '(training and eval), to reduce fragmentation.'
                        '0=off, 1=moderate, 2=aggressive.')
+    group.add_argument('--deterministic-mode', action='store_true',
+                       help='Choose code that has deterministic execution. This usually '
+                       'means slower execution, but is good for debugging and testing.')
     group.add_argument('--check-weight-hash-across-dp-replicas-interval', type=int, default=None,
                        help='Interval to check weight hashes are same across DP replicas. If not specified, weight hashes not checked.')
 

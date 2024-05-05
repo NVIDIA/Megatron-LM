@@ -451,6 +451,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 self.config.context_parallel_size == 1
             ), "Only Transformer-Engine version >= 1.0.0 supports context parallelism!"
 
+        if self.config.deterministic_mode:
+            if int(os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")) != 0:
+                raise RuntimeError(
+                    "deterministic_mode is on and we are using DotProductAttention from "
+                    "Transformer Engine, but NVTE_ALLOW_NONDETERMINISTIC_ALGO is not 0. "
+                    f"Currently set to: {os.getenv('NVTE_ALLOW_NONDETERMINISTIC_ALGO', 'not set')}."
+                )
+
         if config.window_size is not None:
             # Check version
             assert _te_version >= packaging.version.Version(
