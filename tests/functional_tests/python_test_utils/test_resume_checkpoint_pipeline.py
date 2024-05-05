@@ -26,14 +26,14 @@ def read_tb_logs_as_list(path, summary_name, index):
         summary_list = [round(x.value, 5) for x in summary]
         print(summary_list)
         return summary_list
-    raise FileNotFoundError(f"File not found matching: {path}/events*")    
+    raise FileNotFoundError(f"File not found matching: {path}/events*")
 
 def collect_train_test_metrics(logs_dir, index):
     train_loss_list = read_tb_logs_as_list(logs_dir, "lm loss", index)
     train_loss_list = [round(elem,3) for elem in train_loss_list]
     train_metrics = {
         "lm loss": train_loss_list[0:len(train_loss_list):STEP_INTERVAL],
-    } 
+    }
     str_train_metrics = str(train_metrics).replace("'", "\"")
     print(f"\n ----------- The following are the metrics for ----------")
     print(f"\n {str_train_metrics}", flush=True)
@@ -64,8 +64,5 @@ class TestCIPipeline:
             else:
                 assert actual_val == expected_val, f"The value at step {step} should be {expected_val} but it is {actual_val}."
 
-    # def test_lm_loss_deterministic(self):
-    #     self._test_helper("lm loss", TypeOfTest.DETERMINISTIC)
-
-    def test_lm_loss_approx(self):
-        self._test_helper("lm loss", TypeOfTest.APPROX)
+    def test_lm_loss_deterministic(self):
+        self._test_helper("lm loss", TypeOfTest.DETERMINISTIC)

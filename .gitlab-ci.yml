@@ -79,7 +79,7 @@ unit_tests-dist-checkpointing:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-  
+
 unit_tests-fusions:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
   tags:
@@ -93,7 +93,7 @@ unit_tests-fusions:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-  
+
 unit_tests-models:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
   tags:
@@ -107,7 +107,7 @@ unit_tests-models:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-  
+
 unit_tests-pipeline-parallel:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
   tags:
@@ -121,7 +121,7 @@ unit_tests-pipeline-parallel:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-  
+
 unit_tests-tensor-parallel:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
   tags:
@@ -135,7 +135,7 @@ unit_tests-tensor-parallel:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-  
+
 unit_tests-transformer:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
   tags:
@@ -149,7 +149,7 @@ unit_tests-transformer:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-  
+
 unit_tests-top-py:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
   tags:
@@ -163,7 +163,7 @@ unit_tests-top-py:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-  
+
 docs_build_test:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/python-format:0.0.1
   stage: test

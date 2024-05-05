@@ -1,14 +1,12 @@
-ARG FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:23.04-py3
-FROM ${FROM_IMAGE_NAME}
+# syntax=docker/dockerfile:experimental
 
-RUN pip install --no-cache-dir \
-    "pytest-cov" \
-    "pytest_mock" \
-    "nltk" \
-    "wrapt" \
-    "zarr" \
-    "tensorstore==0.1.45" \
-    "git+https://github.com/fanshiqing/grouped_gemm@v1.0" \
-    "black==19.10b0" \
-    "isort" \
-    "click==8.0.2"
+FROM nvcr.io/nvidia/pytorch:24.01-py3
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN sed -i -e 's/^APT/# APT/' -e 's/^DPkg/# DPkg/' \
+      /etc/apt/apt.conf.d/docker-clean
+
+RUN apt-get update && apt-get install -y --no-install-recommends
+
+RUN pip3 install sentencepiece einops flask-restful pytest wandb
+RUN pip3 install git+https://github.com/fanshiqing/grouped_gemm@v1.1.1

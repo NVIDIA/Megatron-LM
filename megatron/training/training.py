@@ -885,8 +885,12 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
     timers = get_timers()
     # Extra barrier is added to make sure all ranks report the max time.
     timers('save-checkpoint', log_level=0).start(barrier=True)
+    if args.use_distributed_optimizer and args.overlap_param_gather:
+        optimizer.disable_pre_hook()
     save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
                     num_floating_point_operations_so_far, checkpointing_context)
+    if args.use_distributed_optimizer and args.overlap_param_gather:
+        optimizer.enable_pre_hook()
     timers('save-checkpoint').stop(barrier=True)
     timers.log(['save-checkpoint'])
 
