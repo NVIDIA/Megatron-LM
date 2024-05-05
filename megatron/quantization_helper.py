@@ -132,12 +132,10 @@ class QuantizationHelper:
         assert weight_tensor.nelement() % self.wq_group_size == 0
         groups =  weight_tensor.nelement() // self.wq_group_size
         quant_module = self.quant_module
-        if weight_tensor.dtype is not torch.half or weight_tensor.dtype is not torch.float:
-            weight_tensor = weight_tensor.to(torch.float)
         quant_tensor, quant_scales = quant_module.stochastic_quantize(weight_tensor, groups, self.weight_quantization_bits, quant_module.Symmetric)
         return quant_tensor, quant_scales
 
-    def dequantize_gather_weights(self, quantized_weight_tensor, scales, dequant_type, received_buffer=None):
+    def dequantize_gather_weights(self, quantized_weight_tensor, scales, dequant_type, received_buffer):
         """
         Dequantize the given tensor using CUDAQuantizer.
 
@@ -148,16 +146,18 @@ class QuantizationHelper:
         Returns:
             torch.Tensor: The dequantized tensor.
         """
-        if self.weight_quantization_bits == 4:
-            quantized_weight_tensor = self.use_2int4_represent_1int8(quantized_weight_tensor)
-        dequant_value = self.dequantize_nbits(quantized_weight_tensor, scales, groupsize=self.wq_group_size)
-        if dequant_value.dtype is not dequant_type:
-            dequant_value = dequant_value.to(dequant_type)
-        if received_buffer is not None:
-            received_buffer.copy_(dequant_value)
-            return received_buffer
+        groups =  quantized_weight_tensor.nelement() * (8 // self.weight_quantization_bits) // self.wq_group_size
+        quant_module = self.quant_module
+        if dequant_type is torch.bfloat16:
+            quant_module.dequantize_bf16(quantized_weight_tensor, scales, received_buffer, groups, self.weight_quantization_bits, quant_module.Symmetric)
+        elif dequant_type is torch.float32:
+            quant_module.dequantize_fp32(quantized_weight_tensor, scales, received_buffer, groups, self.weight_quantization_bits, quant_module.Symmetric)
+        elif dequant_type is torch.float16:
+            quant_module.dequantize_half(quantized_weight_tensor, scales, received_buffer, groups, self.weight_quantization_bits, quant_module.Symmetric)
         else:
-            return dequant_value
+            assert(False), "dequant_type is not supported"
+
+        return received_buffer
 
     def quantize_reduce_gradients(self, tensor, received_buffer=None):
         world_size = torch.distributed.get_world_size(group=self.data_parallel_group)
@@ -175,19 +175,15 @@ class QuantizationHelper:
         original_grad_type = tensor.dtype
         if original_grad_type is not torch.float32:
             tensor = tensor.to(torch.float32)
-        if self.hadamard_transform:
-            tensor = self.hadamard_tranformation_grad(tensor)
-        final_output = self.quantized_reduce_scatter(tensor)
-        if self.hadamard_transform:
-            final_output = self.hadamard_back_tranformation(final_output)
-        if final_output.dtype is not original_grad_type:
-            final_output = final_output.to(original_grad_type)
-        received_buffer.copy_(final_output)
+
+        self.quantized_reduce_scatter(tensor, received_buffer)
+
         if _GRADIENT_COMM_DEBUG == 1:
             diff = received_buffer - reduced_tensor
             print(f'Gradient Quantization DEBUG, dp rank: {torch.distributed.get_rank(group=self.data_parallel_group)}, '
                   f'abs norm: {torch.norm(diff)}, '
-                  f'rel norm: {torch.norm(diff) / torch.norm(reduced_tensor)}')
+                  f'rel norm: {torch.norm(diff) / torch.norm(reduced_tensor)}',
+                  f'reduce tensor norm: {torch.norm(reduced_tensor)}')
     def _all_to_all_along_first_dim(self, input_, output=None):
         """All to All gather tensor"""
         world_size = torch.distributed.get_world_size(group=self.data_parallel_group)
@@ -220,7 +216,7 @@ class QuantizationHelper:
             self.hadamard_matrix = get_hadamard_matrix(self.hadamard_order)
         H = self.hadamard_matrix
 
-        transformed_tensor = (tensor @ H) / torch.tensor(group_size, device=torch.cuda.current_device())
+        transformed_tensor = (tensor @ H)
 
         return transformed_tensor.view(-1)
 
@@ -229,14 +225,15 @@ class QuantizationHelper:
 
         # split tensor to groups
         transformed_tensor = transformed_tensor.view(-1, group_size)
-
+        if self.hadamard_matrix is None:
+            self.hadamard_matrix = get_hadamard_matrix(self.hadamard_order)
         H = self.hadamard_matrix
 
-        original_tensor = (transformed_tensor @ H)
+        original_tensor = (transformed_tensor @ H)  / torch.tensor(group_size, device=torch.cuda.current_device())
 
         return original_tensor.view(-1)
 
-    def quantized_reduce_scatter(self, tensor):
+    def quantized_reduce_scatter(self, tensor, received_buffer):
         assert tensor.numel() % self.gq_group_size_inter == 0 # tensor size must be multiple of group size
         assert self.gq_group_size_inter  % (8 // min(self.gradient_quantization_bits_inter, self.gradient_quantization_bits_intra)) == 0 # group size must be multiple of 2 when using 4bits
         assert self.gq_group_size_inter % 8 == 0 # group size must be multiple of 8 when tensor is half type; must be multiple of 4 when type is float. 
@@ -252,30 +249,40 @@ class QuantizationHelper:
         this_rank = torch.distributed.get_rank(
             group=self.data_parallel_group
         )
+        assert(tensor.dtype is torch.float), "current quantized graidient only support float32"
+        reduced_tensor = torch.empty(size=(tensor.numel()//intra_dp_size, ), device='cuda', dtype=torch.float)
 
         pp_rank = torch.distributed.get_rank(group=self.pipeline_parallel_group)
         tp_rank = torch.distributed.get_rank(group=self.tensor_parallel_group)
         intra_idx = int(this_rank / intra_dp_size)
         inter_idx = this_rank % intra_dp_size
         quant_module = self.quant_module
-
+        swizzle_quant_func = quant_module.swizzle_quant
+        final_dequant = quant_module.dequantize_reduce
+        if self.hadamard_transform:
+            swizzle_quant_func = quant_module.swizzle_quant_ht32
+            final_dequant = quant_module.dequantize_reduce_ht32
         """intra node quantization and all-to-all"""
-        output_tensor, output_scales = quant_module.swizzle_quant(  tensor, 
-                                                                            intra_quant_group, 
-                                                                            self.gradient_quantization_bits_intra,
-                                                                            quant_module.Symmetric, 
-                                                                            1, 
-                                                                            inter_dp_size,
-                                                                            intra_dp_size)
+        output_tensor, output_scales = swizzle_quant_func(tensor,
+                                                          intra_quant_group,
+                                                          self.gradient_quantization_bits_intra,
+                                                          quant_module.Symmetric,
+                                                          1,
+                                                          inter_dp_size,
+                                                          intra_dp_size)
         """all to all, dequantReduction"""
         all_to_all_output_tensor = torch.empty_like(output_tensor)
         all_to_all_output_scales = torch.empty_like(output_scales)
         all_to_all_single(all_to_all_output_tensor, output_tensor, group=groups[f'local_{pp_rank}_{tp_rank}_{intra_idx}'])
         all_to_all_single(all_to_all_output_scales, output_scales, group=groups[f'local_{pp_rank}_{tp_rank}_{intra_idx}'])
 
-        reduced_tensor, = quant_module.quantized_reduction(
-            all_to_all_output_tensor, all_to_all_output_scales, intra_quant_group, inter_quant_group, self.gradient_quantization_bits_intra, quant_module.Symmetric,
-            intra_dp_size)
+        quant_module.dequantize_reduce(all_to_all_output_tensor, 
+                                         all_to_all_output_scales, 
+                                         reduced_tensor, 
+                                         intra_quant_group, 
+                                         self.gradient_quantization_bits_intra, 
+                                         quant_module.Symmetric,
+                                         intra_dp_size)
         
         """inter node quantization and all-to-all"""
         quant_tensor, quant_scales = quant_module.stochastic_quantize(reduced_tensor, inter_quant_group, self.gradient_quantization_bits_inter, quant_module.Symmetric)
@@ -287,15 +294,15 @@ class QuantizationHelper:
         all_to_all_single(all_to_all_output_scales, quant_scales, group=groups[f'global_{pp_rank}_{tp_rank}_{inter_idx}'])
 
         """dequantizeReduction"""
-        dquant_output, = quant_module.quantized_reduction(all_to_all_output_tensor, 
-                                                            all_to_all_output_scales, 
-                                                            inter_quant_group, 
-                                                            inter_quant_group // inter_dp_size, 
-                                                            self.gradient_quantization_bits_inter, 
-                                                            quant_module.Symmetric,
-                                                            inter_dp_size)
+        final_dequant(all_to_all_output_tensor, 
+                        all_to_all_output_scales, 
+                        received_buffer,
+                        inter_quant_group,
+                        self.gradient_quantization_bits_inter,
+                        quant_module.Symmetric,
+                        inter_dp_size)
 
-        return dquant_output
+        return received_buffer
 
     def quantize_4bits(self, x, groupsize=-1):
         bits = 4
