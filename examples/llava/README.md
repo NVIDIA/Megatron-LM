@@ -33,6 +33,8 @@ Run training: (You should change th /path/to into the real path of your file.)
 bash pretrain_llama2_70b_tp8_pp2.sh
 ```
 
+If you want to use sequence parallel and context parallel, you need to change --image-seq-length from 257 to 256, which will omit the [CLS] token of ViT.
+
 ## Step 3
 
 Run inference: (You should change th /path/to into the real path of your file.)

@@ -35,10 +35,8 @@ class BlipImageEvalProcessor(BlipImageBaseProcessor):
     def __call__(self, item):
         return self.transform(item)
 
-def blip2_image_processor_func_megatron(image_processor, image):
-    return {'external_images': image_processor(image).unsqueeze(0), 'external_input_ids': torch.zeros(1, 257, dtype=torch.long), 'external_position_ids': torch.arange(257, dtype=torch.long).unsqueeze(0)}
-
-blip2_image_processor_megatron_224 = partial(blip2_image_processor_func_megatron, BlipImageEvalProcessor(224))
+def blip2_image_processor_func_megatron(image_seq_length, image_processor, image):
+    return {'external_images': image_processor(image).unsqueeze(0), 'external_input_ids': torch.zeros(1, image_seq_length, dtype=torch.long), 'external_position_ids': torch.arange(image_seq_length, dtype=torch.long).unsqueeze(0)}
 
 def _history_to_prompt(self, history, query, add_eoi_first=False):
     ret = []
@@ -87,7 +85,7 @@ import re
 import numpy as np
 
 class llama2_text_processor:
-    def __init__(self, tokenizer, max_target_length=1024, image_length=257, model=None):
+    def __init__(self, tokenizer, max_target_length=1024, image_length=256, model=None):
         self.tokenizer = tokenizer
         self.max_target_length = max_target_length
         self.image_length = image_length

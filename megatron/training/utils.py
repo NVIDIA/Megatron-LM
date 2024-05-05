@@ -235,7 +235,7 @@ def get_batch_on_this_cp_rank(batch):
     if cp_size > 1:
         cp_rank = mpu.get_context_parallel_rank()
         for key, val in list(batch.items()):
-            if 'external' in key:
+            if 'external' in key and 'input_ids' not in key and 'position_ids' not in key and 'attention_mask' not in key:
                 continue
             elif key == 'indices':
                 """

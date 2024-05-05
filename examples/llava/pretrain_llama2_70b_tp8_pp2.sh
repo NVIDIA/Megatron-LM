@@ -48,6 +48,7 @@ GPT_ARGS="
     --hidden-size 8192 \
     --num-attention-heads 64 \
     --seq-length 1024 \
+    --image-seq-length 257 \
     --max-position-embeddings 1024 \
     --micro-batch-size 2 \
     --global-batch-size 64 \

@@ -41,6 +41,7 @@ class MegatronVisionModel(torch.nn.Module):
     def __init__(self, pre_process):
         super().__init__()
         args = get_args()
+        self.image_seq_length = args.image_seq_length
         eva_args = torch.load(os.path.join(args.vit_load, "iter_0000001/mp_rank_00/model_optim_rng.pt"), map_location="cpu")["args"]
         eva_args.independent_parallel = True
         assert args.tensor_model_parallel_size == eva_args.tensor_model_parallel_size
@@ -60,11 +61,25 @@ class MegatronVisionModel(torch.nn.Module):
     
     def forward(self, **kw_args):
         kw_args.pop('indices', None)
+        kw_args.pop('src_indices', None)
+        kw_args.pop('tgt_indices', None)
         kw_args.pop('pre_len', None)
         external_inputs = {"images": kw_args.pop('images')}
         if 'attention_mask' not in kw_args:
             kw_args['attention_mask'] = None
         vit_output = self.vit(**kw_args, external_inputs=external_inputs)
+        if mpu.get_context_parallel_world_size() != 1:
+            cp_size = mpu.get_context_parallel_world_size()
+            cp_rank = mpu.get_context_parallel_rank()
+            calibration_index = torch.arange(self.image_seq_length, device='cuda').view(2 * cp_size, self.image_seq_length // (2 * cp_size))[[cp_rank, (2 * cp_size - cp_rank - 1)]].view(-1)
+            ci_list = [torch.empty_like(calibration_index) for _ in range(cp_size)]
+            torch.distributed.all_gather(ci_list, calibration_index, group=mpu.get_context_parallel_group())
+            calibration_index = torch.cat(ci_list)
+            vo_list = [torch.empty_like(vit_output) for _ in range(cp_size)]
+            torch.distributed.all_gather(vo_list, vit_output, group=mpu.get_context_parallel_group())
+            vit_output_all = torch.cat(vo_list)
+            vit_output = torch.empty_like(vit_output_all)
+            vit_output[calibration_index] = vit_output_all
         return self.linear_proj(vit_output.transpose(0, 1))
 
 def eva_model_provider(config):
@@ -253,9 +268,10 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         return old_batch
     args.collate_fn = collate_fn
 
-    from dataset import llama2_text_processor, llama2_tokenizer, blip2_image_processor_megatron_224
+    from dataset import llama2_text_processor, llama2_tokenizer, blip2_image_processor_func_megatron, BlipImageEvalProcessor
+    blip2_image_processor_megatron_224 = partial(blip2_image_processor_func_megatron, args.image_seq_length, BlipImageEvalProcessor(224))
     tokenizer = llama2_tokenizer('/'.join(args.tokenizer_model.split('/')[:-1]))
-    text_processor = llama2_text_processor(tokenizer, image_length=257, max_target_length=args.seq_length)
+    text_processor = llama2_text_processor(tokenizer, image_length=args.image_seq_length, max_target_length=args.seq_length)
 
     def process_fn(item):
         prompt = "Describe the image."
@@ -278,6 +294,8 @@ def add_vit_load_args(parser):
     group = parser.add_argument_group(title='vit load')
     group.add_argument("--vit-load", type=str,
                        help='path of vit')
+    group.add_argument("--image-seq-length", type=int,
+                       help='vit image length')
     return parser
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
+from megatron.core import mpu
 
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
 
@@ -192,6 +193,22 @@ class Eva2ClipModel(LanguageModule):
                 images = external_inputs["images"]
                 embeddings = self.conv1(images)
                 embeddings = embeddings.flatten(2).transpose(1, 2)
+                if mpu.get_context_parallel_world_size() != 1:
+                    cp_size = mpu.get_context_parallel_world_size()
+                    cp_rank = mpu.get_context_parallel_rank()
+                    val = embeddings
+                    seq_dim = 1
+                    val = val.view(
+                        *val.shape[0:seq_dim],
+                        2 * cp_size,
+                        val.shape[seq_dim] // (2 * cp_size),
+                        *val.shape[(seq_dim + 1) :],
+                    )
+                    index = torch.tensor([cp_rank, (2 * cp_size - cp_rank - 1)], 
+                                        device="cpu", pin_memory=True).cuda(non_blocking=True)
+                    val = val.index_select(seq_dim, index)
+                    val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
+                    embeddings = val
                 external_feature_dict = {
                     "features": embeddings,
                     "pre_len": input_ids.shape[1] - embeddings.shape[1]

@@ -8,6 +8,7 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core import mpu
 
 
 class LanguageModelEmbedding(MegatronModule):
@@ -142,6 +143,8 @@ class LanguageModelEmbedding(MegatronModule):
 
         # Dropout.
         if self.config.sequence_parallel:
+            if isinstance(self.word_embeddings, torch.nn.Embedding):
+                embeddings += self.word_embeddings.weight[0].mean() * 0
             embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
             # `scatter_to_sequence_parallel_region` returns a view, which prevents
             # the original tensor from being garbage collected. Clone to facilitate GC.
@@ -151,6 +154,9 @@ class LanguageModelEmbedding(MegatronModule):
             with tensor_parallel.get_cuda_rng_tracker().fork():
                 embeddings = self.embedding_dropout(embeddings)
         else:
+            if mpu.get_context_parallel_world_size() != 1:
+                if isinstance(self.word_embeddings, torch.nn.Embedding):
+                    embeddings += self.word_embeddings.weight[0].mean() * 0
             embeddings = self.embedding_dropout(embeddings)
 
         return embeddings
