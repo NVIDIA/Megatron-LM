@@ -1180,10 +1180,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 self.param_diff_ops('cal_model_paramdiff') 
                 pdbuf_view_items = self.get_model_paramdiff_buffer_dp_views()
                 assert self.overlap_param_gather == False
-
+                weight_dtype = pbuf.dtype
                 # PDEF before allgather: quant -> (use_1int8_represent_2int4) -> allgather
                 param2send = pbuf_views[data_parallel_rank]
-                param2recv = torch.zeros_like(pbuf)
                 if model_index < _COMM_QUANT_CHUNKNUM_PARAM: 
                     data_parallel_world_size = mpu.get_data_parallel_world_size()
 
@@ -1191,51 +1190,34 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         quant_copy = pbuf_views[data_parallel_rank].clone().detach()
                         pdbuf_views = pdbuf_view_items[all_gather_handle_index][3]
                         quant_copy_original_param = pdbuf_views[data_parallel_rank].clone().detach()
-                    param2send, s = quantize(pbuf_views[data_parallel_rank].to(torch.float32), bits=quantize_bits, groupsize=quantize_group_size)
-                    param2send = param2send.to(torch.int8)
-                    scale2send = s
+                    
+                    assert self.quantize_helper is not None, "Quantization helper for weight not initialized"
+                    param2send, scale2send = self.quantize_helper.quantize_gather_weights(pbuf_views[data_parallel_rank])
 
-                    if quantize_bits == 4: 
-                        param2send = use_1int8_represent_2int4(int4_input=param2send)
-                        # append fp32 scale2send as 4*int8 to param2send
-                        assert list(scale2send.shape)[1] == 1
-                        scale2send = torch.squeeze(scale2send, 1)
-                        scale2send_fp32shape = list(scale2send.shape)[0]
-                        param2send = torch.cat((param2send, scale2send.view(torch.int8)))
+                    param2recv_shape = list(param2send.size())
+                    param2recv_shape[0] = param2recv_shape[0] * data_parallel_world_size
+                    scale2recv_shape = list(scale2send.size())
+                    scale2recv_shape = scale2recv_shape[0] * data_parallel_world_size
 
-                        shape = list(pbuf.shape)[0] // 2 + scale2send_fp32shape * 4 * data_parallel_world_size
-                        param2recv = torch.zeros(shape, dtype=torch.int8, device=pbuf.device)
-                    else:
-                        param2recv = torch.zeros_like(pbuf, dtype=torch.int8)
+                    param2recv = torch.empty(param2recv_shape, dtype=param2send.dtype, device=param2send.device)
+                    scale2recv = torch.empty(scale2recv_shape, dtype=scale2send.dtype, device=scale2send.device)
 
                 # we donot async allgather
                 all_gather_handle = torch.distributed._all_gather_base(
                     param2recv,
                     param2send,
                     group = data_parallel_group,
-                    # async_op = self.overlap_param_gather
                 )
-
+                all_gather_handle = torch.distributed._all_gather_base(
+                    scale2recv,
+                    scale2send,
+                    group = data_parallel_group,
+                )
                 # PDEF after allgather: allgather -> (use_2int4_represent_1int8) -> dequant
-                if quantize_bits == 4: 
-                    each_dp_rank_size = list(param2send.shape)[0]
-                    to_unpack_param2recv = []
-                    scales = []
-                    for dp_idx in range(mpu.get_data_parallel_world_size()):
-                        to_unpack = param2recv[each_dp_rank_size*dp_idx : each_dp_rank_size*(dp_idx+1) - scale2send_fp32shape*4]
-                        scale_recvd = param2recv[each_dp_rank_size*(dp_idx+1) - scale2send_fp32shape*4 : each_dp_rank_size*(dp_idx+1)].clone().detach()
-
-                        to_unpack_param2recv.append(to_unpack)
-                        scales.append(torch.unsqueeze(scale_recvd.view(torch.float32), 1))
-                    to_unpack_param2recv = torch.concat(to_unpack_param2recv, dim = 0)
-                    param2recv = use_2int4_represent_1int8(to_unpack_param2recv, data_parallel_world_size)
-
-                pbuf.copy_(param2recv.to(torch.bfloat16))
+                self.quantize_helper.dequantize_gather_weights(param2recv, scale2recv, weight_dtype, pbuf)
 
                 if model_index < _COMM_QUANT_CHUNKNUM_PARAM: 
                     for idx, p in enumerate(pbuf_views): 
-                        tmp = dequantize(pbuf_views[idx], scales[idx].to(pbuf_views[idx].device), groupsize=quantize_group_size)
-                        pbuf_views[idx].copy_(tmp.to(torch.bfloat16))
                         if _COMM_QUANT_REC_ERROR == 1 and idx == data_parallel_rank:
                             abs_diff = torch.norm(quant_copy - pbuf_views[data_parallel_rank], p=2)
                             rel_diff = abs_diff / torch.norm(quant_copy, p=2)
