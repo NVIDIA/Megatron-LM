@@ -215,7 +215,7 @@ def read_metadata(tracker_filename):
     # Get the max iteration retrieved across the ranks.
     if torch.distributed.is_initialized():
         iters_cuda = torch.tensor([iteration], dtype=torch.long, device='cuda')
-        torch.distributed.all_reduce(iters_cuda, op=torch.distributed.ReduceOp.MAX, group=get_tensor_model_parallel_group())
+        torch.distributed.all_reduce(iters_cuda, op=torch.distributed.ReduceOp.MAX, group=mpu.get_tensor_model_parallel_group())
         max_iter = iters_cuda[0].item()
 
         # We should now have all the same iteration.
@@ -827,7 +827,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
 
     # Some utilities want to load a checkpoint without distributed being initialized
     if torch.distributed.is_initialized():
-        torch.distributed.barrier(group=get_tensor_model_parallel_group())
+        torch.distributed.barrier(group=mpu.get_tensor_model_parallel_group())
 
     print_rank_0(f'  successfully loaded checkpoint from {load_dir} '
                  f'[ t {mpu.get_tensor_model_parallel_rank()}, '
