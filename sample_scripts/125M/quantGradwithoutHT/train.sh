@@ -21,21 +21,21 @@ DISTRIBUTED_ARGS="
     --master_port $MASTER_PORT \
 "
 
-# 6.7B Model
+# 125M Model
 MODEL_ARGS="
-    --num-layers 32 \
-    --hidden-size 4096 \
-    --num-attention-heads 32 \
+    --num-layers 12 \
+    --hidden-size 768 \
+    --num-attention-heads 12 \
     --seq-length 2048 \
     --max-position-embeddings 2048 \
 "
 
 # learning rate, training type and other optimizer arguments
 OPTIMIZER_ARGS="
-    --lr 0.00012 \
+    --lr 0.0006 \
     --lr-decay-iters 70000 \
     --lr-decay-style cosine \
-    --min-lr 0.000012 \
+    --min-lr 0.00006 \
     --adam-beta1 0.9 \
     --adam-beta2 0.95 \
     --adam-eps 1e-08 \
@@ -54,7 +54,7 @@ OPTIMIZER_ARGS="
 TRAINING_ARGS="
     --tensor-model-parallel-size 1 \
     --pipeline-model-parallel-size 1 \
-    --micro-batch-size 2 \
+    --micro-batch-size 8 \
     --global-batch-size 256 \
     --train-iters 80000 \
 "
@@ -69,7 +69,7 @@ DATA_ARGS="
 OUTPUT_ARGS="
     --log-interval 100 \
     --timing-log-level 2 \
-    --save-interval 2502 \
+    --save-interval 5002 \
     --eval-interval 100 \
     --eval-iters 10 \
     --log-timers-to-tensorboard \
@@ -79,23 +79,18 @@ OUTPUT_ARGS="
     --tensorboard-log-interval 1 \
     --wandb-project NeurIPS \
     --wandb-save-dir ${WANDB_DIR} \
-    --wandb-exp-name 6_7B-quant \
+    --wandb-exp-name 125M-grad_wo_HT \
 "
 
 QUANTIZE_ARGS="
     --no-async-tensor-model-parallel-allreduce \
     --recompute-activations \
     --recompute-granularity selective \
-    --overlap-grad-reduce \
-    --quantized-weights \
-    --weight-quantization-bits 4 \
-    --wq-group-size 2048 \
     --quantized-gradients \
     --gq-group-size-inter 128 \
     --gradient-quantization-bits-inter 4 \
     --gq-group-size-intra 128 \
     --gradient-quantization-bits-intra 8 \
-    --hadamard-transform \
 "
 
 torchrun $DISTRIBUTED_ARGS pretrain_gpt.py \
@@ -108,4 +103,4 @@ torchrun $DISTRIBUTED_ARGS pretrain_gpt.py \
     --distributed-backend nccl \
     --save $CHECKPOINT_PATH \
     --load $CHECKPOINT_PATH \
-    --exit-duration-in-mins 2840
+    --exit-duration-in-mins 1530
