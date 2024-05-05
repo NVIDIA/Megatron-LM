@@ -488,11 +488,11 @@ class _Llama2Tokenizer(_SentencePieceTokenizer):
         return None
 
 
-class _NullTokenizer:
+class _NullTokenizer(MegatronTokenizer):
     def __init__(self, vocab_size):
-        vocab_size = int(vocab_size)
-        self._eos_id = vocab_size
-        self.vocab_size = vocab_size+1
+        super().__init__(None, vocab_size=vocab_size)
+        self._vocab_size_without_eod = int(vocab_size)
+        self._eod_id = self._vocab_size_without_eod
 
     def tokenize(self, text):
         return [int(x) for x in text.split(' ')]
@@ -500,6 +500,18 @@ class _NullTokenizer:
     def detokenize(self, ids):
         text = [str(x) for x in ids]
         return ' '.join(text)
+
+    @property
+    def vocab_size(self):
+        return self._vocab_size_without_eod + 1
+
+    @property
+    def vocab(self):
+        raise NotImplementedError
+
+    @property
+    def inv_vocab(self):
+        raise NotImplementedError
 
     @property
     def cls(self):
@@ -515,7 +527,7 @@ class _NullTokenizer:
 
     @property
     def eod(self):
-        return self._eos_id
+        return self._eod_id
 
     @property
     def additional_special_tokens_ids(self):

@@ -1,6 +1,8 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Utility functions used throughout Megatron core"""
+import array
+import hashlib
 import logging
 import math
 import operator
@@ -20,6 +22,8 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
+
+logger = logging.getLogger(__name__)
 
 
 def ensure_divisibility(numerator, denominator):
@@ -192,6 +196,60 @@ def scaled_init_method_normal(sigma, num_layers):
         return torch.nn.init.normal_(tensor, mean=0.0, std=std)
 
     return init_
+
+
+def check_param_hashes_across_dp_replicas(model: List[torch.nn.Module]) -> bool:
+    """Computes hashes of all parameters in model, all-gathers hashes across DP replicas,
+    and then checks for equality between the locally-computed hashes and the hashes
+    from DP replica 0.
+
+    NOTE: This function computes SHA-1 hashes on the CPU and thus needs to move all param
+    tensors from GPU to CPU first; as a result, this function is not intended to be called
+    very frequently in the main training loop.
+
+    Args:
+        model (List[torch.nn.Module]): List of model chunks whose parameter hashes need to
+            be checked.
+
+    Returns:
+        True if all param hashes match with corresponding hash on DP replica 0, False
+        otherwise.
+    """
+
+    # Compute per-parameter hashes on this rank.
+    params = []
+    local_param_hashes = []
+    for model_chunk_id, model_chunk in enumerate(model):
+        for (param_name, param) in model_chunk.named_parameters():
+            param_hash = torch.frombuffer(
+                array.array(
+                    'B', hashlib.sha1(param.data.to("cpu").float().numpy(force=True)).digest()
+                ),
+                dtype=torch.uint8,
+            )
+            params.append((model_chunk_id, param_name, param))
+            local_param_hashes.append(param_hash)
+    local_param_hashes = torch.stack(local_param_hashes)
+
+    # Collect per-parameter hashes across all ranks in DP group.
+    all_param_hashes = [
+        torch.zeros_like(local_param_hashes)
+        for _ in range(parallel_state.get_data_parallel_world_size())
+    ]
+    torch.distributed.all_gather(
+        all_param_hashes, local_param_hashes, group=parallel_state.get_data_parallel_group_gloo()
+    )
+
+    # Make sure local per-parameter hash matches DP rank 0.
+    param_hashes_match = torch.equal(local_param_hashes, all_param_hashes[0])
+    if not param_hashes_match:
+        for i, (model_chunk_id, param_name, param) in enumerate(params):
+            if not torch.equal(local_param_hashes[i], all_param_hashes[0][i]):
+                rank = torch.distributed.get_rank()
+                logger.info(
+                    f"[Rank {rank}] Hash not matching for {param_name} in model chunk {model_chunk_id}"
+                )
+    return param_hashes_match
 
 
 def make_tp_sharded_tensor_for_checkpoint(
@@ -490,7 +548,6 @@ class StragglerDetector:
         stop_batch (list[int]): stop time for get_batch
         sock (socket): the controller socket
         ctrlr (Thread): the controller thread
-        logger (Logger): the logger instance for this instance
     """
 
     _configured = False
@@ -541,7 +598,6 @@ class StragglerDetector:
         self.stop_batch = None
         self.sock = None
         self.ctrlr = None
-        self.logger = logging.getLogger(__name__)
 
     def configure(
         self,
@@ -714,9 +770,9 @@ class StragglerDetector:
         power = 0
         clock = 0
         if ls_ev != le_ev:
-            self.logger.warning(f"Event Start/Stop out of sync {ls_ev}/{le_ev}")
+            logger.warning(f"Event Start/Stop out of sync {ls_ev}/{le_ev}")
         elif ls_bs != ls_be:
-            self.logger.warning(f"get_batch Start/Stop out of sync {ls_bs}/{ls_be}")
+            logger.warning(f"get_batch Start/Stop out of sync {ls_bs}/{ls_be}")
         else:
             temp = torch.cuda.temperature()
             power = torch.cuda.power_draw()
@@ -770,7 +826,7 @@ class StragglerDetector:
                 now = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
                 min_flops, min_frank, _ = o_dt.aflops[0]()
                 max_flops, max_frank, _ = o_dt.aflops[-1]()
-                self.logger.info(
+                logger.info(
                     f"{now} | "
                     f"MnRtt/Rnk: {o_dt.min_elapsed} | "
                     f"MxRtt/Rnk: {o_dt.max_elapsed} | "
@@ -791,12 +847,12 @@ class StragglerDetector:
                     line = f"^^^^ Bottom {self.mmcnt} Ranks with lowest  Etpt(TF):"
                     for i in range(self.mmcnt):
                         line += f" {o_dt.aflops[i]},"
-                    self.logger.info(line)
+                    logger.info(line)
                     line = f"^^^^ Top    {self.mmcnt} Ranks with highest Etpt(TF):"
                     shift = self.world - self.mmcnt
                     for i in range(self.mmcnt):
                         line += f" {o_dt.aflops[i+shift]},"
-                    self.logger.info(line)
+                    logger.info(line)
                 ret = True
 
         # Check/Communicate if tracking is turned off or on
@@ -828,7 +884,7 @@ class StragglerDetector:
             self.stop = self.null_method
             state = "OFF"
         if self.rank == 0 and off is not self._off:
-            self.logger.info(f"Toggling StragglerDetector State {state}")
+            logger.info(f"Toggling StragglerDetector State {state}")
 
     def _handler(self) -> None:
         """Thread function for the controller.
@@ -842,7 +898,7 @@ class StragglerDetector:
 
         if self.rank == 0:
             state = "OFF" if self._off else "ON"
-            self.logger.info(
+            logger.info(
                 f"Controller ready to recv " f"commands on port {self.port}. Current state {state}"
             )
             while True:
@@ -856,9 +912,9 @@ class StragglerDetector:
                     final_resp = f"{resp}{msg_len}\r\n\r\n{msg}"
                     conn.send(final_resp.encode())
                     conn.close()
-                    self.logger.info(msg)
+                    logger.info(msg)
                 except Exception as err:
-                    self.logger.error(f"Error in stragler handler.. {str(err)}")
+                    logger.error(f"Error in stragler handler.. {str(err)}")
                     return
 
     def _controller(self):
@@ -879,7 +935,7 @@ class StragglerDetector:
                 )
                 self.ctrlr.start()
         except Exception as err:
-            self.logger.warning(f"StragglerDetector cannot be controlled.. {str(err)}")
+            logger.warning(f"StragglerDetector cannot be controlled.. {str(err)}")
 
     def _min_max(
         self,
@@ -1086,7 +1142,7 @@ class StragglerDetector:
         ret = False
         if ex_type is not None:
             err = traceback.format_exception(ex_tb)
-            self.logger.warning(f"{str(ex_val)}\n{err}")
+            logger.warning(f"{str(ex_val)}\n{err}")
             ret = True
         self.stop()
         return ret

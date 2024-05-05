@@ -303,7 +303,7 @@ def save(
         raise NotImplementedError('The only supported common strategy is torch')
 
     if sharded_strategy is None:
-        sharded_strategy = ('zarr', 1)
+        sharded_strategy = get_default_save_sharded_strategy()
     if not isinstance(sharded_strategy, SaveShardedStrategy):
         assert isinstance(sharded_strategy, tuple), type(sharded_strategy)
         sharded_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, *sharded_strategy)
@@ -328,6 +328,16 @@ def save(
             CheckpointingConfig(sharded_strategy.backend, sharded_strategy.version), checkpoint_dir
         )
     torch.distributed.barrier()
+
+
+def get_default_save_sharded_strategy(
+    backend: str = 'torch_dist', version: int = 1
+) -> SaveShardedStrategy:
+    return get_default_strategy(StrategyAction.SAVE_SHARDED, backend, version)
+
+
+def get_default_load_sharded_strategy(checkpoint_dir: str) -> LoadShardedStrategy:
+    return _verify_checkpoint_and_load_strategy(checkpoint_dir)
 
 
 # TODO: implement it as common torch strategy

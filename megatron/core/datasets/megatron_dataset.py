@@ -22,7 +22,7 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
     Args:
         dataset (LowLevelDataset): The dataset around which to build the MegatronDataset
 
-        dataset_path (str): The real path on disk to the dataset, for bookkeeping. TODO: subsume this argument by enforcing auto-bookkeeping in the dataset class type.
+        dataset_path (Optional[str]): The real path on disk to the dataset, for bookkeeping
 
         indices (numpy.ndarray): The set of the documents indices to expose
 
@@ -36,7 +36,7 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
     def __init__(
         self,
         dataset: LowLevelDataset,
-        dataset_path: str,
+        dataset_path: Optional[str],
         indices: numpy.ndarray,
         num_samples: Optional[int],
         index_split: Split,
@@ -49,28 +49,21 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
         self.index_split = index_split
         self.config = config
 
-        if not self.config.mock:
-            self.unique_identifiers = OrderedDict()
-            self.unique_identifiers["class"] = type(self).__name__
-            self.unique_identifiers["dataset_path"] = self.dataset_path
-            self.unique_identifiers["num_samples"] = self.num_samples
-            self.unique_identifiers["index_split"] = self.index_split.name
-            for attr in self._key_config_attributes():
-                self.unique_identifiers[attr] = getattr(self.config, attr)
+        self.unique_identifiers = OrderedDict()
 
-            self.unique_description = json.dumps(
-                self.unique_identifiers, indent=4, default=lambda obj: obj.unique_identifiers
-            )
-            self.unique_description_hash = hashlib.md5(
-                self.unique_description.encode("utf-8")
-            ).hexdigest()
+        self.unique_identifiers["class"] = type(self).__name__
+        self.unique_identifiers["dataset_path"] = self.dataset_path
+        self.unique_identifiers["num_samples"] = self.num_samples
+        self.unique_identifiers["index_split"] = self.index_split.name
+        for attr in self._key_config_attributes():
+            self.unique_identifiers[attr] = getattr(self.config, attr)
 
-        self._finalize()
-
-    def _finalize(self) -> None:
-        """Build the dataset and assert any subclass-specific conditions
-        """
-        pass
+        self.unique_description = json.dumps(
+            self.unique_identifiers, indent=4, default=lambda obj: obj.unique_identifiers
+        )
+        self.unique_description_hash = hashlib.md5(
+            self.unique_description.encode("utf-8")
+        ).hexdigest()
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: LowLevelDataset) -> int:
@@ -142,52 +135,3 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
             Dict[str, Union[torch.Tensor, numpy.ndarray]]: See abstract implementation
         """
         pass
-
-
-class MockDataset(MegatronDataset):
-    """The highest level wrapper class from which all mock dataset classes should inherit
-
-    The MockDataset is a special, one-off class that should not serve as a precedent for developers
-    seeking to extend the MegatronDataset. This class is incompatible with BlendedDataset
-
-    This class cannibalizes the constructor of the parent class. As such, we do not need to
-    pass in some constructor parameters. They may be populated, but most are superfluous and can
-    be None. Only num_samples, index_split, and config are required.
-
-
-    Args:
-        dataset (Optional[LowLevelDataset]): The dataset around which to build the MegatronDataset
-
-        dataset_path (Optional[str]): The real path on disk to the dataset, for bookkeeping. TODO: subsume
-        this argument by enforcing auto-bookkeeping in the dataset class type.
-
-        indices (Optional[numpy.ndarray]): The set of the documents indices to expose
-
-        num_samples (int): The number of samples to draw from the indexed dataset
-
-        index_split (Split): The indices Split
-
-        config (BlendedMegatronDatasetConfig): The config
-    """
-
-    def __init__(
-        self,
-        dataset: Optional[LowLevelDataset],
-        dataset_path: Optional[str],
-        indices: Optional[numpy.ndarray],
-        num_samples: int,
-        index_split: Split,
-        config: BlendedMegatronDatasetConfig,
-    ) -> None:
-        self.config = config
-        assert self.config.mock
-
-        super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
-
-    def __len__(self) -> int:
-        """Return an arbitrary length
-
-        Returns:
-            int: The total number of samples that are present in the dataset
-        """
-        return self.num_samples
