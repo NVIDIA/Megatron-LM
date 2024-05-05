@@ -364,6 +364,151 @@ DS_D_INLINE __half2 init<ROpType::Max>()
 #endif
 }
 
+#ifdef BF16_AVAILABLE
+#include <cuda_bf16.h>
+
+/* bfloat16 element reduce implementation */
+template <>
+DS_D_INLINE __nv_bfloat16 element<ROpType::Add>(const __nv_bfloat16 lhs, const __nv_bfloat16 rhs)
+{
+    return lhs + rhs;
+}
+
+template <>
+DS_D_INLINE __nv_bfloat16 element<ROpType::Max>(const __nv_bfloat16 lhs, const __nv_bfloat16 rhs)
+{
+#if __CUDA_ARCH__ >= 800
+    // Intrinsic limited to Ampere + newer
+    return __hmax(lhs, rhs);
+#else
+    float lhs_float = static_cast<float>(lhs);
+    float rhs_float = static_cast<float>(rhs);
+    return (lhs_float > rhs_float) ? lhs : rhs;
+#endif
+}
+
+template <>
+DS_D_INLINE __nv_bfloat16 element<ROpType::Min>(const __nv_bfloat16 lhs, const __nv_bfloat16 rhs)
+{
+#if __CUDA_ARCH__ >= 800
+    // Intrinsic limited to Ampere + newer
+    return __hmin(lhs, rhs);
+#else
+    float lhs_float = static_cast<float>(lhs);
+    float rhs_float = static_cast<float>(rhs);
+    return (lhs_float < rhs_float) ? lhs : rhs;
+#endif
+}
+
+/* bfloat162 element reduce implementation */
+template <>
+DS_D_INLINE __nv_bfloat162 element<ROpType::Add>(const __nv_bfloat162 lhs, const __nv_bfloat162 rhs)
+{
+    return lhs + rhs;
+}
+
+template <>
+DS_D_INLINE __nv_bfloat162 element<ROpType::Max>(const __nv_bfloat162 lhs, const __nv_bfloat162 rhs)
+{
+#if __CUDA_ARCH__ >= 800
+    return __hmax2(lhs, rhs);
+#else
+    union {
+        __nv_bfloat162 bf16;
+        float2 f32;
+    } lhs_u, rhs_u, max_u;
+
+    lhs_u.bf16 = lhs;
+    rhs_u.bf16 = rhs;
+
+    max_u.f32.x = fmaxf(lhs_u.f32.x, rhs_u.f32.x);
+    max_u.f32.y = fmaxf(lhs_u.f32.y, rhs_u.f32.y);
+
+    return max_u.bf16;
+#endif
+}
+
+template <>
+DS_D_INLINE __nv_bfloat162 element<ROpType::Min>(const __nv_bfloat162 lhs, const __nv_bfloat162 rhs)
+{
+#if __CUDA_ARCH__ >= 800
+    return __hmin2(lhs, rhs);
+#else
+    union {
+        __nv_bfloat162 bf16;
+        float2 f32;
+    } lhs_u, rhs_u, min_u;
+
+    lhs_u.bf16 = lhs;
+    rhs_u.bf16 = rhs;
+
+    min_u.f32.x = fminf(lhs_u.f32.x, rhs_u.f32.x);
+    min_u.f32.y = fminf(lhs_u.f32.y, rhs_u.f32.y);
+
+    return min_u.bf16;
+#endif
+}
+
+// Single bfloat16 operations
+template <>
+DS_D_INLINE __nv_bfloat16 init<ROpType::Add>()
+{
+    constexpr __nv_bfloat16_raw zero = {0x0000};  // Zero for BF16
+    return __nv_bfloat16(zero);
+}
+
+template <>
+DS_D_INLINE __nv_bfloat16 init<ROpType::Min>()
+{
+    constexpr __nv_bfloat16_raw inf = {0x7F80};  // Positive infinity for BF16
+    return __nv_bfloat16(inf);
+}
+
+template <>
+DS_D_INLINE __nv_bfloat16 init<ROpType::Max>()
+{
+    constexpr __nv_bfloat16_raw neg_inf = {0xFF80};  // Negative infinity for BF16
+    return __nv_bfloat16(neg_inf);
+}
+
+// Vectorized bfloat162 operations
+template <>
+DS_D_INLINE __nv_bfloat162 init<ROpType::Add>()
+{
+#ifdef __HIP_PLATFORM_AMD__
+    // Assuming AMD support for BF16
+    return __nv_bfloat162{_BFloat16_2{0x0000, 0x0000}};
+#else
+    constexpr __nv_bfloat162_raw zero = {0x0000, 0x0000};  // Zero for BF16
+    return __nv_bfloat162(zero);
+#endif
+}
+
+template <>
+DS_D_INLINE __nv_bfloat162 init<ROpType::Min>()
+{
+#ifdef __HIP_PLATFORM_AMD__
+    // Assuming AMD support for BF16
+    return __nv_bfloat162{_BFloat16_2{0x7F80, 0x7F80}};
+#else
+    constexpr __nv_bfloat162_raw inf = {0x7F80, 0x7F80};  // Positive infinity for BF16
+    return __nv_bfloat162(inf);
+#endif
+}
+
+template <>
+DS_D_INLINE __nv_bfloat162 init<ROpType::Max>()
+{
+#ifdef __HIP_PLATFORM_AMD__
+    // Assuming AMD support for BF16
+    return __nv_bfloat162{_BFloat16_2{0xFF80, 0xFF80}};
+#else
+    constexpr __nv_bfloat162_raw neg_inf = {0xFF80, 0xFF80};  // Negative infinity for BF16
+    return __nv_bfloat162(neg_inf);
+#endif
+}
+#endif
+
 template <>
 DS_D_INLINE int32_t init<ROpType::Add>()
 {

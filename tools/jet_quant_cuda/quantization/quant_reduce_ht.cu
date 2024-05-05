@@ -9,7 +9,8 @@
 #include "memory_access_utils.h"
 #include "quantization_utils.h"
 #include "reduction_utils.h"
-
+#include "fast_hadamard_transform.h"
+#include "fast_hadamard_transform_common.h"
 using rop = reduce::ROpType;
 
 /*
@@ -18,7 +19,7 @@ to leverage some parallel reductions here to improve performance.
 */
 
 template <int numBits, int numTensors, int totalChunks, quantize::Type quantType>
-__global__ void __launch_bounds__(1024) dequant_reduce(float* reduced_data,
+__global__ void __launch_bounds__(1024) dequant_reduce_ht(float* reduced_data,
                                                        const int8_t* input_data,
                                                        const float* input_scales,
                                                        int elems_per_out_group,
@@ -108,9 +109,30 @@ __global__ void __launch_bounds__(1024) dequant_reduce(float* reduced_data,
 
     }
 
+    // start fixed 32*32 Hadamard Transform, accroding https://github.com/Dao-AILab/fast-hadamard-transform/blob/master/csrc/fast_hadamard_transform_cuda.cu
+    constexpr int kLogNElts = 2;
+    constexpr int kNChunks = 1;
+    constexpr int kLogWarpSize = 3;
+    constexpr int kNElts = 4;
+    constexpr int kNWarps = 1;
+#pragma unroll
+    for (int i = 0; i < totalChunks; i++) {
+        float* iteration_buffer = local_buffer + i * storage_values;
+        if (i * stride + elem_offset < elems_per_out_group) {
+            hadamard_mult_thread_quant<kLogNElts, kNChunks>(iteration_buffer);
+            hadamard_mult_warp_quant<kLogWarpSize, 0, kNChunks, kNElts>(iteration_buffer);
+        }
+    }
+
 #pragma unroll
     for (int i = 0; i < totalChunks; i++) {
         const int iter_offset = (i * stride + base_offset) * (8 / numBits);
+        
+        float* data = local_buffer + i * storage_values;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            data[j] *= 0.03125; // hadamard transform back scale when order = 32
+        }
         if (i * stride + elem_offset < elems_per_in_group) {
             mem_access::store_global<16>(reduced_data + iter_offset, local_buffer + i * storage_values); //for each thread, each chunk operate on 16bytes, 4 float32 elements. 
                                                                                                         //If you want to change 16, you should also change totalChunks
@@ -125,7 +147,7 @@ int32_t pow2_round(int32_t raw_value)
 }
 
 #define LAUNCH_DEQUANT_REDUCE(num_chunks)                      \
-    dequant_reduce<numBits, numTensors, num_chunks, quantType> \
+    dequant_reduce_ht<numBits, numTensors, num_chunks, quantType> \
         <<<grid, block, 0, stream>>>(reduced_data,             \
                                      input_data,               \
                                      input_scales,             \
@@ -136,7 +158,7 @@ int32_t pow2_round(int32_t raw_value)
                                      num_tensors);
 
 template <int numBits, int numTensors, quantize::Type quantType>
-void launch_dequant_reduce_impl(float* reduced_data,
+void launch_dequant_reduce_impl_ht(float* reduced_data,
                                 const int8_t* input_data,
                                 const float* input_scales,
                                 int out_groups,
@@ -188,7 +210,7 @@ void launch_dequant_reduce_impl(float* reduced_data,
 }
 
 #define LAUNCH_DEQUANT_REDUCE_IMPL(NUM_BITS, NUM_GPUS, QUANT_TYPE)                   \
-    launch_dequant_reduce_impl<NUM_BITS, NUM_GPUS, QUANT_TYPE>(reduced_data,         \
+    launch_dequant_reduce_impl_ht<NUM_BITS, NUM_GPUS, QUANT_TYPE>(reduced_data,         \
                                                                input_data,           \
                                                                input_scales,         \
                                                                out_groups,           \
@@ -199,7 +221,7 @@ void launch_dequant_reduce_impl(float* reduced_data,
                                                                num_gpus,             \
                                                                stream);
 
-void launch_dequant_reduce(float* reduced_data,
+void launch_dequant_reduce_ht(float* reduced_data,
                            const int8_t* input_data,
                            const float* input_scales,
                            int num_gpus,
