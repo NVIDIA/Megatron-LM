@@ -1,14 +1,13 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 
-from megatron.core import tensor_parallel
 from megatron.core.models.common.vision_module.vision_module import VisionModule
 from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.enums import ModelType
-from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -18,8 +17,9 @@ class CLIPViTModel(VisionModule):
     """CLIP ViT vision model.
 
     Args:
-        transformer_config (TransformerConfig): Transformer config
-        transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers
+        transformer_config (TransformerConfig): Transformer config.
+        transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers.
+        ln_pre_impl (ModuleSpec or type): Specifies the layer norm type to use for ln_pre.
         patch_dim (int): Image patch size.
         img_h (int): Input image height.
         img_w (int): Input image width.
@@ -31,6 +31,7 @@ class CLIPViTModel(VisionModule):
         self,
         transformer_config: TransformerConfig,
         transformer_layer_spec: ModuleSpec,
+        ln_pre_impl: Union[ModuleSpec, type] = TENorm,
         patch_dim: int = 14,
         img_h: int = 336,
         img_w: int = 336,
@@ -72,10 +73,11 @@ class CLIPViTModel(VisionModule):
                 torch.randn(1, self.class_token_len, self.visual_hidden_size)
             )
 
-        self.ln_pre = TENorm(
-            config=self.config,
+        self.ln_pre = build_module(
+            ln_pre_impl,
+            config=transformer_config,
             hidden_size=self.visual_hidden_size,
-            eps=self.config.layernorm_epsilon,
+            eps=transformer_config.layernorm_epsilon,
         )
 
         self.model_type = ModelType.encoder_or_decoder
