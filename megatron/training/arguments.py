@@ -15,6 +15,7 @@ from megatron.core.models.retro.utils import (
     get_gpt_data_dir as get_retro_data_dir,
 )
 from megatron.core.transformer import TransformerConfig
+from megatron.training.activations import squared_relu
 
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
@@ -566,13 +567,6 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['bias_activation_fusion'] = args.bias_gelu_fusion
     if args.squared_relu:
         assert not args.swiglu
-        try:
-            jit_fuser = torch.compile
-        except:
-            jit_fuser = torch.jit.script
-        @jit_fuser
-        def squared_relu(x):
-            return torch.pow(F.relu(x), 2)
         kw_args['activation_func'] = squared_relu
     if args.init_method_xavier_uniform:
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
