@@ -68,6 +68,8 @@ run_cmd="${OPTIONS_NCCL} torchrun $DISTRIBUTED_ARGS run_text_generation_server_m
        --bf16  \
        --micro-batch-size 1  \
        --seq-length 4096  \
+       --image-seq-length 256 \
+       --mock-data \
        --tokenizer-model /path/to/Llama-2-70b-chat-hf/tokenizer.model \
        --use-checkpoint-args \
        --no-load-optim \

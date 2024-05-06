@@ -131,6 +131,8 @@ def add_text_generate_args(parser):
                        help='port for text generation server to run on')
     group.add_argument("--vit-load", type=str,
                        help='path to load vit model')
+    group.add_argument("--image-seq-length", type=int,
+                       help='vit image length')
     return parser
 
 
@@ -146,7 +148,7 @@ if __name__ == "__main__":
     from dataset import BlipImageEvalProcessor
 
     def blip2_image_processor_func_megatron_inference(image_processor, image):
-        return {'images': image_processor(image).unsqueeze(0).cuda(), 'input_ids': torch.zeros(1, 257, dtype=torch.long).cuda(), 'position_ids': torch.arange(257, dtype=torch.long).unsqueeze(0).cuda(), 'pre_len': 0}
+        return {'images': image_processor(image).unsqueeze(0).cuda(), 'input_ids': torch.zeros(1, args.image_seq_length, dtype=torch.long).cuda(), 'position_ids': torch.arange(args.image_seq_length, dtype=torch.long).unsqueeze(0).cuda(), 'pre_len': 0}
     blip2_image_processor_megatron_inference_224 = partial(blip2_image_processor_func_megatron_inference, BlipImageEvalProcessor(224))
 
     forward_step._IMAGE_PROCESSOR = blip2_image_processor_megatron_inference_224
@@ -155,17 +157,10 @@ if __name__ == "__main__":
     class _llama2_vision_tokenizer(_Llama2Tokenizer):
 
         def tokenize(self, s: str, bos=True, eos=False):
-            '''Default args for text completion, not chat/dialog.'''
-            assert type(s) is str
-            t = self.tokenizer.encode(s)
-            if bos:
-                t = [0] * 257 + [self.bos_id] + t
-            if eos:
-                t = t + [self.eos_id]
-            return t
+            return [0] * args.image_seq_length + super().tokenize(s, bos, eos)
 
         def detokenize(self, ids):
-            return super().detokenize(ids[257:])
+            return super().detokenize(ids[args.image_seq_length:])
 
     from megatron.training import global_vars
     global_vars._GLOBAL_TOKENIZER = _llama2_vision_tokenizer(args.tokenizer_model)
