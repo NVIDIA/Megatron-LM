@@ -637,6 +637,23 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
         self.optimizer.load_state_dict(self.optimizer.state_dict())
 
+    def post_init_quantized_buffer(self):
+        if self.quantize_helper is not None and self.quantize_helper.quantized_weights:
+            pbuf_quantize_buffer = []
+            for gbuf_index, buffers in enumerate(self.param_buffers):
+                quantize_receive_buf_per_model_chunk = []
+                for bucket_index, buf in enumerate(buffers):
+                    buffer_len = buf.numel() // (8 // self.quantize_helper.weight_quantization_bits)
+                    scale_len = buf.numel() // self.quantize_helper.wq_group_size
+                    buf_quantize_val = torch.empty(size=(buffer_len, ), dtype=torch.int8, device='cuda')
+                    buf_quantize_scale = torch.empty(size=(scale_len, ), dtype=torch.float, device='cuda')
+
+                    quantize_receive_buf_per_model_chunk.insert(
+                        0, (buf_quantize_val, buf_quantize_scale)
+                    )
+                pbuf_quantize_buffer.extend(quantize_receive_buf_per_model_chunk)
+            self.pbuf_quantize_buffer = pbuf_quantize_buffer
+
     def disable_pre_hook(self):
         assert self.remove_pre_hook_handle is not None
         self.remove_pre_hook_handle.remove()
@@ -1175,8 +1192,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert all_gather_handle_index < len(self.all_gather_handles)
 
             if self.quantize_helper is not None and self.quantize_helper.quantized_weights:
-                quantize_bits = self.quantize_helper.weight_quantization_bits
-                quantize_group_size = self.quantize_helper.wq_group_size
+                if not hasattr(self, 'pbuf_quantize_buffer') or self.pbuf_quantize_buffer is None:
+                    self.post_init_quantized_buffer()
+                (param2recv, scale2recv) = self.pbuf_quantize_buffer[all_gather_handle_index]
                 self.param_diff_ops('cal_model_paramdiff') 
                 pdbuf_view_items = self.get_model_paramdiff_buffer_dp_views()
                 assert self.overlap_param_gather == False
@@ -1199,8 +1217,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     scale2recv_shape = list(scale2send.size())
                     scale2recv_shape = scale2recv_shape[0] * data_parallel_world_size
 
-                    param2recv = torch.empty(param2recv_shape, dtype=param2send.dtype, device=param2send.device)
-                    scale2recv = torch.empty(scale2recv_shape, dtype=scale2send.dtype, device=scale2send.device)
+                    # param2recv = torch.empty(param2recv_shape, dtype=param2send.dtype, device=param2send.device)
+                    # scale2recv = torch.empty(scale2recv_shape, dtype=scale2send.dtype, device=scale2send.device)
 
                 # we donot async allgather
                 all_gather_handle = torch.distributed._all_gather_base(

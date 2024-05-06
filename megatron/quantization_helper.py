@@ -233,7 +233,7 @@ class QuantizationHelper:
 
         return original_tensor.view(-1)
 
-    def quantized_reduce_scatter(self, tensor, received_buffer):
+    def quantized_reduce_scatter_intra_and_inter(self, tensor, received_buffer):
         assert tensor.numel() % self.gq_group_size_inter == 0 # tensor size must be multiple of group size
         assert self.gq_group_size_inter  % (8 // min(self.gradient_quantization_bits_inter, self.gradient_quantization_bits_intra)) == 0 # group size must be multiple of 2 when using 4bits
         assert self.gq_group_size_inter % 8 == 0 # group size must be multiple of 8 when tensor is half type; must be multiple of 4 when type is float. 
@@ -301,8 +301,114 @@ class QuantizationHelper:
                         self.gradient_quantization_bits_inter,
                         quant_module.Symmetric,
                         inter_dp_size)
-
         return received_buffer
+
+    def quantized_reduce_scatter_intra_only(self, tensor, received_buffer):
+        assert tensor.numel() % self.gq_group_size_inter == 0 # tensor size must be multiple of group size
+        assert self.gq_group_size_inter  % (8 // min(self.gradient_quantization_bits_inter, self.gradient_quantization_bits_intra)) == 0 # group size must be multiple of 2 when using 4bits
+        assert self.gq_group_size_inter % 8 == 0 # group size must be multiple of 8 when tensor is half type; must be multiple of 4 when type is float. 
+                                    # That is because cuda swizzle quant function will load 4 float or 8 half for each thread step to get better performance
+        # assert (tensor.numel() // self.gq_group_size_inter) % (num_nodes * local_world_size * pipeline) == 0
+        groups = self.all2all_process_group
+        global_world_size = torch.distributed.get_world_size(group=self.data_parallel_group)
+        # group_size = self.gq_group_size
+        intra_quant_group = max(math.ceil(tensor.numel() / self.gq_group_size_intra), global_world_size)
+        intra_dp_size = self.intra_dp_size
+        inter_dp_size = self.inter_dp_size
+        inter_quant_group = intra_quant_group // intra_dp_size
+        this_rank = torch.distributed.get_rank(
+            group=self.data_parallel_group
+        )
+        assert(tensor.dtype is torch.float), "current quantized graidient only support float32"
+
+        pp_rank = torch.distributed.get_rank(group=self.pipeline_parallel_group)
+        tp_rank = torch.distributed.get_rank(group=self.tensor_parallel_group)
+        intra_idx = int(this_rank / intra_dp_size)
+        inter_idx = this_rank % intra_dp_size
+        quant_module = self.quant_module
+        st_quant = quant_module.stochastic_quantize
+        final_dequant = quant_module.dequantize_reduce
+        if self.hadamard_transform:
+            tensor = self.hadamard_tranformation_grad(tensor)
+            # st_quant = quant_module.stochastic_quantize_ht32 //TODO
+            final_dequant = quant_module.dequantize_reduce_ht32
+
+        """intra node quantization and all-to-all"""
+        quant_tensor, quant_scales = st_quant(tensor, intra_quant_group, self.gradient_quantization_bits_intra, quant_module.Symmetric)
+
+        """all to all, dequantReduction"""
+        all_to_all_output_tensor = torch.empty_like(quant_tensor)
+        all_to_all_output_scales = torch.empty_like(quant_scales)
+        all_to_all_single(all_to_all_output_tensor, quant_tensor, group=groups[f'local_{pp_rank}_{tp_rank}_{intra_idx}'])
+        all_to_all_single(all_to_all_output_scales, quant_scales, group=groups[f'local_{pp_rank}_{tp_rank}_{intra_idx}'])
+
+        final_dequant(all_to_all_output_tensor, 
+                        all_to_all_output_scales, 
+                        received_buffer, 
+                        intra_quant_group, 
+                        self.gradient_quantization_bits_intra, 
+                        quant_module.Symmetric,
+                        intra_dp_size)
+        return received_buffer
+
+    def quantized_reduce_scatter_inter_only(self, tensor, received_buffer):
+        assert tensor.numel() % self.gq_group_size_inter == 0 # tensor size must be multiple of group size
+        assert self.gq_group_size_inter  % (8 // min(self.gradient_quantization_bits_inter, self.gradient_quantization_bits_intra)) == 0 # group size must be multiple of 2 when using 4bits
+        assert self.gq_group_size_inter % 8 == 0 # group size must be multiple of 8 when tensor is half type; must be multiple of 4 when type is float. 
+                                    # That is because cuda swizzle quant function will load 4 float or 8 half for each thread step to get better performance
+
+        groups = self.all2all_process_group
+        global_world_size = torch.distributed.get_world_size(group=self.data_parallel_group)
+        inter_quant_group = max(math.ceil(tensor.numel() / self.gq_group_size_intra), global_world_size)
+        intra_dp_size = self.intra_dp_size
+        inter_dp_size = self.inter_dp_size
+
+        this_rank = torch.distributed.get_rank(
+            group=self.data_parallel_group
+        )
+        assert(tensor.dtype is torch.float), "current quantized graidient only support float32"
+
+        pp_rank = torch.distributed.get_rank(group=self.pipeline_parallel_group)
+        tp_rank = torch.distributed.get_rank(group=self.tensor_parallel_group)
+        intra_idx = int(this_rank / intra_dp_size)
+        inter_idx = this_rank % intra_dp_size
+        quant_module = self.quant_module
+        st_quant = quant_module.stochastic_quantize
+        final_dequant = quant_module.dequantize_reduce
+        if self.hadamard_transform:
+            tensor = self.hadamard_tranformation_grad(tensor)
+            # st_quant = quant_module.stochastic_quantize_ht32 //TODO
+            final_dequant = quant_module.dequantize_reduce_ht32
+        
+        """inter node quantization and all-to-all"""
+        quant_tensor, quant_scales = st_quant(tensor, inter_quant_group, self.gradient_quantization_bits_inter, quant_module.Symmetric)
+
+        """all to all"""
+        all_to_all_output_tensor = torch.empty_like(quant_tensor)
+        all_to_all_output_scales = torch.empty_like(quant_scales)
+        all_to_all_single(all_to_all_output_tensor, quant_tensor, group=groups[f'global_{pp_rank}_{tp_rank}_{inter_idx}'])
+        all_to_all_single(all_to_all_output_scales, quant_scales, group=groups[f'global_{pp_rank}_{tp_rank}_{inter_idx}'])
+
+        """dequantizeReduction"""
+        final_dequant(all_to_all_output_tensor, 
+                        all_to_all_output_scales, 
+                        received_buffer,
+                        inter_quant_group,
+                        self.gradient_quantization_bits_inter,
+                        quant_module.Symmetric,
+                        inter_dp_size)
+        return received_buffer
+        
+    def quantized_reduce_scatter(self, tensor, received_buffer):
+        if self.intra_dp_size > 1 and self.inter_dp_size > 1:
+            return self.quantized_reduce_scatter_intra_and_inter(tensor, received_buffer)
+        elif self.intra_dp_size > 1:
+            return self.quantized_reduce_scatter_intra_only(tensor, received_buffer)
+        elif self.inter_dp_size > 1:
+            return self.quantized_reduce_scatter_inter_only(tensor, received_buffer)
+        else:
+            received_buffer.copy_(tensor)
+            return received_buffer
 
     def quantize_4bits(self, x, groupsize=-1):
         bits = 4
