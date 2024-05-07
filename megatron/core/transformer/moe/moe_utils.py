@@ -269,7 +269,7 @@ def topk_softmax_with_capacity(
     topk: int,
     capacity_factor: float = None,
     pad_to_capacity: bool = False,
-    drop_policy: str = "probs",
+    drop_policy: str = "prob",
 ):
     """Apply capacity and padding to the top-k selection.
         Args:
