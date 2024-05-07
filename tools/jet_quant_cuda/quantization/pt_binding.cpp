@@ -299,6 +299,68 @@ std::vector<at::Tensor> stochastic_quantize(at::Tensor& input_vals,
 
 }
 
+std::vector<at::Tensor> stochastic_quantize_ht(at::Tensor& input_vals,
+                                            int groups,
+                                            int numBits,
+                                            quantize::Type quantType)
+{
+    auto dtype = at::kFloat;
+    auto params_options = at::TensorOptions()
+                              .dtype(dtype)
+                              .layout(at::kStrided)
+                              .device(at::kCUDA)
+                              .requires_grad(false);
+    const int param_elems = (quantize::requires_offset(quantType)) ? 2 : 1;
+    auto params = torch::empty({groups, param_elems}, params_options);
+
+    auto output_options = at::TensorOptions()
+                              .dtype(at::kChar)
+                              .layout(at::kStrided)
+                              .device(at::kCUDA)
+                              .requires_grad(false);
+
+    auto output_sizes = input_vals.sizes().vec();
+    output_sizes[output_sizes.size() - 1] /= numBits == 8 ? 1 : 2;
+    auto output = torch::empty(output_sizes, output_options);
+
+    const int elems_per_group = at::numel(input_vals) / groups;
+
+    if (input_vals.scalar_type() == at::ScalarType::Half) {
+        launch_quant_ht((int8_t*)output.data_ptr(),
+                    (float*)params.data_ptr(),
+                    (__half*)input_vals.data_ptr(),
+                    groups,
+                    elems_per_group,
+                    numBits,
+                    quantType,
+                    at::cuda::getCurrentCUDAStream());
+        return {output, params};
+    } else if (input_vals.scalar_type() == at::ScalarType::Float) {
+        launch_quant_ht((int8_t*)output.data_ptr(),
+                    (float*)params.data_ptr(),
+                    (float*)input_vals.data_ptr(),
+                    groups,
+                    elems_per_group,
+                    numBits,
+                    quantType,
+                    at::cuda::getCurrentCUDAStream());
+        return {output, params};
+    } else if (input_vals.scalar_type() == at::ScalarType::BFloat16) {
+        launch_quant_ht((int8_t*)output.data_ptr(),
+                    (float*)params.data_ptr(),
+                    (__nv_bfloat16*)input_vals.data_ptr(),
+                    groups,
+                    elems_per_group,
+                    numBits,
+                    quantType,
+                    at::cuda::getCurrentCUDAStream());
+        return {output, params};
+    } else {
+        throw std::runtime_error("Unsupported input tensor data type.");
+    }
+
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     pybind11::enum_<quantize::Type>(m, "QuantizationType")
@@ -310,6 +372,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dequantize_reduce", &dequantize_reduce);
     m.def("dequantize_reduce_ht32", &dequantize_reduce_ht);
     m.def("stochastic_quantize", &stochastic_quantize);
+    m.def("stochastic_quantize_ht32", &stochastic_quantize_ht);
     m.def("dequantize_half", &dequantize<__half>);
     m.def("dequantize_fp32", &dequantize<float>);
     m.def("dequantize_bf16", &dequantize<__nv_bfloat16>);

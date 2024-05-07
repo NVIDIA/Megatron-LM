@@ -58,6 +58,33 @@ void launch_quant(int8_t* output_data,
                   const quantize::Type quant_type,
                   cudaStream_t stream);
 
+void launch_quant_ht(int8_t* output_data,
+                  float* params,
+                  const __half* input_data,
+                  const int groups,
+                  const int elems_per_group,
+                  const int num_bits,
+                  const quantize::Type quant_type,
+                  cudaStream_t stream);
+
+void launch_quant_ht(int8_t* output_data,
+                  float* params,
+                  const float* input_data,
+                  const int groups,
+                  const int elems_per_group,
+                  const int num_bits,
+                  const quantize::Type quant_type,
+                  cudaStream_t stream);
+
+void launch_quant_ht(int8_t* output_data,
+                  float* params,
+                  const __nv_bfloat16* input_data,
+                  const int groups,
+                  const int elems_per_group,
+                  const int num_bits,
+                  const quantize::Type quant_type,
+                  cudaStream_t stream);
+
 template <typename T>
 void launch_dequantize_kernel(T* dequant_data,
                               const int8_t* q_data,

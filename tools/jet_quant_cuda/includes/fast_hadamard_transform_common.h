@@ -144,6 +144,48 @@ __device__ __forceinline__ void hadamard_mult_thread_quant(float x[kNChunks * (1
     }
 }
 
+template<int kLogN, int kNChunks>
+__device__ __forceinline__ void hadamard_mult_thread_quant(__half x[kNChunks * (1 << kLogN)]) {
+    constexpr int N = 1 << kLogN;
+    #pragma unroll
+    for (int i = 0; i < kLogN; ++i) {
+        const int stride = 1 << i;
+        #pragma unroll
+        for (int j = 0; j < N / 2; ++j) {
+            const int lo = j & (stride - 1);
+            const int idx = (j - lo) * 2 + lo;
+            #pragma unroll
+            for (int c = 0; c < kNChunks; ++c) {
+                const float a = __half2float(x[c * N + idx]);
+                const float b = __half2float(x[c * N + idx + stride]);
+                x[c * N + idx] = __float2half(a + b);
+                x[c * N + idx + stride] = __float2half(a - b);
+            }
+        }
+    }
+}
+
+template<int kLogN, int kNChunks>
+__device__ __forceinline__ void hadamard_mult_thread_quant(__nv_bfloat16 x[kNChunks * (1 << kLogN)]) {
+    constexpr int N = 1 << kLogN;
+    #pragma unroll
+    for (int i = 0; i < kLogN; ++i) {
+        const int stride = 1 << i;
+        #pragma unroll
+        for (int j = 0; j < N / 2; ++j) {
+            const int lo = j & (stride - 1);
+            const int idx = (j - lo) * 2 + lo;
+            #pragma unroll
+            for (int c = 0; c < kNChunks; ++c) {
+                const float a = __bfloat162float(x[c * N + idx]);
+                const float b = __bfloat162float(x[c * N + idx + stride]);
+                x[c * N + idx] = __float2bfloat16(a + b);
+                x[c * N + idx + stride] = __float2bfloat16(a - b);
+            }
+        }
+    }
+}
+
 template<int kLogWarpSize, int kStepStart, int kNChunks, int kNItems>
 __device__ __forceinline__ void hadamard_mult_warp_quant(float x[kNChunks * kNItems]) {
     constexpr int N = 1 << kLogWarpSize;
@@ -162,6 +204,45 @@ __device__ __forceinline__ void hadamard_mult_warp_quant(float x[kNChunks * kNIt
         }
     }
 }
+
+template<int kLogWarpSize, int kStepStart, int kNChunks, int kNItems>
+__device__ __forceinline__ void hadamard_mult_warp_quant(__half x[kNChunks * kNItems]) {
+    constexpr int N = 1 << kLogWarpSize;
+    int lane_id = threadIdx.x % N;
+    #pragma unroll
+    for (int step = kStepStart; step < kLogWarpSize; ++step) {
+        const int lane_mask = 1 << step;
+        const float sign = (lane_id & lane_mask) ? -1.f : 1.f;
+        #pragma unroll
+        for (int c = 0; c < kNChunks; ++c) {
+            #pragma unroll
+            for (int i = 0; i < kNItems; ++i) {
+                float x_val_other = __half2float(__shfl_xor_sync(FULL_MASK, x[c * kNItems + i], lane_mask));
+                x[c * kNItems + i] = __float2half(sign * __half2float(x[c * kNItems + i]) + x_val_other);
+            }
+        }
+    }
+}
+
+template<int kLogWarpSize, int kStepStart, int kNChunks, int kNItems>
+__device__ __forceinline__ void hadamard_mult_warp_quant(__nv_bfloat16 x[kNChunks * kNItems]) {
+    constexpr int N = 1 << kLogWarpSize;
+    int lane_id = threadIdx.x % N;
+    #pragma unroll
+    for (int step = kStepStart; step < kLogWarpSize; ++step) {
+        const int lane_mask = 1 << step;
+        const float sign = (lane_id & lane_mask) ? -1.f : 1.f;
+        #pragma unroll
+        for (int c = 0; c < kNChunks; ++c) {
+            #pragma unroll
+            for (int i = 0; i < kNItems; ++i) {
+                float x_val_other = __bfloat162float(__shfl_xor_sync(FULL_MASK, x[c * kNItems + i], lane_mask));
+                x[c * kNItems + i] = __float2bfloat16(sign * __bfloat162float(x[c * kNItems + i]) + x_val_other);
+            }
+        }
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int kNChunks, int kNElts, typename input_t>
