@@ -329,9 +329,8 @@ class QuantizationHelper:
         st_quant = quant_module.stochastic_quantize
         final_dequant = quant_module.dequantize_reduce
         if self.hadamard_transform:
-            tensor = self.hadamard_tranformation_grad(tensor)
-            # st_quant = quant_module.stochastic_quantize_ht32 //TODO
-            final_dequant = quant_module.dequantize_reduce_ht32
+            st_quant = quant_module.stochastic_quantize_ht32 # fused st quantization with hadamard transform order of 32
+            final_dequant = quant_module.dequantize_reduce_ht32 # fused dquantization with hadamard transform order of 32 and divided by 32
 
         """intra node quantization and all-to-all"""
         quant_tensor, quant_scales = st_quant(tensor, intra_quant_group, self.gradient_quantization_bits_intra, quant_module.Symmetric)
@@ -376,9 +375,8 @@ class QuantizationHelper:
         st_quant = quant_module.stochastic_quantize
         final_dequant = quant_module.dequantize_reduce
         if self.hadamard_transform:
-            tensor = self.hadamard_tranformation_grad(tensor)
-            # st_quant = quant_module.stochastic_quantize_ht32 //TODO
-            final_dequant = quant_module.dequantize_reduce_ht32
+            st_quant = quant_module.stochastic_quantize_ht32 # fused st quantization with hadamard transform order of 32
+            final_dequant = quant_module.dequantize_reduce_ht32 # fused dquantization with hadamard transform order of 32 and divided by 32
         
         """inter node quantization and all-to-all"""
         quant_tensor, quant_scales = st_quant(tensor, inter_quant_group, self.gradient_quantization_bits_inter, quant_module.Symmetric)
