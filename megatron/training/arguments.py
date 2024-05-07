@@ -534,6 +534,10 @@ def validate_args(args, defaults={}):
         assert os.getenv("NCCL_ALGO", -1) != -1 and os.getenv("NCCL_ALGO") in all_reduce_choices, \
             f"NCCL_ALGO must be one of {all_reduce_choices}."
 
+    # Update the printed args to reflect that `apply_query_key_layer_scaling` also controls `attention_softmax_in_fp32`
+    if args.apply_query_key_layer_scaling:
+        args.attention_softmax_in_fp32 = True
+
     # Print arguments.
     _print_args("arguments", args)
 
@@ -1285,11 +1289,9 @@ def _add_mixed_precision_args(parser):
                        help='Move residual connections to fp32.')
     group.add_argument('--apply-query-key-layer-scaling', action='store_true',
                        help='Scale Q * K^T by 1 / layer-number. '
-                       'Useful for fp16 training.')
+                       'Useful for fp16 training. Also sets `attention_softmax_in_fp32` to True.')
     group.add_argument('--attention-softmax-in-fp32', action='store_true',
-                       help='Run attention masking and softmax in fp32. '
-                       'This flag is ignored unless '
-                       '--no-query-key-layer-scaling is specified.')
+                       help='Run attention masking and softmax in fp32.')
     group.add_argument('--accumulate-allreduce-grads-in-fp32',
                        action='store_true',
                        help='Gradient accumulation and all-reduce in fp32.')
