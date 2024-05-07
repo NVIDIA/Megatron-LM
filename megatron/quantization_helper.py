@@ -250,7 +250,6 @@ class QuantizationHelper:
             group=self.data_parallel_group
         )
         assert(tensor.dtype is torch.float), "current quantized graidient only support float32"
-        reduced_tensor = torch.empty(size=(tensor.numel()//intra_dp_size, ), device='cuda', dtype=torch.float)
 
         pp_rank = torch.distributed.get_rank(group=self.pipeline_parallel_group)
         tp_rank = torch.distributed.get_rank(group=self.tensor_parallel_group)
@@ -276,16 +275,14 @@ class QuantizationHelper:
         all_to_all_single(all_to_all_output_tensor, output_tensor, group=groups[f'local_{pp_rank}_{tp_rank}_{intra_idx}'])
         all_to_all_single(all_to_all_output_scales, output_scales, group=groups[f'local_{pp_rank}_{tp_rank}_{intra_idx}'])
 
-        quant_module.dequantize_reduce(all_to_all_output_tensor, 
-                                         all_to_all_output_scales, 
-                                         reduced_tensor, 
-                                         intra_quant_group, 
-                                         self.gradient_quantization_bits_intra, 
-                                         quant_module.Symmetric,
-                                         intra_dp_size)
-        
-        """inter node quantization and all-to-all"""
-        quant_tensor, quant_scales = quant_module.stochastic_quantize(reduced_tensor, inter_quant_group, self.gradient_quantization_bits_inter, quant_module.Symmetric)
+        """fused dequantization & reduction & quantization kernel"""
+        quant_tensor, quant_scales = quant_module.dequantize_reduce_quant(all_to_all_output_tensor,
+                                                                          all_to_all_output_scales,
+                                                                          intra_quant_group,
+                                                                          self.gradient_quantization_bits_intra,
+                                                                          self.gradient_quantization_bits_inter,
+                                                                          quant_module.Symmetric,
+                                                                          intra_dp_size)
 
         """all to all"""
         all_to_all_output_tensor = torch.empty_like(quant_tensor)
