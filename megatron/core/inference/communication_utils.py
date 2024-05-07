@@ -1,7 +1,6 @@
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.inference.common_inference_params import CommonInferenceParams
 
 
 def synchronize_list_across_all_ranks(size, list_values=None, dtype=torch.float32):

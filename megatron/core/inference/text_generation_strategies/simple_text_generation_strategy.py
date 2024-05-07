@@ -14,8 +14,6 @@ from megatron.core.inference.communication_utils import (
 from megatron.core.inference.inference_model_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
-from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
-from megatron.global_vars import get_num_microbatches
 
 
 class SimpleTextGenerationStrategy:

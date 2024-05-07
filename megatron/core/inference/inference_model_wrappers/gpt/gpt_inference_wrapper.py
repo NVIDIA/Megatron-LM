@@ -1,23 +1,22 @@
 from argparse import Namespace
-from typing import List, Tuple, Union
+from typing import List, Tuple
 
 import torch
 
-import megatron.model
 from megatron.core.inference.inference_model_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
-from megatron.model import GPTModel
+from megatron.core.models.gpt import GPTModel
 
 
 class GPTInferenceWrapper(AbstractModelInferenceWrapper):
-    def __init__(self, model: Union[GPTModel, megatron.model.GPTModel], args: Namespace):
+    def __init__(self, model: GPTModel, args: Namespace):
         """Constructor for the model inference wrapper
 
         The wrapper is in charge of preparing the model for inference, providing the required in put data and running the forward passf
 
         Args:
-            model (Union[GPTModel, megatron.model.GPTModel]): The actual GPT model (MCore or MLM)
+            model (GPTModel): The actual GPT model (MCore or MLM)
             args (Namespace): The commadline arguments that were passed
         """
         super().__init__(model, args)
