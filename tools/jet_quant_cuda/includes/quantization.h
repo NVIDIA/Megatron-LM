@@ -156,6 +156,21 @@ void launch_dequant_reduce(float* reduced_data,
                            int elems_per_in_group,
                            cudaStream_t stream);
 
+void launch_dequant_reduce_quant(int8_t* reduced_data,
+                           float* reduced_scales,
+                           const int8_t* input_data,
+                           const float* input_scales,
+                           int num_gpus,
+                           int in_num_bits,
+                           int out_num_bits,
+                           quantize::Type quant_type,
+                           int out_groups,
+                           int elems_per_out_group,
+                           int elems_per_in_tensor,
+                           int groups_per_in_tensor,
+                           int elems_per_in_group,
+                           cudaStream_t stream);
+
 void launch_dequant_reduce_ht(float* reduced_data,
                             const int8_t* input_data,
                             const float* input_scales,

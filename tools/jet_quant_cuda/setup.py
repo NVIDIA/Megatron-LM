@@ -29,6 +29,7 @@ source_files = [
     os.path.join(setup_dir, 'quantization', 'stochastic_quantize.cu'),
     os.path.join(setup_dir, 'quantization', 'stochastic_quantize_ht.cu'),
     os.path.join(setup_dir, 'quantization', 'dequantize.cu'),
+    os.path.join(setup_dir, 'quantization', 'dequant_reduce_quant.cu'),
     os.path.join(setup_dir, 'hadamard', 'hadamard_binding.cpp'),
     os.path.join(setup_dir, 'hadamard', 'fast_hadamard_transform_cuda.cu'),
 ]

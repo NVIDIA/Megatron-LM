@@ -63,8 +63,8 @@ at::Tensor dequantize_reduce(at::Tensor& input_vals,
 
     const int elems_per_in_tensor = at::numel(input_vals) / chunks;
     const int out_groups = num_groups / chunks;
-    const int elems_per_in_group = elems_per_in_tensor / (num_groups / chunks);
-    const int elems_per_out_group = elems_per_in_group * (8 / num_bits) * 4;
+    const int elems_per_in_group = elems_per_in_tensor / (num_groups / chunks); // number of bytes per in group
+    const int elems_per_out_group = elems_per_in_group * (8 / num_bits) * sizeof(float); // number of bytes per out group
 
     launch_dequant_reduce((float*)output_buffer.data_ptr(),
                           (const int8_t*)input_vals.data_ptr(),
@@ -361,6 +361,55 @@ std::vector<at::Tensor> stochastic_quantize_ht(at::Tensor& input_vals,
 
 }
 
+std::vector<at::Tensor> dequantize_reduce_quant(at::Tensor& input_vals,
+                                            at::Tensor& input_scales,
+                                            int in_groups,
+                                            int in_num_bits,
+                                            int out_num_bits,
+                                            quantize::Type quant_type,
+                                            int chunks)
+{
+    auto scales_options = at::TensorOptions()
+                              .dtype(at::kFloat)
+                              .layout(at::kStrided)
+                              .device(at::kCUDA)
+                              .requires_grad(false);
+    const int scales_elems = (quantize::requires_offset(quant_type)) ? 2 : 1;
+    const int out_groups = in_groups / chunks;
+    auto scales = torch::empty({out_groups, scales_elems}, scales_options);
+
+    auto output_options = at::TensorOptions()
+                              .dtype(at::kChar)
+                              .layout(at::kStrided)
+                              .device(at::kCUDA)
+                              .requires_grad(false);
+
+    std::vector<long int> sz(input_vals.sizes().begin(), input_vals.sizes().end());
+    sz[sz.size() - 1] = sz.back() / chunks ;
+    sz[sz.size() - 1] = sz.back() * out_num_bits / in_num_bits ;
+    const int elems_per_in_tensor = at::numel(input_vals) / chunks;
+    auto output = torch::empty(sz, output_options);
+
+    const int elems_per_in_group = elems_per_in_tensor / (in_groups / chunks); // number of bytes per in group
+    const int elems_per_out_group = elems_per_in_group * out_num_bits / in_num_bits ; // number of bytes of per out group
+
+    launch_dequant_reduce_quant((int8_t*)output.data_ptr(),
+                                (float*)scales.data_ptr(),
+                                (const int8_t*)input_vals.data_ptr(),
+                                (const float*)input_scales.data_ptr(),
+                                chunks,
+                                in_num_bits,
+                                out_num_bits,
+                                quant_type,
+                                out_groups,
+                                elems_per_out_group,
+                                elems_per_in_tensor,
+                                in_groups / chunks,
+                                elems_per_in_group,
+                                at::cuda::getCurrentCUDAStream());
+    return {output, scales};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     pybind11::enum_<quantize::Type>(m, "QuantizationType")
@@ -369,6 +418,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .export_values();
     m.def("swizzle_quant", &ds_swizzle_quant);
     m.def("swizzle_quant_ht32", &ds_swizzle_quant_ht, "swizzle quantization with Hadamard Transfomr 32*32");
+    m.def("dequantize_reduce_quant", &dequantize_reduce_quant);
     m.def("dequantize_reduce", &dequantize_reduce);
     m.def("dequantize_reduce_ht32", &dequantize_reduce_ht);
     m.def("stochastic_quantize", &stochastic_quantize);
