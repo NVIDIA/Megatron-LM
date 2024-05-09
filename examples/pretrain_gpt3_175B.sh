@@ -55,7 +55,7 @@ run_cmd="python -u ${DIR}/pretrain_gpt.py $@ ${options}"
 
 
 srun -l \
-     --container-image "nvcr.io/nvidia/pytorch:20.12-py3" \
+     --container-image "nvcr.io/nvidia/pytorch:24.01-py3" \
      --container-mounts "<DIRECTORIES TO MOUNT>" \
      --output=$DIR/logs/%x_%j_$DATETIME.log sh -c "${run_cmd}"
 
