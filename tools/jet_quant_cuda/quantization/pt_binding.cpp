@@ -142,7 +142,7 @@ std::vector<at::Tensor> ds_swizzle_quant(at::Tensor& input_vals,
                               .requires_grad(false);
 
     const int quantization_scalar = 8 / num_bits;
-    const int compressed_vals = at::numel(input_vals) / quantization_scalar;
+    const int64_t compressed_vals = at::numel(input_vals) / quantization_scalar;
 
     auto output = torch::empty({compressed_vals}, output_options);
     const int elems_per_group = at::numel(input_vals) / groups;
@@ -201,7 +201,7 @@ std::vector<at::Tensor> ds_swizzle_quant_ht(at::Tensor& input_vals,
                               .requires_grad(false);
 
     const int quantization_scalar = 8 / num_bits;
-    const int compressed_vals = at::numel(input_vals) / quantization_scalar;
+    const int64_t compressed_vals = at::numel(input_vals) / quantization_scalar;
 
     auto output = torch::empty({compressed_vals}, output_options);
     const int elems_per_group = at::numel(input_vals) / groups;
@@ -391,6 +391,7 @@ std::vector<at::Tensor> dequantize_reduce_quant(at::Tensor& input_vals,
     auto output = torch::empty(sz, output_options);
 
     const int elems_per_in_group = elems_per_in_tensor / (in_groups / chunks); // number of bytes per in group
+    // const int elems_per_out_group = elems_per_in_tensor / out_groups; 
     const int elems_per_out_group = elems_per_in_group * out_num_bits / in_num_bits ; // number of bytes of per out group
 
     launch_dequant_reduce_quant((int8_t*)output.data_ptr(),
