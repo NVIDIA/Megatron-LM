@@ -23,7 +23,7 @@ __global__ void __launch_bounds__(1024) dequant_reduce_ht(float* reduced_data,
                                                        const int8_t* input_data,
                                                        const float* input_scales,
                                                        int elems_per_out_group,
-                                                       int elems_per_in_tensor,
+                                                       int64_t elems_per_in_tensor,
                                                        int groups_per_in_tensor,
                                                        int elems_per_in_group,
                                                        int num_tensors)
@@ -39,9 +39,9 @@ __global__ void __launch_bounds__(1024) dequant_reduce_ht(float* reduced_data,
     constexpr int storage_values = 16 / sizeof(float); //for each thread, each chunk operate on 16bytes, 4 float32 elements. 
                                                         //If you want to change 16, you should also change totalChunks
 
-    const int block_offset = tb.group_index().x * elems_per_in_group;
+    const int64_t block_offset = tb.group_index().x * elems_per_in_group;
     const int elem_offset = tb.thread_index().x * elems_per_load;
-    const int base_offset = block_offset + elem_offset;
+    const int64_t base_offset = block_offset + elem_offset;
     const int stride = tb.group_dim().x * elems_per_load;
 
     float local_buffer[totalChunks * storage_values];
@@ -57,7 +57,7 @@ __global__ void __launch_bounds__(1024) dequant_reduce_ht(float* reduced_data,
             iteration_buffer[j] = reduce::init<rop::Add, float>();
         }
 
-        const int iter_offset = i * stride + base_offset;
+        const int64_t iter_offset = i * stride + base_offset;
         const int iter_scale_idx = iter_offset / elems_per_in_group;
         bool do_loads = i * stride + elem_offset < elems_per_in_group;
 
@@ -110,11 +110,11 @@ __global__ void __launch_bounds__(1024) dequant_reduce_ht(float* reduced_data,
     }
 
     // start fixed 32*32 Hadamard Transform, accroding https://github.com/Dao-AILab/fast-hadamard-transform/blob/master/csrc/fast_hadamard_transform_cuda.cu
-    constexpr int kLogNElts = 2;
     constexpr int kNChunks = 1;
-    constexpr int kLogWarpSize = 3;
-    constexpr int kNElts = 4;
-    constexpr int kNWarps = 1;
+    constexpr int kNElts = quantize::f_per_load;
+    constexpr int kLogNElts = cilog2(kNElts);
+    constexpr int kNWarps = 32 / kNElts;
+    constexpr int kLogWarpSize = cilog2(kNWarps);
 #pragma unroll
     for (int i = 0; i < totalChunks; i++) {
         float* iteration_buffer = local_buffer + i * storage_values;
@@ -126,7 +126,7 @@ __global__ void __launch_bounds__(1024) dequant_reduce_ht(float* reduced_data,
 
 #pragma unroll
     for (int i = 0; i < totalChunks; i++) {
-        const int iter_offset = (i * stride + base_offset) * (8 / numBits);
+        const int64_t iter_offset = (i * stride + base_offset) * (8 / numBits);
         
         float* data = local_buffer + i * storage_values;
 #pragma unroll
@@ -163,7 +163,7 @@ void launch_dequant_reduce_impl_ht(float* reduced_data,
                                 const float* input_scales,
                                 int out_groups,
                                 int elems_per_out_group,
-                                int elems_per_in_tensor,
+                                int64_t elems_per_in_tensor,
                                 int groups_per_in_tensor,
                                 int elems_per_in_group,
                                 int num_tensors,
@@ -229,7 +229,7 @@ void launch_dequant_reduce_ht(float* reduced_data,
                            quantize::Type quant_type,
                            int out_groups,
                            int elems_per_out_group,
-                           int elems_per_in_tensor,
+                           int64_t elems_per_in_tensor,
                            int groups_per_in_tensor,
                            int elems_per_in_group,
                            cudaStream_t stream)

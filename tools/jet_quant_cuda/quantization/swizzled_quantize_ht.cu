@@ -34,10 +34,10 @@ __global__ void swizzled_quant_kernel_ht(int8_t* quantized_data,
     cg::thread_block_tile<hw_warp_size> warp = cg::tiled_partition<hw_warp_size>(tb);
 
     // Indexing offsets, same as normal quantization for in-case
-    const int block_rank = blockIdx.x + blockIdx.y * gridDim.x + blockIdx.z * gridDim.x * gridDim.y;
-    const int block_offset = block_rank * elems_per_group;
+    const int64_t block_rank = blockIdx.x + blockIdx.y * gridDim.x + blockIdx.z * gridDim.x * gridDim.y;
+    const int64_t block_offset = block_rank * elems_per_group;
     const int elem_offset = tb.thread_index().x * quantize::h_per_load;
-    const int base_offset = block_offset + elem_offset;
+    const int64_t base_offset = block_offset + elem_offset;
     const int stride = tb.size() * quantize::h_per_load;
     const __half* input_base = uncompressed_data + base_offset;
 
@@ -52,6 +52,28 @@ __global__ void swizzled_quant_kernel_ht(int8_t* quantized_data,
         mem_access::load_global<quantize::granularity>(
             iteration_buffer, input_base + i * stride, elem_offset + i * stride < elems_per_group);
 
+    }
+
+    // start fixed 32*32 Hadamard Transform, accroding https://github.com/Dao-AILab/fast-hadamard-transform/blob/master/csrc/fast_hadamard_transform_cuda.cu
+    constexpr int kNChunks = 1;
+    constexpr int kNElts = quantize::h_per_load;
+    constexpr int kLogNElts = cilog2(kNElts);
+    constexpr int kNWarps = 32 / kNElts;
+    constexpr int kLogWarpSize = cilog2(kNWarps);
+#pragma unroll
+    for (int i = 0; i < totalChunks; i++) {
+        __half2* iteration_buffer = local_buffer + i * quantize::h2_per_load;
+        __half* iteration_cast = reinterpret_cast<__half*>(iteration_buffer);
+        if (i * stride + elem_offset < elems_per_group) {
+            hadamard_mult_thread_quant<kLogNElts, kNChunks>(iteration_cast);
+            hadamard_mult_warp_quant<kLogWarpSize, 0, kNChunks, kNElts>(iteration_cast);
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < totalChunks; i++) {
+        __half2* iteration_buffer = local_buffer + i * quantize::h2_per_load;
+
 #pragma unroll
         for (int j = 0; j < quantize::h2_per_load; j++) { stats.update(iteration_buffer[j]); }
     }
@@ -65,9 +87,9 @@ __global__ void swizzled_quant_kernel_ht(int8_t* quantized_data,
     const int output_partition = (pipelining_offset + partition_base + partition_offset);
 
     constexpr int out_scalar_effect = 8 / numBits;
-    const int out_block_rank = output_partition * gridDim.x + blockIdx.x;
-    const int out_block_offset = out_block_rank * elems_per_group / out_scalar_effect;
-    const int out_base_offset = out_block_offset + elem_offset / out_scalar_effect;
+    const int64_t out_block_rank = output_partition * gridDim.x + blockIdx.x;
+    const int64_t out_block_offset = out_block_rank * elems_per_group / out_scalar_effect;
+    const int64_t out_base_offset = out_block_offset + elem_offset / out_scalar_effect;
     int8_t* out_base = quantized_data + out_base_offset;
 
     const int out_stride = stride / out_scalar_effect;
@@ -98,10 +120,10 @@ __global__ void swizzled_quant_kernel_float_ht(int8_t* quantized_data,
     cg::thread_block_tile<hw_warp_size> warp = cg::tiled_partition<hw_warp_size>(tb);
 
     // Indexing offsets, same as normal quantization for in-case
-    const int block_rank = blockIdx.x + blockIdx.y * gridDim.x + blockIdx.z * gridDim.x * gridDim.y;
-    const int block_offset = block_rank * elems_per_group;
+    const int64_t block_rank = blockIdx.x + blockIdx.y * gridDim.x + blockIdx.z * gridDim.x * gridDim.y;
+    const int64_t block_offset = block_rank * elems_per_group;
     const int elem_offset = tb.thread_index().x * quantize::f_per_load;
-    const int base_offset = block_offset + elem_offset;
+    const int64_t base_offset = block_offset + elem_offset;
     const int stride = tb.size() * quantize::f_per_load;
     const float* input_base = uncompressed_data + base_offset;
 
@@ -118,11 +140,11 @@ __global__ void swizzled_quant_kernel_float_ht(int8_t* quantized_data,
     }
 
     // start fixed 32*32 Hadamard Transform, accroding https://github.com/Dao-AILab/fast-hadamard-transform/blob/master/csrc/fast_hadamard_transform_cuda.cu
-    constexpr int kLogNElts = 2;
     constexpr int kNChunks = 1;
-    constexpr int kLogWarpSize = 3;
-    constexpr int kNElts = 4;
-    constexpr int kNWarps = 1;
+    constexpr int kNElts = quantize::f_per_load;
+    constexpr int kLogNElts = cilog2(kNElts);
+    constexpr int kNWarps = 32 / kNElts;
+    constexpr int kLogWarpSize = cilog2(kNWarps);
 #pragma unroll
     for (int i = 0; i < totalChunks; i++) {
         float* iteration_buffer = local_buffer + i * quantize::f_per_load;
@@ -146,9 +168,9 @@ __global__ void swizzled_quant_kernel_float_ht(int8_t* quantized_data,
     const int output_partition = (pipelining_offset + partition_base + partition_offset);
 
     constexpr int out_scalar_effect = 8 / numBits;
-    const int out_block_rank = output_partition * gridDim.x + blockIdx.x;
-    const int out_block_offset = out_block_rank * elems_per_group / out_scalar_effect;
-    const int out_base_offset = out_block_offset + elem_offset / out_scalar_effect;
+    const int64_t out_block_rank = output_partition * gridDim.x + blockIdx.x;
+    const int64_t out_block_offset = out_block_rank * elems_per_group / out_scalar_effect;
+    const int64_t out_base_offset = out_block_offset + elem_offset / out_scalar_effect;
     int8_t* out_base = quantized_data + out_base_offset;
 
     const int out_stride = stride / out_scalar_effect;

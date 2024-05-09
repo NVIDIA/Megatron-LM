@@ -31,11 +31,11 @@ __global__ void cached_quantization_ht(int8_t* __restrict__ output_data,
     cg::thread_block_tile<hw_warp_size> warp = cg::tiled_partition<hw_warp_size>(tb);
 
     // Indexing offsets
-    const int block_offset =
-        (tb.group_index().x * (max_threads / threads_per_group) * elems_per_group) +
+    const int64_t block_offset =
+        (static_cast<int64_t>(tb.group_index().x) * (max_threads / threads_per_group) * elems_per_group) +
         (tb.thread_index().y * elems_per_group);
     const int elem_offset = tb.thread_index().x * quantize::h_per_load;
-    const int base_offset = block_offset + elem_offset;
+    const int64_t base_offset = block_offset + elem_offset;
     const int stride = tb.size() * quantize::h_per_load;
 
     const __half* input_base = input_data + base_offset;  //..
@@ -101,11 +101,11 @@ __global__ void cached_quantization_ht(int8_t* __restrict__ output_data,
     cg::thread_block_tile<hw_warp_size> warp = cg::tiled_partition<hw_warp_size>(tb);
 
     // Indexing offsets
-    const int block_offset =
-        (tb.group_index().x * (max_threads / threads_per_group) * elems_per_group) +
+    const int64_t block_offset =
+        (static_cast<int64_t>(tb.group_index().x) * (max_threads / threads_per_group) * elems_per_group) +
         (tb.thread_index().y * elems_per_group);
     const int elem_offset = tb.thread_index().x * quantize::bf_per_load;
-    const int base_offset = block_offset + elem_offset;
+    const int64_t base_offset = block_offset + elem_offset;
     const int stride = tb.size() * quantize::bf_per_load;
 
     const __nv_bfloat16* input_base = input_data + base_offset;
@@ -169,11 +169,11 @@ __global__ void cached_quantization_ht(int8_t* __restrict__ output_data,
     cg::thread_block_tile<hw_warp_size> warp = cg::tiled_partition<hw_warp_size>(tb);
 
     // Indexing offsets
-    const int block_offset =
-        (tb.group_index().x * (max_threads / threads_per_group) * elems_per_group) +
+    const int64_t block_offset =
+        (static_cast<int64_t>(tb.group_index().x) * (max_threads / threads_per_group) * elems_per_group) +
         (tb.thread_index().y * elems_per_group);
     const int elem_offset = tb.thread_index().x * quantize::f_per_load;
-    const int base_offset = block_offset + elem_offset;
+    const int64_t base_offset = block_offset + elem_offset;
     const int stride = tb.size() * quantize::f_per_load;
 
     const float* input_base = input_data + base_offset;  //..

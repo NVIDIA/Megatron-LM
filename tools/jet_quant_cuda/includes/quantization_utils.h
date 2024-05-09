@@ -753,11 +753,11 @@ DS_D_INLINE void local_array(cg::thread_block& tb,
     constexpr int num_int8_out = quantize::bf_per_load / num_ele_int8;
 
     // Indexing offsets
-    const int block_num =
+    const int64_t block_num =
         (tb.group_index().x * max_threads / threads_per_group) + tb.thread_index().y;
-    const int block_offset = block_num * elems_per_group;
+    const int64_t block_offset = block_num * elems_per_group;
     const int elem_offset = tb.thread_index().x * quantize::bf_per_load;
-    const int base_offset = (block_offset + elem_offset) / num_ele_int8;
+    const int64_t base_offset = (block_offset + elem_offset) / num_ele_int8;
     const int stride = tb.size() * quantize::bf_per_load / num_ele_int8;
 
     int8_t local_output[num_int8_out];
@@ -765,7 +765,7 @@ DS_D_INLINE void local_array(cg::thread_block& tb,
     if (tb.thread_index().x == 0 && block_num < groups) {
         q_params.store(
             global_params,
-            (tb.group_index().x * max_threads / threads_per_group) + tb.thread_index().y);
+            block_num);
     }
 #pragma unroll
     for (int i = 0; i < numChunks; i++) {
@@ -793,11 +793,11 @@ DS_D_INLINE void local_array(cg::thread_block& tb,
     constexpr int num_int8_out = quantize::h_per_load / num_ele_int8;
 
     // Indexing offsets
-    const int block_num =
+    const int64_t block_num =
         (tb.group_index().x * max_threads / threads_per_group) + tb.thread_index().y;
-    const int block_offset = block_num * elems_per_group;
+    const int64_t block_offset = block_num * elems_per_group;
     const int elem_offset = tb.thread_index().x * quantize::h_per_load;
-    const int base_offset = (block_offset + elem_offset) / num_ele_int8;
+    const int64_t base_offset = (block_offset + elem_offset) / num_ele_int8;
     const int stride = tb.size() * quantize::h_per_load / num_ele_int8;
 
     int8_t local_output[num_int8_out];
@@ -805,7 +805,7 @@ DS_D_INLINE void local_array(cg::thread_block& tb,
     if (tb.thread_index().x == 0 && block_num < groups) {
         q_params.store(
             global_params,
-            (tb.group_index().x * max_threads / threads_per_group) + tb.thread_index().y);
+            block_num);
     }
 #pragma unroll
     for (int i = 0; i < numChunks; i++) {
@@ -832,11 +832,11 @@ DS_D_INLINE void local_array(cg::thread_block& tb,
     constexpr int num_int8_out = quantize::f_per_load / num_ele_int8;
 
     // Indexing offsets
-    const int block_num =
+    const int64_t block_num =
         (tb.group_index().x * max_threads / threads_per_group) + tb.thread_index().y;
-    const int block_offset = block_num * elems_per_group;
+    const int64_t block_offset = block_num * elems_per_group;
     const int elem_offset = tb.thread_index().x * quantize::f_per_load;
-    const int base_offset = (block_offset + elem_offset) / num_ele_int8;
+    const int64_t base_offset = (block_offset + elem_offset) / num_ele_int8;
     const int stride = tb.size() * quantize::f_per_load / num_ele_int8;
 
     int8_t local_output[num_int8_out];
@@ -844,7 +844,7 @@ DS_D_INLINE void local_array(cg::thread_block& tb,
     if (tb.thread_index().x == 0 && block_num < groups) {
         q_params.store(
             global_params,
-            (tb.group_index().x * max_threads / threads_per_group) + tb.thread_index().y);
+            block_num);
     }
 #pragma unroll
     for (int i = 0; i < numChunks; i++) {

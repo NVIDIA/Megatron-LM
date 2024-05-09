@@ -32,10 +32,10 @@ __global__ void swizzled_quant_kernel(int8_t* quantized_data,
     cg::thread_block_tile<hw_warp_size> warp = cg::tiled_partition<hw_warp_size>(tb);
 
     // Indexing offsets, same as normal quantization for in-case
-    const int block_rank = blockIdx.x + blockIdx.y * gridDim.x + blockIdx.z * gridDim.x * gridDim.y;
-    const int block_offset = block_rank * elems_per_group;
+    const int64_t block_rank = blockIdx.x + blockIdx.y * gridDim.x + blockIdx.z * gridDim.x * gridDim.y;
+    const int64_t block_offset = block_rank * elems_per_group;
     const int elem_offset = tb.thread_index().x * quantize::h_per_load;
-    const int base_offset = block_offset + elem_offset;
+    const int64_t base_offset = block_offset + elem_offset;
     const int stride = tb.size() * quantize::h_per_load;
     const __half* input_base = uncompressed_data + base_offset;
 
@@ -63,9 +63,9 @@ __global__ void swizzled_quant_kernel(int8_t* quantized_data,
     const int output_partition = (pipelining_offset + partition_base + partition_offset);
 
     constexpr int out_scalar_effect = 8 / numBits;
-    const int out_block_rank = output_partition * gridDim.x + blockIdx.x;
-    const int out_block_offset = out_block_rank * elems_per_group / out_scalar_effect;
-    const int out_base_offset = out_block_offset + elem_offset / out_scalar_effect;
+    const int64_t out_block_rank = output_partition * gridDim.x + blockIdx.x;
+    const int64_t out_block_offset = out_block_rank * elems_per_group / out_scalar_effect;
+    const int64_t out_base_offset = out_block_offset + elem_offset / out_scalar_effect;
     int8_t* out_base = quantized_data + out_base_offset;
 
     const int out_stride = stride / out_scalar_effect;
@@ -96,10 +96,10 @@ __global__ void swizzled_quant_kernel_float(int8_t* quantized_data,
     cg::thread_block_tile<hw_warp_size> warp = cg::tiled_partition<hw_warp_size>(tb);
 
     // Indexing offsets, same as normal quantization for in-case
-    const int block_rank = blockIdx.x + blockIdx.y * gridDim.x + blockIdx.z * gridDim.x * gridDim.y;
-    const int block_offset = block_rank * elems_per_group;
+    const int64_t block_rank = blockIdx.x + blockIdx.y * gridDim.x + blockIdx.z * gridDim.x * gridDim.y;
+    const int64_t block_offset = block_rank * elems_per_group;
     const int elem_offset = tb.thread_index().x * quantize::f_per_load;
-    const int base_offset = block_offset + elem_offset;
+    const int64_t base_offset = block_offset + elem_offset;
     const int stride = tb.size() * quantize::f_per_load;
     const float* input_base = uncompressed_data + base_offset;
 
@@ -127,9 +127,9 @@ __global__ void swizzled_quant_kernel_float(int8_t* quantized_data,
     const int output_partition = (pipelining_offset + partition_base + partition_offset);
 
     constexpr int out_scalar_effect = 8 / numBits;
-    const int out_block_rank = output_partition * gridDim.x + blockIdx.x;
-    const int out_block_offset = out_block_rank * elems_per_group / out_scalar_effect;
-    const int out_base_offset = out_block_offset + elem_offset / out_scalar_effect;
+    const int64_t out_block_rank = output_partition * gridDim.x + blockIdx.x;
+    const int64_t out_block_offset = out_block_rank * elems_per_group / out_scalar_effect;
+    const int64_t out_base_offset = out_block_offset + elem_offset / out_scalar_effect;
     int8_t* out_base = quantized_data + out_base_offset;
 
     const int out_stride = stride / out_scalar_effect;

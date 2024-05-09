@@ -13,7 +13,7 @@ __global__ void __launch_bounds__(1024) dequant_reduce_quant(int8_t* reduced_dat
                                                        const int8_t* input_data,
                                                        const float* input_scales,
                                                        int elems_per_out_group,
-                                                       int elems_per_in_tensor,
+                                                       int64_t elems_per_in_tensor,
                                                        int groups_per_in_tensor,
                                                        int elems_per_in_group,
                                                        int num_tensors)
@@ -28,9 +28,9 @@ __global__ void __launch_bounds__(1024) dequant_reduce_quant(int8_t* reduced_dat
     constexpr int elems_per_load = mem_granularity / sizeof(int8_t);  // div by 1
     constexpr int storage_values = 16 / sizeof(float);
 
-    const int block_offset = tb.group_index().x * elems_per_in_group;
+    const int64_t block_offset = tb.group_index().x * elems_per_in_group;
     const int elem_offset = tb.thread_index().x * elems_per_load;
-    const int base_offset = block_offset + elem_offset;
+    const int64_t base_offset = block_offset + elem_offset;
     const int stride = tb.group_dim().x * elems_per_load;
 
     float local_buffer[totalChunks * storage_values];
@@ -46,7 +46,7 @@ __global__ void __launch_bounds__(1024) dequant_reduce_quant(int8_t* reduced_dat
             iteration_buffer[j] = reduce::init<rop::Add, float>();
         }
 
-        const int iter_offset = i * stride + base_offset;
+        const int64_t iter_offset = i * stride + base_offset;
         const int iter_scale_idx = iter_offset / elems_per_in_group;
         bool do_loads = i * stride + elem_offset < elems_per_in_group;
 
@@ -106,14 +106,14 @@ __global__ void __launch_bounds__(1024) dequant_reduce_quant(int8_t* reduced_dat
 
     constexpr int out_mem_granularity = (outNumBits == 8) ? 4 : 2;
     constexpr int elems_per_out = out_mem_granularity / sizeof(int8_t);  // div by 1
-    const int block_offset_out = tb.group_index().x * elems_per_out_group;
+    const int64_t block_offset_out = tb.group_index().x * elems_per_out_group;
     const int elem_offset_out = tb.thread_index().x * elems_per_out;
-    const int base_offset_out = block_offset_out + elem_offset_out;
+    const int64_t base_offset_out = block_offset_out + elem_offset_out;
     const int stride_out = tb.group_dim().x * elems_per_out;
 
 #pragma unroll
     for (int i = 0; i < totalChunks; i++) {
-        const int iter_offset = i * stride_out + base_offset_out;
+        const int64_t iter_offset = i * stride_out + base_offset_out;
         if (i * stride_out + elem_offset_out < elems_per_out_group) {
             int8_t local_output[elems_per_out];
             quantize::_chunk<outNumBits, quantType>(
@@ -148,7 +148,7 @@ void launch_dequant_reduce_quant_impl(int8_t* reduced_data,
                                 const float* input_scales,
                                 int out_groups,
                                 int elems_per_out_group,
-                                int elems_per_in_tensor,
+                                int64_t elems_per_in_tensor,
                                 int groups_per_in_tensor,
                                 int elems_per_in_group,
                                 int num_tensors,
@@ -216,7 +216,7 @@ void launch_dequant_reduce_quant(int8_t* reduced_data,
                            quantize::Type quant_type,
                            int out_groups,
                            int elems_per_out_group,
-                           int elems_per_in_tensor,
+                           int64_t elems_per_in_tensor,
                            int groups_per_in_tensor,
                            int elems_per_in_group,
                            cudaStream_t stream)

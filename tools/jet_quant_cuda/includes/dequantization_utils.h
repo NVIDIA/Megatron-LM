@@ -100,7 +100,7 @@ DS_D_INLINE void _to_global(T* global_output,
                             const int8_t* data,
                             const float* global_params,
                             const int elems_per_group,
-                            const int total_elems)
+                            const int64_t total_elems)
 {
     cg::thread_block tb = cg::this_thread_block();
     cg::thread_block_tile<hw_warp_size> warp = cg::tiled_partition<hw_warp_size>(tb);
@@ -117,15 +117,15 @@ DS_D_INLINE void _to_global(T* global_output,
     constexpr int store_block_stride = store_step_stride * unroll;
 
     // Load offsets
-    const int load_block_offset = tb.group_index().x * load_block_stride;
+    const int64_t load_block_offset = tb.group_index().x * load_block_stride;
     // Note: we can use `load_granularity` since the dtype is `int8_t`.
     const int load_thread_offset = tb.thread_index().x * load_granularity;
     const int8_t* load_base = data + load_block_offset + load_thread_offset;
 
     // Store offsets
-    const int store_block_offset = tb.group_index().x * store_block_stride;
+    const int64_t store_block_offset = tb.group_index().x * store_block_stride;
     const int store_thread_offset = tb.thread_index().x * T_per_chunk;
-    const int elem_id_base = store_block_offset + store_thread_offset;
+    const int64_t elem_id_base = store_block_offset + store_thread_offset;
 
     int8_t local_load_buffer[load_granularity * unroll];
     T local_dequant_buffer[T_per_chunk * unroll];
@@ -136,7 +136,7 @@ DS_D_INLINE void _to_global(T* global_output,
     */
 #pragma unroll
     for (int i = 0; i < unroll; i++) {
-        const int elem_id_iter = elem_id_base + i * store_step_stride;
+        const int64_t elem_id_iter = elem_id_base + i * store_step_stride;
 
         if (elem_id_iter < total_elems) {
             mem_access::load_global<load_granularity>(local_load_buffer + i * load_granularity,
@@ -146,7 +146,7 @@ DS_D_INLINE void _to_global(T* global_output,
 
 #pragma unroll
     for (int i = 0; i < unroll; i++) {
-        const int elem_id_iter = elem_id_base + i * store_step_stride;
+        const int64_t elem_id_iter = elem_id_base + i * store_step_stride;
         if (elem_id_iter < total_elems) {
             // TODO(cmikeh2): Can we amortize this division? Perform once on the first iteration and
             // use indexing math to do division free interpolation of the successive groups?
@@ -167,7 +167,7 @@ DS_D_INLINE void to_global(T* global_output,
                            const int8_t* data,
                            const float* global_params,
                            const int elems_per_group,
-                           const int total_elems)
+                           const int64_t total_elems)
 {
     if constexpr (numBits == 4 || numBits == 8) {
         _to_global<T, numBits, qType, unroll, threads>(

@@ -13,7 +13,7 @@ __global__ void dequantize_kernel(T* __restrict__ dequant_data,
                                   const int8_t* __restrict__ q_data,
                                   const float* __restrict__ q_params,
                                   int elems_per_group,
-                                  int total_elems)
+                                  int64_t total_elems)
 {
     dequantize::to_global<T, numBits, qType, unroll, threads>(
         dequant_data, q_data, q_params, elems_per_group, total_elems);
@@ -30,7 +30,7 @@ void launch_dequantize_kernel(T* dequant_data,
                               quantize::Type q_type,
                               int num_bits,
                               int elems_per_group,
-                              int total_elems,
+                              int64_t total_elems,
                               cudaStream_t stream)
 {
     constexpr int unroll = 8;
@@ -59,7 +59,7 @@ template void launch_dequantize_kernel(__half* dequant_data,
                                        quantize::Type q_type,
                                        int num_bits,
                                        int elems_per_group,
-                                       int total_elems,
+                                       int64_t total_elems,
                                        cudaStream_t stream);
 
 template void launch_dequantize_kernel(float* dequant_data,
@@ -68,7 +68,7 @@ template void launch_dequantize_kernel(float* dequant_data,
                                        quantize::Type q_type,
                                        int num_bits,
                                        int elems_per_group,
-                                       int total_elems,
+                                       int64_t total_elems,
                                        cudaStream_t stream);
 
 #ifdef BF16_AVAILABLE
@@ -78,6 +78,6 @@ template void launch_dequantize_kernel(__nv_bfloat16* dequant_data,
                                        quantize::Type q_type,
                                        int num_bits,
                                        int elems_per_group,
-                                       int total_elems,
+                                       int64_t total_elems,
                                        cudaStream_t stream);
 #endif

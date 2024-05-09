@@ -28,7 +28,7 @@ at::Tensor dequantize(at::Tensor& quantized_data,
     }
     TORCH_CHECK(output_buffer.numel() == expected_buffer_elements, "Output buffer does not have the correct number of elements.");
 
-    const int total_elems = at::numel(output_buffer);
+    const int64_t total_elems = at::numel(output_buffer);
     const int elems_per_group = total_elems / groups;
 
     launch_dequantize_kernel((T*)output_buffer.data_ptr(),
@@ -61,7 +61,7 @@ at::Tensor dequantize_reduce(at::Tensor& input_vals,
     TORCH_CHECK(output_buffer.is_contiguous(), "Output buffer must be contiguous.");
     TORCH_CHECK(output_buffer.numel() == expected_buffer_elements, "Output buffer does not have the correct number of elements.");
 
-    const int elems_per_in_tensor = at::numel(input_vals) / chunks;
+    const int64_t elems_per_in_tensor = at::numel(input_vals) / chunks;
     const int out_groups = num_groups / chunks;
     const int elems_per_in_group = elems_per_in_tensor / (num_groups / chunks); // number of bytes per in group
     const int elems_per_out_group = elems_per_in_group * (8 / num_bits) * sizeof(float); // number of bytes per out group
@@ -99,10 +99,10 @@ at::Tensor dequantize_reduce_ht(at::Tensor& input_vals,
     TORCH_CHECK(output_buffer.is_contiguous(), "Output buffer must be contiguous.");
     TORCH_CHECK(output_buffer.numel() == expected_buffer_elements, "Output buffer does not have the correct number of elements.");
 
-    const int elems_per_in_tensor = at::numel(input_vals) / chunks;
+    const int64_t elems_per_in_tensor = at::numel(input_vals) / chunks;
     const int out_groups = num_groups / chunks;
-    const int elems_per_in_group = elems_per_in_tensor / (num_groups / chunks);
-    const int elems_per_out_group = elems_per_in_group * (8 / num_bits) * 4;
+    const int elems_per_in_group = elems_per_in_tensor / (num_groups / chunks); // number of bytes per in group
+    const int elems_per_out_group = elems_per_in_group * (8 / num_bits) * sizeof(float); // number of bytes per out group
 
     launch_dequant_reduce_ht((float*)output_buffer.data_ptr(),
                           (const int8_t*)input_vals.data_ptr(),
@@ -387,7 +387,7 @@ std::vector<at::Tensor> dequantize_reduce_quant(at::Tensor& input_vals,
     std::vector<long int> sz(input_vals.sizes().begin(), input_vals.sizes().end());
     sz[sz.size() - 1] = sz.back() / chunks ;
     sz[sz.size() - 1] = sz.back() * out_num_bits / in_num_bits ;
-    const int elems_per_in_tensor = at::numel(input_vals) / chunks;
+    const int64_t elems_per_in_tensor = at::numel(input_vals) / chunks;
     auto output = torch::empty(sz, output_options);
 
     const int elems_per_in_group = elems_per_in_tensor / (in_groups / chunks); // number of bytes per in group
