@@ -185,7 +185,7 @@ An example command to run instruction tuning on 843M Retro is as follows:
 
 ```bash
                                       [blend-dataset-name] [model-size] [batch-size]  [lr]    [checkpoints]
-bash tools/retro/sft/sft_retro_lm.sh       open_inst               843m            128    5e-6  <path/to/pretrained/retro>  
+bash tools/retro/sft/sft_retro_lm.sh       open_inst               843m            128    5e-6  <path/to/pretrained/retro>
 ```
 
 The `blend_dataset_name` argument will blend all the datasets within the `$DATA_HOME` following the weights and

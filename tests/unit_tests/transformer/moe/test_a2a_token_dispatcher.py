@@ -15,6 +15,7 @@ class TestAlltoAllDispatcher:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [
         (1, 8),
         (8, 1),
@@ -33,6 +34,7 @@ class TestAlltoAllDispatcher:
         container.dispatcher_dropless_test()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [
         (1, 8),
         (8, 1)
@@ -52,6 +54,7 @@ class TestAlltoAllDispatcher:
         container.dispacher_capacity_test()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [
         (1, 8),
         (8, 1),

@@ -10,7 +10,7 @@
 
 To run the model using a docker container run it as follows
 ```
-PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:23.09-py3
+PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:24.01-py3
 CHECKPOINT_PATH="" #<Specify path>
 TENSORBOARD_LOGS_PATH=""#<Specify path>
 VOCAB_FILE="" #<Specify path to file>/gpt2-vocab.json
@@ -23,7 +23,7 @@ docker run \
   --workdir /workspace/megatron-lm \
   -v /path/to/data:/path/to/data \
   -v /path/to/megatron-lm:/workspace/megatron-lm \
-  megatron-lm nvcr.io/nvidia/pytorch:23.04-py3 \
+  megatron-lm nvcr.io/nvidia/pytorch:24.01-py3 \
   bash examples/gpt3/train_gpt3_175b_distributed.sh $CHECKPOINT_PATH $TENSORBOARD_LOGS_PATH $VOCAB_FILE $MERGE_FILE $DATA_PATH "
 
 ```
@@ -34,7 +34,7 @@ NOTE: Depending on the environment you are running it the above command might li
 <a id="markdown-configurations" name="configurations"></a>
 The example in this folder shows you how to run 175B model. There are other configs you could run as well
 
-### 345M 
+### 345M
 ```
        --num-layers 12 \
        --hidden-size 512 \
@@ -45,7 +45,7 @@ The example in this folder shows you how to run 175B model. There are other conf
 
 ```
 
-### 857M 
+### 857M
 ```
        --num-layers 24 \
        --hidden-size 1024 \
