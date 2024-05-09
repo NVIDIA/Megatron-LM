@@ -141,7 +141,8 @@ def forward_step(data_iterator, model: GPTModel):
     tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
         data_iterator)
     timers('batch-generator').stop()
-
+    print_rank_0(tokens.shape)
+    print_rank_0(tokens)
     output_tensor = model(tokens, position_ids, attention_mask,
                           labels=labels)
 
@@ -168,7 +169,6 @@ def core_gpt_dataset_config_from_args(args):
         reset_position_ids=args.reset_position_ids,
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
-        eod_id=get_tokenizer().eod,
         is_distributed_storage=args.distributed_storage
     )
 
