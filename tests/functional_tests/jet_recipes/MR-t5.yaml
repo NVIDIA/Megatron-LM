@@ -10,7 +10,7 @@ spec:
          {'_'+args_meta if args_meta else ''}"
   model: t5
   variant: 220m
-  build: mcore-pyt 
+  build: mcore-pyt
   scope: merge-request
   nodes: 1
   gpus: 8
@@ -48,4 +48,4 @@ spec:
         JOB_NAME={key.split("/")[1]} \
         ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'}
 products:
-  - {use_te: [True], tp_size: [1],  pp_size: [1], vp_size: [1]}
+  - {use_te: [True], tp_size: [1],  pp_size: [1], vp_size: [1], extra_args: ["--calculate-per-token-loss"], args_meta: ["calculate_per_token_loss"]}

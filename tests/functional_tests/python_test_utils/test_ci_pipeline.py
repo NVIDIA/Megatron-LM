@@ -19,13 +19,15 @@ class TestCIPipeline:
         if os.path.exists(EXPECTED_METRICS_FILE):
             with open(EXPECTED_METRICS_FILE) as f:
                 self.expected = json.load(f)
+        else:
+            print(f"File {EXPECTED_METRICS_FILE} not found!")
 
     def _get_actual(self, loss_type):
         return read_tb_logs_as_list(LOGS_DIR, loss_type)
 
     def _test_helper(self, loss_type, test_type):
         if self.expected is None:
-            raise FileNotFoundError("Expected data is none")
+            raise FileNotFoundError(f"Expected data is none")
         expected = self.expected[loss_type]
         expected_list = expected["values"]
         print(f"The list of expected values: {expected_list}")
@@ -55,10 +57,10 @@ class TestCIPipeline:
         # Expected validation loss curve at different global steps.
         self._setup()
         self._test_helper("num-zeros", TypeOfTest.DETERMINISTIC)
-    
+
     def iteration_timing_node(self):
         expected_iteration_timing_avg = self.expected["train_step_timing_avg"]
         iteration_time = read_tb_logs_as_list(LOGS_DIR, "iteration-time")
-        idx = len(iteration_time)//3   
+        idx = len(iteration_time)//3
         iteration_time_avg = sum(iteration_time[idx:])/len(iteration_time[idx:])
         assert expected_iteration_timing_avg == pytest.approx(expected=iteration_time_avg, rel=self.margin_time), f"The time per global step must be approximately {expected_iteration_timing_avg} but it is {iteration_time_avg}."
