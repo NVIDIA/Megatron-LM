@@ -402,7 +402,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                                                     data_parallel_group=mpu.get_data_parallel_group(with_context_parallel=True),
                                                     tensor_parallel_group=mpu.get_tensor_model_parallel_group(),
                                                     pipeline_parallel_group=mpu.get_pipeline_model_parallel_group(),
-                                                    hadamard_transform=args.hadamard_transform)
+                                                    hadamard_transform=args.hadamard_transform,
+                                                    gradient_alltoall_pipeline=args.gradient_alltoall_pipeline)
 
     if wrap_with_ddp:
         config = get_model_config(model[0])

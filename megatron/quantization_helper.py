@@ -50,6 +50,7 @@ class QuantizationHelper:
                  tensor_parallel_group: torch.distributed.ProcessGroup = None,
                  pipeline_parallel_group: torch.distributed.ProcessGroup = None,
                  hadamard_transform=False,
+                 gradient_alltoall_pipeline=1,
                  ):
 
         self.quantized_weights = quantized_weights
@@ -67,6 +68,7 @@ class QuantizationHelper:
         self.hadamard_order = 5
         self.hadamard_group_size = 2**self.hadamard_order
         self.hadamard_matrix = None
+        self.gradient_alltoall_pipeline=gradient_alltoall_pipeline
         if self.quantized_gradients or self.quantized_weights:
             self.set_local_all_to_all_group()
             self.quant_module = self.build_or_import_siwzzle_quant_module()
@@ -238,8 +240,10 @@ class QuantizationHelper:
         assert self.gq_group_size_inter  % (8 // min(self.gradient_quantization_bits_inter, self.gradient_quantization_bits_intra)) == 0 # group size must be multiple of 2 when using 4bits
         assert self.gq_group_size_inter % 8 == 0 # group size must be multiple of 8 when tensor is half type; must be multiple of 4 when type is float. 
                                     # That is because cuda swizzle quant function will load 4 float or 8 half for each thread step to get better performance
-        # assert (tensor.numel() // self.gq_group_size_inter) % (num_nodes * local_world_size * pipeline) == 0
+        assert (tensor.numel() // self.gq_group_size_intra) % (self.inter_dp_size * self.intra_dp_size * self.gradient_alltoall_pipeline) == 0
+                                    # gradient_alltoall_pipeline is for intra-inter communication overlap, groups need to be evenly partitioned among gpus
         groups = self.all2all_process_group
+        pipeline = self.gradient_alltoall_pipeline
         global_world_size = torch.distributed.get_world_size(group=self.data_parallel_group)
         # group_size = self.gq_group_size
         intra_quant_group = max(math.ceil(tensor.numel() / self.gq_group_size_intra), global_world_size)
@@ -262,42 +266,54 @@ class QuantizationHelper:
             swizzle_quant_func = quant_module.swizzle_quant_ht32
             final_dequant = quant_module.dequantize_reduce_ht32
         """intra node quantization and all-to-all"""
+        tensor_output_pipeline_chunk_list = [torch.empty(size=(tensor.numel() // pipeline // (8//self.gradient_quantization_bits_intra), ), dtype=torch.int8, device=torch.cuda.current_device()) for _ in range(pipeline)]
+        scale_output_pipeline_chunk_list = [torch.empty(size=(tensor.numel() // self.gq_group_size_intra // pipeline, ), dtype=torch.float32, device=torch.cuda.current_device()) for _ in range(pipeline)]
+        tensor_pipeline_chunk_len = tensor.numel() // pipeline // (8 // self.gradient_quantization_bits_intra)
+        scale_pipeline_chunk_len = tensor.numel() // self.gq_group_size_intra // pipeline
+        received_buffer_chunk_len = tensor.numel() // (self.inter_dp_size * self.intra_dp_size * self.gradient_alltoall_pipeline)
+        pipeline_received_buffer_view_list = [received_buffer[i*received_buffer_chunk_len: (i+1)*received_buffer_chunk_len] for i in range(pipeline)]
         output_tensor, output_scales = swizzle_quant_func(tensor,
                                                           intra_quant_group,
                                                           self.gradient_quantization_bits_intra,
                                                           quant_module.Symmetric,
-                                                          1,
+                                                          pipeline,
                                                           inter_dp_size,
                                                           intra_dp_size)
-        """all to all, dequantReduction"""
-        all_to_all_output_tensor = torch.empty_like(output_tensor)
-        all_to_all_output_scales = torch.empty_like(output_scales)
-        all_to_all_single(all_to_all_output_tensor, output_tensor, group=groups[f'local_{pp_rank}_{tp_rank}_{intra_idx}'])
-        all_to_all_single(all_to_all_output_scales, output_scales, group=groups[f'local_{pp_rank}_{tp_rank}_{intra_idx}'])
+        streams = [torch.cuda.Stream() for _ in range(pipeline)]
+        for i, stream in enumerate(streams):
+            with torch.cuda.stream(stream):
+                """all to all, dequantReduction"""
+                all_to_all_output_tensor = tensor_output_pipeline_chunk_list[i]
+                all_to_all_output_scales = scale_output_pipeline_chunk_list[i]
+                all_to_all_single(all_to_all_output_tensor, output_tensor[i*tensor_pipeline_chunk_len:(i+1)*tensor_pipeline_chunk_len], group=groups[f'local_{pp_rank}_{tp_rank}_{intra_idx}'])
+                all_to_all_single(all_to_all_output_scales, output_scales[i*scale_pipeline_chunk_len:(i+1)*scale_pipeline_chunk_len], group=groups[f'local_{pp_rank}_{tp_rank}_{intra_idx}'])
 
-        """fused dequantization & reduction & quantization kernel"""
-        quant_tensor, quant_scales = quant_module.dequantize_reduce_quant(all_to_all_output_tensor,
-                                                                          all_to_all_output_scales,
-                                                                          intra_quant_group,
-                                                                          self.gradient_quantization_bits_intra,
-                                                                          self.gradient_quantization_bits_inter,
-                                                                          quant_module.Symmetric,
-                                                                          intra_dp_size)
+                """fused dequantization & reduction & quantization kernel"""
+                quant_tensor, quant_scales = quant_module.dequantize_reduce_quant(all_to_all_output_tensor,
+                                                                                all_to_all_output_scales,
+                                                                                intra_quant_group//pipeline,
+                                                                                self.gradient_quantization_bits_intra,
+                                                                                self.gradient_quantization_bits_inter,
+                                                                                quant_module.Symmetric,
+                                                                                intra_dp_size)
 
-        """all to all"""
-        all_to_all_output_tensor = torch.empty_like(quant_tensor)
-        all_to_all_output_scales = torch.empty_like(quant_scales)
-        all_to_all_single(all_to_all_output_tensor, quant_tensor, group=groups[f'global_{pp_rank}_{tp_rank}_{inter_idx}'])
-        all_to_all_single(all_to_all_output_scales, quant_scales, group=groups[f'global_{pp_rank}_{tp_rank}_{inter_idx}'])
+                """all to all"""
+                all_to_all_output_tensor = torch.empty_like(quant_tensor)
+                all_to_all_output_scales = torch.empty_like(quant_scales)
+                all_to_all_single(all_to_all_output_tensor, quant_tensor, group=groups[f'global_{pp_rank}_{tp_rank}_{inter_idx}'])
+                all_to_all_single(all_to_all_output_scales, quant_scales, group=groups[f'global_{pp_rank}_{tp_rank}_{inter_idx}'])
 
-        """dequantizeReduction"""
-        final_dequant(all_to_all_output_tensor, 
-                        all_to_all_output_scales, 
-                        received_buffer,
-                        inter_quant_group,
-                        self.gradient_quantization_bits_inter,
-                        quant_module.Symmetric,
-                        inter_dp_size)
+                """dequantizeReduction"""
+                pipeline_received_buffer_view = pipeline_received_buffer_view_list[i]
+                final_dequant(all_to_all_output_tensor, 
+                                all_to_all_output_scales, 
+                                pipeline_received_buffer_view,
+                                inter_quant_group//pipeline,
+                                self.gradient_quantization_bits_inter,
+                                quant_module.Symmetric,
+                                inter_dp_size)
+        for stream in streams:
+            torch.cuda.current_stream().wait_stream(stream)
         return received_buffer
 
     def quantized_reduce_scatter_intra_only(self, tensor, received_buffer):

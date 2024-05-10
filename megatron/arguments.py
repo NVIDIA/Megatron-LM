@@ -1209,6 +1209,8 @@ def _add_quantize_args(parser):
                        help='Group size for intra-node gpus gradient quantization.')
     group.add_argument('--gradients-quantization-start-iteration', type=int, default=0,
                        help='Gradient quantization strat after this iteration.')
+    group.add_argument('--gradient-alltoall-pipeline', type=int, default=1,
+                       help='Gradient 2-hop all-to-all pipeline size for intra-node inter-node communication overlapping.')
     group.add_argument('--hadamard-transform', action='store_true',
                        default=False,
                        help='Hadamard Transformation before gradient reduction to decrease quantization error')
