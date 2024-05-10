@@ -24,7 +24,7 @@ spec:
   batch_size: 32 # GBS, JET schema requires 'batch_size'
   moe_grouped_gemm: 0
   precision: bf16
-  time_limit: 1200
+  time_limit: 1500
   artifacts: {/workspace/data/gpt3_data: text/the_pile/shard00}
   ckpt_format: torch_dist
   ckpt_resume: 0
@@ -59,6 +59,7 @@ products:
   - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], extra_args: ["--no-create-attention-mask-in-dataloader"], args_meta: ["no_create_attention_mask_in_dataloader"]}
   - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], extra_args: ["--no-mmap-bin-files"], args_meta: ["no_mmap_bin_files"]}
   - {tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1]}
+  - {tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1], extra_args: ["--calculate-per-token-loss"], args_meta: ["calculate_per_token_loss"]}
   - {tp_size: [4], pp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--qk-layernorm --test-mode"'], args_meta: ["qk_layernorm_test_mode"]}
   - {tp_size: [1], pp_size: [2], ckpt_resume: [0, 1], extra_args: ['"--position-embedding-type rope"'], args_meta: ["rope_embeddings"]}
   - {tp_size: [1], pp_size: [2], ckpt_resume: [0, 1], extra_args: ['"--position-embedding-type rope --rotary-interleaved --no-rope-fusion"'], args_meta: ["rope_embeddings_interleaved_no_fusion"]}
