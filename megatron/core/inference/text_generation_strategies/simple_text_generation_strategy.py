@@ -251,7 +251,7 @@ class SimpleTextGenerationStrategy:
 
                 # Returns the final logits of shape [batch_size, context_length, vocab_size]
                 # Note: This is returned in all TP ranks or last PP stage in PP models
-                logits = self.inference_wrapped_model.one_forward_step(inference_input)
+                logits = self.inference_wrapped_model.run_one_forward_step(inference_input)
 
                 if self.model_is_pipeline_parallel:
                     context_length = context_end_position - context_start_position

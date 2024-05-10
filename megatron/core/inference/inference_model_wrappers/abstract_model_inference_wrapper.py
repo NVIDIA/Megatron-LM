@@ -185,7 +185,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         # NOTE: Only returns the logits on the last pipeline stage
         return logits
 
-    def one_forward_step(self, inference_input: List) -> torch.Tensor:
+    def run_one_forward_step(self, inference_input: List) -> torch.Tensor:
         """The forward pass of the model for inference
 
         Appropriate utility is called for the forward pass depending on the type of model parallelism used

@@ -7,18 +7,18 @@ This guide will walk you through how you can use megatron core for inference on 
   - [1. Quick Start](#1-quick-start)
     - [1.1 Understanding The Code](#11-understanding-the-code)
     - [1.2 Running The Code](#12-running-the-code)
-  - [2. A More Involved Example](#2-a-more-involved-example)
-  - [3. Flow of Control In MCore Backend](#3-flow-of-control-in-mcore-backend)
-  - [4. Customizing The Inference Pipeline](#4-customizing-the-inference-pipeline)
-    - [4.1. Create Your Own Inference Backend](#41-create-your-own-inference-backend)
-    - [4.2. Create Your Own Text Generation Strategy](#42-create-your-own-text-generation-strategy)
-    - [4.3. Support Other Models](#43-support-other-models)
-    - [4.3. Modify Inference Parameters](#43-modify-inference-parameters)
+  - [2. Flow of Control In MCore Backend](#2-flow-of-control-in-mcore-backend)
+  - [3. Customizing The Inference Pipeline](#3-customizing-the-inference-pipeline)
+    - [3.1. Create Your Own Inference Backend](#31-create-your-own-inference-backend)
+    - [3.2. Create Your Own Text Generation Strategy](#32-create-your-own-text-generation-strategy)
+    - [3.3. Support Other Models](#33-support-other-models)
+    - [3.3. Modify Inference Parameters](#33-modify-inference-parameters)
+  - [4. Future work](#4-future-work)
 
 <br>
 
 #### 1. Quick Start
-This will walk you through the flow of running inference on a GPT model trained using megatron core. The file can be found at [quick_start.py](./quick_start.py)
+This will walk you through the flow of running batch inference on a GPT model trained using megatron core. The file can be found at [simple_gpt_batch_inference.py](./gpt/simple_gpt_batch_inference.py)
 
 <br>
 
@@ -32,38 +32,45 @@ We can default micro batch size to be 1, since for TP models its not used, and f
 ```
 
 ***STEP 2 - We load the model using the model_provider_function***
-NOTE: The model provider function in the quickstart just supports mcore model. Check [generate_mcore_samples_gpt.py](./gpt/generate_mcore_samples_gpt.py) to see how to support megatorn lm models as well.
+NOTE: The model provider function in the script supports MCore and Legacy models. 
+
 ```python
     model = get_model(model_provider, wrap_with_ddp=False)
     load_checkpoint(model, None, None)
     model = model[0]
 ```
 
-***STEP 3 - Choose a backend***
-One of the important elements of the generate function is a backend. In this example we will be choosing the [megatorn core backend](../../megatron/core/inference/backends/mcore_backend.py) with a [simple text generation strategy](../../megatron/core/inference/text_generation_strategies/simple_text_generation_strategy.py). (Other backends that will be supported are [TRTLLMBackend](../../megatron/core/inference/backends/trt_llm_backend.py)). If you dont want any customization use mcore backend with simple text generation strategy.
+***STEP 3 - Choose an engine***
+One of the important elements of the generate function is an inference engine. In this example we will be choosing the [megatorn core enge](../../megatron/core/inference/engine/mcore_engine.py) with a [simple text generation strategy](../../megatron/core/inference/text_generation_strategies/simple_text_generation_strategy.py) since TRTLLMEngine is not available yet. Other engines that will be supported are [TRTLLMEngine](../../megatron/core/inference/engine/trt_llm_engine_wrapper.py)). If you dont want any customization use mcore engine with simple text generation strategy.
 ```python
     inference_wrapped_model = GPTInferenceWrapper(model, args)
     text_generation_strategy = SimpleTextGenerationStrategy(
         inference_wrapped_model=inference_wrapped_model, 
         tokenizer=tokenizer
     )
-    inference_backend = MCoreBackend(
-        text_generation_strategy=text_generation_strategy
+    inference_backend = MCoreEngine(
+        text_generation_strategy=text_generation_strategy, max_batch_size=args.max_batch_size
     )
 ```
 
 ***STEP 4 - Run the generate function and display results***
 We use default values for the [common inference params](../../megatron/core/inference/common_inference_params.py). Customize this if you want to change top_p, top_k, number of tokens to generate etc. 
-*Note that the result is returned as a dictionary only on rank 0.*
+*Note that the result is returned as a list of [InferenceRequests](../../megatron/core/inference/inference_request.py)*
 ```python
-    result = common_generate(
-        inference_backend=inference_backend,
-        prompts=["How large is the universe ?", "Where can you celebrate birthdays ? "],
-        common_inference_params=CommonInferenceParams(),
+    results: List[InferenceRequest] = inference_engine.generate(
+        prompts=args.prompts, common_inference_params=common_inference_params
     )
-
+    
     if torch.distributed.get_rank() == 0:
-        print(result['prompts_plus_generations_detokenized'])
+        for idx, result in enumerate(results):
+            print(f' ------------- RESULT FOR PROMPT {idx} --------------- ')
+            result = {
+                'id': result.request_id,
+                'input_prompt': result.prompt, 
+                'generated_text': result.generated_text,
+                'generated_tokens' : result.generated_tokens
+                }
+            print(result)
 ```
 
 <br>
@@ -98,7 +105,7 @@ INFERENCE_SPECIFIC_ARGS=(
     --attention-dropout 0.0
     --hidden-dropout 0.0
 )
-torchrun --nproc-per-node=4 examples/inference/quick_start.py \
+torchrun --nproc-per-node=4 examples/inference/gpt/simple_gpt_batch_inference.py \
     --load /workspace/checkpoint/tp2pp2 \
     ${TOKENIZER_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
@@ -108,44 +115,38 @@ torchrun --nproc-per-node=4 examples/inference/quick_start.py \
 
 <br>
 
-#### 2. A More Involved Example
-The example in [generate_mcore_samples_gpt.py](./gpt/generate_mcore_samples_gpt.py) is more involved. It shows you the following
-* Loading mcore/megatron lm checkpoint
-* Customizing inference parameters using command line aruguments
-* Reading prompts in batches from a file and writing results to a file
 
-<br>  
-
-#### 3. Flow of Control In MCore Backend
-The following is what happens in the [generate_mcore_samples_gpt.py](./gpt/generate_mcore_samples_gpt.py) text generation part.
-* We call the [common_generate_function](../../megatron/core/inference/common_generate_function.py) with the megatron core backend and the list of input prompts and inference parameters
-* This in turn calls the [mcore_backend](../../megatron/core/inference/backends/mcore_backend.py) **generate()** function. 
-* This function uses the [simple_text_generation_strategy](../../megatron/core/inference/text_generation_strategies/simple_text_generation_strategy.py) to pad and tokenize input prompts 
-* The padded prompts are passed into the **generate_output_tokens()** of the text generation strategy . 
-* This function uses the [model_inference_wrappers](../../megatron/core/inference/inference_model_wrappers/abstract_model_inference_wrapper.py) **prep_model_for_inference()** , and then runs an auto regressive loop
-* In the auto regressive loop the inference wrappers **get_batch_for_context_window()** is called to get the required input, which is passed into the __call__ method, which takes care of calling the appropriate (PP, TP) model forward methods to get the output logits
-* The text generation strategy then samples from these logits and obtains the log probabilities based on the common inference parameters.
-* The input prompt tokens are updated with the results and then copied from last stage to first stage in case of PP models.  
-* The **update_generation_status** of the text generation strategy is called to check which of the prompts have completed generating , what the generation lengths are etc. 
-* The status of the prompts generations is broacasted so that in case of early stopping all ranks can break. 
-* Finally after the inference loop, the tokens are passed to the text generation strategies *detokenize_generations()* function to get the generated text . 
+#### 2. Flow of Control In MCore Backend
+The following is what happens in the [simple_gpt_batch_inference.py](./gpt/simple_gpt_batch_inference.py) text generation part.
+* We call  [mcore_engine](../../megatron/core/inference/engine/mcore_engine.py) **generate()** function with all our input prompts.
+* The scheduler in the engine will add these prompts to [active requests](../../megatron/core/inference/inference_request.py) till we hit max batch size, and then it will put the rest in waiting requests. 
+* The engine will then run till all requests (waiting + active) are completed 
+    * The active requests are passed into  **generate_output_tokens_all_steps()** of the text generation strategy . 
+    * This function uses the [model_inference_wrappers](../../megatron/core/inference/inference_model_wrappers/abstract_model_inference_wrapper.py) **prep_model_for_inference()** , and then runs an auto regressive loop
+    * In the auto regressive loop the inference wrappers **get_batch_for_context_window()** is called to get the required input, which is passed into the **run_one_forward_step()** method, which takes care of calling the appropriate (PP, TP) model forward methods to get the output logits
+    * The output logits are synchornized across all ranks for PP Models
+    * The text generation strategy then samples from these logits and obtains the log probabilities based on the common inference parameters.
+    * The input prompt tokens are updated with the results a
+    * The **update_generation_status()** of the text generation strategy is called to check which of the prompts have completed generating , what the generation lengths are etc. 
+    * Finally after the inference loop, the result is detokenized and stored back into the inference requests. The status of these requests are marked as completed. 
+    * We then use the schedulers **update_requests_pool_with_result()** to update the requests pools. (i.e) Completed requests are put into the completed request pool and the waiting requests are added into the active request pool
 
 <br>
 
-#### 4. Customizing The Inference Pipeline
+#### 3. Customizing The Inference Pipeline
 The following guide will walk you through how you can customize different parts of the inference pipeline. Broadly there are three levels at which you can customize the pipeline. 
-* **Inference backend** - Highest level of customization. (Currently we support MCore and TRTLLM backends). Change this if you completely want to add your own way of running inference.  
-* **Text generation strategy** - Extend this if you want to customize tokenization, text generation or detokenization
+* **Inference engine** - Highest level of customization. (Currently we support MCore Engine). Change this if you completely want to add your own way of running inference.  
+* **Text generation strategy** - Extend this if you want to customize tokenization, text generation, sampling, detokenization etc.
 * **Inference Wrapped Model** - Change this if you just want to support a new model 
 * **Modify Inference Parameters** - Change this to update top_p, top_k, number of tokens to be generated, temperature etc.
 
 <br>
 
-##### 4.1. Create Your Own Inference Backend 
-This is the highest level of customization. The  [abstract_backend.py](./../../megatron/core/inference/backends/abstract_backend.py) file has a core generate method that you can extend to support your own backend. 
+##### 3.1. Create Your Own Inference Backend 
+This is the highest level of customization. The  [abstract_engine.py](./../../megatron/core/inference/engine/abstract_engine.py) file has a core generate method that you can extend to support your own backend. 
 
 ```python
-class AbstractBackend(ABC):
+class AbstractEngine(ABC):
     @staticmethod
     def generate(self) -> dict:
         """The abstarct backends generate function. 
@@ -153,23 +154,18 @@ class AbstractBackend(ABC):
         To define your own backend, make sure you implement this and return the outputs as a dictionary . 
 ```
 
-Currently we support mcore backend. Soon we will suport TRT-LLM. The suggested flow as you can see from the [generate_mcore_samples_gpt.py](./gpt/generate_mcore_samples_gpt.py) is to choose TRTLLM Backend as a default, and if the model fails the export, we will use the megatron core backend. 
+Currently we support mcore engine. Soon we will suport TRT-LLM. The suggested flow as you can see from the [simple_gpt_batch_inference.py](./gpt/simple_gpt_batch_inference.py) is to choose TRTLLM Backend as a default, and if the model fails the export, we will use the megatron core backend. 
 
 
 <br>
 
-##### 4.2. Create Your Own Text Generation Strategy
+##### 3.2. Create Your Own Text Generation Strategy
 In case you want to use the megatron core backend, but would like to overwrite the tokenization, text generation or detokenization extend the [simple_text_generation_strategy.py](../../megatron/core/inference/text_generation_strategies/simple_text_generation_strategy.py). The class has the following methods
 ``` python
 class SimpleTextGenerationStrategy:
 
-    def tokenize_and_pad_input_prompts(
-            self, prompts: List[str], num_tokens_to_generate: int
-        ) -> Tuple[torch.Tensor, torch.Tensor]
-        """Utility to tokenize and pad the input prompts
-
-            Tokenizes the input prompts, pads them to required length and returns the tokenized tensor and also the original prompt lengths.
-        """
+    def tokenize_prompt(self, prompt: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Utility to tokenize the input prompts"""
 
     def sample_from_logits(
         self,
@@ -188,36 +184,28 @@ class SimpleTextGenerationStrategy:
         generation_started: torch.Tensor,
         current_context_end_position: int,
         is_generation_done_tensor: torch.Tensor,
-        actual_plus_generated_sequence_lengths: torch.Tensor,
+        generated_sequence_lengths: torch.Tensor,
     ) -> torch.Tensor:
         """Function to check which prompts have reached an end condition
 
-        We check which prompts have reached an end condition and set the corresponding flags of the is_generation_done_tensor to True . The generated sequence lengths starts off with input prompt lengths values and increases as we keep generating, until that prompts hits an eod condition. The generation started status tensor helps us determine which are generated tokens, and which are input prompt tokens
+        We check which prompts have reached an end condition and set the corresponding flags of the is_generation_done_tensor to True . The generated sequence lengths increases as we keep generating, until that prompts hits an eod condition. The generation started status tensor helps us determine which prompts have started generating
         """
 
-    def generate_output_tokens(
-        self,
-        prompts_tokens: torch.Tensor,
-        prompts_lengths: torch.Tensor,
-        common_inference_params: CommonInferenceParams,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def generate_output_tokens_all_steps(
+        self, active_requests: OrderedDict[int, InferenceRequest],
+    ) -> OrderedDict[int, InferenceRequest]:
         """Utility to generate the output tokens and probabilities for the prompts
 
-        This utility generates the output tokens. It uses the model wrapper to generate the outputs internally
+        This utility generates the output tokens. It uses the model inference wrapper to generate the logits, which then gets process to generate the final results
         """
 
-    def detokenize_generations(
-        self, prompt_tokens_with_generations: torch.Tensor, required_sequence_lengths: torch.Tensor
-    ) -> List[str]:
-        """Detokenize the output generations
-
-        This function takes the prompts with the generated tokens, and detokenizes it and trims off according to the generated sequence length param
-        """
+    def detokenize_generations(self, prompt_tokens_with_generated_tokens: torch.Tensor) -> str:
+        """Detokenize the output generations"""
 ```
 
 <br>
 
-##### 4.3. Support Other Models
+##### 3.3. Support Other Models
 In order to support other models please extend the [abstract_model_inference_wrapper.py](./../../megatron/core/inference/inference_model_wrappers/abstract_model_inference_wrapper.py) file. The abstract wrapper already supports the following :
 * Forward method which automatically calls the appropriate forward method (PP or TP etc) depending on model parallel settings
 * Initalizes the model and puts it in eval mode
@@ -243,7 +231,7 @@ To see an example of how we extend this for gpt please refer [gpt_inference_wrap
 
 <br>
 
-##### 4.3. Modify Inference Parameters
+##### 3.3. Modify Inference Parameters
 We use  [common inference params](../../megatron/core/inference/common_inference_params.py) for text generation. Customize this if you want to change top_p, top_k, number of tokens to generate etc. If you want to add other attributes that you would use in the inference loop, you can do that as shown below
 
 ```
@@ -252,3 +240,12 @@ from megatron.core.inference.common_inference_params import CommonInferenceParam
 c = CommonInferenceParams(temperature=0.5)
 c.add_attributes({'min_length':4, 'eod_id':153})
 ```
+
+<br>
+
+#### 4. Future work
+The following are planned for the future releases . 
+* Dynamic batching 
+* Paged Attention
+* TRTLLM Engine support
+* Support for Multimodal model inference
