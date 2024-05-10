@@ -299,8 +299,8 @@ class QuantizationHelper:
                                                                                 intra_dp_size)
 
                 """all to all"""
-                all_to_all_output_tensor = torch.empty_like(quant_tensor)
-                all_to_all_output_scales = torch.empty_like(quant_scales)
+                all_to_all_output_tensor = all_to_all_output_tensor[:all_to_all_output_tensor.numel() // intra_dp_size] # Reuse All to All receive buffer
+                all_to_all_output_scales = all_to_all_output_scales[:all_to_all_output_scales.numel() // intra_dp_size] # Reuse All to All receive buffer
                 all_to_all_single(all_to_all_output_tensor, quant_tensor, group=groups[f'global_{pp_rank}_{tp_rank}_{inter_idx}'])
                 all_to_all_single(all_to_all_output_scales, quant_scales, group=groups[f'global_{pp_rank}_{tp_rank}_{inter_idx}'])
 
