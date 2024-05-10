@@ -93,7 +93,10 @@ class Scheduler:
                 completed_request = self.active_request_pool.pop(result_request_id)
                 self.completed_request_pool[result_request_id] = completed_request
                 if len(self.waiting_request_pool) > 0:
-                    earliest_waiting_request = self.waiting_request_pool.popitem(last=False)
+                    (
+                        earliest_waiting_request_request_id,
+                        earliest_waiting_request,
+                    ) = self.waiting_request_pool.popitem(last=False)
                     self.active_request_pool[
-                        earliest_waiting_request.request_id
+                        earliest_waiting_request_request_id
                     ] = earliest_waiting_request
