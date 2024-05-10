@@ -1018,6 +1018,9 @@ def _add_training_args(parser):
                        '0=off, 1=moderate, 2=aggressive.')
     group.add_argument('--check-weight-hash-across-dp-replicas-interval', type=int, default=None,
                        help='Interval to check weight hashes are same across DP replicas. If not specified, weight hashes not checked.')
+    group.add_argument('--calculate-per-token-loss', action='store_true',
+                       help=('Scale cross entropy loss by the number of non-padded tokens in the '
+                             'global batch, versus the default behavior of assuming all tokens are non-padded.'))
 
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
