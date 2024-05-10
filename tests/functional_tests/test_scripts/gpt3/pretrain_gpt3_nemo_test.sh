@@ -53,7 +53,7 @@ build_run_cmd() {
         model.megatron_amp_O2=True \
         model.data.data_prefix=[] \
         model.data.data_impl=mock \
-        model.data.splits_string=[99990,8,2] \
+        model.data.splits_string=\'[99990,8,2]\' \
         model.optim.name=distributed_fused_adam \
         model.optim.weight_decay=0.1 \
         exp_manager.create_checkpoint_callback=False \
