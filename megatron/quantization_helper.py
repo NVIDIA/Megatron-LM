@@ -281,6 +281,7 @@ class QuantizationHelper:
                                                           intra_dp_size)
         streams = [torch.cuda.Stream() for _ in range(pipeline)]
         for i, stream in enumerate(streams):
+            stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
                 """all to all, dequantReduction"""
                 all_to_all_output_tensor = tensor_output_pipeline_chunk_list[i]
