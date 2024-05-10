@@ -1,11 +1,11 @@
 from typing import List
 
-from megatron.core.inference.backends.abstract_backend import AbstractBackend
 from megatron.core.inference.common_inference_params import CommonInferenceParams
+from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.models.common.language_module.language_module import LanguageModule
 
 
-class TRTLLMBackend(AbstractBackend):
+class TRTLLMEngineWrapper(AbstractEngine):
     def __init__(self, model: LanguageModule, tokenizer=None):
         self.model = model
         self.tokenizer = tokenizer

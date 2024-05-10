@@ -3,7 +3,7 @@ import sys
 
 import torch
 
-from megatron.core.inference.backends.mcore_backend import MCoreBackend
+from megatron.core.inference.engines.mcore_engine import MCoreBackend
 from megatron.core.inference.common_generate_function import common_generate
 from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.inference_model_wrappers.gpt.gpt_inference_wrapper import (
@@ -17,11 +17,11 @@ sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 from megatron import get_args, get_tokenizer, print_rank_0
-from megatron.arguments import core_transformer_config_from_args
-from megatron.checkpointing import load_checkpoint
+from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.checkpointing import load_checkpoint
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.initialize import initialize_megatron
+from megatron.training.initialize import initialize_megatron
 from megatron.training import get_model
 
 

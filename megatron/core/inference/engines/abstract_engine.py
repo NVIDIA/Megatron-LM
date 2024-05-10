@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from typing import List
 
 
-class AbstractBackend(ABC):
+class AbstractEngine(ABC):
     @staticmethod
     @abstractmethod
     def generate(self) -> dict:
