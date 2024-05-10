@@ -131,11 +131,9 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce').stop()
 
-    # normalize gradients.
+    # normalize gradients for per-token loss normalization.
     # if we are using by the number of tokens, then we use that as a divisor. this number
     # will be the total number of non-padded tokens in the global batch.
-    # otherwise, we simply divide by the number of data parallel ranks, which is the original
-    # behavior in megatron and is identical to the previous version when sequences are not padded.
     if num_tokens is not None:
         # the number of tokens is only present on the last stage, so broadcast it
         # to the other ranks in the pipeline parallel group.
@@ -144,9 +142,9 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
             src=parallel_state.get_pipeline_model_parallel_last_rank(),
             group=parallel_state.get_pipeline_model_parallel_group(),
         )
-    for model_chunk in model:
-        if num_tokens is not None and num_tokens > 0:
-            scaling = 1.0 / num_tokens
-        else:
-            scaling = 1.0 / parallel_state.get_data_parallel_world_size()
-        model_chunk.scale_gradients(scaling)
+        # all-reduce across DP ranks.
+        torch.distributed.all_reduce(num_tokens, group=parallel_state.get_data_parallel_group())
+        for model_chunk in model:
+            if num_tokens > 0:
+                scaling = 1.0 / num_tokens
+                model_chunk.scale_gradients(scaling)
