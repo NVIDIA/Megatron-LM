@@ -8,7 +8,8 @@
 | 2.7B | Quantize Grad and WeightDiff | 2_7B_QWG |
 
 
-*Env: 4 nodes each equipped with 8xA100 GPUs* \
+**Run on Bytedance cluster with Infiniband(400Gbps)** \
+*Env: up to 8 nodes each equipped with 8xA100 GPUs* \
 *Note: For Speed Test, Sequence Length=1024, Accumulation Step=1, using Mock Data*
 
-Each Script will run on 4 8xA100 nodes respectivelly.
+Each Script will run on [4, 8] 8xA100 nodes respectivelly.

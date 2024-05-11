@@ -1,16 +1,5 @@
 #!/bin/bash
-
-NNODES=$SLURM_NNODES # number of nodes used for training
-GPUS_PER_NODE=$SLURM_GPUS_PER_NODE # number of gpus per node
-MASTER_PORT=6002
-WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
-NODE_RANK=$SLURM_NODEID
-
-VOCAB_FILE=  # Path to vocab.json
-MERGE_FILE=  # Path to merges.txt
-DATA_PATH=  # Path to Pile Dedupulicated dataset
-TENSORBOARD_DIR=  # path to store tensorboard log
-WANDB_DIR=  # path to store wandb log
+set -x
 
 # Parallel Setting
 TENSOR_PARALLEL_SIZE=1
@@ -99,7 +88,9 @@ QUANTIZE_ARGS="
     --wq-group-size 2048 \
 "
 
-torchrun $DISTRIBUTED_ARGS pretrain_gpt.py \
+PRETRAIN_PY="$MEGATRON_PATH/pretrain_gpt.py"
+
+torchrun $DISTRIBUTED_ARGS $PRETRAIN_PY \
     $MODEL_ARGS \
     $TRAINING_ARGS \
     $OPTIMIZER_ARGS \
@@ -107,5 +98,4 @@ torchrun $DISTRIBUTED_ARGS pretrain_gpt.py \
     $OUTPUT_ARGS \
     $QUANTIZE_ARGS \
     --distributed-backend nccl \
-    --save $CHECKPOINT_PATH \
-    --load $CHECKPOINT_PATH
+    --exit-interval 200 \
