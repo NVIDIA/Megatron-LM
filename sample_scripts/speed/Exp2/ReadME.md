@@ -12,4 +12,4 @@
 *Env: up to 8 nodes each equipped with 8xA100 GPUs* \
 *Note: For Speed Test, Sequence Length=1024, Accumulation Step=1, using Mock Data*
 
-Each Script will run on [4, 8] 8xA100 nodes respectivelly.
+Each Script will run on [4, 8, 16] 8xA100 nodes respectivelly.
