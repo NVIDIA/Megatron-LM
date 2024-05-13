@@ -2,7 +2,7 @@
 #SBATCH -J SpeedTest-EXP2
 #SBATCH -p gpu
 #SBATCH -o speed_test_starter-exp2_%j.txt
-#SBATCH --nodes=8
+#SBATCH --nodes=16
 #SBATCH --gpus-per-node=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=60
