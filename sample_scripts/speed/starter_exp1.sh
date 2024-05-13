@@ -30,7 +30,7 @@ execute_script() {
     local command="ssh $node \"bash -c \\\"\
         set -x; \
         echo 'Activating Conda environment: $conda_env'; \
-        # TODO prepair environment here; \
+        : 'TODO: Prepare environment here'; \  # Use : to introduce a comment in the command string
         conda init; \
         source ~/.bashrc; \
         conda activate $conda_env; \
