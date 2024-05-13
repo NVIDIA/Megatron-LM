@@ -67,7 +67,7 @@ OUTPUT_LOG_PATH="/N/slate/jindjia/bash_scripts/bytedance/speedtest/output_result
 OUTPUT_LOG_PATH="${OUTPUT_LOG_PATH}/Exp1/${SLURM_JOB_ID}" # TODO I used job id to be a unique identifier for each run, you can change it with a unique value
 SCRIPT_DIRECTORY="/N/slate/jindjia/LLM/Megatron-SpeedTest/sample_scripts/speed/Exp1" # TODO abslute path for Exp1 scripts
 
-NUM_NODES_LIST=(4 8 12 16)  # TODO Number of Nodes you will use to test on it. (Need to equal or smaller than your allocation)
+NUM_NODES_LIST=(4 6 8 12 16 )  # TODO Number of Nodes you will use to test on it. (Need to equal or smaller than your allocation)
 SCRIPT_LIST=("1_3B_Baseline.sh" "1_3B_QWG.sh" "2_7B_Baseline.sh" "2_7B_QWG.sh" "6_7B_Baseline.sh" "6_7B_QWG.sh" "13B_Baseline.sh" "13B_QWG.sh" "18B_Baseline.sh" "18B_QWG.sh")
     # TODO specify the training script you plan to run
 
