@@ -222,7 +222,7 @@ def _initialize_distributed():
     else:
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(
-                backend=args.distributed_backend,
+                backend=get_accelerator().communication_backend_name(),
                 world_size=args.world_size, rank=args.rank,
                 timeout=timedelta(minutes=args.distributed_timeout_minutes))
 
