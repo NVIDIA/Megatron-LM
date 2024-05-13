@@ -165,6 +165,9 @@ def validate_args(args, defaults={}):
         if args.standalone_embedding_stage else
         args.pipeline_model_parallel_size
     )
+    assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
+        'number of layers should be divisible by the pipeline parallel size'
+    num_layers_per_pipeline_stage = args.num_layers // args.transformer_pipeline_model_parallel_size
 
     # Checks.
     model_parallel_size = args.pipeline_model_parallel_size * \
@@ -243,9 +246,6 @@ def validate_args(args, defaults={}):
         assert args.pipeline_model_parallel_size > 2, \
             'pipeline-model-parallel size should be greater than 2 with ' \
             'interleaved schedule'
-        assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
-            'number of layers should be divisible by the pipeline parallel size'
-        num_layers_per_pipeline_stage = args.num_layers // args.transformer_pipeline_model_parallel_size
         assert num_layers_per_pipeline_stage % args.num_layers_per_virtual_pipeline_stage == 0, \
             'number of layers per pipeline stage must be divisible number of layers per virtual pipeline stage'
         args.virtual_pipeline_model_parallel_size = num_layers_per_pipeline_stage // \
