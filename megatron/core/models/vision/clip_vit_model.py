@@ -82,16 +82,15 @@ class CLIPViTModel(VisionModule):
 
         self.model_type = ModelType.encoder_or_decoder
 
-        # Transformer + final layer norm (via post_process)
+        # Transformer layers.
         # TODO: Follow-up changes will make pre and post_process configurable. They are needed for supporting pipeline parallelism.
-        self.transformer = TransformerBlock(
+        # Note: a final layer norm and/or linear layer present in some implementations are omitted here. They can be added separately where needed.
+        self.decoder = TransformerBlock(
             config=transformer_config,
             spec=transformer_layer_spec,
             pre_process=True,
-            post_process=True,
+            post_process=False,
         )
-
-        # Note: a final linear layer present in some implementations is omitted here. It can be added separately where needed.
 
     def set_input_tensor(self, input_tensor: torch.Tensor) -> None:
         """Sets input tensor to the model.
@@ -99,7 +98,7 @@ class CLIPViTModel(VisionModule):
         Args:
             input_tensor (Tensor): Sets the input tensor for the model.
         """
-        self.transformer.set_input_tensor(input_tensor)
+        self.decoder.set_input_tensor(input_tensor)
 
     def forward(
         self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
@@ -133,7 +132,7 @@ class CLIPViTModel(VisionModule):
         if attention_mask is None:
             attention_mask = torch.ones(1, 1, x.shape[0], x.shape[0]).cuda()  # [1, 1, s, s]
             attention_mask = attention_mask < 0.5  # to bool
-        x = self.transformer(x.contiguous(), attention_mask)
+        x = self.decoder(x.contiguous(), attention_mask)
         x = x.permute(1, 0, 2)  # [s, b, h] -> [b, s, h]
         x = x.contiguous()
 
