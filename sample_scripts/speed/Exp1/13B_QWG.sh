@@ -94,7 +94,9 @@ QUANTIZE_ARGS="
     --hadamard-transform \
 "
 
-torchrun $DISTRIBUTED_ARGS pretrain_gpt.py \
+PRETRAIN_PY="$MEGATRON_PATH/pretrain_gpt.py"
+
+torchrun $DISTRIBUTED_ARGS $PRETRAIN_PY \
     $MODEL_ARGS \
     $TRAINING_ARGS \
     $OPTIMIZER_ARGS \

@@ -1,7 +1,6 @@
 #!/bin/bash
 #SBATCH -J SpeedTest-EXP3
 #SBATCH -p gpu
-#SBATCH -A r00114
 #SBATCH -o speed_test_starter-exp3_%j.txt
 #SBATCH --nodes=32
 #SBATCH --gpus-per-node=8
@@ -16,10 +15,9 @@ set -x
 execute_script() {
     local node=$1
     local script_path=$2
-    local conda_env=$3
-    local output_base_path=$4
-    local node_rank=$5
-    local run_in_background=$6
+    local output_base_path=$3
+    local node_rank=$4
+    local run_in_background=$5
 
     echo "Preparing to execute script on node $node with rank $node_rank..."
     
@@ -32,9 +30,10 @@ execute_script() {
     local command="ssh $node \"bash -c \\\"\
         set -x; \
         echo 'Activating Conda environment: $conda_env'; \
-        mamba init; \
+        # TODO prepair environment here; \
+        conda init; \
         source ~/.bashrc; \
-        mamba activate $conda_env; \
+        conda activate $conda_env; \
 
         mkdir -p $full_output_path; \
         cd $full_output_path; \
@@ -63,14 +62,13 @@ execute_script() {
     eval $command
 }
 
-MEGATRON_PATH="/N/slate/jindjia/LLM/Megatron-SpeedTest" # Specify Megatron-LM Path
-OUTPUT_LOG_PATH="/N/slate/jindjia/bash_scripts/bytedance/speedtest/output_result" # Specify outputlog path
-OUTPUT_LOG_PATH="${OUTPUT_LOG_PATH}/Exp3/${SLURM_JOB_ID}"
-SCRIPT_DIRECTORY="/N/slate/jindjia/bash_scripts/bytedance/speedtest/test_scripts/Exp1" # Exp3 has same scripts with Exp1
-SCRIPT_LIST=("6_7B_Baseline.sh" "6_7B_QWG.sh" "13B_Baseline.sh" "13B_QWG.sh" "18B_Baseline.sh" "18B_QWG.sh")
+MEGATRON_PATH="/N/slate/jindjia/LLM/Megatron-SpeedTest" # TODO Specify you path to Megatron-LM Folder
+OUTPUT_LOG_PATH="/N/slate/jindjia/bash_scripts/bytedance/speedtest/output_result" # TODO Specify your output Path
+OUTPUT_LOG_PATH="${OUTPUT_LOG_PATH}/Exp3/${SLURM_JOB_ID}" # TODO I used job id to be a unique identifier for each run, you can change it with a unique value
+SCRIPT_DIRECTORY="/N/slate/jindjia/LLM/Megatron-SpeedTest/sample_scripts/speed/Exp3" # TODO abslute path for Exp3 scripts
 
-NUM_NODES_LIST=(4 6 8 12 16 20 24 28 32)  # Number of Nodes you will use to test on it. (Need to equal or smaller than your allocation)
-CONDA_ENV_NAME="megatron-TE" # Specify conda environment name or path here
+NUM_NODES_LIST=(20 24 28 32 )  # TODO Number of Nodes you will use to test on it. (Need to equal or smaller than your allocation)
+SCRIPT_LIST=("6_7B_Baseline.sh" "6_7B_QWG.sh" "13B_Baseline.sh" "13B_QWG.sh" "18B_Baseline.sh" "18B_QWG.sh") # TODO specify the training script you plan to run
 
 # Set master node and node list (Slurm only)
 if [[ -z "${SLURM_NODELIST}" ]]; then
@@ -79,14 +77,15 @@ else
     MASTER_RANK=$(scontrol show hostnames "$SLURM_NODELIST" | head -n 1)
     NODERANKS=$(scontrol show hostnames "$SLURM_NODELIST" | tr '\n' ' ')
 fi
-
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -n 1)
-GPUS_PER_NODE=$SLURM_GPUS_PER_NODE
-OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
-VOCAB_FILE=/N/scratch/jindjia/thepile/vocab.json
-MERGE_FILE=/N/scratch/jindjia/thepile/merges.txt
-DATA_PATH=/N/scratch/jindjia/thepile/pile_text_document
+GPUS_PER_NODE=$SLURM_GPUS_PER_NODE # TODO Set the number of gpus for per node
+OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK # TODO Set number of cpus per task, can be ignored
+
+VOCAB_FILE=/N/scratch/jindjia/thepile/vocab.json # TODO Set vocab path
+MERGE_FILE=/N/scratch/jindjia/thepile/merges.txt # TODO Set merges path
+DATA_PATH=/N/scratch/jindjia/thepile/pile_text_document # TODO Set dataset path, actually won't be used because will use mock data.
+
 
 for num_nodes in "${NUM_NODES_LIST[@]}"; do
     NNODES=$num_nodes
