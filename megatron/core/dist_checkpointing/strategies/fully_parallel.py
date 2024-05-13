@@ -121,10 +121,10 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
         Returns: None
         """
         if self.do_cache_distribution and self.cached_distribution is not None:
-            logger.info(f'Apply *cached* save parallelization')
+            logger.debug(f'Apply *cached* save parallelization')
             precomputed_distribution = self.cached_distribution
         else:
-            logger.info(f'Apply save parallelization')
+            logger.debug(f'Apply save parallelization')
             precomputed_distribution = determine_main_replica_uniform_distribution(
                 sharded_state_dict, self.parallelization_group
             )
@@ -223,7 +223,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             precomputed_distribution is not None
         ), 'Expecting non-trivial distribution for non-trivial parallelization group'
         end = time()
-        logger.info(f'self.apply_loading_parallelization took {end - start}s')
+        logger.debug(f'self.apply_loading_parallelization took {end - start}s')
         start = end
 
         # Step 3: load part of the checkpoint.
@@ -238,18 +238,18 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         loaded_state_dict = self.base_strategy.load(sharded_state_dict, checkpoint_dir)
 
         end = time()
-        logger.info(f'Base load of ShardedObjects took {end - start}s')
+        logger.debug(f'Base load of ShardedObjects took {end - start}s')
         start = end
 
         # Load sharded tensors separately
         loaded_tensors = self.base_strategy.load(to_load_shards, checkpoint_dir)
 
         end = time()
-        logger.info(f'Base load of ShardedTensors took {end - start}s')
+        logger.debug(f'Base load of ShardedTensors took {end - start}s')
         start = end
 
         # Step 4: exchange data between ranks
-        logger.info(f'Applying parallel load with algo {self.exchange_algo}')
+        logger.debug(f'Applying parallel load with algo {self.exchange_algo}')
         if self.exchange_algo == 'gather_object':
             exchange_fn = self.exchange_loaded_tensors_gather_object
         elif self.exchange_algo == 'gather_rounds':
@@ -271,8 +271,8 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         sync_start = time()
         torch.cuda.synchronize()
         end = time()
-        logger.info(f'torch.cuda.synchronize took {end - sync_start}s')
-        logger.info(f'self.exchange_loaded_tensors took {end - start}s')
+        logger.debug(f'torch.cuda.synchronize took {end - sync_start}s')
+        logger.debug(f'self.exchange_loaded_tensors took {end - start}s')
 
         self.fill_in_deferred_sharded_tensors(sharded_tensors, all_loaded_tensors)
         merge(loaded_state_dict, sharded_tensors)
@@ -344,10 +344,10 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             SaveLoadDistribution (optional): the computed loading distribution
         """
         if self.do_cache_distribution and self.cached_distribution is not None:
-            logger.info(f'Apply *cached* load parallelization')
+            logger.debug(f'Apply *cached* load parallelization')
             precomputed_distribution = self.cached_distribution
         else:
-            logger.info(f'Apply load parallelization')
+            logger.debug(f'Apply load parallelization')
             precomputed_distribution = determine_main_replica_uniform_distribution(
                 sharded_state_dict, self.parallelization_group, True
             )
@@ -493,7 +493,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
 
             end = time()
             if torch.distributed.get_rank() == 0:
-                logger.info(f'{dtype} exchange rounds all_gather schedule took {end - start}s')
+                logger.debug(f'{dtype} exchange rounds all_gather schedule took {end - start}s')
 
         return all_loaded_tensors
 
@@ -547,7 +547,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
 
         end = time()
         if torch.distributed.get_rank() == 0:
-            logger.info(f'exchange broadcast schedule took {end - start}s')
+            logger.debug(f'exchange broadcast schedule took {end - start}s')
 
         return all_loaded_tensors
 
@@ -821,6 +821,6 @@ def distribute_shards_to_ranks(
         shard_to_saving_rank[shard_id] = rank
         rank_sizes[rank] = (size + shard_to_size[shard_id], rank)
 
-    logger.info(f'distribute_shards_to_ranks distribution: {rank_sizes}')
+    logger.debug(f'distribute_shards_to_ranks distribution: {rank_sizes}')
 
     return shard_to_saving_rank
