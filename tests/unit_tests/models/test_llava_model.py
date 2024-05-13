@@ -4,6 +4,7 @@ from copy import deepcopy
 import pytest
 import torch
 
+from megatron.core import InferenceParams
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -37,10 +38,12 @@ class TestLLaVAModel:
         self.model = LLaVAModel(
             language_transformer_config=language_config,
             language_transformer_layer_spec=language_layer_spec,
+            language_position_embedding_type="rope",
             vocab_size=2048,
             max_sequence_length=1024,
             vision_transformer_config=vision_config,
             vision_transformer_layer_spec=vision_layer_spec,
+            drop_vision_class_token=False,
             vision_projection_config=vision_projection_config,
             vision_projection_layer_spec=vision_projection_spec,
         )
@@ -52,13 +55,13 @@ class TestLLaVAModel:
         assert isinstance(self.model, LLaVAModel)
 
         num_weights = sum([p.numel() for p in self.model.parameters()])
-        assert num_weights == 1439432
+        assert num_weights == 1308232
 
     def test_set_input_tensor(self):
         expected_shape = (1, 2, 3, 4)
         input_tensor = torch.zeros(expected_shape)
         self.model.set_input_tensor(input_tensor)
-        assert self.model.vision_model.transformer.input_tensor.shape == expected_shape
+        assert self.model.vision_model.decoder.input_tensor.shape == expected_shape
 
     def test_forward(self):
         self.model.cuda()
@@ -72,12 +75,27 @@ class TestLLaVAModel:
         attention_mask = attention_mask < 0.5
         labels = torch.randint(0, 2048, (2, 1601)).cuda()
 
-        # Try with and without labels.
+        # Try with labels.
         loss = self.model.forward(img, input_ids, position_ids, attention_mask, labels)
         assert loss.shape == torch.Size((2, 1601))
 
+        # Try without labels and without inference params.
         logits = self.model.forward(img, input_ids, position_ids, attention_mask, labels=None)
         assert logits.shape == torch.Size((2, 1601, 2048))
+
+        # Try without labels and with inference params.
+        inference_params = InferenceParams(2, 1601)
+        logits = self.model.forward(
+            img,
+            input_ids,
+            position_ids,
+            attention_mask,
+            labels=None,
+            inference_params=inference_params,
+        )
+        assert logits.shape == torch.Size((2, 1601, 2048))
+        # Check KV cache got created.
+        assert len(inference_params.key_value_memory_dict) > 0
 
     def test_save_load(self, tmp_path):
         path = tmp_path / "model.pt"
