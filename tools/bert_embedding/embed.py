@@ -16,7 +16,7 @@ from megatron.core.datasets.retro.utils import get_blocks_by_rank
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.legacy.model import BertModel
-from megatron.training import setup_model_and_optimizer
+from megatron.training.training import setup_model_and_optimizer
 from pretrain_bert import model_provider, get_batch, loss_func, forward_step
 
 from .dataset import BertEmbeddingDataset

@@ -13,8 +13,8 @@ from megatron.core.datasets.retro.db.utils import (
     get_merged_train_dataset as get_db_dataset,
 )
 from megatron.core.datasets.retro.query.retro_dataset import get_retro_datasets, RetroDataset
-from megatron.global_vars import set_global_variables
-from megatron.training import build_train_valid_test_datasets, update_train_iters
+from megatron.training.global_vars import set_global_variables
+from megatron.training.training import build_train_valid_test_datasets, update_train_iters
 from pretrain_retro import train_valid_test_datasets_provider
 from tools.retro.preprocess_data import get_tokenizers
 
