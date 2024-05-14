@@ -228,15 +228,19 @@ class ParamAndGradBuffer:
         self.param_to_bucket = {}  # Param -> bucket mapping.
         self.param_index_map = {}  # Param -> location in buffer mapping (used in dist. optimizer).
 
+        def _pad(number_to_be_padded: int, divisor: int) -> int:
+            return int(math.ceil(number_to_be_padded / divisor) * divisor)
+
         def _pad_if_needed(data_index: int) -> int:
             """
             Pads data indices if using distributed optimizer (to ensure uniform sharding).
             """
             if self.ddp_config.use_distributed_optimizer:
-                return (
-                    int(math.ceil(data_index / self.data_parallel_world_size))
-                    * self.data_parallel_world_size
-                )
+                # Workaround for TE bug causing cuBLAS to pick an incompatible algorithm.
+                # This also helps cuBLAS pick more efficient algorithms for GEMMs.
+                # We now ensure that all buckets start at a memory address that is 256-byte
+                # aligned (128 values since params and grads use >= 16-bit precision).
+                return _pad(data_index, math.lcm(self.data_parallel_world_size, 128))
             return data_index
 
         # First, figure out how many elements should be in the underlying buffer storage.
