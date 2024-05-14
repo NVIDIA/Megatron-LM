@@ -61,9 +61,7 @@ class DistributedDataParallel(MegatronModule):
 
         self.ddp_config = ddp_config
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-            logger.info(
-                f'Setting up DistributedDataParallel with {type(self.ddp_config).__name__}: {self.ddp_config}'
-            )
+            logger.info(f'Setting up DistributedDataParallel with config {self.ddp_config}')
 
         # Turn off bucketing if we are on a pipeline stage that is not the first (since
         # data-parallel communication on these stages is not on the critical path), or if
