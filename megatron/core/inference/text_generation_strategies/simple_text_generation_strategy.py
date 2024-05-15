@@ -188,12 +188,27 @@ class SimpleTextGenerationStrategy:
 
         return torch.tensor(batch_prompt_tokens_list).cuda()
 
-    def generate_output_tokens_static_batch(
+    def generate_output_tokens_dynamic_batch(
         self, active_requests: OrderedDict[int, InferenceRequest],
     ) -> OrderedDict[int, InferenceRequest]:
         """Utility to generate the output tokens and probabilities for the prompts
 
-        This utility generates the output tokens. It uses the model wrapper to generate the outputs internally
+        This utility generates the output tokens for a dynamic batch. It will run one forward step at a time, and pass control back to the engine, which will update the request pool and call this method again.  
+        
+        Args:
+            active_requests (OrderedDict[int, InferenceRequest]): The input active requests. 
+
+        Returns:
+            OrderedDict[int, InferenceRequest]: The result for each of the incoming requests after running one forward step. 
+        """
+        raise Exception("Not implemented yet")
+
+    def generate_output_tokens_static_batch(
+        self, active_requests: OrderedDict[int, InferenceRequest],
+    ) -> OrderedDict[int, InferenceRequest]:
+        """Utility to generate the output tokens and probabilities for the prompts .
+
+        This utility generates the output tokens for a static batch. It runs the forward steps till all prompts complete generation. 
 
         Args:
             active_requests (OrderedDict[int, InferenceRequest]): The input active requests. 

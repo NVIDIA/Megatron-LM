@@ -63,6 +63,13 @@ class MCoreEngine(AbstractEngine):
         return result
 
     def run_engine(self, dynamic_generation=False):
+        """Main functionality to run inference
+
+        We will keep running the engine , till we have requests in the queue. 
+
+        Args:
+            dynamic_generation (bool, optional): Set this to True, if you want to enable dynamic batching. Mainly used with an inference server. Defaults to False.
+        """
         while self.scheduler.have_requests_pending():
             active_requests: Dict[int, InferenceRequest] = self.scheduler.active_request_pool.copy()
             if not dynamic_generation:
