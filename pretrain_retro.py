@@ -205,11 +205,22 @@ def train_valid_test_datasets_provider(train_valid_test_num_samples):
         data_config,
     ).build()
 
+    # >>>
+    # from lutil import pax
+    # pax("train_valid_test_num_samples")
+    # pax({"datasets": [ train_ds, valid_ds, test_ds ]})
+    # <<<
+
     gpt_datasets = {
         "train" : (train_ds, train_valid_test_num_samples[0]),
         "valid" : (valid_ds, train_valid_test_num_samples[1]),
         "test"  : (test_ds, train_valid_test_num_samples[2]),
     }
+
+    # >>>
+    from lutil import pax
+    pax({k:"%s, %d" % (len(d) if d else "--", n) for k, (d, n) in gpt_datasets.items()})
+    # <<<
 
     # Retro datasets.
     if args.retro_add_retriever:

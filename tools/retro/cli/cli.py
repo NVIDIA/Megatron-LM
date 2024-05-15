@@ -60,6 +60,15 @@ class retro:
                                         cls.config.retro_gpt_chunk_length,
                                         cls.config.retro_tokenizers.gpt.eod)
 
+        # >>>
+        # from megatron.training.training import build_train_valid_test_data_loaders
+        # args.iteration = 0
+        # train_loader, valid_loader, test_loader = \
+        #     build_train_valid_test_data_loaders(
+        #         train_valid_test_datasets_provider)
+        # pax("train_loader, valid_loader, test_loader")
+        # <<<
+
         # Pretraining datasets.
         pt_train_ds, pt_valid_ds, pt_test_ds = build_train_valid_test_datasets(
             train_valid_test_datasets_provider)
@@ -68,6 +77,11 @@ class retro:
             valid=pt_valid_ds,
             test=pt_test_ds,
         )
+
+        # >>>
+        from lscratch import analyze_retro_dataset
+        analyze_retro_dataset("0.7", pt_train_ds)
+        # <<<
 
         # Print usage.
         cls.print_usage()

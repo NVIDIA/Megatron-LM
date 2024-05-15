@@ -124,6 +124,11 @@ class BlendedMegatronDatasetBuilder(object):
         """
         datasets = self._build_blended_dataset_splits()
 
+        # >>>
+        # from lutil import pax
+        # pax("datasets")
+        # <<<
+
         for dataset in datasets:
             if dataset is not None and len(dataset) > 0:
                 if isinstance(dataset, BlendedDataset):
@@ -136,6 +141,11 @@ class BlendedMegatronDatasetBuilder(object):
                             raise IndexError(
                                 f"{type(dataset).__name__} blend goes out of bounds for {type([dataset_and_size[0]]).__name__} {i} for {dataset.split.name} split"
                             )
+
+        # >>>
+        # from lutil import pax
+        # pax("datasets")
+        # <<<
 
         return datasets
 
@@ -169,9 +179,15 @@ class BlendedMegatronDatasetBuilder(object):
 
             split = self.config.split_matrix
 
-            # Blend consists of a single prefix
-            if len(prefixes) == 1:
-                return self._build_megatron_dataset_splits(prefixes[0], split, self.sizes)
+            # >>>
+            if 0:
+                # Blend consists of a single prefix
+                if len(prefixes) == 1:
+                    # >>>
+                    # raise Exception("hi.")
+                    # <<<
+                    return self._build_megatron_dataset_splits(prefixes[0], split, self.sizes)
+            # <<<
 
             # Build the mid-level datasets
             if weights is None:
@@ -213,6 +229,11 @@ class BlendedMegatronDatasetBuilder(object):
                         size_i,
                         self.config,
                     )
+
+            # >>>
+            # from lutil import pax
+            # pax("blended_datasets")
+            # <<<
 
             return blended_datasets
 
@@ -277,6 +298,11 @@ class BlendedMegatronDatasetBuilder(object):
                         size,
                         self.config,
                     )
+
+            # >>>
+            from lutil import pax
+            pax("blended_datasets")
+            # <<<
 
             return blended_datasets
 
