@@ -310,7 +310,7 @@ def topk_softmax_with_capacity(
         topk_mask = torch.zeros_like(logits).scatter(1, top_indices, 1)
 
         # Maskout exceeded tokens
-        if drop_policy == "prob":
+        if drop_policy == "probs":
             capacity_probs, capacity_indices = torch.topk(
                 topk_masked_gates, k=expert_capacity, dim=0, sorted=False
             )
@@ -319,6 +319,8 @@ def topk_softmax_with_capacity(
             _, capacity_indices = torch.topk(topk_mask, k=expert_capacity, dim=0, sorted=False)
             capacity_mask = torch.zeros_like(logits).scatter(0, capacity_indices, 1)
             capacity_probs = torch.gather(topk_masked_gates, 0, capacity_indices)
+        else:
+            raise ValueError(f"Invalid drop_policy: {drop_policy}")
 
         if pad_to_capacity:
             final_probs, final_indices = (
