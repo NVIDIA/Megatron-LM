@@ -22,9 +22,8 @@ class LLaVAModel(MegatronModule):
     Args:
         language_transformer_config (TransformerConfig): Transformer config for the language model.
         language_transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers of the language model.
-        language_position_embedding_type (str): Type of the positional embedding to use in the language model.
-        vocab_size (int): Vocabulary size.
-        max_sequence_length (int): maximum sequence length. This is used for positional embedding.
+        language_vocab_size (int): Language model vocabulary size.
+        language_max_sequence_length (int): Language model maximum sequence length. This is used for positional embedding.
         vision_transformer_config (TransformerConfig): Transformer config for the vision model.
         vision_transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers of the vision model.
         drop_vision_class_token (bool): Drop vision class token(s) before input to the language model.
@@ -32,15 +31,17 @@ class LLaVAModel(MegatronModule):
         vision_projection_layer_spec (ModuleSpec): Specifies the module to use for the vision projection.
         vision_projection_type (str): Type of the vision projection to use. Default is a 2-layer MLP.
         allow_missing_vision_projection_checkpoint (bool): Allow vision projection weights to be missing when loading a checkpoint. Default False.
+        parallel_output (bool): Do not gather the outputs, keep them split across tensor parallel ranks. This is typically True for training and False for inference.
+        language_position_embedding_type (str): Position embedding type to use in the language model. Default learned absolute.
+        language_rotary_percent (float): Percent of rotary dimension to use for rotary position embeddings in the language model. Defaults to 1.0.
     """
 
     def __init__(
         self,
         language_transformer_config: TransformerConfig,
         language_transformer_layer_spec: ModuleSpec,
-        language_position_embedding_type: str,
-        vocab_size: int,
-        max_sequence_length: int,
+        language_vocab_size: int,
+        language_max_sequence_length: int,
         vision_transformer_config: TransformerConfig,
         vision_transformer_layer_spec: ModuleSpec,
         drop_vision_class_token: bool,
@@ -48,6 +49,9 @@ class LLaVAModel(MegatronModule):
         vision_projection_layer_spec: ModuleSpec,
         vision_projection_type: str = "mlp",
         allow_missing_vision_projection_checkpoint: bool = False,
+        parallel_output: bool = True,
+        language_position_embedding_type: str = 'learned_absolute',
+        language_rotary_percent: float = 1.0,
     ) -> None:
         super().__init__(config=language_transformer_config)
 
@@ -59,11 +63,13 @@ class LLaVAModel(MegatronModule):
             raise NotImplementedError("pipeline parallelism is not supported in this model yet.")
 
         self.language_model = GPTModel(
-            language_transformer_config,
-            language_transformer_layer_spec,
-            vocab_size,
-            max_sequence_length,
+            config=language_transformer_config,
+            transformer_layer_spec=language_transformer_layer_spec,
+            vocab_size=language_vocab_size,
+            max_sequence_length=language_max_sequence_length,
+            parallel_output=parallel_output,
             position_embedding_type=language_position_embedding_type,
+            rotary_percent=language_rotary_percent,
         )
 
         self.vision_model = CLIPViTModel(vision_transformer_config, vision_transformer_layer_spec)
