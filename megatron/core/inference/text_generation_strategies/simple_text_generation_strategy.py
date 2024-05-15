@@ -188,7 +188,7 @@ class SimpleTextGenerationStrategy:
 
         return torch.tensor(batch_prompt_tokens_list).cuda()
 
-    def generate_output_tokens_all_steps(
+    def generate_output_tokens_static_batch(
         self, active_requests: OrderedDict[int, InferenceRequest],
     ) -> OrderedDict[int, InferenceRequest]:
         """Utility to generate the output tokens and probabilities for the prompts

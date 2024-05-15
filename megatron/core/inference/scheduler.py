@@ -75,15 +75,30 @@ class Scheduler:
         num_requests_pending = len(self.active_request_pool) + len(self.waiting_request_pool)
         return num_requests_pending > 0
 
-    def update_requests_pool_with_result(
-        self, result_dict: typing.OrderedDict[int, InferenceRequest]
-    ):
-        """Update request pool status using the result
+    def add_earliest_waiting_request_to_active_pool(self):
+        """Utility to add the waiting request to active pool
 
-        Given an inference result from the engine, we update the active, waiting, completed request pools accordingly. 
+        This method will add the earliest request that is in the waiting request pool to the active request pool
+        """
+        assert (
+            len(self.active_request_pool) > self.max_batch_size
+        ), "Active request pool is already full. Cant add any more requests"
+        if len(self.waiting_request_pool) > 0:
+            (
+                earliest_waiting_request_request_id,
+                earliest_waiting_request,
+            ) = self.waiting_request_pool.popitem(last=False)
+            earliest_waiting_request.status = Status.ACTIVE_BUT_NOT_GENERATING_TOKENS
+            self.active_request_pool[earliest_waiting_request_request_id] = earliest_waiting_request
+
+    def update_requests_pools(self, result_dict: typing.OrderedDict[int, InferenceRequest] = None):
+        """Update request pool status
+
+        This method will full up the active request pool, if it has less than max batch size elements from the waiting request pool. 
+        If provided with a request dict, it will put the completed requests into the completed request pool and add waiting request into active pool.  
 
         Args:
-            result (typing.OrderedDict[int, InferenceRequest]): The result returned by the engine. A dictionary with keys as the request ids, and values as the requests 
+            result (typing.OrderedDict[int, InferenceRequest], optional): The result returned by the engine. A dictionary with keys as the request ids, and values as the requests. Defaults to None
         """
         for result_request_id in list(result_dict.keys()):
             active_request = self.active_request_pool[result_request_id]
@@ -92,11 +107,11 @@ class Scheduler:
             if active_request.status == Status.COMPLETED:
                 completed_request = self.active_request_pool.pop(result_request_id)
                 self.completed_request_pool[result_request_id] = completed_request
-                if len(self.waiting_request_pool) > 0:
-                    (
-                        earliest_waiting_request_request_id,
-                        earliest_waiting_request,
-                    ) = self.waiting_request_pool.popitem(last=False)
-                    self.active_request_pool[
-                        earliest_waiting_request_request_id
-                    ] = earliest_waiting_request
+                self.add_earliest_waiting_request_to_active_pool()
+
+        # If the active request pool is not full, add waiting requests
+        while (
+            len(self.active_request_pool) < self.max_batch_size
+            and len(self.waiting_request_pool) > 0
+        ):
+            self.add_earliest_waiting_request_to_active_pool()

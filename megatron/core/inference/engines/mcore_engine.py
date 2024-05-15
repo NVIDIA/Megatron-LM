@@ -68,7 +68,13 @@ class MCoreEngine(AbstractEngine):
             if not dynamic_generation:
                 result_dict: Dict[
                     int, InferenceRequest
-                ] = self.text_generation_strategy.generate_output_tokens_all_steps(active_requests)
-            # For dynamic batching we can call something like this :
-            # result: Dict[int, InferenceRequest] = self.text_generation_strategy.generat_output_tokens_one_step(active_requests)
-            self.scheduler.update_requests_pool_with_result(result_dict)
+                ] = self.text_generation_strategy.generate_output_tokens_static_batch(
+                    active_requests
+                )
+            else:
+                result_dict: Dict[
+                    int, InferenceRequest
+                ] = self.text_generation_strategy.generate_output_tokens_dynamic_batch(
+                    active_requests
+                )
+            self.scheduler.update_requests_pools(result_dict=result_dict)
