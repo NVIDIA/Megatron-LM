@@ -10,7 +10,7 @@ This guide will walk you through how you can use megatron core for inference on 
   - [2. Flow of Control In MCore Backend](#2-flow-of-control-in-mcore-backend)
   - [3. Customizing The Inference Pipeline](#3-customizing-the-inference-pipeline)
     - [3.1. Create Your Own Inference Backend](#31-create-your-own-inference-backend)
-    - [3.2. Create Your Own Text Generation Strategy](#32-create-your-own-text-generation-strategy)
+    - [3.2. Create Your Own Text Generation Controller](#32-create-your-own-text-generation-controller)
     - [3.3. Support Other Models](#33-support-other-models)
     - [3.3. Modify Inference Parameters](#33-modify-inference-parameters)
   - [4. Future work](#4-future-work)
@@ -41,15 +41,15 @@ NOTE: The model provider function in the script supports MCore and Legacy models
 ```
 
 ***STEP 3 - Choose an engine***
-One of the important elements of the generate function is an inference engine. In this example we will be choosing the [megatorn core enge](../../megatron/core/inference/engine/mcore_engine.py) with a [simple text generation strategy](../../megatron/core/inference/text_generation_strategies/simple_text_generation_strategy.py) since TRTLLMEngine is not available yet. Other engines that will be supported are [TRTLLMEngine](../../megatron/core/inference/engine/trt_llm_engine_wrapper.py)). If you dont want any customization use mcore engine with simple text generation strategy.
+One of the important elements of the generate function is an inference engine. In this example we will be choosing the [megatorn core enge](../../megatron/core/inference/engine/mcore_engine.py) with a [simple text generation controller](../../megatron/core/inference/text_generation_controllers/simple_text_generation_controller.py) since TRTLLMEngine is not available yet. Other engines that will be supported are [TRTLLMEngine](../../megatron/core/inference/engine/trt_llm_engine_wrapper.py)). If you dont want any customization use mcore engine with simple text generation controller.
 ```python
     inference_wrapped_model = GPTInferenceWrapper(model, args)
-    text_generation_strategy = SimpleTextGenerationStrategy(
+    text_generation_controller = SimpleTextGenerationController(
         inference_wrapped_model=inference_wrapped_model, 
         tokenizer=tokenizer
     )
     inference_backend = MCoreEngine(
-        text_generation_strategy=text_generation_strategy, max_batch_size=args.max_batch_size
+        text_generation_controller=text_generation_controller, max_batch_size=args.max_batch_size
     )
 ```
 
@@ -121,22 +121,22 @@ The following is what happens in the [simple_gpt_batch_inference.py](./gpt/simpl
 * We call  [mcore_engine](../../megatron/core/inference/engine/mcore_engine.py) **generate()** function with all our input prompts.
 * The scheduler in the engine will add these prompts to [active requests](../../megatron/core/inference/inference_request.py) till we hit max batch size, and then it will put the rest in waiting requests. 
 * The engine will then run till all requests (waiting + active) are completed 
-    * The active requests are passed into  **generate_output_tokens_all_steps()** of the text generation strategy . 
+    * The active requests are passed into  **generate_output_tokens_static_batch()** of the text generation controller . 
     * This function uses the [model_inference_wrappers](../../megatron/core/inference/inference_model_wrappers/abstract_model_inference_wrapper.py) **prep_model_for_inference()** , and then runs an auto regressive loop
     * In the auto regressive loop the inference wrappers **get_batch_for_context_window()** is called to get the required input, which is passed into the **run_one_forward_step()** method, which takes care of calling the appropriate (PP, TP) model forward methods to get the output logits
     * The output logits are synchornized across all ranks for PP Models
-    * The text generation strategy then samples from these logits and obtains the log probabilities based on the common inference parameters.
+    * The text generation controller then samples from these logits and obtains the log probabilities based on the common inference parameters.
     * The input prompt tokens are updated with the results a
-    * The **update_generation_status()** of the text generation strategy is called to check which of the prompts have completed generating , what the generation lengths are etc. 
+    * The **update_generation_status()** of the text generation controller is called to check which of the prompts have completed generating , what the generation lengths are etc. 
     * Finally after the inference loop, the result is detokenized and stored back into the inference requests. The status of these requests are marked as completed. 
-    * We then use the schedulers **update_requests_pool_with_result()** to update the requests pools. (i.e) Completed requests are put into the completed request pool and the waiting requests are added into the active request pool
+    * We then use the schedulers **update_requests_pool()** to update the requests pools. (i.e) Completed requests are put into the completed request pool and the waiting requests are added into the active request pool
 
 <br>
 
 #### 3. Customizing The Inference Pipeline
 The following guide will walk you through how you can customize different parts of the inference pipeline. Broadly there are three levels at which you can customize the pipeline. 
 * **Inference engine** - Highest level of customization. (Currently we support MCore Engine). Change this if you completely want to add your own way of running inference.  
-* **Text generation strategy** - Extend this if you want to customize tokenization, text generation, sampling, detokenization etc.
+* **Text generation controller** - Extend this if you want to customize tokenization, text generation, sampling, detokenization etc.
 * **Inference Wrapped Model** - Change this if you just want to support a new model 
 * **Modify Inference Parameters** - Change this to update top_p, top_k, number of tokens to be generated, temperature etc.
 
@@ -159,10 +159,10 @@ Currently we support mcore engine. Soon we will suport TRT-LLM. The suggested fl
 
 <br>
 
-##### 3.2. Create Your Own Text Generation Strategy
-In case you want to use the megatron core backend, but would like to overwrite the tokenization, text generation or detokenization extend the [simple_text_generation_strategy.py](../../megatron/core/inference/text_generation_strategies/simple_text_generation_strategy.py). The class has the following methods
+##### 3.2. Create Your Own Text Generation Controller
+In case you want to use the megatron core backend, but would like to overwrite the tokenization, text generation or detokenization extend the [simple_text_generation_controller.py](../../megatron/core/inference/text_generation_controllers/simple_text_generation_controller.py). The class has the following methods
 ``` python
-class SimpleTextGenerationStrategy:
+class SimpleTextGenerationController:
 
     def tokenize_prompt(self, prompt: str) -> Tuple[torch.Tensor, torch.Tensor]:
         """Utility to tokenize the input prompts"""
@@ -191,12 +191,12 @@ class SimpleTextGenerationStrategy:
         We check which prompts have reached an end condition and set the corresponding flags of the is_generation_done_tensor to True . The generated sequence lengths increases as we keep generating, until that prompts hits an eod condition. The generation started status tensor helps us determine which prompts have started generating
         """
 
-    def generate_output_tokens_all_steps(
+    def generate_output_tokens_static_batch(
         self, active_requests: OrderedDict[int, InferenceRequest],
     ) -> OrderedDict[int, InferenceRequest]:
-        """Utility to generate the output tokens and probabilities for the prompts
+        """Utility to generate the output tokens and probabilities for the prompts .
 
-        This utility generates the output tokens. It uses the model inference wrapper to generate the logits, which then gets process to generate the final results
+        This utility generates the output tokens for a static batch. It runs the forward steps till all prompts complete generation, updates the status of these requests to completed, adds the generated result and returns these requests
         """
 
     def detokenize_generations(self, prompt_tokens_with_generated_tokens: torch.Tensor) -> str:

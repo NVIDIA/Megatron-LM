@@ -8,7 +8,7 @@ from megatron.core.inference.engines.trt_llm_engine_wrapper import TRTLLMEngineW
 from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.inference_model_wrappers.gpt.gpt_inference_wrapper import GPTInferenceWrapper
 from megatron.core.inference.inference_request import InferenceRequest
-from megatron.core.inference.text_generation_strategies.simple_text_generation_strategy import SimpleTextGenerationStrategy
+from megatron.core.inference.text_generation_controllers.simple_text_generation_controller import SimpleTextGenerationController
 from megatron.core.transformer.module import MegatronModule
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir, os.path.pardir)))
@@ -122,8 +122,8 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
         return TRTLLMEngineWrapper(model, tokenizer)
     else :
         inference_wrapped_model = GPTInferenceWrapper(model, args)
-        text_generation_strategy = SimpleTextGenerationStrategy(inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer)
-        return MCoreEngine(text_generation_strategy=text_generation_strategy, max_batch_size=args.max_batch_size)
+        text_generation_controller = SimpleTextGenerationController(inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer)
+        return MCoreEngine(text_generation_controller=text_generation_controller, max_batch_size=args.max_batch_size)
             
 def main():
     """Main program."""

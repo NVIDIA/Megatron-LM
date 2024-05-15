@@ -12,11 +12,11 @@ from megatron.core.inference.inference_model_wrappers.abstract_model_inference_w
 from megatron.core.inference.inference_request import InferenceRequest, Status
 
 
-class SimpleTextGenerationStrategy:
+class SimpleTextGenerationController:
     def __init__(self, inference_wrapped_model: AbstractModelInferenceWrapper, tokenizer):
-        """The basic text generation strategy
+        """The basic text generation controller
 
-        This class is responsible for tokenizing the input , running the inference and also detokenizing the output
+        This class is responsible for tokenizing the input , running the inference, sampling and also detokenizing the output
 
         Args:
             inference_wrapped_model (AbstractModelInferenceWrapper): A model that is wrapped using the specs given in the abstract_model_inference_wrapper.py
@@ -208,7 +208,7 @@ class SimpleTextGenerationStrategy:
     ) -> OrderedDict[int, InferenceRequest]:
         """Utility to generate the output tokens and probabilities for the prompts .
 
-        This utility generates the output tokens for a static batch. It runs the forward steps till all prompts complete generation. 
+        This utility generates the output tokens for a static batch. It runs the forward steps till all prompts complete generation, updates the status of these requests to completed, adds the generated result and returns these requests
 
         Args:
             active_requests (OrderedDict[int, InferenceRequest]): The input active requests. 
