@@ -38,9 +38,8 @@ class TestLLaVAModel:
         self.model = LLaVAModel(
             language_transformer_config=language_config,
             language_transformer_layer_spec=language_layer_spec,
-            language_position_embedding_type="rope",
-            vocab_size=2048,
-            max_sequence_length=1024,
+            language_vocab_size=2048,
+            language_max_sequence_length=1024,
             vision_transformer_config=vision_config,
             vision_transformer_layer_spec=vision_layer_spec,
             drop_vision_class_token=False,
@@ -55,7 +54,7 @@ class TestLLaVAModel:
         assert isinstance(self.model, LLaVAModel)
 
         num_weights = sum([p.numel() for p in self.model.parameters()])
-        assert num_weights == 1308232
+        assert num_weights == 1439304
 
     def test_set_input_tensor(self):
         expected_shape = (1, 2, 3, 4)
