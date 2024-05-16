@@ -107,7 +107,6 @@ class Scheduler:
             if active_request.status == Status.COMPLETED:
                 completed_request = self.active_request_pool.pop(result_request_id)
                 self.completed_request_pool[result_request_id] = completed_request
-                self.add_earliest_waiting_request_to_active_pool()
 
         # If the active request pool is not full, add waiting requests
         while (
