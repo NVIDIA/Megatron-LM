@@ -180,13 +180,21 @@ class BlendedMegatronDatasetBuilder(object):
             split = self.config.split_matrix
 
             # >>>
-            if 0:
-                # Blend consists of a single prefix
-                if len(prefixes) == 1:
-                    # >>>
-                    # raise Exception("hi.")
-                    # <<<
-                    return self._build_megatron_dataset_splits(prefixes[0], split, self.sizes)
+            # if 0:
+            # Blend consists of a single prefix
+            # >>>
+            # if len(prefixes) == 1:
+            if len(prefixes) == 1 and weights is None:
+            # <<<
+                # >>>
+                raise Exception("hi.")
+                # <<<
+                return self._build_megatron_dataset_splits(prefixes[0], split, self.sizes)
+            # <<<
+
+            # >>>
+            from lutil import pax
+            pax("prefixes, weights")
             # <<<
 
             # Build the mid-level datasets

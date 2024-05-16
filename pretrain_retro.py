@@ -218,8 +218,8 @@ def train_valid_test_datasets_provider(train_valid_test_num_samples):
     }
 
     # >>>
-    from lutil import pax
-    pax({k:"%s, %d" % (len(d) if d else "--", n) for k, (d, n) in gpt_datasets.items()})
+    # from lutil import pax
+    # pax({k:"%s, %d" % (len(d) if d else "--", n) for k, (d, n) in gpt_datasets.items()})
     # <<<
 
     # Retro datasets.
