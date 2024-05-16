@@ -1,5 +1,11 @@
 workflow:
   rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests and nightly/
+      variables:
+        JET_CUSTOM_FILTER: "type == 'build' or 'merge-request' in spec.scope or 'nightly' in spec.scope"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/
+      variables:
+        JET_CUSTOM_FILTER: "type == 'build' or 'merge-request' in spec.scope"
     # always run MR pipelines
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     # always run web pipelines
@@ -18,9 +24,6 @@ variables: &VARS
   SELENE_ADLR_CI_PATH: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron"
   DATA_DIR: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron/data"
   PYTHON_VIRTUAL_ENV: /lustre/fsw/adlr/adlr-nlp/adlr_ci/cienv/bin/activate
-  TESTS_TO_RUN_AFTER_MERGING: "MR_TESTS NIGHTLY_TESTS" # Can specify levels
-  TESTS_TO_RUN_ON_THIS_COMMIT: unit_tests
-  TEST_REGEX_ON_THIS_COMMIT:  NONE #https://github.com/google/re2/wiki/Syntax (Can define regex as in this spec) e.g /.*gpt3.*/
   JET_CUSTOM_FILTER: ""
   DISPLAY_OUTPUT: "True" # Set to true for new tests to copy the logs for creating golden truth file
   TIME_LIMIT: "10:00" # Default time limit for all jobs

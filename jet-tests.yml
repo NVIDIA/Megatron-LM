@@ -16,15 +16,8 @@ jet-setup:
     - os/linux
   script:
     - set -x
-    - |
-      if [[ $CI_PIPELINE_SOURCE == "merge_request_event" ]] && [[ $CI_MERGE_REQUEST_LABELS =~ "Run tests" ]]; then
-          JET_FILTER="type == 'build' or 'merge-request' in spec.scope"
-      elif [[ -n $JET_CUSTOM_FILTER && $CI_PIPELINE_SOURCE != 'merge_request_event' ]]; then
-        JET_FILTER=$JET_CUSTOM_FILTER
-      else
-        JET_FILTER="False"
-      fi
-      echo "_JET_FILTER=$JET_FILTER" | tee -a config.env
+    - JET_FILTER=${JET_CUSTOM_FILTER:-False}
+    - echo "_JET_FILTER=$JET_FILTER" | tee -a config.env
   artifacts:
     reports:
       dotenv: config.env
