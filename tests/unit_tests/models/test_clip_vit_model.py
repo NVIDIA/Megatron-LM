@@ -1,5 +1,4 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-
 import pytest
 import torch
 
@@ -29,7 +28,7 @@ class TestCLIPViTModel:
         assert isinstance(self.model, CLIPViTModel)
 
         num_weights = sum([p.numel() for p in self.model.parameters()])
-        assert num_weights == 174848
+        assert num_weights == 174720
 
     def test_set_input_tensor(self):
         # [s, b, h] expected to the transformer.
@@ -38,7 +37,7 @@ class TestCLIPViTModel:
 
         self.model.set_input_tensor(input_tensor)
 
-        assert self.model.transformer.input_tensor.shape == torch.Size(expected_shape)
+        assert self.model.decoder.input_tensor.shape == torch.Size(expected_shape)
 
     def test_forward(self):
         self.model.cuda()

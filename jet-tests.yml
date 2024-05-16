@@ -30,12 +30,11 @@ jet-setup:
       dotenv: config.env
 
 jet-configure:
-  image: alpine
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/ci_yq:v1
   extends: [.jet_common, .jet-configure]
   tags:
     - os/linux
   script:
-    - wget https://github.com/mikefarah/yq/releases/download/v4.35.2/yq_linux_amd64.tar.gz -O - | tar xz && mv yq_linux_amd64 /usr/local/bin/yq
     - cd tests/functional_tests/jet_recipes
     - |
       if [[ $CI_PIPELINE_SOURCE == "merge_request_event" ]]; then

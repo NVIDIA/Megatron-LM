@@ -155,6 +155,12 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     Args:
         loss_mask (torch.Tensor): Used to mask out some portions of the loss
         output_tensor (torch.Tensor): The tensor with the losses
+
+    Returns:
+        the loss scalar for this micro-batch
+        the number of non-padded tokens in this microbatch
+        a dict containing reporting metrics on the loss and number of tokens across
+            the data parallel ranks
     """
     lm_loss_ = output_tensor.float()
     total_tokens = loss_mask.sum()
@@ -162,10 +168,10 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     lm_loss = torch.sum(lm_loss_.view(-1) * loss_mask.reshape(-1))
     lm_loss = torch.cat([lm_loss.view(1), total_tokens.view(1)])
 
-    reporting_loss = lm_loss.detach()
+    reporting_loss = lm_loss.clone().detach()
     torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
 
-    num_tokens = lm_loss[1].detach().to(torch.int)
+    num_tokens = lm_loss[1].clone().detach().to(torch.int)
     return lm_loss[0], num_tokens, {'lm loss': (reporting_loss[0], reporting_loss[1])}
 
 

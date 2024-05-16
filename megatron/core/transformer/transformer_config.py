@@ -98,6 +98,10 @@ class TransformerConfig(ModelParallelConfig):
     test_mode: bool = False
     """Whether to run real-time tests."""
 
+    calculate_per_token_loss: bool = False
+    """Whether cross entropy loss is calculated over the actual number of non-padded tokens in the
+    global batch, versus the default behavior of assuming all tokens are non-padded."""
+
     ####################
     # initialization
     ####################
@@ -257,8 +261,8 @@ class TransformerConfig(ModelParallelConfig):
     moe_pad_expert_input_to_capacity: bool = False
     """moe_pad_expert_input_to_capacity (bool): If True, pads the input for each expert to match the expert capacity length, effective only after the moe_expert_capacity_factor is set. The default setting is False."""
 
-    moe_token_drop_policy: str = 'position'
-    """The policy to drop tokens. Can be either "prob" or "position". If "prob", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.
+    moe_token_drop_policy: str = 'probs'
+    """The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.
     """
     moe_layer_recompute: bool = False
     """Memory optimization: checkpointing moe_layer to save actiavtion memory."""

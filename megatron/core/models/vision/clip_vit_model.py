@@ -1,14 +1,13 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 
-from megatron.core import tensor_parallel
 from megatron.core.models.common.vision_module.vision_module import VisionModule
 from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.enums import ModelType
-from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -18,8 +17,9 @@ class CLIPViTModel(VisionModule):
     """CLIP ViT vision model.
 
     Args:
-        transformer_config (TransformerConfig): Transformer config
-        transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers
+        transformer_config (TransformerConfig): Transformer config.
+        transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers.
+        ln_pre_impl (ModuleSpec or type): Specifies the layer norm type to use for ln_pre.
         patch_dim (int): Image patch size.
         img_h (int): Input image height.
         img_w (int): Input image width.
@@ -31,6 +31,7 @@ class CLIPViTModel(VisionModule):
         self,
         transformer_config: TransformerConfig,
         transformer_layer_spec: ModuleSpec,
+        ln_pre_impl: Union[ModuleSpec, type] = TENorm,
         patch_dim: int = 14,
         img_h: int = 336,
         img_w: int = 336,
@@ -72,24 +73,24 @@ class CLIPViTModel(VisionModule):
                 torch.randn(1, self.class_token_len, self.visual_hidden_size)
             )
 
-        self.ln_pre = TENorm(
-            config=self.config,
+        self.ln_pre = build_module(
+            ln_pre_impl,
+            config=transformer_config,
             hidden_size=self.visual_hidden_size,
-            eps=self.config.layernorm_epsilon,
+            eps=transformer_config.layernorm_epsilon,
         )
 
         self.model_type = ModelType.encoder_or_decoder
 
-        # Transformer + final layer norm (via post_process)
+        # Transformer layers.
         # TODO: Follow-up changes will make pre and post_process configurable. They are needed for supporting pipeline parallelism.
-        self.transformer = TransformerBlock(
+        # Note: a final layer norm and/or linear layer present in some implementations are omitted here. They can be added separately where needed.
+        self.decoder = TransformerBlock(
             config=transformer_config,
             spec=transformer_layer_spec,
             pre_process=True,
-            post_process=True,
+            post_process=False,
         )
-
-        # Note: a final linear layer present in some implementations is omitted here. It can be added separately where needed.
 
     def set_input_tensor(self, input_tensor: torch.Tensor) -> None:
         """Sets input tensor to the model.
@@ -97,7 +98,7 @@ class CLIPViTModel(VisionModule):
         Args:
             input_tensor (Tensor): Sets the input tensor for the model.
         """
-        self.transformer.set_input_tensor(input_tensor)
+        self.decoder.set_input_tensor(input_tensor)
 
     def forward(
         self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
@@ -131,7 +132,7 @@ class CLIPViTModel(VisionModule):
         if attention_mask is None:
             attention_mask = torch.ones(1, 1, x.shape[0], x.shape[0]).cuda()  # [1, 1, s, s]
             attention_mask = attention_mask < 0.5  # to bool
-        x = self.transformer(x.contiguous(), attention_mask)
+        x = self.decoder(x.contiguous(), attention_mask)
         x = x.permute(1, 0, 2)  # [s, b, h] -> [b, s, h]
         x = x.contiguous()
 

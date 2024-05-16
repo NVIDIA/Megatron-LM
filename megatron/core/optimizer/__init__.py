@@ -278,7 +278,7 @@ def get_megatron_optimizer(
     """
 
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        logger.info(f'Setting up optimizer with {type(config).__name__}: {config}')
+        logger.info(f'Setting up optimizer with config {config}')
 
     # Collect param groups.
     param_groups = _get_param_groups(

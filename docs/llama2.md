@@ -98,6 +98,7 @@ If loading for either inference or finetuning, use the following arguments:
 --normalization RMSNorm \
 --no-position-embedding \
 --no-masked-softmax-fusion \
+--attention-softmax-in-fp32
 ```
 
 ### Launch Meta

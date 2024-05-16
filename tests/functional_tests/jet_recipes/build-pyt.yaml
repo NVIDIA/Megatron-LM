@@ -5,7 +5,7 @@ spec:
   name: pyt
   platforms: [linux/amd64]
   source:
-    image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
+    image: gitlab-master.nvidia.com/adlr/megatron-lm/mcore_ci:24.01v3
 
 ---
 type: build
@@ -28,7 +28,7 @@ spec:
   name: nemo
   platforms: [linux/amd64]
   source:
-    image: nvcr.io/nvidian/bignlp-train:nemofw-nightly
+    image: nvcr.io/nvidian/nemo:nightly
 
 ---
 type: build

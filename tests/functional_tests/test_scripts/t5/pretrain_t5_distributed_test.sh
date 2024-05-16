@@ -16,6 +16,7 @@ set -exo pipefail
 if [[ -z $MBS ]]; then MBS=4; fi
 if [[ -z $GBS ]]; then GBS=32; fi
 if [[ -z $VOCAB_PATH ]]; then VOCAB_PATH="/workspace/data/t5_data/bert-large-cased-vocab.txt"; fi
+if [[ -z $ALLOW_NONDETERMINISTIC ]]; then ALLOW_NONDETERMINISTIC=0; fi
 
 GPUS_PER_NODE=8
 # Change for multinode config
@@ -26,16 +27,21 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 
 command="export CUDA_DEVICE_MAX_CONNECTIONS=1;"
 
-TRANSFORMER_IMPL=local
 TRAINING_DTYPE=fp16
+TRANSFORMER_IMPL=local
+
+if [[ $ALLOW_NONDETERMINISTIC -eq 1 ]]; then
+   command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1;"
+else
+   command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0; export NCCL_ALGO=^NVLS;"
+   ADDITIONAL_PARAMS+=" --deterministic-mode"
+fi
 
 if [[ $USE_CORE -eq 1 ]]; then
        echo "Running using megatron core"
        TRANSFORMER_IMPL=local
        TRAINING_DTYPE=bf16
-       command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0;"
        USE_MCORE=1
-       export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0
 fi
 
 if [[ $NO_FA -eq 1 ]]; then
@@ -116,6 +122,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --eval-iters 10 \
     --distributed-backend nccl \
     ${DATA_CACHE:+--data-cache-path "$DATA_CACHE"} \
+    ${USE_MCORE:+--use-mcore-models} \
     ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS}"
 
 command="$command $torch_run_cmd"

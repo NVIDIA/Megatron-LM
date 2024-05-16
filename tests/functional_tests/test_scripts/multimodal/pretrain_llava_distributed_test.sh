@@ -16,6 +16,7 @@ set -exo pipefail
 if [[ -z $MBS ]]; then MBS=4; fi
 if [[ -z $GBS ]]; then GBS=32; fi
 if [[ -z $MOE_GROUPED_GEMM ]]; then MOE_GROUPED_GEMM=0; fi
+if [[ -z $ALLOW_NONDETERMINISTIC ]]; then ALLOW_NONDETERMINISTIC=0; fi
 
 GPUS_PER_NODE=8
 # Change for multinode config
@@ -26,14 +27,20 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 
 command="export CUDA_DEVICE_MAX_CONNECTIONS=1;"
 
-TRANSFORMER_IMPL=local
 TRAINING_DTYPE=fp16
+TRANSFORMER_IMPL=local
+
+if [[ $ALLOW_NONDETERMINISTIC -eq 1 ]]; then
+   command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1;"
+else
+   command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0; export NCCL_ALGO=^NVLS;"
+   ADDITIONAL_PARAMS+=" --deterministic-mode"
+fi
 
 if [[ $USE_CORE -eq 1 ]]; then
        echo "Running using megatron core"
        TRANSFORMER_IMPL=local
        TRAINING_DTYPE=bf16
-       command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0;"
        USE_MCORE=1
 fi
 
@@ -107,8 +114,6 @@ build_torch_run_cmd() {
       --transformer-impl $TRANSFORMER_IMPL \
       --tensor-model-parallel-size $TP_SIZE \
       --pipeline-model-parallel-size $PP_SIZE \
-      --no-bias-swiglu-fusion \
-      --no-rope-fusion \
       ${VP_SIZE:+--num-layers-per-virtual-pipeline-stage "$VP_SIZE"} \
       ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
       ${USE_MCORE:+--use-mcore-models} \

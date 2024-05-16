@@ -6,22 +6,21 @@ from types import SimpleNamespace
 
 import torch
 
-from megatron.training import get_args, get_timers, get_tokenizer, print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core import tensor_parallel
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import MockGPTLowLevelDataset
 from megatron.core.datasets.multimodal_dataset import MockMultimodalDataset, MultimodalDatasetConfig
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from megatron.core.models.multimodal.llava_model import LLaVAModel
+from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from megatron.core.transformer.spec_utils import import_module
-from megatron.training import pretrain
+from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
+from megatron.training.arguments import core_transformer_config_from_args
 from pretrain_gpt import is_dataset_built_on_rank, loss_func
 
 
-def model_provider(pre_process=True, post_process=True) -> LLaVAModel:
+def model_provider(pre_process=True, post_process=True, parallel_output=True) -> LLaVAModel:
     """Builds the model.
 
     Note: currently, only LLaVA model is supported. Follow-up changes will make this configurable.
@@ -29,6 +28,7 @@ def model_provider(pre_process=True, post_process=True) -> LLaVAModel:
     Args:
         pre_process (bool): Enable preprocessing in the model. NOTE: Not used at the moment.
         post_process (bool): Enable postprocessing in the model. NOTE: Not used at the moment.
+        parallel_output (bool): Enable model parallel output.
 
     Returns:
         model (megatron.core.models.multimodal.llava_model.LLaVAModel): A multimodal model
@@ -44,7 +44,7 @@ def model_provider(pre_process=True, post_process=True) -> LLaVAModel:
         language_transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             args.num_experts, args.moe_grouped_gemm
         )
-    
+
     vision_transformer_layer_spec = get_vit_layer_with_transformer_engine_spec()
 
     # TODO: Make these configurable via input .yaml config.
@@ -57,13 +57,17 @@ def model_provider(pre_process=True, post_process=True) -> LLaVAModel:
     model = LLaVAModel(
         language_transformer_config=language_transformer_config,
         language_transformer_layer_spec=language_transformer_layer_spec,
-        vocab_size=args.padded_vocab_size,
-        max_sequence_length=args.max_position_embeddings,
+        language_vocab_size=args.padded_vocab_size,
+        language_max_sequence_length=args.max_position_embeddings,
         vision_transformer_config=vision_transformer_config,
         vision_transformer_layer_spec=vision_transformer_layer_spec,
+        drop_vision_class_token=args.drop_vision_class_token,
         vision_projection_config=vision_projection_config,
         vision_projection_layer_spec=vision_projection_modules,
         vision_projection_type=vision_projection_type,
+        parallel_output=parallel_output,
+        language_position_embedding_type=args.position_embedding_type,
+        language_rotary_percent=args.rotary_percent,
     )
 
     return model
@@ -192,6 +196,18 @@ def forward_step(data_iterator, model: LLaVAModel):
     return output_tensor, partial(loss_func, loss_mask)
 
 
+def add_vlm_extra_args(parser):
+    """Extra arguments."""
+    group = parser.add_argument_group(title='vision language model specific arguments')
+    group.add_argument(
+        "--drop-vision-class-token",
+        action="store_true",
+        default=False,
+        help="Drop vision class token before input to the language model.",
+    )
+    return parser
+
+
 if __name__ == "__main__":
     train_valid_test_datasets_provider.is_distributed = True
 
@@ -201,4 +217,5 @@ if __name__ == "__main__":
         ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+        extra_args_provider=add_vlm_extra_args,
     )
