@@ -7,6 +7,7 @@ from .common import read_tb_logs_as_list, TypeOfTest
 
 LOGS_DIR = os.getenv('LOGS_DIR')
 EXPECTED_METRICS_FILE = os.getenv('EXPECTED_METRICS_FILE')
+ALLOW_NONDETERMINISTIC = os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO")
 
 
 # If we require a variation of tests for any of the other pipelines we can just inherit this class.
@@ -14,6 +15,7 @@ class TestCIPipeline:
 
     margin_loss, margin_time = 0.05, 0.1
     expected = None
+    allow_nondeterministic = bool(int(ALLOW_NONDETERMINISTIC))
 
     def _setup(self):
         if os.path.exists(EXPECTED_METRICS_FILE):
@@ -43,16 +45,19 @@ class TestCIPipeline:
             else:
                 assert actual_val == expected_val, f"The value at step {step} should be {expected_val} but it is {actual_val}."
 
+    @pytest.mark.skipif(allow_nondeterministic, reason="Nondeterministic is allowed.")
     def test_lm_loss_deterministic(self):
         # Expected training loss curve at different global steps.
         self._setup()
         self._test_helper("lm loss", TypeOfTest.DETERMINISTIC)
 
+    @pytest.mark.skipif(not allow_nondeterministic, reason="Nondeterministic is not allowed.")
     def test_lm_loss_approx(self):
         # Expected training loss curve at different global steps.
         self._setup()
         self._test_helper("lm loss", TypeOfTest.APPROX)
 
+    @pytest.mark.skipif(allow_nondeterministic, reason="Nondeterministic is allowed.")
     def test_num_zeros_deterministic(self):
         # Expected validation loss curve at different global steps.
         self._setup()
