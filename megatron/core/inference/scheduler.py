@@ -78,7 +78,7 @@ class Scheduler:
     def add_earliest_waiting_request_to_active_pool(self):
         """Utility to add the waiting request to active pool
 
-        This method will add the earliest request that is in the waiting request pool to the active request pool
+        This method will add the earliest request (FIFO) that is in the waiting request pool to the active request pool.
         """
         assert (
             len(self.active_request_pool) > self.max_batch_size
@@ -103,12 +103,12 @@ class Scheduler:
         for result_request_id in list(result_dict.keys()):
             active_request = self.active_request_pool[result_request_id]
 
-            # If a request has completed swap it out to the earliest waiting request.
+            # If a request has completed put it into the completed request pool.
             if active_request.status == Status.COMPLETED:
                 completed_request = self.active_request_pool.pop(result_request_id)
                 self.completed_request_pool[result_request_id] = completed_request
 
-        # If the active request pool is not full, add waiting requests
+        # If the active request pool is not full, add waiting requests in FIFO order
         while (
             len(self.active_request_pool) < self.max_batch_size
             and len(self.waiting_request_pool) > 0
