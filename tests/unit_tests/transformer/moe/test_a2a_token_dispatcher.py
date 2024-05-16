@@ -18,7 +18,8 @@ class TestAlltoAllDispatcher:
     @pytest.mark.parametrize("tp_size,ep_size", [
         (1, 8),
         (8, 1),
-        (4, 2)
+        (4, 2),
+        (1, 1),
     ])
     def test_forward_backward(self, tp_size, ep_size):
         container = MoEModelTestContainer(
@@ -35,7 +36,9 @@ class TestAlltoAllDispatcher:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("tp_size,ep_size", [
         (1, 8),
-        (8, 1)
+        (8, 1),
+        (4, 2),
+        (1, 1),
     ])
     def test_capacity_forward_backward(self, tp_size, ep_size):
         container = MoEModelTestContainer(
@@ -46,6 +49,7 @@ class TestAlltoAllDispatcher:
             moe_router_topk=2,
             moe_router_load_balancing_type="aux_loss",
             moe_token_dispatcher_type="alltoall",
+            moe_token_drop_policy="probs",
             moe_expert_capacity_factor=0.5,
             moe_pad_expert_input_to_capacity=False,
         )
@@ -55,6 +59,8 @@ class TestAlltoAllDispatcher:
     @pytest.mark.parametrize("tp_size,ep_size", [
         (1, 8),
         (8, 1),
+        (4, 2),
+        (1, 1)
     ])
     def test_capacity_padding_forward_backward(self, tp_size, ep_size):
         import time
@@ -67,6 +73,7 @@ class TestAlltoAllDispatcher:
             moe_router_topk=2,
             moe_router_load_balancing_type="aux_loss",
             moe_token_dispatcher_type="alltoall",
+            moe_token_drop_policy="probs",
             moe_expert_capacity_factor=0.5,
             moe_pad_expert_input_to_capacity=True,
         )
