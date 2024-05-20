@@ -80,8 +80,19 @@ def num_floating_point_operations(args, batch_size):
     # MoE.
     num_experts_routed_to = 1 if args.num_experts is None else args.moe_router_topk
     gated_linear_multiplier = 3 / 2 if args.swiglu else 1
+
+    # The 12x term below comes from the following factors; for more details, see
+    # "APPENDIX: FLOATING-POINT OPERATIONS" in https://arxiv.org/abs/2104.04473.
+    # - 3x: Each GEMM in the model needs to be performed 3 times (forward pass,
+    #       backward wgrad [weight gradient], backward dgrad [data gradient]).
+    # - 2x: GEMMs of a particular size are stacked twice in the standard Transformer model
+    #       architectures implemented in this codebase (e.g., h->ffn_h GEMM and ffn_h->h GEMM
+    #       in MLP layer).
+    # - 2x: A GEMM of a m*n tensor with a n*k tensor requires 2mnk floating-point operations.
+    expansion_factor = 3 * 2 * 2
+
     return (
-        12
+        expansion_factor
         * batch_size
         * args.seq_length
         * args.num_layers
