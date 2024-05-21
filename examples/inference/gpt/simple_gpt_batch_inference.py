@@ -133,7 +133,8 @@ def main():
     initialize_megatron(extra_args_provider=add_text_generate_args,
                         args_defaults={'no_load_rng': True,
                                        'no_load_optim': True,
-                                       'micro_batch_size': 1})
+                                       'micro_batch_size': 1, 
+                                       'exit_on_missing_checkpoint': True})
 
     # Set up model and load checkpoint
     model = get_model(model_provider, wrap_with_ddp=False)

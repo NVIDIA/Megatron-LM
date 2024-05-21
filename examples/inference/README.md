@@ -76,7 +76,7 @@ We use default values for the [common inference params](../../megatron/core/infe
 <br>
 
 ##### 1.2 Running The Code
-An example of running the file is shown below. Change TP,PP values, model spec , tokenizer etc according to your model . 
+An example of running the file is shown below. Change TP &PP values, model spec , tokenizer paths, etc.for your model . 
 
 *NOTE: Most of these can be obtained from the script you used to train the model*
 ```
