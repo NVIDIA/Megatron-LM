@@ -1503,7 +1503,8 @@ class ParallelTransformer(MegatronModule):
                 assert config.attention_softmax_in_fp32, "TransformerEngine only supports softmax compute in FP32."
                 assert (
                     (bool(int(os.getenv("NVTE_APPLY_QK_LAYER_SCALING", "0"))) and args.fp16) == config.apply_query_key_layer_scaling
-                ), "Unsupported config for apply_query_key_layer_scaling in TransformerEngine."
+                ), ("Unsupported config for apply_query_key_layer_scaling in TransformerEngine. If --apply-query-key-layer-scaling is "
+                    "provided, set env-var NVTE_APPLY_QK_LAYER_SCALING=1 and you must be using fp16.")
                 return transformer_engine.pytorch.TransformerLayer(
                     config.hidden_size,
                     config.ffn_hidden_size,
