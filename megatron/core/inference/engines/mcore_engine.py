@@ -61,7 +61,7 @@ class MCoreEngine(AbstractEngine):
         result: List[InferenceRequest] = self.scheduler.completed_request_pool.values()
         return result
 
-    def run_engine(self, dynamic_generation=False):
+    def run_engine(self):
         """Main functionality to run inference
 
         We will keep running the engine , till we have requests in the queue. 
@@ -71,16 +71,20 @@ class MCoreEngine(AbstractEngine):
         """
         while self.scheduler.have_requests_pending():
             active_requests: Dict[int, InferenceRequest] = self.scheduler.active_request_pool.copy()
-            if not dynamic_generation:
-                result_dict: Dict[
-                    int, InferenceRequest
-                ] = self.text_generation_controller.generate_output_tokens_static_batch(
-                    active_requests
-                )
-            else:
-                result_dict: Dict[
-                    int, InferenceRequest
-                ] = self.text_generation_controller.generate_output_tokens_dynamic_batch(
-                    active_requests
-                )
+            result_dict: Dict[
+                int, InferenceRequest
+            ] = self.text_generation_controller.generate_all_output_tokens_static_batch(
+                active_requests
+            )
             self.scheduler.update_requests_pools(result_dict=result_dict)
+
+        # TODO: Later for dynamic batching we will do something like this
+        """ 
+            if dynamic_batching:
+                result_dict: Dict[
+                    int, InferenceRequest
+                ] = self.text_generation_controller.generate_output_tokens_one_step_dynamic_batch(
+                    active_requests
+                )
+            self.scheduler.update_requests_pools(result_dict=result_dict)         
+        """

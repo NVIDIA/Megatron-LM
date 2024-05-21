@@ -203,10 +203,10 @@ class SimpleTextGenerationController:
         """
         raise Exception("Not implemented yet")
 
-    def generate_output_tokens_static_batch(
+    def generate_all_output_tokens_static_batch(
         self, active_requests: OrderedDict[int, InferenceRequest],
     ) -> OrderedDict[int, InferenceRequest]:
-        """Utility to generate the output tokens and probabilities for the prompts .
+        """Utility to generate the all the output tokens and probabilities for the prompts .
 
         This utility generates the output tokens for a static batch. It runs the forward steps till all prompts complete generation, updates the status of these requests to completed, adds the generated result and returns these requests
 

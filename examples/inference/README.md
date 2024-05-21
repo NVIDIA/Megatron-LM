@@ -121,7 +121,7 @@ The following is what happens in the [simple_gpt_batch_inference.py](./gpt/simpl
 * We call  [mcore_engine](../../megatron/core/inference/engine/mcore_engine.py) **generate()** function with all our input prompts.
 * The scheduler in the engine will add these prompts to [active requests](../../megatron/core/inference/inference_request.py) till we hit max batch size, and then it will put the rest in waiting requests. 
 * The engine will then run till all requests (waiting + active) are completed 
-    * The active requests are passed into  **generate_output_tokens_static_batch()** of the text generation controller . 
+    * The active requests are passed into  **generate_all_output_tokens_static_batch()** of the text generation controller . 
     * This function uses the [model_inference_wrappers](../../megatron/core/inference/inference_model_wrappers/abstract_model_inference_wrapper.py) **prep_model_for_inference()** , and then runs an auto regressive loop
     * In the auto regressive loop the inference wrappers **get_batch_for_context_window()** is called to get the required input, which is passed into the **run_one_forward_step()** method, which takes care of calling the appropriate (PP, TP) model forward methods to get the output logits
     * The output logits are synchornized across all ranks for PP Models
@@ -191,10 +191,10 @@ class SimpleTextGenerationController:
         We check which prompts have reached an end condition and set the corresponding flags of the is_generation_done_tensor to True . The generated sequence lengths increases as we keep generating, until that prompts hits an eod condition. The generation started status tensor helps us determine which prompts have started generating
         """
 
-    def generate_output_tokens_static_batch(
+    def generate_all_output_tokens_static_batch(
         self, active_requests: OrderedDict[int, InferenceRequest],
     ) -> OrderedDict[int, InferenceRequest]:
-        """Utility to generate the output tokens and probabilities for the prompts .
+        """Utility to generate all the output tokens and probabilities for the prompts .
 
         This utility generates the output tokens for a static batch. It runs the forward steps till all prompts complete generation, updates the status of these requests to completed, adds the generated result and returns these requests
         """
