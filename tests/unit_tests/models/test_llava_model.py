@@ -93,8 +93,15 @@ class TestLLaVAModel:
             inference_params=inference_params,
         )
         assert logits.shape == torch.Size((2, 1601, 2048))
-        # Check KV cache got created.
-        assert len(inference_params.key_value_memory_dict) > 0
+
+        # Check KV cache got created correctly.
+        kv_dict = inference_params.key_value_memory_dict
+
+        assert kv_dict["image_tokens_count"] == 577
+        for layer_no in range(1, 4):    # 3 layers in the model.
+            layer_kv = kv_dict[layer_no]
+            # Expected shape is [sequence_len, batch_size, num_heads, hidden_size_per_head]
+            assert layer_kv[0].shape == layer_kv[1].shape == torch.Size((1601, 2, 8, 16))
 
     def test_save_load(self, tmp_path):
         path = tmp_path / "model.pt"
