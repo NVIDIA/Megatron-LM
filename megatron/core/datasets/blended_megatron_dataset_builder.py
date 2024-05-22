@@ -170,7 +170,7 @@ class BlendedMegatronDatasetBuilder(object):
             split = self.config.split_matrix
 
             # Blend consists of a single prefix
-            if len(prefixes) == 1:
+            if len(prefixes) == 1 and weights is None:
                 return self._build_megatron_dataset_splits(prefixes[0], split, self.sizes)
 
             # Build the mid-level datasets
