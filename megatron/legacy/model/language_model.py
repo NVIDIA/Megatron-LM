@@ -22,15 +22,13 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
     """LM logits using word embedding weights."""
     args = get_args()
     # Parallel logits.
-    if args.async_tensor_model_parallel_allreduce or\
-            args.sequence_parallel:
+    model_parallel = mpu.get_tensor_model_parallel_world_size() > 1
+    if model_parallel or args.sequence_parallel:
         input_parallel = input_
-        model_parallel = mpu.get_tensor_model_parallel_world_size() > 1
-        async_grad_allreduce = args.async_tensor_model_parallel_allreduce and \
-            model_parallel and not args.sequence_parallel
+        allreduce_dgrad = model_parallel and not args.sequence_parallel
     else:
         input_parallel = tensor_parallel.copy_to_tensor_model_parallel_region(input_)
-        async_grad_allreduce = False
+        allreduce_dgrad = False
 
     # Matrix multiply.
     logits_parallel = tensor_parallel.linear_with_grad_accumulation_and_async_allreduce(
@@ -38,8 +36,11 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
         weight=word_embeddings_weight,
         bias=bias,
         gradient_accumulation_fusion=args.gradient_accumulation_fusion,
-        async_grad_allreduce=async_grad_allreduce,
-        sequence_parallel=args.sequence_parallel)
+        async_grad_allreduce=allreduce_dgrad,
+        sequence_parallel=args.sequence_parallel,
+        grad_output_buffer=None,
+        allreduce_dgrad=allreduce_dgrad,
+    )
     # Gather if needed.
 
     if parallel_output:

@@ -5,7 +5,7 @@ import re
 import yaml
 
 SBATCH_TEMPLATE = '''
-srun --container-image nvcr.io/nvidia/pytorch:23.04-py3 \\
+srun --container-image nvcr.io/nvidia/pytorch:24.01-py3 \\
      --container-mounts "{}:{},{}:/workspace/megatron-lm" \\
      bash -c \"
      \n{}

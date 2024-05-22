@@ -115,14 +115,14 @@ def save_scripts(results, save_dir):
         if result['obj_workload']['obj_spec']['flat_artifacts']:
             dataset_mount = list(result['obj_workload']['obj_spec']['flat_artifacts'].keys())[0]
             content = f'''
-            srun --container-image nvcr.io/nvidia/pytorch:23.04-py3 \\
+            srun --container-image nvcr.io/nvidia/pytorch:24.01-py3 \\
                  --container-mounts "/path/to/data:{dataset_mount},/path/to/megatron-lm:/workspace/megatron-lm" \\
                  bash -c'''
             content = dedent(content)
             content += f' \'\n{script}\n\''
         else:
             content = '''
-            srun --container-image nvcr.io/nvidia/pytorch:23.04-py3 \\
+            srun --container-image nvcr.io/nvidia/pytorch:24.01-py3 \\
                  --container-mounts "/path/to/megatron-lm:/workspace/megatron-lm" \\
                  bash -c'''
             content = dedent(content)

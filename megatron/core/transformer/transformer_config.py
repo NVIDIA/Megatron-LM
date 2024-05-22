@@ -98,6 +98,10 @@ class TransformerConfig(ModelParallelConfig):
     test_mode: bool = False
     """Whether to run real-time tests."""
 
+    calculate_per_token_loss: bool = False
+    """Whether cross entropy loss is calculated over the actual number of non-padded tokens in the
+    global batch, versus the default behavior of assuming all tokens are non-padded."""
+
     ####################
     # initialization
     ####################
@@ -251,6 +255,18 @@ class TransformerConfig(ModelParallelConfig):
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
+    moe_expert_capacity_factor: float = None
+    """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token will be dropped. The default is None."""
+
+    moe_pad_expert_input_to_capacity: bool = False
+    """moe_pad_expert_input_to_capacity (bool): If True, pads the input for each expert to match the expert capacity length, effective only after the moe_expert_capacity_factor is set. The default setting is False."""
+
+    moe_token_drop_policy: str = 'probs'
+    """The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.
+    """
+    moe_layer_recompute: bool = False
+    """Memory optimization: checkpointing moe_layer to save actiavtion memory."""
+
     ####################
     # miscellaneous
     ####################
@@ -310,6 +326,24 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError(f'num_moe_experts must be non-negative.')
+
+        if self.moe_expert_capacity_factor is not None:
+            if self.moe_token_dispatcher_type != "alltoall":
+                raise ValueError(
+                    f'moe_expert_capacity_factor only works with alltoall token dispatcher'
+                )
+            if self.moe_expert_capacity_factor < 0:
+                self.moe_expert_capacity_factor = None
+            if self.moe_router_load_balancing_type not in ["aux_loss", "none"]:
+                raise ValueError(
+                    f'moe_expert_capacity_factor only works with aux_loss or none load balancing'
+                )
+
+        if self.moe_pad_expert_input_to_capacity:
+            if self.moe_expert_capacity_factor is None:
+                raise ValueError(
+                    f'moe_expert_capacity_factor must be set to use moe_pad_expert_input_to_capacity'
+                )
 
         if self.cpu_offloading and (
             self.cpu_offloading_num_layers < 0 or self.cpu_offloading_num_layers >= self.num_layers
@@ -397,3 +431,14 @@ class TransformerConfig(ModelParallelConfig):
             self.output_layer_init_method = scaled_init_method_normal(
                 self.init_method_std, self.num_layers
             )
+
+        if self.moe_extended_tp:
+            if self.moe_token_dispatcher_type != 'allgather':
+                raise ValueError(
+                    "Moe extended TP parallelism only applies to allgather based token dispatcher."
+                )
+            extended_tp_size = self.tensor_model_parallel_size * self.expert_model_parallel_size
+            if self.ffn_hidden_size % extended_tp_size != 0:
+                raise ValueError(
+                    f'ffn_hidden_size: {self.ffn_hidden_size} must be divisible by extended_tp_size {extended_tp_size}'
+                )

@@ -1,5 +1,11 @@
 workflow:
   rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests and nightly/
+      variables:
+        JET_CUSTOM_FILTER: "type == 'build' or 'merge-request' in spec.scope or 'nightly' in spec.scope"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/
+      variables:
+        JET_CUSTOM_FILTER: "type == 'build' or 'merge-request' in spec.scope"
     # always run MR pipelines
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     # always run web pipelines
@@ -17,11 +23,7 @@ stages:
 variables: &VARS
   SELENE_ADLR_CI_PATH: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron"
   DATA_DIR: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron/data"
-  PYTORCH_IMAGE: /lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron/nvcr_pytorch_23.04.sqsh # This is the image that is run by all nodes on selene for tests
   PYTHON_VIRTUAL_ENV: /lustre/fsw/adlr/adlr-nlp/adlr_ci/cienv/bin/activate
-  TESTS_TO_RUN_AFTER_MERGING: "MR_TESTS NIGHTLY_TESTS" # Can specify levels
-  TESTS_TO_RUN_ON_THIS_COMMIT: unit_tests
-  TEST_REGEX_ON_THIS_COMMIT:  NONE #https://github.com/google/re2/wiki/Syntax (Can define regex as in this spec) e.g /.*gpt3.*/
   JET_CUSTOM_FILTER: ""
   DISPLAY_OUTPUT: "True" # Set to true for new tests to copy the logs for creating golden truth file
   TIME_LIMIT: "10:00" # Default time limit for all jobs
@@ -37,7 +39,7 @@ include:
   - jet-tests.yml
 
 unit_tests:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
   tags:
     - 8xL40S
   stage: test
@@ -53,7 +55,7 @@ unit_tests:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 unit_tests-data:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
   tags:
     - 8xL40S
   stage: test
@@ -67,7 +69,7 @@ unit_tests-data:
     - when: always
 
 unit_tests-dist-checkpointing:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
   tags:
     - 8xL40S
   stage: test
@@ -79,9 +81,9 @@ unit_tests-dist-checkpointing:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-  
+
 unit_tests-fusions:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
   tags:
     - 8xL40S
   stage: test
@@ -93,9 +95,9 @@ unit_tests-fusions:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-  
+
 unit_tests-models:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
   tags:
     - 8xL40S
   stage: test
@@ -107,9 +109,9 @@ unit_tests-models:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-  
+
 unit_tests-pipeline-parallel:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
   tags:
     - 8xL40S
   stage: test
@@ -121,9 +123,9 @@ unit_tests-pipeline-parallel:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-  
+
 unit_tests-tensor-parallel:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
   tags:
     - 8xL40S
   stage: test
@@ -135,9 +137,9 @@ unit_tests-tensor-parallel:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-  
+
 unit_tests-transformer:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
   tags:
     - 8xL40S
   stage: test
@@ -149,9 +151,9 @@ unit_tests-transformer:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-  
+
 unit_tests-top-py:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/pytorch-all-tests:23.04-v1
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
   tags:
     - 8xL40S
   stage: test
@@ -163,7 +165,7 @@ unit_tests-top-py:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-  
+
 docs_build_test:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/python-format:0.0.1
   stage: test

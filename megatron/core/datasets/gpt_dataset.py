@@ -2,7 +2,6 @@
 
 import logging
 import os
-import sys
 import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
@@ -12,10 +11,13 @@ import torch
 
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.indexed_dataset import IndexedDataset
-from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset, MockDataset
+from megatron.core.datasets.megatron_dataset import MegatronDataset
+from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
 from megatron.core.datasets.utils import Split, log_single_rank
 
 logger = logging.getLogger(__name__)
+
+_PAD_TOKEN_ID = -1
 
 
 @dataclass
@@ -36,6 +38,14 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
        generates masks by itself.
     """
 
+    drop_last_partial_validation_sequence: bool = True
+    """Option to drop the last partial validation sequence"""
+
+    add_extra_token_to_sequence: bool = True
+    """Option to draw sequences with one extra token to ensure the sample input tokens and sample
+       output tokens are both of the desired sequence length
+    """
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init
         """
@@ -48,115 +58,17 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.eod_mask_loss is not None
 
 
-class MockGPTDataset(MockDataset):
-    """The mock GPT dataset
-    """
-
-    def __init__(
-        self,
-        dataset: Optional[LowLevelDataset],
-        dataset_path: Optional[str],
-        indices: Optional[numpy.ndarray],
-        num_samples: int,
-        index_split: Split,
-        config: BlendedMegatronDatasetConfig,
-    ) -> None:
-        super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
-
-        self.masks_and_position_ids_are_cacheable = not any(
-            [
-                self.config.reset_position_ids,
-                self.config.reset_attention_mask,
-                self.config.eod_mask_loss,
-            ]
-        )
-        self.masks_and_position_ids_are_cached = False
-        self.cached_attention_mask = None
-        self.cached_loss_mask = None
-        self.cached_position_ids = None
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Return a sequence_length + 1 token sequence consisting of the following:
-            - (1) S, the RNG length-sentinel in the range [0, sequence_length)
-            - (S) tokens
-            - (1) end of document token
-            - (sequence_length - S - 1) padding tokens
-
-        Args:
-            idx (int): The integer seed for mock data generation
-
-        Returns:
-            Dict[str, numpy.ndarray]: The mock data
-        """
-        tok = 1
-        pad = 2
-        eod = 0
-
-        assert (
-            idx < self.num_samples,
-            "Exceeded the available number of samples ({self.num_samples})",
-        )
-
-        rng = numpy.random.default_rng(seed=[self.index_split.value, idx])
-        length = rng.integers(low=0, high=self.config.sequence_length)
-        sample_toks = numpy.zeros(length) + tok
-        sample_pads = numpy.zeros(self.config.sequence_length - length - 1) + pad
-        sample = numpy.int64(numpy.concatenate([[length], sample_toks, [eod], sample_pads]))
-
-        text = torch.from_numpy(sample).long()
-        labels = text[1:].contiguous()
-        tokens = text[:-1].contiguous()
-
-        if (
-            not self.masks_and_position_ids_are_cacheable
-            or not self.masks_and_position_ids_are_cached
-        ):
-            attention_mask, loss_mask, position_ids = _get_ltor_masks_and_position_ids(
-                tokens,
-                eod,
-                self.config.reset_position_ids,
-                self.config.reset_attention_mask,
-                self.config.eod_mask_loss,
-                self.config.create_attention_mask,
-            )
-            if self.masks_and_position_ids_are_cacheable:
-                self.cached_attention_mask = attention_mask
-                self.cached_loss_mask = loss_mask
-                self.cached_position_ids = position_ids
-                self.masks_and_position_ids_are_cached = True
-        else:
-            attention_mask = self.cached_attention_mask
-            loss_mask = self.cached_loss_mask
-            position_ids = self.cached_position_ids
-
-        if self.config.create_attention_mask:
-            return {
-                "tokens": tokens,
-                "labels": labels,
-                "attention_mask": attention_mask,
-                "loss_mask": loss_mask,
-                "position_ids": position_ids,
-            }
-        else:
-            return {
-                "tokens": tokens,
-                "labels": labels,
-                "loss_mask": loss_mask,
-                "position_ids": position_ids,
-            }
-
-
 class GPTDataset(MegatronDataset):
     """The base GPT dataset
 
     Args:
-        indexed_dataset (IndexedDataset): The IndexedDataset around which to build the MegatronDataset
+        indexed_dataset (IndexedDataset): The IndexedDataset around which to build the GPTDataset
 
-        dataset_path (str): The real path on disk to the dataset, for bookkeeping
+        dataset_path (Optional[str]): The real path on disk to the dataset, for bookkeeping
 
         indexed_indices (numpy.ndarray): The set of the documents indices to expose
 
-        num_samples (int): The number of samples to draw from the indexed dataset
+        num_samples (Optional[int]): The number of samples to draw from the indexed dataset. When None, build as many samples as correspond to one epoch.
 
         index_split (Split): The indexed_indices Split
 
@@ -166,9 +78,9 @@ class GPTDataset(MegatronDataset):
     def __init__(
         self,
         indexed_dataset: IndexedDataset,
-        dataset_path: str,
+        dataset_path: Optional[str],
         indexed_indices: numpy.ndarray,
-        num_samples: int,
+        num_samples: Optional[int],
         index_split: Split,
         config: GPTDatasetConfig,
     ) -> None:
@@ -187,11 +99,11 @@ class GPTDataset(MegatronDataset):
         self.cached_loss_mask = None
         self.cached_position_ids = None
 
-    def _finalize(self) -> None:
-        """Abstract method implementation
-        
-        Load or build/cache the document, sample, and shuffle indices
-        """
+        try:
+            self._pad_token_id = self.config.tokenizer.pad
+        except:
+            self._pad_token_id = _PAD_TOKEN_ID
+
         (
             self.document_index,
             self.sample_index,
@@ -220,7 +132,7 @@ class GPTDataset(MegatronDataset):
         Args:
             dataset_path (str): The real path prefix to the IndexedDataset .bin and .idx files
 
-            config (BlendedMegatronDatasetConfig): The dataset config
+            config (GPTDatasetConfig): The config
 
         Returns:
             IndexedDataset: The underlying IndexedDataset
@@ -235,24 +147,29 @@ class GPTDataset(MegatronDataset):
         """
         return self.sample_index.shape[0] - 1
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: Optional[int]) -> Dict[str, torch.Tensor]:
         """Abstract method implementation
 
         Args:
-            idx (int): The index into the dataset
+            idx (Optioal[int]): The index into the dataset
 
         Returns:
-            Dict[str, torch.Tensor]: The text ids wrapped in a dictionary
+            Dict[str, torch.Tensor]: The sample information wrapped in a dictionary
         """
-        text, _ = self._query_document_sample_shuffle_indices(idx)
+        if idx is None:
+            # Batch padding sequence so the index does not matter
+            text, _ = self._query_document_sample_shuffle_indices(0)
+        else:
+            text, _ = self._query_document_sample_shuffle_indices(idx)
 
         text = torch.from_numpy(text).long()
-        labels = text[1:].contiguous()
-        tokens = text[:-1].contiguous()
-
-        assert not torch.any(
-            tokens >= self.config.tokenizer.vocab_size
-        ), "An input token is out of bounds of the tokenizer vocabulary"
+        if self.config.add_extra_token_to_sequence:
+            tokens = text[:-1].contiguous()
+            labels = text[1:].contiguous()
+        else:
+            tokens = text
+            labels = torch.roll(text, shifts=-1, dims=0)
+            labels[-1] = self._pad_token_id
 
         if (
             not self.masks_and_position_ids_are_cacheable
@@ -275,6 +192,17 @@ class GPTDataset(MegatronDataset):
             attention_mask = self.cached_attention_mask
             loss_mask = self.cached_loss_mask
             position_ids = self.cached_position_ids
+
+        # For padded sequences, mask the loss
+        loss_mask[labels == self._pad_token_id] = 0.0
+
+        # For padded sequences, ensure the embedding layer can map the token ID
+        tokens[tokens == self._pad_token_id] = 0
+        labels[labels == self._pad_token_id] = 0
+
+        # Batch padding sequence so we mask the loss
+        if idx is None:
+            loss_mask = torch.zeros_like(loss_mask)
 
         if self.config.create_attention_mask:
             return {
@@ -323,7 +251,9 @@ class GPTDataset(MegatronDataset):
                 self.dataset.get(
                     self.document_index[doc_index_beg],
                     offset=doc_index_beg_offset,
-                    length=doc_index_end_offset - doc_index_beg_offset + 1,
+                    length=doc_index_end_offset
+                    - doc_index_beg_offset
+                    + self.config.add_extra_token_to_sequence,
                 )
             )
 
@@ -335,13 +265,29 @@ class GPTDataset(MegatronDataset):
 
                 # Add the sample part
                 offset = 0 if i > doc_index_beg else doc_index_beg_offset
-                length = None if i < doc_index_end else doc_index_end_offset + 1
+                length = (
+                    None
+                    if i < doc_index_end
+                    else doc_index_end_offset + self.config.add_extra_token_to_sequence
+                )
                 sample_parts.append(
                     self.dataset.get(self.document_index[i], offset=offset, length=length)
                 )
+        assert len(document_ids) == len(
+            sample_parts
+        ), f"len(document_ids) ({len(document_ids)}) != len(sample_parts) ({len(sample_parts)})"
+
+        length = sum(map(len, sample_parts))
+
+        # Pad the sample if necessary
+        if length < (self.config.sequence_length + self.config.add_extra_token_to_sequence):
+            sample_parts.append(
+                [self._pad_token_id]
+                * (self.config.sequence_length + self.config.add_extra_token_to_sequence - length)
+            )
 
         return (
-            numpy.array(numpy.concatenate(sample_parts), dtype=numpy.int64),
+            numpy.concatenate(sample_parts, dtype=numpy.int64),
             numpy.array(document_ids, dtype=numpy.int64),
         )
 
@@ -366,32 +312,37 @@ class GPTDataset(MegatronDataset):
             Tuple[numpy.ndarray, numpy.ndarray]: The document index, the sample index, and the shuffle index
         """
         path_to_cache = self.config.path_to_cache
-        if path_to_cache is None:
+        if path_to_cache is None and not self.config.mock:
             path_to_cache = os.path.join(
                 self.dataset.path_prefix, "cache", f"{type(self).__name__}_indices"
             )
 
-        get_path_to = lambda suffix: os.path.join(
-            path_to_cache, f"{self.unique_description_hash}-{type(self).__name__}-{suffix}"
-        )
-        path_to_description = get_path_to("description.txt")
-        path_to_document_index = get_path_to("document_index.npy")
-        path_to_sample_index = get_path_to("sample_index.npy")
-        path_to_shuffle_index = get_path_to("shuffle_index.npy")
-        cache_hit = all(
-            map(
-                os.path.isfile,
-                [
-                    path_to_description,
-                    path_to_document_index,
-                    path_to_sample_index,
-                    path_to_shuffle_index,
-                ],
+        if path_to_cache:
+            get_path_to = lambda suffix: os.path.join(
+                path_to_cache,
+                f"{self.unique_description_hash}-{type(self).__name__}-{self.index_split.name}-{suffix}",
             )
-        )
+            path_to_description = get_path_to("description.txt")
+            path_to_document_index = get_path_to("document_index.npy")
+            path_to_sample_index = get_path_to("sample_index.npy")
+            path_to_shuffle_index = get_path_to("shuffle_index.npy")
+            cache_hit = all(
+                map(
+                    os.path.isfile,
+                    [
+                        path_to_description,
+                        path_to_document_index,
+                        path_to_sample_index,
+                        path_to_shuffle_index,
+                    ],
+                )
+            )
+        else:
+            cache_hit = False
 
-        if not cache_hit and (
-            not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        if not path_to_cache or (
+            not cache_hit
+            and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
         ):
 
             log_single_rank(
@@ -399,6 +350,7 @@ class GPTDataset(MegatronDataset):
                 logging.INFO,
                 f"Build and save the {type(self).__name__} {self.index_split.name} indices",
             )
+            t_beg = time.time()
 
             sequence_length = self.config.sequence_length
             num_tokens_per_epoch = self._get_num_tokens_per_epoch()
@@ -409,10 +361,13 @@ class GPTDataset(MegatronDataset):
             else:
                 # Get the number of samples for the last epoch
                 num_samples_sans_final_epoch = (
-                    (num_epochs - 1) * num_tokens_per_epoch - 1
+                    (num_epochs - 1) * num_tokens_per_epoch
+                    - self.config.add_extra_token_to_sequence
                 ) // sequence_length
                 num_samples_from_final_epoch = self.num_samples - num_samples_sans_final_epoch
-                num_samples_per_epoch = (num_tokens_per_epoch - 1) // sequence_length
+                num_samples_per_epoch = (
+                    num_tokens_per_epoch - self.config.add_extra_token_to_sequence
+                ) // sequence_length
 
                 # num_samples_from_final_epoch should be non-negative
                 assert num_samples_from_final_epoch >= 0
@@ -442,34 +397,22 @@ class GPTDataset(MegatronDataset):
 
             numpy_random_state = numpy.random.RandomState(self.config.random_seed)
 
-            os.makedirs(path_to_cache, exist_ok=True)
-
-            # Write the description
-            with open(path_to_description, "wt") as writer:
-                writer.write(self.unique_description)
-
             # Build the document index
-            log_single_rank(
-                logger,
-                logging.INFO,
-                f"\tBuild and save the document index to {os.path.basename(path_to_document_index)}",
-            )
-            t_beg = time.time()
             document_index = _build_document_index(
                 self.indices, num_epochs, numpy_random_state, separate_final_epoch
             )
-            numpy.save(path_to_document_index, document_index, allow_pickle=True)
-            t_end = time.time()
-            log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
+
+            drop_last_partial_sequence = True
+            if self.index_split == Split.valid:
+                drop_last_partial_sequence = self.config.drop_last_partial_validation_sequence
 
             # Build the sample index
-            log_single_rank(
-                logger,
-                logging.INFO,
-                f"\tBuild and save the sample index to {os.path.basename(path_to_sample_index)}",
-            )
-            t_beg = time.time()
             from megatron.core.datasets import helpers
+
+            if self.index_split == Split.valid:
+                drop_last_partial_sequence = self.config.drop_last_partial_validation_sequence
+            else:
+                drop_last_partial_sequence = True
 
             assert document_index.dtype == numpy.int32
             assert self.dataset.sequence_lengths.dtype == numpy.int32
@@ -479,18 +422,11 @@ class GPTDataset(MegatronDataset):
                 sequence_length,
                 num_epochs,
                 num_tokens_per_epoch,
+                drop_last_partial_sequence,
+                self.config.add_extra_token_to_sequence,
             )
-            numpy.save(path_to_sample_index, sample_index, allow_pickle=True)
-            t_end = time.time()
-            log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
             # Build the shuffle index
-            log_single_rank(
-                logger,
-                logging.INFO,
-                f"\tBuild and save the shuffle index to {os.path.basename(path_to_shuffle_index)}",
-            )
-            t_beg = time.time()
             if separate_final_epoch:
                 shuffle_index = _build_shuffle_index(
                     num_samples_sans_final_epoch, sample_index.shape[0] - 1, numpy_random_state
@@ -499,7 +435,22 @@ class GPTDataset(MegatronDataset):
                 shuffle_index = _build_shuffle_index(
                     sample_index.shape[0] - 1, sample_index.shape[0] - 1, numpy_random_state
                 )
-            numpy.save(path_to_shuffle_index, shuffle_index, allow_pickle=True)
+
+            if path_to_cache:
+                os.makedirs(path_to_cache, exist_ok=True)
+                # Write the description
+                with open(path_to_description, "wt") as writer:
+                    writer.write(self.unique_description)
+                numpy.save(path_to_document_index, document_index, allow_pickle=True)
+                numpy.save(path_to_sample_index, sample_index, allow_pickle=True)
+                numpy.save(path_to_shuffle_index, shuffle_index, allow_pickle=True)
+            else:
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    f"Unable to save the {type(self).__name__} indexes because path_to_cache is None",
+                )
+
             t_end = time.time()
             log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -567,14 +518,18 @@ class GPTDataset(MegatronDataset):
         Returns:
             int: The number of epochs
         """
-        num_epochs = 0
-        num_tokens = 0
-        num_tokens_requested = (self.num_samples * self.config.sequence_length) + 1
-        while True:
-            num_epochs += 1
-            num_tokens += num_tokens_per_epoch
-            if num_tokens >= num_tokens_requested:
-                return num_epochs
+        num_epochs = 1
+        num_tokens = num_tokens_per_epoch
+        if self.num_samples is None:
+            return num_epochs
+        else:
+            num_tokens_requested = (
+                self.num_samples * self.config.sequence_length
+            ) + self.config.add_extra_token_to_sequence
+            while num_tokens < num_tokens_requested:
+                num_epochs += 1
+                num_tokens += num_tokens_per_epoch
+        return num_epochs
 
 
 def _build_document_index(
@@ -714,3 +669,118 @@ def _get_ltor_masks_and_position_ids(
         attention_mask = attention_mask < 0.5
 
     return attention_mask, loss_mask, position_ids
+
+
+class MockGPTLowLevelDataset:
+
+    seed: int = 0
+    size: int = 100000
+    max_sequence_length: int = 4096
+
+    def __init__(self, tokenizer: MegatronTokenizer) -> None:
+        self.tokenizer = tokenizer
+        rng = numpy.random.default_rng(seed=self.seed)
+        self.sequence_lengths = rng.integers(
+            low=1, high=self.max_sequence_length, size=self.size, dtype=numpy.int32
+        )
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, idx: int) -> numpy.number:
+        length = self.sequence_lengths[idx]
+        sample = numpy.int64(
+            numpy.concatenate([numpy.arange(length - 1) + 1, [self.tokenizer.eod]])
+        )
+        return sample
+
+    def get(self, idx: int, offset: int = 0, length: Optional[int] = None) -> numpy.ndarray:
+        if length is None:
+            length = self.sequence_lengths[idx] - offset
+        return self[idx][offset : offset + length]
+
+
+class MockGPTDataset(GPTDataset):
+    """The mock GPT dataset
+
+    Args:
+        indexed_dataset (MockGPTLowLevelDataset): The MockGPTLowLevelDataset around which to build the MockGPTDataset
+
+        dataset_path (Optional[str]): This argument is of no consequence for the MockGPTDataset
+
+        indices (numpy.ndarray): The set of the dataset indices to expose
+
+        num_samples (int): The number of samples to draw from the dataset
+
+        index_split (Split): The indices Split
+
+        config (GPTDatasetConfig): The config
+    """
+
+    def __init__(
+        self,
+        dataset: MockGPTLowLevelDataset,
+        dataset_path: Optional[str],
+        indices: numpy.ndarray,
+        num_samples: int,
+        index_split: Split,
+        config: GPTDatasetConfig,
+    ) -> None:
+        assert config.mock
+
+        if num_samples is None:
+            num_samples = len(indices)
+
+        super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
+
+    @staticmethod
+    def numel_low_level_dataset(low_level_dataset: MockGPTLowLevelDataset) -> int:
+        """Abstract method implementation
+
+        Args:
+            low_level_dataset (MockGPTLowLevelDataset): The underlying MockGPTLowLevelDataset
+
+        Returns:
+            int: The number of unique elements in the underlying MockGPTLowLevelDataset
+        """
+        return len(low_level_dataset)
+
+    @staticmethod
+    def build_low_level_dataset(
+        dataset_path: Optional[str], config: GPTDatasetConfig
+    ) -> MockGPTLowLevelDataset:
+        """Abstract method implementation
+
+        Args:
+            dataset_path (Optional[str]): This argument is of no consequence for the MockGPTLowLevelDataset
+
+            config (GPTDatasetConfig): The config
+
+        Returns:
+            MockGPTLowLevelDataset: The underlying MockGPTLowLevelDataset
+        """
+        return MockGPTLowLevelDataset(config.tokenizer)
+
+    def __len__(self) -> int:
+        """Abstract method implementation
+
+        Returns:
+            int: The length of the dataset
+        """
+        return self.num_samples
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """Abstract method implementation
+
+        Args:
+            idx (int): The integer seed for mock data generation
+
+        Returns:
+            Dict[str, numpy.ndarray]: The mock sample information wrapped in a dictionary
+        """
+        if idx is not None and idx >= self.num_samples:
+            raise IndexError(
+                f"The index {idx} exceeds the available number of samples ({self.num_samples})"
+            )
+
+        return super().__getitem__(idx)

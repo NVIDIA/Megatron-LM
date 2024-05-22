@@ -61,9 +61,7 @@ class DistributedDataParallel(MegatronModule):
 
         self.ddp_config = ddp_config
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-            logger.info(
-                f'Setting up DistributedDataParallel with {type(self.ddp_config).__name__}: {self.ddp_config}'
-            )
+            logger.info(f'Setting up DistributedDataParallel with config {self.ddp_config}')
 
         # Turn off bucketing if we are on a pipeline stage that is not the first (since
         # data-parallel communication on these stages is not on the critical path), or if
@@ -95,7 +93,7 @@ class DistributedDataParallel(MegatronModule):
                 expert_parallel_params.append(param)
 
         def allocate_buffers_for_parameters(
-            input_params, data_parallel_group, gradient_scaling_factor=1.0,
+            input_params, data_parallel_group, gradient_scaling_factor,
         ):
             param_and_grad_dtype_to_params = {}
 
@@ -131,20 +129,22 @@ class DistributedDataParallel(MegatronModule):
 
             return buffers
 
-        data_parallel_world_size = torch.distributed.get_world_size(data_parallel_group)
+        if config.calculate_per_token_loss:
+            gradient_scaling_factor = 1.0
+        else:
+            data_parallel_world_size = torch.distributed.get_world_size(data_parallel_group)
+            gradient_scaling_factor = 1.0 / data_parallel_world_size
 
         # Allocate the param+grad buffers for dense params' grads.
         self.buffers = allocate_buffers_for_parameters(
-            dense_params,
-            data_parallel_group,
-            gradient_scaling_factor=1.0 / data_parallel_world_size,
+            dense_params, data_parallel_group, gradient_scaling_factor=gradient_scaling_factor,
         )
 
         # Allocate separate param+grad buffers for expert parallel params' grads.
         self.expert_parallel_buffers = allocate_buffers_for_parameters(
             expert_parallel_params,
             expert_data_parallel_group,
-            gradient_scaling_factor=1.0 / data_parallel_world_size,
+            gradient_scaling_factor=gradient_scaling_factor,
         )
 
         # Delete references to weight_tensor if they exist since we don't want two parameter copies
@@ -229,6 +229,11 @@ class DistributedDataParallel(MegatronModule):
         """
         for buffer in self.buffers + self.expert_parallel_buffers:
             buffer.start_grad_sync()
+
+    def scale_gradients(self, scaling_factor: float) -> None:
+        """Scale all gradients inside the buffers by `scaling_factor`."""
+        for buffer in self.buffers + self.expert_parallel_buffers:
+            buffer.scale_gradients(scaling_factor)
 
     def finish_grad_sync(self):
         """

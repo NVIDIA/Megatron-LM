@@ -117,7 +117,8 @@ class Bucket:
                 f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
             )
 
-        self.grad_data *= self.gradient_scaling_factor
+        if self.gradient_scaling_factor != 1.0:
+            self.grad_data *= self.gradient_scaling_factor
         # Use async_op only when overlap_grad_reduce is True.
         if self.ddp_config.use_distributed_optimizer:
             local_data_view = shard_buffer(self.grad_data, self.data_parallel_world_size)[
@@ -227,15 +228,19 @@ class ParamAndGradBuffer:
         self.param_to_bucket = {}  # Param -> bucket mapping.
         self.param_index_map = {}  # Param -> location in buffer mapping (used in dist. optimizer).
 
+        def _pad(number_to_be_padded: int, divisor: int) -> int:
+            return int(math.ceil(number_to_be_padded / divisor) * divisor)
+
         def _pad_if_needed(data_index: int) -> int:
             """
             Pads data indices if using distributed optimizer (to ensure uniform sharding).
             """
             if self.ddp_config.use_distributed_optimizer:
-                return (
-                    int(math.ceil(data_index / self.data_parallel_world_size))
-                    * self.data_parallel_world_size
-                )
+                # Workaround for TE bug causing cuBLAS to pick an incompatible algorithm.
+                # This also helps cuBLAS pick more efficient algorithms for GEMMs.
+                # We now ensure that all buckets start at a memory address that is 256-byte
+                # aligned (128 values since params and grads use >= 16-bit precision).
+                return _pad(data_index, math.lcm(self.data_parallel_world_size, 128))
             return data_index
 
         # First, figure out how many elements should be in the underlying buffer storage.
@@ -318,8 +323,13 @@ class ParamAndGradBuffer:
         # Next, create underlying storage for buffer (with numel elements that includes
         # padding as necessary).
         self.numel = data_end_index
+        self.numel_unpadded = sum(per_bucket_numel_unpadded)
+        assert self.numel_unpadded <= self.numel
         if self.ddp_config.use_distributed_optimizer:
             assert self.numel % self.data_parallel_world_size == 0
+        else:
+            assert self.numel == self.numel_unpadded
+
         self.param_data = None
         # Only re-map param tensors if using distributed optimizer.
         if self.ddp_config.use_distributed_optimizer:
@@ -401,6 +411,10 @@ class ParamAndGradBuffer:
                 logger.info(f'Params for bucket {index+1} ({numel} elements):')
                 for param in bucket.params:
                     logger.info(f'    {param_to_name[param]}')
+
+    def scale_gradients(self, scaling_factor: float) -> None:
+        """Scale the gradient data by `scaling_factor`."""
+        self.grad_data *= scaling_factor
 
     def _get(self, shape: torch.Size, start_index: int, buffer_type: BufferType) -> torch.Tensor:
         """

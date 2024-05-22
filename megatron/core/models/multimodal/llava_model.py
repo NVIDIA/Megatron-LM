@@ -6,7 +6,7 @@ from typing import List
 
 import torch
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import InferenceParams, parallel_state
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
@@ -22,28 +22,36 @@ class LLaVAModel(MegatronModule):
     Args:
         language_transformer_config (TransformerConfig): Transformer config for the language model.
         language_transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers of the language model.
-        vocab_size (int): Vocabulary size.
-        max_sequence_length (int): maximum sequence length. This is used for positional embedding.
+        language_vocab_size (int): Language model vocabulary size.
+        language_max_sequence_length (int): Language model maximum sequence length. This is used for positional embedding.
         vision_transformer_config (TransformerConfig): Transformer config for the vision model.
         vision_transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers of the vision model.
+        drop_vision_class_token (bool): Drop vision class token(s) before input to the language model.
         vision_projection_config (TransformerConfig): Config for the projection from vision model outputs to language model inputs.
         vision_projection_layer_spec (ModuleSpec): Specifies the module to use for the vision projection.
         vision_projection_type (str): Type of the vision projection to use. Default is a 2-layer MLP.
         allow_missing_vision_projection_checkpoint (bool): Allow vision projection weights to be missing when loading a checkpoint. Default False.
+        parallel_output (bool): Do not gather the outputs, keep them split across tensor parallel ranks. This is typically True for training and False for inference.
+        language_position_embedding_type (str): Position embedding type to use in the language model. Default learned absolute.
+        language_rotary_percent (float): Percent of rotary dimension to use for rotary position embeddings in the language model. Defaults to 1.0.
     """
 
     def __init__(
         self,
         language_transformer_config: TransformerConfig,
         language_transformer_layer_spec: ModuleSpec,
-        vocab_size: int,
-        max_sequence_length: int,
+        language_vocab_size: int,
+        language_max_sequence_length: int,
         vision_transformer_config: TransformerConfig,
         vision_transformer_layer_spec: ModuleSpec,
+        drop_vision_class_token: bool,
         vision_projection_config: TransformerConfig,
         vision_projection_layer_spec: ModuleSpec,
         vision_projection_type: str = "mlp",
         allow_missing_vision_projection_checkpoint: bool = False,
+        parallel_output: bool = True,
+        language_position_embedding_type: str = 'learned_absolute',
+        language_rotary_percent: float = 1.0,
     ) -> None:
         super().__init__(config=language_transformer_config)
 
@@ -55,13 +63,17 @@ class LLaVAModel(MegatronModule):
             raise NotImplementedError("pipeline parallelism is not supported in this model yet.")
 
         self.language_model = GPTModel(
-            language_transformer_config,
-            language_transformer_layer_spec,
-            vocab_size,
-            max_sequence_length,
+            config=language_transformer_config,
+            transformer_layer_spec=language_transformer_layer_spec,
+            vocab_size=language_vocab_size,
+            max_sequence_length=language_max_sequence_length,
+            parallel_output=parallel_output,
+            position_embedding_type=language_position_embedding_type,
+            rotary_percent=language_rotary_percent,
         )
 
         self.vision_model = CLIPViTModel(vision_transformer_config, vision_transformer_layer_spec)
+        self._drop_vision_class_token = drop_vision_class_token
 
         # Map (intermediate) vision model outputs to the language model input dimension.
         self.vision_projection = MultimodalProjector(
@@ -123,6 +135,7 @@ class LLaVAModel(MegatronModule):
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         labels: torch.Tensor = None,
+        inference_params: InferenceParams = None,
     ) -> torch.Tensor:
         """Forward function of the LLaVA model.
 
@@ -132,22 +145,44 @@ class LLaVAModel(MegatronModule):
             position_ids (torch.Tensor): input text position ids [batch, text_seq_len].
             attention_mask (torch.Tensor): attention mask for the language model [batch, 1, combined_seq_len, combined_seq_len].
             labels (torch.Tensor): Optional target text labels [batch, combined_seq_len].
+            inference_params (InferenceParams): Inference-time parameters including KV cache.
 
         Returns:
             output (torch.Tensor): Loss of shape [b, s] if labels are provided, otherwise logits of shape [b, s, vocab_size].
         """
-        image_embeddings = self.vision_model(images)  # [b, img_seq_len, h_vision]
-
-        # map vision model output size to language model input size.
-        image_embeddings = self.vision_projection(image_embeddings)  # [b, img_seq_len, h_language]
-
-        image_embeddings = image_embeddings.permute(1, 0, 2)  # [img_seq_len, b, h_language]
         language_embeddings = self.language_model.embedding(
             input_ids=input_ids, position_ids=position_ids
         )  # [text_seq_len, b, h_language]
-        combined_embeddings = torch.cat(
-            [image_embeddings, language_embeddings], dim=0
-        )  # [combined_seq_len, b, h_language]
+
+        # If running inference, we can skip image token computation if they were computed already earlier for this sample.
+        if (
+            inference_params is not None
+            and "image_tokens_count" in inference_params.key_value_memory_dict
+        ):
+            combined_embeddings = language_embeddings
+        else:
+            image_embeddings = self.vision_model(images)  # [b, img_seq_len, h_vision]
+
+            if self._drop_vision_class_token:
+                image_embeddings = image_embeddings[:, self.vision_model.class_token_len :, :]
+
+            image_embeddings = image_embeddings.permute(1, 0, 2)  # [img_seq_len, b, h_vision]
+
+            # map vision model output size to language model input size.
+            image_embeddings = self.vision_projection(
+                image_embeddings
+            )  # [b, img_seq_len, h_language]
+
+            # If running inference, the language model KV cache will be updated for image token positions.
+            # Here we store the image tokens sequence length, which can be used as an offset to the KV cache later.
+            if inference_params is not None:
+                inference_params.key_value_memory_dict[
+                    "image_tokens_count"
+                ] = image_embeddings.shape[1]
+
+            combined_embeddings = torch.cat(
+                [image_embeddings, language_embeddings], dim=0
+            )  # [combined_seq_len, b, h_language]
 
         # Embedding is computed above so we can discard input and position ids.
         input_ids = None

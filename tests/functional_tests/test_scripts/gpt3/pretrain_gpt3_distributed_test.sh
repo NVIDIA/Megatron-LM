@@ -29,14 +29,20 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 
 command="export CUDA_DEVICE_MAX_CONNECTIONS=1;"
 
-TRANSFORMER_IMPL=local
 TRAINING_DTYPE=fp16
+TRANSFORMER_IMPL=local
+
+if [[ $ALLOW_NONDETERMINISTIC -eq 1 ]]; then
+   command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1;"
+else
+   command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0; export NCCL_ALGO=Tree;"
+   ADDITIONAL_PARAMS+=" --deterministic-mode"
+fi
 
 if [[ $USE_CORE -eq 1 ]]; then
        echo "Running using megatron core"
        TRANSFORMER_IMPL=transformer_engine
        TRAINING_DTYPE=bf16
-       command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=$ALLOW_NONDETERMINISTIC;"
        USE_MCORE=1
 fi
 
@@ -118,8 +124,6 @@ build_torch_run_cmd() {
        --transformer-impl $TRANSFORMER_IMPL \
        --tensor-model-parallel-size $TP_SIZE \
        --pipeline-model-parallel-size $PP_SIZE \
-       --no-bias-swiglu-fusion \
-       --no-rope-fusion \
        ${VP_SIZE:+--num-layers-per-virtual-pipeline-stage "$VP_SIZE"} \
        ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
        ${USE_MCORE:+--use-mcore-models} \
@@ -129,6 +133,12 @@ build_torch_run_cmd() {
 
   if [[ "${TRAINING_DTYPE}" == "fp16" ]]; then
       torch_run_cmd+=" --apply-query-key-layer-scaling"
+      # NVTE_APPLY_QK_LAYER_SCALING=1 is required if using:
+      #  1. --apply-query-key-layer-scaling
+      #  2. transformer_impl="transformer_engine"
+      #  3. TE >= 0.11
+      #  4. fp16
+      export NVTE_APPLY_QK_LAYER_SCALING=1
   fi
 }
 

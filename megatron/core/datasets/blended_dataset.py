@@ -6,7 +6,7 @@ import logging
 import os
 import time
 from collections import OrderedDict
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy
 import torch
@@ -26,9 +26,9 @@ class BlendedDataset(torch.utils.data.Dataset):
     Args:
         datasets (List[MegatronDataset]): The MegatronDataset instances to blend
 
-        weights (List[float]): The weights which determines the dataset blend ratios
+        weights (List[Union[int, float]]): The weights that determine the dataset blend ratios
 
-        size (int): The number of samples to draw from the blend
+        size (Optional[int]): The number of samples to draw from the blend. If None, for each dataset index idx draw exactly weights[idx] samples from datasets[idx].
 
         config (BlendedMegatronDatasetConfig): The config
 
@@ -39,14 +39,18 @@ class BlendedDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         datasets: List[MegatronDataset],
-        weights: List[float],
-        size: int,
+        weights: List[Union[int, float]],
+        size: Optional[int],
         config: BlendedMegatronDatasetConfig,
     ) -> None:
-        assert len(datasets) < 32767
         assert len(datasets) == len(weights)
-        assert numpy.isclose(sum(weights), 1.0)
+        assert len(datasets) < 32767
         assert all(map(lambda _: type(_) == type(datasets[0]), datasets))
+        assert all(map(lambda _: _.index_split == datasets[0].index_split, datasets))
+        assert all(map(lambda _: _ > 0, weights))
+        assert all(map(lambda _: type(_) == type(weights[0]), weights))
+        if size is None and isinstance(weights[0], float):
+            assert all(map(lambda _: _ == int(_), weights))
 
         # Alert user to unnecessary blending
         if len(datasets) == 1:
@@ -54,10 +58,11 @@ class BlendedDataset(torch.utils.data.Dataset):
                 logger, logging.WARNING, f"Building a BlendedDataset for a single MegatronDataset"
             )
 
-        # Redundant normalization for bitwise identical comparison with Megatron-LM
-        weights = normalize(weights)
+        if size is not None:
+            weights = normalize(weights)
 
         self.datasets = datasets
+        self.split = self.datasets[0].index_split
         self.weights = weights
         self.size = size
         self.config = config
@@ -65,6 +70,7 @@ class BlendedDataset(torch.utils.data.Dataset):
         unique_identifiers = OrderedDict()
         unique_identifiers["class"] = type(self).__name__
         unique_identifiers["datasets"] = [dataset.unique_identifiers for dataset in self.datasets]
+        unique_identifiers["split"] = self.split.name
         unique_identifiers["weights"] = self.weights
         unique_identifiers["size"] = self.size
 
@@ -77,16 +83,8 @@ class BlendedDataset(torch.utils.data.Dataset):
 
         self.dataset_index, self.dataset_sample_index = self._build_indices()
 
-        # Check size
-        _ = self[self.size - 1]
-        try:
-            _ = self[self.size]
-            raise RuntimeError(f"{type(self).__name__} size is improperly bounded")
-        except IndexError:
-            log_single_rank(logger, logging.INFO, f"> {type(self).__name__} length: {len(self)}")
-
     def __len__(self) -> int:
-        return self.size
+        return self.dataset_index.shape[0]
 
     def __getitem__(self, idx: int) -> Dict[str, Union[int, numpy.ndarray]]:
         dataset_id = self.dataset_index[idx]
@@ -110,7 +108,8 @@ class BlendedDataset(torch.utils.data.Dataset):
 
         if path_to_cache:
             get_path_to = lambda suffix: os.path.join(
-                path_to_cache, f"{self.unique_description_hash}-{type(self).__name__}-{suffix}"
+                path_to_cache,
+                f"{self.unique_description_hash}-{type(self).__name__}-{self.split.name}-{suffix}",
             )
             path_to_description = get_path_to("description.txt")
             path_to_dataset_index = get_path_to("dataset_index.npy")
@@ -136,16 +135,24 @@ class BlendedDataset(torch.utils.data.Dataset):
             t_beg = time.time()
             from megatron.core.datasets import helpers
 
-            dataset_index = numpy.zeros(self.size, dtype=numpy.int16)
-            dataset_sample_index = numpy.zeros(self.size, dtype=numpy.int64)
-            helpers.build_blending_indices(
-                dataset_index,
-                dataset_sample_index,
-                self.weights,
-                len(self.datasets),
-                self.size,
-                _VERBOSE,
-            )
+            if self.size is not None:
+                dataset_index = numpy.zeros(self.size, dtype=numpy.int16)
+                dataset_sample_index = numpy.zeros(self.size, dtype=numpy.int64)
+                helpers.build_blending_indices(
+                    dataset_index,
+                    dataset_sample_index,
+                    self.weights,
+                    len(self.datasets),
+                    self.size,
+                    _VERBOSE,
+                )
+            else:
+                size = sum(self.weights)
+                dataset_index = numpy.zeros(size, dtype=numpy.int16)
+                dataset_sample_index = numpy.zeros(size, dtype=numpy.int64)
+                helpers.build_exhaustive_blending_indices(
+                    dataset_index, dataset_sample_index, self.weights, len(self.datasets)
+                )
 
             if path_to_cache:
                 os.makedirs(path_to_cache, exist_ok=True)
@@ -159,7 +166,7 @@ class BlendedDataset(torch.utils.data.Dataset):
                 log_single_rank(
                     logger,
                     logging.WARNING,
-                    "Unable to save the indexes because path_to_cache is None",
+                    f"Unable to save the {type(self).__name__} indexes because path_to_cache is None",
                 )
 
             t_end = time.time()

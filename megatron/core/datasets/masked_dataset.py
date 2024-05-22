@@ -90,7 +90,7 @@ class MaskedWordPieceDataset(MegatronDataset):
 
         indexed_indices (numpy.ndarray): The set of the documents indices to expose
 
-        num_samples (int): The number of samples to draw from the indexed dataset
+        num_samples (Optional[int]): The number of samples to draw from the indexed dataset. When None, build as many samples as correspond to one epoch.
 
         index_split (Split): The indexed_indices Split
 
@@ -102,7 +102,7 @@ class MaskedWordPieceDataset(MegatronDataset):
         indexed_dataset: IndexedDataset,
         dataset_path: str,
         indexed_indices: numpy.ndarray,
-        num_samples: int,
+        num_samples: Optional[int],
         index_split: Split,
         config: MaskedWordPieceDatasetConfig,
     ) -> None:
@@ -156,7 +156,10 @@ class MaskedWordPieceDataset(MegatronDataset):
         path_to_sample_index = get_path_to("sample_index.npy")
         cache_hit = all(map(os.path.isfile, [path_to_description, path_to_sample_index,],))
 
-        num_epochs = numpy.iinfo(numpy.int32).max - 1
+        if self.num_samples is not None:
+            num_epochs = numpy.iinfo(numpy.int32).max - 1
+        else:
+            num_epochs = 1
 
         if not cache_hit and torch.distributed.get_rank() == 0:
             log_single_rank(

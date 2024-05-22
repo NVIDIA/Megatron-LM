@@ -12,6 +12,7 @@ from megatron.training import print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core import tensor_parallel
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.datasets.retro.query.retro_dataset import get_retro_datasets
 from megatron.core.datasets.retro.query.multi_split_gpt_dataset import MultiSplitGPTDataset, MultiSplitGPTDatasetConfig
 from megatron.core.enums import ModelType
@@ -179,8 +180,12 @@ def train_valid_test_datasets_provider(train_valid_test_num_samples):
     data_config = MultiSplitGPTDatasetConfig(
         random_seed=args.seed,
         sequence_length=args.seq_length,
-        blend=args.data_path,
-        blend_per_split=[args.train_data_path, args.valid_data_path, args.test_data_path],
+        blend=get_blend_from_list(args.data_path),
+        blend_per_split=[
+            get_blend_from_list(args.train_data_path),
+            get_blend_from_list(args.valid_data_path),
+            get_blend_from_list(args.test_data_path)
+        ],
         split=args.split,
         split_preprocessing=retro_config.retro_split_preprocessing,
         path_to_cache=args.data_cache_path,
@@ -189,7 +194,6 @@ def train_valid_test_datasets_provider(train_valid_test_num_samples):
         reset_position_ids=args.reset_position_ids,
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
-        mock=args.mock_data,
     )
 
     # GPT datasets.

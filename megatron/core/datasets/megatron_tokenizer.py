@@ -15,7 +15,7 @@ class MegatronTokenizer(ABC):
     Args:
         tokenizer_paths (Tuple[str]): All tokenizer source paths or prefixes
 
-        kwargs (Dict[str, Any]): All tokenizer options
+        tokenizer_options (Dict[str, Any]): All tokenizer options
     """
 
     def __init__(self, *tokenizer_paths: str, **tokenizer_options: Any):

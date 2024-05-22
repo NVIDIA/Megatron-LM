@@ -1169,6 +1169,14 @@ def get_data_modulo_expert_parallel_rank():
         return 0
 
 
+def get_tensor_and_expert_parallel_rank():
+    """Return my rank for the tensor and expert parallel group"""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank(group=get_tensor_and_expert_parallel_group())
+    else:
+        return 0
+
+
 def _set_global_memory_buffer():
     """Initialize global buffer"""
     global _GLOBAL_MEMORY_BUFFER

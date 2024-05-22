@@ -1,6 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from typing import List
+from typing import List, Optional
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
@@ -96,10 +96,11 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
                 buf.copy_(synced)
 
 
-def finalize_model_grads(model: List[torch.nn.Module]):
+def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torch.Tensor] = None):
     """
     All-reduce all model grads across DP replicas, layernorm grads for sequence parallelism,
-    embedding grads across first and last pipeline stages (if not tied).
+    embedding grads across first and last pipeline stages (if not tied),
+    scale gradients by `num_tokens`.
     """
 
     config = get_model_config(model[0])
@@ -129,3 +130,21 @@ def finalize_model_grads(model: List[torch.nn.Module]):
     _allreduce_embedding_grads(model, config)
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce').stop()
+
+    # normalize gradients for per-token loss normalization.
+    # if we are using by the number of tokens, then we use that as a divisor. this number
+    # will be the total number of non-padded tokens in the global batch.
+    if num_tokens is not None:
+        # the number of tokens is only present on the last stage, so broadcast it
+        # to the other ranks in the pipeline parallel group.
+        torch.distributed.broadcast(
+            num_tokens,
+            src=parallel_state.get_pipeline_model_parallel_last_rank(),
+            group=parallel_state.get_pipeline_model_parallel_group(),
+        )
+        # all-reduce across DP ranks.
+        torch.distributed.all_reduce(num_tokens, group=parallel_state.get_data_parallel_group())
+        for model_chunk in model:
+            if num_tokens > 0:
+                scaling = 1.0 / num_tokens
+                model_chunk.scale_gradients(scaling)
