@@ -171,14 +171,14 @@ class LLaVAModel(MegatronModule):
             # map vision model output size to language model input size.
             image_embeddings = self.vision_projection(
                 image_embeddings
-            )  # [b, img_seq_len, h_language]
+            )  # [img_seq_len, b, h_vision]
 
             # If running inference, the language model KV cache will be updated for image token positions.
             # Here we store the image tokens sequence length, which can be used as an offset to the KV cache later.
             if inference_params is not None:
                 inference_params.key_value_memory_dict[
                     "image_tokens_count"
-                ] = image_embeddings.shape[1]
+                ] = image_embeddings.shape[0]
 
             combined_embeddings = torch.cat(
                 [image_embeddings, language_embeddings], dim=0
@@ -195,6 +195,7 @@ class LLaVAModel(MegatronModule):
             attention_mask,
             decoder_input=combined_embeddings,
             labels=labels,
+            inference_params=inference_params,
         )
 
         return output
