@@ -375,7 +375,7 @@ def forward_backward_no_pipelining(
 
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
-    total_num_tokens = torch.tensor(0, dtype=torch.int).cuda()
+    total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
     with no_sync_func():
         for i in range(num_microbatches - 1):
             output_tensor, num_tokens = forward_step(
