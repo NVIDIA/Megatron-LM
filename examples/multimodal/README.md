@@ -27,3 +27,14 @@ Run the following script:
 ```
 examples/multimodal/sft_8b.sh
 ```
+
+
+### Evaluation
+
+## Generation
+
+Run the following script:
+
+```
+examples/multimodal/text_generation_8b.sh --input-path /path/to/input/images --output-path /some/output/directory --model-path /path/to/model.pt --tokenizer-path /path/to/tokenizer.model --gt-path /path/to/groundtruth/file
+```

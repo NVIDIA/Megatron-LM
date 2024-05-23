@@ -59,7 +59,7 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
 
     vision_projection_config = deepcopy(base_config)
     vision_projection_config = get_vision_projection_config(vision_projection_config, language_config.hidden_size)
-    vision_projection_layer_spec = get_mlp_module_spec(use_te=use_te)
+    vision_projection_layer_spec = get_mlp_module_spec(use_te=use_te).submodules
 
     model = LLaVAModel(
         language_transformer_config=language_config,
@@ -134,8 +134,7 @@ def get_batch(data_iterator):
     return tokens, labels, loss_mask, attention_mask, position_ids, img_raw
 
 
-def _preprocess_data_for_llava(loss_mask, labels, attention_mask):
-    """Preprocess data sample to the format expected by a LLaVA model."""
+def get_image_token_count():
     args = get_args()
 
     add_class_token = not args.disable_vision_class_token
@@ -144,6 +143,14 @@ def _preprocess_data_for_llava(loss_mask, labels, attention_mask):
     num_patches_per_dim_w = args.img_w // args.patch_dim
     num_patches = num_patches_per_dim_h * num_patches_per_dim_w
     num_image_tokens = num_patches + (1 if add_class_token else 0)
+
+    return num_image_tokens
+
+
+def _preprocess_data_for_llava(loss_mask, labels, attention_mask):
+    """Preprocess data sample to the format expected by a LLaVA model."""
+    num_image_tokens = get_image_token_count()
+
     batch_size = loss_mask.shape[0]
 
     loss_mask2 = torch.cat(
