@@ -705,7 +705,6 @@ class FP32Optimizer(MegatronOptimizer):
         return state_dict
 
 
-
 class ProxyDict:
     """
     A dictionary-like object that proxies to a list of dictionaries.
