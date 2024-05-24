@@ -91,7 +91,7 @@ class Bucket:
         """
         self.params_with_grad = set()
         self.communication_handle = None
-        self.communication_issued = False
+        self.is_communication_outstanding = False
 
     def start_grad_sync(self):
         """
@@ -103,8 +103,8 @@ class Bucket:
         synchronous call.
         """
         assert (
-            self.communication_handle is None and not self.communication_issued
-        ), 'Should not have multiple communication calls in flight at once'
+            self.communication_handle is None and not self.is_communication_outstanding
+        ), 'Should not have multiple communication calls outstanding at once'
 
         # Make sure norm of grads in bucket are not NaN
         # prior to data-parallel all-reduce / reduce-scatter.
@@ -136,7 +136,10 @@ class Bucket:
                 group=self.data_parallel_group,
                 async_op=self.ddp_config.overlap_grad_reduce,
             )
-        self.communication_issued = True
+        if self.ddp_config.overlap_grad_reduce:
+            self.is_communication_outstanding = True
+        else:
+            self.is_communication_outstanding = False
 
     def finish_grad_sync(self):
         """
@@ -150,7 +153,7 @@ class Bucket:
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync()
             return
-        assert self.communication_handle is not None and self.communication_issued, (
+        assert self.communication_handle is not None and self.is_communication_outstanding, (
             f'Communication call has not been issued for this bucket '
             f'({len(self.params_with_grad)}/{len(self.params)} params have grad available)'
         )
