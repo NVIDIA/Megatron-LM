@@ -5,6 +5,7 @@
 import argparse
 import dataclasses
 import json
+import logging
 import os
 import torch
 import types
@@ -882,6 +883,8 @@ def _add_logging_args(parser):
     group.add_argument('--one-logger-run-name', type=str, default=None,
                        help='The one-logger run name displayed. Will ignore if '
                        '--enable-one-logger is not set')
+    group.add_argument('--logging-level', type=int, default=None,
+                       help='Set default logging level')
     return parser
 
 
