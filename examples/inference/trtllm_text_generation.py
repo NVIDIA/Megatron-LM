@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from ammo.deploy.llm import generate, load, unload
+from modelopt.deploy.llm import LLM, build_tensorrt_llm
 from transformers import AutoTokenizer, T5Tokenizer
 
 
@@ -23,19 +23,30 @@ class CustomSentencePieceTokenizer(T5Tokenizer):
         super().__init__(model, extra_ids=0, bos_token="<s>", pad_token="<pad>")
 
     def encode(self, text, add_special_tokens: bool = True, **kwargs):
-        return self.sp_model.encode_as_ids(text)
+        return torch.Tensor(self.sp_model.encode_as_ids(text))
+
+    def batch_encode_plus(
+        self, batch_text_or_text_pairs, add_special_tokens: bool = True, **kwargs
+    ):
+        return {'input_ids': self.sp_model.encode_as_ids(batch_text_or_text_pairs)}
 
     def batch_decode(self, sequences, skip_special_tokens: bool = False, **kwargs):
         if isinstance(sequences, np.ndarray) or torch.is_tensor(sequences):
             sequences = sequences.tolist()
         return self.sp_model.decode(sequences)
 
+    def decode(self, token_ids, skip_special_tokens: bool = False, **kwargs):
+        return self.sp_model.decode([token_ids])[0]
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokenizer", type=str, default="")
-    parser.add_argument("--max-output-len", type=int, default=100)
-    parser.add_argument("--engine-dir", type=str, default="/tmp/ammo")
+    parser.add_argument("--max-input-len", type=int, default=4096)
+    parser.add_argument("--max-output-len", type=int, default=512)
+    parser.add_argument("--max-batch-size", type=int, default=8)
+    parser.add_argument("--tensorrt-llm-checkpoint-dir", type=str, default=None)
+    parser.add_argument("--engine-dir", type=str, default="/tmp/trtllm_engine")
     parser.add_argument(
         "--input-texts",
         type=str,
@@ -44,7 +55,7 @@ def parse_arguments():
         ),
         help="Input texts. Please use | to separate different batches.",
     )
-    parser.add_argument("--max-num-beams", type=int, default=1)
+    parser.add_argument("--max-beam-width", type=int, default=1)
     parser.add_argument("--profiler-output", type=str, default="")
     return parser.parse_args()
 
@@ -62,6 +73,7 @@ def run(args):
         raise ValueError(
             "arg.tokenizer must be a dir to a hf tokenizer checkpoint for llama or a SentencePiece .model file for gptnext"
         )
+    print(tokenizer, tokenizer.vocab_size)
 
     if not hasattr(args, "profiler_output"):
         args.profiler_output = ""
@@ -70,22 +82,33 @@ def run(args):
     assert input_texts, "input_text not specified"
     print(input_texts)
 
+    if args.tensorrt_llm_checkpoint_dir is not None:
+        print("Building TensorRT-LLM engines.")
+        build_tensorrt_llm(
+            args.tensorrt_llm_checkpoint_dir + "/config.json",
+            args.engine_dir,
+            max_input_len=args.max_input_len,
+            max_batch_size=args.max_batch_size,
+            max_beam_width=args.max_beam_width,
+            num_build_workers=1,
+        )
+        print(f"TensorRT-LLM engines saved to {args.engine_dir}")
+
     free_memory_before = torch.cuda.mem_get_info()
 
-    host_context = load(
-        tokenizer=tokenizer, engine_dir=args.engine_dir, num_beams=args.max_num_beams
-    )
+    # This is a ModelOpt wrapper on top of tensorrt_llm.hlapi.llm.LLM
+    llm_engine = LLM(args.engine_dir, tokenizer)
+
     torch.cuda.cudart().cudaProfilerStart()
-    outputs = generate(input_texts, args.max_output_len, host_context, None, args.profiler_output)
-    print(outputs)
+    # outputs = llm_engine.generate_text(input_texts, args.max_output_len, args.max_beam_width)
+    outputs = llm_engine.generate(input_texts)
     torch.cuda.cudart().cudaProfilerStop()
 
     free_memory_after = torch.cuda.mem_get_info()
     print(
-        f"Use GPU memory: {(free_memory_before[0] - free_memory_after[0]) / 1024 / 1024 / 1024} GB"
+        f"Used GPU memory: {(free_memory_before[0] - free_memory_after[0]) / 1024 / 1024 / 1024} GB"
     )
-
-    unload(host_context)
+    print(outputs)
 
 
 if __name__ == "__main__":
