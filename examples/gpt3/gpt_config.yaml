@@ -132,7 +132,7 @@ model_parallel:
   barrier_with_L1_time: True
 
 # training:
-use_mcore_models: True
+use_legacy_models: False
 spec: null
 micro_batch_size: 2
 global_batch_size: 128

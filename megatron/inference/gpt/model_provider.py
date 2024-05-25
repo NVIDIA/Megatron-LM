@@ -17,7 +17,7 @@ from megatron.training.arguments import core_transformer_config_from_args
 def model_provider(pre_process=True, post_process=True, parallel_output=True) -> MCoreGPTModel:
     """Builds the model.
 
-    If you set the use_mcore_models to True, it will return the mcore GPT model and if not the legacy GPT model.
+    If you set the use_legacy_models to True, it will return the legacy GPT model and if not the core GPT model.
 
     Args:
         pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
@@ -36,32 +36,32 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
     config = core_transformer_config_from_args(get_args())
     config.non_homogeneous_layers = True
 
-    if args.use_mcore_models:
-        if args.spec is not None:
-            transformer_layer_spec = import_module(args.spec)
-        else:
-            transformer_layer_spec = get_gpt_layer_modelopt_spec(
-                remap_te_layernorm=args.export_te_mcore_model, qk_layernorm=False,
-            )
-
-        model_type = MCoreGPTModel
-        model_kwargs = {
-            "config": config,
-            "transformer_layer_spec": transformer_layer_spec,
-            "vocab_size": args.padded_vocab_size,
-            "max_sequence_length": args.max_position_embeddings,
-            "pre_process": pre_process,
-            "post_process": post_process,
-            "fp16_lm_cross_entropy": args.fp16_lm_cross_entropy,
-            "parallel_output": parallel_output,
-            "share_embeddings_and_output_weights": not args.untie_embeddings_and_output_weights,
-            "position_embedding_type": args.position_embedding_type,
-            "rotary_percent": args.rotary_percent,
-        }
-    else:
+    if args.use_legacy_models:
         raise ValueError(
             "ModelOpt integration only support MCore models. Use --use-mcore-modules instead."
         )
+
+    if args.spec is not None:
+        transformer_layer_spec = import_module(args.spec)
+    else:
+        transformer_layer_spec = get_gpt_layer_modelopt_spec(
+            remap_te_layernorm=args.export_te_mcore_model, qk_layernorm=False,
+        )
+
+    model_type = MCoreGPTModel
+    model_kwargs = {
+        "config": config,
+        "transformer_layer_spec": transformer_layer_spec,
+        "vocab_size": args.padded_vocab_size,
+        "max_sequence_length": args.max_position_embeddings,
+        "pre_process": pre_process,
+        "post_process": post_process,
+        "fp16_lm_cross_entropy": args.fp16_lm_cross_entropy,
+        "parallel_output": parallel_output,
+        "share_embeddings_and_output_weights": not args.untie_embeddings_and_output_weights,
+        "position_embedding_type": args.position_embedding_type,
+        "rotary_percent": args.rotary_percent,
+    }
 
     model = model_type(**model_kwargs)
 

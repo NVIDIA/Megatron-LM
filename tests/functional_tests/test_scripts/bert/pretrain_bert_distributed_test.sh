@@ -36,11 +36,12 @@ else
    ADDITIONAL_PARAMS+=" --deterministic-mode"
 fi
 
+USE_LEGACY=1
 if [[ $USE_CORE -eq 1 ]]; then
        echo "Running using megatron core"
        TRANSFORMER_IMPL=local
        TRAINING_DTYPE=bf16
-       USE_MCORE=1
+       unset USE_LEGACY
 fi
 if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
        echo "Running checkpoint resume test..."
@@ -89,7 +90,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        --tensor-model-parallel-size $TP_SIZE \
        --pipeline-model-parallel-size $PP_SIZE \
        ${VP_SIZE:+--num-layers-per-virtual-pipeline-stage "$VP_SIZE"} \
-       ${USE_MCORE:+--use-mcore-models} \
+       ${USE_LEGACY:+--use-legacy-models} \
        ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
        --no-gradient-accumulation-fusion \
        ${DATA_CACHE:+--data-cache-path "$DATA_CACHE"} \

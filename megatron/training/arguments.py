@@ -59,7 +59,8 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     # Experimental yaml
     if args.yaml_cfg is not None:
         from .yaml_arguments import load_yaml
-        assert args.yaml_cfg and args.use_mcore_models, "To use yaml, mcore must be enabled"
+        assert args.yaml_cfg and not args.use_legacy_models, \
+            "Yaml config is not supported with legacy models."
         args = load_yaml(args.yaml_cfg)
 
 
@@ -264,7 +265,7 @@ def validate_args(args, defaults={}):
             '--overlap-param-gather only supported with distributed optimizer'
         assert args.overlap_grad_reduce, \
             '--overlap-grad-reduce should be turned on when using --overlap-param-gather'
-        assert args.use_mcore_models, \
+        assert not args.use_legacy_models, \
             '--overlap-param-gather only supported with MCore models'
 
     # Parameters dtype.
@@ -481,8 +482,8 @@ def validate_args(args, defaults={}):
             "retro currently does not support pipeline parallelism."
 
     if args.decoupled_lr is not None or args.decoupled_min_lr is not None:
-        assert args.use_mcore_models, \
-            '--decoupled-lr and --decoupled-min-lr only supported by Megatron Core, please add --use-mcore-models.'
+        assert not args.use_legacy_models, \
+            '--decoupled-lr and --decoupled-min-lr is not supported in legacy models.'
         assert not args.use_dist_ckpt, "Distributed checkpointing does not work with decoupled LR yet."
 
     # Legacy RoPE arguments
@@ -490,8 +491,8 @@ def validate_args(args, defaults={}):
         args.position_embedding_type = 'rope'
     if args.rotary_interleaved and args.apply_rope_fusion:
         raise RuntimeError('--rotary-interleaved does not work with rope_fusion.')
-    if args.rotary_interleaved and not args.use_mcore_models:
-        raise RuntimeError('--rotary-interleaved only support Megatron Core, please add --use-mcore-models.')
+    if args.rotary_interleaved and args.use_legacy_models:
+        raise RuntimeError('--rotary-interleaved is not supported in legacy models.')
 
     # Would just need to add 'NoPE' as a position_embedding_type to support this, but for now
     # don't allow it to keep things simple
@@ -505,6 +506,10 @@ def validate_args(args, defaults={}):
             assert args.sequence_parallel, \
                 "When using MoE and tensor parallelism, sequence parallelism must be used."
 
+    # Context parallel
+    if args.context_parallel_size > 1:
+        assert not args.use_legacy_models, "Context parallelism is not supported in legacy models."
+
     # Expert parallelism check
     if args.expert_model_parallel_size  > 1:
         assert args.num_experts is not None, "num_experts must be non None to use expert model parallelism"
@@ -514,8 +519,8 @@ def validate_args(args, defaults={}):
             "Expert parallelism is not supported with fp16 training."
 
     # Distributed checkpointing checks
-    if args.use_dist_ckpt and not args.use_mcore_models:
-        raise RuntimeError('--use-dist-ckpt only support Megatron Core, please add --use-mcore-models.')
+    if args.use_dist_ckpt and args.use_legacy_models:
+        raise RuntimeError('--use-dist-ckpt is not supported in legacy models.')
 
     # Data blend checks
     assert args.mock_data + \
@@ -1110,7 +1115,12 @@ def _add_training_args(parser):
                        'gradient computation of linear layers',
                        dest='gradient_accumulation_fusion')
     group.add_argument('--use-mcore-models', action='store_true',
-                       help='Use the implementation from megatron core')
+                       dest='deprecated_use_mcore_models',
+                       help='DEPRECATED. Use the implementation from megatron core.'
+                       'Now ignored and mcore models are the default, use '
+                       '--use-legacy-models to not use core models.')
+    group.add_argument('--use-legacy-models', action='store_true',
+                       help='Use the legacy Megatron models, not Megatron-Core models.')
     group.add_argument('--manual-gc', action='store_true',
                        help='Disable the threshold-based default garbage '
                        'collector and trigger the garbage collection manually. '

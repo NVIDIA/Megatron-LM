@@ -35,9 +35,15 @@ def model_provider(pre_process=True, post_process=True):
     config = core_transformer_config_from_args(args)
     num_tokentypes = 2 if args.bert_binary_head else 0
 
-    if args.use_mcore_models:
-
-
+    if args.use_legacy_models:
+        model = megatron.legacy.model.BertModel(
+            config=config,
+            num_tokentypes=num_tokentypes,
+            add_binary_head=args.bert_binary_head,
+            parallel_output=True,
+            pre_process=pre_process,
+            post_process=post_process)
+    else:
         if args.spec is None:
             transformer_layer_spec = bert_layer_with_transformer_engine_spec #default spec
         elif args.spec[0] == 'local':
@@ -45,7 +51,6 @@ def model_provider(pre_process=True, post_process=True):
             transformer_layer_spec = bert_layer_local_spec
         else :
             transformer_layer_spec = import_module(args.spec)
-
 
         model = BertModel(
             config=config,
@@ -55,14 +60,6 @@ def model_provider(pre_process=True, post_process=True):
             num_tokentypes=num_tokentypes,
             add_binary_head=args.bert_binary_head,
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-            parallel_output=True,
-            pre_process=pre_process,
-            post_process=post_process)
-    else:
-        model = megatron.legacy.model.BertModel(
-            config=config,
-            num_tokentypes=num_tokentypes,
-            add_binary_head=args.bert_binary_head,
             parallel_output=True,
             pre_process=pre_process,
             post_process=post_process)
