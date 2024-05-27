@@ -345,16 +345,16 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         if args.use_dist_ckpt:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 ensure_directory_exists(checkpoint_name, check_parent=False)
-            validate_sharding_integrity = True
-            save_strategy = (checkpointing_context or {}).get('save_strategy',
-                                                              get_default_save_sharded_strategy(args.dist_ckpt_format))
-            if args.ckpt_assume_constant_structure and args.dist_ckpt_format == 'torch_dist':
-                save_strategy.use_cached_ckpt_structure = args.ckpt_assume_constant_structure
-            if args.ckpt_fully_parallel_save:
-                if checkpointing_context is not None and 'save_strategy' in checkpointing_context:
-                    # Already saved once before - don't need to rerun sharding validation
-                    validate_sharding_integrity = not args.ckpt_assume_constant_structure
-                else:
+            if checkpointing_context is not None and 'save_strategy' in checkpointing_context:
+                save_strategy = checkpointing_context['save_strategy']
+                # Already saved once before - don't need to rerun sharding validation
+                validate_sharding_integrity = not args.ckpt_assume_constant_structure
+            else:
+                validate_sharding_integrity = True
+                save_strategy = get_default_save_sharded_strategy(args.dist_ckpt_format)
+                if args.ckpt_assume_constant_structure and args.dist_ckpt_format == 'torch_dist':
+                    save_strategy.use_cached_ckpt_structure = args.ckpt_assume_constant_structure
+                if args.ckpt_fully_parallel_save:
                     save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, mpu.get_data_parallel_group(with_context_parallel=True),
                                                                      args.ckpt_assume_constant_structure)
             # Store save strategy for future checkpoint saves
@@ -363,7 +363,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             end_ckpt = time()
             logger.debug(f"rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt ")
             async_save_request = dist_checkpointing.save(state_dict, checkpoint_name, save_strategy,
-                                                         async_sharded_save=args.async_save)
+                                                         async_sharded_save=args.async_save,
+                                                         validate_access_integrity=validate_sharding_integrity)
 
             # [ModelOpt]: save sharded modelopt_state
             if has_nvidia_modelopt:
