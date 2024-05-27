@@ -216,6 +216,10 @@ def validate_args(args, defaults={}):
         args.recompute_granularity = 'selective'
     del args.recompute_activations
 
+    # train-data-path and split cannot be set simultaneously
+    if args.train_data_path is not None and args.split is not None:
+        args.split = None
+
     # Set input defaults.
     for key in defaults:
         # For default to be valid, it should not be provided in the
