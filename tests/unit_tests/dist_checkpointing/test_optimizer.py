@@ -9,7 +9,8 @@ import torch
 from torch.optim import Adam
 
 from megatron.core import parallel_state, DistributedDataParallel as DDP
-from megatron.core.dist_checkpointing import ShardedTensor, save, load
+from megatron.core.dist_checkpointing import ShardedTensor, save, load, \
+    load_plain_tensors
 from megatron.core.dist_checkpointing.dict_utils import nested_values, diff
 from megatron.core.dist_checkpointing.optimizer import \
     get_param_id_to_sharded_param_map, optim_state_to_sharding_state
@@ -26,6 +27,7 @@ from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import get_model_config
 from megatron.training.training import get_model
+from megatron.training.utils import unwrap_model
 from pretrain_gpt import model_provider
 
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -103,10 +105,10 @@ def initialize_gpt_model(pre_process=True, post_process=True, seed=0, **config_k
     return model
 
 
-def init_mock_args(args):
+def init_mock_args(args, bf16=True):
     args.data_parallel_random_init = False
     args.virtual_pipeline_model_parallel_size = None
-    args.bf16 = True
+    args.bf16 = bf16
     args.accumulate_allreduce_grads_in_fp32 = False
     args.overlap_grad_reduce = False
     args.use_distributed_optimizer = True
@@ -114,12 +116,12 @@ def init_mock_args(args):
     return args
 
 
-def setup_model_and_optimizer(seed):
+def setup_model_and_optimizer(seed, bf16=True):
     with mock.patch('megatron.training.training.get_args', data_parallel_random_init=False) as mock_args:
-        init_mock_args(mock_args.return_value)
+        init_mock_args(mock_args.return_value, bf16)
         model = get_model(partial(initialize_gpt_model, seed=seed))
 
-    config = OptimizerConfig(bf16=True, params_dtype=torch.bfloat16, use_distributed_optimizer=True)
+    config = OptimizerConfig(bf16=bf16, params_dtype=torch.bfloat16 if bf16 else torch.float, use_distributed_optimizer=bf16)
     optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)
@@ -133,7 +135,7 @@ def setup_model_and_optimizer(seed):
 
     optimizer.reload_model_params()
 
-    return model, optimizer
+    return unwrap_model(model), optimizer
 
 
 class TestDistributedOptimizer:
@@ -201,3 +203,40 @@ class TestDistributedOptimizer:
                     sleep(20)
             finally:
                 Utils.set_world_size()
+
+
+class TestFP32Optimizer:
+    @pytest.mark.parametrize(
+        ('src_tp_pp', 'dest_tp_pp'),
+        [
+            ((2, 4), (2, 4)),
+            ((2, 4), (4, 2)),
+            ((8, 1), (1, 2)),
+        ]
+    )
+    def test_fp32_optimizer_resharding(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp):
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=False) as ckpt_dir_A:
+            with TempNamedDir(tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=False) as ckpt_dir_B:
+                Utils.initialize_model_parallel(*src_tp_pp)
+                model_A, optimizer_A = setup_model_and_optimizer(seed=2, bf16=False)
+
+                save(optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()), ckpt_dir_A)
+                Utils.destroy_model_parallel()
+
+                # Load checkpoint A with different TP/PP and save as checkpoint B
+                Utils.initialize_model_parallel(*dest_tp_pp)
+                model_B, optimizer_B = setup_model_and_optimizer(seed=3, bf16=False)
+                load_sharded_state_dict = optimizer_B.sharded_state_dict(model_B[0].sharded_state_dict())
+                state_dict = load(load_sharded_state_dict, ckpt_dir_A)
+
+                optimizer_B.load_state_dict(state_dict)
+                save(optimizer_B.sharded_state_dict(model_B[0].sharded_state_dict()), ckpt_dir_B)
+                Utils.destroy_model_parallel()
+
+                # Test both checkpoints are equal
+                Utils.initialize_model_parallel(1, 1)
+                plain_state_dict_A = load_plain_tensors(ckpt_dir_A)
+                plain_state_dict_B = load_plain_tensors(ckpt_dir_B)
+                diffs = diff(plain_state_dict_A, plain_state_dict_B)
+                assert not any(map(bool, diffs)), diffs
+                Utils.destroy_model_parallel()
