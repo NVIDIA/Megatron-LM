@@ -17,13 +17,13 @@ import numpy as np
 import torch
 from PIL import Image
 from torchvision.transforms import Compose, Resize, ToPILImage
+from train import add_multimodal_extra_args, get_image_token_count, model_provider
 
 from megatron.inference.text_generation.api import generate_and_post_process
 from megatron.inference.text_generation.forward_step import ForwardStep
 from megatron.training import get_args, get_model, print_rank_0
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
-from train import model_provider, get_image_token_count, add_multimodal_extra_args
 
 
 def add_text_generation_args(parser):
@@ -37,13 +37,15 @@ def add_text_generation_args(parser):
         "--out-seq-length", type=int, default=1024, help='Length of the output generated text.'
     )
     group.add_argument("--output-path", type=str, required=True, help='Output file path')
-    group.add_argument('--input-path', type=str, required=True, help="Input directory")
+    group.add_argument('--input-image-path', type=str, required=True, help="Input image directory")
+    group.add_argument('--input-metadata-path', type=str, help="Input metadata path")
     group.add_argument(
         '--num-partitions', type=int, default=0, help="Number of partitions for inputs."
     )
     group.add_argument('--partition-id', type=int, default=0, help="Partition index")
     group.add_argument("--drop-vision-class-token", action="store_true", default=False)
     group.add_argument("--gt-path", type=str, help="Optional ground truth file")
+    group.add_argument("--task", type=str, help="Generation task to run")
 
     # Add common multimodal arguments needed for e.g. building the model.
     parser = add_multimodal_extra_args(parser)
@@ -51,77 +53,137 @@ def add_text_generation_args(parser):
     return parser
 
 
-def _convert_image_to_rgb(image):
-    return image.convert("RGB")
+def preprocess_image(target_h, target_w, img):
+    """Example image preprocessing. Resizes input image to target size.
 
+    Args:
+        target_h (int): Target height in pixels.
+        target_w (int): Target width in pixels
+        img (np.array [h, w, c]): Input image in a numpy array.
 
-def _transform_test(img_h, img_w):
-    return Compose([ToPILImage(), Resize((img_h, img_w)), _convert_image_to_rgb])
-
-
-def preprocess(img_h, img_w, img):
-    # Example image preprocessing.
-    pixel_mean = [123.675, 116.28, 103.53]  # Imagenet's mean.
+    Returns:
+        output_img (torch.Tensor [c, h, w]): Input image resized to target size.
+    """
+    # Imagenet's mean and std for normalization.
+    pixel_mean = [123.675, 116.28, 103.53]
     pixel_std = [58.395, 57.12, 57.375]
     pixel_mean = torch.Tensor(pixel_mean).view(-1, 1, 1)
     pixel_std = torch.Tensor(pixel_std).view(-1, 1, 1)
 
-    raw_h, raw_w = img.shape[0], img.shape[1]
-    ratio = float(max(img_h, img_w)) / max(raw_h, raw_w)
-    H, W = int(raw_h * ratio + 0.5), int(raw_w * ratio + 0.5)
-    image_transform = _transform_test(H, W)
-    img = image_transform(img)
-    img = (torch.Tensor(np.array(img)).permute(2, 0, 1) - pixel_mean) / pixel_std
-    delta_h, delta_w = img_h - H, img_w - W
-    padded_img = torch.nn.functional.pad(img, (0, delta_w, 0, delta_h))
+    # Resize image considering ratio between input and target image sizes.
+    img_h, img_w = img.shape[0], img.shape[1]
+    ratio = float(max(target_h, target_w)) / max(img_h, img_w)
 
-    return padded_img
+    scaled_h, scaled_w = int(img_h * ratio + 0.5), int(img_w * ratio + 0.5)
+
+    image_transform = Compose(
+        [ToPILImage(), Resize((scaled_h, scaled_w)), lambda x: x.convert("RGB")]
+    )
+    img = image_transform(img)
+
+    # Normalize pixel values.
+    img = (torch.Tensor(np.array(img)).permute(2, 0, 1) - pixel_mean) / pixel_std
+
+    # Pad to target size.
+    delta_h, delta_w = target_h - scaled_h, target_w - scaled_w
+    output_img = torch.nn.functional.pad(img, (0, delta_w, 0, delta_h))
+
+    return output_img
 
 
 def generate_samples(model):
-    """Text generation using a trained vision language model. This is an example for the COCO dataset."""
+    """Text generation using a trained vision language model."""
     args = get_args()
 
-    image_files = sorted(glob.glob(args.input_path + "/*"))
-    # Optionally, process only a subset of the input files.
-    if args.num_partitions > 0:
-        per_part = len(image_files) // args.num_partitions
-        image_files = image_files[per_part * args.partition_id : per_part * (args.partition_id + 1)]
-
-    num_samples = len(image_files)
     images = []
+    questions, answers = [], []
+    samples, sample_ids = [], []
 
-    # Run image preprocessing.
-    for image_file in image_files:
-        img = np.array(Image.open(image_file))
-        img = preprocess(args.img_h, args.img_w, img)
+    if args.task in ("TextVQA", "VQAv2"):
+        input_metadata_path = args.input_metadata_path
 
-        images.append(img.reshape(-1, 3, args.img_h, args.img_w))
+        if input_metadata_path.endswith(".json"):
+            samples = json.load(open(input_metadata_path))
+        elif input_metadata_path.endswith(".jsonl"):
+            with open(input_metadata_path, 'r') as jsonl_file:
+                json_list = list(jsonl_file)
+                samples = [json.loads(json_str) for json_str in json_list]
+        else:
+            return NotImplementedError
 
-    # Load optional ground truth.
-    gt_image_id_to_captions = defaultdict(list)
-    if args.gt_path:
-        gts = json.load(open(args.gt_path))
-        for gt in gts["annotations"]:
-            gt_image_id_to_captions[gt["image_id"]].append(gt['caption'])
+        # Optionally, process only a subset of the input files.
+        if args.num_partitions > 0:
+            per_part = len(samples) // args.num_partitions
+            samples = samples[per_part * args.partition_id : per_part * (args.partition_id + 1)]
 
-    num_image_tokens = get_image_token_count()
+        num_samples = len(samples)
+
+        for i in range(len(samples)):
+            sample = samples[i]
+
+            img_file = "{}/{}".format(args.input_image_path, sample["image"])
+
+            img_sample = np.array(Image.open(img_file))
+            processed_img = preprocess_image(args.img_h, args.img_w, img_sample)
+            images.append(processed_img.reshape(-1, 3, args.img_h, args.img_w))
+
+            if args.task == "VQAv2":
+                questions.append(sample["question"])
+                answers.append(sample["answer"])
+            elif args.task == 'TextVQA':
+                questions.append(sample["text"])
+
+            sample_ids.append(sample["question_id"])
+
+            if len(images) == num_samples:
+                break
+    elif args.task == "captioning":
+        image_files = sorted(glob.glob(args.input_image_path + "/*"))
+        # Optionally, process only a subset of the input files.
+        if args.num_partitions > 0:
+            per_part = len(image_files) // args.num_partitions
+            image_files = image_files[
+                per_part * args.partition_id : per_part * (args.partition_id + 1)
+            ]
+
+        num_samples = len(image_files)
+        images = []
+
+        # Run image preprocessing.
+        for image_file in image_files:
+            img = np.array(Image.open(image_file))
+            img = preprocess(args.img_h, args.img_w, img)
+
+            images.append(img.reshape(-1, 3, args.img_h, args.img_w))
+
+            image_id = int(image_file.split("_")[-1].split(".")[0])
+            sample_ids.append(image_id)
+
+        # Load optional ground truth.
+        gt_sample_id_to_captions = defaultdict(list)
+        if args.gt_path:
+            gts = json.load(open(args.gt_path))
+            for gt in gts["annotations"]:
+                gt_sample_id_to_captions[gt["image_id"]].append(gt['caption'])
+    else:
+        raise NotImplementedError("unsupported task")
 
     idx = 0
     while idx < num_samples:
-        try:
-            image = images[idx].cuda()
-        except:
-            breakpoint()
-            pass
+        image = images[idx].cuda()
+        sample_id = sample_ids[idx]
 
-        image_id = int(image_files[idx].split("_")[-1].split(".")[0])
+        if args.task == "captioning":
+            prompt = "Give a short and clear explanation of the subsequent image.\n"
+        elif args.task == "TextVQA":
+            prompt = questions[idx]
+        elif args.task == "VQAv2":
+            prompt = questions[idx]
+            prompt += "\nAnswer the question using a single word or phrase."
 
-        forward_step = partial(VLMForwardStep, image, num_image_tokens)
+        forward_step = partial(VLMForwardStep, image, get_image_token_count())
 
         if torch.distributed.get_rank() == 0:
-            prompt = "Give a short and clear explanation of the subsequent image.\n"
-
             resp_sentences, _, _, _ = generate_and_post_process(
                 model,
                 forward_step=forward_step,
@@ -137,12 +199,25 @@ def generate_samples(model):
 
             for prompt, generation in zip([prompt], resp_sentences):
                 output = {
-                    "question_id": image_id,
+                    "sample_id": sample_id,
                     "prompt": prompt,
-                    "caption": generation[len(prompt) :],
                 }
 
-                output["ground_truth"] = gt_image_id_to_captions[image_id]
+                output_name = ""
+                if args.task == "captioning":
+                    output_name = "caption"
+                elif args.task == "VQAv2":
+                    output_name = "answer"
+                elif args.task == "TextVQA":
+                    output_name = "text"
+
+                generated = generation[len(prompt) :]
+                output[output_name] = generated
+
+                if args.task == "captioning":
+                    output["ground_truth"] = gt_sample_id_to_captions[sample_id]
+                elif args.task == "VQAv2":
+                    output["ground_truth"] = answers[idx]
 
                 print_rank_0(output)
 
@@ -150,6 +225,7 @@ def generate_samples(model):
                 idx += 1
         else:
             generate_and_post_process(model, forward_step=forward_step)
+
             idx += 1
 
 
