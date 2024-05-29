@@ -21,7 +21,7 @@ MASTER_PORT=6000
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 
-command="export CUDA_DEVICE_MAX_CONNECTIONS=1; export HF_HOME=/workspace/huggingface/hub;"
+command="export CUDA_DEVICE_MAX_CONNECTIONS=1;"
 
 set +x
 # Runs the "126m" parameter model

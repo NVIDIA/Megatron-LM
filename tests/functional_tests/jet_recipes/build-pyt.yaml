@@ -28,7 +28,7 @@ spec:
   name: nemo
   platforms: [linux/amd64]
   source:
-    image: nvcr.io/nvidian/bignlp-train:nemofw-nightly
+    image: nvcr.io/nvidian/nemo:nightly
 
 ---
 type: build

@@ -39,13 +39,13 @@ class GroupedMLP(MegatronModule):
 
         self.expert_parallel = config.expert_model_parallel_size > 1
         if self.config.gated_linear_unit:
-            if self.config.activation_func != F.silu:
-                raise ValueError("Activation function must be silu when using GroupedMLP.")
+            if self.config.activation_func not in (F.silu, F.gelu):
+                raise ValueError("Activation function must be silu or gelu when using GroupedMLP.")
 
             @jit_fuser
             def glu(x):
                 x = torch.chunk(x, 2, dim=-1)
-                return F.silu(x[0]) * x[1]
+                return self.config.activation_func(x[0]) * x[1]
 
             self.activation_func = glu
         else:

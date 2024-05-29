@@ -22,7 +22,6 @@ spec:
   args_meta: null
   micro_batch_size: 4 # MBS
   batch_size: 128 # GBS, JET schema requires 'batch_size'
-  precision: bf16
   time_limit: 1200
   ckpt_format: torch
   ckpt_resume: 0

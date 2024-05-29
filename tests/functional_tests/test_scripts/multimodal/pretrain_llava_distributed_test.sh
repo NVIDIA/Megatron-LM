@@ -126,6 +126,12 @@ build_torch_run_cmd() {
 
   if [[ "${TRAINING_DTYPE}" == "fp16" ]]; then
       torch_run_cmd+=" --apply-query-key-layer-scaling"
+      # NVTE_APPLY_QK_LAYER_SCALING=1 is required if using:
+      #  1. --apply-query-key-layer-scaling
+      #  2. transformer_impl="transformer_engine"
+      #  3. TE >= 0.11
+      #  4. fp16
+      export NVTE_APPLY_QK_LAYER_SCALING=1
   fi
 }
 

@@ -261,8 +261,8 @@ class TransformerConfig(ModelParallelConfig):
     moe_pad_expert_input_to_capacity: bool = False
     """moe_pad_expert_input_to_capacity (bool): If True, pads the input for each expert to match the expert capacity length, effective only after the moe_expert_capacity_factor is set. The default setting is False."""
 
-    moe_token_drop_policy: str = 'position'
-    """The policy to drop tokens. Can be either "prob" or "position". If "prob", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.
+    moe_token_drop_policy: str = 'probs'
+    """The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.
     """
     moe_layer_recompute: bool = False
     """Memory optimization: checkpointing moe_layer to save actiavtion memory."""
@@ -279,13 +279,6 @@ class TransformerConfig(ModelParallelConfig):
 
     enable_cuda_graph: bool = False
     """When set to true, TransformerLayer blocks are wrapped with CUDA graph."""
-
-    # These 2 attributes are WAR for TRTLLM export. DO NOT USE!! WILL BE DEPRECATED SOON!!
-    max_position_embeddings: int = 0
-    """Deprecated. Do not use."""
-
-    rotary_percent: float = 0
-    """Deprecated. Do not use."""
 
     def __post_init__(self):
         """ Python dataclass method that is used to modify attributes after initialization.

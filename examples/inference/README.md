@@ -4,10 +4,10 @@
 We recommend that users follow TensorRT-LLM's official installation guide to build it from source
 and proceed with a containerized environment (`docker.io/tensorrt_llm/release:latest`):
 
-```
+```sh
 git clone https://github.com/NVIDIA/TensorRT-LLM.git
 cd TensorRT-LLM
-git checkout v0.7.1
+git checkout v0.9.0
 make -C docker release_build
 ```
 
@@ -15,18 +15,17 @@ make -C docker release_build
 > you may need to copy the entire dir as `COPY ./ /src/tensorrt_llm` since a `git submodule` is
 > called later which requires `.git` to continue.
 
-Once the container is built, install `nvidia-ammo` and additional dependencies for sharded checkpoint support:
-```
-pip install --no-cache-dir --extra-index-url https://pypi.nvidia.com nvidia-ammo
+Once the container is built, install `nvidia-modelopt` and additional dependencies for sharded checkpoint support:
+```sh
+pip install "nvidia-modelopt[all]~=0.11.0" --extra-index-url https://pypi.nvidia.com
 pip install zarr tensorstore==0.1.45
 ```
-TensorRT-LLM quantization functionalities are currently packaged in `nvidia-ammo`.
-You can find more documentation about `nvidia-ammo` in [TensorRT-LLM's quantization
-examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/quantization).
+TensorRT-LLM quantization functionalities are currently packaged in `nvidia-modelopt`.
+You can find more documentation about `nvidia-modelopt` [here](https://nvidia.github.io/TensorRT-Model-Optimizer/).
 
 ## Support Matrix
 
-The following matrix shows the current support for the PTQ + TensorRT-LLM export flow. 
+The following matrix shows the current support for the PTQ + TensorRT-LLM export flow.
 
 | model                       | fp16 | int8_sq | fp8 | int4_awq |
 |-----------------------------|------|---------| ----| -------- |
@@ -40,17 +39,17 @@ Our PTQ + TensorRT-LLM flow has native support on MCore `GPTModel` with a mixed 
 and Transformer-Engine Norm (`TENorm`). Note that this is not the default mcore gpt spec. You can still load the
 following checkpoint formats with some remedy:
 
-| GPTModel                          | sharded |                        remedy arguments |
-|-----------------------------------|---------|-----------------------------------------|
-| megatron.legacy.model             |         | `--ammo-load-classic-megatron-to-mcore` |
-| TE-Fused (default mcore gpt spec) |         | `--ammo-convert-te-to-local-spec`       |
-| TE-Fused (default mcore gpt spec) |       x |                                         |
+| GPTModel                          | sharded |                        remedy arguments     |
+|-----------------------------------|---------|---------------------------------------------|
+| megatron.legacy.model             |         | `--export-legacy-megatron` |
+| TE-Fused (default mcore gpt spec) |         | `--export-te-mcore-model`       |
+| TE-Fused (default mcore gpt spec) |       x |                                             |
 
 > **TROUBLE SHOOTING:** If you are trying to load an unpacked `.nemo` sharded checkpoint, then typically you will
-> need to adding `additional_sharded_prefix="model."` to `ammo_load_checkpoint()` since NeMo has an additional
+> need to adding `additional_sharded_prefix="model."` to `modelopt_load_checkpoint()` since NeMo has an additional
 > `model.` wrapper on top of the `GPTModel`.
 
-> **NOTE:** flag `--ammo-load-classic-megatron-to-mcore` may not work on all legacy checkpoint versions.
+> **NOTE:** flag `--export-legacy-megatron` may not work on all legacy checkpoint versions.
 
 ## Examples
 
@@ -75,12 +74,13 @@ cd ..
 ```
 
 Now launch the PTQ + TensorRT-LLM export script,
-```
+```sh
 bash examples/inference/ptq_trtllm_nemotron3_8b ./nemotron-3-8b-base-4k None
 ```
 By default, `cnn_dailymail` is used for calibration. The `GPTModel` will have quantizers for simulating the
 quantization effect. The checkpoint will be saved optionally (with quantizers as additional states) and can
-be restored for further evaluation. TensorRT-LLM engine is exported to `/tmo/ammo` by default.
+be restored for further evaluation. TensorRT-LLM checkpoint and engine are exported to `/tmp/trtllm_ckpt` and
+built in `/tmp/trtllm_engine` by default.
 
 The script expects `${CHECKPOINT_DIR}` (`./nemotron-3-8b-base-4k`) to have the following structure:
 ```
@@ -101,14 +101,10 @@ The script expects `${CHECKPOINT_DIR}` (`./nemotron-3-8b-base-4k`) to have the f
 > some special tokens, `encode`, and `batch_decode`. As a result, the tokenizer behavior in TensorRT-LLM engine may
 > not match exactly.
 
-> **TROUBLE SHOOTING:** If you are loading `.nemo` sharded checkpoint here, call 
-> `ammo_load_checkpoint(..., additional_sharded_prefix="model.")` with additional sharded prefix in
-> `text_generation_ptq.py` to align the sharded keys.
-
 ### llama2-text-7b INT8 SmoothQuant and TensorRT-LLM Deployment
 > **NOTE:** Due to the LICENSE issue, we do not provide a MCore checkpoint to download. Users can follow
-> the instruction in `docs/llama2.md` to convert the checkpoint to megatron classic `GPTModel` format and
-> use `--ammo-load-classic-megatron-to-mcore` flag which will remap the checkpoint to the MCore `GPTModel` spec
+> the instruction in `docs/llama2.md` to convert the checkpoint to megatron legacy `GPTModel` format and
+> use `--export-legacy-megatron` flag which will remap the checkpoint to the MCore `GPTModel` spec
 > that we support.
 
 ```sh

@@ -32,7 +32,7 @@ def add_arguments(parser):
     group.add_argument('--tokenizer-model', required=True,
                        help='Sentencepiece tokenizer model.')
     group.add_argument('--megatron-path', type=str, default=None,
-                       help='Base directory of deepspeed repository')
+                       help='Base directory of Megatron repository')
     group.add_argument('--loader-transformer-impl', default='local',
                        choices=['local', 'transformer_engine'],
                        help='Which Transformer implementation to use.')

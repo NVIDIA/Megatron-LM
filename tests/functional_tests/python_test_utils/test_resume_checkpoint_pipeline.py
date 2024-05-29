@@ -12,6 +12,7 @@ from tensorboard.backend.event_processing import event_accumulator
 from tests.functional_tests.python_test_utils.common import TypeOfTest
 
 LOGS_DIR = os.getenv('LOGS_DIR')
+ALLOW_NONDETERMINISTIC = os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO")
 STEP_INTERVAL = 5
 
 def read_tb_logs_as_list(path, summary_name, index):
@@ -42,6 +43,7 @@ def collect_train_test_metrics(logs_dir, index):
 class TestCIPipeline:
 
     margin_loss = 0.005
+    allow_nondeterministic = bool(int(ALLOW_NONDETERMINISTIC))
     train_metrics_100 = collect_train_test_metrics(LOGS_DIR, 0)
     train_metrics_50_to_100 = collect_train_test_metrics(LOGS_DIR, 1)
 
@@ -64,5 +66,10 @@ class TestCIPipeline:
             else:
                 assert actual_val == expected_val, f"The value at step {step} should be {expected_val} but it is {actual_val}."
 
+    @pytest.mark.skipif(allow_nondeterministic, reason="Nondeterministic is allowed.")
     def test_lm_loss_deterministic(self):
         self._test_helper("lm loss", TypeOfTest.DETERMINISTIC)
+
+    @pytest.mark.skipif(not allow_nondeterministic, reason="Nondeterministic is not allowed.")
+    def test_lm_loss_deterministic(self):
+        self._test_helper("lm loss", TypeOfTest.APPROX)
