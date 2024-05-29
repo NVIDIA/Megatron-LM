@@ -54,7 +54,7 @@ def _multi_tensor_copy_this_to_that(
     is not provided, we default back to simple loop copy to be compatible
     with bfloat16.
     """
-    if overflow_buf:
+    if overflow_buf is not None:
         overflow_buf.fill_(0)
         # Scaling with factor `1.0` is equivalent to copy.
         multi_tensor_applier(amp_C.multi_tensor_scale, overflow_buf, [this, that], 1.0)
