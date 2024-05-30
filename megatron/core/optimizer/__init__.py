@@ -152,6 +152,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     config: OptimizerConfig,
     param_groups: List,
     per_model_buffers: Optional[Dict[int, List[ParamAndGradBuffer]]] = None,
+    model_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group_gloo: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group_idx: Optional[int] = None,
@@ -245,11 +246,13 @@ def _get_megatron_optimizer_based_on_param_groups(
             )
         else:
             optimizer = Float16OptimizerWithFloat16Params(*optimizer_args)
+            setattr(optimizer, 'model_parallel_group', model_parallel_group)
+    else:
+        # FP32 optimizer.
+        optimizer = FP32Optimizer(optimizer, config, init_state_fn,)
+        setattr(optimizer, 'model_parallel_group', model_parallel_group)
 
-        return optimizer
-
-    # FP32.
-    return FP32Optimizer(optimizer, config, init_state_fn,)
+    return optimizer
 
 
 def get_megatron_optimizer(
@@ -316,6 +319,7 @@ def get_megatron_optimizer(
             config,
             param_groups=dense_param_groups,
             per_model_buffers=per_model_buffers,
+            model_parallel_group=mpu.get_model_parallel_group(),
             data_parallel_group=mpu.get_data_parallel_group(with_context_parallel=True),
             data_parallel_group_gloo=mpu.get_data_parallel_group_gloo(with_context_parallel=True),
             data_parallel_group_idx=model_parallel_rank,
@@ -329,6 +333,7 @@ def get_megatron_optimizer(
                 config,
                 param_groups=moe_param_groups,
                 per_model_buffers=per_model_ep_buffers,
+                model_parallel_group=mpu.get_model_parallel_group(with_expert_parallel=True),
                 data_parallel_group=mpu.get_data_modulo_expert_parallel_group(),
                 data_parallel_group_gloo=mpu.get_data_modulo_expert_parallel_group_gloo(),
                 data_parallel_group_idx=expert_parallel_rank * model_parallel_world_size

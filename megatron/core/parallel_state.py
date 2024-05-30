@@ -17,6 +17,8 @@ _TENSOR_MODEL_PARALLEL_GROUP = None
 _PIPELINE_MODEL_PARALLEL_GROUP = None
 # Model parallel group (both intra- and pipeline) that the current rank belongs to.
 _MODEL_PARALLEL_GROUP = None
+# Model parallel group (both intra-, pipeline, and expert) that the current rank belongs to.
+_MODEL_AND_EXPERT_PARALLEL_GROUP = None
 # Embedding group.
 _EMBEDDING_GROUP = None
 # Position embedding group.
@@ -554,6 +556,18 @@ def initialize_model_parallel(
         if rank in ranks:
             _MODEL_PARALLEL_GROUP = group
 
+    # Build the model-parallel groups with expert parallel
+    global _MODEL_AND_EXPERT_PARALLEL_GROUP
+    assert (
+        _MODEL_AND_EXPERT_PARALLEL_GROUP is None
+    ), 'model and expert parallel group is already initialized'
+    for ranks in rank_generator.get_ranks('tp-ep-pp', independent_ep=True):
+        group = torch.distributed.new_group(
+            ranks, timeout=timeout, pg_options=get_nccl_options('mp_exp', nccl_comm_cfgs)
+        )
+        if rank in ranks:
+            _MODEL_AND_EXPERT_PARALLEL_GROUP = group
+
     # Build the tensor model-parallel groups.
     global _TENSOR_MODEL_PARALLEL_GROUP
     global _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS
@@ -714,8 +728,13 @@ def model_parallel_is_initialized():
     return True
 
 
-def get_model_parallel_group():
+def get_model_parallel_group(with_expert_parallel=False):
     """Get the model parallel group the caller rank belongs to."""
+    if with_expert_parallel:
+        assert (
+            _MODEL_AND_EXPERT_PARALLEL_GROUP is not None
+        ), 'model parallel group is not initialized'
+        return _MODEL_AND_EXPERT_PARALLEL_GROUP
     assert _MODEL_PARALLEL_GROUP is not None, 'model parallel group is not initialized'
     return _MODEL_PARALLEL_GROUP
 
@@ -1200,6 +1219,8 @@ def destroy_model_parallel():
     """Set the groups to none."""
     global _MODEL_PARALLEL_GROUP
     _MODEL_PARALLEL_GROUP = None
+    global _MODEL_AND_EXPERT_PARALLEL_GROUP
+    _MODEL_AND_EXPERT_PARALLEL_GROUP = None
     global _TENSOR_MODEL_PARALLEL_GROUP
     _TENSOR_MODEL_PARALLEL_GROUP = None
     global _PIPELINE_MODEL_PARALLEL_GROUP

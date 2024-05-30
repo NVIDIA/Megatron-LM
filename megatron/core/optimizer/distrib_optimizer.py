@@ -1420,13 +1420,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 self._dispatch_gather_model_params(all_gather_handle_index, force_sync=force_sync)
 
     @torch.no_grad()
-    def step(self):
-        """
-        Step optimizer.
+    def step_with_ready_grads(self) -> bool:
+        """Step the optimizer with ready gradients, return successful.
         Under the hood, either launch synchronous param all-gathers or get ready to launch
         asynchorous all-gathers that get overlapped with the next forward pass.
         """
-        self.update_successful, grad_norm, num_zeros_in_grad = super().step()
+        self.update_successful = super().step_with_ready_grads()
 
         timers = self.config.timers
         if timers is not None:
@@ -1440,4 +1439,4 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if timers is not None:
             timers('params-all-gather').stop()
 
-        return self.update_successful, grad_norm, num_zeros_in_grad
+        return self.update_successful
