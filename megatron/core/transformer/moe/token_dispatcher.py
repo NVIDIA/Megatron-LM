@@ -107,7 +107,9 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
         # Permute the tokens across the expert parallel devices.
-        if self.config.sequence_parallel or (self.config.expert_model_parallel_size > 1):
+        if (self.config.tensor_model_parallel_size > 1) or (
+            self.config.expert_model_parallel_size > 1
+        ):
             with torch.no_grad():
                 global_indices = tensor_parallel.gather_from_sequence_parallel_region_to_moe(
                     max_ind
@@ -214,7 +216,9 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         output_bias_total = unpermuted_local_bias
 
         # Unpermute the tokens across expert parallel devices.
-        if self.config.sequence_parallel or (self.config.expert_model_parallel_size > 1):
+        if (self.config.tensor_model_parallel_size > 1) or (
+            self.config.expert_model_parallel_size > 1
+        ):
             assert (
                 self.global_local_map is not None
             ), "global_local_map is necessary for `AllGather`."
