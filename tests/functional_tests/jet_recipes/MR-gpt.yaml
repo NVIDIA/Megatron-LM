@@ -53,7 +53,7 @@ spec:
         CKPT_FORMAT={ckpt_format} \
         CHECKPOINT_RESUME_TEST={ckpt_resume} \
         ALLOW_NONDETERMINISTIC={allow_nondeterministic} \
-        JOB_NAME={key.split("/")[1]} \
+        JOB_NAME={name} \
         ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'}
 products:
   # MCore

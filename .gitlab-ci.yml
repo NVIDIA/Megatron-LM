@@ -20,11 +20,14 @@ stages:
   - test
   - jet
 
-variables: &VARS
+variables:
   SELENE_ADLR_CI_PATH: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron"
   DATA_DIR: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron/data"
   PYTHON_VIRTUAL_ENV: /lustre/fsw/adlr/adlr-nlp/adlr_ci/cienv/bin/activate
-  JET_CUSTOM_FILTER: ""
+  JET_CUSTOM_FILTER:
+    description: |
+      Selects what functional tests to run. For merge-request tests: "type == 'build' or 'merge-request' in spec.scope". For nightly tests: "type == 'build' or 'nightly' in spec.scope"
+    value: ""
   DISPLAY_OUTPUT: "True" # Set to true for new tests to copy the logs for creating golden truth file
   TIME_LIMIT: "10:00" # Default time limit for all jobs
   MOE_GROUPED_GEMM: 0 # Set to 1 to enable grouped gemm for MoE

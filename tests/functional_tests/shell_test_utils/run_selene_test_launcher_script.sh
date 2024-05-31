@@ -69,7 +69,7 @@ if [ $? -ne 0 ]; then echo "Slurm job did not complete. See ${SELENE_ADLR_CI_PAT
 # step 8 : DISPLAYING THE GROUND TRUTH INFO FOR DEBUGGING OR UPDATING GROUND TRUTH VALUES
 source $PYTHON_VIRTUAL_ENV
 if [[ "$DISPLAY_OUTPUT" == "True" ]]; then
-    python3 $BUILD_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $LOGS_DIR $RUN_NAME
+    PYTHONPATH=$BUILD_DIR python3 $BUILD_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $LOGS_DIR $RUN_NAME
 fi
 
 # step 9 : COMPARING THE GROUND TRUTH VALUES TO THE OBTAINED VALUES FROM THE JOB

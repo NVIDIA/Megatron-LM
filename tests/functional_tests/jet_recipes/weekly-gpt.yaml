@@ -50,7 +50,7 @@ spec:
         GBS={batch_size} \
         MOE_GROUPED_GEMM={moe_grouped_gemm} \
         ALLOW_NONDETERMINISTIC={"1" if allow_nondeterministic else "0"} \
-        JOB_NAME={key.split("/")[1]} \
+        JOB_NAME={name} \
         ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'}
 products:
   - {use_mcore: [True], precision: [bf16], tp_size: [1], pp_size: [1], allow_nondeterministic: [False], args_meta: ["bf16_baseline"]}
