@@ -679,7 +679,7 @@ class ColumnParallelLinear(torch.nn.Module):
         self.disable_grad_reduce = disable_grad_reduce
 
         self.explicit_expert_comm = self.is_expert and (
-            config.sequence_parallel or self.expert_parallel
+            config.tensor_model_parallel_size > 1 or self.expert_parallel
         )
         if self.explicit_expert_comm and config.moe_extended_tp:
             world_size = get_tensor_and_expert_parallel_world_size()
@@ -941,7 +941,7 @@ class RowParallelLinear(torch.nn.Module):
             raise RuntimeError("To enable `sequence_parallel`, `input_is_parallel` must be `True`")
 
         self.explicit_expert_comm = self.is_expert and (
-            config.sequence_parallel or self.expert_parallel
+            config.tensor_model_parallel_size > 1 or self.expert_parallel
         )
 
         # Divide the weight matrix along the last dimension.
