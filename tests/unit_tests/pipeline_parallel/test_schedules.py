@@ -17,6 +17,9 @@ def test_get_forward_backward_func():
     Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=4, virtual_pipeline_model_parallel_size=2)
     assert(schedule.get_forward_backward_func() == schedule.forward_backward_pipelining_with_interleaving)
     Utils.destroy_model_parallel()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=4)
+    assert(schedule.get_forward_backward_func() == schedule.forward_backward_pipelining_with_interleaving)
+    Utils.destroy_model_parallel()
 
 def test_deallocate_output_tensor():
     out = torch.tensor([[1, 2, 3], [4, 5, 6]])
