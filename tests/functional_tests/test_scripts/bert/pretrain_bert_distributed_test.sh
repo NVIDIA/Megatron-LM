@@ -96,6 +96,9 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        --${TRAINING_DTYPE}"
 
 if [[ "${TRAINING_DTYPE}" == "fp16" ]]; then
+    # Both NVTE_APPLY_QK_LAYER_SCALING and --apply-query-key-layer-scaling must be passed
+    # to enable feature and be backward compatible with TE<0.11
+    export NVTE_APPLY_QK_LAYER_SCALING=1
     torch_run_cmd+=" --apply-query-key-layer-scaling"
     # NVTE_APPLY_QK_LAYER_SCALING=1 is required if using:
     #  1. --apply-query-key-layer-scaling
@@ -117,7 +120,7 @@ echo "$command" > $SCRIPTS_DIR/pretrain_bert_distributed_command.sh
 eval $command
 
 echo "Saving test results to $TENSORBOARD_DIR"
-python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $TENSORBOARD_DIR "$JOB_NAME" | \
+PYTHONPATH=$PWD python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $TENSORBOARD_DIR "$JOB_NAME" | \
     tee ${TENSORBOARD_DIR}/results.json
 
 if [[ $SKIP_PYTEST != 1 ]]; then

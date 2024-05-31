@@ -137,7 +137,7 @@ echo "$command" > $SCRIPTS_DIR/pretrain_t5_distributed_command.sh
 eval $command
 
 echo "Saving test results to $TENSORBOARD_DIR"
-python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $TENSORBOARD_DIR "$JOB_NAME" | \
+PYTHONPATH=$PWD python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $TENSORBOARD_DIR "$JOB_NAME" | \
     tee ${TENSORBOARD_DIR}/results.json
 
 if [[ $SKIP_PYTEST != 1 ]]; then

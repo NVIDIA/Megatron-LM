@@ -46,7 +46,7 @@ spec:
         MBS={micro_batch_size} \
         GBS={batch_size} \
         CHECKPOINT_RESUME_TEST={ckpt_resume} \
-        JOB_NAME={key.split("/")[1]} \
+        JOB_NAME={name} \
         ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'}
 products:
   - {tp_size: [1,2], pp_size: [1], vp_size: [1] }
