@@ -15,11 +15,13 @@ import types
 
 
 def add_arguments(parser):
-    group = parser.add_argument_group(title='Llama-2 HF loader.')
+    group = parser.add_argument_group(title='Llama/Mistral loader.')
 
+    # TODO(jbarker): Need assertion to make sure *exactly* one of these is used
     parser.add_argument('--model-size', type=str, required=True,
-                        help='Model size can be `7B`, `13B`, and `70B` (for pretrained models), and `7Bf`, `13Bf`, '
-                             'and `70Bf` (for chat-finetuned models).')
+                        choices=['llama2-7B', 'llama2-13B', 'llama2-70B', 'llama2-7Bf', 'llama2-13Bf', 'llama2-70Bf', 'llama3-8B', 'llama3-70B', 'llama3-8Bf', 'llama3-70Bf', 'mistral-7B', 'mistral-7Bf'],
+                        help='Model size can be `llama2-7B`, `llama2-13B`, `llama2-70B`, `llama3-8B`, `llama3-70B`, `mistral-7B` (for pretrained models), '
+                        'and `llama2-7Bf`, `llama2-13Bf`, `llama2-70Bf`, `llama3-8Bf`, `llama3-70bf` and `mistral-7Bf` (for chat-finetuned models).')
     parser.add_argument('--checkpoint-type', type=str, required=True,
                         help='Type of checkpoint to convert, options are "meta" or "hf"')
     parser.add_argument('--bf16', action='store_true', help='Whether to load weights in bf16.')
@@ -30,7 +32,7 @@ def add_arguments(parser):
                        help='Path to the vocab file. If specified will use this to get vocab size and '
                        'trim padding from the embedding table.')
     group.add_argument('--tokenizer-model', required=True,
-                       help='Sentencepiece tokenizer model.')
+                       help='Tokenizer model file.')
     group.add_argument('--megatron-path', type=str, default=None,
                        help='Base directory of Megatron repository')
     group.add_argument('--loader-transformer-impl', default='local',
@@ -44,15 +46,18 @@ def verify_transformers_version():
 
 
 NUM_SHARDS = {
-    "7B": 1,
-    "7Bf": 1,
-    "13B": 2,
-    "13Bf": 2,
-    "34B": 4,
-    "30B": 4,
-    "65B": 8,
-    "70B": 8,
-    "70Bf": 8,
+    "llama2-7B": 1,
+    "llama2-7Bf": 1,
+    "llama2-13B": 2,
+    "llama2-13Bf": 2,
+    "llama2-70B": 8,
+    "llama2-70Bf": 8,
+    "llama3-8B": 1,
+    "llama3-8Bf": 1,
+    "llama3-70B": 8,
+    "llama3-70Bf": 8,
+    "mistral-7B": 1,
+    "mistral-7Bf": 1,
 }
 
 
@@ -74,7 +79,18 @@ def write_json(text, path):
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/convert_llama_weights_to_hf.py
 def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
 
-    from transformers import LlamaConfig, LlamaForCausalLM, LlamaTokenizer, LlamaTokenizerFast
+    if "llama2" in model_size:
+        from transformers import LlamaConfig as ModelConfig
+        from transformers import  LlamaTokenizer, LlamaTokenizerFast
+    elif "llama3" in model_size:
+        from transformers import LlamaConfig as ModelConfig
+    elif "mistral" in model_size:
+        from transformers import MistralConfig as ModelConfig
+        try:
+            from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+        except ImportError:
+            raise ImportError("Module 'mistral-common' is required but not installed.")
+
 
     # for backward compatibility, before you needed the repo to be called `my_repo/model_size`
     if not os.path.isfile(os.path.join(input_base_path, "params.json")):
@@ -93,15 +109,33 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
     base = params.get("rope_theta", 10000.0)
     inv_freq = 1.0 / (base ** (torch.arange(0, dims_per_head, 2).float() / dims_per_head))
     if base > 10000.0:
-        max_position_embeddings = 16384
+        max_position_embeddings = 32768 if "mistral" in model_size else 16384
     else:
-        max_position_embeddings = 2048
+        max_position_embeddings = 4096 if "mistral" in model_size else 2048
 
-    tokenizer_class = LlamaTokenizer if LlamaTokenizerFast is None else LlamaTokenizerFast
+    if "llama2" in model_size:
+        tokenizer_class = LlamaTokenizer if LlamaTokenizerFast is None else LlamaTokenizerFast
+    elif "llama3" in model_size:
+        try:
+            from llama.tokenizer import Tokenizer as Llama3Tokenizer
+        except ImportError:
+            raise AssertionError("Module 'llama' is required but not installed.")
+        tokenizer_class = Llama3Tokenizer
+    elif "mistral" in model_size:
+        tokenizer_class = MistralTokenizer
+    else:
+        raise AttributeError(f"model_size={model_size} not supported")
     if tokenizer_path is not None:
-        tokenizer = tokenizer_class(tokenizer_path)
-        tokenizer.save_pretrained(model_path)
-    vocab_size = tokenizer.vocab_size if tokenizer_path is not None else 32000
+        if "llama" in model_size:
+            tokenizer = tokenizer_class(tokenizer_path)
+            if "llama2" in model_size:
+                tokenizer.save_pretrained(model_path)
+            vocab_size = tokenizer.vocab_size if tokenizer_path is not None else 32000
+        elif "mistral" in model_size:
+            tokenizer = tokenizer_class.from_file(tokenizer_path)
+            vocab_size = 32768
+        else:
+            raise AttributeError(f"model_size={model_size} is not supported")
 
     if params.get("n_kv_heads", None) is not None:
         num_key_value_heads = params["n_kv_heads"]  # for GQA / MQA
@@ -134,13 +168,14 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
         filename = f"pytorch_model-{layer_i + 1}-of-{n_layers + 1}.bin"
         if num_shards == 1:
             # Unsharded
+            q_proj = loaded[f"layers.{layer_i}.attention.wq.weight"]
+            k_proj = loaded[f"layers.{layer_i}.attention.wk.weight"]
+            if ("llama2" in model_size) or ("mistral" in model_size):
+                q_proj = permute(q_proj)
+                k_proj = permute(k_proj)
             state_dict = {
-                f"model.layers.{layer_i}.self_attn.q_proj.weight": permute(
-                    loaded[f"layers.{layer_i}.attention.wq.weight"]
-                ),
-                f"model.layers.{layer_i}.self_attn.k_proj.weight": permute(
-                    loaded[f"layers.{layer_i}.attention.wk.weight"]
-                ),
+                f"model.layers.{layer_i}.self_attn.q_proj.weight": q_proj,
+                f"model.layers.{layer_i}.self_attn.k_proj.weight": k_proj,
                 f"model.layers.{layer_i}.self_attn.v_proj.weight": loaded[f"layers.{layer_i}.attention.wv.weight"],
                 f"model.layers.{layer_i}.self_attn.o_proj.weight": loaded[f"layers.{layer_i}.attention.wo.weight"],
                 f"model.layers.{layer_i}.mlp.gate_proj.weight": loaded[f"layers.{layer_i}.feed_forward.w1.weight"],
@@ -224,10 +259,11 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
             "lm_head.weight": loaded["output.weight"],
         }
     else:
+        d = 0 if "llama3" in model_size else 1
         state_dict = {
             "model.norm.weight": loaded[0]["norm.weight"],
             "model.embed_tokens.weight": torch.cat(
-                [loaded[i]["tok_embeddings.weight"] for i in range(num_shards)], dim=1
+                [loaded[i]["tok_embeddings.weight"] for i in range(num_shards)], dim=d
             ),
             "lm_head.weight": torch.cat([loaded[i]["output.weight"] for i in range(num_shards)], dim=0),
         }
@@ -242,7 +278,7 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
     write_json(index_dict, os.path.join(model_path, "pytorch_model.bin.index.json"))
     ffn_dim_multiplier = params["ffn_dim_multiplier"] if "ffn_dim_multiplier" in params else 1
     multiple_of = params["multiple_of"] if "multiple_of" in params else 256
-    config = LlamaConfig(
+    config = ModelConfig(
         hidden_size=dim,
         intermediate_size=compute_intermediate_size(dim, ffn_dim_multiplier, multiple_of),
         num_attention_heads=params["n_heads"],
@@ -266,33 +302,31 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
 def load_args_from_checkpoint(args):
 
     # Read Llama args.
-    llama_args_path = os.path.join(args.load, "config.json")
-    with open(llama_args_path) as f:
-        llama_args = json.load(f)
+    model_args_path = os.path.join(args.load, "config.json")
+    with open(model_args_path) as f:
+        model_args = json.load(f)
     # Update Megatron args.
     args.seq_length = 4096
-    args.max_position_embeddings = 4096
-    args.hidden_size = llama_args["hidden_size"]
-    args.num_attention_heads = llama_args["num_attention_heads"]
-    args.num_layers = llama_args["num_hidden_layers"]
+    args.max_position_embeddings = model_args["max_position_embeddings"]
+    args.hidden_size = model_args["hidden_size"]
+    args.num_attention_heads = model_args["num_attention_heads"]
+    args.num_layers = model_args["num_hidden_layers"]
     args.global_batch_size = 1024
-    args.norm_epsilon = llama_args["rms_norm_eps"]
+    args.norm_epsilon = model_args["rms_norm_eps"]
     args.iteration = 1 # '0', 'release' don't work
     args.add_position_embedding = False
     args.use_rotary_position_embeddings = True
     args.swiglu = True
-    args.tokenizer_type = "Llama2Tokenizer"
     args.normalization = "RMSNorm"
     args.add_bias_linear = False
     args.untie_embeddings_and_output_weights = True
-    args.vocab_size = llama_args["vocab_size"]
-    args.padded_vocab_size = llama_args["vocab_size"]
-    args.llama = llama_args
-    args.ffn_hidden_size = llama_args["intermediate_size"]
+    args.vocab_size = model_args["vocab_size"]
+    args.padded_vocab_size = model_args["vocab_size"]
+    args.ffn_hidden_size = model_args["intermediate_size"]
 
-    if "num_key_value_heads" in llama_args:
+    if "num_key_value_heads" in model_args:
         args.group_query_attention = True
-        args.num_query_groups = llama_args["num_key_value_heads"]
+        args.num_query_groups = model_args["num_key_value_heads"]
 
 
 def set_preprocess_state(args, model, hf_model):
@@ -323,7 +357,7 @@ def set_attn_state(args, layer, hf_layer):
     assert nh % ng == 0
 
     # Copy weights (re-order dimensions for Megatron).
-    attn.query_key_value.weight.data.copy_(torch.cat([ 
+    attn.query_key_value.weight.data.copy_(torch.cat([
         hf_attn.q_proj.weight.reshape((ng, dim*nh//ng, -1)),
         hf_attn.k_proj.weight.reshape((ng, dim, -1)),
         hf_attn.v_proj.weight.reshape((ng, dim, -1)),
@@ -360,10 +394,15 @@ def load_checkpoint_to_model(args):
     '''Set model params.'''
 
     from pretrain_gpt import model_provider
-    from transformers import LlamaForCausalLM
+    if "llama" in args.model_size:
+        from transformers import LlamaForCausalLM as ModelForCausalLM
+    elif "mistral" in args.model_size:
+        from transformers import MistralForCausalLM as ModelForCausalLM
+    else:
+        raise AttributeError(f"args.model_size={args.model_size} not supported")
 
     # Load Huggingface model.
-    hf_model = LlamaForCausalLM.from_pretrained(args.load, torch_dtype=args.params_dtype, low_cpu_mem_usage=True, device_map="cpu")
+    hf_model = ModelForCausalLM.from_pretrained(args.load, torch_dtype=args.params_dtype, low_cpu_mem_usage=True, device_map="cpu")
 
     # Init Megatron model.
     model = model_provider(True, True).to(args.params_dtype)
@@ -379,7 +418,6 @@ def load_checkpoint_to_model(args):
 
 def _load_checkpoint(queue, args):
 
-    # Llama-2 requires HF transformers >=4.31.0.
     verify_transformers_version()
 
     # Search in directory above this.
@@ -427,6 +465,13 @@ def _load_checkpoint(queue, args):
     margs.tokenizer_model = args.tokenizer_model
     load_args_from_checkpoint(margs)
 
+    if "llama2" in args.model_size:
+        margs.tokenizer_type = "Llama2Tokenizer"
+    elif "llama3" in args.model_size:
+        margs.tokenizer_type = "Llama3Tokenizer"
+    elif "mistral" in args.model_size:
+        margs.tokenizer_type = "MistralTokenizer"
+
     # Arguments do sanity checks on the world size, but we don't care,
     # so trick it into thinking we are plenty of processes.
     margs.world_size = margs.tensor_model_parallel_size * margs.pipeline_model_parallel_size
@@ -454,7 +499,6 @@ def _load_checkpoint(queue, args):
     check_for_arg('num_attention_heads')
     check_for_arg('max_position_embeddings')
     check_for_arg('position_embedding_type')
-    check_for_arg('tokenizer_type')
     check_for_arg('iteration')
     check_for_arg('bert_binary_head')
     check_for_arg('disable_bias_linear', False)
@@ -462,7 +506,7 @@ def _load_checkpoint(queue, args):
     check_for_arg('swiglu', False)
 
     # Determine how to make our models.
-    assert args.model_type == 'GPT', 'Llama-2 is a GPT model.'
+    assert args.model_type == 'GPT', 'Llama-2, Llama-3 and Mistral are GPT models.'
     margs.model_type = ModelType.encoder_or_decoder
     margs.params_dtype = torch.bfloat16 if args.bf16 else torch.float16 if args.fp16 else torch.float32
 
@@ -501,11 +545,23 @@ def _load_checkpoint(queue, args):
     md.swiglu = margs.swiglu
     md.previous_tensor_parallel_size = margs.tensor_model_parallel_size
     md.previous_pipeline_parallel_size = margs.pipeline_model_parallel_size
-    md.true_vocab_size = None # skips padding in saver
     md.make_vocab_size_divisible_by = None
     md.checkpoint_args = margs
     md.consumed_train_samples = 0
     md.consumed_valid_samples = 0
+
+    margs.model_size = args.model_size
+
+    # Get true (non-padded) vocab size
+    if margs.tokenizer_model is not None and "llama3" in args.model_size:
+        try:
+            from llama.tokenizer import Tokenizer as Llama3Tokenizer
+        except ImportError:
+            raise AssertionError("Module 'llama' is required but not installed.")
+        tokenizer = Llama3Tokenizer(margs.tokenizer_model)
+        md.true_vocab_size = tokenizer.vocab_size
+    else:
+        md.true_vocab_size = None
 
     # Get first pipe stage.
     mpu.set_tensor_model_parallel_rank(0)
