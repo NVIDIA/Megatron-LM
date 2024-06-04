@@ -728,9 +728,6 @@ class MockGPTDataset(GPTDataset):
     ) -> None:
         assert config.mock
 
-        if num_samples is None:
-            num_samples = len(indices)
-
         super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
 
     @staticmethod
@@ -760,27 +757,3 @@ class MockGPTDataset(GPTDataset):
             MockGPTLowLevelDataset: The underlying MockGPTLowLevelDataset
         """
         return MockGPTLowLevelDataset(config.tokenizer)
-
-    def __len__(self) -> int:
-        """Abstract method implementation
-
-        Returns:
-            int: The length of the dataset
-        """
-        return self.num_samples
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Abstract method implementation
-
-        Args:
-            idx (int): The integer seed for mock data generation
-
-        Returns:
-            Dict[str, numpy.ndarray]: The mock sample information wrapped in a dictionary
-        """
-        if idx is not None and idx >= self.num_samples:
-            raise IndexError(
-                f"The index {idx} exceeds the available number of samples ({self.num_samples})"
-            )
-
-        return super().__getitem__(idx)
