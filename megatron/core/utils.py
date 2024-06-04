@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import reduce
 from types import TracebackType
-from typing import List, Optional, Tuple, Type, Union
+from typing import Any, List, Optional, Tuple, Type, Union
 
 import torch
 
@@ -196,6 +196,44 @@ def scaled_init_method_normal(sigma, num_layers):
         return torch.nn.init.normal_(tensor, mean=0.0, std=std)
 
     return init_
+
+
+def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs: Any):
+    """If torch distributed is initialized, log only on rank
+
+    Args:
+        logger (logging.Logger): The logger to write the logs
+
+        args (Tuple[Any]): All logging.Logger.log positional arguments
+
+        rank (int, optional): The rank to write on. Defaults to 0.
+
+        kwargs (Dict[str, Any]): All logging.Logger.log keyword arguments
+    """
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == rank:
+            logger.log(*args, **kwargs)
+    else:
+        logger.log(*args, **kwargs)
+
+
+def log_on_each_pipeline_stage(logger: logging.Logger, *args: Any, **kwargs: Any):
+    """Log on first rank in each pipeline stage
+
+    Args:
+        logger (logging.Logger): The logger to write the logs
+
+        args (Tuple[Any]): All logging.Logger.log positional arguments
+
+        kwargs (Dict[str, Any]): All logging.Logger.log keyword arguments
+    """
+    assert torch.distributed.is_initialized()
+
+    if (
+        parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0
+        and parallel_state.get_tensor_model_parallel_rank() == 0
+    ):
+        logger.log(*args, **kwargs)
 
 
 def check_param_hashes_across_dp_replicas(model: List[torch.nn.Module]) -> bool:

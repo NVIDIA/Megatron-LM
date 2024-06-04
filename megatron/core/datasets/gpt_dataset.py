@@ -13,7 +13,8 @@ from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatr
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
-from megatron.core.datasets.utils import Split, log_single_rank
+from megatron.core.datasets.utils import Split
+from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
 

@@ -1,17 +1,17 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 import math
 import os
 from enum import Enum
-from logging import getLogger
 from typing import Dict, List, Optional
 
 import torch
 
-from .. import parallel_state
+from ..utils import log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 
-logger = getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class BufferType(Enum):
@@ -117,8 +117,16 @@ class Bucket:
                 f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
             )
 
+        # gradient_scaling_factor already takes into account whether we are computing
+        # an average or sum in the data-parallel collective.
         if self.gradient_scaling_factor != 1.0:
             self.grad_data *= self.gradient_scaling_factor
+
+        # Decide reduce_op.
+        reduce_op = torch.distributed.ReduceOp.SUM
+        if self.ddp_config.average_in_collective:
+            reduce_op = torch.distributed.ReduceOp.AVG
+
         # Use async_op only when overlap_grad_reduce is True.
         if self.ddp_config.use_distributed_optimizer:
             local_data_view = shard_buffer(self.grad_data, self.data_parallel_world_size)[
@@ -127,12 +135,14 @@ class Bucket:
             self.communication_handle = torch.distributed._reduce_scatter_base(
                 local_data_view,
                 self.grad_data,
+                op=reduce_op,
                 group=self.data_parallel_group,
                 async_op=self.ddp_config.overlap_grad_reduce,
             )
         else:
             self.communication_handle = torch.distributed.all_reduce(
                 self.grad_data,
+                op=reduce_op,
                 group=self.data_parallel_group,
                 async_op=self.ddp_config.overlap_grad_reduce,
             )
@@ -400,20 +410,18 @@ class ParamAndGradBuffer:
             )
 
         # Log buckets for all PP stages.
-        if (
-            parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0
-            and parallel_state.get_tensor_model_parallel_rank() == 0
-        ):
-            logger.info(
-                f'Number of buckets for gradient all-reduce / reduce-scatter: {len(self.buckets)}'
-            )
-            for index, bucket in enumerate(self.buckets):
-                numel = 0
-                for param in bucket.params:
-                    numel += param.data.nelement()
-                logger.info(f'Params for bucket {index+1} ({numel} elements):')
-                for param in bucket.params:
-                    logger.info(f'    {param_to_name[param]}')
+        log_strs = []
+        log_strs.append(
+            f'Number of buckets for gradient all-reduce / reduce-scatter: {len(self.buckets)}'
+        )
+        for index, bucket in enumerate(self.buckets):
+            numel = 0
+            for param in bucket.params:
+                numel += param.data.nelement()
+            log_strs.append(f'Params for bucket {index+1} ({numel} elements):')
+            for param in bucket.params:
+                log_strs.append(f'\t{param_to_name[param]}')
+        log_on_each_pipeline_stage(logger, logging.INFO, '\n'.join(log_strs))
 
     def scale_gradients(self, scaling_factor: float) -> None:
         """Scale the gradient data by `scaling_factor`."""

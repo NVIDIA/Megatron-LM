@@ -19,7 +19,7 @@ from typing import List, Optional, Tuple, Type, Union
 import numpy
 import torch
 
-from megatron.core.datasets.utils import log_single_rank
+from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
 
