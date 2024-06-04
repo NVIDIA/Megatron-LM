@@ -1,5 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from logging import getLogger
+import logging
 from typing import Callable, Dict, List, Optional
 
 import torch
@@ -10,6 +10,7 @@ from megatron.core import mpu
 
 from ..distributed import ParamAndGradBuffer
 from ..transformer.module import MegatronModule
+from ..utils import log_single_rank
 from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import (
@@ -20,7 +21,7 @@ from .optimizer import (
 )
 from .optimizer_config import OptimizerConfig
 
-logger = getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
 def _get_param_groups(
@@ -277,8 +278,7 @@ def get_megatron_optimizer(
         Instance of MegatronOptimizer.
     """
 
-    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        logger.info(f'Setting up optimizer with config {config}')
+    log_single_rank(logger, logging.INFO, f'Setting up optimizer with config {config}')
 
     # Collect param groups.
     param_groups = _get_param_groups(

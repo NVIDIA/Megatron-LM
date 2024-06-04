@@ -15,8 +15,8 @@ class DistributedDataParallelConfig:
     """If true, overlap grad all-reduce / reduce-scatter with backward compute."""
 
     use_distributed_optimizer: bool = False
-    """If true, issue reduce-scatter collectives to aggregate gradients and clean up originally
-       allocated model parameters, otherwise issue all-reduce collectives.
+    """If true, issue reduce-scatter collectives to aggregate gradients and clean up
+       originally allocated model parameters, otherwise issue all-reduce collectives.
     """
 
     check_for_nan_in_grad: bool = False
@@ -24,5 +24,9 @@ class DistributedDataParallelConfig:
 
     bucket_size: Optional[int] = None
     """Maximum number of parameters in each bucket. If unspecified, MCore uses a default
-    value of max(40000000, 1000000 * dp_size) parameters (larger DP sizes need larger buckets
-    to ensure collectives do not become latency-bound)."""
+       value of max(40000000, 1000000 * dp_size) parameters (larger DP sizes need larger
+       buckets to ensure collectives do not become latency-bound)."""
+
+    average_in_collective: bool = False
+    """If true, compute average in collective directly, as opposed to dividing by the
+       dp_size first and then computing sum in the collective."""

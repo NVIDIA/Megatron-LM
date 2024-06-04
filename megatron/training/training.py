@@ -421,12 +421,11 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             overlap_grad_reduce=args.overlap_grad_reduce,
             use_distributed_optimizer=args.use_distributed_optimizer,
             check_for_nan_in_grad=args.check_for_nan_in_loss_and_grad,
-            bucket_size=args.ddp_bucket_size)
+            bucket_size=args.ddp_bucket_size,
+            average_in_collective=args.ddp_average_in_collective)
         model = [DDP(config,
                      ddp_config,
                      model_chunk,
-                     data_parallel_group=mpu.get_data_parallel_group(with_context_parallel=True),
-                     expert_data_parallel_group=mpu.get_data_modulo_expert_parallel_group(),
                      # Turn off bucketing for model_chunk 2 onwards, since communication for these
                      # model chunks is overlapped with compute anyway.
                      disable_bucketing=(model_chunk_idx > 0))

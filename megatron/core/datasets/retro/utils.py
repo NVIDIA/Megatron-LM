@@ -19,7 +19,7 @@ from megatron.core.datasets.retro.query.multi_split_gpt_dataset import (
     MultiSplitGPTDataset,
     MultiSplitGPTDatasetConfig,
 )
-from megatron.core.datasets.utils import log_single_rank
+from megatron.core.utils import log_single_rank
 
 from .external_libs import h5py
 

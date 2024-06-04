@@ -60,6 +60,7 @@ products:
   - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1]}
   - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], extra_args: ["--no-create-attention-mask-in-dataloader"], args_meta: ["no_create_attention_mask_in_dataloader"]}
   - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], extra_args: ["--no-mmap-bin-files"], args_meta: ["no_mmap_bin_files"]}
+  - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], extra_args: ["--ddp-average-in-collective"], args_meta: ["ddp_average_in_collective"]}
   - {tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1]}
   - {tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1], extra_args: ["--calculate-per-token-loss"], args_meta: ["calculate_per_token_loss"]}
   - {tp_size: [4], pp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--qk-layernorm --test-mode"'], args_meta: ["qk_layernorm_test_mode"]}
