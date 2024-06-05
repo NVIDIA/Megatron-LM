@@ -16,12 +16,12 @@ from tqdm import tqdm
 
 # [ModelOpt]: changing the default model provider to the ModelOpt version
 from megatron.core import mpu
-from megatron.core.dist_checkpointing import load
 from megatron.inference.arguments import add_modelopt_args
+from megatron.inference.checkpointing import load_modelopt_checkpoint
 from megatron.inference.gpt.model_provider import model_provider
 from megatron.inference.text_generation import generate_and_post_process
 from megatron.training import get_args, get_model, initialize_megatron
-from megatron.training.checkpointing import load_checkpoint, save_checkpoint
+from megatron.training.checkpointing import save_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
 
 QUANT_CFG_CHOICES = {
@@ -103,53 +103,6 @@ def get_calib_dataloader(
         yield batch
 
 
-def modelopt_load_checkpoint(
-    model, optimizer=None, opt_param_scheduler=None, strict=True, additional_sharded_prefix="model."
-):
-    """Load a megatron checkpoint depending its format.
-
-    Args:
-        model: MCoreGPTModel instance
-        optimizer: Megatron optimizer instance
-        opt_param_scheduler: Megatron scheduler instance
-        strict: if True, no extra or missing keys are allowed while loading the state_dict
-        additional_sharded_prefix (str): Append additional prefix to align the sharded checkpoint keys. When loading
-        an .nemo sharded checkpoint, this is usually `model.`. Otherwise, this is typically an empty string.
-    """
-
-    def _remove_prefix_state_dict_pre_hook(
-        state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs,
-    ):
-        """Pytorch _load_state_dict_pre_hook to remap the state_dict with the additional sharded prefix."""
-        if additional_sharded_prefix is None:
-            return
-        key_rewrite_list = []
-        for key, _ in state_dict.items():
-            if key.startswith(additional_sharded_prefix):
-                key_rewrite_list.append(key)
-        for old_key in key_rewrite_list:
-            new_key = old_key[len(additional_sharded_prefix) :]
-            state_dict[new_key] = state_dict.pop(old_key)
-
-    args = get_args()
-    load_dir = args.load
-
-    shared_model_state_dir = "model_weights"
-    sharded_load_dir = Path(load_dir + "/" + shared_model_state_dir)
-
-    if sharded_load_dir.exists() and optimizer is None and opt_param_scheduler is None:
-        unwrapped_model = unwrap_model(model)
-        shareded_state_dict = unwrapped_model[0].sharded_state_dict(
-            prefix=additional_sharded_prefix
-        )
-        if additional_sharded_prefix:
-            unwrapped_model[0]._register_load_state_dict_pre_hook(
-                _remove_prefix_state_dict_pre_hook
-            )
-        unwrapped_model[0].load_state_dict(load(shareded_state_dict, sharded_load_dir))
-    else:
-        _ = load_checkpoint(model, optimizer, opt_param_scheduler, strict=strict)
-
 
 if __name__ == "__main__":
     initialize_megatron(
@@ -175,7 +128,7 @@ if __name__ == "__main__":
     model = get_model(text_generation_model_provider, wrap_with_ddp=False)
 
     if args.load is not None:
-        modelopt_load_checkpoint(model)
+        load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
 
     # Removing virtual pipeline parallel and other wrapper

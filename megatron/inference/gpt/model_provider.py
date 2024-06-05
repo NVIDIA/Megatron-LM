@@ -2,6 +2,8 @@
 
 """ModelOpt GPT model provider."""
 
+import modelopt.torch.opt as mto
+
 from megatron.core.inference.gpt.model_specs import get_gpt_layer_modelopt_spec
 from megatron.core.inference.gpt.state_dict_hooks import (
     mcore_gpt_load_legacy_state_dict_pre_hook,
@@ -10,6 +12,7 @@ from megatron.core.inference.gpt.state_dict_hooks import (
 from megatron.core.models.gpt import GPTModel as MCoreGPTModel
 from megatron.core.parallel_state import get_tensor_model_parallel_rank
 from megatron.core.transformer.spec_utils import import_module
+from megatron.inference.checkpointing import load_modelopt_state
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 
@@ -33,7 +36,7 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
     print_rank_0("building GPT model ...")
 
     # ModelOpt by default assumes none homogenous layers. This affect the storage format of the sharded checkpoint.
-    config = core_transformer_config_from_args(get_args())
+    config = core_transformer_config_from_args(args)
     config.non_homogeneous_layers = True
 
     if args.use_mcore_models:
@@ -64,6 +67,11 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
         )
 
     model = model_type(**model_kwargs)
+
+    # Load modelopt_state
+    modelopt_state = load_modelopt_state() if args.load else {}
+    if modelopt_state:
+        model = mto.restore_from_modelopt_state(model, modelopt_state)
 
     # Register some load_state_dict prehooks to handle some known state_dict key mismatch.
     # (legacy <-> modelopt) and (default te <-> modelopt)
