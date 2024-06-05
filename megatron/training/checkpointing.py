@@ -21,6 +21,18 @@ from .utils import unwrap_model, print_rank_0, append_to_progress_log
 from ..core.dist_checkpointing.serialization import \
     get_default_save_sharded_strategy
 
+# [ModelOpt]: Import
+try:
+    from modelopt.torch.opt.plugins import (
+        save_modelopt_state,
+        save_sharded_modelopt_state,
+        restore_modelopt_state,
+        restore_sharded_modelopt_state,
+    )
+    has_nvidia_modelopt = True
+except Exception:
+    has_nvidia_modelopt = False
+
 _CHECKPOINT_VERSION = None
 
 
@@ -338,7 +350,15 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
                 checkpointing_context['save_strategy'] = save_strategy
             async_save_request = dist_checkpointing.save(state_dict, checkpoint_name, save_strategy,
                                                          async_sharded_save=args.async_save)
+
+            # [ModelOpt]: save sharded modelopt_state
+            if has_nvidia_modelopt:
+                save_sharded_modelopt_state(model, checkpoint_name, (args.dist_ckpt_format, 1))
         else:
+            # [ModelOpt]: Inject modelopt_state into state_dict
+            if has_nvidia_modelopt:
+                save_modelopt_state(model, state_dict)
+
             # Save.
             ensure_directory_exists(checkpoint_name)
             torch.save(state_dict, checkpoint_name)
@@ -718,8 +738,13 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 optim_sd_kwargs['sharding_type'] = ('fully_sharded_bucket_space'
                                                     if getattr(state_dict['args'], 'ckpt_fully_parallel_save', False)
                                                     else 'dp_zero_gather_scatter')
-            load_kwargs['sharded_state_dict'] = generate_state_dict(args, model, optimizer, opt_param_scheduler,
-                                                                    rng_state, args.use_dist_ckpt, optim_sd_kwargs=optim_sd_kwargs)
+            # [ModelOpt]: remedy for finetune
+            if args.finetune or args.no_load_optim:
+                load_kwargs['sharded_state_dict'] = generate_state_dict(args, model, None, None,
+                                                                        rng_state, args.use_dist_ckpt, optim_sd_kwargs=optim_sd_kwargs)
+            else:
+                load_kwargs['sharded_state_dict'] = generate_state_dict(args, model, optimizer, opt_param_scheduler,
+                                                                        rng_state, args.use_dist_ckpt, optim_sd_kwargs=optim_sd_kwargs)
             load_kwargs['exit_on_missing_checkpoint'] = args.exit_on_missing_checkpoint
 
     state_dict, checkpoint_name, release = _load_base_checkpoint(load_dir, rank0=False, **load_kwargs)
@@ -760,6 +785,13 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                                               'consumed_valid_samples', 0)
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
+    
+    # [ModelOpt]: loading modelopt_state (sharded or not)
+    if has_nvidia_modelopt:
+        if args.use_dist_ckpt:
+            restore_sharded_modelopt_state(model, checkpoint_name)
+        else:
+            restore_modelopt_state(model, state_dict)
 
     # Model.
     strict = False if args.retro_add_retriever else strict
