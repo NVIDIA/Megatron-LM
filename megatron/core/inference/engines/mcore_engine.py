@@ -49,7 +49,6 @@ class MCoreEngine(AbstractEngine):
             torch.random.manual_seed(self.random_seed)
 
         for prompt in prompts:
-            # TODO : Should we move prompt tokens to cuda device here ?
             prompt_tokens = self.text_generation_controller.tokenize_prompt(prompt)
             self.scheduler.add_request(
                 prompt=prompt,
@@ -77,6 +76,7 @@ class MCoreEngine(AbstractEngine):
             ] = self.text_generation_controller.generate_all_output_tokens_static_batch(
                 active_requests
             )
+
             self.scheduler.update_requests_pools(result_dict=result_dict)
 
         # TODO: Later for dynamic batching we will do something like this

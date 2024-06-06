@@ -23,8 +23,6 @@ def broadcast_from_last_pipeline_stage(size, dtype, tensor=None):
     torch.distributed.broadcast(tensor, src, group)
     return tensor
 
-
-# TODO: Can use utilites from mcore itself I think
 def recv_from_prev_pipeline_rank_(recv_buffer=None):
     """Receive from previous pipeline stage and update the
     input buffer inplace."""
@@ -37,8 +35,6 @@ def recv_from_prev_pipeline_rank_(recv_buffer=None):
     # To protect against race condition when using batch_isend_irecv().
     torch.cuda.synchronize()
 
-
-# TODO: Can use utilites from mcore itself I think
 def send_to_next_pipeline_rank(tensor=None):
     """Send output to the next pipeline stage."""
     send_next_op = torch.distributed.P2POp(

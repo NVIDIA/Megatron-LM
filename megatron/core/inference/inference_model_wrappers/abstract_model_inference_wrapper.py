@@ -116,7 +116,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         logits = None
         if parallel_state.is_pipeline_last_stage():
             logits = output_tensor
-        
+
         return logits
 
     def forward_pass_with_pipeline_parallel_large_input_batch(

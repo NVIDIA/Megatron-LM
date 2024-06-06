@@ -2,6 +2,8 @@
 from collections import OrderedDict
 from typing import Dict
 import torch
+import random
+import string 
 from argparse import Namespace
 from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.inference_model_wrappers.gpt.gpt_inference_wrapper import GPTInferenceWrapper
@@ -48,8 +50,6 @@ class TestTextGenerationController:
 
         self.text_generation_controller = SimpleTextGenerationController(inference_wrapped_model=inference_wrapped_model, tokenizer=self.mock_tokenizer)
 
-
-    """
     def test_sample_from_logits(self):
         with pytest.raises(AssertionError) as aerror:
             self.text_generation_controller.sample_from_logits(last_token_logits=None, common_inference_params=CommonInferenceParams(top_k=2, top_p=0.4), vocab_size=self.vocab_size )
@@ -82,10 +82,11 @@ class TestTextGenerationController:
         expected_min_value = l[l.div_(temperature).softmax(dim=-1).cumsum(dim=-1) > top_p][0].item()
         sampled_logits = self.text_generation_controller.sample_from_logits(last_token_logits, CommonInferenceParams(top_p=top_p, temperature=temperature, top_k=0), self.vocab_size)
         assert torch.all(sampled_logits >= expected_min_value), f"The sampled logits should all be greater than {expected_min_value} but its {sampled_logits}"
-    """ 
+ 
     def test_generate_all_output_tokens_static_batch(self):
         self.mock_tokenizer.vocab_size = self.vocab_size
         self.mock_tokenizer.eod = self.vocab_size - 1
+        self.mock_tokenizer.detokenize.return_value = ''.join(random.choices(string.ascii_letters, k=random.randint(4,10)))
 
         active_requests: Dict[int, InferenceRequest] = OrderedDict()
         for i in range(self.batch_size):
@@ -106,6 +107,7 @@ class TestTextGenerationController:
         for request_id, request in requests.items():
             assert request.status == Status.COMPLETED, f"Status should be completed but its {request.status}"
             assert request.generated_length > 0 , f"Generated length should be greater than zero"
+            assert request.generated_text is not None, "Generated text should not be None"
 
 
         

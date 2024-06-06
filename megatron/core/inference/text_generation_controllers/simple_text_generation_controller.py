@@ -258,7 +258,7 @@ class SimpleTextGenerationController:
             context_start_position = 0
             # Pick the context window that we need to pass through the network.
             for context_end_position in range(min_prompt_length_in_batch, max_sequence_length):
-                
+
                 inference_input = self.inference_wrapped_model.get_batch_for_context_window(
                     context_start_position, context_end_position
                 )
@@ -280,7 +280,7 @@ class SimpleTextGenerationController:
                 sampled_logits = self.sample_from_logits(
                     last_token_logits, common_inference_params, self.tokenizer.vocab_size
                 )
-                
+
                 # Substitute the sampled logits only for only the prompts that have started generating tokens
                 batch_prompt_tokens[generation_started, context_end_position] = sampled_logits[
                     generation_started
@@ -317,7 +317,7 @@ class SimpleTextGenerationController:
                 all_prompts_done = torch.all(is_generation_done_tensor)
                 if all_prompts_done:
                     break
-        
+
         # Include all the generated tokens
         batch_prompt_tokens_with_generations = batch_prompt_tokens[:, : (context_end_position + 1)]
         if common_inference_params.return_log_probs:
