@@ -49,6 +49,7 @@ class MCoreEngine(AbstractEngine):
             torch.random.manual_seed(self.random_seed)
 
         for prompt in prompts:
+            # TODO : Should we move prompt tokens to cuda device here ?
             prompt_tokens = self.text_generation_controller.tokenize_prompt(prompt)
             self.scheduler.add_request(
                 prompt=prompt,

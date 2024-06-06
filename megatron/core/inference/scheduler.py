@@ -67,7 +67,7 @@ class Scheduler:
         else:
             self.waiting_request_pool[request_id] = inference_request
 
-    def have_requests_pending(self) -> int:
+    def have_requests_pending(self) -> bool:
         """Method to check if there are requests pending
 
         This method returns False only when there are no active requests or waiting requests. 
@@ -81,7 +81,7 @@ class Scheduler:
         This method will add the earliest request (FIFO) that is in the waiting request pool to the active request pool.
         """
         assert (
-            len(self.active_request_pool) > self.max_batch_size
+            len(self.active_request_pool) < self.max_batch_size
         ), "Active request pool is already full. Cant add any more requests"
         if len(self.waiting_request_pool) > 0:
             (

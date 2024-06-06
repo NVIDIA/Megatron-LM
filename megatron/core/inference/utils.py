@@ -1,7 +1,7 @@
 class Counter:
     """A simple counter class
 
-    This class is responsible for assigning request ids to incomign requests
+    This class is responsible for assigning request ids to incoming requests
     """
 
     def __init__(self, start: int = 0) -> None:

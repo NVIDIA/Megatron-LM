@@ -57,7 +57,7 @@ class SimpleTextGenerationController:
         self,
         last_token_logits: torch.Tensor,
         common_inference_params: CommonInferenceParams,
-        vocab_size: int,
+        vocab_size: int = None,
     ) -> torch.Tensor:
         """Samples the logits to generate outputs
 
@@ -66,7 +66,7 @@ class SimpleTextGenerationController:
         Args:
             last_token_logits (torch.Tensor): The last token logits. A tensor of size [batch_size, vocab_size]
             common_inference_params (CommonInferenceParams): The paramters to use for inference
-            vocab_size (int): Obtained from the tokenizer. 
+            vocab_size (int): Obtained from the tokenizer. Defaults to None
 
         Returns:
             torch.Tensor: 1D tensor of the sampled logits with [batch_size] elements 
@@ -76,8 +76,7 @@ class SimpleTextGenerationController:
         top_k = common_inference_params.top_k
         temperature = common_inference_params.temperature
 
-        assert not (top_k == 0 and top_p == 0), 'Cannot have top-p and top-k both to be zero'
-        assert not (top_k == 0 and top_p == 0), 'Cannot have top-p and top-k both greater than zero'
+        assert not (top_k > 0 and top_p > 0), 'Cannot have top-p and top-k both greater than zero'
         assert top_p <= 1.0, 'top-p should be in (0,1]'
 
         def modify_logits_for_top_k_filtering(logits, top_k):
@@ -259,7 +258,7 @@ class SimpleTextGenerationController:
             context_start_position = 0
             # Pick the context window that we need to pass through the network.
             for context_end_position in range(min_prompt_length_in_batch, max_sequence_length):
-
+                
                 inference_input = self.inference_wrapped_model.get_batch_for_context_window(
                     context_start_position, context_end_position
                 )
@@ -267,7 +266,6 @@ class SimpleTextGenerationController:
                 # Returns the final logits of shape [batch_size, context_length, vocab_size]
                 # Note: This is returned in all TP ranks or last PP stage in PP models
                 logits = self.inference_wrapped_model.run_one_forward_step(inference_input)
-
                 if self.model_is_pipeline_parallel:
                     context_length = context_end_position - context_start_position
                     logits = broadcast_from_last_pipeline_stage(
@@ -278,12 +276,11 @@ class SimpleTextGenerationController:
 
                 # Indicates which of the input prompts have started generating tokens. A 1D boolean tensor with [batch_size] elements (i.e) The shortest prompts will start generating first and so on
                 generation_started = prompt_lengths_in_batch <= context_end_position
-
                 last_token_logits = logits[:, -1, :]
                 sampled_logits = self.sample_from_logits(
                     last_token_logits, common_inference_params, self.tokenizer.vocab_size
                 )
-
+                
                 # Substitute the sampled logits only for only the prompts that have started generating tokens
                 batch_prompt_tokens[generation_started, context_end_position] = sampled_logits[
                     generation_started
@@ -316,12 +313,11 @@ class SimpleTextGenerationController:
                     is_generation_done_tensor=is_generation_done_tensor,
                     generated_sequence_lengths=generated_sequence_lengths,
                 )
-
                 # Boolean flag indicating if all prompts are finished
                 all_prompts_done = torch.all(is_generation_done_tensor)
                 if all_prompts_done:
                     break
-
+        
         # Include all the generated tokens
         batch_prompt_tokens_with_generations = batch_prompt_tokens[:, : (context_end_position + 1)]
         if common_inference_params.return_log_probs:

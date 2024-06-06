@@ -49,7 +49,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         batch_size, max_sequence_length = self.prompts_tokens.shape
         self.inference_params = InferenceParams(batch_size, max_sequence_length)
 
-    @abc.abstractclassmethod
+    @abc.abstractmethod
     def get_batch_for_context_window(self) -> List:
         """Returns the input data for inference 
 
@@ -107,6 +107,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         output_tensor = self.model(
             tokens, position_ids, attention_mask, inference_params=self.inference_params
         )
+
         if not parallel_state.is_pipeline_last_stage():
             send_to_next_pipeline_rank(output_tensor)
 
@@ -115,7 +116,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         logits = None
         if parallel_state.is_pipeline_last_stage():
             logits = output_tensor
-
+        
         return logits
 
     def forward_pass_with_pipeline_parallel_large_input_batch(
