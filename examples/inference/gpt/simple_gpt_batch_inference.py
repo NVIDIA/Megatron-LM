@@ -26,7 +26,7 @@ from megatron.core.models.gpt import GPTModel
 from typing import List, Union
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, get_gpt_layer_with_transformer_engine_spec
 
 def model_provider(pre_process=True, post_process=True) -> Union[LegacyGPTModel, GPTModel]:
     """Builds the model.
@@ -42,6 +42,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[LegacyGPTModel,
         Union[GPTModel, megatron.model.GPTModel]: The returned model
     """
     args = get_args()
+    use_te = args.transformer_impl == "transformer_engine"
     print_rank_0('building GPT model ...')
     config = core_transformer_config_from_args(args)
 
@@ -49,7 +50,10 @@ def model_provider(pre_process=True, post_process=True) -> Union[LegacyGPTModel,
         if args.spec is not None:
             transformer_layer_spec = import_module(args.spec)
         else:
-            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm)
+            if use_te:
+                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm)
+            else:
+                transformer_layer_spec = get_gpt_layer_local_spec(args.num_experts, args.moe_grouped_gemm)
 
         model = GPTModel(
             config=config,

@@ -24,7 +24,7 @@ This will walk you through the flow of running batch inference on a GPT model tr
 
 ##### 1.1 Understanding The Code
 ***STEP 1 - We initalize model parallel and other default aruguments***
-We can default micro batch size to be 1, since for TP models its not used, and for PP models it is calculated during runtime. 
+We can default micro batch size to be 1, since for TP models it is not used, and for PP models it is calculated during runtime. 
 ```python
     initialize_megatron(
         args_defaults={'no_load_rng': True, 'no_load_optim': True, 'micro_batch_size': 1}
@@ -124,9 +124,9 @@ The following is what happens in the [simple_gpt_batch_inference.py](./gpt/simpl
     * The active requests are passed into  **generate_all_output_tokens_static_batch()** of the text generation controller . 
     * This function uses the [model_inference_wrappers](../../megatron/core/inference/inference_model_wrappers/abstract_model_inference_wrapper.py) **prep_model_for_inference()** , and then runs an auto regressive loop
     * In the auto regressive loop the inference wrappers **get_batch_for_context_window()** is called to get the required input, which is passed into the **run_one_forward_step()** method, which takes care of calling the appropriate (PP, TP) model forward methods to get the output logits
-    * The output logits are synchornized across all ranks for PP Models
-    * The text generation controller then samples from these logits and obtains the log probabilities based on the common inference parameters.
-    * The input prompt tokens are updated with the results a
+    * The output logits are synchronized across all ranks for PP Models
+    * The text generation controller obtains the log probabilities and samples tokens based on the common inference parameters.
+    * The sampled tokens are then appended to the input prompt tokens for the next iteration 
     * The **update_generation_status()** of the text generation controller is called to check which of the prompts have completed generating , what the generation lengths are etc. 
     * Finally after the inference loop, the result is detokenized and stored back into the inference requests. The status of these requests are marked as completed. 
     * We then use the schedulers **update_requests_pool()** to update the requests pools. (i.e) Completed requests are put into the completed request pool and the waiting requests are added into the active request pool
@@ -180,7 +180,7 @@ class SimpleTextGenerationController:
 
     def update_generation_status(
         self,
-        updated_promps_tokens: torch.Tensor,
+        updated_prompts_tokens: torch.Tensor,
         generation_started: torch.Tensor,
         current_context_end_position: int,
         is_generation_done_tensor: torch.Tensor,
