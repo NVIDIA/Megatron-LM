@@ -1,21 +1,20 @@
 #! /bin/bash
 echo "------ARGUMENTS LIST --------"
-for ARGUMENT in "$@"
-do
-   KEY=$(echo $ARGUMENT | cut -f1 -d=)
+for ARGUMENT in "$@"; do
+    KEY=$(echo $ARGUMENT | cut -f1 -d=)
 
-   KEY_LENGTH=${#KEY}
-   VALUE="${ARGUMENT:$KEY_LENGTH+1}"
+    KEY_LENGTH=${#KEY}
+    VALUE="${ARGUMENT:$KEY_LENGTH+1}"
 
-   export "$KEY"="$VALUE"
-   echo "$KEY=$VALUE"
+    export "$KEY"="$VALUE"
+    echo "$KEY=$VALUE"
 done
 echo "---------------------------------"
 
 set -exo pipefail
 if [[ -z $MBS ]]; then MBS=4; fi
 if [[ -z $GBS ]]; then GBS=128; fi
-if [[ -z $VOCAB_FILE ]]; then VOCAB_FILE="/workspace/data/bert_data/vocab.txt" ; fi
+if [[ -z $VOCAB_FILE ]]; then VOCAB_FILE="/workspace/data/bert_data/vocab.txt"; fi
 if [[ -z $ALLOW_NONDETERMINISTIC ]]; then ALLOW_NONDETERMINISTIC=0; fi
 
 # Change for multinode config
@@ -23,17 +22,17 @@ GPUS_PER_NODE=8
 MASTER_ADDR=localhost
 MASTER_PORT=6000
 NODE_RANK=0
-WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
+WORLD_SIZE=$(($GPUS_PER_NODE * $NUM_NODES))
 command="export CUDA_DEVICE_MAX_CONNECTIONS=1;"
 
 TRAINING_DTYPE=fp16
 TRANSFORMER_IMPL=local
 
 if [[ $ALLOW_NONDETERMINISTIC -eq 1 ]]; then
-   command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1;"
+    command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1;"
 else
-   command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0; export NCCL_ALGO=^NVLS;"
-   ADDITIONAL_PARAMS+=" --deterministic-mode"
+    command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0; export NCCL_ALGO=^NVLS;"
+    ADDITIONAL_PARAMS+=" --deterministic-mode"
 fi
 
 USE_LEGACY=1
@@ -44,15 +43,15 @@ if [[ $USE_CORE -eq 1 ]]; then
        unset USE_LEGACY
 fi
 if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
-       echo "Running checkpoint resume test..."
-       __SAVE_INTERVAL=50
-       ADDITIONAL_PARAMS+=" --use-checkpoint-args --use-checkpoint-opt_param-scheduler"
-       if [[ $MAX_STEPS -ne 100 ]]; then
-         echo "Overriding MAX_STEPS=100"
-         MAX_STEPS=100
-       fi
+    echo "Running checkpoint resume test..."
+    __SAVE_INTERVAL=50
+    ADDITIONAL_PARAMS+=" --use-checkpoint-args --use-checkpoint-opt_param-scheduler"
+    if [[ $MAX_STEPS -ne 100 ]]; then
+        echo "Overriding MAX_STEPS=100"
+        MAX_STEPS=100
+    fi
 else
-       __SAVE_INTERVAL=10000  # inf
+    __SAVE_INTERVAL=10000 # inf
 fi
 # Runs the "345M" parameter model
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
@@ -66,6 +65,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        --log-num-zeros-in-grad \
        --log-validation-ppl-to-tensorboard \
        --log-timers-to-tensorboard \
+       --log-memory-to-tensorboard \
        --tensorboard-dir ${TENSORBOARD_DIR} \
        --micro-batch-size ${MBS:-4} \
        --global-batch-size ${GBS:-128} \
@@ -111,17 +111,17 @@ fi
 
 command="$command $torch_run_cmd"
 if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
-  command="$command; rm -rf $CHECKPOINT_PATH/iter_0000100; echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt; $torch_run_cmd"
+    command="$command; rm -rf $CHECKPOINT_PATH/iter_0000100; echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt; $torch_run_cmd"
 fi
 echo "-------------------- THE FINAL PRETRAIN SCRIPT COMMAND THAT WILL BE RUN ------------"
 echo "$command"
 echo "-----------------------------------------------------------------------------"
 
-echo "$command" > $SCRIPTS_DIR/pretrain_bert_distributed_command.sh
+echo "$command" >$SCRIPTS_DIR/pretrain_bert_distributed_command.sh
 eval $command
 
 echo "Saving test results to $TENSORBOARD_DIR"
-PYTHONPATH=$PWD python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $TENSORBOARD_DIR "$JOB_NAME" | \
+PYTHONPATH=$PWD python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $TENSORBOARD_DIR "$JOB_NAME" |
     tee ${TENSORBOARD_DIR}/results.json
 
 if [[ $SKIP_PYTEST != 1 ]]; then
