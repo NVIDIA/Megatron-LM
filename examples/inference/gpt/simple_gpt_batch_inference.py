@@ -82,15 +82,11 @@ def model_provider(pre_process=True, post_process=True) -> Union[LegacyGPTModel,
     return model
 
 def add_text_generate_args(parser):
-
-    def list_of_strings(arg):
-        return arg.split(',')
-
     """Text generation arguments."""
     group = parser.add_argument_group(title='text generation')
 
     group.add_argument("--temperature", type=float, default=1.0,
-                    help='Sampling temperature.')
+                       help='Sampling temperature.')
     group.add_argument("--top_k", type=int, default=1,
                        help='Top k sampling.')
     group.add_argument("--top_p", type=float, default=0.0,
@@ -99,12 +95,10 @@ def add_text_generate_args(parser):
                        help='Return the log probabilities of the final output tokens')
     group.add_argument("--num-tokens-to-generate", type=int, default=30,
                        help='Number of tokens to generate for each prompt')
-    group.add_argument("--prompts", type=list_of_strings, default=None,
-                       help='Input prompts, with each prompt seperated by commas')
+    group.add_argument("--prompts", metavar='N', type=str, nargs='+',
+                       help='Input prompts with each prompt within quotes and seperated by space')
     group.add_argument("--max-batch-size", type=int, default=1,
                        help='Max number of prompts to process at once')
-    group.add_argument("--dynamic-batching", action='store_true', default=False,
-                       help='Turn on dynamic batching (Note: This is useful when model is running behind a server')
     return parser
 
 
@@ -162,7 +156,7 @@ def main():
     
     if torch.distributed.get_rank() == 0:
         for idx, result in enumerate(results):
-            print(f' ------------- RESULT FOR PROMPT {idx} --------------- ')
+            print(f' \n------------- RESULT FOR PROMPT {idx} --------------- ')
             result = {
                 'id': result.request_id,
                 'input_prompt': result.prompt, 

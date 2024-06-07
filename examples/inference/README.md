@@ -76,9 +76,10 @@ We use default values for the [common inference params](../../megatron/core/infe
 <br>
 
 ##### 1.2 Running The Code
-An example of running the file is shown below. Change TP &PP values, model spec , tokenizer paths, etc.for your model . 
+An example of running the file is shown below. Change tokenizer paths, inference params etc.for your model . 
 
-*NOTE: Most of these can be obtained from the script you used to train the model*
+For a quick recap on inference params refer to [this blog](https://ivibudh.medium.com/a-guide-to-controlling-llm-model-output-exploring-top-k-top-p-and-temperature-parameters-ed6a31313910) 
+
 ```
 
 TOKENIZER_ARGS=(
@@ -87,31 +88,34 @@ TOKENIZER_ARGS=(
     --tokenizer-type GPT2BPETokenizer
 )
 
-MODEL_PARALLEL_ARGS=(
-   --tensor-model-parallel-size 2 
-   --pipeline-model-parallel-size 2
-)
-
-MODEL_SPEC=(
-    --num-layers 8 
-    --hidden-size 256 
-    --num-attention-heads 8 
-    --seq-length 512 
-    --max-position-embeddings 512 
-    --use-mcore-models 
+MODEL_ARGS=(
+    --use-checkpoint-args
+    --use-mcore-models
 )
 
 INFERENCE_SPECIFIC_ARGS=(
     --attention-dropout 0.0
     --hidden-dropout 0.0
+    --num-tokens-to-generate 20
+    --max-batch-size 4
 )
+
 torchrun --nproc-per-node=4 examples/inference/gpt/simple_gpt_batch_inference.py \
     --load /workspace/checkpoint/tp2pp2 \
     ${TOKENIZER_ARGS[@]} \
-    ${MODEL_PARALLEL_ARGS[@]} \
-    ${MODEL_SPEC[@]} \
-    ${INFERENCE_SPECIFIC_ARGS[@]} \
+    ${MODEL_ARGS[@]} \
+    ${INFERENCE_SPECIFIC_ARGS[@]} 
+    --prompts "prompt one " "sample prompt two" "sample prompt 3"
+
+NOTE: Other parameters which can be customized for inference are :-
+--temperature (Sampling temperature)
+--top_k (top_k sampling)
+--top_p (top_p sampling)
+--num-tokens-to-generate (Number of tokens to generate for each prompt)
+--inference-batch-times-seqlen-threshold (During inference, if batch-size times sequence-length is smaller than this threshold then we will not use pipelining, otherwise we will.')
+
 ```
+
 
 <br>
 
