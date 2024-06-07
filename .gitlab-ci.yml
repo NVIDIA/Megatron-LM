@@ -71,6 +71,20 @@ unit_tests-data:
       when: never
     - when: always
 
+unit_tests-inference:
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
+  tags:
+    - 8xL40S
+  stage: test
+  script:
+    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/inference
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: always
+
 unit_tests-dist-checkpointing:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
   tags:
