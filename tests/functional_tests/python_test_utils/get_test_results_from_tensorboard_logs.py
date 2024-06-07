@@ -1,6 +1,7 @@
 import os
 
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
+import json
 import sys
 
 from tests.functional_tests.python_test_utils.common import read_tb_logs_as_list
@@ -18,11 +19,10 @@ def collect_train_test_metrics(logs_dir, run_name):
         }
         for metric_name, metric_values in summaries.items()
     }
-    str_train_metrics = str(train_metrics).replace("'", '"')
     print(
         f"\n ----------- Store the following metrics in tests/functional_tests/test_results/jet/{run_name}.json ----------"
     )
-    print(f"\n {str_train_metrics}", flush=True)
+    print(f"\n {json.dumps(train_metrics)}", flush=True)
 
 
 if __name__ == "__main__":
