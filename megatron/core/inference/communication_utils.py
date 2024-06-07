@@ -23,6 +23,7 @@ def broadcast_from_last_pipeline_stage(size, dtype, tensor=None):
     torch.distributed.broadcast(tensor, src, group)
     return tensor
 
+
 def recv_from_prev_pipeline_rank_(recv_buffer=None):
     """Receive from previous pipeline stage and update the
     input buffer inplace."""
@@ -34,6 +35,7 @@ def recv_from_prev_pipeline_rank_(recv_buffer=None):
         req.wait()
     # To protect against race condition when using batch_isend_irecv().
     torch.cuda.synchronize()
+
 
 def send_to_next_pipeline_rank(tensor=None):
     """Send output to the next pipeline stage."""
