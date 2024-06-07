@@ -1,0 +1,29 @@
+{
+    "Captioning": {
+        "raw": [
+            "Can you briefly explain what you see in the image?",
+            "Describe what's happening in this image in one short sentence.",
+            "Write a short caption that accurately represents the content of this image.",
+            "Please generate a descriptive caption for the image provided.",
+            "How would you summarize the scene depicted in the picture in short?"
+        ]
+    },
+    "OCR": {
+        "raw": [
+            "Can you read the text from image and output here?",
+            "Extract and document the text from the provided image.",
+            "Converting the text embedded in this image into a readable document.",
+            "Transcribe all the text you find.",
+            "Can you extract all visible text from the image here?"
+        ]
+    },
+    "VQA": {
+        "raw": [
+            "Given the image, answer the following question with few words.",
+            "Answer the following question: ",
+            "What is the answer to this question?",
+            "Write the answer: ",
+            "Please answer this question: "
+        ]
+    }
+}
