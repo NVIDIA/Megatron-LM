@@ -12,10 +12,16 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-from megatron.core.datasets.utils import Split
+from megatron.core.datasets.utils import compile_helpers 
+from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
+from megatron.training.tokenizer.tokenizer import _NullTokenizer
 
-def initialize_distributed(tensor_model_parallel_size = 1, pipeline_model_parallel_size = 1):
+
+_SEQUENCE_LENGTH = 64
+
+
+def initialize_distributed(tensor_model_parallel_size=1, pipeline_model_parallel_size=1):
     parallel_state.destroy_model_parallel()
 
     # Torch setup for distributed training
@@ -35,32 +41,43 @@ def model_provider():
         hidden_size=12, 
         num_attention_heads=4, 
         use_cpu_initialization=True, 
-        pipeline_dtype=torch.float32)
+        pipeline_dtype=torch.float32,
+    )
 
     gpt_model = GPTModel(
         config=transformer_config, 
         transformer_layer_spec=get_gpt_layer_local_spec(), 
         vocab_size=100, 
-        max_sequence_length=64)
+        max_sequence_length=_SEQUENCE_LENGTH,
+    )
 
     return gpt_model
 
 def get_train_data_iterator():
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0:
+            compile_helpers()
+        torch.distributed.barrier()
+    else:
+        compile_helpers()
+
     config = GPTDatasetConfig(
-        random_seed = 0,
-        sequence_length = 64,
-        blend=[],
-        mock=True,
+        random_seed=0,
+        sequence_length=_SEQUENCE_LENGTH,
         reset_position_ids=False,
         reset_attention_mask=False,
         eod_mask_loss=False,
-        tokenizer="dummy")
+        tokenizer=_NullTokenizer(vocab_size=_SEQUENCE_LENGTH),
+    )
 
-    training_data= MockGPTDataset(Split.train, config)
+    datasets = BlendedMegatronDatasetBuilder(
+        MockGPTDataset, [1000, None, None], lambda: True, config
+    ).build()
 
-    train_dataloader = DataLoader(training_data, batch_size=8, shuffle=True)
+    train_dataloader = DataLoader(datasets[0], batch_size=8, shuffle=True)
 
     train_iterator = iter(train_dataloader)
+
     return train_iterator
 
 def forward_step_func(data_iterator, model):
@@ -120,9 +137,9 @@ if __name__ == "__main__":
             data_iterator=train_iterator,
             model=gpt_model,
             num_microbatches=1,
-            seq_length=64,
+            seq_length=_SEQUENCE_LENGTH,
             micro_batch_size=8,
-            decoder_seq_length=64,
+            decoder_seq_length=_SEQUENCE_LENGTH,
             forward_only=False)
 
         optim.step()
@@ -137,4 +154,5 @@ if __name__ == "__main__":
     # Loading the model
     gpt_model = load_distributed_checkpoint(gpt_model=gpt_model, checkpoint_path=ckpt_path)
     gpt_model.to(device)
-    print('Successfully loaded the model')   
+    print('Successfully loaded the model')
+

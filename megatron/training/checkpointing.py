@@ -11,11 +11,27 @@ import torch
 
 from megatron.training import update_num_microbatches
 from megatron.core import mpu, tensor_parallel, dist_checkpointing
-from ..core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.serialization import get_default_load_sharded_strategy
+from megatron.core.dist_checkpointing.strategies.fully_parallel import \
+    FullyParallelSaveStrategyWrapper, FullyParallelLoadStrategyWrapper
+from .async_utils import schedule_async_save
 from .global_vars import get_args
-from .utils import (unwrap_model,
-                    print_rank_0)
+from .utils import unwrap_model, print_rank_0, append_to_progress_log
+from ..core.dist_checkpointing.serialization import \
+    get_default_save_sharded_strategy
 
+# [ModelOpt]: Import
+try:
+    from modelopt.torch.opt.plugins import (
+        save_modelopt_state,
+        save_sharded_modelopt_state,
+        restore_modelopt_state,
+        restore_sharded_modelopt_state,
+    )
+    has_nvidia_modelopt = True
+except Exception:
+    has_nvidia_modelopt = False
 
 _CHECKPOINT_VERSION = None
 
@@ -266,8 +282,12 @@ def get_rng_state(use_dist_ckpt: bool = False):
 
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
-                    num_floating_point_operations_so_far):
-    """Save a model checkpoint."""
+                    num_floating_point_operations_so_far, checkpointing_context=None):
+    """Save a model checkpoint.
+
+    Checkpointing context is used to persist some checkpointing state
+    throughout a single job. Must be initialized externally (not used if None).
+    """
     args = get_args()
 
     # Only rank zero of the data parallel writes to the disk.
@@ -290,6 +310,13 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
         ensure_directory_exists(optim_checkpoint_name)
         optimizer.save_parameter_state(optim_checkpoint_name)
 
+    async_save_request = None
+    if args.async_save:
+        if not args.use_dist_ckpt:
+            raise NotImplementedError('Async checkpoint save not implemented for legacy checkpoints')
+        elif args.dist_ckpt_format != 'torch_dist':
+            raise NotImplementedError(f'Async checkpoint save not implemented for {args.dist_ckpt_format} distributed checkpoint format')
+
     # Collect args, model, RNG.
     if not torch.distributed.is_initialized() \
             or mpu.get_data_modulo_expert_parallel_rank() == 0 \
@@ -307,28 +334,65 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if args.use_dist_ckpt:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                ensure_directory_exists(checkpoint_name,
-                                        check_parent=False)
-            dist_checkpointing.save(state_dict, checkpoint_name, (args.dist_ckpt_format, 1))
+                ensure_directory_exists(checkpoint_name, check_parent=False)
+            validate_sharding_integrity = True
+            save_strategy = (checkpointing_context or {}).get('save_strategy',
+                                                              get_default_save_sharded_strategy(args.dist_ckpt_format))
+            if args.ckpt_fully_parallel_save:
+                if checkpointing_context is not None and 'save_strategy' in checkpointing_context:
+                    # Already saved once before - don't need to rerun sharding validation
+                    validate_sharding_integrity = not args.ckpt_assume_constant_structure
+                else:
+                    save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, mpu.get_data_parallel_group(with_context_parallel=True),
+                                                                     args.ckpt_assume_constant_structure)
+            # Store save strategy for future checkpoint saves
+            if checkpointing_context is not None:
+                checkpointing_context['save_strategy'] = save_strategy
+            async_save_request = dist_checkpointing.save(state_dict, checkpoint_name, save_strategy,
+                                                         async_sharded_save=args.async_save)
 
+            # [ModelOpt]: save sharded modelopt_state
+            if has_nvidia_modelopt:
+                save_sharded_modelopt_state(model, checkpoint_name, (args.dist_ckpt_format, 1))
         else:
+            # [ModelOpt]: Inject modelopt_state into state_dict
+            if has_nvidia_modelopt:
+                save_modelopt_state(model, state_dict)
+
             # Save.
             ensure_directory_exists(checkpoint_name)
             torch.save(state_dict, checkpoint_name)
 
-    # Wait so everyone is done (necessary)
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-
-    print_rank_0('  successfully saved checkpoint at iteration {:7d} to {}' \
-                 .format(iteration, args.save))
+    if not args.async_save:
+        assert async_save_request is None
+        # Wait so everyone is done (necessary)
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
     # And update the latest iteration
     if not torch.distributed.is_initialized() \
        or torch.distributed.get_rank() == 0:
         tracker_filename = get_checkpoint_tracker_filename(args.save)
-        with open(tracker_filename, 'w') as f:
-            f.write(str(iteration))
+
+        def iter_finalize_fn():
+            with open(tracker_filename, 'w') as f:
+                f.write(str(iteration))
+            print_rank_0('  successfully saved checkpoint from iteration {:7d} to {}'
+                         .format(iteration, args.save))
+            if args.log_progress and args.async_save:
+                append_to_progress_log(f'Saved async checkpoint\tIteration: {iteration}',
+                                       barrier=False)
+
+        if args.async_save:
+            assert async_save_request is not None
+            async_save_request.add_finalize_fn(iter_finalize_fn)
+        else:
+            iter_finalize_fn()
+
+    if args.async_save:
+        schedule_async_save(async_save_request)
+        print_rank_0('  scheduled an async checkpoint save at iteration {:7d} to {}' \
+                     .format(iteration, args.save))
 
     # Wait so everyone is done (not necessary)
     if torch.distributed.is_initialized():
@@ -447,7 +511,6 @@ def _load_base_checkpoint(load_dir, rank0=False, sharded_state_dict=None,
 
     If rank0 is true, just loads rank 0 checkpoint, ignoring arguments.
     """
-
     # Read the tracker file and set the iteration.
     tracker_filename = get_checkpoint_tracker_filename(load_dir)
 
@@ -499,11 +562,17 @@ def _load_base_checkpoint(load_dir, rank0=False, sharded_state_dict=None,
             state_dict = dist_checkpointing.load_common_state_dict(checkpoint_name)
             return state_dict, checkpoint_name, release
 
+        # at this point args are available
+        args = get_args()
         if sharded_state_dict is None:
-            args = get_args()
             assert not args.auto_detect_ckpt_format and not args.use_dist_ckpt, (args.auto_detect_ckpt_format, args.use_dist_ckpt)
             raise RuntimeError('Detected load from a distributed checkpoint, but neither --use-dist-ckpt nor --auto-detect-ckpt-format is set.')
-        state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name)
+
+        load_strategy = get_default_load_sharded_strategy(checkpoint_name)
+        if args.ckpt_fully_parallel_load:
+            load_strategy = FullyParallelLoadStrategyWrapper(load_strategy,
+                                                             mpu.get_data_parallel_group(with_context_parallel=True))
+        state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name, load_strategy)
         return state_dict, checkpoint_name, release
 
     try:
@@ -669,8 +738,13 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 optim_sd_kwargs['sharding_type'] = ('fully_sharded_bucket_space'
                                                     if getattr(state_dict['args'], 'ckpt_fully_parallel_save', False)
                                                     else 'dp_zero_gather_scatter')
-            load_kwargs['sharded_state_dict'] = generate_state_dict(args, model, optimizer, opt_param_scheduler,
-                                                                    rng_state, args.use_dist_ckpt, optim_sd_kwargs=optim_sd_kwargs)
+            # [ModelOpt]: remedy for finetune
+            if args.finetune or args.no_load_optim:
+                load_kwargs['sharded_state_dict'] = generate_state_dict(args, model, None, None,
+                                                                        rng_state, args.use_dist_ckpt, optim_sd_kwargs=optim_sd_kwargs)
+            else:
+                load_kwargs['sharded_state_dict'] = generate_state_dict(args, model, optimizer, opt_param_scheduler,
+                                                                        rng_state, args.use_dist_ckpt, optim_sd_kwargs=optim_sd_kwargs)
             load_kwargs['exit_on_missing_checkpoint'] = args.exit_on_missing_checkpoint
 
     state_dict, checkpoint_name, release = _load_base_checkpoint(load_dir, rank0=False, **load_kwargs)
@@ -711,6 +785,13 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                                               'consumed_valid_samples', 0)
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
+    
+    # [ModelOpt]: loading modelopt_state (sharded or not)
+    if has_nvidia_modelopt:
+        if args.use_dist_ckpt:
+            restore_sharded_modelopt_state(model, checkpoint_name)
+        else:
+            restore_modelopt_state(model, state_dict)
 
     # Model.
     strict = False if args.retro_add_retriever else strict

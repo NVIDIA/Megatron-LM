@@ -19,7 +19,7 @@ from typing import List, Optional, Tuple, Type, Union
 import numpy
 import torch
 
-from megatron.core.datasets.utils import log_single_rank
+from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
 
@@ -367,7 +367,7 @@ class IndexedDataset(torch.utils.data.Dataset):
         bin_path = get_bin_path(path_prefix)
         assert os.path.exists(idx_path) and os.path.exists(
             bin_path
-        ), f"One or both of the .idx and .bin files cannot be found at the path prefix {self.path_prefix}"
+        ), f"One or both of the .idx and .bin files cannot be found at the path prefix {path_prefix}"
 
         self.path_prefix = path_prefix
         self.multimodal = multimodal

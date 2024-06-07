@@ -16,26 +16,18 @@ jet-setup:
     - os/linux
   script:
     - set -x
-    - |
-      if [[ $CI_PIPELINE_SOURCE == "merge_request_event" ]] && [[ $CI_MERGE_REQUEST_LABELS =~ "Run tests" ]]; then
-          JET_FILTER="type == 'build' or 'merge-request' in spec.scope"
-      elif [[ -n $JET_CUSTOM_FILTER && $CI_PIPELINE_SOURCE != 'merge_request_event' ]]; then
-        JET_FILTER=$JET_CUSTOM_FILTER
-      else
-        JET_FILTER="False"
-      fi
-      echo "_JET_FILTER=$JET_FILTER" | tee -a config.env
+    - JET_FILTER=${JET_CUSTOM_FILTER:-False}
+    - echo "_JET_FILTER=$JET_FILTER" | tee -a config.env
   artifacts:
     reports:
       dotenv: config.env
 
 jet-configure:
-  image: alpine
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/ci_yq:v1
   extends: [.jet_common, .jet-configure]
   tags:
     - os/linux
   script:
-    - wget https://github.com/mikefarah/yq/releases/download/v4.35.2/yq_linux_amd64.tar.gz -O - | tar xz && mv yq_linux_amd64 /usr/local/bin/yq
     - cd tests/functional_tests/jet_recipes
     - |
       if [[ $CI_PIPELINE_SOURCE == "merge_request_event" ]]; then
@@ -73,10 +65,17 @@ jet-results-summary:
     - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $CI_JOB_JWT
   script: 
     - python -m pip install -U --no-cache-dir prettytable
-    - python tests/functional_tests/python_test_utils/jet_test_pipeline.py ${CI_PIPELINE_ID} --test exit
+    - rc=0
+    - python tests/functional_tests/python_test_utils/jet_test_pipeline.py ${CI_PIPELINE_ID} --test exit --artifact_links $CI_JOB_ID || rc=$?
+    - python tests/functional_tests/python_test_utils/jet_test_pipeline.py ${CI_PIPELINE_ID} --download_scripts_dir ./scripts || rc=$?
+    - exit $rc
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
       when: always
     - if: $JET_CUSTOM_FILTER != "" && $CI_PIPELINE_SOURCE != 'merge_request_event'
       when: always
     - when: never
+  artifacts:
+    when: always
+    paths:
+      - scripts

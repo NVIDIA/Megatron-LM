@@ -13,9 +13,8 @@ import os
 import sys
 import torch
 
-from megatron import get_args, initialize_megatron, print_rank_0
-from megatron.arguments import core_transformer_config_from_args
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.datasets.retro.db import build_db
 from megatron.core.datasets.retro.index import add_to_index, train_index
 from megatron.core.datasets.retro.config import (
@@ -36,6 +35,8 @@ from megatron.core.models.retro.utils import (
     get_config_path,
     get_gpt_data_dir,
 )
+from megatron.training import get_args, initialize_megatron, print_rank_0
+from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.tokenizer.tokenizer import (
     _BertWordPieceTokenizer,
     _GPT2BPETokenizer,
@@ -103,14 +104,17 @@ def get_gpt_chunk_datasets(config):
     data_config = MultiSplitGPTDatasetConfig(
         random_seed=config.retro_gpt_seed,
         sequence_length=config.retro_gpt_seq_length,
-        blend=blend,
-        blend_per_split=[args.train_data_path, args.valid_data_path, args.test_data_path],
+        blend=get_blend_from_list(blend),
+        blend_per_split=[
+            get_blend_from_list(args.train_data_path),
+            get_blend_from_list(args.valid_data_path),
+            get_blend_from_list(args.test_data_path)
+        ],
         split=config.retro_gpt_split,
         split_preprocessing=config.retro_gpt_split,
         path_to_cache=config.retro_gpt_data_cache_path,
         return_document_ids=True,
         tokenizer=config.retro_tokenizers.gpt,
-        mock=args.mock_data,
         reset_position_ids=args.reset_position_ids,
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,

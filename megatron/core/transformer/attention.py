@@ -372,19 +372,25 @@ class SelfAttention(Attention):
             tp_comm_buffer_name='qkv',
         )
 
-        self.q_layernorm = build_module(
-            submodules.q_layernorm,
-            hidden_size=self.hidden_size_per_attention_head,
-            config=self.config,
-            eps=self.config.layernorm_epsilon,
-        )
+        if submodules.q_layernorm is not None:
+            self.q_layernorm = build_module(
+                submodules.q_layernorm,
+                hidden_size=self.hidden_size_per_attention_head,
+                config=self.config,
+                eps=self.config.layernorm_epsilon,
+            )
+        else:
+            self.q_layernorm = None
 
-        self.k_layernorm = build_module(
-            submodules.k_layernorm,
-            hidden_size=self.hidden_size_per_attention_head,
-            config=self.config,
-            eps=self.config.layernorm_epsilon,
-        )
+        if submodules.k_layernorm is not None:
+            self.k_layernorm = build_module(
+                submodules.k_layernorm,
+                hidden_size=self.hidden_size_per_attention_head,
+                config=self.config,
+                eps=self.config.layernorm_epsilon,
+            )
+        else:
+            self.k_layernorm = None
 
     def run_realtime_tests(self):
         """Performs a consistency check.
@@ -397,63 +403,63 @@ class SelfAttention(Attention):
         checked every X iterations. This is left for future work. Equality of tensors is probably not
         required; transmitting hashes is sufficient."""
 
-        if self.config.qk_layernorm:
-            # check that all tensor parallel and data parallel ranks have the same
-            # Q & K layernorm parameters.
-            rank = get_data_parallel_rank()
-            inputs = torch.stack(
+        if not self.config.qk_layernorm:
+            return
+
+        # check that all tensor parallel and data parallel ranks have the same
+        # Q & K layernorm parameters.
+        rank = get_data_parallel_rank()
+        inputs = torch.stack(
+            [
+                self.q_layernorm.weight.data,
+                self.q_layernorm.bias.data,
+                self.k_layernorm.weight.data,
+                self.k_layernorm.bias.data,
+            ]
+        )
+        dp_list = [torch.empty_like(inputs) for _ in range(get_data_parallel_world_size())]
+        dp_list[rank] = inputs
+        torch.distributed.all_gather(dp_list, inputs, group=get_data_parallel_group())
+
+        def _compare(srcs, tgts, names, parallelism):
+            assert len(srcs) == len(tgts) == len(names)
+            for src, tgt, name in zip(srcs, tgts, names):
+                assert torch.all(
+                    src == tgt
+                ), f"Discrepancy between {name} in {parallelism} ranks {i} and {rank}. Diff: {torch.norm(src - tgt)}"
+
+        for i, dp in enumerate(dp_list):
+            q_w, q_b, k_w, k_b = torch.unbind(dp)
+            _compare(
+                [q_w, q_b, k_w, k_b],
                 [
                     self.q_layernorm.weight.data,
                     self.q_layernorm.bias.data,
                     self.k_layernorm.weight.data,
                     self.k_layernorm.bias.data,
-                ]
+                ],
+                ["q_w", "q_b", "k_w", "k_b"],
+                "DP",
             )
-            dp_list = [torch.empty_like(inputs) for _ in range(get_data_parallel_world_size())]
-            dp_list[rank] = inputs
-            torch.distributed.all_gather(dp_list, inputs, group=get_data_parallel_group())
 
-            def _compare(srcs, tgts, names, parallelism):
-                assert len(srcs) == len(tgts) == len(names)
-                for src, tgt, name in zip(srcs, tgts, names):
-                    assert torch.all(
-                        src == tgt
-                    ), f"Discrepancy between {name} in {parallelism} ranks {i} and {rank}. Diff: {torch.norm(src - tgt)}"
+        rank = get_tensor_model_parallel_rank()
+        tp_list = [torch.empty_like(inputs) for _ in range(get_tensor_model_parallel_world_size())]
+        tp_list[rank] = inputs
+        torch.distributed.all_gather(tp_list, inputs, group=get_tensor_model_parallel_group())
 
-            for i, dp in enumerate(dp_list):
-                q_w, q_b, k_w, k_b = torch.unbind(dp)
-                _compare(
-                    [q_w, q_b, k_w, k_b],
-                    [
-                        self.q_layernorm.weight.data,
-                        self.q_layernorm.bias.data,
-                        self.k_layernorm.weight.data,
-                        self.k_layernorm.bias.data,
-                    ],
-                    ["q_w", "q_b", "k_w", "k_b"],
-                    "DP",
-                )
-
-            rank = get_tensor_model_parallel_rank()
-            tp_list = [
-                torch.empty_like(inputs) for _ in range(get_tensor_model_parallel_world_size())
-            ]
-            tp_list[rank] = inputs
-            torch.distributed.all_gather(tp_list, inputs, group=get_tensor_model_parallel_group())
-
-            for i, tp in enumerate(tp_list):
-                q_w, q_b, k_w, k_b = torch.unbind(tp)
-                _compare(
-                    [q_w, q_b, k_w, k_b],
-                    [
-                        self.q_layernorm.weight.data,
-                        self.q_layernorm.bias.data,
-                        self.k_layernorm.weight.data,
-                        self.k_layernorm.bias.data,
-                    ],
-                    ["q_w", "q_b", "k_w", "k_b"],
-                    "TP",
-                )
+        for i, tp in enumerate(tp_list):
+            q_w, q_b, k_w, k_b = torch.unbind(tp)
+            _compare(
+                [q_w, q_b, k_w, k_b],
+                [
+                    self.q_layernorm.weight.data,
+                    self.q_layernorm.bias.data,
+                    self.k_layernorm.weight.data,
+                    self.k_layernorm.bias.data,
+                ],
+                ["q_w", "q_b", "k_w", "k_b"],
+                "TP",
+            )
 
     def get_query_key_value_tensors(self, hidden_states, key_value_states=None):
         """
@@ -494,8 +500,11 @@ class SelfAttention(Attention):
         # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
 
-        query = self.q_layernorm(query)
-        key = self.k_layernorm(key)
+        if self.q_layernorm is not None:
+            query = self.q_layernorm(query)
+
+        if self.k_layernorm is not None:
+            key = self.k_layernorm(key)
 
         if self.config.test_mode:
             self.run_realtime_tests()

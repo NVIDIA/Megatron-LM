@@ -1,7 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron initialization."""
-
+import logging
 import random
 import os
 import time
@@ -21,6 +21,9 @@ from megatron.training.checkpointing import load_args_from_checkpoint
 from megatron.training.global_vars import set_global_variables
 from megatron.legacy.model.transformer import bias_dropout_add_fused_train
 from megatron.legacy.model.fused_bias_gelu import bias_gelu
+
+logger = logging.getLogger(__name__)
+
 
 def initialize_megatron(
     extra_args_provider=None,
@@ -57,6 +60,9 @@ def initialize_megatron(
     # set global args, build tokenizer, and set adlr-autoresume,
     # tensorboard-writer, and timers.
     set_global_variables(args)
+
+    # set logging level
+    setup_logging()
 
     # torch.distributed initialization
     def finish_mpu_init():
@@ -256,6 +262,7 @@ def _initialize_distributed():
                 expert_model_parallel_size=args.expert_model_parallel_size,
                 distributed_timeout_minutes=args.distributed_timeout_minutes,
                 nccl_communicator_config_path=args.nccl_communicator_config_path,
+                order='tp-cp-ep-dp-pp' if not args.use_tp_pp_dp_mapping else 'tp-pp-dp',
             )
             if args.rank == 0:
                 print(
@@ -391,3 +398,26 @@ def _warmup_jit_function():
             output = bias_dropout_add_fused_train(input, bias, residual, dropout_rate)
     del bias, input, residual, output
     torch.cuda.empty_cache()
+
+
+def setup_logging() -> None:
+    """ Sets the default logging level based on cmdline args and env vars.
+
+    Precedence:
+    1. Command line argument `--logging-level`
+    2. Env var `MEGATRON_LOGGING_LEVEL`
+    3. Default logging level (INFO)
+
+    Returns: None
+    """
+    args = get_args()
+    logging_level = None
+    env_logging_level = os.getenv('MEGATRON_LOGGING_LEVEL', None)
+    if env_logging_level is not None:
+        logging_level = int(env_logging_level)
+    if args.logging_level is not None:
+        logging_level = args.logging_level
+
+    if logging_level is not None:
+        logger.info(f'Setting logging level to {logging_level}')
+        logging.getLogger().setLevel(logging_level)

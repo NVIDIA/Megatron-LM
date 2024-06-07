@@ -39,20 +39,24 @@ class GroupedMLP(MegatronModule):
 
         self.expert_parallel = config.expert_model_parallel_size > 1
         if self.config.gated_linear_unit:
-            if self.config.activation_func != F.silu:
-                raise ValueError("Activation function must be silu when using GroupedMLP.")
+            if self.config.activation_func not in (F.silu, F.gelu):
+                raise ValueError("Activation function must be silu or gelu when using GroupedMLP.")
 
             @jit_fuser
             def glu(x):
                 x = torch.chunk(x, 2, dim=-1)
-                return F.silu(x[0]) * x[1]
+                return self.config.activation_func(x[0]) * x[1]
 
             self.activation_func = glu
         else:
             self.activation_func = self.config.activation_func
 
         # How many feature each rank holds for fc1 and fc2, respectively.
-        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        if config.moe_extended_tp:
+            tp_size = parallel_state.get_tensor_and_expert_parallel_world_size()
+        else:
+            tp_size = parallel_state.get_tensor_model_parallel_world_size()
+
         fc1_output_size = self.config.ffn_hidden_size * self.num_local_experts
         if config.gated_linear_unit:
             # Project to 4h. If using swiglu double the output width,
@@ -178,6 +182,7 @@ class SequentialMLP(MegatronModule):
     def __init__(self, num_local_experts, config: TransformerConfig, submodules: MLPSubmodules):
         super().__init__(config=config)
         self.add_bias = config.add_bias_linear
+        self.moe_extended_tp = config.moe_extended_tp
         self.num_local_experts = num_local_experts
         self.local_experts = torch.nn.ModuleList()
         for _ in range(self.num_local_experts):
@@ -185,6 +190,7 @@ class SequentialMLP(MegatronModule):
             self.local_experts.append(expert)
 
     def forward(self, permuted_local_hidden_states, tokens_per_expert):
+
         output_local = torch.zeros_like(permuted_local_hidden_states)
         output_bias_local = None
         if self.add_bias:
@@ -209,6 +215,11 @@ class SequentialMLP(MegatronModule):
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """ Maps local expert to global experts. """
+        if self.moe_extended_tp:
+            raise NotImplementedError(
+                'Currently distributed checkpointing is not supported for moe_extended_tp'
+            )
+
         sharded_state_dict = {}
         num_global_experts = (
             parallel_state.get_expert_model_parallel_world_size() * self.num_local_experts

@@ -6,6 +6,10 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import save, load, load_plain_tensors
 from megatron.core.dist_checkpointing.dict_utils import diff
+from megatron.core.dist_checkpointing.serialization import \
+    get_default_save_sharded_strategy, get_default_load_sharded_strategy
+from megatron.core.dist_checkpointing.strategies.fully_parallel import \
+    FullyParallelSaveStrategyWrapper, FullyParallelLoadStrategyWrapper
 from megatron.core.models.gpt.gpt_layer_specs import \
     get_gpt_layer_with_transformer_engine_spec
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -40,22 +44,23 @@ def get_pp_offsets():
 
 
 class TestSequentialMLPReconfiguration:
-    @pytest.mark.parametrize("src_tp_pp_exp,dest_tp_pp_exp,use_glu", [
+    @pytest.mark.parametrize("use_fpsl,src_tp_pp_exp,dest_tp_pp_exp,use_glu", [
         # changing PP is impossible because the number of layers must be the same
-        ((2, 4, 1), (2, 4, 1), False),
-        ((1, 1, 1), (1, 1, 1), False),
-        ((1, 1, 1), (1, 1, 4), False),
-        ((1, 1, 8), (1, 1, 2), False),
-        ((2, 2, 2), (4, 2, 1), False),
-        ((1, 1, 4), (8, 1, 1), False),
-        ((1, 8, 1), (1, 8, 1), False),
-        ((1, 1, 4), (2, 1, 1), False),
-        ((1, 1, 1), (1, 1, 1), True),
-        ((1, 1, 1), (1, 1, 4), True),
-        ((1, 1, 1), (2, 1, 1), True),
-        ((1, 1, 4), (8, 1, 1), True),
+        (False, (2, 4, 1), (2, 4, 1), False),
+        (True,  (2, 4, 1), (2, 4, 1), False),
+        (False, (1, 1, 1), (1, 1, 1), False),
+        (True,  (1, 1, 1), (1, 1, 4), False),
+        (False, (1, 1, 8), (1, 1, 2), False),
+        (False, (2, 2, 2), (4, 2, 1), False),
+        (True,  (1, 1, 4), (8, 1, 1), False),
+        (False, (1, 8, 1), (1, 8, 1), False),
+        (False, (1, 1, 4), (2, 1, 1), False),
+        (False, (1, 1, 1), (1, 1, 1), True),
+        (False, (1, 1, 1), (1, 1, 4), True),
+        (True,  (1, 1, 1), (2, 1, 1), True),
+        (False, (1, 1, 4), (8, 1, 1), True),
     ])
-    def test_parallel_reconfiguration_e2e(self, tmp_path_dist_ckpt, src_tp_pp_exp, dest_tp_pp_exp, use_glu):
+    def test_parallel_reconfiguration_e2e(self, tmp_path_dist_ckpt, src_tp_pp_exp, dest_tp_pp_exp, use_glu, use_fpsl):
         """ Test model saving and loading with different TP/PP/expert parallelism """
         src_tp, src_pp, src_exp = src_tp_pp_exp
         dest_tp, dest_pp, dest_exp = dest_tp_pp_exp
@@ -65,13 +70,28 @@ class TestSequentialMLPReconfiguration:
             Utils.initialize_model_parallel(src_tp, src_pp, expert_model_parallel_size=src_exp)
             model_A = initialize_sequential_mlp(1, use_glu)
             sharded_state_dict = model_A.sharded_state_dict(sharded_offsets=get_pp_offsets())
-            save(sharded_state_dict, ckpt_dir_A)
+
+            save_strategy = get_default_save_sharded_strategy()
+            if use_fpsl:
+                save_strategy = FullyParallelSaveStrategyWrapper(
+                    save_strategy,
+                    parallel_state.get_data_parallel_group(with_context_parallel=True),
+                    True
+                )
+            save(sharded_state_dict, ckpt_dir_A, save_strategy)
             Utils.destroy_model_parallel()
 
             # Load checkpoint A with different TP/PP/expert and save as checkpoint B
+            # No FPS this time, only FPL
             Utils.initialize_model_parallel(dest_tp, dest_pp, expert_model_parallel_size=dest_exp)
             model_B = initialize_sequential_mlp(2, use_glu)
-            state_dict = load(model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_A)
+            if use_fpsl:
+                load_strategy = get_default_load_sharded_strategy(ckpt_dir_A)
+                load_strategy = FullyParallelLoadStrategyWrapper(load_strategy,
+                                                                 parallel_state.get_data_parallel_group(with_context_parallel=True))
+            else:
+                load_strategy = None
+            state_dict = load(model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_A, load_strategy)
             model_B.load_state_dict(state_dict)
             save(model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_B)
             Utils.destroy_model_parallel()

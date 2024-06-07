@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 from contextlib import contextmanager
 from typing import Dict, Optional
 
@@ -8,7 +9,11 @@ import torch
 from .. import parallel_state
 from ..transformer.module import MegatronModule
 from ..transformer.transformer_config import TransformerConfig
+from ..utils import log_single_rank
+from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import ParamAndGradBuffer
+
+logger = logging.getLogger(__name__)
 
 
 class DistributedDataParallel(MegatronModule):
@@ -21,56 +26,52 @@ class DistributedDataParallel(MegatronModule):
 
     Args:
         config: Transformer config object.
+        ddp_config: DistributedDataParallel config object.
         module: Underlying model.
-        data_parallel_group: Data-parallel process group.
-        accumulate_allreduce_grads_in_fp32: If true, do the gradient accumulation and
-            communication in fp32.
-        overlap_grad_reduce: If true, overlap communication with backprop computation by
-            breaking up grads into buckets. If false, single synchronous communication call
-            is used instead.
-        use_distributed_optimizer: If true, issue reduce-scatter communication calls as part
-            of distributed optimizer. If false, issue all-reduce communication calls.
         disable_bucketing: If true, force assign all parameters to a single bucket. If false,
             use standard bucketing policy: assign parameters to smaller buckets and all-reduce
             per bucket _if_ overlap_grad_reduce is True and pp_rank is 0.
-        check_for_nan_in_grad: If true, check if local grad norm is NaN.
 
     """
 
     def __init__(
         self,
         config: TransformerConfig,
+        ddp_config: DistributedDataParallelConfig,
         module: torch.nn.Module,
-        data_parallel_group: torch.distributed.ProcessGroup,
-        accumulate_allreduce_grads_in_fp32: bool,
-        overlap_grad_reduce: bool,
-        use_distributed_optimizer: bool,
-        expert_data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         disable_bucketing: bool = False,
-        check_for_nan_in_grad: bool = False,
-        bucket_size: int = 40000000,
     ):
         super().__init__(config=config)
         self.module = module
 
+        # If bucket_size is not provided as an input, use sane default.
+        # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
+        # ring-reduce implementations are large enough to remain bandwidth-bound rather than
+        # latency-bound.
+        if ddp_config.bucket_size is None:
+            ddp_config.bucket_size = max(
+                40000000, 1000000 * parallel_state.get_data_parallel_world_size()
+            )
         # Set bucket_size to infinity if overlap_grad_reduce is False.
-        self.overlap_grad_reduce = overlap_grad_reduce
-        self.use_distributed_optimizer = use_distributed_optimizer
+        if not ddp_config.overlap_grad_reduce:
+            ddp_config.bucket_size = None
 
-        # Turn off bucketing if overlap_grad_reduce is False, if we are on a pipeline stage
-        # that is not the first (since data-parallel communication on these stages is not on
-        # the critical path), or if disable_bucketing is True (e.g., we might not want to
-        # break up model parameters into buckets for model chunks after the first
-        # in the interleaved schedule).
-        if not self.overlap_grad_reduce:
-            bucket_size = None
+        self.ddp_config = ddp_config
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f'Setting up DistributedDataParallel with config {self.ddp_config}',
+        )
+
+        # Turn off bucketing if we are on a pipeline stage that is not the first (since
+        # data-parallel communication on these stages is not on the critical path), or if
+        # disable_bucketing is True (e.g., we might not want to break up model parameters
+        # into buckets for model chunks after the first in the interleaved schedule).
+        self.bucket_size = self.ddp_config.bucket_size
         if parallel_state.get_pipeline_model_parallel_rank() > 0:
-            bucket_size = None
+            self.bucket_size = None
         if disable_bucketing:
-            bucket_size = None
-
-        self.check_for_nan_in_grad = check_for_nan_in_grad
-        self.bucket_size = bucket_size
+            self.bucket_size = None
 
         self.module = module
         self.param_to_buffer = {}
@@ -92,7 +93,7 @@ class DistributedDataParallel(MegatronModule):
                 expert_parallel_params.append(param)
 
         def allocate_buffers_for_parameters(
-            input_params, data_parallel_group, gradient_scaling_factor=1.0,
+            input_params, data_parallel_group, gradient_scaling_factor,
         ):
             param_and_grad_dtype_to_params = {}
 
@@ -102,27 +103,37 @@ class DistributedDataParallel(MegatronModule):
                     continue
 
                 param_dtype = param.dtype
-                grad_dtype = torch.float if accumulate_allreduce_grads_in_fp32 else param.dtype
+                grad_dtype = torch.float if self.ddp_config.grad_reduce_in_fp32 else param.dtype
 
                 params = param_and_grad_dtype_to_params.get((param_dtype, grad_dtype), [])
                 params.append(param)
                 param_and_grad_dtype_to_params[(param_dtype, grad_dtype)] = params
+
+            if not config.calculate_per_token_loss:
+                target_gradient_scaling_factor = 1.0 / parallel_state.get_data_parallel_world_size()
+                if self.ddp_config.average_in_collective:
+                    # Collective is averaging gradients in collective with data_parallel_group.
+                    assert (
+                        gradient_scaling_factor
+                        / torch.distributed.get_world_size(group=data_parallel_group)
+                        == target_gradient_scaling_factor
+                    )
+                else:
+                    assert gradient_scaling_factor == target_gradient_scaling_factor
 
             # Allocate the grad buffers and map the grads.
             buffers = []
             for (param_dtype, grad_dtype), params in param_and_grad_dtype_to_params.items():
                 buffers.append(
                     ParamAndGradBuffer(
+                        self.ddp_config,
                         param_dtype,
                         grad_dtype,
                         params,
                         data_parallel_group,
-                        bucket_size,
+                        self.bucket_size,
                         param_to_name,
-                        self.overlap_grad_reduce,
-                        self.use_distributed_optimizer,
                         gradient_scaling_factor,
-                        self.check_for_nan_in_grad,
                     )
                 )
                 for param in params:
@@ -130,27 +141,39 @@ class DistributedDataParallel(MegatronModule):
 
             return buffers
 
-        data_parallel_world_size = torch.distributed.get_world_size(data_parallel_group)
+        if config.calculate_per_token_loss:
+            gradient_scaling_factor = 1.0
+            expert_gradient_scaling_factor = 1.0
+        else:
+            if self.ddp_config.average_in_collective:
+                gradient_scaling_factor = 1.0
+                expert_gradient_scaling_factor = (
+                    1.0 / parallel_state.get_expert_model_parallel_world_size()
+                )
+            else:
+                data_parallel_world_size = parallel_state.get_data_parallel_world_size()
+                gradient_scaling_factor = 1.0 / data_parallel_world_size
+                expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
 
         # Allocate the param+grad buffers for dense params' grads.
         self.buffers = allocate_buffers_for_parameters(
             dense_params,
-            data_parallel_group,
-            gradient_scaling_factor=1.0 / data_parallel_world_size,
+            parallel_state.get_data_parallel_group(with_context_parallel=True),
+            gradient_scaling_factor=gradient_scaling_factor,
         )
 
         # Allocate separate param+grad buffers for expert parallel params' grads.
         self.expert_parallel_buffers = allocate_buffers_for_parameters(
             expert_parallel_params,
-            expert_data_parallel_group,
-            gradient_scaling_factor=1.0 / data_parallel_world_size,
+            parallel_state.get_data_modulo_expert_parallel_group(),
+            gradient_scaling_factor=expert_gradient_scaling_factor,
         )
 
         # Delete references to weight_tensor if they exist since we don't want two parameter copies
         # if we re-mapped parameters (which happens when we use the distributed optimizer).
         # This is a temporary workaround around a TE bug that is fixed with
         # https://github.com/NVIDIA/TransformerEngine/pull/719.
-        if self.use_distributed_optimizer:
+        if self.ddp_config.use_distributed_optimizer:
 
             @torch.no_grad()
             def unmap_weight_tensor(m):
@@ -189,7 +212,7 @@ class DistributedDataParallel(MegatronModule):
 
         def param_hook(*unused):
             if param.requires_grad:
-                if self.overlap_grad_reduce:
+                if self.ddp_config.overlap_grad_reduce:
                     assert (
                         param.grad is not None
                     ), 'param.grad being None is not safe when overlap_grad_reduce is True'
@@ -199,7 +222,7 @@ class DistributedDataParallel(MegatronModule):
                     param.main_grad.add_(param.grad.data)
                 param.grad = None
 
-                if self.overlap_grad_reduce:
+                if self.ddp_config.overlap_grad_reduce:
                     param_to_buffer[param].register_grad_ready(param)
 
         return param_hook
@@ -228,6 +251,11 @@ class DistributedDataParallel(MegatronModule):
         """
         for buffer in self.buffers + self.expert_parallel_buffers:
             buffer.start_grad_sync()
+
+    def scale_gradients(self, scaling_factor: float) -> None:
+        """Scale all gradients inside the buffers by `scaling_factor`."""
+        for buffer in self.buffers + self.expert_parallel_buffers:
+            buffer.scale_gradients(scaling_factor)
 
     def finish_grad_sync(self):
         """
@@ -260,17 +288,16 @@ class DistributedDataParallel(MegatronModule):
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
             if is_expert_parallel:
-                torch.distributed.broadcast(
-                    param.data,
-                    src=torch.distributed.get_process_group_ranks(self.expert_data_parallel_group),
-                    group=self.expert_data_parallel_group,
-                )
+                data_parallel_group = parallel_state.get_data_modulo_expert_parallel_group()
             else:
-                torch.distributed.broadcast(
-                    param.data,
-                    src=torch.distributed.get_process_group_ranks(self.data_parallel_group),
-                    group=self.data_parallel_group,
+                data_parallel_group = parallel_state.get_data_parallel_group(
+                    with_context_parallel=True
                 )
+            torch.distributed.broadcast(
+                param.data,
+                src=torch.distributed.get_global_rank(data_parallel_group, 0),
+                group=data_parallel_group,
+            )
 
     def state_dict(self, prefix='', keep_vars=False):
         """

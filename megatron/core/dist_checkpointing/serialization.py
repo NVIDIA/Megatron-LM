@@ -37,7 +37,9 @@ from .mapping import (
     apply_factory_merges,
     is_main_replica,
 )
+from .strategies.async_utils import AsyncRequest
 from .strategies.base import (
+    AsyncSaveShardedStrategy,
     LoadCommonStrategy,
     LoadShardedStrategy,
     SaveCommonStrategy,
@@ -260,7 +262,8 @@ def save(
     sharded_strategy: Union[SaveShardedStrategy, Tuple[str, int], None] = None,
     common_strategy: Union[SaveCommonStrategy, Tuple[str, int], None] = None,
     validate_access_integrity: bool = True,
-) -> None:
+    async_sharded_save: bool = False,
+) -> Optional[AsyncRequest]:
     """Saving entrypoint.
 
     Extracts ShardedTensors from the given state dict. Rank 0 saves the
@@ -275,6 +278,13 @@ def save(
     4. Save all other objects to common.pt
     5. (optional) Extract and save ShardedObjects
     6. Save all ShardedBase objects
+    7. Write metadata.json file with backend and version metadata.
+
+    Step (6) can be performed asynchronously (see `async_sharded_save`), in this
+    case the actual save is embodied in the returned async request and can be
+    scheduled by the external caller. For async request, step (7) is added as
+    one of the finalization functions, so that metadata.json is written only
+    if the checkpoint is complete.
 
     Args:
         sharded_state_dict (ShardedStateDict): state dict of the populated with
@@ -285,6 +295,15 @@ def save(
         common_strategy (SaveCommonStrategy, Tuple[str, int], optional): configures common data saving behavior and backend
         validate_access_integrity (bool default = True): checks if each tensor shard is accessed
             exactly once (as main replica) by some process
+        async_sharded_save (bool, optional): if True, for the sharded state dict part
+            an async save implementation will be called, with the AsyncRequest
+            being returned to the caller. Note that it is the caller responsibility to
+            actually schedule the async save. Defaults to False.
+
+    Returns:
+        AsyncRequest (optional): if `async_sharded_save` is True, returns
+            async request that should be scheduled by the caller of this function.
+            None otherwise.
     """
     checkpoint_dir = Path(checkpoint_dir)
 
@@ -303,7 +322,7 @@ def save(
         raise NotImplementedError('The only supported common strategy is torch')
 
     if sharded_strategy is None:
-        sharded_strategy = ('zarr', 1)
+        sharded_strategy = get_default_save_sharded_strategy()
     if not isinstance(sharded_strategy, SaveShardedStrategy):
         assert isinstance(sharded_strategy, tuple), type(sharded_strategy)
         sharded_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, *sharded_strategy)
@@ -322,12 +341,36 @@ def save(
             sharded_state_dict, checkpoint_dir, validate_access_integrity
         )
 
-    sharded_strategy.save(sharded_state_dict, checkpoint_dir)
-    if torch.distributed.get_rank() == 0:
-        save_config(
-            CheckpointingConfig(sharded_strategy.backend, sharded_strategy.version), checkpoint_dir
+    def metadata_finalize_fn():
+        if torch.distributed.get_rank() == 0:
+            save_config(
+                CheckpointingConfig(sharded_strategy.backend, sharded_strategy.version),
+                checkpoint_dir,
+            )
+        torch.distributed.barrier()
+
+    if not async_sharded_save:
+        sharded_strategy.save(sharded_state_dict, checkpoint_dir)
+        metadata_finalize_fn()
+        return
+
+    if not isinstance(sharded_strategy, AsyncSaveShardedStrategy):
+        raise CheckpointingException(
+            f'Cannot apply async_save to non-async strategy {sharded_strategy}'
         )
-    torch.distributed.barrier()
+    async_request = sharded_strategy.async_save(sharded_state_dict, checkpoint_dir)
+    async_request.finalize_fns.append(metadata_finalize_fn)
+    return async_request
+
+
+def get_default_save_sharded_strategy(
+    backend: str = 'torch_dist', version: int = 1
+) -> SaveShardedStrategy:
+    return get_default_strategy(StrategyAction.SAVE_SHARDED, backend, version)
+
+
+def get_default_load_sharded_strategy(checkpoint_dir: str) -> LoadShardedStrategy:
+    return _verify_checkpoint_and_load_strategy(checkpoint_dir)
 
 
 # TODO: implement it as common torch strategy

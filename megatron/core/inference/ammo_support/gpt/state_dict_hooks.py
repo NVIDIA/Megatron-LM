@@ -7,15 +7,15 @@ import torch
 logger = getLogger(__name__)
 
 
-def mcore_gpt_load_classic_state_dict_pre_hook(
+def mcore_gpt_load_legacy_state_dict_pre_hook(
     state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs,
 ):
     """Register a pre-hook to fix the state_dict key difference.
 
-    This prehook is used when trying to load the classic Megatron-LM GPTModel into its
+    This prehook is used when trying to load the legacy Megatron-LM GPTModel into its
     megatron/core variant that uses native ParallelLinear and Transformer-Engine Norm.
     Only this particular spec supports post-training quantization and TensorRT-LLM
-    config export through `nvidia-ammo` package.
+    config export through `nvidia-modelopt` package.
 
     Args:
         state_dict: state dictionary
@@ -89,7 +89,7 @@ def mcore_gpt_load_te_state_dict_pre_hook(
     fused Transformer-Engine ParallelLinear into the variant that uses native ParallelLinear
     and Transformer-Engine Norm (effectively to restore the fusion).
     Only this particular spec supports post-training quantization and TensorRT-LLM
-    config export through `nvidia-ammo` package.
+    config export through `nvidia-modelopt` package.
 
     Args:
         state_dict: state dictionary

@@ -592,7 +592,14 @@ def save_checkpoint(queue, args):
                 if not hasattr(models[0], 'output_layer'):
                     print("ERROR: got an output layer, but model does not have one")
                     exit(1)
-                output_layer_weight = torch.chunk(msg.pop("weight"), args.target_tensor_parallel_size, dim=0)
+                output_layer_weight = msg.pop("weight")
+                orig_vocab_size = orig_word_embed.shape[0]
+                padding_size = margs.padded_vocab_size - orig_vocab_size
+                output_layer_weight = torch.cat((
+                    output_layer_weight,
+                    output_layer_weight[-1].unsqueeze(0).expand(padding_size, -1)
+                ))
+                output_layer_weight = torch.chunk(output_layer_weight, args.target_tensor_parallel_size, dim=0)
                 for tp_rank, model in enumerate(models):
                     setter.set_output_layer(model, output_layer_weight[tp_rank])
                 del output_layer_weight

@@ -73,6 +73,10 @@ class TransformerConfig(ModelParallelConfig):
     activation_func: Callable = F.gelu
     """Activation function to use for the non-linearity in the MLP."""
 
+    activation_func_fp8_input_store: bool = False
+    """Store the input of MLP activation function in FP8 for backprop to save memory.
+    The stored input is casted back to the original precision before backprop compuatation."""
+
     num_moe_experts: int = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
@@ -93,6 +97,10 @@ class TransformerConfig(ModelParallelConfig):
 
     test_mode: bool = False
     """Whether to run real-time tests."""
+
+    calculate_per_token_loss: bool = False
+    """Whether cross entropy loss is calculated over the actual number of non-padded tokens in the
+    global batch, versus the default behavior of assuming all tokens are non-padded."""
 
     ####################
     # initialization
@@ -204,6 +212,12 @@ class TransformerConfig(ModelParallelConfig):
     fp8_wgrad: bool = True
     """When set to False, override FP8 config options and do the wgrad computation in higher precision."""
 
+    fp8_dot_product_attention: bool = False
+    """When set to True, use the FP8 implementation of Dot Product Attention."""
+
+    fp8_multi_head_attention: bool = False
+    """When set to True, use the FP8 implementation of Multi Head Attention."""
+
     ####################
     # MoE related
     ####################
@@ -241,6 +255,18 @@ class TransformerConfig(ModelParallelConfig):
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
+    moe_expert_capacity_factor: float = None
+    """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token will be dropped. The default is None."""
+
+    moe_pad_expert_input_to_capacity: bool = False
+    """moe_pad_expert_input_to_capacity (bool): If True, pads the input for each expert to match the expert capacity length, effective only after the moe_expert_capacity_factor is set. The default setting is False."""
+
+    moe_token_drop_policy: str = 'probs'
+    """The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.
+    """
+    moe_layer_recompute: bool = False
+    """Memory optimization: checkpointing moe_layer to save actiavtion memory."""
+
     ####################
     # miscellaneous
     ####################
@@ -251,12 +277,8 @@ class TransformerConfig(ModelParallelConfig):
     disable_parameter_transpose_cache: bool = False
     """When set to true, the parameter transposes are not cached for subsequent iterations."""
 
-    # These 2 attributes are WAR for TRTLLM export. DO NOT USE!! WILL BE DEPRECATED SOON!!
-    max_position_embeddings: int = 0
-    """Deprecated. Do not use."""
-
-    rotary_percent: float = 0
-    """Deprecated. Do not use."""
+    enable_cuda_graph: bool = False
+    """When set to true, TransformerLayer blocks are wrapped with CUDA graph."""
 
     def __post_init__(self):
         """ Python dataclass method that is used to modify attributes after initialization.
@@ -297,6 +319,24 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError(f'num_moe_experts must be non-negative.')
+
+        if self.moe_expert_capacity_factor is not None:
+            if self.moe_token_dispatcher_type != "alltoall":
+                raise ValueError(
+                    f'moe_expert_capacity_factor only works with alltoall token dispatcher'
+                )
+            if self.moe_expert_capacity_factor < 0:
+                self.moe_expert_capacity_factor = None
+            if self.moe_router_load_balancing_type not in ["aux_loss", "none"]:
+                raise ValueError(
+                    f'moe_expert_capacity_factor only works with aux_loss or none load balancing'
+                )
+
+        if self.moe_pad_expert_input_to_capacity:
+            if self.moe_expert_capacity_factor is None:
+                raise ValueError(
+                    f'moe_expert_capacity_factor must be set to use moe_pad_expert_input_to_capacity'
+                )
 
         if self.cpu_offloading and (
             self.cpu_offloading_num_layers < 0 or self.cpu_offloading_num_layers >= self.num_layers
@@ -371,6 +411,9 @@ class TransformerConfig(ModelParallelConfig):
                     "When bias_activation_fusion is True, gated_linear_unit is False, "
                     "and activation function is gelu, add_bias_linear must also be True."
                 )
+        if self.activation_func_fp8_input_store:
+            if self.activation_func != F.silu or not self.gated_linear_unit:
+                raise ValueError("Storing activation input in FP8 is supported only for SwiGLU.")
         if self.apply_rope_fusion and self.rotary_interleaved:
             raise ValueError(f'rotary_interleaved does not work with apply_rope_fusion.')
 
@@ -381,3 +424,14 @@ class TransformerConfig(ModelParallelConfig):
             self.output_layer_init_method = scaled_init_method_normal(
                 self.init_method_std, self.num_layers
             )
+
+        if self.moe_extended_tp:
+            if self.moe_token_dispatcher_type != 'allgather':
+                raise ValueError(
+                    "Moe extended TP parallelism only applies to allgather based token dispatcher."
+                )
+            extended_tp_size = self.tensor_model_parallel_size * self.expert_model_parallel_size
+            if self.ffn_hidden_size % extended_tp_size != 0:
+                raise ValueError(
+                    f'ffn_hidden_size: {self.ffn_hidden_size} must be divisible by extended_tp_size {extended_tp_size}'
+                )

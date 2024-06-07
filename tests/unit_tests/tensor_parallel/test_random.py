@@ -1,6 +1,5 @@
 from megatron.core.tensor_parallel.random import CudaRNGStatesTracker
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.tensor_parallel.random import _CUDA_RNG_STATE_TRACKER
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed,get_cuda_rng_tracker
 from megatron.core.tensor_parallel.random import checkpoint
 from tests.unit_tests.test_utilities import Utils
 import pytest
@@ -30,7 +29,8 @@ def test_cuda_rng_states_tracker():
 def test_model_parallel_cuda_manual_seed():
     Utils.initialize_model_parallel(4,2)
     model_parallel_cuda_manual_seed(0)
-    assert(_CUDA_RNG_STATE_TRACKER.get_states()['model-parallel-rng'] is not None)
+    rng_tracker = get_cuda_rng_tracker()
+    assert(rng_tracker.get_states()['model-parallel-rng'] is not None)
     Utils.destroy_model_parallel()
 
 def test_checkpoint():

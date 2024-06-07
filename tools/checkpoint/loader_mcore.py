@@ -18,7 +18,7 @@ def add_arguments(parser):
                        help='Path to the vocab file. If specified will use this to get vocab size and '
                        'trim padding from the embedding table.')
     group.add_argument('--megatron-path', type=str, default=None,
-                       help='Base directory of deepspeed repository')
+                       help='Base directory of Megatron repository')
     group.add_argument('--position-embedding-type',
                        type=str,
                        default='learned_absolute',
