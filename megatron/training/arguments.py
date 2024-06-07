@@ -231,6 +231,13 @@ def validate_args(args, defaults={}):
         else:
             setattr(args, key, defaults[key])
 
+    if args.data_path is not None and args.split is None:
+        legacy_default_split_value = '969, 30, 1'
+        if args.rank == 0:
+            print('WARNING: Please specify --split when using --data-path. Using legacy default value '
+                  f'of "{legacy_default_split_value}"')
+        args.split = legacy_default_split_value
+
     # Batch size.
     assert args.micro_batch_size is not None
     assert args.micro_batch_size > 0
@@ -1411,7 +1418,7 @@ def _add_data_args(parser):
                        '(3) a list of prefixes e.g. prefix1 prefix2. '
                        'For (3), weights are inferred from the lengths of the contributing datasets. '
                        'This argument is exclusive to the other independent --*-data-path arguments.')
-    group.add_argument('--split', type=str, default='969, 30, 1',
+    group.add_argument('--split', type=str, default=None,
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
                        '`90,5,5` will use 90%% of data for training, 5%% for '
