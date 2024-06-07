@@ -4,7 +4,6 @@ import sys
 from argparse import Namespace
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines.mcore_engine import MCoreEngine
-from megatron.core.inference.engines.trt_llm_engine_wrapper import TRTLLMEngineWrapper
 from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.inference_model_wrappers.gpt.gpt_inference_wrapper import GPTInferenceWrapper
 from megatron.core.inference.inference_request import InferenceRequest
@@ -105,7 +104,7 @@ def add_text_generate_args(parser):
 def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngine:
     """Utility to get the relevant backend for running inference
 
-    This function will automatically chose the TRTLLMBackend when possible, and if not revert to Mcore backend if the user does not specify any backends. 
+    This function will automatically chose the TRTLLMBackend when possible, and if not revert to Mcore backend if the user does not specify any backends. TRT LLM Backend is not implmented yet. 
 
     Args:
         args (Namespace): The user arguments parsed from command line
@@ -116,12 +115,9 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
     """
     tokenizer = get_tokenizer()
 
-    if TRTLLMEngineWrapper.is_model_trt_llm_exportable(model):
-        return TRTLLMEngineWrapper(model, tokenizer)
-    else :
-        inference_wrapped_model = GPTInferenceWrapper(model, args)
-        text_generation_controller = SimpleTextGenerationController(inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer)
-        return MCoreEngine(text_generation_controller=text_generation_controller, max_batch_size=args.max_batch_size)
+    inference_wrapped_model = GPTInferenceWrapper(model, args)
+    text_generation_controller = SimpleTextGenerationController(inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer)
+    return MCoreEngine(text_generation_controller=text_generation_controller, max_batch_size=args.max_batch_size)
             
 def main():
     """Main program."""
