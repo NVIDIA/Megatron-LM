@@ -72,6 +72,7 @@ unit_tests-data:
     - when: always
 
 unit_tests-dist-checkpointing:
+  timeout: 1h
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
   tags:
     - 8xL40S
@@ -100,6 +101,7 @@ unit_tests-fusions:
     - when: always
 
 unit_tests-inference:
+  timeout: 1h
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
   tags:
     - 8xL40S
