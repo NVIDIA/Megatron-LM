@@ -30,7 +30,7 @@ class TestCIPipeline:
         expected_list = expected["values"]
         print(f"The list of expected values: {expected_list}")
         try:
-            actual_list = read_tb_logs_as_list(LOGS_DIR, metric_type)
+            actual_list = read_tb_logs_as_list(LOGS_DIR)[metric_type]
         except KeyError as e:
             raise KeyError(
                 f"Required metric {metric_type} not found in TB logs. Please make sure your model exports this metric as its required by the test case/golden values file"
@@ -72,7 +72,7 @@ class TestCIPipeline:
     # @TODO: This is inactive, do we want to activate it?
     def iteration_timing_node(self):
         expected_iteration_timing_avg = self.expected["train_step_timing_avg"]
-        iteration_time = read_tb_logs_as_list(LOGS_DIR, "iteration-time")
+        iteration_time = read_tb_logs_as_list(LOGS_DIR)["iteration-time"]
         idx = len(iteration_time) // 3
         iteration_time_avg = sum(iteration_time[idx:]) / len(iteration_time[idx:])
         assert (

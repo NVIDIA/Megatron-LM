@@ -25,7 +25,7 @@ TYPE_OF_TEST_TO_METRIC = {
 }
 
 
-def read_tb_logs_as_list(path, summary_name, index=0):
+def read_tb_logs_as_list(path, index=0):
     """Reads a TensorBoard Events file from the input path, and returns the
     summary specified as input as a list.
 
@@ -47,8 +47,13 @@ def read_tb_logs_as_list(path, summary_name, index=0):
     event_file = files[index]
     ea = event_accumulator.EventAccumulator(event_file, size_guidance=SIZE_GUIDANCE)
     ea.Reload()
-    summary = ea.Scalars(summary_name)
-    summary_list = [round(x.value, 5) for x in summary]
-    print(f"\nObtained the following list for {summary_name} ------------------")
-    print(summary_list)
-    return summary_list
+
+    summaries = {}
+    for scalar_name in ea.Tags()["scalars"]:
+        summaries[scalar_name] = [round(x.value, 5) for x in ea.Scalars(scalar_name)]
+
+        print(
+            f"\nObtained the following list for {summaries[scalar_name]} ------------------"
+        )
+    print(summaries)
+    return summaries
