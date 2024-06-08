@@ -25,7 +25,7 @@ def test_deallocate_output_tensor():
     out = torch.tensor([[1, 2, 3], [4, 5, 6]])
     schedule.deallocate_output_tensor(out)
     assert(out.nelement() == 6) 
-""" 
+
 def test_forward_backward_func_without_pipeline_parallel(mocker):
     from megatron.core.pipeline_parallel import get_forward_backward_func
 
@@ -56,18 +56,21 @@ def test_forward_backward_func_without_pipeline_parallel(mocker):
 
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
-        data_iterator=None,
+        data_iterator=range(0,100),
         model=[model],
         num_microbatches=4,
         seq_length=None,
         micro_batch_size=None,
-        forward_only=False) 
+        forward_only=True) 
     
+
     loss_reduced_expected = [{'loss_reduced': rank}, {'loss_reduced': rank}, {'loss_reduced': rank}, {'loss_reduced': rank}]
+    
     for i,j in zip(losses_reduced, loss_reduced_expected):
         print(losses_reduced)
         assert(i['loss_reduced'] == j['loss_reduced'])
     Utils.destroy_model_parallel() 
+
 
 def test_forward_backward_func_with_pipeline_parallel(mocker):
     from megatron.core.pipeline_parallel import get_forward_backward_func
@@ -96,14 +99,15 @@ def test_forward_backward_func_with_pipeline_parallel(mocker):
 
     config = ModelParallelConfig(
         pipeline_model_parallel_size = 4,
-        sequence_parallel = False
+        sequence_parallel = False,
+        pipeline_dtype=torch.float,
     )
+    config.hidden_size = hidden_size
     model.config = config
     
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
         data_iterator=None,
-        dtype=torch.float32,
         model=[model],
         num_microbatches= micro_batch_size,
         seq_length=sequence_length,
@@ -142,57 +146,62 @@ def test_forward_backward_func_with_interleaving(mocker):
     micro_batch_size = 8
     hidden_size = 256
 
+    config = ModelParallelConfig(
+        pipeline_model_parallel_size = 4,
+        sequence_parallel = False,
+        pipeline_dtype=torch.float,
+    )
+    config.hidden_size = hidden_size
+    model.config = config
+
     mocker.patch("megatron.core.pipeline_parallel.schedules.custom_backward", return_value=2)
 
     with pytest.raises(RuntimeError):
         model.model_type = ModelType.encoder_and_decoder
         forward_backward_func(
             forward_step_func=forward_step_func,
-            data_iterator=range(0,100),
-            dtype=torch.float32,
+            data_iterator=[range(0,100)],
             model=[model, model],
             num_microbatches= micro_batch_size,
-            tensor_shape=[sequence_length, micro_batch_size, hidden_size],
+            seq_length=sequence_length,
+            micro_batch_size=micro_batch_size, 
             decoder_seq_length=sequence_length,
-            sequence_parallel=False,
             forward_only=True)
-        
+ 
     with pytest.raises(RuntimeError):
         model.model_type = ModelType.encoder_or_decoder
         forward_backward_func(
             forward_step_func=forward_step_func,
-            data_iterator=range(0,100),
-            dtype=torch.float32,
+            data_iterator=[range(0,100)],
             model=[model, model],
             num_microbatches= micro_batch_size,
-            tensor_shape=[sequence_length, micro_batch_size, hidden_size],
+            seq_length=sequence_length,
+            micro_batch_size=micro_batch_size, 
             decoder_seq_length=256,
-            sequence_parallel=False,
             forward_only=True)
-
+     
     with pytest.raises(RuntimeError):
         model.model_type = ModelType.encoder_or_decoder
         forward_backward_func(
             forward_step_func=forward_step_func,
-            data_iterator=range(0,100),
-            dtype=torch.float32,
+            data_iterator=[range(0,100)],
             model=[model, model],
             num_microbatches= 7,
-            tensor_shape=[sequence_length, micro_batch_size, hidden_size],
+            seq_length=sequence_length,
+            micro_batch_size=micro_batch_size, 
             decoder_seq_length=512,
-            sequence_parallel=False,
             forward_only=True)    
 
+    
     model.model_type = ModelType.encoder_or_decoder
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
-        data_iterator=range(0,100),
-        dtype=torch.float32,
+        data_iterator=[range(0,100), range(0,100)],
         model=[model, model],
         num_microbatches= micro_batch_size,
-        tensor_shape=[sequence_length, micro_batch_size, hidden_size],
+        seq_length=sequence_length,
+        micro_batch_size=micro_batch_size, 
         decoder_seq_length=sequence_length,
-        sequence_parallel=True,
         forward_only=True) 
     
     loss_reduced_expected = [{'loss_reduced': rank}, {'loss_reduced': rank}, {'loss_reduced': rank}, {'loss_reduced': rank}]
@@ -200,5 +209,4 @@ def test_forward_backward_func_with_interleaving(mocker):
         print(losses_reduced)
         assert(i['loss_reduced'] == j['loss_reduced'])
 
-    Utils.destroy_model_parallel()  
-"""
+    Utils.destroy_model_parallel()    
