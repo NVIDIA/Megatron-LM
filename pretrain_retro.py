@@ -70,7 +70,10 @@ def model_provider(pre_process=True, post_process=True):
     """
 
     args = get_args()
-    provider = core_model_provider if (args.use_mcore_models and args.retro_add_retriever) else default_model_provider
+    if not args.use_legacy_models and args.retro_add_retriever:
+        provider = core_model_provider
+    else:
+        provider = default_model_provider
     model = provider(pre_process=pre_process, post_process=post_process)
     return model
 
@@ -149,7 +152,13 @@ def forward_step(data_iterator, model):
     timers('batch-generator').stop()
 
     # Model call.
-    if args.use_mcore_models:
+    if args.use_legacy_models:
+        forward_kwargs = {
+            "retriever_input_ids" : neighbor_tokens,
+            "retriever_position_ids" : neighbor_position_ids,
+            "retriever_attn_mask" : neighbor_attention_mask,
+        }
+    else:
         if args.retro_add_retriever:
             forward_kwargs = {
                 "context_input_ids" : neighbor_tokens,
@@ -158,13 +167,7 @@ def forward_step(data_iterator, model):
             }
         else:
             forward_kwargs = {}
-    else:
-        forward_kwargs = {
-            "retriever_input_ids" : neighbor_tokens,
-            "retriever_position_ids" : neighbor_position_ids,
-            "retriever_attn_mask" : neighbor_attention_mask,
-        }
-
+ 
     output_tensor = model(tokens, position_ids, attention_mask,
                           labels=labels, **forward_kwargs)
 

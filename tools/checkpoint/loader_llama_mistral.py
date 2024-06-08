@@ -478,7 +478,7 @@ def _load_checkpoint(queue, args):
 
     margs = validate_args(margs)
 
-    margs.use_mcore_models = False
+    margs.use_legacy_models = True
     margs.transformer_impl = args.loader_transformer_impl
 
     def check_for_arg(arg_name, default=None):

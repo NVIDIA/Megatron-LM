@@ -67,8 +67,7 @@ options=" \
     --save-interval 1000000 \
     --use-dist-ckpt \
     --load ${CHECKPOINT_LOAD_DIR}
-    --fp16 \
-    --use-mcore-models "
+    --fp16"
 
 # Precompile CUDA extentions
 python -c "import modelopt.torch.quantization.extensions as ext; print(ext.cuda_ext); print(ext.cuda_ext_fp8)"

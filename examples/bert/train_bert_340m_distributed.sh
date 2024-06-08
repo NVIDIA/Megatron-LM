@@ -46,7 +46,6 @@ TRAINING_ARGS=(
     --weight-decay 1e-2 
     --lr-warmup-fraction .01 
     --clip-grad 1.0 
-    --use-mcore-models
 )
 
 MODEL_PARALLEL_ARGS=(

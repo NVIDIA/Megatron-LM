@@ -383,7 +383,7 @@ def save_checkpoint(queue, args):
     validate_args(margs)
 
     # Use M-core models & unset loaded paths.
-    margs.use_mcore_models = True
+    margs.use_legacy_models = False
     margs.blendable_index_path = None
     margs.data_path = []
     margs.load = None
