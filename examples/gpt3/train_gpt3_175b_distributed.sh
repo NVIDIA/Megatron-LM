@@ -49,7 +49,6 @@ TRAINING_ARGS=(
     --min-lr 6.0e-6
     --lr-warmup-fraction .001 
     --lr-decay-iters 430000 
-    --use-mcore-models
 )
 
 MODEL_PARALLEL_ARGS=(

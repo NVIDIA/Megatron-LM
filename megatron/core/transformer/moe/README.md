@@ -126,7 +126,6 @@ DISTRIBUTED_ARGS=(
 )
 
 MODEL_ARGS=(
-    --use-mcore-models
     --disable-bias-linear
     --seq-length 4096
     --max-position-embeddings 32768

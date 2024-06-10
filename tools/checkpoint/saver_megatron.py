@@ -165,7 +165,7 @@ def save_checkpoint(queue, args):
     validate_args(margs)
 
     # Use MLM models.
-    margs.use_mcore_models = False
+    margs.use_legacy_models = True
     margs.transformer_impl = args.saver_transformer_impl
 
     # Do not instantiate Tensorboard

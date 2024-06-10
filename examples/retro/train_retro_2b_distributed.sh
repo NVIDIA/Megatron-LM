@@ -65,7 +65,6 @@ EVAL_AND_LOGGING_ARGS=(
 
 TRAINING_ARGS=" \
     --retro-project-dir ${RETRO_PROJECT_DIR} \
-    --use-mcore-models \
     --transformer-impl transformer_engine \
     --num-workers 8 \
     --micro-batch-size 4 \
