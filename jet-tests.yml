@@ -5,6 +5,11 @@
     - if: $JET_CUSTOM_FILTER != "" && $CI_PIPELINE_SOURCE != 'merge_request_event'
     - when: never
 
+default:
+  id_tokens:
+    VAULT_JWT_TOKEN:
+      aud: https://stg.vault.nvidia.com
+
 include:
   - project: dl/jet/gitlab-templates
     ref: main
@@ -62,7 +67,7 @@ jet-results-summary:
     - os/linux
   needs: [ jet-trigger ]
   before_script:
-    - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $CI_JOB_JWT
+    - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $VAULT_JWT_TOKEN
   script: 
     - python -m pip install -U --no-cache-dir prettytable
     - rc=0
