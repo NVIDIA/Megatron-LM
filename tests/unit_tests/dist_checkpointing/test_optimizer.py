@@ -1,6 +1,8 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+from copy import deepcopy
 from functools import partial
 from time import sleep
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -26,6 +28,7 @@ from megatron.core.optimizer import DistributedOptimizer, OptimizerConfig, \
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import get_model_config
+from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.training import get_model
 from megatron.training.utils import unwrap_model
 from pretrain_gpt import model_provider
@@ -105,20 +108,53 @@ def initialize_gpt_model(pre_process=True, post_process=True, seed=0, **config_k
     return model
 
 
-def init_mock_args(args, bf16=True):
+def init_basic_mock_args(args, bf16=True):
     args.data_parallel_random_init = False
     args.virtual_pipeline_model_parallel_size = None
+    args.fp16 = False
     args.bf16 = bf16
     args.accumulate_allreduce_grads_in_fp32 = False
     args.overlap_grad_reduce = False
     args.use_distributed_optimizer = True
     args.ddp_bucket_size = None
+    args.check_for_nan_in_loss_and_grad = False
+    args.ddp_average_in_collective = False
     return args
 
 
+def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
+    args.save = ckpt_dir
+    args.load = ckpt_dir
+    args.pretrained_checkpoint = None
+    args.ckpt_fully_parallel_save = fully_parallel
+    args.ckpt_fully_parallel_load = fully_parallel
+    args.async_save = False
+    args.use_dist_ckpt = True
+    args.dist_ckpt_format = 'torch_dist'
+    args.no_save_optim = False
+    args.no_save_rng = False
+    args.ckpt_assume_constant_structure = False
+    args.log_progress = False
+    args.auto_detect_ckpt_format = False
+    args.exit_on_missing_checkpoint = False
+    args.finetune = False
+    args.consumed_train_samples = 0
+    args.consumed_valid_samples = 0
+    args.retro_add_retriever = False
+    args.no_load_optim = False
+    args.no_load_rng = False
+
+
+def load_checkpoint_no_arg_checks(*args, **kwargs):
+    with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
+        with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
+            return load_checkpoint(*args, **kwargs)
+
+
 def setup_model_and_optimizer(seed, bf16=True):
-    with mock.patch('megatron.training.training.get_args', data_parallel_random_init=False) as mock_args:
-        init_mock_args(mock_args.return_value, bf16)
+    mock_args = SimpleNamespace()
+    with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
+        init_basic_mock_args(mock_args, bf16=bf16)
         model = get_model(partial(initialize_gpt_model, seed=seed))
 
     config = OptimizerConfig(bf16=bf16, params_dtype=torch.bfloat16 if bf16 else torch.float, use_distributed_optimizer=bf16)
@@ -203,6 +239,69 @@ class TestDistributedOptimizer:
                     sleep(20)
             finally:
                 Utils.set_world_size()
+
+    @pytest.mark.parametrize(
+        ('src_tp_pp', 'dest_tp_pp',),
+        [
+            ((2, 2), (2, 4)),
+            ((1, 8), (4, 1)),
+            ((2, 4), (4, 2)),
+        ]
+    )
+    def test_finetune_doesnt_load_optimizer(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp,):
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_finetune_doesnt_load_optimizer') as ckpt_dir:
+            mock_args = SimpleNamespace()
+            with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
+                init_basic_mock_args(mock_args)
+                init_checkpointing_mock_args(mock_args, ckpt_dir, False)
+
+                Utils.initialize_model_parallel(*src_tp_pp)
+                model, optimizer = setup_model_and_optimizer(seed=2)
+
+                # We need to save the TPxPP of the source model
+                mock_args.tensor_model_parallel_size = src_tp_pp[0]
+                mock_args.pipeline_model_parallel_size = src_tp_pp[1]
+                save_checkpoint(10, model, optimizer, None, 0)
+                Utils.destroy_model_parallel()
+
+                Utils.initialize_model_parallel(*dest_tp_pp)
+                model, optimizer = setup_model_and_optimizer(seed=3)
+                model_unloaded_state_dict = deepcopy(model[0].state_dict())
+                optim_unloaded_state_dict = deepcopy(optimizer.state_dict())
+
+                # Load with different TPxPP should raise DistributeOptimizer error
+                with pytest.raises(RuntimeError) as exc_info:
+                    load_checkpoint_no_arg_checks(model, optimizer, None)
+                assert "(TP, PP) mismatch" in str(exc_info.value)
+
+                ## Check that the state didn't change
+                assert not any(diff(model[0].state_dict(), model_unloaded_state_dict))
+                assert not any(diff(optimizer.state_dict(), optim_unloaded_state_dict))
+
+                # Now test the same with a `finetune` flag
+                mock_args.finetune = True
+                load_checkpoint_no_arg_checks(model, optimizer, None)
+
+                ## Model weights should be different, but optimizer state is unchanged
+                diffs = diff(model[0].state_dict(), model_unloaded_state_dict)
+                # diffs[0] and diffs[1] is structural diff, diffs[2] is values diff - we expect only values diff
+                assert not diffs[0] and not diffs[1] and diffs[2]
+                assert not any(diff(optimizer.state_dict(), optim_unloaded_state_dict))
+
+                # ... or `no_load_optim` flag
+                model, optimizer = setup_model_and_optimizer(seed=3)
+                mock_args.finetune = False
+                mock_args.no_load_optim = True
+                mock_args.no_load_rng = True
+                load_checkpoint_no_arg_checks(model, optimizer, None)
+
+                ## Model weights should be different, but optimizer state is unchanged
+                diffs = (diff(model[0].state_dict(), model_unloaded_state_dict))
+                # diffs[0] and diffs[1] is structural diff, diffs[2] is values diff - we expect only values diff
+                assert not diffs[0] and not diffs[1] and diffs[2]
+                assert not any(diff(optimizer.state_dict(), optim_unloaded_state_dict))
+
+                Utils.destroy_model_parallel()
 
 
 class TestFP32Optimizer:
