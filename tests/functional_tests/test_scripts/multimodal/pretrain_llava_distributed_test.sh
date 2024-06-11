@@ -33,7 +33,7 @@ TRANSFORMER_IMPL=local
 if [[ $ALLOW_NONDETERMINISTIC -eq 1 ]]; then
    command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1;"
 else
-   command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0; export NCCL_ALGO=^NVLS;"
+   command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0; export NCCL_ALGO=Tree;"
    ADDITIONAL_PARAMS+=" --deterministic-mode"
 fi
 
@@ -70,9 +70,9 @@ else
        __SAVE_INTERVAL=10000  # inf
 fi
 if [[ -n "$CKPT_FORMAT" ]] && [[ "$CKPT_FORMAT" != 'torch' ]]; then
-       echo "Using distributed checkpoint format..."
-       command="$command pip install zarr tensorstore==0.1.45;"
-       ADDITIONAL_PARAMS+=" --use-dist-ckpt --dist-ckpt-format $CKPT_FORMAT"
+       echo "Using distributed checkpoint format $CKPT_FORMAT..."
+       [[ "$CKPT_FORMAT" == 'zarr' ]] && command="$command pip install zarr tensorstore==0.1.45;"
+       ADDITIONAL_PARAMS+=" --use-dist-ckpt --dist-ckpt-format $CKPT_FORMAT --use-mcore-models"
 fi
 set +x
 
@@ -83,6 +83,8 @@ build_torch_run_cmd() {
     pretrain_vlm.py \
       --num-layers 12 \
       --hidden-size 512 \
+      --attention-dropout 0.0 \
+      --hidden-dropout 0.0 \
       --num-attention-heads 8 \
       --log-params-norm \
       --log-num-zeros-in-grad \

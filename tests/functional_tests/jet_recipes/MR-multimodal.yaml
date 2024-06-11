@@ -27,6 +27,7 @@ spec:
   time_limit: 1200
   ckpt_format: torch
   ckpt_resume: 0
+  allow_nondeterministic: 0
   script: |-
     ls
     cd /workspace/megatron-lm
@@ -46,6 +47,7 @@ spec:
         MOE_GROUPED_GEMM={moe_grouped_gemm} \
         CKPT_FORMAT={ckpt_format} \
         CHECKPOINT_RESUME_TEST={ckpt_resume} \
+        ALLOW_NONDETERMINISTIC={allow_nondeterministic} \
         JOB_NAME={name} \
         ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'}
 products:
