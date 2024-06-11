@@ -1,5 +1,6 @@
 import enum
 import glob
+import json
 import os
 
 from tensorboard.backend.event_processing import event_accumulator
@@ -21,9 +22,15 @@ class TypeOfTest(enum.Enum):
 
 TYPE_OF_TEST_TO_METRIC = {
     TypeOfTest.DETERMINISTIC: ["lm loss", "num-zeros"],
-    TypeOfTest.APPROX: ["num-zeros"],
+    TypeOfTest.APPROX: ["lm loss"],
 }
 
+METRIC_TO_THRESHOLD = {
+    "lm loss": 0.05,
+}
+
+ALLOW_NONDETERMINISTIC = bool(int(os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO")))
+LOGS_DIR = os.getenv("LOGS_DIR")
 
 def read_tb_logs_as_list(path, index=0):
     """Reads a TensorBoard Events file from the input path, and returns the
@@ -38,10 +45,12 @@ def read_tb_logs_as_list(path, index=0):
     """
     files = glob.glob(f"{path}/events*tfevents*")
     files += glob.glob(f"{path}/results/events*tfevents*")
+
     if not files:
         raise FileNotFoundError(
             f"File not found matching: {path}/events* || {path}/results/events*"
         )
+    
     files.sort(key=lambda x: os.path.getmtime(os.path.join(path, x)))
 
     event_file = files[index]
@@ -57,3 +66,14 @@ def read_tb_logs_as_list(path, index=0):
         )
     print(summaries)
     return summaries
+
+
+def load_expected_data():
+    expected_metrics_file = os.getenv("EXPECTED_METRICS_FILE")
+
+    with open(expected_metrics_file) as f:
+        if os.path.exists(expected_metrics_file):
+            with open(expected_metrics_file) as f:
+                return json.load(f)
+        else:
+            print(f"File {expected_metrics_file} not found!")
