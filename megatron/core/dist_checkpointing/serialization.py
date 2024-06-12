@@ -476,26 +476,12 @@ def _validate_sharding_for_key(rank_sharding: List[Tuple[int, ShardedTensor]]):
 
 
 def _compute_shards_access(rank_sharding):
-    def chunk_offset(sharding):
-        assert len(sharding.global_offset) == len(sharding.local_shape) + sharding.prepend_axis_num
-        return tuple(
-            chain(
-                (off for off in sharding.global_offset[: sharding.prepend_axis_num]),
-                (
-                    off // sh
-                    for off, sh in zip(
-                        sharding.global_offset[sharding.prepend_axis_num :], sharding.local_shape
-                    )
-                ),
-            )
-        )
-
     shard_access_cnt = torch.zeros(
         rank_sharding[0][1].axis_fragmentations, dtype=torch.int, device='cpu'
     )
     for rank, sharding in rank_sharding:
         if is_main_replica(sharding.replica_id):
-            shard_access_cnt[chunk_offset(sharding)] += 1
+            shard_access_cnt[sharding.local_chunk_offset_in_global()] += 1
         # TODO: consider validating different replicas too
     return shard_access_cnt
 
