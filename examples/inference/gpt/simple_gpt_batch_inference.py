@@ -45,7 +45,17 @@ def model_provider(pre_process=True, post_process=True) -> Union[LegacyGPTModel,
     print_rank_0('building GPT model ...')
     config = core_transformer_config_from_args(args)
 
-    if args.use_mcore_models:
+    if args.use_legacy_models:
+        assert(args.context_parallel_size == 1), "Context parallelism is only supported with Megatron Core!"
+
+        model = LegacyGPTModel(
+            config,
+            num_tokentypes=0,
+            parallel_output=False, 
+            pre_process=pre_process,
+            post_process=post_process
+        )
+    else:
         if args.spec is not None:
             transformer_layer_spec = import_module(args.spec)
         else:
@@ -66,16 +76,6 @@ def model_provider(pre_process=True, post_process=True) -> Union[LegacyGPTModel,
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent
-        )
-    else:
-        assert(args.context_parallel_size == 1), "Context parallelism is only supported with Megatron Core!"
-
-        model = LegacyGPTModel(
-            config,
-            num_tokentypes=0,
-            parallel_output=False, 
-            pre_process=pre_process,
-            post_process=post_process
         )
 
     return model
