@@ -1,13 +1,16 @@
-## StragglerDetector
+## StragglerDetector for a TP Group
 
-The file `megatron/core/utils.py` has a class named `StragglerDetector` which supports Python Contexts
+The file `megatron/core/utils.py` has a class named `StragglerDetector` which supports Python Contexts.
+It can be used to find straggling TP group based on the RTT of the ranks in the TP Group. It also collects
+Power/Temp/Utilization for GPUs, which can additionally be used to narrow down to the exact GPU in the TP Group,
+assuming the straggling was caused by hardware anomaly in a given GPU.<br>
 This class supports collecting timing events for various steps of a given iteration. It
 keeps collecting such timing events on a per rank basis, and when the reporter is invoked
 during a logging interval, it computes the min and max of certain metric across all
 ranks and logs the observed metric and the rank as follows
 
 ```
- 0: INFO:megatron.core.utils:[2024-03-14 23:07:56] | MnRtt/Rnk: 3453.08ms/8 | MxRtt/Rnk: 3468.20ms/0 | MnPwr/Rnk: 601796W/8 | MxPwr/Rnk: 683801W/18 | MnTmp/Rnk: 52C/0 | MxTmp/Rnk: 65C/21 | MnUtl/Rnk: 97%/8 | MxUtl/Rnk: 100%/6 | MnClk/Rnk: 1950MHz/28 | MxClk/Rnk: 1980MHz/0 | MnDRtt/Rnk: 14.27us/23 | MxDRtt/Rnk: 34.65us/3 | MnEtpt/Rnk: 296.02TF/0 | MxEtpt/Rnk: 297.32TF/8
+ 0: INFO:megatron.core.utils:[2024-03-14 23:07:56] | MnRtt/Rnk: 3453.08ms/8 | MxRtt/Rnk: 3468.20ms/0 | MnPwr/Rnk: 601796W/8 | MxPwr/Rnk: 683801W/18 | MnTmp/Rnk: 52C/0 | MxTmp/Rnk: 65C/21 | MnUtl/Rnk: 97%/8 | MxUtl/Rnk: 100%/6 | MnClk/Rnk: 1950MHz/28 | MxClk/Rnk: 1980MHz/0 | MnDRtt/Rnk: 14.27ms/23 | MxDRtt/Rnk: 34.65ms/3 | MnEtpt/Rnk: 296.02TF/0 | MxEtpt/Rnk: 297.32TF/8
 ```
 <hr>
 
