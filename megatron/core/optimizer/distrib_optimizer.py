@@ -4,6 +4,7 @@
 
 
 import itertools
+from dataclasses import replace
 from logging import getLogger
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -12,7 +13,15 @@ from apex.optimizers import FusedAdam as Adam
 
 from .. import parallel_state, tensor_parallel
 from ..dist_checkpointing import ShardedTensor
-from ..dist_checkpointing.mapping import LocalNonpersitentObject, ShardedObject, ShardedStateDict
+from ..dist_checkpointing.dict_utils import nested_values
+from ..dist_checkpointing.mapping import (
+    LocalNonpersitentObject,
+    ShardedObject,
+    ShardedStateDict,
+    ShardedTensorFactory,
+)
+from ..dist_checkpointing.optimizer import get_param_id_to_sharded_param_map
+from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
 from ..distributed import ParamAndGradBuffer, shard_buffer
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper
@@ -651,6 +660,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 self.load_parameter_state_from_dp_zero(param_state)
             elif sharding_type == 'fully_sharded_bucket_space':
                 self.load_parameter_state_from_fs_bucket_space(param_state)
+            elif sharding_type == 'fully_sharded_model_space':
+                self.load_parameter_state_from_fs_model_space(param_state)
             else:
                 raise NotImplementedError(f'Unknown sharding_type: {sharding_type}')
 
@@ -828,24 +839,33 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self,
         model_sharded_state_dict: ShardedStateDict,
         is_loading: bool = False,
-        sharding_type: str = 'fully_sharded_bucket_space',
+        sharding_type: str = 'fully_sharded_model_space',
     ):
         """
         Chooses between 3 param state sharding implementations as requested by `sharding_type`.
 
         Regular state dict parameters are saved on DP rank 0 and loaded on all ranks.
         """
-
-        state_dict = {
-            k: ShardedObject(
-                f'optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}.{k}',
-                v,
-                (1,),
-                (0,),
-                replica_id=torch.distributed.get_rank(self.data_parallel_group),
+        if not is_loading and sharding_type == 'fully_sharded_bucket_space':
+            logger.warning(
+                '`fully_sharded_bucket_space` sharding for DistributedOptimizer'
+                ' checkpoint is deprecated and will be removed in the future.'
+                ' Please switch to `full_sharded_model_space`.'
             )
-            for k, v in self.state_dict().items()
-        }
+
+        state_dict = self.state_dict()
+        if sharding_type != 'fully_sharded_model_space':
+            # State dict differs between different model parallel groups
+            state_dict = {
+                k: ShardedObject(
+                    f'optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}.{k}',
+                    v,
+                    (1,),
+                    (0,),
+                    replica_id=torch.distributed.get_rank(self.data_parallel_group),
+                )
+                for k, v in state_dict.items()
+            }
 
         if is_loading:
             self.init_state_fn(self.optimizer)
@@ -857,14 +877,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         elif sharding_type == 'dp_zero_gather_scatter':
             param_state = self.sharded_param_state_dp_zero(model_sharded_state_dict, is_loading)
         elif sharding_type == 'fully_sharded_model_space':
-            # In this approach the tensors could be directly related to model parameters
-            # by linking them with metadata from `model_sharded_state_dict`.
-            # This would allow changing TP and PP while using DistOpt (as with other optimizers).
-            # This implementation is more involved and left out for now.
-            raise NotImplementedError(
-                f'The fully sharded model space version for'
-                f' {self.__class__.__name__}.sharded_state_dict'
-                f' not implemented.'
+            param_state = self.sharded_param_state_fs_model_space(
+                model_sharded_state_dict, is_loading
             )
         else:
             raise NotImplementedError(f'Unknown sharding_type: {sharding_type}')
@@ -985,11 +999,81 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             )
         return state
 
+    def sharded_param_state_fs_model_space(
+        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
+    ):
+        """Sharded state dict where each buffer is mapped to corresponding model param.
+
+        In this approach the optimizer state tensors are directly related to model parameters
+        by linking them with metadata from `model_sharded_state_dict`.
+        This will allow changing TP and PP while using DistOpt (as with other optimizers).
+        """
+
+        param_to_sharded_metadata = {}
+        model_sharded_state_dict, _ = extract_sharded_tensors_and_factories(
+            model_sharded_state_dict
+        )
+        for sh_base in nested_values(model_sharded_state_dict):
+            param_to_sharded_metadata[sh_base.data] = sh_base
+
+        prefix = 'optimizer.state'
+        state = {}
+        param_idx = 0  # this is not stored in the checkpoint, used only to identify params in `sharded_param_state_fs_model_space`
+        for gbuf_range_maps in self.gbuf_ranges:
+            for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
+                for gbuf_range_map in gbuf_range_map_for_all_buckets:
+                    for model_param, param_range_map in gbuf_range_map["param_map"].items():
+                        group_index, group_order = self.model_param_group_index_map[model_param]
+                        param_range = param_range_map['param']
+
+                        main_param = self.optimizer.param_groups[group_index]["params"][group_order]
+                        optim_state = self.optimizer.state[main_param]
+
+                        tensors = {
+                            "fp32_param": main_param,
+                            **optim_state,
+                        }
+                        # Match optimizer parameter with model ShardedTensor (or ShardedTensorFactory)
+                        try:
+                            sharded_metadata = param_to_sharded_metadata[model_param]
+                        except KeyError as e:
+                            raise ValueError(
+                                f'Model param {model_param} not in model_sharded_state_dict'
+                            ) from e
+
+                        # Set DP corresponding replica_id coordinate to 0
+                        assert (
+                            len(sharded_metadata.replica_id) == 3
+                        ), f'Expected replica_id format (PP, TP, DP), got: {sharded_metadata}'
+                        replica_id = (*sharded_metadata.replica_id[:2], 0)
+
+                        # Instantiate ShardedTensor (or ShardedTensorFactory) for optimizer params
+                        for state_key, state_ten in tensors.items():
+                            replace_kwargs = dict(
+                                key=f'{prefix}.{state_key}.{sharded_metadata.key}',
+                                data=state_ten,
+                                dtype=state_ten.dtype,
+                                flattened_range=slice(param_range.start, param_range.end),
+                                replica_id=replica_id,
+                            )
+                            if isinstance(sharded_metadata, ShardedTensorFactory):
+                                replace_kwargs.pop('dtype')
+                            tensors[state_key] = replace(sharded_metadata, **replace_kwargs)
+                            tensors[state_key].validate_metadata_integrity()
+                        state[param_idx] = tensors
+                        param_idx += 1
+        return state
+
     def load_parameter_state_from_fs_bucket_space(self, state_dict):
         """ Loads the parameter state from an internal representation.
 
-        Inverse of the `get_parameter_state_internal_repr` method.
+        Inverse of the `get_parameter_state_fs_bucket_space` method.
         """
+        logger.warning(
+            '`fully_sharded_bucket_space` sharding for DistributedOptimizer'
+            'checkpoint is deprecated. Please switch to `full_sharded_model_space`'
+        )
+
         if state_dict is not None and "per_bucket_numel_unpadded" in state_dict:
             per_bucket_numel_unpadded_in_checkpoint = state_dict["per_bucket_numel_unpadded"]
             assert self.per_bucket_numel_unpadded == per_bucket_numel_unpadded_in_checkpoint, (
@@ -1023,6 +1107,30 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         }
                         for key in dst_tensors:
                             dst_tensors[key].copy_(src_tensors[key])
+
+    def load_parameter_state_from_fs_model_space(self, state_dict):
+        """Loads the parameter state from a "model space" representation.
+
+        Inverse of the `sharded_param_state_fs_model_space` method.
+        """
+        param_idx = 0  # matching order with `sharded_param_state_fs_model_space`
+        for gbuf_range_maps in self.gbuf_ranges:
+            for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
+                for gbuf_range_map in gbuf_range_map_for_all_buckets:
+                    for model_param, param_range_map in gbuf_range_map["param_map"].items():
+                        group_index, group_order = self.model_param_group_index_map[model_param]
+                        main_param = self.optimizer.param_groups[group_index]["params"][group_order]
+                        optim_state = self.optimizer.state[main_param]
+
+                        src_tensors = state_dict[param_idx]
+                        dst_tensors = {
+                            "fp32_param": main_param,
+                            **optim_state,
+                        }
+                        for key in dst_tensors:
+                            dst_tensors[key].copy_(src_tensors[key])
+
+                        param_idx += 1
 
     def load_parameter_state_from_dp_zero(self, state_dict):
         """Load parameter state (i.e., parameter & optimizer tensors) from DP 0 rank,

@@ -324,7 +324,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
 
         optim_sd_kwargs = {}
         if args.use_dist_ckpt and args.use_distributed_optimizer:
-            optim_sd_kwargs['sharding_type'] = ('fully_sharded_bucket_space'
+            optim_sd_kwargs['sharding_type'] = ('fully_sharded_model_space'
                                                 if args.ckpt_fully_parallel_save
                                                 else 'dp_zero_gather_scatter')
             print_rank_0(f'Storing distributed optimizer sharded state of type {optim_sd_kwargs["sharding_type"]}')
@@ -745,9 +745,16 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
 
 
                 if args.use_distributed_optimizer:
-                    optim_sd_kwargs['sharding_type'] = ('fully_sharded_bucket_space'
+                    optim_sd_kwargs['sharding_type'] = ('fully_sharded_model_space'
                                                         if getattr(state_dict['args'], 'ckpt_fully_parallel_save', False)
                                                         else 'dp_zero_gather_scatter')
+                    # This is for backwards-compatibility. Can be removed once 'fully_sharded_bucket_space' loading is removed
+                    for maybe_dist_opt_optim_state in (state_dict['optimizer'], *state_dict['optimizer'].values()):
+                        if 'param_state_sharding_type' in maybe_dist_opt_optim_state:
+                            if maybe_dist_opt_optim_state['param_state_sharding_type'] == 'fully_sharded_bucket_space':
+                                print_rank_0('Detected deprecated `fully_sharded_bucket_space` DistributedOptimizer checkpoint format')
+                                optim_sd_kwargs['sharding_type'] = maybe_dist_opt_optim_state['param_state_sharding_type']
+                            break
             else:
                 gen_sd_optim = None
                 gen_sd_opt_param_scheduler = None
