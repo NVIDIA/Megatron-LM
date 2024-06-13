@@ -42,7 +42,7 @@ class MCoreEngine(AbstractEngine):
             common_inference_params (CommonInferenceParams): The inference parameters
 
         Returns:
-            dict: The output dictionary containing the generated tokens, texts and log probs if required
+            List[InferenceRequest]: The output is list of inference requests containing the generated tokens, texts and log probs if required
         """
         # TODO :M core- get rng state tracker
         if self.random_seed:

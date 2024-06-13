@@ -30,7 +30,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, g
 def model_provider(pre_process=True, post_process=True) -> Union[LegacyGPTModel, GPTModel]:
     """Builds the model.
 
-    If you set the use_mcore_models to True, it will return the mcore GPT model and if not the legacy GPT model.
+    If you set the use_legacy_models to True, it will  use the legacy GPT model and if not by default it will use the mcore GPT model. 
 
     Args:
         pre_process (bool, optional): Set to true if you need to compute embeddings. Defaults to True.

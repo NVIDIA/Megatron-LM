@@ -41,7 +41,7 @@ NOTE: The model provider function in the script supports MCore and Legacy models
 ```
 
 ***STEP 3 - Choose an engine***
-One of the important elements of the generate function is an inference engine. In this example we will be choosing the [megatron core engine](../../megatron/core/inference/engine/mcore_engine.py) with a [simple text generation controller](../../megatron/core/inference/text_generation_controllers/simple_text_generation_controller.py), the default engine. Other engines that will be supported are [TRTLLMEngine](../../megatron/core/inference/engine/trt_llm_engine_wrapper.py)).
+One of the important elements of the generate function is an inference engine. In this example we will be choosing the [megatron core engine](../../megatron/core/inference/engine/mcore_engine.py) with a [simple text generation controller](../../megatron/core/inference/text_generation_controllers/simple_text_generation_controller.py), the default engine. Other engines that will be supported in the future are TRTLLMEngine.
 ```python
     inference_wrapped_model = GPTInferenceWrapper(model, args)
     text_generation_controller = SimpleTextGenerationController(

@@ -1,7 +1,7 @@
 import abc
 import math
 from argparse import Namespace
-from typing import Iterable, List
+from typing import Iterable, List, Union
 
 import torch
 
@@ -12,17 +12,19 @@ from megatron.core.inference.communication_utils import (
     send_to_next_pipeline_rank,
 )
 from megatron.core.inference_params import InferenceParams
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.legacy.model.gpt_model import GPTModel as LegacyGPTModel
 
 
 class AbstractModelInferenceWrapper(abc.ABC):
-    def __init__(self, model, args: Namespace):
+    def __init__(self, model: Union[LegacyGPTModel, GPTModel], args: Namespace):
         """Constructor for the model inference wrapper
 
         The wrapper prepares the model for inference, provides the required input data and runs the forward pass.
 
         Args:
-            model (Union[GPTModel, megatron.model.GPTModel]): The actual GPT model (MCore or MLM)
-            args (Namespace): The command line arguments that were passed
+            model (Union[GPTModel, LegacyGPTModel]): The actual GPT model (MCore or MLM)
+            args (Namespace): The commadline arguments that were passed
         """
         assert not isinstance(
             model, Iterable
