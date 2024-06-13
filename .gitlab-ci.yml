@@ -107,6 +107,7 @@ unit_tests-inference:
     - 8xL40S
   stage: test
   script:
+    - export CUDA_DEVICE_MAX_CONNECTIONS=1
     - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/inference
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'

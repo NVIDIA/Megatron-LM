@@ -65,7 +65,7 @@ class TestTextGenerationController:
 
     
         last_token_logits = torch.arange(0, self.vocab_size).repeat(self.batch_size,1).float().cuda()
-        sampled_logits = self.text_generation_controller.sample_from_logits(last_token_logits, CommonInferenceParams(), self.vocab_size)
+        sampled_logits = self.text_generation_controller.sample_from_logits(last_token_logits, CommonInferenceParams(top_k=1), self.vocab_size)
         assert torch.all(sampled_logits.cpu() == torch.ones(self.batch_size) * self.vocab_size - 1), f"The sampled logits should all be {self.vocab_size} but its {sampled_logits}"
 
         sampled_logits = self.text_generation_controller.sample_from_logits(last_token_logits, CommonInferenceParams(top_k=2), self.vocab_size)
