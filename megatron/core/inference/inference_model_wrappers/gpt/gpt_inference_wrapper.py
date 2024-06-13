@@ -13,18 +13,18 @@ class GPTInferenceWrapper(AbstractModelInferenceWrapper):
     def __init__(self, model: GPTModel, args: Namespace):
         """Constructor for the model inference wrapper
 
-        The wrapper is in charge of preparing the model for inference, providing the required in put data and running the forward passf
+        The wrapper prepares the model for inference, provides the required input data, and runs the forward pass
 
         Args:
-            model (GPTModel): The actual GPT model (MCore or MLM)
-            args (Namespace): The commadline arguments that were passed
+            model (GPTModel): The GPT model (MCore or legacy)
+            args (Namespace): The command line arguments that were passed
         """
         super().__init__(model, args)
 
     def prep_model_for_inference(self, prompts_tokens: torch.Tensor):
         """A utility function for preparing model for inference
 
-        The function gets called before you get the inference data and running forward pass. Use it to put the model in eval mode, build position ids ,attention mask etc, so that required slices can be extracted during the forward pass. 
+        This function is called before the forward pass. It puts the model in eval mode, builds position ids, and creates attention masks so that required slices can be extracted during the forward pass. 
 
         Args:
             prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_seq_len]

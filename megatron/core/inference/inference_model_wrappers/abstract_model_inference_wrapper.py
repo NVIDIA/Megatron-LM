@@ -18,11 +18,11 @@ class AbstractModelInferenceWrapper(abc.ABC):
     def __init__(self, model, args: Namespace):
         """Constructor for the model inference wrapper
 
-        The wrapper is in charge of preparing the model for inference, providing the required in put data and running the forward pass
+        The wrapper prepares the model for inference, provides the required input data and runs the forward pass.
 
         Args:
             model (Union[GPTModel, megatron.model.GPTModel]): The actual GPT model (MCore or MLM)
-            args (Namespace): The commadline arguments that were passed
+            args (Namespace): The command line arguments that were passed
         """
         assert not isinstance(
             model, Iterable

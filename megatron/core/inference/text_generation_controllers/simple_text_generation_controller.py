@@ -25,7 +25,7 @@ class SimpleTextGenerationController:
         self.inference_wrapped_model = inference_wrapped_model
         self.tokenizer = tokenizer
 
-        # Only for TP models both is_first_stage and is_large_stage returns True
+        # For models without pipeline parallelism, is_first_stage and is_last_stage returns True
         self.model_is_pipeline_parallel = not (
             parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
         )
@@ -138,14 +138,14 @@ class SimpleTextGenerationController:
         is_generation_done_tensor: torch.Tensor,
         generated_sequence_lengths: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Function to check which prompts have reached an end condition
+        """Checks which prompts have reached an end condition
 
-        We check which prompts have reached an end condition and set the corresponding flags of the is_generation_done_tensor to True . The generated sequence lengths increases as we keep generating, until that prompts hits an eod condition. The generation started status tensor helps us determine which prompts have started generating
+        We check which prompts have reached an end condition and set the corresponding flags of the is_generation_done_tensor to True. The generated sequence lengths increase as we keep generating, until that prompts hits an end condition. The generation_started tensor determines which prompts have started generating.
 
         Args:
             updated_prompts_tokens (torch.Tensor): The prompts tokens updated with the latest generated tokens. A tensor of shape [batch_size, max_seq_len] (i.e max_seq_len = max_prompt_len + tokens_to_generate)
             generation_started (torch.Tensor): A boolean tensor of shape [batch_size]. True indicates the prompt at that index has started generating tokens. 
-            current_context_end_position (int): An intiger showing which position to extract from the prompts tokens to get the latest generated tokens. 
+            current_context_end_position (int): An integer indicating which position to extract from the prompts tokens to get the latest generated tokens. 
             is_generation_done_tensor (torch.Tensor): A boolean tensor of shape [batch_size]. True indicates the prompt at that index has reached end condition.  
             generated_sequence_lengths (torch.Tensor): A int tensor of shape [batch_size]. Each value represents the generated sequence lengths for that prompt.
 
@@ -169,7 +169,7 @@ class SimpleTextGenerationController:
     ) -> torch.Tensor:
         """Method to pad input prompts
 
-        Given a bunch of prompt tokens, we pad them such that they all have uniform length
+        Given a list of prompts, pad them all to uniform length
 
         Args:
             batch_prompt_tokens_list (List[List[int]]): A list containing the prompt tokens
@@ -294,8 +294,7 @@ class SimpleTextGenerationController:
                         ],
                         2,
                     )
-                    # Gather the log probabilities only along the indices of the prompt tokens
-                    # i.e Get the log probablitiles for the prompt tokens alone
+                    # Get the log probabilities for only the prompt tokens
                     output_log_probs[:, context_start_position:context_end_position] = torch.gather(
                         log_probs, 2, indices
                     ).squeeze(2)

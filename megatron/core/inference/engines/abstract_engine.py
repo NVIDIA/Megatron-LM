@@ -6,11 +6,11 @@ class AbstractEngine(ABC):
     @staticmethod
     @abstractmethod
     def generate(self) -> dict:
-        """The abstarct backends generate function. 
+        """The abstract backend's generate function. 
 
-        To define your own backend, make sure you implement this and return the outputs as a dictionary . 
+        To define a new backend, implement this and return the outputs as a dictionary. 
 
         Returns:
-            dict: The output dictionary which will have as keys mostly the generated tokens, text and log probabilitites. 
+            dict: The output dictionary containing keys for `input_prompt`, `generated_text`, `generated_tokens`.
         """
         pass

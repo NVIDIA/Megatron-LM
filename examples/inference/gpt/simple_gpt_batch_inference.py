@@ -33,12 +33,12 @@ def model_provider(pre_process=True, post_process=True) -> Union[LegacyGPTModel,
     If you set the use_mcore_models to True, it will return the mcore GPT model and if not the legacy GPT model.
 
     Args:
-        pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
+        pre_process (bool, optional): Set to true if you need to compute embeddings. Defaults to True.
         post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
 
 
     Returns:
-        Union[GPTModel, megatron.model.GPTModel]: The returned model
+        Union[GPTModel, LegacyGPTModel]: The returned model
     """
     args = get_args()
     use_te = args.transformer_impl == "transformer_engine"
@@ -122,7 +122,7 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
 def main():
     """Main program."""
 
-    # Note: The default args passed here can be overwridden by using appropriate params (check arguments.py file)
+    # Note: The default args passed here can be overwritten by using appropriate params (check arguments.py file)
     # Micro batch size is not needed to be set by user. (It is calculated based on inference-batch-times-seqlen-threshold argument)
     initialize_megatron(extra_args_provider=add_text_generate_args,
                         args_defaults={'no_load_rng': True,

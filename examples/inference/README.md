@@ -23,7 +23,7 @@ This will walk you through the flow of running batch inference on a GPT model tr
 <br>
 
 ##### 1.1 Understanding The Code
-***STEP 1 - We initalize model parallel and other default aruguments***
+***STEP 1 - We initialize model parallel and other default arguments***
 We can default micro batch size to be 1, since for TP models it is not used, and for PP models it is calculated during runtime. 
 ```python
     initialize_megatron(
@@ -41,7 +41,7 @@ NOTE: The model provider function in the script supports MCore and Legacy models
 ```
 
 ***STEP 3 - Choose an engine***
-One of the important elements of the generate function is an inference engine. In this example we will be choosing the [megatorn core enge](../../megatron/core/inference/engine/mcore_engine.py) with a [simple text generation controller](../../megatron/core/inference/text_generation_controllers/simple_text_generation_controller.py) since TRTLLMEngine is not available yet. Other engines that will be supported are [TRTLLMEngine](../../megatron/core/inference/engine/trt_llm_engine_wrapper.py)). If you dont want any customization use mcore engine with simple text generation controller.
+One of the important elements of the generate function is an inference engine. In this example we will be choosing the [megatron core engine](../../megatron/core/inference/engine/mcore_engine.py) with a [simple text generation controller](../../megatron/core/inference/text_generation_controllers/simple_text_generation_controller.py), the default engine. Other engines that will be supported are [TRTLLMEngine](../../megatron/core/inference/engine/trt_llm_engine_wrapper.py)).
 ```python
     inference_wrapped_model = GPTInferenceWrapper(model, args)
     text_generation_controller = SimpleTextGenerationController(
@@ -76,7 +76,7 @@ We use default values for the [common inference params](../../megatron/core/infe
 <br>
 
 ##### 1.2 Running The Code
-An example of running the file is shown below. Change tokenizer paths, inference params etc.for your model . 
+An example run script is shown below. Change the tokenizer paths, inference params, and other settings for your model. 
 
 For a quick recap on inference params refer to [this blog](https://ivibudh.medium.com/a-guide-to-controlling-llm-model-output-exploring-top-k-top-p-and-temperature-parameters-ed6a31313910) 
 
@@ -121,44 +121,41 @@ NOTE: Other parameters which can be customized for inference are :-
 
 
 #### 2. Flow of Control In MCore Backend
-The following is what happens in the [simple_gpt_batch_inference.py](./gpt/simple_gpt_batch_inference.py) text generation part.
-* We call  [mcore_engine](../../megatron/core/inference/engine/mcore_engine.py) **generate()** function with all our input prompts.
-* The scheduler in the engine will add these prompts to [active requests](../../megatron/core/inference/inference_request.py) till we hit max batch size, and then it will put the rest in waiting requests. 
-* The engine will then run till all requests (waiting + active) are completed 
+The following is what happens in the [simple_gpt_batch_inference.py](./gpt/simple_gpt_batch_inference.py).
+* We call  [mcore_engine](../../megatron/core/inference/engines/mcore_engine.py) **generate()** function with all our input prompts.
+* The scheduler in the engine will add these prompts to the [active requests] pool (../../megatron/core/inference/inference_request.py) until we hit the max batch size, and then it will put the rest in the waiting requests pool. 
+* The engine will then run until all requests (waiting + active) are completed 
     * The active requests are passed into  **generate_all_output_tokens_static_batch()** of the text generation controller . 
     * This function uses the [model_inference_wrappers](../../megatron/core/inference/inference_model_wrappers/abstract_model_inference_wrapper.py) **prep_model_for_inference()** , and then runs an auto regressive loop
-    * In the auto regressive loop the inference wrappers **get_batch_for_context_window()** is called to get the required input, which is passed into the **run_one_forward_step()** method, which takes care of calling the appropriate (PP, TP) model forward methods to get the output logits
-    * The output logits are synchronized across all ranks for PP Models
-    * The text generation controller obtains the log probabilities and samples tokens based on the common inference parameters.
+    * In the auto regressive loop, the **get_batch_for_context_window()** method of the inference wrapper is called to get the required input, passes it into the **run_one_forward_step()** method, which calls the appropriate (PP, TP) model `.forward()` methods to get the output logits
+    * The output logits are synchronized across all pipeline parallel ranks
+    * The text generation controller obtains the log probabilities and samples tokens based on the strategy defined in the common inference parameters.
     * The sampled tokens are then appended to the input prompt tokens for the next iteration 
-    * The **update_generation_status()** of the text generation controller is called to check which of the prompts have completed generating , what the generation lengths are etc. 
-    * Finally after the inference loop, the result is detokenized and stored back into the inference requests. The status of these requests are marked as completed. 
-    * We then use the schedulers **update_requests_pool()** to update the requests pools. (i.e) Completed requests are put into the completed request pool and the waiting requests are added into the active request pool
+    * The **update_generation_status()** method of the text generation controller checks which prompts have finished generating or hit a stop condition
+    * After the inference loop, the result is detokenized and stored as an attribute of the InferenceRequest. These requests are marked as completed. 
+    * The **update_requests_pool()** method of the scheduler moves completed requests into the completed request pool and waiting requests into the active request pool
 
 <br>
 
 #### 3. Customizing The Inference Pipeline
-The following guide will walk you through how you can customize different parts of the inference pipeline. Broadly there are three levels at which you can customize the pipeline. 
-* **Inference engine** - Highest level of customization. (Currently we support MCore Engine). Change this if you completely want to add your own way of running inference.  
-* **Text generation controller** - Extend this if you want to customize tokenization, text generation, sampling, detokenization etc.
-* **Inference Wrapped Model** - Change this if you just want to support a new model 
-* **Modify Inference Parameters** - Change this to update top_p, top_k, number of tokens to be generated, temperature etc.
+The following guide will walk you through how you can customize different parts of the inference pipeline. There are three levels at which you can customize the pipeline. 
+* **Inference engine** - Highest level of customization. Currently we support the MCore Engine. Change this to add a new engine.
+* **Text generation controller** - Extend this to customize tokenization, detokenization, or implement a new sampling strategy.
+* **Inference Wrapped Model** - Change this to support a new model.
+* **Modify Inference Parameters** - Change this to update top_p, top_k, number of tokens to be generated, temperature, or other sampling parameters.
 
 <br>
 
 ##### 3.1. Create Your Own Inference Backend 
-This is the highest level of customization. The  [abstract_engine.py](./../../megatron/core/inference/engine/abstract_engine.py) file has a core generate method that you can extend to support your own backend. 
+This is the highest level of customization. The  [abstract_engine.py](./../../megatron/core/inference/engine/abstract_engine.py) file has a generate method that can be extended to support a new backend. 
 
 ```python
 class AbstractEngine(ABC):
     @staticmethod
     def generate(self) -> dict:
-        """The abstarct backends generate function. 
+        """The abstract backend's generate function. 
 
         To define your own backend, make sure you implement this and return the outputs as a dictionary . 
-```
-
-Currently we support mcore engine. Soon we will suport TRT-LLM. The suggested flow as you can see from the [simple_gpt_batch_inference.py](./gpt/simple_gpt_batch_inference.py) is to choose TRTLLM Backend as a default, and if the model fails the export, we will use the megatron core backend. 
 
 
 <br>
@@ -231,7 +228,7 @@ class AbstractModelInferenceWrapper:
         This function gets called iteratively in the inference loop . It can be used to extract relevant input from the prompt tokens, attention mask etc. required for each step in inference.
 ```
 
-To see an example of how we extend this for gpt please refer [gpt_inference_wrapper.py](../../megatron/core/inference/inference_model_wrappers/gpt/gpt_inference_wrapper.py)
+Refer to [gpt_inference_wrapper.py](../../megatron/core/inference/inference_model_wrappers/gpt/gpt_inference_wrapper.py) for an example of extending this for GPTModel.
 
 <br>
 
