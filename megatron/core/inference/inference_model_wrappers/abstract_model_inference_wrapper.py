@@ -13,11 +13,10 @@ from megatron.core.inference.communication_utils import (
 )
 from megatron.core.inference_params import InferenceParams
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.legacy.model.gpt_model import GPTModel as LegacyGPTModel
 
 
 class AbstractModelInferenceWrapper(abc.ABC):
-    def __init__(self, model: Union[LegacyGPTModel, GPTModel], args: Namespace):
+    def __init__(self, model: Union['LegacyGPTModel', GPTModel], args: Namespace):
         """Constructor for the model inference wrapper
 
         The wrapper prepares the model for inference, provides the required input data and runs the forward pass.

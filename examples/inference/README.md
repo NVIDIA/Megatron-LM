@@ -81,16 +81,37 @@ An example run script is shown below. Change the tokenizer paths, inference para
 For a quick recap on inference params refer to [this blog](https://ivibudh.medium.com/a-guide-to-controlling-llm-model-output-exploring-top-k-top-p-and-temperature-parameters-ed6a31313910) 
 
 ```
+In a slurm cluster
+ACCOUNT=<account>
+MLM_PATH=/path/to/megatron-lm
+GPT_CKPT=/path/to/gpt/ckpt
+VOCAB_MERGE_FILE_PATH=/path/to/vocab/and/merge/file
+CONTAINER_IMAGE=nvcr.io/ea-bignlp/ga-participants/nemofw-training:23.11
+
+srun --account $ACCOUNT \
+--job-name=$ACCOUNT:inference \
+--partition=batch \
+--time=01:00:00 \
+--container-image $CONTAINER_IMAGE \
+--container-mounts $MLM_PATH:/workspace/megatron-lm/,$GPT_CKPT:/workspace/mcore_gpt_ckpt,$VOCAB_MERGE_FILE_PATH:/workspace/tokenizer \
+--no-container-mount-home \
+--pty /bin/bash \
+
+# Inside the container run the following. 
+
+cd megatron-lm/
+export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 TOKENIZER_ARGS=(
-    --vocab-file /workspace/megatron-lm/gpt2-vocab.json
-    --merge-file /workspace/megatron-lm/gpt2-merges.txt
+    --vocab-file /workspace/tokenizer/gpt2-vocab.json
+    --merge-file /workspace/tokenizer/gpt2-merges.txt
     --tokenizer-type GPT2BPETokenizer
 )
 
 MODEL_ARGS=(
     --use-checkpoint-args
     --use-mcore-models
+    --load /workspace/mcore_gpt_ckpt
 )
 
 INFERENCE_SPECIFIC_ARGS=(
@@ -101,10 +122,9 @@ INFERENCE_SPECIFIC_ARGS=(
 )
 
 torchrun --nproc-per-node=4 examples/inference/gpt/simple_gpt_batch_inference.py \
-    --load /workspace/checkpoint/tp2pp2 \
     ${TOKENIZER_ARGS[@]} \
     ${MODEL_ARGS[@]} \
-    ${INFERENCE_SPECIFIC_ARGS[@]} 
+    ${INFERENCE_SPECIFIC_ARGS[@]} \
     --prompts "prompt one " "sample prompt two" "sample prompt 3"
 
 NOTE: Other parameters which can be customized for inference are :-
@@ -113,6 +133,8 @@ NOTE: Other parameters which can be customized for inference are :-
 --top_p (top_p sampling)
 --num-tokens-to-generate (Number of tokens to generate for each prompt)
 --inference-batch-times-seqlen-threshold (During inference, if batch-size times sequence-length is smaller than this threshold then we will not use pipelining, otherwise we will.')
+--use-dist-ckpt (If you are using dist checkpoint format for the model)
+--use-legacy-models (If you are using legacy gpt model instead of mcore gpt model)
 
 ```
 
