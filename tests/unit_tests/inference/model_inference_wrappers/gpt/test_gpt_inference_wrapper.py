@@ -2,7 +2,7 @@ from argparse import Namespace
 from megatron.core import parallel_state
 import torch
 from megatron.core.inference.inference_model_wrappers.gpt.gpt_inference_wrapper import GPTInferenceWrapper
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.gpt.gpt_model import GPTModel
 from tests.unit_tests.test_utilities import Utils
@@ -22,7 +22,7 @@ class TestGPTInferenceWrapper:
                                                     
         gpt_model = GPTModel(
             config=transformer_config, 
-            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(), 
+            transformer_layer_spec=get_gpt_layer_local_spec(), 
             vocab_size=self.vocab_size, 
             max_sequence_length=self.sequence_length, 
             parallel_output = False).cuda()
@@ -35,7 +35,7 @@ class TestGPTInferenceWrapper:
         args.padded_vocab_size = self.vocab_size
 
         self.inference_wrapped_model = GPTInferenceWrapper(gpt_model, args)
-    
+     
     # This will call the inference_wrapped_model.forward_pass_with_pipeline_parallel_small_input_batch()    
     def test_inference_pipeline_parallel_small_size(self):
         self.setup_model(tensor_parallel_size=2, pipeline_parallel_size=2)
@@ -50,6 +50,7 @@ class TestGPTInferenceWrapper:
         if parallel_state.is_pipeline_last_stage():
             assert logits.shape == (self.batch_size, 5, self.vocab_size), f"Shape mismatch . Expected {(self.batch_size, 5, self.vocab_size)}, but got {logits.shape}"
  
+
     # This will call the inference_wrapped_model.forward_pass_with_pipeline_parallel_large_input_batch()
     def test_inference_pipeline_parallel_large__size(self):
         self.setup_model(tensor_parallel_size=2, pipeline_parallel_size=2)
@@ -63,7 +64,7 @@ class TestGPTInferenceWrapper:
 
         if parallel_state.is_pipeline_last_stage():
             assert logits.shape == (self.batch_size, 10, self.vocab_size), f"Shape mismatch . Expected {(self.batch_size,10, self.vocab_size)}, but got {logits.shape}"
-
+   
 
     def test_inference_only_tensor_parallel(self):
         self.setup_model(tensor_parallel_size=4, pipeline_parallel_size=1)
