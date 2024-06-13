@@ -81,7 +81,7 @@ An example run script is shown below. Change the tokenizer paths, inference para
 For a quick recap on inference params refer to [this blog](https://ivibudh.medium.com/a-guide-to-controlling-llm-model-output-exploring-top-k-top-p-and-temperature-parameters-ed6a31313910) 
 
 ```
-In a slurm cluster
+#In a slurm cluster (You could also use docker)
 ACCOUNT=<account>
 MLM_PATH=/path/to/megatron-lm
 GPT_CKPT=/path/to/gpt/ckpt
