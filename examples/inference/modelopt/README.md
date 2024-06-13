@@ -7,7 +7,7 @@ and proceed with a containerized environment (`docker.io/tensorrt_llm/release:la
 ```sh
 git clone https://github.com/NVIDIA/TensorRT-LLM.git
 cd TensorRT-LLM
-git checkout v0.9.0
+git checkout v0.10.0
 make -C docker release_build
 ```
 
@@ -17,7 +17,7 @@ make -C docker release_build
 
 Once the container is built, install `nvidia-modelopt` and additional dependencies for sharded checkpoint support:
 ```sh
-pip install "nvidia-modelopt[all]~=0.11.0" --extra-index-url https://pypi.nvidia.com
+pip install "nvidia-modelopt[all]~=0.13.0" --extra-index-url https://pypi.nvidia.com
 pip install zarr tensorstore==0.1.45
 ```
 TensorRT-LLM quantization functionalities are currently packaged in `nvidia-modelopt`.
@@ -69,7 +69,7 @@ git lfs install
 git clone git@hf.co:nvidia/nemotron-3-8b-base-4k
 cd nemotron-3-8b-base-4k
 tar -xvf Nemotron-3-8B-Base-4k.nemo
-mv 586f3f51a9cf43bc9369bd53fa08868c_a934dc7c3e1e46a6838bb63379916563_3feba89c944047c19d5a1d0c07a85c32_mt_nlg_plus_multilingual_ja_zh_the_stack_frac_015_256k.model mt_nlg_plus_multilingual_ja_zh_the_stack_frac_015_256k.model
+mv 586f3f51a9cf43bc9369bd53fa08868c_a934dc7c3e1e46a6838bb63379916563_3feba89c944047c19d5a1d0c07a85c32_mt_nlg_plus_multilingual_ja_zh_the_stack_frac_015_256k.model tokenizer.model
 cd ..
 ```
 
