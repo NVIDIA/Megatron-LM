@@ -9,7 +9,7 @@ from megatron.core.inference.engines.mcore_engine import MCoreEngine
 from megatron.core.inference.inference_model_wrappers.gpt.gpt_inference_wrapper import GPTInferenceWrapper
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.text_generation_controllers.simple_text_generation_controller import SimpleTextGenerationController
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -28,7 +28,7 @@ class TestMCoreEngine:
                                                     
         gpt_model = GPTModel(
             config=transformer_config, 
-            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(), 
+            transformer_layer_spec=get_gpt_layer_local_spec(), 
             vocab_size=self.vocab_size, 
             max_sequence_length=self.sequence_length, 
             parallel_output = False).cuda()
