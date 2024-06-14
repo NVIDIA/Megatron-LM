@@ -198,6 +198,11 @@ class ModelParallelConfig:
        Reduce-Scatter both done atomically. Don't care if tp_comm_overlap is False.
     """
 
+    cross_entropy_loss_fusion: bool = False
+    """If this is enabled, the fused cross entropy implementation would be used.
+       Defaults to False.
+    """
+
     ###################
     # Pipeline Parallel
     ###################
