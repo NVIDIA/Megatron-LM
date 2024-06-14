@@ -446,6 +446,21 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
     wgrad_compute(all_gathered_input[1], grad_output, weight)
     input, all_gathered_input[1], grad_output = None, None, None
 
+def local_multi_tensor_applier(op, noop_flag_buffer, tensor_lists, *args):
+    return op(noop_flag_buffer, tensor_lists, *args)
+
+## computes l2 norm for a list of contiguous tensors
+## TODO: check that this gives the same output as amp version!!
+def local_multi_tensor_l2_norm(noop_flag, tensor_lists, per_tensor):
+    l2_sq = [[(torch.norm(tensor))**2 for tensor in tensor_list] for tensor_list in tensor_lists]
+    l2_sq_reduced = torch.norm(torch.tensor(l2_sq))**2
+    l2_sq_cuda = torch.tensor([float(l2_sq_reduced)], dtype=torch.float, device='cuda')
+    return l2_sq_cuda, None
+
+def local_multi_tensor_scale(noop_flag, tensor_lists, scale):
+    inputs, targets = tensor_lists
+    for i in range(len(targets)):
+        targets[i] = inputs[i] / scale
 
 class _ValueWithRank:
     """This is an internal class, not for use outside this module

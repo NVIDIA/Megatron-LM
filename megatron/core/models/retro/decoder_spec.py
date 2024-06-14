@@ -19,18 +19,22 @@ from megatron.core.models.retro.encoder_spec import get_retro_encoder_block_spec
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.attention import CrossAttentionSubmodules
-from megatron.core.transformer.custom_layers.transformer_engine import (
-    TEColumnParallelLinear,
-    TEDotProductAttention,
-    TENorm,
-    TERowParallelLinear,
-)
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.transformer_block import (
     TransformerBlockSubmodules,
     get_num_layers_to_build,
 )
 
+try:
+    from megatron.core.transformer.custom_layers.transformer_engine import (
+        TEDotProductAttention,
+        TELayerNormColumnParallelLinear,
+        TENorm,
+        TERowParallelLinear,
+    )
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 def get_retro_decoder_layer_te_spec(
     encoder_block_spec: typing.Union[ModuleSpec, TransformerBlockSubmodules, None] = None

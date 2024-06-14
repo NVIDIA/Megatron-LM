@@ -17,7 +17,6 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from megatron.core.transformer.custom_layers.transformer_engine import SplitAlongDim
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.module import MegatronModule
@@ -28,6 +27,16 @@ from megatron.core.utils import divide
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
 
+try:
+    import transformer_engine
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
+if HAVE_TE:
+    from megatron.core.transformer.custom_layers.transformer_engine import SplitAlongDim
+else:
+    SplitAlongDim = None
 
 @dataclass
 class SelfAttentionSubmodules:

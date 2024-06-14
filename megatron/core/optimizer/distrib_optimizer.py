@@ -8,7 +8,10 @@ from logging import getLogger
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
-from apex.optimizers import FusedAdam as Adam
+try:
+    from apex.optimizers import FusedAdam as Adam
+except ImportError:
+    from torch.optim import Adam
 
 from .. import parallel_state, tensor_parallel
 from ..dist_checkpointing import ShardedTensor

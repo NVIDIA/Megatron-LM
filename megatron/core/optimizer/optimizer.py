@@ -8,9 +8,13 @@ from itertools import chain
 from logging import getLogger
 from typing import Any, Callable, List, Optional, Tuple
 
-import amp_C
+try:
+    import amp_C
+    from apex.multi_tensor_apply import multi_tensor_applier
+except ImportError:
+    pass
+
 import torch
-from apex.multi_tensor_apply import multi_tensor_applier
 
 from .. import parallel_state, tensor_parallel
 from ..dist_checkpointing.mapping import ShardedStateDict

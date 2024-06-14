@@ -3,8 +3,11 @@ import logging
 from typing import Callable, Dict, List, Optional
 
 import torch
-from apex.optimizers import FusedAdam as Adam
-from apex.optimizers import FusedSGD as SGD
+try:
+    from apex.optimizers import FusedAdam as Adam
+    from apex.optimizers import FusedSGD as SGD
+except ImportError:
+    from torch.optim import Adam, SGD
 
 from megatron.core import mpu
 
