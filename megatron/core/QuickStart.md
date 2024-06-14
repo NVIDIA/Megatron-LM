@@ -21,7 +21,10 @@ The following steps will walk you through how you can create a sample GPT model 
 
 <br>
 
-**NOTE: All of the folowing steps needs to be put into a script and then run as explained in the last step** 
+**NOTE: All of the following steps are already put into a script [run_simple_mcore_train_loop.py](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/run_simple_mcore_train_loop.py) which you can run as follows** 
+```
+PYTHONPATH=$PYTHON_PATH:./megatron torchrun --nproc-per-node 2 examples/run_simple_mcore_train_loop.py
+```
 
 <br>
 
@@ -219,13 +222,7 @@ if __name__ == "__main__":
 ```
 <br>
 
-**STEP 7 - Running the full example**
-All the above steps are put to gether in a [run_simple_mcore_train_loop.py](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/run_simple_mcore_train_loop.py) script in examples folder in megatron . You can run it as follows after completing all steps in the Environment Setup section.
 
-```
-PYTHONPATH=$PYTHON_PATH:./megatron torchrun --nproc-per-node 2 examples/run_simple_mcore_train_loop.py
-```
-<br>
 
 ### Extending Further
 The above example introduced you to a basic training loop in MCore. To see more advanced examples please look at [pretrain_gpt.py]. That will show you how you can write more complex training loops, involving pipeline parallel, context parallel, rope embeddings, mixture of experts and all other functionalities present in mcore. 
