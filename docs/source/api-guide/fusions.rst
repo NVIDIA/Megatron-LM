@@ -53,3 +53,13 @@ This module provides wrappers around variations of Softmax in Apex.
    :undoc-members:
    :show-inheritance:
 
+fusions.fused\_cross\_entropy\_loss module
+------------------------------------------
+
+This module uses PyTorch JIT to fuse the cross entropy loss calculation and batches communication calls.
+
+.. automodule:: core.fusions.fused_softmax
+   :members:
+   :undoc-members:
+   :show-inheritance:
+

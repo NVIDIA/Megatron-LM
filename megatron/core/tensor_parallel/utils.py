@@ -5,6 +5,11 @@ from typing import List, Sequence
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.parallel_state import (
+    get_tensor_model_parallel_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from megatron.core.utils import divide
 
 
