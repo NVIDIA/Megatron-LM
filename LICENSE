@@ -30,12 +30,13 @@ The following applies to all files unless otherwise noted:
 
 This repository also contains code from Hugging Face Inc., Google Research,
 Facebook (from their Fairseq, Dino, and ParlAI projects), Microsoft (from their
-Swin-Transformer project) and Philip Popien. Files from these
-organizations have notices at the top of each file. Below are
-licenses used in those files, as indicated.
+Swin-Transformer project), Philip Popien, and the Mamba project (Tri Dao and
+Albert Gu). Files from these organizations have notices at the top of each file.
+Below are licenses used in those files, as indicated.
 
 
-------------- LICENSE FOR Facebook, huggingface, Google Research and LLaVA code  --------------
+--------------------------------------------------------------------------------
+-- LICENSE FOR Facebook, huggingface, Google Research, LLaVA, and Mamba code  --
 
 
                                  Apache License

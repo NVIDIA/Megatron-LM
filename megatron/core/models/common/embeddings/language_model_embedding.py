@@ -28,7 +28,7 @@ class LanguageModelEmbedding(MegatronModule):
         config: TransformerConfig,
         vocab_size: int,
         max_sequence_length: int,
-        position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
+        position_embedding_type: Literal['learned_absolute', 'rope', 'none'] = 'learned_absolute',
         num_tokentypes: int = 0,
     ):
         super().__init__(config=config)

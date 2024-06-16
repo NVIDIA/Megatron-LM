@@ -1,38 +1,35 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import logging
-from typing import Dict, Literal, Optional, Tuple, Union
+from typing import Literal, Optional
 
-import torch
 from torch import Tensor
 
-from megatron.core import InferenceParams, parallel_state, tensor_parallel
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core import InferenceParams, tensor_parallel
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.transformer.enums import AttnMaskType, ModelType
-from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_block import TransformerBlock
+from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
 
-class GPTModel(LanguageModule):
-    """GPT Transformer language model.
+class MambaModel(LanguageModule):
+    """Mamba language model.
 
     Args:
         config (TransformerConfig): Transformer config
-        transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers
+        mamba_stack_spec (ModuleSpec): Specifies the modules to use for the various layer types
         vocab_size (int): Vocabulary size
         max_sequence_length (int): maximum size of sequence. This is used for positional embedding
         pre_process (bool, optional): Include embedding layer (used with pipeline parallelism). Defaults to True.
+        hybrid_attention_ratio (float, optional): The target ratio of attention layers to total layers
+        hybrid_mlp_ratio (float, optional): The target ratio of mlp layers to total layers
+        hybrid_override_pattern (str, optional): The hybrid layer pattern to override with
         post_process (bool, optional): Include an output layer (used with pipeline parallelism). Defaults to True.
         fp16_lm_cross_entropy (bool, optional): Defaults to False.
         parallel_output (bool, optional): Do not gather the outputs, keep them split across tensor parallel ranks. Defaults to True.
         share_embeddings_and_output_weights (bool, optional): When True, input embeddings and output logit weights are shared. Defaults to False.
-        position_embedding_type (Literal[learned_absolute,rope], optional):  Position embedding type.. Defaults to 'learned_absolute'.
+        position_embedding_type (Literal[learned_absolute,rope,none], optional):  Position embedding type. Defaults to 'none'.
         rotary_percent (float, optional): Percent of rotary dimension to use for rotary position embeddings. Ignored unless position_embedding_type is 'rope'. Defaults to 1.0.
         rotary_base (int, optional): Base period for rotary position embeddings. Ignored unless position_embedding_type is 'rope'. Defaults to 10000.
         seq_len_interpolation_factor (Optional[float], optional): scale of linearly interpolating RoPE for longer sequences. The value must be a float larger than 1.0. Defaults to None.
@@ -41,25 +38,32 @@ class GPTModel(LanguageModule):
     def __init__(
         self,
         config: TransformerConfig,
-        transformer_layer_spec: ModuleSpec,
+        mamba_stack_spec: ModuleSpec,
         vocab_size: int,
         max_sequence_length: int,
         pre_process: bool = True,
+        hybrid_attention_ratio: float = 0.0,
+        hybrid_mlp_ratio: float = 0.0,
+        hybrid_override_pattern: str = None,
         post_process: bool = True,
         fp16_lm_cross_entropy: bool = False,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
-        position_embedding_type: Literal['learned_absolute', 'rope', 'none'] = 'learned_absolute',
+        # Mamba with no attention has no need for position embeddings, so none is default
+        position_embedding_type: Literal['learned_absolute', 'rope', 'none'] = 'none',
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
         seq_len_interpolation_factor: Optional[float] = None,
     ) -> None:
         super().__init__(config=config)
 
-        self.transformer_layer_spec: ModuleSpec = transformer_layer_spec
+        self.mamba_stack_spec: ModuleSpec = mamba_stack_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
         self.pre_process = pre_process
+        self.hybrid_attention_ratio = hybrid_attention_ratio
+        self.hybrid_mlp_ratio = hybrid_mlp_ratio
+        self.hybrid_override_pattern = hybrid_override_pattern
         self.post_process = post_process
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
         self.parallel_output = parallel_output
@@ -69,10 +73,6 @@ class GPTModel(LanguageModule):
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
         self.model_type = ModelType.encoder_or_decoder
-
-        # These 2 attributes are needed for TensorRT-LLM export.
-        self.max_position_embeddings = max_sequence_length
-        self.rotary_percent = rotary_percent
 
         if self.pre_process:
             self.embedding = LanguageModelEmbedding(
@@ -86,35 +86,23 @@ class GPTModel(LanguageModule):
             self.rotary_pos_emb = RotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
-                rotary_interleaved=self.config.rotary_interleaved,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
             )
 
-        # Transformer.
-        self.decoder = TransformerBlock(
-            config=self.config,
-            spec=transformer_layer_spec,
+        self.decoder = build_module(
+            mamba_stack_spec,
+            self.config,
             pre_process=self.pre_process,
+            hybrid_attention_ratio=self.hybrid_attention_ratio,
+            hybrid_mlp_ratio=self.hybrid_mlp_ratio,
+            hybrid_override_pattern=self.hybrid_override_pattern,
             post_process=self.post_process,
+            dtype=config.params_dtype,
         )
 
         # Output
         if post_process:
-            if self.config.defer_embedding_wgrad_compute:
-                # The embedding activation buffer preserves a reference to the input activations
-                # of the final embedding projection layer GEMM. It will hold the activations for
-                # all the micro-batches of a global batch for the last pipeline stage. Once we are
-                # done with all the back props for all the microbatches for the last pipeline stage,
-                # it will be in the pipeline flush stage. During this pipeline flush we use the
-                # input activations stored in embedding activation buffer and gradient outputs stored
-                # in gradient buffer to calculate the weight gradients for the embedding final linear layer.
-                self.embedding_activation_buffer = []
-                self.grad_output_buffer = []
-            else:
-                self.embedding_activation_buffer = None
-                self.grad_output_buffer = None
-
             self.output_layer = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
                 self.vocab_size,
@@ -125,8 +113,6 @@ class GPTModel(LanguageModule):
                 gather_output=not self.parallel_output,
                 skip_weight_param_allocation=self.pre_process
                 and self.share_embeddings_and_output_weights,
-                embedding_activation_buffer=self.embedding_activation_buffer,
-                grad_output_buffer=self.grad_output_buffer,
             )
 
         if self.pre_process or self.post_process:
@@ -156,14 +142,12 @@ class GPTModel(LanguageModule):
         decoder_input: Tensor = None,
         labels: Tensor = None,
         inference_params: InferenceParams = None,
-        packed_seq_params: PackedSeqParams = None,
-        extra_block_kwargs: dict = None,
     ) -> Tensor:
-        """Forward function of the GPT Model This function passes the input tensors
-        through the embedding layer, and then the decoeder and finally into the post
+        """Forward function of the Mamba model. This function passes the input tensors
+        through the embedding layer, and then the decoder and finally into the post
         processing layer (optional).
 
-        It either returns the Loss values if labels are given  or the final hidden units
+        It either returns the Loss values if labels are given or the final hidden units
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -178,7 +162,6 @@ class GPTModel(LanguageModule):
             # decoder will get hidden_states from encoder.input_tensor
             decoder_input = None
 
-        # Rotary positional embeddings (embedding is None for PP intermediate devices)
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
@@ -186,14 +169,22 @@ class GPTModel(LanguageModule):
             )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
+        # The following assert will currently fail when running inference.
+        # Commented out for now.
+        # TODO (duncan/rwaleffe): (1) confirm that the externally-generated
+        #   attention mask is not needed and is ignored by the model in
+        #   inference mode, (2) reduce the size of the externally-generated
+        #   attention mask to prevent CPU OOM (as we did for training), (3)
+        #   force the attention mask passed to the model in inference mode to
+        #   be None, so this assert will succeed.
+        # assert attention_mask is None, "The attention mask is ignored and should be set to None"
+
         # Run decoder.
         hidden_states = self.decoder(
             hidden_states=decoder_input,
             attention_mask=attention_mask,
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
-            packed_seq_params=packed_seq_params,
-            **(extra_block_kwargs or {}),
         )
 
         if not self.post_process:
@@ -212,28 +203,3 @@ class GPTModel(LanguageModule):
         loss = self.compute_language_model_loss(labels, logits)
 
         return loss
-
-    def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[Dict] = None
-    ) -> ShardedStateDict:
-        """ Sharded state dict implementation for GPTModel backward-compatibility (removing extra state).
-
-        Args:
-            prefix (str): Module name prefix.
-            sharded_offsets (tuple): PP related offsets, expected to be empty at this module level.
-            metadata (Optional[Dict]): metadata controlling sharded state dict creation.
-
-        Returns:
-            ShardedStateDict: sharded state dict for the GPTModel
-        """
-        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
-        output_layer_extra_state_key = f'{prefix}output_layer._extra_state'
-
-        # Old GPT checkpoints only stored the output layer weight key. So we remove the _extra_state key
-        # but check that it doesn't contain any data anyway
-        output_extra_state = sharded_state_dict.pop(output_layer_extra_state_key, None)
-        assert not (
-            output_extra_state and output_extra_state.data
-        ), f'Expected output layer extra state to be empty, got: {output_extra_state}'
-
-        return sharded_state_dict
