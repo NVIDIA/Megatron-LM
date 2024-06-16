@@ -749,7 +749,7 @@ def _add_network_size_args(parser):
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
     group.add_argument('--position-embedding-type', type=str, default='learned_absolute',
-                       choices=['learned_absolute', 'rope'],
+                       choices=['learned_absolute', 'rope', 'none'],
                        help='Position embedding type.')
     group.add_argument('--use-rotary-position-embeddings', action='store_true',
                        help='Use rotary positional embeddings or not. '
@@ -1186,14 +1186,21 @@ def _add_learning_rate_args(parser):
                        'and initial warmup, the learning rate at each '
                        'iteration would be different.')
     group.add_argument('--lr-decay-style', type=str, default='linear',
-                       choices=['constant', 'linear', 'cosine', 'inverse-square-root'],
+                       choices=['constant', 'linear', 'cosine', 'inverse-square-root', 'WSD'],
                        help='Learning rate decay function.')
+    group.add_argument('--lr-wsd-decay-style', type=str, default='exponential',
+                       choices=['exponential', 'linear', 'cosine'],
+                       help='Decay style for the annealing phase of WSD'),
     group.add_argument('--lr-decay-iters', type=int, default=None,
                        help='number of iterations to decay learning rate over,'
                        ' If None defaults to `--train-iters`')
     group.add_argument('--lr-decay-samples', type=int, default=None,
                        help='number of samples to decay learning rate over,'
                        ' If None defaults to `--train-samples`')
+    group.add_argument('--lr-wsd-decay-samples', type=int, default=None,
+                       help='number of samples for the annealing phase in the wsd schedule')
+    group.add_argument('--lr-wsd-decay-iters', type=int, default=None,
+                       help='number of iterations for the annealing phase in the wsd schedule')
     group.add_argument('--lr-warmup-fraction', type=float, default=None,
                        help='fraction of lr-warmup-(iters/samples) to use '
                        'for warmup (as a float)')
@@ -1488,6 +1495,7 @@ def _add_data_args(parser):
                                 'GPT2BPETokenizer',
                                 'SentencePieceTokenizer',
                                 'GPTSentencePieceTokenizer',
+                                'HuggingFaceTokenizer',
                                 'Llama2Tokenizer',
                                 'Llama3Tokenizer',
                                 'MistralTokenizer',
@@ -1700,6 +1708,18 @@ def _add_experimental_args(parser):
                        'To use local spec specify local as the argument.'
                        'For more details, see the model class, '
                        '`transformer_block.py`, or `transformer_layer.py`')
+    group.add_argument('--hybrid-attention-ratio', type=float, default=0.0,
+                       help='Ratio of attention layers to total layers, in the '
+                       'range [0.0, 1.0].')
+    group.add_argument('--hybrid-mlp-ratio', type=float, default=0.0,
+                       help='Ratio of mlp layers to total layers, in the '
+                       'range [0.0, 1.0].')
+    group.add_argument('--hybrid-override-pattern', type=str, default=None,
+                       help='Force a specific hybrid layer pattern. If a value'
+                       'greater than 0.0 is supplied to any of the hybrid ratio'
+                       'arguments, then the number of each type of layer in the'
+                       'override pattern must match number in the overidden'
+                       'pattern')
     group.add_argument('--yaml-cfg', type=str, default=None,
                        help = 'Config file to add additional arguments')
 
