@@ -4,3 +4,5 @@ megatron/core/ @shanmugamr @jcasper @eharper @terryk
 [TESTS]
 tests/ @shanmugamr @terryk
 
+[MODELOPT]
+examples/inference/quantization @chenhany @kmorabia
