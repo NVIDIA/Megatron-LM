@@ -7,11 +7,12 @@ launchers:
     ntasks_per_node: '{gpus}'
     no_container_mount_home: 'true'
 spec:
-  name: "{model}_{variant}_{scope}_{platforms}_{nodes}N{gpus}G_\
+  name: "{model}_{variant}_{scope}_\
          mbs{mbs}_gbs{gbs}_\
          {'mcore_' if use_mcore else ''}{'te_' if use_te else ''}\
          tp{tp_size}_pp{pp_size}{'_vp'+str(vp_size) if vp_size else ''}\
-         {'_'+args_meta if args_meta else ''}"
+         {'_'+args_meta if args_meta else ''}
+         _{platforms}_{nodes}N{gpus}G"
   model: gpt3-nemo
   variant: 126m
   build: mcore-nemo
