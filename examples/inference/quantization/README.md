@@ -75,7 +75,7 @@ cd ..
 
 Now launch the PTQ + TensorRT-LLM export script,
 ```sh
-bash examples/inference/ptq_trtllm_nemotron3_8b ./nemotron-3-8b-base-4k None
+bash examples/inference/quantization/ptq_trtllm_nemotron3_8b ./nemotron-3-8b-base-4k None
 ```
 By default, `cnn_dailymail` is used for calibration. The `GPTModel` will have quantizers for simulating the
 quantization effect. The checkpoint will be saved optionally (with quantizers as additional states) and can
@@ -108,7 +108,7 @@ The script expects `${CHECKPOINT_DIR}` (`./nemotron-3-8b-base-4k`) to have the f
 > that we support.
 
 ```sh
-bash examples/inference/ptq_trtllm_llama_7b.sh ${CHECKPOINT_DIR}
+bash examples/inference/quantization/ptq_trtllm_llama_7b.sh ${CHECKPOINT_DIR}
 ```
 
 The script expect `${CHECKPOINT_DIR}` to have the following structure:

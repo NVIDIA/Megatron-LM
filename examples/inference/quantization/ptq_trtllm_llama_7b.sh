@@ -76,7 +76,7 @@ python -c "import modelopt.torch.quantization.extensions as ext; print(ext.cuda_
 launch_config="--nproc_per_node=${TP}"
 
 # Launch multi-process with torchrun
-torchrun ${launch_config} examples/inference/text_generation_ptq.py ${options} ${additional_options}
+torchrun ${launch_config} examples/inference/quantization/text_generation_ptq.py ${options} ${additional_options}
 
 # This script is using mpi4py which will fork multiple processes.
-python examples/inference/trtllm_text_generation.py ${trtllm_options}
+python examples/inference/quantization/trtllm_text_generation.py ${trtllm_options}
