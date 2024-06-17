@@ -1,4 +1,4 @@
-# Llama and Mistral support in Megatron-LM
+# Llama, Mistral and other Llama-like model support in Megatron-LM
 
 NOTE: Llama-3 and Mistral support in Megatron is currently experimental and we are still evaluting benchmark results to confirm model conversion, training and inference correctness.
 
@@ -386,6 +386,12 @@ If loading for either inference or finetuning, use the following arguments:
 --attention-softmax-in-fp32
 ```
 
-# Benchmark results
+## Benchmark results
 
 Mistral-7B support in Megatron is currently experimental and we are still carrying out benchmark evaluations.
+
+# Other Llama-like model support
+
+*Note: Experimental*
+
+Many models such as Yi-34B use the Llama architecture and may be converted from HuggingFace to Megatron using the commands in [Llama3](#llama-3).

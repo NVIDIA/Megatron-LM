@@ -19,7 +19,7 @@ def add_arguments(parser):
 
     # TODO(jbarker): Need assertion to make sure *exactly* one of these is used
     parser.add_argument('--model-size', type=str, required=True,
-                        choices=['llama2-7B', 'llama2-13B', 'llama2-70B', 'llama2-7Bf', 'llama2-13Bf', 'llama2-70Bf', 'llama3-8B', 'llama3-70B', 'llama3-8Bf', 'llama3-70Bf', 'mistral-7B', 'mistral-7Bf'],
+                        choices=['llama2-7B', 'llama2-13B', 'llama2-70B', 'llama2-7Bf', 'llama2-13Bf', 'llama2-70Bf', 'llama3-8B', 'llama3-70B', 'llama3-8Bf', 'llama3-70Bf', 'mistral-7B', 'mistral-7Bf', 'yi-34B'],
                         help='Model size can be `llama2-7B`, `llama2-13B`, `llama2-70B`, `llama3-8B`, `llama3-70B`, `mistral-7B` (for pretrained models), '
                         'and `llama2-7Bf`, `llama2-13Bf`, `llama2-70Bf`, `llama3-8Bf`, `llama3-70bf` and `mistral-7Bf` (for chat-finetuned models).')
     parser.add_argument('--checkpoint-type', type=str, required=True,
@@ -58,6 +58,7 @@ NUM_SHARDS = {
     "llama3-70Bf": 8,
     "mistral-7B": 1,
     "mistral-7Bf": 1,
+    "yi-34B": 8,
 }
 
 
@@ -394,7 +395,7 @@ def load_checkpoint_to_model(args):
     '''Set model params.'''
 
     from pretrain_gpt import model_provider
-    if "llama" in args.model_size:
+    if "llama" in args.model_size or "yi" in args.model_size:
         from transformers import LlamaForCausalLM as ModelForCausalLM
     elif "mistral" in args.model_size:
         from transformers import MistralForCausalLM as ModelForCausalLM
@@ -465,7 +466,7 @@ def _load_checkpoint(queue, args):
     margs.tokenizer_model = args.tokenizer_model
     load_args_from_checkpoint(margs)
 
-    if "llama2" in args.model_size:
+    if "llama2" in args.model_size or "yi" in args.model_size:
         margs.tokenizer_type = "Llama2Tokenizer"
     elif "llama3" in args.model_size:
         margs.tokenizer_type = "Llama3Tokenizer"
