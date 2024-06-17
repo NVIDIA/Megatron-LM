@@ -11,7 +11,7 @@ spec:
   model: t5
   variant: 220m
   build: mcore-pyt
-  scope: merge-request
+  scope: mr
   nodes: 1
   gpus: 8
   platforms: dgx_a100

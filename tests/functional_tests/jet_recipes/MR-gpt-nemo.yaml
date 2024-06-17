@@ -15,7 +15,7 @@ spec:
   model: gpt3-nemo
   variant: 126m
   build: mcore-nemo
-  scope: merge-request
+  scope: mr
   nodes: 1
   gpus: 8
   platforms: dgx_a100
