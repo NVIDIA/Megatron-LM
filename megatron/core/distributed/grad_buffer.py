@@ -54,6 +54,7 @@ class Bucket:
         data_parallel_group: torch.distributed.ProcessGroup,
         data_parallel_world_size: int,
         overlap_grad_reduce: bool,
+        grad_reduce_stream: torch.cuda.Stream,
         use_distributed_optimizer: bool,
         quantization_helper: QuantizationHelper,
     ):
@@ -76,7 +77,8 @@ class Bucket:
         self.use_distributed_optimizer = use_distributed_optimizer
         self.quantization_helper = quantization_helper
         if self.overlap_grad_reduce:
-            self.comm_stream = torch.cuda.Stream()
+            assert isinstance(grad_reduce_stream, torch.cuda.Stream)
+            self.comm_stream = grad_reduce_stream
         else:
             self.comm_stream = torch.cuda.default_stream()
         self.reset()
@@ -136,7 +138,6 @@ class Bucket:
                 )
                 event.record()
         if not self.overlap_grad_reduce:
-            self.communication_event.synchronize()
             torch.cuda.current_stream().wait_stream(self.comm_stream)
             self.communication_event = None
 
@@ -156,7 +157,6 @@ class Bucket:
             f'Communication call has not been issued for this bucket '
             f'({len(self.params_with_grad)}/{len(self.params)} params have grad available)'
         )
-        self.communication_event.synchronize()
         torch.cuda.current_stream().wait_stream(self.comm_stream)
         self.communication_event = None
 
@@ -222,6 +222,9 @@ class GradBuffer:
             group=self.data_parallel_group
         )
         self.overlap_grad_reduce = overlap_grad_reduce
+        self.grad_reduce_stream = None
+        if self.overlap_grad_reduce:
+            self.grad_reduce_stream = torch.cuda.Stream()
         self.use_distributed_optimizer = use_distributed_optimizer
         self.quantization_helper = quantization_helper
         self.is_last_microbatch = True
@@ -417,6 +420,7 @@ class GradBuffer:
             data_parallel_group=self.data_parallel_group,
             data_parallel_world_size=self.data_parallel_world_size,
             overlap_grad_reduce=self.overlap_grad_reduce,
+            grad_reduce_stream=self.grad_reduce_stream,
             use_distributed_optimizer=self.use_distributed_optimizer,
             quantization_helper=self.quantization_helper,
         )

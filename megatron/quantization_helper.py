@@ -69,6 +69,8 @@ class QuantizationHelper:
         self.hadamard_group_size = 2**self.hadamard_order
         self.hadamard_matrix = None
         self.gradient_alltoall_pipeline=gradient_alltoall_pipeline
+        self.grad_pipeline_streams = [torch.cuda.Stream() for _ in range(gradient_alltoall_pipeline)]
+        self.quantize_weigth_stream = torch.cuda.Stream()
         if self.quantized_gradients or self.quantized_weights:
             self.set_local_all_to_all_group()
             self.quant_module = self.build_or_import_siwzzle_quant_module()
@@ -279,7 +281,8 @@ class QuantizationHelper:
                                                           pipeline,
                                                           inter_dp_size,
                                                           intra_dp_size)
-        streams = [torch.cuda.Stream() for _ in range(pipeline)]
+        # streams = [torch.cuda.Stream() for _ in range(pipeline)]
+        streams = self.grad_pipeline_streams
         for i, stream in enumerate(streams):
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
