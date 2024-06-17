@@ -1250,7 +1250,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     pbuf,
                     pbuf_views[data_parallel_rank],
                     group = data_parallel_group,
-                    async_op = self.overlap_param_gather
+                    async_op = async_op
                 )
             self.all_gather_handles[all_gather_handle_index] = all_gather_handle
             assert self.all_gather_handle_index_to_bucket_index_map[all_gather_handle_index] == \
