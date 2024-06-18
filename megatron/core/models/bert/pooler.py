@@ -5,7 +5,7 @@ from megatron.core import tensor_parallel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import get_linear_layer
-
+from megatron.core import parallel_state
 
 class Pooler(MegatronModule):
     """Pooler layer.
@@ -45,7 +45,16 @@ class Pooler(MegatronModule):
                 hidden_states, tensor_parallel_output_grad=False
             )
 
-        pooled = hidden_states[sequence_index, :, :]
+        cp_size = parallel_state.get_context_parallel_world_size()
+        if cp_size > 0:
+            if sequence_index // cp_size == parallel_state.get_context_parallel_rank():
+                pooled = hidden_states[sequence_index % cp_size, :, :]
+            else:
+                pooled = torch.empty_like(hidden_states[0, :, :])
+            src = parallel_state.get_context_parallel_global_ranks()[sequence_index // cp_size]
+            torch.distributed.broadcast(pooled, src, group=parallel_state.get_context_parallel_group())
+        else:
+            pooled = hidden_states[sequence_index, :, :]
         pooled = self.dense(pooled)
         pooled = torch.tanh(pooled)
         return pooled

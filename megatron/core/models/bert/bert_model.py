@@ -151,26 +151,36 @@ class BertModel(LanguageModule):
         Returns:
             Tensor: The extended binary attention mask
         """
-        # We create a 3D attention mask from a 2D tensor mask.
-        # [b, 1, s]
-        attention_mask_b1s = attention_mask.unsqueeze(1)
-        # [b, s, 1]
-        attention_mask_bs1 = attention_mask.unsqueeze(2)
-        # [b, s, s]
-        attention_mask_bss = attention_mask_b1s * attention_mask_bs1
-        # [b, 1, s, s]
-        extended_attention_mask = attention_mask_bss.unsqueeze(1)
+        if parallel_state.get_context_parallel_world_size():
+            # TE accepts [b, 1, 1, s] masks
+            extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)  < 0.5
+        else:
+            # We create a 3D attention mask from a 2D tensor mask.
+            # [b, 1, s]
+            attention_mask_b1s = attention_mask.unsqueeze(1)
+            # [b, s, 1]
+            attention_mask_bs1 = attention_mask.unsqueeze(2)
+            # [b, s, s]
+            attention_mask_bss = attention_mask_b1s * attention_mask_bs1
+            # [b, 1, s, s]
+            extended_attention_mask = attention_mask_bss.unsqueeze(1)
 
-        # Convert attention mask to binary:
-        extended_attention_mask = extended_attention_mask < 0.5
+            # Convert attention mask to binary:
+            extended_attention_mask = extended_attention_mask < 0.5
 
         return extended_attention_mask
 
     def bert_position_ids(self, token_ids):
         # Create position ids
+        # In case of CP, position_ids has been sharded across CP ranks
+
         seq_length = token_ids.size(1)
-        position_ids = torch.arange(seq_length, dtype=torch.long, device=token_ids.device)
-        position_ids = position_ids.unsqueeze(0).expand_as(token_ids)
+        if parallel_state.get_context_parallel_world_size() > 1:
+            start = seq_length * parallel_state.get_context_parallel_rank()
+            position_ids = torch.arange(start=start, end=start+seq_length, dtype=torch.long, device=token_ids.device)
+        else:
+            position_ids = torch.arange(seq_length, dtype=torch.long, device=token_ids.device)
+        position_ids = position_ids.unsqueeze(0).expand_as(token_ids) 
 
         return position_ids
 

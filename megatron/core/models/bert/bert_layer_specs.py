@@ -15,59 +15,64 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
 # Use this spec to use lower level Transformer Engine modules (required for fp8 training)
-bert_layer_with_transformer_engine_spec = ModuleSpec(
-    module=TransformerLayer,
-    submodules=TransformerLayerSubmodules(
-        self_attention=ModuleSpec(
-            module=SelfAttention,
-            params={"attn_mask_type": AttnMaskType.padding},
-            submodules=SelfAttentionSubmodules(
-                linear_qkv=TELayerNormColumnParallelLinear,
-                core_attention=TEDotProductAttention,
-                linear_proj=TERowParallelLinear,
-                q_layernorm=IdentityOp,
-                k_layernorm=IdentityOp,
+def get_bert_layer_with_transformer_engine_spec(cp_size):
+    #Transformer Engine currently only supports 'no_mask' with CP for non-causal models
+    attn_mask_type = AttnMaskType.no_mask if cp_size > 1 else AttnMaskType.padding
+    return ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            self_attention=ModuleSpec(
+                module=SelfAttention,
+                params={"attn_mask_type": attn_mask_type},
+                submodules=SelfAttentionSubmodules(
+                    linear_qkv=TELayerNormColumnParallelLinear,
+                    core_attention=TEDotProductAttention,
+                    linear_proj=TERowParallelLinear,
+                    q_layernorm=IdentityOp,
+                    k_layernorm=IdentityOp,
+                ),
             ),
-        ),
-        self_attn_bda=get_bias_dropout_add,
-        mlp=ModuleSpec(
-            module=MLP,
-            submodules=MLPSubmodules(
-                linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear,
+            self_attn_bda=get_bias_dropout_add,
+            mlp=ModuleSpec(
+                module=MLP,
+                submodules=MLPSubmodules(
+                    linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear,
+                ),
             ),
+            mlp_bda=get_bias_dropout_add,
         ),
-        mlp_bda=get_bias_dropout_add,
-    ),
-)
+    )
 
 # Use this spec for an implementation using only modules in megatron core
-bert_layer_local_spec = ModuleSpec(
-    module=TransformerLayer,
-    submodules=TransformerLayerSubmodules(
-        input_layernorm=FusedLayerNorm,
-        self_attention=ModuleSpec(
-            module=SelfAttention,
-            params={"attn_mask_type": AttnMaskType.padding},
-            submodules=SelfAttentionSubmodules(
-                linear_qkv=ColumnParallelLinear,
-                core_attention=DotProductAttention,
-                linear_proj=RowParallelLinear,
-                q_layernorm=IdentityOp,
-                k_layernorm=IdentityOp,
+def get_bert_layer_local_spec(cp_size):
+    assert cp_size == 1, "Context Parallelism is only supported with Transformer Engine, please use 'get_bert_layer_with_transformer_engine_spec' spec"
+    return ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            input_layernorm=FusedLayerNorm,
+            self_attention=ModuleSpec(
+                module=SelfAttention,
+                params={"attn_mask_type": AttnMaskType.padding},
+                submodules=SelfAttentionSubmodules(
+                    linear_qkv=ColumnParallelLinear,
+                    core_attention=DotProductAttention,
+                    linear_proj=RowParallelLinear,
+                    q_layernorm=IdentityOp,
+                    k_layernorm=IdentityOp,
+                ),
             ),
-        ),
-        self_attn_bda=get_bias_dropout_add,
-        pre_mlp_layernorm=FusedLayerNorm,
-        mlp=ModuleSpec(
-            module=MLP,
-            submodules=MLPSubmodules(
-                linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear,
+            self_attn_bda=get_bias_dropout_add,
+            pre_mlp_layernorm=FusedLayerNorm,
+            mlp=ModuleSpec(
+                module=MLP,
+                submodules=MLPSubmodules(
+                    linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear,
+                ),
             ),
+            mlp_bda=get_bias_dropout_add,
+            sharded_state_dict_keys_map={
+                'input_layernorm.': 'self_attention.linear_qkv.layer_norm_',
+                'pre_mlp_layernorm.': 'mlp.linear_fc1.layer_norm_',
+            },
         ),
-        mlp_bda=get_bias_dropout_add,
-        sharded_state_dict_keys_map={
-            'input_layernorm.': 'self_attention.linear_qkv.layer_norm_',
-            'pre_mlp_layernorm.': 'mlp.linear_fc1.layer_norm_',
-        },
-    ),
-)
+    )
