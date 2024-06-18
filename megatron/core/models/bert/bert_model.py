@@ -151,7 +151,7 @@ class BertModel(LanguageModule):
         Returns:
             Tensor: The extended binary attention mask
         """
-        if parallel_state.get_context_parallel_world_size():
+        if parallel_state.get_context_parallel_world_size() > 1:
             # TE accepts [b, 1, 1, s] masks
             extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)  < 0.5
         else:

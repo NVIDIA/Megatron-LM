@@ -19,7 +19,7 @@ from megatron.training import pretrain
 from megatron.training.utils import average_losses_across_data_parallel_group
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core.transformer.spec_utils import import_module
-from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec, bert_layer_local_spec
+from megatron.core.models.bert.bert_layer_specs import get_bert_layer_with_transformer_engine_spec, get_bert_layer_local_spec
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.bert_dataset import BERTMaskedWordPieceDataset, BERTMaskedWordPieceDatasetConfig
 from megatron.core.datasets.utils import get_blend_from_list
@@ -45,10 +45,10 @@ def model_provider(pre_process=True, post_process=True):
             post_process=post_process)
     else:
         if args.spec is None:
-            transformer_layer_spec = bert_layer_with_transformer_engine_spec #default spec
+            transformer_layer_spec = get_bert_layer_with_transformer_engine_spec(args.context_parallel_size) #default spec
         elif args.spec[0] == 'local':
             print_rank_0('Using Local spec for transformer layers')
-            transformer_layer_spec = bert_layer_local_spec
+            transformer_layer_spec = get_bert_layer_local_spec(args.context_parallel_size)
         else :
             transformer_layer_spec = import_module(args.spec)
 
