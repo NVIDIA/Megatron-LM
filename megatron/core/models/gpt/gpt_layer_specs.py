@@ -37,8 +37,10 @@ def get_gpt_layer_with_transformer_engine_spec(
                     linear_qkv=TELayerNormColumnParallelLinear,
                     core_attention=TEDotProductAttention,
                     linear_proj=TERowParallelLinear,
-                    q_layernorm=TENorm if qk_layernorm else IdentityOp,
-                    k_layernorm=TENorm if qk_layernorm else IdentityOp,
+                    # TENorm significantly harms convergence when used
+                    # for QKLayerNorm; we instead use the Apex implementation.
+                    q_layernorm=FusedLayerNorm if qk_layernorm else IdentityOp,
+                    k_layernorm=FusedLayerNorm if qk_layernorm else IdentityOp,
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
