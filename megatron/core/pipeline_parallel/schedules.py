@@ -236,7 +236,7 @@ def forward_step(
     if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
         # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
         loss_scale = (
-            config.grad_scale_func(torch.tensor(1.0, device=output_tensor.device))
+            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
             if config.grad_scale_func is not None
             else torch.tensor(1.0)
         )

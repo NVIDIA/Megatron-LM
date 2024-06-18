@@ -421,12 +421,11 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             overlap_grad_reduce=args.overlap_grad_reduce,
             use_distributed_optimizer=args.use_distributed_optimizer,
             check_for_nan_in_grad=args.check_for_nan_in_loss_and_grad,
-            bucket_size=args.ddp_bucket_size)
+            bucket_size=args.ddp_bucket_size,
+            average_in_collective=args.ddp_average_in_collective)
         model = [DDP(config,
                      ddp_config,
                      model_chunk,
-                     data_parallel_group=mpu.get_data_parallel_group(with_context_parallel=True),
-                     expert_data_parallel_group=mpu.get_data_modulo_expert_parallel_group(),
                      # Turn off bucketing for model_chunk 2 onwards, since communication for these
                      # model chunks is overlapped with compute anyway.
                      disable_bucketing=(model_chunk_idx > 0))
@@ -450,6 +449,9 @@ def get_optimizer_param_scheduler(optimizer):
             args.lr_decay_iters = args.train_iters
         lr_decay_steps = args.lr_decay_iters * args.global_batch_size
         wd_incr_steps = args.train_iters * args.global_batch_size
+        wsd_decay_steps = None
+        if args.lr_wsd_decay_iters is not None:
+            wsd_decay_steps = args.lr_wsd_decay_iters * args.global_batch_size
         if args.lr_warmup_fraction is not None:
             lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
         else:
@@ -464,6 +466,7 @@ def get_optimizer_param_scheduler(optimizer):
             args.lr_decay_samples = args.train_samples
         lr_decay_steps = args.lr_decay_samples
         wd_incr_steps = args.train_samples
+        wsd_decay_steps = args.lr_wsd_decay_samples
         if args.lr_warmup_fraction is not None:
             lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
         else:
@@ -485,7 +488,9 @@ def get_optimizer_param_scheduler(optimizer):
         wd_incr_steps=wd_incr_steps,
         wd_incr_style=args.weight_decay_incr_style,
         use_checkpoint_opt_param_scheduler=args.use_checkpoint_opt_param_scheduler,
-        override_opt_param_scheduler=args.override_opt_param_scheduler)
+        override_opt_param_scheduler=args.override_opt_param_scheduler,
+        wsd_decay_steps=wsd_decay_steps,
+        lr_wsd_decay_style=args.lr_wsd_decay_style)
 
     return opt_param_scheduler
 

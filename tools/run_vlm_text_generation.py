@@ -46,31 +46,42 @@ def add_text_generation_args(parser):
     return parser
 
 
-def _convert_image_to_rgb(image):
-    return image.convert("RGB")
+def preprocess_image(target_h, target_w, img):
+    """Example image preprocessing. Resizes input image to target size.
 
+    Args:
+        target_h (int): Target height in pixels.
+        target_w (int): Target width in pixels
+        img (np.array [h, w, c]): Input image in a numpy array.
 
-def _transform_test(img_h, img_w):
-    return Compose([ToPILImage(), Resize((img_h, img_w)), _convert_image_to_rgb])
-
-
-def preprocess(img_h, img_w, img):
-    # Example image preprocessing.
-    pixel_mean = [123.675, 116.28, 103.53]  # Imagenet's mean.
+    Returns:
+        output_img (torch.Tensor [c, h, w]): Input image resized to target size.
+    """
+    # Imagenet's mean and std for normalization.
+    pixel_mean = [123.675, 116.28, 103.53]
     pixel_std = [58.395, 57.12, 57.375]
     pixel_mean = torch.Tensor(pixel_mean).view(-1, 1, 1)
     pixel_std = torch.Tensor(pixel_std).view(-1, 1, 1)
 
-    raw_h, raw_w = img.shape[0], img.shape[1]
-    ratio = float(max(img_h, img_w)) / max(raw_h, raw_w)
-    H, W = int(raw_h * ratio + 0.5), int(raw_w * ratio + 0.5)
-    image_transform = _transform_test(H, W)
-    img = image_transform(img)
-    img = (torch.Tensor(np.array(img)).permute(2, 0, 1) - pixel_mean) / pixel_std
-    delta_h, delta_w = img_h - H, img_w - W
-    padded_img = torch.nn.functional.pad(img, (0, delta_w, 0, delta_h))
+    # Resize image considering ratio between input and target image sizes.
+    img_h, img_w = img.shape[0], img.shape[1]
+    ratio = float(max(target_h, target_w)) / max(img_h, img_w)
 
-    return padded_img
+    scaled_h, scaled_w = int(img_h * ratio + 0.5), int(img_w * ratio + 0.5)
+
+    image_transform = Compose(
+        [ToPILImage(), Resize((scaled_h, scaled_w)), lambda x: x.convert("RGB")]
+    )
+    img = image_transform(img)
+
+    # Normalize pixel values.
+    img = (torch.Tensor(np.array(img)).permute(2, 0, 1) - pixel_mean) / pixel_std
+
+    # Pad to target size.
+    delta_h, delta_w = target_h - scaled_h, target_w - scaled_w
+    output_img = torch.nn.functional.pad(img, (0, delta_w, 0, delta_h))
+
+    return output_img
 
 
 def generate_samples(model):
@@ -89,7 +100,7 @@ def generate_samples(model):
     # Run image preprocessing.
     for image_file in image_files:
         img = np.array(Image.open(image_file))
-        img = preprocess(args.img_h, args.img_w, img)
+        img = preprocess_image(args.img_h, args.img_w, img)
 
         images.append(img.reshape(-1, 3, args.img_h, args.img_w))
 

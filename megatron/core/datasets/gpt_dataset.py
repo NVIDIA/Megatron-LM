@@ -13,7 +13,8 @@ from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatr
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
-from megatron.core.datasets.utils import Split, log_single_rank
+from megatron.core.datasets.utils import Split
+from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
 
@@ -416,8 +417,17 @@ class GPTDataset(MegatronDataset):
 
             assert document_index.dtype == numpy.int32
             assert self.dataset.sequence_lengths.dtype == numpy.int32
+            if len(document_index) * 2 > len(self.dataset.sequence_lengths):
+                # Heuristic: if "access density" of sequence_lengths is relatively high,
+                # force loading the mmap-ed array into memory by taking a copy.
+                # System performance benefits come from two aspects:
+                # 1. **sequentially** pre-loading the whole file if we're gonna read a large fraction anyways.
+                # 2. GIL is held when calling into c++ code; making the c++ func faster improves parallelism.
+                sequence_lengths_for_cpp = self.dataset.sequence_lengths.copy()
+            else:
+                sequence_lengths_for_cpp = self.dataset.sequence_lengths
             sample_index = helpers.build_sample_idx(
-                self.dataset.sequence_lengths,
+                sequence_lengths_for_cpp,
                 document_index,
                 sequence_length,
                 num_epochs,
@@ -728,9 +738,6 @@ class MockGPTDataset(GPTDataset):
     ) -> None:
         assert config.mock
 
-        if num_samples is None:
-            num_samples = len(indices)
-
         super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
 
     @staticmethod
@@ -760,27 +767,3 @@ class MockGPTDataset(GPTDataset):
             MockGPTLowLevelDataset: The underlying MockGPTLowLevelDataset
         """
         return MockGPTLowLevelDataset(config.tokenizer)
-
-    def __len__(self) -> int:
-        """Abstract method implementation
-
-        Returns:
-            int: The length of the dataset
-        """
-        return self.num_samples
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Abstract method implementation
-
-        Args:
-            idx (int): The integer seed for mock data generation
-
-        Returns:
-            Dict[str, numpy.ndarray]: The mock sample information wrapped in a dictionary
-        """
-        if idx is not None and idx >= self.num_samples:
-            raise IndexError(
-                f"The index {idx} exceeds the available number of samples ({self.num_samples})"
-            )
-
-        return super().__getitem__(idx)

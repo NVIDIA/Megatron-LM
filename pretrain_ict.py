@@ -158,6 +158,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 
 if __name__ == "__main__":
+    print_rank_0("WARNING : This script is DEPRECATED. Will be removed in mcore release 0.9")
     pretrain(train_valid_test_datasets_provider,
              pretrain_ict_model_provider,
              ModelType.encoder_or_decoder,

@@ -36,11 +36,12 @@ else
    ADDITIONAL_PARAMS+=" --deterministic-mode"
 fi
 
+USE_LEGACY=1
 if [[ $USE_CORE -eq 1 ]]; then
        echo "Running using megatron core"
        TRANSFORMER_IMPL=local
        TRAINING_DTYPE=bf16
-       USE_MCORE=1
+       unset USE_LEGACY
 fi
 if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
        echo "Running checkpoint resume test..."
@@ -89,13 +90,16 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        --tensor-model-parallel-size $TP_SIZE \
        --pipeline-model-parallel-size $PP_SIZE \
        ${VP_SIZE:+--num-layers-per-virtual-pipeline-stage "$VP_SIZE"} \
-       ${USE_MCORE:+--use-mcore-models} \
+       ${USE_LEGACY:+--use-legacy-models} \
        ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
        --no-gradient-accumulation-fusion \
        ${DATA_CACHE:+--data-cache-path "$DATA_CACHE"} \
        --${TRAINING_DTYPE}"
 
 if [[ "${TRAINING_DTYPE}" == "fp16" ]]; then
+    # Both NVTE_APPLY_QK_LAYER_SCALING and --apply-query-key-layer-scaling must be passed
+    # to enable feature and be backward compatible with TE<0.11
+    export NVTE_APPLY_QK_LAYER_SCALING=1
     torch_run_cmd+=" --apply-query-key-layer-scaling"
     # NVTE_APPLY_QK_LAYER_SCALING=1 is required if using:
     #  1. --apply-query-key-layer-scaling
@@ -117,7 +121,7 @@ echo "$command" > $SCRIPTS_DIR/pretrain_bert_distributed_command.sh
 eval $command
 
 echo "Saving test results to $TENSORBOARD_DIR"
-python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $TENSORBOARD_DIR "$JOB_NAME" | \
+PYTHONPATH=$PWD python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $TENSORBOARD_DIR "$JOB_NAME" | \
     tee ${TENSORBOARD_DIR}/results.json
 
 if [[ $SKIP_PYTEST != 1 ]]; then

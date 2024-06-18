@@ -19,6 +19,7 @@ from megatron.core.models.multimodal.llava_model import LLaVAModel
 from layer_specs import get_layer_spec, get_mlp_module_spec, get_layer_spec_te
 from megatron.training import pretrain
 from megatron.training.utils import average_losses_across_data_parallel_group
+from dataloader_provider import train_valid_test_dataloaders_provider
 
 
 def model_provider(pre_process=True, post_process=True, parallel_output=True) -> LLaVAModel:
@@ -291,10 +292,10 @@ def add_multimodal_extra_args(parser):
 
 
 if __name__ == "__main__":
-    train_valid_test_datasets_provider.is_distributed = True
+    train_valid_test_dataloaders_provider.is_distributed = True
 
     pretrain(
-        train_valid_test_datasets_provider,
+        train_valid_test_dataloaders_provider,
         model_provider,
         ModelType.encoder_or_decoder,
         forward_step,

@@ -157,6 +157,7 @@ class VocabParallelEmbedding(torch.nn.Module):
     Args:
         num_embeddings: vocabulary size.
         embedding_dim: size of hidden state.
+        reduce_scatter_embeddings: Decides whether to perform ReduceScatter after embedding lookup
 
     Keyword Args:
         config: A megatron.core.ModelParallelConfig object
@@ -168,12 +169,14 @@ class VocabParallelEmbedding(torch.nn.Module):
         embedding_dim: int,
         *,
         init_method: Callable,
+        reduce_scatter_embeddings: bool = False,
         config: ModelParallelConfig,
     ):
         super(VocabParallelEmbedding, self).__init__()
         # Keep the input dimensions.
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
+        self.reduce_scatter_embeddings = reduce_scatter_embeddings
         self.tensor_model_parallel_size = get_tensor_model_parallel_world_size()
         # Divide the weight matrix along the vocaburaly dimension.
         (
@@ -183,6 +186,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             self.num_embeddings, get_tensor_model_parallel_rank(), self.tensor_model_parallel_size
         )
         self.num_embeddings_per_partition = self.vocab_end_index - self.vocab_start_index
+        self.deterministic_mode = config.deterministic_mode
 
         # Allocate weights and initialize.
         if config.use_cpu_initialization:
@@ -223,12 +227,22 @@ class VocabParallelEmbedding(torch.nn.Module):
         else:
             masked_input = input_
         # Get the embeddings.
-        output_parallel = self.weight[masked_input]
+        if self.deterministic_mode:
+            output_parallel = self.weight[masked_input]
+        else:
+            # F.embedding currently has a non-deterministic backward function
+            output_parallel = F.embedding(masked_input, self.weight)
         # Mask the output embedding.
         if self.tensor_model_parallel_size > 1:
             output_parallel[input_mask, :] = 0.0
-        # Reduce across all the model parallel GPUs.
-        output = reduce_from_tensor_model_parallel_region(output_parallel)
+
+        if self.reduce_scatter_embeddings:
+            # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
+            output_parallel = output_parallel.transpose(0, 1).contiguous()
+            output = reduce_scatter_to_sequence_parallel_region(output_parallel)
+        else:
+            # Reduce across all the model parallel GPUs.
+            output = reduce_from_tensor_model_parallel_region(output_parallel)
         return output
 
     def sharded_state_dict(
@@ -679,7 +693,7 @@ class ColumnParallelLinear(torch.nn.Module):
         self.disable_grad_reduce = disable_grad_reduce
 
         self.explicit_expert_comm = self.is_expert and (
-            config.sequence_parallel or self.expert_parallel
+            config.tensor_model_parallel_size > 1 or self.expert_parallel
         )
         if self.explicit_expert_comm and config.moe_extended_tp:
             world_size = get_tensor_and_expert_parallel_world_size()
@@ -941,7 +955,7 @@ class RowParallelLinear(torch.nn.Module):
             raise RuntimeError("To enable `sequence_parallel`, `input_is_parallel` must be `True`")
 
         self.explicit_expert_comm = self.is_expert and (
-            config.sequence_parallel or self.expert_parallel
+            config.tensor_model_parallel_size > 1 or self.expert_parallel
         )
 
         # Divide the weight matrix along the last dimension.

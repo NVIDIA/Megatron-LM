@@ -39,7 +39,8 @@ examples/multimodal/sft_8b.sh
 Run the following script:
 
 ```
-examples/multimodal/text_generation_8b.sh --input-image-path /path/to/input/images --output-path /some/output/directory --model-path /path/to/model.pt --tokenizer-path /path/to/tokenizer.model --gt-path /path/to/groundtruth/file --task generation-task-name
+examples/multimodal/text_generation_8b.sh --input-image-path /path/to/input/images --output-path /some/output/directory \
+    --model-path /path/to/model.pt --tokenizer-path /path/to/tokenizer.model --gt-path /path/to/groundtruth/file --task generation-task-name
 ```
 
 ### COCO captioning
@@ -48,4 +49,32 @@ First, run text generation using `--task captioning`. Then, run the following co
 
 ```
 python examples/multimodal/evaluate_coco.py --input-path /output/directory/from/generation --groundtruth-path /path/to/groundtruth/file
+```
+
+### TextVQA
+
+First, run text generation using `--task TextVQA`. Then, run the following command:
+
+```
+python examples/multimodal/evaluate_textvqa.py --input-path /output/directory/from/generation --groundtruth-path /path/to/groundtruth/file
+```
+
+### VQAv2
+
+First, run text generation using `--task VQAv2`. Then, run the following command:
+
+```
+python examples/multimodal/evaluate_textvqa.py --input-path /output/directory/from/generation --groundtruth-path /path/to/groundtruth/file --question-path /path/to/question/file
+```
+
+### MMMU
+
+The official MMMU repository is not pip installable currently so please clone their code in `examples/multimodal` by running `git clone https://github.com/MMMU-Benchmark/MMMU.git`.
+
+The MMMU dataset is loaded from HuggingFace.
+
+Run text generation using `--task MMMU`. Then, run the following command:
+
+```
+python examples/multimodal/evaluate_mmmu.py --input-path /output/directory/from/generation
 ```

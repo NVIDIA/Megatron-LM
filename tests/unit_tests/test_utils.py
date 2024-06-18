@@ -80,6 +80,7 @@ def test_check_param_hashes_across_dp_replicas():
     # Teardown.
     _deinit_distributed()
 
+
 def test_straggler_detector():
     world = int(os.getenv('WORLD_SIZE', '1'))
     rank = int(os.getenv('RANK', '0'))
@@ -119,6 +120,21 @@ def test_straggler_detector():
         delta, batch_delta, _, _, _, _, = stimer.elapsed()
         assert delta > 0.0
         assert batch_delta >= s
+
+    # Test function to raise ValueError
+    def straggler_value_error():
+        raise ValueError("Exception value raised")
+
+    # Check that exception is not suppressed.
+    def straggler_detector_exception_propagate():
+        # batch_data
+        with pytest.raises(ZeroDivisionError):
+            with stimer(bdata=True):
+                x = 1 / 0
+        # non-batch-data
+        with pytest.raises(ValueError, match=r".* value .*"):
+            with stimer():
+                straggler_value_error()
 
     # Reporting.
     def straggler_detector_report():
@@ -160,6 +176,8 @@ def test_straggler_detector():
     straggler_detector_timeit()
     # Report only from rank 0.
     straggler_detector_report()
+    # Check that exception is not suppressed.
+    straggler_detector_exception_propagate()
 
     # Teardown.
     _deinit_distributed()

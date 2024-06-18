@@ -28,8 +28,6 @@ from megatron.training.arguments import core_transformer_config_from_args
 def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
     """Builds the model.
 
-    If you set the use_mcore_models to True, it will return the mcore GPT model and if not the legacy GPT model.
-
     Args:
         pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
         post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
@@ -39,8 +37,11 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
         Union[GPTModel, megatron.legacy.model.GPTModel]: The returned model
     """
     print_rank_0('building GPT model ...')
-    config = core_transformer_config_from_args(get_args())
+    args = get_args()
+    config = core_transformer_config_from_args(args)
 
+    assert args.use_legacy_models, 'retro text generation only implemented for legacy models'
+    
     # not support core model yet
     model = megatron.legacy.model.GPTModel(
         config,
