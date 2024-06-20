@@ -52,6 +52,21 @@ def build_tokenizer(args):
     elif args.tokenizer_type == 'NullTokenizer':
         assert args.vocab_size is not None
         tokenizer = _NullTokenizer(args.vocab_size)
+    elif args.tokenizer_type == "PretrainedFromHF":
+        assert args.tokenizer_name_or_path is not None
+
+        # prevent transformers from logging info and warnings on each rank
+        import transformers
+        import logging
+        if args.rank == 0:
+            transformers.utils.logging.set_verbosity(logging.INFO)
+        else:
+            # shut the warnings on replicas
+            transformers.utils.logging.set_verbosity(logging.ERROR)
+
+        if args.rank == 0:
+            print(" vocab file is un-used. loading tokenizer from pre-trained model")
+        tokenizer = _AutoTokenizer(args.tokenizer_name_or_path, vocab_extra_ids=args.vocab_extra_ids)
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
@@ -644,3 +659,102 @@ class _NullTokenizer(MegatronTokenizer):
     @property
     def additional_special_tokens_ids(self):
         return None
+
+class _AutoTokenizer(_SentencePieceTokenizer):
+    """AutoTokenizer for Hf Pretrained model loading."""
+
+    def __init__(self, tokenizer_name_or_path, vocab_extra_ids):
+        from transformers import AutoTokenizer
+        name = tokenizer_name_or_path
+        super().__init__(name)
+        hf_tokenizer_kwargs = {}
+        if vocab_extra_ids > 0:
+            # TODO @thomasw21 we might need to concatenate to a pre-existing list?
+            hf_tokenizer_kwargs["additional_special_tokens"] = [f"<extra_id_{_id}>" for _id in range(vocab_extra_ids)]
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, **hf_tokenizer_kwargs)
+        self.encoder = self.tokenizer.get_vocab()
+        self.decoder = {v: k for k, v in self.encoder.items()}
+
+    @property
+    def vocab_size(self):
+        return len(self.tokenizer) # vocab_size doesn't contain additional tokens
+
+    @property
+    def vocab(self):
+        # TODO @thomasw21 make sure that special tokens don't collapse with vocab tokens.
+        return {
+            **{special_token: self.tokenizer.convert_tokens_to_ids(special_token) for special_token in self.tokenizer.additional_special_tokens},
+            **self.tokenizer.vocab,
+        }
+
+    @property
+    def inv_vocab(self):
+        return {v: k for k, v in self.vocab.items()}
+
+    def tokenize(self, text):
+        # HACK: this was hanging for very large inputs (>1M chars)
+        # chunking it into 100k chars max seems to make it much faster
+        # WARNING: this might be breaking tokenization every once in a while
+        CHUNK_MAX = 100000
+        if len(text) > CHUNK_MAX:
+            tokens = []
+            for i in range(0, len(text), CHUNK_MAX):
+                tokens += self.tokenizer.encode(text[i:i+CHUNK_MAX], add_special_tokens=False)
+            # add special tokens to beginning and end
+            if self.tokenizer.bos_token:
+                tokens = [self.tokenizer.bos_token_id] + tokens
+            if self.tokenizer.eos_token_id and self.tokenizer.add_eos_token:
+                tokens = tokens + [self.tokenizer.eos_token_id]
+            return tokens
+        else:
+            return self.tokenizer.encode(text)
+
+    def detokenize(self, token_ids):
+        # extract string from HF 
+        return self.tokenizer.decode(token_ids)
+
+    @property
+    def eod(self):
+        # TODO @thomasw21 might conflict with <eos>
+        return self.eos
+
+    @property
+    def cls(self):
+        candidate = self.tokenizer.cls_token_id
+        return self._check_token_candidate(candidate)
+
+    @property
+    def sep(self):
+        candidate = self.tokenizer.sep_token_id
+        return self._check_token_candidate(candidate)
+
+    @property
+    def pad(self):
+        candidate = self.tokenizer.pad_token_id
+        return self._check_token_candidate(candidate)
+
+    @property
+    def mask(self):
+        candidate = self.tokenizer.mask_token_id
+        return self._check_token_candidate(candidate)
+
+    @property
+    def bos(self):
+        raise NotImplementedError("Missing <bos>")
+
+    @property
+    def eos(self):
+        # TODO @thomasw21 might conflict with the notion of <eod>
+        candidate = self.tokenizer.eos_token_id
+        return self._check_token_candidate(candidate)
+
+    @property
+    def additional_special_tokens_ids(self):
+        """ All the additional special tokens you may want to use (list of strings)."""
+        return self.tokenizer.additional_special_tokens_ids
+
+    @staticmethod
+    def _check_token_candidate(candidate):
+        if candidate is None:
+            raise AttributeError("Token doesn't exist")
+        return candidate

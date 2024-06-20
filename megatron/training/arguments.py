@@ -1499,10 +1499,13 @@ def _add_data_args(parser):
                                 'Llama2Tokenizer',
                                 'Llama3Tokenizer',
                                 'MistralTokenizer',
-                                'NullTokenizer'],
+                                'NullTokenizer',
+                                'PretrainedFromHF'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='Sentencepiece tokenizer model.')
+    group.add_argument('--tokenizer-name-or-path', type=str, default=None,
+                          help='Pretrained tokenizer name or path')
     group.add_argument('--reset-position-ids', action='store_true',
                        help='Reset posistion ids after end-of-document token.')
     group.add_argument('--reset-attention-mask', action='store_true',
