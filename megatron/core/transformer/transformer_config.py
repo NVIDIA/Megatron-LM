@@ -158,7 +158,6 @@ class TransformerConfig(ModelParallelConfig):
     # activation recomputation
     ####################
     recompute_granularity: str = None
-    recompute_granularity: str = None
     """Determines which type of activation recompute to use.  Megatron-core supports 'selective'
     activation checkpointing where only the memory intensive part of attention is checkpointed.
     These memory intensive activations are also less compute intensive which makes activation
