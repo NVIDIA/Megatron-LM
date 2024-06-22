@@ -37,6 +37,7 @@ class DotProductAttention(MegatronModule):
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
+        softmax_scale=None,
         attention_dropout: float = None,
     ):
         super().__init__(config=config)
@@ -64,11 +65,15 @@ class DotProductAttention(MegatronModule):
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
-        coeff = None
-        self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
+        if softmax_scale is None:
+            self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
+        elif softmax_scale == 1:
+            self.norm_factor = None
+        else:
+            self.norm_factor = softmax_scale
+
         if self.config.apply_query_key_layer_scaling:
-            coeff = self.layer_number
-            self.norm_factor *= coeff
+            self.norm_factor *= self.layer_number
 
         self.scale_mask_softmax = FusedScaleMaskSoftmax(
             input_in_fp16=self.config.fp16,
@@ -77,7 +82,7 @@ class DotProductAttention(MegatronModule):
             scaled_masked_softmax_fusion=self.config.masked_softmax_fusion,
             mask_func=attention_mask_func,
             softmax_in_fp32=self.config.attention_softmax_in_fp32,
-            scale=coeff,
+            scale=self.norm_factor,
         )
 
         # Dropout. Note that for a single iteration, this layer will generate
