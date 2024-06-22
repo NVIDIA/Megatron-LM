@@ -59,7 +59,8 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     # Experimental yaml
     if args.yaml_cfg is not None:
         from .yaml_arguments import load_yaml
-        assert args.yaml_cfg and args.use_mcore_models, "To use yaml, mcore must be enabled"
+        assert args.yaml_cfg and not args.use_legacy_models, \
+            "Yaml config is not supported with legacy models."
         args = load_yaml(args.yaml_cfg)
 
 
@@ -231,6 +232,13 @@ def validate_args(args, defaults={}):
         else:
             setattr(args, key, defaults[key])
 
+    if args.data_path is not None and args.split is None:
+        legacy_default_split_value = '969, 30, 1'
+        if args.rank == 0:
+            print('WARNING: Please specify --split when using --data-path. Using legacy default value '
+                  f'of "{legacy_default_split_value}"')
+        args.split = legacy_default_split_value
+
     # Batch size.
     assert args.micro_batch_size is not None
     assert args.micro_batch_size > 0
@@ -241,9 +249,15 @@ def validate_args(args, defaults={}):
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
     if args.num_layers_per_virtual_pipeline_stage is not None:
-        assert args.pipeline_model_parallel_size > 2, \
-            'pipeline-model-parallel size should be greater than 2 with ' \
-            'interleaved schedule'
+        if args.overlap_p2p_comm:
+            assert args.pipeline_model_parallel_size > 1, \
+                'when interleaved schedule is used, pipeline-model-parallel size '\
+                'should be greater than 1'
+        else:
+            assert args.pipeline_model_parallel_size > 2, \
+                'when interleaved schedule is used and p2p communication overlap is disabled, '\
+                'pipeline-model-parallel size should be greater than 2 to avoid having multiple '\
+                'p2p sends and recvs between same 2 ranks per communication batch'
         assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
             'number of layers should be divisible by the pipeline parallel size'
         num_layers_per_pipeline_stage = args.num_layers // args.transformer_pipeline_model_parallel_size
@@ -264,7 +278,7 @@ def validate_args(args, defaults={}):
             '--overlap-param-gather only supported with distributed optimizer'
         assert args.overlap_grad_reduce, \
             '--overlap-grad-reduce should be turned on when using --overlap-param-gather'
-        assert args.use_mcore_models, \
+        assert not args.use_legacy_models, \
             '--overlap-param-gather only supported with MCore models'
 
     # Parameters dtype.
@@ -481,8 +495,8 @@ def validate_args(args, defaults={}):
             "retro currently does not support pipeline parallelism."
 
     if args.decoupled_lr is not None or args.decoupled_min_lr is not None:
-        assert args.use_mcore_models, \
-            '--decoupled-lr and --decoupled-min-lr only supported by Megatron Core, please add --use-mcore-models.'
+        assert not args.use_legacy_models, \
+            '--decoupled-lr and --decoupled-min-lr is not supported in legacy models.'
         assert not args.use_dist_ckpt, "Distributed checkpointing does not work with decoupled LR yet."
 
     # Legacy RoPE arguments
@@ -490,8 +504,8 @@ def validate_args(args, defaults={}):
         args.position_embedding_type = 'rope'
     if args.rotary_interleaved and args.apply_rope_fusion:
         raise RuntimeError('--rotary-interleaved does not work with rope_fusion.')
-    if args.rotary_interleaved and not args.use_mcore_models:
-        raise RuntimeError('--rotary-interleaved only support Megatron Core, please add --use-mcore-models.')
+    if args.rotary_interleaved and args.use_legacy_models:
+        raise RuntimeError('--rotary-interleaved is not supported in legacy models.')
 
     # Would just need to add 'NoPE' as a position_embedding_type to support this, but for now
     # don't allow it to keep things simple
@@ -501,9 +515,10 @@ def validate_args(args, defaults={}):
     # MoE Spec check
     if args.num_experts is not None:
         assert args.spec is None, "Model Spec must be None when using MoEs"
-        if args.tensor_model_parallel_size > 1:
-            assert args.sequence_parallel, \
-                "When using MoE and tensor parallelism, sequence parallelism must be used."
+
+    # Context parallel
+    if args.context_parallel_size > 1:
+        assert not args.use_legacy_models, "Context parallelism is not supported in legacy models."
 
     # Expert parallelism check
     if args.expert_model_parallel_size  > 1:
@@ -514,8 +529,8 @@ def validate_args(args, defaults={}):
             "Expert parallelism is not supported with fp16 training."
 
     # Distributed checkpointing checks
-    if args.use_dist_ckpt and not args.use_mcore_models:
-        raise RuntimeError('--use-dist-ckpt only support Megatron Core, please add --use-mcore-models.')
+    if args.use_dist_ckpt and args.use_legacy_models:
+        raise RuntimeError('--use-dist-ckpt is not supported in legacy models.')
 
     # Data blend checks
     assert args.mock_data + \
@@ -734,7 +749,7 @@ def _add_network_size_args(parser):
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
     group.add_argument('--position-embedding-type', type=str, default='learned_absolute',
-                       choices=['learned_absolute', 'rope'],
+                       choices=['learned_absolute', 'rope', 'none'],
                        help='Position embedding type.')
     group.add_argument('--use-rotary-position-embeddings', action='store_true',
                        help='Use rotary positional embeddings or not. '
@@ -1078,6 +1093,9 @@ def _add_training_args(parser):
                        help='Disable rope fusion, the fusion is available '
                        'only when using megatron-core.',
                        dest='apply_rope_fusion')
+    group.add_argument('--cross-entropy-loss-fusion', action='store_true',
+                       help='Enabled fusion of cross entropy loss calculation.',
+                       dest='cross_entropy_loss_fusion')
     group.add_argument('--use-flash-attn', action='store_true',
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
@@ -1110,7 +1128,12 @@ def _add_training_args(parser):
                        'gradient computation of linear layers',
                        dest='gradient_accumulation_fusion')
     group.add_argument('--use-mcore-models', action='store_true',
-                       help='Use the implementation from megatron core')
+                       dest='deprecated_use_mcore_models',
+                       help='DEPRECATED. Use the implementation from megatron core.'
+                       'Now ignored and mcore models are the default, use '
+                       '--use-legacy-models to not use core models.')
+    group.add_argument('--use-legacy-models', action='store_true',
+                       help='Use the legacy Megatron models, not Megatron-Core models.')
     group.add_argument('--manual-gc', action='store_true',
                        help='Disable the threshold-based default garbage '
                        'collector and trigger the garbage collection manually. '
@@ -1163,14 +1186,21 @@ def _add_learning_rate_args(parser):
                        'and initial warmup, the learning rate at each '
                        'iteration would be different.')
     group.add_argument('--lr-decay-style', type=str, default='linear',
-                       choices=['constant', 'linear', 'cosine', 'inverse-square-root'],
+                       choices=['constant', 'linear', 'cosine', 'inverse-square-root', 'WSD'],
                        help='Learning rate decay function.')
+    group.add_argument('--lr-wsd-decay-style', type=str, default='exponential',
+                       choices=['exponential', 'linear', 'cosine'],
+                       help='Decay style for the annealing phase of WSD'),
     group.add_argument('--lr-decay-iters', type=int, default=None,
                        help='number of iterations to decay learning rate over,'
                        ' If None defaults to `--train-iters`')
     group.add_argument('--lr-decay-samples', type=int, default=None,
                        help='number of samples to decay learning rate over,'
                        ' If None defaults to `--train-samples`')
+    group.add_argument('--lr-wsd-decay-samples', type=int, default=None,
+                       help='number of samples for the annealing phase in the wsd schedule')
+    group.add_argument('--lr-wsd-decay-iters', type=int, default=None,
+                       help='number of iterations for the annealing phase in the wsd schedule')
     group.add_argument('--lr-warmup-fraction', type=float, default=None,
                        help='fraction of lr-warmup-(iters/samples) to use '
                        'for warmup (as a float)')
@@ -1338,6 +1368,8 @@ def _add_distributed_args(parser):
                        dest='delay_grad_reduce')
     group.add_argument('--ddp-bucket-size', type=int, default=None,
                        help='Bucket size for data-parallel communication')
+    group.add_argument('--ddp-average-in-collective', action='store_true',
+                       default=False, help='If set, average directly in data-parallel communication collective.')
     group.add_argument('--overlap-param-gather', action='store_true',
                        default=False, help='If set, overlap param all-gather in distributed optimizer.')
     group.add_argument('--delay-param-gather', action='store_true',
@@ -1406,7 +1438,7 @@ def _add_data_args(parser):
                        '(3) a list of prefixes e.g. prefix1 prefix2. '
                        'For (3), weights are inferred from the lengths of the contributing datasets. '
                        'This argument is exclusive to the other independent --*-data-path arguments.')
-    group.add_argument('--split', type=str, default='969, 30, 1',
+    group.add_argument('--split', type=str, default=None,
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
                        '`90,5,5` will use 90%% of data for training, 5%% for '
@@ -1463,7 +1495,10 @@ def _add_data_args(parser):
                                 'GPT2BPETokenizer',
                                 'SentencePieceTokenizer',
                                 'GPTSentencePieceTokenizer',
+                                'HuggingFaceTokenizer',
                                 'Llama2Tokenizer',
+                                'Llama3Tokenizer',
+                                'MistralTokenizer',
                                 'NullTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
@@ -1673,6 +1708,18 @@ def _add_experimental_args(parser):
                        'To use local spec specify local as the argument.'
                        'For more details, see the model class, '
                        '`transformer_block.py`, or `transformer_layer.py`')
+    group.add_argument('--hybrid-attention-ratio', type=float, default=0.0,
+                       help='Ratio of attention layers to total layers, in the '
+                       'range [0.0, 1.0].')
+    group.add_argument('--hybrid-mlp-ratio', type=float, default=0.0,
+                       help='Ratio of mlp layers to total layers, in the '
+                       'range [0.0, 1.0].')
+    group.add_argument('--hybrid-override-pattern', type=str, default=None,
+                       help='Force a specific hybrid layer pattern. If a value'
+                       'greater than 0.0 is supplied to any of the hybrid ratio'
+                       'arguments, then the number of each type of layer in the'
+                       'override pattern must match number in the overidden'
+                       'pattern')
     group.add_argument('--yaml-cfg', type=str, default=None,
                        help = 'Config file to add additional arguments')
 

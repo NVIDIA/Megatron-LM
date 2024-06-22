@@ -21,6 +21,18 @@ from .utils import unwrap_model, print_rank_0, append_to_progress_log
 from ..core.dist_checkpointing.serialization import \
     get_default_save_sharded_strategy
 
+# [ModelOpt]: Import
+try:
+    from modelopt.torch.opt.plugins import (
+        save_modelopt_state,
+        save_sharded_modelopt_state,
+        restore_modelopt_state,
+        restore_sharded_modelopt_state,
+    )
+    has_nvidia_modelopt = True
+except Exception:
+    has_nvidia_modelopt = False
+
 _CHECKPOINT_VERSION = None
 
 
@@ -312,7 +324,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
 
         optim_sd_kwargs = {}
         if args.use_dist_ckpt and args.use_distributed_optimizer:
-            optim_sd_kwargs['sharding_type'] = ('fully_sharded_bucket_space'
+            optim_sd_kwargs['sharding_type'] = ('fully_sharded_model_space'
                                                 if args.ckpt_fully_parallel_save
                                                 else 'dp_zero_gather_scatter')
             print_rank_0(f'Storing distributed optimizer sharded state of type {optim_sd_kwargs["sharding_type"]}')
@@ -338,7 +350,15 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
                 checkpointing_context['save_strategy'] = save_strategy
             async_save_request = dist_checkpointing.save(state_dict, checkpoint_name, save_strategy,
                                                          async_sharded_save=args.async_save)
+
+            # [ModelOpt]: save sharded modelopt_state
+            if has_nvidia_modelopt:
+                save_sharded_modelopt_state(model, checkpoint_name, (args.dist_ckpt_format, 1))
         else:
+            # [ModelOpt]: Inject modelopt_state into state_dict
+            if has_nvidia_modelopt:
+                save_modelopt_state(model, state_dict)
+
             # Save.
             ensure_directory_exists(checkpoint_name)
             torch.save(state_dict, checkpoint_name)
@@ -703,23 +723,43 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
             run_tp_pp = (mpu.get_tensor_model_parallel_world_size(), mpu.get_pipeline_model_parallel_world_size())
             mismatch_msg = "(TP, PP) mismatch after resume ({} vs {} from checkpoint)".format(ckpt_tp_pp, run_tp_pp)
 
-            if ckpt_tp_pp == run_tp_pp and not getattr(state_dict['args'], 'no_save_rng', False):
-                rng_state = get_rng_state(True)  # we can load the rng state
+            # Determine if RNG state will be loaded
+            if (ckpt_tp_pp == run_tp_pp and not release and not args.finetune and not args.no_load_rng
+                    and not getattr(state_dict['args'], 'no_save_rng', False)):
+                gen_sd_rng_state = get_rng_state(True)  # we can load the rng state
             else:
-                rng_state = None
-                print_rank_0("{}: RNG state will be ignored".format(mismatch_msg))
-
-            # TODO: add DistributedOptimizer support for differing TPxPP
-            if ckpt_tp_pp != run_tp_pp and not release and not args.finetune and not args.no_load_optim and args.use_distributed_optimizer:
-                raise RuntimeError("{}: not supported for DistributedOptimizer".format(mismatch_msg))
+                gen_sd_rng_state = None
+                if ckpt_tp_pp != run_tp_pp:
+                    print_rank_0("{}: RNG state will be ignored".format(mismatch_msg))
 
             optim_sd_kwargs = dict(is_loading=True)
-            if args.use_distributed_optimizer:
-                optim_sd_kwargs['sharding_type'] = ('fully_sharded_bucket_space'
-                                                    if getattr(state_dict['args'], 'ckpt_fully_parallel_save', False)
-                                                    else 'dp_zero_gather_scatter')
-            load_kwargs['sharded_state_dict'] = generate_state_dict(args, model, optimizer, opt_param_scheduler,
-                                                                    rng_state, args.use_dist_ckpt, optim_sd_kwargs=optim_sd_kwargs)
+            # Determine if optimizer state will be loaded
+            if (not release and not args.finetune and not args.no_load_optim
+                    and not getattr(state_dict['args'], 'no_save_optim', False)):
+                gen_sd_optim = optimizer
+                gen_sd_opt_param_scheduler = opt_param_scheduler
+
+                # TODO: add DistributedOptimizer support for differing TPxPP
+                if ckpt_tp_pp != run_tp_pp and args.use_distributed_optimizer:
+                    raise RuntimeError("{}: not supported for DistributedOptimizer".format(mismatch_msg))
+
+
+                if args.use_distributed_optimizer:
+                    optim_sd_kwargs['sharding_type'] = ('fully_sharded_model_space'
+                                                        if getattr(state_dict['args'], 'ckpt_fully_parallel_save', False)
+                                                        else 'dp_zero_gather_scatter')
+                    # This is for backwards-compatibility. Can be removed once 'fully_sharded_bucket_space' loading is removed
+                    for maybe_dist_opt_optim_state in (state_dict['optimizer'], *state_dict['optimizer'].values()):
+                        if 'param_state_sharding_type' in maybe_dist_opt_optim_state:
+                            if maybe_dist_opt_optim_state['param_state_sharding_type'] == 'fully_sharded_bucket_space':
+                                print_rank_0('Detected deprecated `fully_sharded_bucket_space` DistributedOptimizer checkpoint format')
+                                optim_sd_kwargs['sharding_type'] = maybe_dist_opt_optim_state['param_state_sharding_type']
+                            break
+            else:
+                gen_sd_optim = None
+                gen_sd_opt_param_scheduler = None
+            load_kwargs['sharded_state_dict'] = generate_state_dict(args, model, gen_sd_optim, gen_sd_opt_param_scheduler,
+                                                                    gen_sd_rng_state, True, optim_sd_kwargs=optim_sd_kwargs)
             load_kwargs['exit_on_missing_checkpoint'] = args.exit_on_missing_checkpoint
 
     state_dict, checkpoint_name, release = _load_base_checkpoint(load_dir, rank0=False, **load_kwargs)
@@ -760,6 +800,13 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                                               'consumed_valid_samples', 0)
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
+
+    # [ModelOpt]: loading modelopt_state (sharded or not)
+    if has_nvidia_modelopt:
+        if args.use_dist_ckpt:
+            restore_sharded_modelopt_state(model, checkpoint_name)
+        else:
+            restore_modelopt_state(model, state_dict)
 
     # Model.
     strict = False if args.retro_add_retriever else strict

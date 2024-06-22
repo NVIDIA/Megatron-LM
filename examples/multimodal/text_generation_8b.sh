@@ -4,11 +4,23 @@ export NCCL_IB_SL=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NVTE_APPLY_QK_LAYER_SCALING=1
 
+INPUT_METADATA_PATH="placeholder"
+GROUNDTRUTH_PATH="placeholder"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        -i|--input-path)
-            INPUT_PATH="$2"
+        --input-image-path)
+            INPUT_IMAGE_PATH="$2"
+            shift
+            shift
+            ;;
+        --input-metadata-path)
+            INPUT_METADATA_PATH="$2"
+            shift
+            shift
+            ;;
+        -g|--groundtruth-path)
+            GROUNDTRUTH_PATH="$2"
             shift
             shift
             ;;
@@ -27,14 +39,15 @@ while [[ $# -gt 0 ]]; do
             shift
             shift
             ;;
+        --task)
+            TASK="$2"
+            shift
+            shift
+            ;;
         -g|--gt-path)
             GROUNDTRUTH_PATH="$2"
             shift
             shift
-            ;;
-        --default)
-            DEFAULT=YES
-            shift # past argument
             ;;
         -*|--*)
             echo "Invalid option $1"
@@ -46,7 +59,7 @@ done
 # Please modify these as needed.
 NUM_PARTITIONS=100
 START=0
-END=0
+END=2
 
 for PARTITION_ID in $( eval echo {$START..$END} )
 do

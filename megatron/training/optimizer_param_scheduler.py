@@ -13,7 +13,9 @@ class OptimizerParamScheduler(object):
                  lr_warmup_steps, lr_decay_steps, lr_decay_style,
                  start_wd, end_wd, wd_incr_steps, wd_incr_style,
                  use_checkpoint_opt_param_scheduler=True,
-                 override_opt_param_scheduler=False):
+                 override_opt_param_scheduler=False,
+                 wsd_decay_steps=None,
+                 lr_wsd_decay_style=None):
 
         # Class values.
         self.optimizer = optimizer
@@ -28,10 +30,14 @@ class OptimizerParamScheduler(object):
         self.lr_warmup_steps = lr_warmup_steps
         self.num_steps = 0
         self.lr_decay_steps = lr_decay_steps
+        self.wsd_decay_steps = wsd_decay_steps
+        self.lr_wsd_decay_style = lr_wsd_decay_style
         assert self.lr_decay_steps > 0
         assert self.lr_warmup_steps < self.lr_decay_steps
 
         self.lr_decay_style = lr_decay_style
+        if self.lr_decay_style == "WSD":
+            assert self.wsd_decay_steps is not None
 
         self.start_wd = start_wd
         self.end_wd = end_wd
@@ -120,6 +126,19 @@ class OptimizerParamScheduler(object):
             coeff = (1.0 - decay_ratio)
         elif self.lr_decay_style == 'cosine':
             coeff = 0.5 * (math.cos(math.pi * decay_ratio) + 1.0)
+        elif self.lr_decay_style == 'WSD':
+            wsd_anneal_start_ = self.lr_decay_steps - self.wsd_decay_steps
+            if self.num_steps <= wsd_anneal_start_:
+                coeff = 1.0
+            else:
+                wsd_steps = self.num_steps - wsd_anneal_start_
+                wsd_decay_ratio = float(wsd_steps) / float(self.wsd_decay_steps)
+                if self.lr_wsd_decay_style == "linear":
+                    coeff = (1.0 - wsd_decay_ratio)
+                elif self.lr_wsd_decay_style == "cosine":
+                    coeff = 0.5 * (math.cos(math.pi * wsd_decay_ratio) + 1.0)
+                elif self.lr_wsd_decay_style == "exponential":
+                    coeff = ((2.0 * math.pow(0.5, wsd_decay_ratio)) - 1.0)
         else:
             raise Exception('{} decay style is not supported.'.format(
                 self.lr_decay_style))

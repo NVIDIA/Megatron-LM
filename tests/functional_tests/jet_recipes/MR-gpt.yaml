@@ -53,13 +53,14 @@ spec:
         CKPT_FORMAT={ckpt_format} \
         CHECKPOINT_RESUME_TEST={ckpt_resume} \
         ALLOW_NONDETERMINISTIC={allow_nondeterministic} \
-        JOB_NAME={key.split("/")[1]} \
+        JOB_NAME={name} \
         ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'}
 products:
   # MCore
   - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1]}
   - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], extra_args: ["--no-create-attention-mask-in-dataloader"], args_meta: ["no_create_attention_mask_in_dataloader"]}
   - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], extra_args: ["--no-mmap-bin-files"], args_meta: ["no_mmap_bin_files"]}
+  - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], extra_args: ["--ddp-average-in-collective"], args_meta: ["ddp_average_in_collective"]}
   - {tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1]}
   - {tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1], extra_args: ["--calculate-per-token-loss"], args_meta: ["calculate_per_token_loss"]}
   - {tp_size: [4], pp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--qk-layernorm --test-mode"'], args_meta: ["qk_layernorm_test_mode"]}
@@ -72,7 +73,7 @@ products:
   - {tp_size: [1], pp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--recompute-granularity full --recompute-method uniform --recompute-num-layers 1"'], args_meta: ["uniform_full_recompute"]}
   - {tp_size: [2], pp_size: [1,2], ckpt_resume: [0, 1], allow_nondeterministic: [1], extra_args: ['"--context-parallel-size 2 --sequence-parallel --hidden-dropout 0.0 --attention-dropout 0.0"'], args_meta: ["cp2_nondeterministic"]}
   - {tp_size: [2], pp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1 --ckpt-fully-parallel-save --ckpt-fully-parallel-load"'], args_meta: ["te_8experts2parallel"]}
-  - {tp_size: [2], pp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --use-distributed-optimizer --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"'], args_meta: ["te_8experts2parallel_dist_optimizer"]}
+  - {tp_size: [2], pp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --use-distributed-optimizer --moe-router-load-balancing-type sinkhorn --moe-router-topk 1 --ckpt-fully-parallel-save --ckpt-fully-parallel-load"'], args_meta: ["te_8experts2parallel_dist_optimizer"]}
     ## TODO: MoE GroupedMLP dist-ckpt not supported, so must use 'torch' ckpt format
   - {tp_size: [2], pp_size: [1], ckpt_resume: [0, 1], ckpt_format: [torch], extra_args: ['"--moe-grouped-gemm --disable-bias-linear --sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --use-distributed-optimizer --moe-router-load-balancing-type sinkhorn --moe-router-topk 1 --overlap-grad-reduce --overlap-param-gather"'], moe_grouped_gemm: [1], args_meta: ["te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM"]}
   - {tp_size: [2], pp_size: [1], ckpt_resume: [0, 1], ckpt_format: [torch], extra_args: ['"--moe-grouped-gemm --disable-bias-linear --sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"'], moe_grouped_gemm: [1], args_meta: ["te_8experts2parallel_groupedGEMM"]}
@@ -85,6 +86,7 @@ products:
   - {tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce"'], args_meta: ["dist_optimizer_overlap_grad_reduce"]}
   - {tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --untie-embeddings-and-output-weights"'], args_meta: ["dist_optimizer_overlap_grad_reduce_untied"]}
   - {tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather --check-weight-hash-across-dp-replicas-interval 10 --ckpt-fully-parallel-save --ckpt-fully-parallel-load"'], args_meta: ["dist_optimizer_overlap_grad_reduce_param_gather"]}
+  - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], extra_args: ["--cross-entropy-loss-fusion"], args_meta: ["cross_entropy_loss_fusion"]}
   # Non-MCore, only legacy checkpoints supported
   - {use_mcore: [False], use_te: [False, True], tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], ckpt_format: [torch]}
   - {use_mcore: [False], tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1], ckpt_format: [torch]}

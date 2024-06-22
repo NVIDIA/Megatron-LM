@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -134,44 +135,35 @@ class MLP(MegatronModule):
     ) -> ShardedStateDict:
         sharded_state_dict = {}
         for name, module in self._modules.items():
-            if name == 'linear_fc1' and self.config.gated_linear_unit:
-                sub_sd = self._sharded_state_dict_for_glu(
-                    name, module, prefix, sharded_offsets, metadata
-                )
-            else:
-                sub_sd = module.sharded_state_dict(f'{prefix}{name}.', sharded_offsets, metadata)
+            sub_sd = module.sharded_state_dict(f'{prefix}{name}.', sharded_offsets, metadata)
+            if self.config.gated_linear_unit and name == 'linear_fc1':
+                assert f'{prefix}{name}.weight' in sub_sd, sub_sd.keys()
+                for k, v in sub_sd.items():
+                    if k in (f'{prefix}{name}.weight', f'{prefix}{name}.bias'):
+                        sub_sd[k] = apply_swiglu_sharded_factory(v, sharded_offsets)
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
 
-    def _sharded_state_dict_for_glu(
-        self,
-        module_name: str,
-        module: torch.nn.Module,
-        prefix: str,
-        sharded_offsets: Tuple[Tuple[int, int, int]],
-        metadata: Optional[dict] = None,
+
+def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
+    # We must split the tensor into 2 parts, each sharded separately.
+    # This requires a ShardedTensorFactory which `chunk`s during saving
+    # and `cat`s during loading
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    tp_size = parallel_state.get_tensor_model_parallel_world_size()
+    swiglu_shard_axis = 0
+    prepend_axis_num = len(sharded_offsets)
+    original_shape = original_sh_ten.local_shape
+    original_numel = int(np.prod(original_shape))
+
+    @torch.no_grad()
+    def sh_ten_build_fn(
+        key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
     ):
-        assert module_name == 'linear_fc1', module_name
-        sharded_state_dict = module.sharded_state_dict(
-            f'{prefix}{module_name}.', sharded_offsets, metadata
-        )
-        weight_key = f'{prefix}{module_name}.weight'
-        prev_sh_ten = sharded_state_dict[weight_key]
-
-        # We must split the tensor into 2 parts, each sharded separately.
-        # This requires a ShardedTensorFactory which `chunk`s during saving
-        # and `cat`s during loading
-        tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        tp_size = parallel_state.get_tensor_model_parallel_world_size()
-
-        tp_shard_axis = 0
-        prepend_axis_num = len(sharded_offsets)
-
-        def sh_ten_build_fn(key: str, t: torch.Tensor, replica_id: ReplicaId):
-            offset_w = (tp_shard_axis + prepend_axis_num, tp_rank, tp_size * 2)
-            offset_v = (tp_shard_axis + prepend_axis_num, tp_size + tp_rank, tp_size * 2)
-            with torch.no_grad():
-                tensor_w, tensor_v = torch.chunk(t, 2, dim=tp_shard_axis)
+        offset_w = (swiglu_shard_axis + prepend_axis_num, tp_rank, tp_size * 2)
+        offset_v = (swiglu_shard_axis + prepend_axis_num, tp_size + tp_rank, tp_size * 2)
+        if flattened_range is None:
+            tensor_w, tensor_v = torch.chunk(t, 2, dim=swiglu_shard_axis)
             return [
                 ShardedTensor.from_rank_offsets(
                     key,
@@ -190,16 +182,74 @@ class MLP(MegatronModule):
                     prepend_axis_num=prepend_axis_num,
                 ),
             ]
+        else:
+            # Here we need to map a slice `t` (`flattened_range` specifies slice start and stop)
+            # of the *original* flattened tensor into slices `w` and `v` of chunked
+            # and flattened tensor.
+            # Example:
+            # If original tensor has (16, 5) shape and flattened_range is `slice(8, 64)`,
+            # then `t` has shape `(56,)` and we need to create 2 tensors:
+            # w: first 32 elements of `t` with flattened_range slice(8, 40)
+            # v: last 24 elements of `t` with flattened_range slice(0, 24)
+            # Global offsets are the same as in the non-flattened case
+            assert t.ndim == 1, (key, t.shape)
+            non_flat_local_shape = (original_shape[0] // 2, *original_shape[1:])
+            chunk_numel = original_numel // 2
+            result = []
+            if flattened_range.start < chunk_numel:
+                # Non-empty `w` chunk
+                tensor_w = t[: chunk_numel - flattened_range.start]
+                flattened_range_w = slice(
+                    flattened_range.start, min(chunk_numel, flattened_range.stop)
+                )
+                assert len(tensor_w) == flattened_range_w.stop - flattened_range_w.start
+                result.append(
+                    ShardedTensor.from_rank_offsets_flat(
+                        key,
+                        tensor_w,
+                        non_flat_local_shape,
+                        *sharded_offsets,
+                        offset_w,
+                        replica_id=replica_id,
+                        prepend_axis_num=prepend_axis_num,
+                        flattened_range=flattened_range_w,
+                    )
+                )
+            if flattened_range.stop > chunk_numel:
+                # Non-empty `v` chunk
+                tensor_v = t[-(flattened_range.stop - chunk_numel) :]
+                flattened_range_v = slice(
+                    max(chunk_numel, flattened_range.start) - chunk_numel,
+                    flattened_range.stop - chunk_numel,
+                )
+                assert len(tensor_v) == flattened_range_v.stop - flattened_range_v.start, (
+                    len(tensor_v),
+                    flattened_range_v,
+                )
 
-        def sh_ten_merge_fn(sub_state_dict):
-            with torch.no_grad():
-                return torch.cat(sub_state_dict)
+                result.append(
+                    ShardedTensor.from_rank_offsets_flat(
+                        key,
+                        tensor_v,
+                        non_flat_local_shape,
+                        *sharded_offsets,
+                        offset_v,
+                        replica_id=replica_id,
+                        prepend_axis_num=prepend_axis_num,
+                        flattened_range=flattened_range_v,
+                    )
+                )
+            assert sum(sh_ten.data.numel() for sh_ten in result) == t.numel(), (result, t.shape)
+            return result
 
-        sharded_state_dict[weight_key] = ShardedTensorFactory(
-            prev_sh_ten.key,
-            prev_sh_ten.data,
-            sh_ten_build_fn,
-            sh_ten_merge_fn,
-            prev_sh_ten.replica_id,
-        )
-        return sharded_state_dict
+    def sh_ten_merge_fn(sub_state_dict):
+        with torch.no_grad():
+            return torch.cat(sub_state_dict)
+
+    return ShardedTensorFactory(
+        original_sh_ten.key,
+        original_sh_ten.data,
+        sh_ten_build_fn,
+        sh_ten_merge_fn,
+        original_sh_ten.replica_id,
+    )

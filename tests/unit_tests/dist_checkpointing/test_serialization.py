@@ -198,7 +198,8 @@ class TestSerialization:
     def test_can_mix_sharded_tensors_and_factories(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(1, 1)
 
-        def _build_fn(key, tensor, replica_id):
+        def _build_fn(key, tensor, replica_id, flattened_range):
+            assert flattened_range is None
             return [
                 ShardedTensor.from_rank_offsets(key + 'part1', tensor, replica_id=replica_id),
                 ShardedTensor.from_rank_offsets(key + 'part2', tensor, replica_id=replica_id),

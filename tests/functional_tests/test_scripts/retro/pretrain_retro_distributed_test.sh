@@ -28,12 +28,13 @@ command="export CUDA_DEVICE_MAX_CONNECTIONS=1;"
 TRANSFORMER_IMPL=local
 TRAINING_DTYPE=bf16
 
+USE_LEGACY=1
 if [[ $USE_CORE -eq 1 ]]; then
        echo "Running using megatron core"
        TRANSFORMER_IMPL=local
        TRAINING_DTYPE=bf16
        command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0;"
-       USE_MCORE=1
+       unset USE_LEGACY
        export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0
 fi
 
@@ -114,7 +115,7 @@ build_args() {
     --bf16 \
     --transformer-impl $TRANSFORMER_IMPL \
     --${TRAINING_DTYPE} \
-    ${USE_MCORE:+--use-mcore-models} \
+    ${USE_LEGACY:+--use-legacy-models} \
     ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
     --retro-workdir /workspace/data/retro_data/neighbors
     --retro-add-retriever \
@@ -149,7 +150,7 @@ echo "$command" > $SCRIPTS_DIR/pretrain_retro_distributed_command.sh
 eval $command
 
 echo "Saving test results to $TENSORBOARD_DIR"
-python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $TENSORBOARD_DIR "$JOB_NAME" | \
+PYTHONPATH=$PWD python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $TENSORBOARD_DIR "$JOB_NAME" | \
     tee ${TENSORBOARD_DIR}/results.json
 
 if [[ $SKIP_PYTEST != 1 ]]; then

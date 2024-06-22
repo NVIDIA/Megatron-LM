@@ -6,15 +6,13 @@ The following guide will show you how to quickly get started with Megatron Core.
 * We will save the model using the distributed checkpointing format
 * We will load the model saved above. 
 
-*NOTE: The following has been testing for megatron core version 0.5 and NGC Pytorch Container version 24.02
+*NOTE: The following has been testing for megatron core version 0.8.0 and NGC Pytorch Container version 24.02
 
 ### Environment Setup
 ```
-docker run --ipc=host --shm-size=512m --gpus all -it nvcr.io/nvidia/pytorch:24.02-py3
+docker run --ipc=host --shm-size=512m --gpus 2 -it nvcr.io/nvidia/pytorch:24.02-py3
 
-pip install megatron_core
-pip install tensorstore==0.1.45
-pip install zarr
+git clone https://github.com/NVIDIA/Megatron-LM.git && cd Megatron-LM
 ```
 <br>
 
@@ -23,7 +21,10 @@ The following steps will walk you through how you can create a sample GPT model 
 
 <br>
 
-**NOTE: All of the folowing steps needs to be put into a script and then run as explained in the last step** 
+**NOTE: All of the following steps are already put into a script [run_simple_mcore_train_loop.py](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/run_simple_mcore_train_loop.py) which you can run as follows** 
+```
+PYTHONPATH=$PYTHON_PATH:./megatron torchrun --nproc-per-node 2 examples/run_simple_mcore_train_loop.py
+```
 
 <br>
 
@@ -80,26 +81,43 @@ The following shows you how you can quickly get started with a mock dataset util
 To find more information about megatron core data pipeline please refer to [this](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/datasets/readme.md?ref_type=heads)
 
 ```
+import torch
 from torch.utils.data import DataLoader
-from megatron.core.datasets.utils import Split
+
+from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
+from megatron.training.tokenizer.tokenizer import _NullTokenizer
+from megatron.core.datasets.utils import compile_helpers
+
+_SEQUENCE_LENGTH = 64
 
 def get_train_data_iterator():
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0:
+            compile_helpers()
+        torch.distributed.barrier()
+    else:
+        compile_helpers()
+
     config = GPTDatasetConfig(
-        random_seed=0, 
-        sequence_length=64, 
-        blend=None, 
-        reset_position_ids=False, 
-        reset_attention_mask=False, 
-        eod_mask_loss=False, 
-        tokenizer="dummy")
+        random_seed=0,
+        sequence_length=_SEQUENCE_LENGTH,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        tokenizer=_NullTokenizer(vocab_size=_SEQUENCE_LENGTH),
+    )
 
-    training_data= MockGPTDataset(Split.train, config)
+    datasets = BlendedMegatronDatasetBuilder(
+        MockGPTDataset, [1000, None, None], lambda: True, config
+    ).build()
 
-    train_dataloader = DataLoader(training_data, batch_size=8, shuffle=True)
+    train_dataloader = DataLoader(datasets[0], batch_size=8, shuffle=True)
 
     train_iterator = iter(train_dataloader)
+
     return train_iterator
+
 ```
 <br>
 
@@ -138,8 +156,6 @@ def forward_step_func(data_iterator, model):
 **STEP 5 - Load and Save Distributed Checkpoint**
 Megatron core uses distributed checkpoint for loading and saving model. This gives you the flexiblity to convert model from one model parallel setting to another when you load a model (i.e A model trained with tensor parallel size 2, can now be loaded as tensor model parallel size 4 etc.)
 
-*NOTE: Make sure you have zarr and tensorstore pip package installed as shown in the environment setup*
-
 ```python
 from megatron.core import dist_checkpointing
 
@@ -157,6 +173,7 @@ def load_distributed_checkpoint(checkpoint_path, gpt_model):
 
 **STEP 6 - Main Function**
 The following is the main function that needs to go into your script. 
+
 ```python
 from pathlib import Path
 from torch.optim import Adam
@@ -205,16 +222,7 @@ if __name__ == "__main__":
 ```
 <br>
 
-**STEP 7 - Running the full example**
-All the above steps are put to gether in a [run_simple_mcore_train_loop.py](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/run_simple_mcore_train_loop.py) script in examples folder in megatron . You can run it as follows
 
-```
-git clone https://github.com/NVIDIA/Megatron-LM.git
-cd Megatron-LM/examples
-NUM_GPUS=2
-torchrun --nproc-per-node $NUM_GPUS run_simple_mcore_train_loop.py
-```
-<br>
 
 ### Extending Further
 The above example introduced you to a basic training loop in MCore. To see more advanced examples please look at [pretrain_gpt.py]. That will show you how you can write more complex training loops, involving pipeline parallel, context parallel, rope embeddings, mixture of experts and all other functionalities present in mcore. 

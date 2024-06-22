@@ -38,9 +38,17 @@ def build_tokenizer(args):
     elif args.tokenizer_type == 'GPTSentencePieceTokenizer':
         assert args.tokenizer_model is not None
         tokenizer = _GPTSentencePieceTokenizer(args.tokenizer_model)
+    elif args.tokenizer_type == 'HuggingFaceTokenizer':
+        tokenizer = _HuggingFaceTokenizer(args.tokenizer_model)
     elif args.tokenizer_type == 'Llama2Tokenizer':
         assert args.tokenizer_model is not None
         tokenizer = _Llama2Tokenizer(args.tokenizer_model)
+    elif args.tokenizer_type == 'Llama3Tokenizer':
+        assert args.tokenizer_model is not None
+        tokenizer = create_llama3_tokenizer(args.tokenizer_model)
+    elif args.tokenizer_type == 'MistralTokenizer':
+        assert args.tokenizer_model is not None
+        tokenizer = create_mistral_tokenizer(args.tokenizer_model)
     elif args.tokenizer_type == 'NullTokenizer':
         assert args.vocab_size is not None
         tokenizer = _NullTokenizer(args.vocab_size)
@@ -70,6 +78,48 @@ def _vocab_size_with_padding(orig_vocab_size, args):
               '(new size: {})'.format(
                   orig_vocab_size, after - orig_vocab_size, after), flush=True)
     return after
+
+
+class _HuggingFaceTokenizer(MegatronTokenizer):
+    def __init__(self, pretrained_model_name_or_path):
+        super().__init__(pretrained_model_name_or_path)
+        try:
+            import transformers
+        except ImportError:
+            raise EnvironmentError(f"The transformers library must be installed to use huggingface_tokenizer_provider")
+
+        # TODO(bnorick): download tokenizer once to lustre and use force offline to make sure all tasks read it from there
+        self._tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path=pretrained_model_name_or_path)
+        self._vocab = self._tokenizer.get_vocab()
+        self._inv_vocab = {token_id: token for token, token_id in self._vocab.items()}
+
+    @property
+    def vocab_size(self):
+        return len(self._tokenizer)
+
+    @property
+    def vocab(self):
+        """Dictionary from vocab text token to id token."""
+        return self._vocab
+
+    @property
+    def inv_vocab(self):
+        """Dictionary from vocab id token to text token."""
+        return self._inv_vocab
+
+    @property
+    def decoder(self):
+        return self._inv_vocab
+
+    def tokenize(self, text):
+        return self._tokenizer(text).input_ids
+
+    def detokenize(self, token_ids):
+        return self._tokenizer.decode(token_ids)
+
+    @property
+    def eod(self):
+        return self._tokenizer.eos_token_id
 
 
 class _BertWordPieceTokenizer(MegatronTokenizer):
@@ -486,6 +536,68 @@ class _Llama2Tokenizer(_SentencePieceTokenizer):
     @property
     def additional_special_tokens_ids(self):
         return None
+
+
+def create_llama3_tokenizer(*args, **kwargs):
+
+    try:
+        from llama.tokenizer import Tokenizer as Llama3Tokenizer
+    except ImportError:
+        raise ImportError("Module 'llama' is required but not installed.")
+
+    class _Llama3Tokenizer(Llama3Tokenizer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+
+        def tokenize(self, s: str, bos=True, eos=False):
+            '''Default args for text completion, not chat/dialog.'''
+
+            assert type(s) is str
+
+            t = self.encode(s, bos=False, eos=eos, allowed_special='all')
+            return t
+
+        def detokenize(self, ids):
+            return self.decode(ids)
+
+        @property
+        def cls(self):
+            return -1
+
+        @property
+        def sep(self):
+            return -1
+
+        @property
+        def mask(self):
+            return -1
+
+        @property
+        def eod(self):
+            return self.eos_id
+
+        @property
+        def additional_special_tokens_ids(self):
+            return None
+
+        @property
+        def vocab_size(self):
+            return self.model.n_vocab
+
+    return _Llama3Tokenizer(*args, **kwargs)
+
+
+def create_mistral_tokenizer(*args, **kwargs):
+    try:
+        from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+    except ImportError:
+        raise ImportError("Module 'mistral-common' is required but not installed.")
+
+    class _MistralTokenizer(MistralTokenizer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+
+    return _MistralTokenizer.from_file(*args, **kwargs)
 
 
 class _NullTokenizer(MegatronTokenizer):

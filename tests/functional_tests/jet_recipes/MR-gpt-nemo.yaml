@@ -38,7 +38,7 @@ spec:
         VP_SIZE={vp_size if vp_size is not None else '""'} \
         MBS={mbs} \
         GBS={gbs} \
-        JOB_NAME={key.split("/")[1]} \
+        JOB_NAME={name} \
         ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'}
 products:
   - {tp_size: [1], pp_size: [1], mbs: [4], gbs: [64], vp_size: [null]}

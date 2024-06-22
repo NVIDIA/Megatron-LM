@@ -37,11 +37,12 @@ else
    ADDITIONAL_PARAMS+=" --deterministic-mode"
 fi
 
+USE_LEGACY=1
 if [[ $USE_CORE -eq 1 ]]; then
        echo "Running using megatron core"
        TRANSFORMER_IMPL=local
        TRAINING_DTYPE=bf16
-       USE_MCORE=1
+       unset USE_LEGACY
 fi
 
 if [[ $NO_FA -eq 1 ]]; then
@@ -103,7 +104,6 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --vocab-extra-ids 100 \
     --init-method-std 0.015 \
     --transformer-impl $TRANSFORMER_IMPL \
-    --use-mcore-models \
     --data-path $DATA_PATH \
     --vocab-file $VOCAB_PATH \
     --tokenizer-type BertWordPieceCase \
@@ -122,7 +122,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --eval-iters 10 \
     --distributed-backend nccl \
     ${DATA_CACHE:+--data-cache-path "$DATA_CACHE"} \
-    ${USE_MCORE:+--use-mcore-models} \
+    ${USE_LEGACY:+--use-legacy-models} \
     ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS}"
 
 command="$command $torch_run_cmd"
@@ -137,7 +137,7 @@ echo "$command" > $SCRIPTS_DIR/pretrain_t5_distributed_command.sh
 eval $command
 
 echo "Saving test results to $TENSORBOARD_DIR"
-python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $TENSORBOARD_DIR "$JOB_NAME" | \
+PYTHONPATH=$PWD python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $TENSORBOARD_DIR "$JOB_NAME" | \
     tee ${TENSORBOARD_DIR}/results.json
 
 if [[ $SKIP_PYTEST != 1 ]]; then

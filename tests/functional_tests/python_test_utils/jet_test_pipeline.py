@@ -50,7 +50,7 @@ def check_exitcodes(results, summary_jobid):
     for result in results:
         exit_codes.append(result.get('l_exit_code', -1))
         log_urls.append(select_asset(result, 'output_script-0.log'))
-        names.append(result['obj_workload']['s_key'].split('basic/')[-1])
+        names.append(result['obj_workload']['obj_spec']['s_name'])
         metrics_file_urls.append(select_asset(result, 'results.json'))
 
     # Results metrics table
@@ -91,7 +91,7 @@ def check_exitcodes(results, summary_jobid):
 def _download_log(url, save_dir):
     import requests
     if not os.path.exists(save_dir):
-        os.mkdir(save_dir)
+        os.makedirs(save_dir, exist_ok=True)
     filepath = os.path.join(save_dir, url.split('/')[-1])
 
     r = requests.get(url)
@@ -108,7 +108,7 @@ def save_scripts(results, save_dir):
 
     for result in results:
         script = result['obj_workload']['obj_spec']['s_script']
-        target_path = result['obj_workload']['s_key'].split('basic/')[-1] + '.sh'
+        target_path = result['obj_workload']['obj_spec']['s_name'] + '.sh'
         target_path = os.path.join(save_dir, target_path)
 
         from textwrap import dedent
@@ -141,7 +141,7 @@ def check_baselines(results):
         # Download TB event logs
         for result in results:
             event_log_url = select_asset(result, 'events.out.tfevents')
-            target_dir = result['obj_workload']['s_key'].split('basic/')[-1]
+            target_dir = result['obj_workload']['obj_spec']['s_name']
             target_dir = os.path.join(tmpdir, target_dir)
             _download_log(event_log_url, target_dir)
 
@@ -156,7 +156,7 @@ def fetch_metrics_files(results, save_dir):
     for result in results:
         metrics_url = select_asset(result, 'results.json')
         if metrics_url is not None:
-            cfg = result['obj_workload']['s_key'].split('basic/')[-1]
+            cfg = result['obj_workload']['obj_spec']['s_name']
             target_dir = os.path.join(save_dir, cfg)
             _download_log(metrics_url, target_dir)
 

@@ -6,6 +6,9 @@ workflow:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/
       variables:
         JET_CUSTOM_FILTER: "type == 'build' or 'merge-request' in spec.scope"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Build only/
+      variables:
+        JET_CUSTOM_FILTER: "type == 'build'"
     # always run MR pipelines
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     # always run web pipelines
@@ -20,11 +23,14 @@ stages:
   - test
   - jet
 
-variables: &VARS
+variables:
   SELENE_ADLR_CI_PATH: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron"
   DATA_DIR: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron/data"
   PYTHON_VIRTUAL_ENV: /lustre/fsw/adlr/adlr-nlp/adlr_ci/cienv/bin/activate
-  JET_CUSTOM_FILTER: ""
+  JET_CUSTOM_FILTER:
+    description: |
+      Selects what functional tests to run. For merge-request tests: "type == 'build' or 'merge-request' in spec.scope". For nightly tests: "type == 'build' or 'nightly' in spec.scope"
+    value: ""
   DISPLAY_OUTPUT: "True" # Set to true for new tests to copy the logs for creating golden truth file
   TIME_LIMIT: "10:00" # Default time limit for all jobs
   MOE_GROUPED_GEMM: 0 # Set to 1 to enable grouped gemm for MoE
@@ -67,6 +73,7 @@ unit_tests-data:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
+  interruptible: true
 
 unit_tests-dist-checkpointing:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
@@ -81,6 +88,7 @@ unit_tests-dist-checkpointing:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
+  interruptible: true
 
 unit_tests-fusions:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
@@ -95,6 +103,7 @@ unit_tests-fusions:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
+  interruptible: true
 
 unit_tests-inference:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
@@ -109,6 +118,7 @@ unit_tests-inference:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
+  interruptible: true
 
 unit_tests-models:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
@@ -123,6 +133,7 @@ unit_tests-models:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
+  interruptible: true
 
 unit_tests-pipeline-parallel:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
@@ -137,6 +148,7 @@ unit_tests-pipeline-parallel:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
+  interruptible: true
 
 unit_tests-tensor-parallel:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
@@ -151,6 +163,7 @@ unit_tests-tensor-parallel:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
+  interruptible: true
 
 unit_tests-transformer:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
@@ -165,6 +178,7 @@ unit_tests-transformer:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
+  interruptible: true
 
 unit_tests-top-py:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
@@ -179,6 +193,7 @@ unit_tests-top-py:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
+  interruptible: true
 
 docs_build_test:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/python-format:0.0.1
@@ -194,6 +209,7 @@ docs_build_test:
   allow_failure: true
   except:
     - main
+  interruptible: true
 
 formatting:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/python-format:0.0.1
@@ -205,3 +221,4 @@ formatting:
     - isort megatron/core --check
   rules:
     - when: always
+  interruptible: true

@@ -82,9 +82,11 @@ def make_sharded_optimizer_tensor(
     assert (
         tuple(optim_param.shape) == model_param.local_shape
     ), f'Optimizer shape ({tuple(optim_param.shape)} does not match model shape ({model_param.local_shape})'
-    return replace(
+    sh_ten = replace(
         model_param, key=f'{prefix}.{model_param.key}', data=optim_param, dtype=optim_param.dtype
     )
+    sh_ten.validate_metadata_integrity()
+    return sh_ten
 
 
 def optim_state_to_sharding_state(

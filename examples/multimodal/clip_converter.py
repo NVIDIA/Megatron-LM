@@ -111,7 +111,8 @@ def convert(download_root, output_path, tensor_parallel_size, use_te_layernorm_l
             new_tensors = torch.chunk(new_tensor, tensor_parallel_size, dim=chunk_dim)
 
         for i in range(tensor_parallel_size):
-            new_state_dicts[i]["model"][new_name] = new_tensors[i]
+            # chunk() creates a view of a bigger tensor. clone() is used here to avoid excessive storage.
+            new_state_dicts[i]["model"][new_name] = new_tensors[i].clone()
 
     for i in range(tensor_parallel_size):
         output_path_tp = os.path.join(output_path, f"state_dict_tp_{i}.pt")

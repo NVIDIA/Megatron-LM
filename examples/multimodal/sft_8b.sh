@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Run SFT on a multimodal model.
+# Run SFT on a pretrained multimodal model.
 
 export NCCL_IB_SL=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -41,11 +41,13 @@ DEBUG=0
 if [[ $DEBUG -eq 1 ]]; then
     BZ=8
     NW=1
+    LI=1
     HD=0.0
     EXTRA_ARGS=""
 else
     BZ=128
     NW=1
+    LI=10
     HD=0.1
     EXTRA_ARGS=""
 fi
@@ -76,7 +78,7 @@ OPTIONS=" \
     --lr 1e-6 \
     --min-lr 1e-7 \
     --lr-decay-style cosine \
-    --log-interval 10 \
+    --log-interval ${LI} \
     --eval-iters 10 \
     --eval-interval 1000 \
     --tokenizer-type GPTSentencePieceTokenizer \
@@ -84,7 +86,6 @@ OPTIONS=" \
     --data-path ${DATA_TRAIN} \
     --valid-path ${DATA_VALID} \
     --prompt-path ${SOURCE}/examples/multimodal/manual_prompts.json \
-    --dset-config ${SOURCE}/examples/multimodal/dataset_config.yaml \
     --save-interval 1000 \
     --exit-duration-in-mins 230 \
     --save ${FINETUNE_DIR} \
@@ -115,4 +116,4 @@ OPTIONS=" \
 export NVTE_APPLY_QK_LAYER_SCALING=1
 
 # MULTI GPU
-torchrun --nproc_per_node 8 pretrain_multimodal.py ${OPTIONS}
+torchrun --nproc_per_node 8 examples/multimodal/train.py ${OPTIONS}

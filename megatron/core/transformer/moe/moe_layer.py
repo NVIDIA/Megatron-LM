@@ -90,6 +90,16 @@ class MoELayer(BaseMoELayer):
         self.moe_layer_recompute = config.moe_layer_recompute
 
     def forward(self, hidden_states: torch.Tensor):
+        if (
+            self.training
+            and self.config.tensor_model_parallel_size > 1
+            and not self.config.sequence_parallel
+        ):
+            raise ValueError(
+                "During training, performance may degrade if MoE and tensor parallelism"
+                "are enabled without also enabling sequence parallelism."
+            )
+
         # process MoE
         def custom_forward(hidden_states):
             probs, indices = self.router(hidden_states)

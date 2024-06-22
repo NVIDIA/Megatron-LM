@@ -48,7 +48,7 @@ else
     BZ=256
     NW=2
     HD=0.1
-    LI=1
+    LI=10
     EXTRA_ARGS=""
     NONDETERMINISTIC_ATTN=1
 fi
@@ -88,7 +88,6 @@ OPTIONS=" \
     --data-path ${DATA_TRAIN} \
     --valid-path ${DATA_VALID} \
     --prompt-path ${SOURCE}/examples/multimodal/manual_prompts.json \
-    --dataset-config ${SOURCE}/examples/multimodal/dataset_config.yaml \
     --save-interval 1000 \
     --save ${FINETUNE_DIR} \
     --load ${CHECKPOINT_DIR} \
@@ -115,6 +114,7 @@ OPTIONS=" \
     ${EXTRA_ARGS} \
     --distributed-timeout-minutes 60 \
     --allow-missing-vision-projection-checkpoint \
+    --use-te
 "
 
 export NVTE_APPLY_QK_LAYER_SCALING=1

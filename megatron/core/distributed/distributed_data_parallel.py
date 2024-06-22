@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 from contextlib import contextmanager
-from logging import getLogger
 from typing import Dict, Optional
 
 import torch
@@ -9,10 +9,11 @@ import torch
 from .. import parallel_state
 from ..transformer.module import MegatronModule
 from ..transformer.transformer_config import TransformerConfig
+from ..utils import log_single_rank
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import ParamAndGradBuffer
 
-logger = getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class DistributedDataParallel(MegatronModule):
@@ -27,12 +28,9 @@ class DistributedDataParallel(MegatronModule):
         config: Transformer config object.
         ddp_config: DistributedDataParallel config object.
         module: Underlying model.
-        data_parallel_group: Data-parallel process group.
-        expert_data_parallel_group: Optional data-parallel process group for experts in a MoE.
         disable_bucketing: If true, force assign all parameters to a single bucket. If false,
             use standard bucketing policy: assign parameters to smaller buckets and all-reduce
             per bucket _if_ overlap_grad_reduce is True and pp_rank is 0.
-        check_for_nan_in_grad: If true, check if local grad norm is NaN.
 
     """
 
@@ -41,8 +39,6 @@ class DistributedDataParallel(MegatronModule):
         config: TransformerConfig,
         ddp_config: DistributedDataParallelConfig,
         module: torch.nn.Module,
-        data_parallel_group: torch.distributed.ProcessGroup,
-        expert_data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         disable_bucketing: bool = False,
     ):
         super().__init__(config=config)
@@ -53,15 +49,19 @@ class DistributedDataParallel(MegatronModule):
         # ring-reduce implementations are large enough to remain bandwidth-bound rather than
         # latency-bound.
         if ddp_config.bucket_size is None:
-            dp_size = parallel_state.get_data_parallel_world_size()
-            ddp_config.bucket_size = max(40000000, 1000000 * dp_size)
+            ddp_config.bucket_size = max(
+                40000000, 1000000 * parallel_state.get_data_parallel_world_size()
+            )
         # Set bucket_size to infinity if overlap_grad_reduce is False.
         if not ddp_config.overlap_grad_reduce:
             ddp_config.bucket_size = None
 
         self.ddp_config = ddp_config
-        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-            logger.info(f'Setting up DistributedDataParallel with config {self.ddp_config}')
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f'Setting up DistributedDataParallel with config {self.ddp_config}',
+        )
 
         # Turn off bucketing if we are on a pipeline stage that is not the first (since
         # data-parallel communication on these stages is not on the critical path), or if
@@ -109,6 +109,18 @@ class DistributedDataParallel(MegatronModule):
                 params.append(param)
                 param_and_grad_dtype_to_params[(param_dtype, grad_dtype)] = params
 
+            if not config.calculate_per_token_loss:
+                target_gradient_scaling_factor = 1.0 / parallel_state.get_data_parallel_world_size()
+                if self.ddp_config.average_in_collective:
+                    # Collective is averaging gradients in collective with data_parallel_group.
+                    assert (
+                        gradient_scaling_factor
+                        / torch.distributed.get_world_size(group=data_parallel_group)
+                        == target_gradient_scaling_factor
+                    )
+                else:
+                    assert gradient_scaling_factor == target_gradient_scaling_factor
+
             # Allocate the grad buffers and map the grads.
             buffers = []
             for (param_dtype, grad_dtype), params in param_and_grad_dtype_to_params.items():
@@ -131,20 +143,30 @@ class DistributedDataParallel(MegatronModule):
 
         if config.calculate_per_token_loss:
             gradient_scaling_factor = 1.0
+            expert_gradient_scaling_factor = 1.0
         else:
-            data_parallel_world_size = torch.distributed.get_world_size(data_parallel_group)
-            gradient_scaling_factor = 1.0 / data_parallel_world_size
+            if self.ddp_config.average_in_collective:
+                gradient_scaling_factor = 1.0
+                expert_gradient_scaling_factor = (
+                    1.0 / parallel_state.get_expert_model_parallel_world_size()
+                )
+            else:
+                data_parallel_world_size = parallel_state.get_data_parallel_world_size()
+                gradient_scaling_factor = 1.0 / data_parallel_world_size
+                expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
 
         # Allocate the param+grad buffers for dense params' grads.
         self.buffers = allocate_buffers_for_parameters(
-            dense_params, data_parallel_group, gradient_scaling_factor=gradient_scaling_factor,
+            dense_params,
+            parallel_state.get_data_parallel_group(with_context_parallel=True),
+            gradient_scaling_factor=gradient_scaling_factor,
         )
 
         # Allocate separate param+grad buffers for expert parallel params' grads.
         self.expert_parallel_buffers = allocate_buffers_for_parameters(
             expert_parallel_params,
-            expert_data_parallel_group,
-            gradient_scaling_factor=gradient_scaling_factor,
+            parallel_state.get_data_modulo_expert_parallel_group(),
+            gradient_scaling_factor=expert_gradient_scaling_factor,
         )
 
         # Delete references to weight_tensor if they exist since we don't want two parameter copies
@@ -266,17 +288,16 @@ class DistributedDataParallel(MegatronModule):
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
             if is_expert_parallel:
-                torch.distributed.broadcast(
-                    param.data,
-                    src=torch.distributed.get_process_group_ranks(self.expert_data_parallel_group),
-                    group=self.expert_data_parallel_group,
-                )
+                data_parallel_group = parallel_state.get_data_modulo_expert_parallel_group()
             else:
-                torch.distributed.broadcast(
-                    param.data,
-                    src=torch.distributed.get_process_group_ranks(self.data_parallel_group),
-                    group=self.data_parallel_group,
+                data_parallel_group = parallel_state.get_data_parallel_group(
+                    with_context_parallel=True
                 )
+            torch.distributed.broadcast(
+                param.data,
+                src=torch.distributed.get_global_rank(data_parallel_group, 0),
+                group=data_parallel_group,
+            )
 
     def state_dict(self, prefix='', keep_vars=False):
         """
