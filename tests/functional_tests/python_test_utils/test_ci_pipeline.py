@@ -23,6 +23,7 @@ def expected_data(request):
 
 # If we require a variation of tests for any of the other pipelines we can just inherit this class.
 class TestCIPipeline:
+    allow_nondeterministic = ALLOW_NONDETERMINISTIC
 
     # Replace symbol in namespace to fix function call result for lifetime of
     # this class.
@@ -46,6 +47,11 @@ class TestCIPipeline:
             metric_dict["start_step"] : metric_dict["end_step"] : metric_dict["step_interval"]
         ]
         print(f"The list of actual values: {actual_list_sliced}")
+
+        if metric_type == "iteration-time":
+            actual_list_sliced = actual_list_sliced[3:]
+            expected_list = expected_list[3:]
+            print(f"Removing first items of values for metric_type iteration-time")
         
         if test_type == TypeOfTest.DETERMINISTIC:
             assert np.allclose(
@@ -58,22 +64,23 @@ class TestCIPipeline:
         else:
             raise ValueError(f"Unexpected test_type {test_type} provided")
 
-    @pytest.mark.skipif(ALLOW_NONDETERMINISTIC, reason="Nondeterministic is allowed.")
+    def test_approx(self, expected_data):
+        expected_metric, expected_values = expected_data
+
+        if expected_metric in TYPE_OF_TEST_TO_METRIC[TypeOfTest.APPROX]:
+            self._test_helper(expected_metric, expected_values, TypeOfTest.APPROX)
+        else:
+            print(f"Skipping metric {expected_metric} for approximate as it is deterministic only.")
+
+    @pytest.mark.skipif(allow_nondeterministic, reason="Cannot expect exact results")
     def test_deterministic(self, expected_data):
         expected_metric, expected_values = expected_data
 
         if expected_metric in TYPE_OF_TEST_TO_METRIC[TypeOfTest.DETERMINISTIC]:
             self._test_helper(expected_metric, expected_values, TypeOfTest.DETERMINISTIC)
-
-    @pytest.mark.skipif(
-        not ALLOW_NONDETERMINISTIC, reason="Nondeterministic is not allowed."
-    )
-    def test_approx(self, expected_data):
-        expected_metric, expected_values = expected_data
-        
-        if expected_metric in TYPE_OF_TEST_TO_METRIC[TypeOfTest.APPROX]:
-            self._test_helper(expected_metric, expected_values, TypeOfTest.APPROX)
-
+        else:
+            print(f"Skipping metric {expected_metric} for deterministic as it is approximate only.")
+            
     # # @TODO: This is inactive, do we want to activate it?
     # def iteration_timing_node(self):
     #     expected_iteration_timing_avg = self.expected["train_step_timing_avg"]
@@ -84,3 +91,7 @@ class TestCIPipeline:
     #         expected_iteration_timing_avg
     #         == pytest.approx(expected=iteration_time_avg, rel=self.margin_time)
     #     ), f"The time per global step must be approximately {expected_iteration_timing_avg} but it is {iteration_time_avg}."
+
+# if deterministic, then also approx
+# if not determinstic, then also aprox
+

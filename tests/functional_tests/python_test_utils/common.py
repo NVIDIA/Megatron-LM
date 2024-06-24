@@ -22,11 +22,13 @@ class TypeOfTest(enum.Enum):
 
 TYPE_OF_TEST_TO_METRIC = {
     TypeOfTest.DETERMINISTIC: ["lm loss", "num-zeros"],
-    TypeOfTest.APPROX: ["lm loss"],
+    TypeOfTest.APPROX: ["lm loss", "iteration-time", "mem-allocated-bytes"],
 }
 
 METRIC_TO_THRESHOLD = {
-    "lm loss": 0.05,
+    "iteration-time": 0.3,
+    "mem-allocated-bytes": 3 * 1000 * 1000, # 3MB
+    "lm loss": 0.05
 }
 
 ALLOW_NONDETERMINISTIC = bool(int(os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO")))
