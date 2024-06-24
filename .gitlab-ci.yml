@@ -20,6 +20,7 @@ workflow:
     - if: $CI_COMMIT_BRANCH
 
 stages:
+  - build
   - test
   - jet
 
@@ -40,12 +41,36 @@ variables:
       - "mcore/draco-oci"
       - "mcore/eos"
     description: '"mcore/draco-oci" for OCI-IAD, "mcore/eos" for EOS'
-
+  CI_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:${CI_PIPELINE_ID} 
+  CACHE_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:buildcache
 include:
   - jet-tests.yml
 
+build:
+  tags:
+    - 8xL40S
+  image: docker:26.1.4-dind
+  stage: build
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
+  script:
+    - |
+      docker build \
+        -f Dockerfile.ci \
+        -t ${CI_IMAGE} \
+        --cache-to type=inline \
+        --cache-from type=registry,ref=${CACHE_IMAGE} .
+
+      docker push ${CI_IMAGE} 
+
+      if [[ "$CI_COMMIT_BRANCH" = "main" ]]; then
+        docker tag ${CI_IMAGE} ${CACHE_IMAGE}
+        docker push ${CACHE_IMAGE}
+      fi
+  interruptible: true
+
 unit_tests:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
+  image: ${CI_IMAGE}
   tags:
     - 8xL40S
   stage: test
@@ -62,7 +87,7 @@ unit_tests:
     
 
 unit_tests-data:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
+  image: ${CI_IMAGE}
   tags:
     - 8xL40S
   stage: test
@@ -77,7 +102,7 @@ unit_tests-data:
   interruptible: true
 
 unit_tests-dist-checkpointing:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
+  image: ${CI_IMAGE}
   tags:
     - 8xL40S
   stage: test
@@ -92,7 +117,7 @@ unit_tests-dist-checkpointing:
   interruptible: true
 
 unit_tests-fusions:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
+  image: ${CI_IMAGE}
   tags:
     - 8xL40S
   stage: test
@@ -107,7 +132,7 @@ unit_tests-fusions:
   interruptible: true
 
 unit_tests-inference:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
+  image: ${CI_IMAGE}
   tags:
     - 8xL40S
   stage: test
@@ -122,7 +147,7 @@ unit_tests-inference:
   interruptible: true
 
 unit_tests-models:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
+  image: ${CI_IMAGE}
   tags:
     - 8xL40S
   stage: test
@@ -137,7 +162,7 @@ unit_tests-models:
   interruptible: true
 
 unit_tests-pipeline-parallel:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
+  image: ${CI_IMAGE}
   tags:
     - 8xL40S
   stage: test
@@ -152,7 +177,7 @@ unit_tests-pipeline-parallel:
   interruptible: true
 
 unit_tests-tensor-parallel:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
+  image: ${CI_IMAGE}
   tags:
     - 8xL40S
   stage: test
@@ -167,7 +192,7 @@ unit_tests-tensor-parallel:
   interruptible: true
 
 unit_tests-transformer:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
+  image: ${CI_IMAGE}
   tags:
     - 8xL40S
   stage: test
@@ -182,7 +207,7 @@ unit_tests-transformer:
   interruptible: true
 
 unit_tests-top-py:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
+  image: ${CI_IMAGE}
   tags:
     - 8xL40S
   stage: test

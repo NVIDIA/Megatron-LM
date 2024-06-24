@@ -34,13 +34,12 @@ jet-configure:
   tags:
     - os/linux
   script:
-    - cd tests/functional_tests/jet_recipes
     - |
-      if [[ $CI_PIPELINE_SOURCE == "merge_request_event" ]]; then
-        yq e ".spec.source.ref = \"merge-requests/${CI_MERGE_REQUEST_IID}/head\"" -i build-pyt.yaml
-      else
-        yq e ".spec.source.ref = \"${CI_COMMIT_REF_NAME}\"" -i build-pyt.yaml
-      fi
+      IMAGE=$CI_IMAGE yq -i '. |= 
+        (select(.spec.name == "mcore-pyt") 
+        | .spec.source.arguments.FROM_IMAGE_NAME = env(IMAGE))
+      ' tests/functional_tests/jet_recipes/build-pyt.yaml
+
   artifacts:
     paths:
       - tests/functional_tests/jet_recipes
