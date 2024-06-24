@@ -43,7 +43,7 @@ class Utils:
             torch.distributed.is_initialized()
             and Utils.world_size != torch.distributed.get_world_size()
         ):
-            torch.distributed.destroy_process_group()
+            ps.destroy_model_parallel()
 
         if rank is None:
             Utils.rank = int(os.environ['LOCAL_RANK'])
@@ -55,7 +55,6 @@ class Utils:
     @staticmethod
     def destroy_model_parallel():
         ps.destroy_model_parallel()
-        torch.distributed.barrier()
 
     @staticmethod
     def initialize_model_parallel(

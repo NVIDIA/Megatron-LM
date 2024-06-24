@@ -50,7 +50,7 @@ unit_tests:
     - 8xL40S
   stage: test
   script:
-    - torchrun --nproc_per_node=8 -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/unit_tests
+    - torchrun --nproc_per_node=8 -m pytest -x -v -s --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail tests/unit_tests
   coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
   artifacts:
     paths:
@@ -59,6 +59,7 @@ unit_tests:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    
 
 unit_tests-data:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
@@ -66,7 +67,7 @@ unit_tests-data:
     - 8xL40S
   stage: test
   script:
-    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/data
+    - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/data
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
       when: never
@@ -81,7 +82,7 @@ unit_tests-dist-checkpointing:
     - 8xL40S
   stage: test
   script:
-    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/dist_checkpointing
+    - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/dist_checkpointing
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
       when: never
@@ -96,7 +97,7 @@ unit_tests-fusions:
     - 8xL40S
   stage: test
   script:
-    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/fusions
+    - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/fusions
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
       when: never
@@ -111,7 +112,7 @@ unit_tests-inference:
     - 8xL40S
   stage: test
   script:
-    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/inference
+    - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/inference
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
       when: never
@@ -126,7 +127,7 @@ unit_tests-models:
     - 8xL40S
   stage: test
   script:
-    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/models
+    - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/models
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
       when: never
@@ -141,7 +142,7 @@ unit_tests-pipeline-parallel:
     - 8xL40S
   stage: test
   script:
-    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/pipeline_parallel
+    - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/pipeline_parallel
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
       when: never
@@ -156,7 +157,7 @@ unit_tests-tensor-parallel:
     - 8xL40S
   stage: test
   script:
-    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/tensor_parallel
+    - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/tensor_parallel
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
       when: never
@@ -171,7 +172,7 @@ unit_tests-transformer:
     - 8xL40S
   stage: test
   script:
-    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/transformer
+    - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/transformer
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
       when: never
@@ -186,7 +187,7 @@ unit_tests-top-py:
     - 8xL40S
   stage: test
   script:
-    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/*.py
+    - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/*.py
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
       when: never
