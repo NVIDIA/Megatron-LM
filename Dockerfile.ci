@@ -21,6 +21,7 @@ RUN pip3 install --no-cache-dir \
       wrapt \
       git+https://github.com/fanshiqing/grouped_gemm@v1.1.2
 
-COPY . /opt/megatron-lm
+COPY . /workspace/megatron-lm
 
-RUN pip install /opt/megatron-lm
+RUN cp -r /workspace/megatron-lm /opt && \
+    pip install /opt/megatron-lm
