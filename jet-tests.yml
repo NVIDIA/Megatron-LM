@@ -36,7 +36,7 @@ jet-configure:
     - os/linux
   script:
     - |
-      IMAGE=$CI_IMAGE yq -i '. |= 
+      IMAGE=${CI_IMAGE}:${CI_PIPELINE_ID} yq -i '. |= 
         (select(.spec.name == "mcore-pyt") 
         | .spec.source.arguments.FROM_IMAGE_NAME = env(IMAGE))
       ' tests/functional_tests/jet_recipes/build-pyt.yaml

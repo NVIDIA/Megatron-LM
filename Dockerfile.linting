@@ -1,0 +1,16 @@
+# syntax=docker/dockerfile:experimental
+
+FROM python:3.10
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN sed -i -e 's/^APT/# APT/' -e 's/^DPkg/# DPkg/' \
+      /etc/apt/apt.conf.d/docker-clean
+
+
+RUN pip3 install --no-cache-dir \
+      black==24.4.2 \
+      isort
+
+COPY . /opt/megatron-lm
+
+WORKDIR /opt/megatron-lm
