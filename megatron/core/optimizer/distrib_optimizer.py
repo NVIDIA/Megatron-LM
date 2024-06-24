@@ -10,8 +10,11 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 try:
     from apex.optimizers import FusedAdam as Adam
+    HAVE_APEX=True
+
 except ImportError:
     from torch.optim import Adam
+    HAVE_APEX=False
 
 from .. import parallel_state, tensor_parallel
 from ..dist_checkpointing import ShardedTensor
@@ -583,6 +586,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         - state_order : The index of a parameter within the shared parameter
             list.
         """
+
+        if not HAVE_APEX:
+            return super().load_state_dict(state_dict)
+
 
         # Get the Torch optimizer's state dict.
         # - This 'inner' optimizer at this point is unallocated, and only
