@@ -129,11 +129,11 @@ if [[ $SKIP_PYTEST != 1 ]]; then
     if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
         echo "Running pytest 1st vs 2nd run comparison"
         export LOGS_DIR=$TENSORBOARD_DIR
-        pytest ./tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py
+        pytest -s ./tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py
     else
         echo "Running pytest checks against golden values"
         export EXPECTED_METRICS_FILE="./tests/functional_tests/test_results/jet/${JOB_NAME}.json"
         export LOGS_DIR=$TENSORBOARD_DIR
-        pytest ./tests/functional_tests/python_test_utils/test_ci_pipeline.py
+        pytest -s ./tests/functional_tests/python_test_utils/test_ci_pipeline.py
     fi
 fi
