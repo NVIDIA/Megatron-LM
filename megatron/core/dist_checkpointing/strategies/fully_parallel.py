@@ -174,7 +174,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         strategy: LoadShardedStrategy,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
         do_cache_distribution: bool = False,
-        exchange_algo: str = 'gather_rounds',
+        exchange_algo: str = 'broadcast',
     ):
         super().__init__()
         self.base_strategy = strategy
