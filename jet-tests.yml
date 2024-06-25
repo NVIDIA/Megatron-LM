@@ -27,6 +27,7 @@ jet-setup:
   artifacts:
     reports:
       dotenv: config.env
+  interruptible: true
 
 jet-configure:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/ci_yq:v1
@@ -43,7 +44,8 @@ jet-configure:
   artifacts:
     paths:
       - tests/functional_tests/jet_recipes
-
+  interruptible: true
+  
 jet-trigger:
   stage: jet
   extends: [.jet_common, .jet-trigger]
@@ -58,7 +60,7 @@ jet-trigger:
       - JET_CLUSTER_BRANCH
   variables:
     JET_WORKLOADS_FILTER: "$_JET_FILTER"
-
+  interruptible: true
 
 jet-results-summary:
   stage: jet
@@ -84,3 +86,4 @@ jet-results-summary:
     when: always
     paths:
       - scripts
+  interruptible: true

@@ -84,7 +84,7 @@ unit_tests:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-    
+  interruptible: true
 
 unit_tests-data:
   image: ${CI_IMAGE}
