@@ -2,33 +2,14 @@ type: build
 format_version: 1
 maintainers: [maanug]
 spec:
-  name: pyt
-  platforms: [linux/amd64]
-  source:
-    image: gitlab-master.nvidia.com/adlr/megatron-lm/mcore_ci:24.01v3
-
----
-type: build
-format_version: 1
-maintainers: [maanug]
-spec:
   name: mcore-pyt
   platforms: [linux/amd64]
-  parent: pyt
   source:
     repo: https://gitlab-master.nvidia.com/ADLR/megatron-lm.git
     ref: main
     dockerfile: Dockerfile.ci
-
----
-type: build
-format_version: 1
-maintainers: [maanug]
-spec:
-  name: nemo
-  platforms: [linux/amd64]
-  source:
-    image: nvcr.io/nvidian/nemo:nightly
+    arguments:
+      FROM_IMAGE_NAME: gitlab-master.nvidia.com/adlr/megatron-lm/mcore_ci:24.01v3
 
 ---
 type: build
@@ -37,8 +18,9 @@ maintainers: [maanug]
 spec:
   name: mcore-nemo
   platforms: [linux/amd64]
-  parent: nemo
   source:
     repo: https://gitlab-master.nvidia.com/ADLR/megatron-lm.git
     ref: main
     dockerfile: Dockerfile.ci
+    arguments:
+      FROM_IMAGE_NAME: nvcr.io/nvidian/nemo:nightly

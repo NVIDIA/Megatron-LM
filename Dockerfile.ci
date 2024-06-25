@@ -1,7 +1,27 @@
-ARG FROM_IMAGE_NAME
-FROM ${FROM_IMAGE_NAME}
+# syntax=docker/dockerfile:experimental
 
-COPY . megatron-lm
+FROM nvcr.io/nvidia/pytorch:24.01-py3
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN sed -i -e 's/^APT/# APT/' -e 's/^DPkg/# DPkg/' \
+      /etc/apt/apt.conf.d/docker-clean
+
+RUN apt-get update && \
+      apt-get install -y --no-install-recommends && \
+      apt-get clean
+
+RUN pip3 install --no-cache-dir \
+      einops \
+      flask-restful \
+      nltk \
+      pytest \
+      pytest-cov \
+      pytest_mock \
+      sentencepiece \
+      wrapt \
+      git+https://github.com/fanshiqing/grouped_gemm@v1.1.2
+
+COPY . /workspace/megatron-lm
 
 RUN cp -r /workspace/megatron-lm /opt && \
     pip install /opt/megatron-lm

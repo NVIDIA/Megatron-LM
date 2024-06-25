@@ -1,6 +1,8 @@
 [MCORE][3]
-megatron/core/ @shanmugamr @maanug @jcasper @eharper
+megatron/core/ @shanmugamr @jcasper @eharper @terryk @okoenig
 
 [TESTS]
-tests/ @shanmugamr @maanug @terryk
+tests/ @shanmugamr @terryk @okoenig
 
+[MODELOPT]
+examples/inference/quantization @chenhany @kmorabia

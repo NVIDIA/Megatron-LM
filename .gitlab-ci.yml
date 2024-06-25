@@ -1,11 +1,14 @@
 workflow:
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests and nightly/
+    - if: ($CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests and nightly/) || ($CI_PIPELINE_SOURCE == "schedule")
       variables:
-        JET_CUSTOM_FILTER: "type == 'build' or 'merge-request' in spec.scope or 'nightly' in spec.scope"
+        JET_CUSTOM_FILTER: "type == 'build' or 'mr' in spec.scope or 'nightly' in spec.scope"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/
       variables:
-        JET_CUSTOM_FILTER: "type == 'build' or 'merge-request' in spec.scope"
+        JET_CUSTOM_FILTER: "type == 'build' or 'mr' in spec.scope"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Build only/
+      variables:
+        JET_CUSTOM_FILTER: "type == 'build'"
     # always run MR pipelines
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     # always run web pipelines
@@ -15,8 +18,10 @@ workflow:
       when: never
     # run branch pipeline if no open MR
     - if: $CI_COMMIT_BRANCH
+    
 
 stages:
+  - build
   - test
   - jet
 
@@ -26,7 +31,7 @@ variables:
   PYTHON_VIRTUAL_ENV: /lustre/fsw/adlr/adlr-nlp/adlr_ci/cienv/bin/activate
   JET_CUSTOM_FILTER:
     description: |
-      Selects what functional tests to run. For merge-request tests: "type == 'build' or 'merge-request' in spec.scope". For nightly tests: "type == 'build' or 'nightly' in spec.scope"
+      Selects what functional tests to run. For mr tests: "type == 'build' or 'mr' in spec.scope". For nightly tests: "type == 'build' or 'nightly' in spec.scope"
     value: ""
   DISPLAY_OUTPUT: "True" # Set to true for new tests to copy the logs for creating golden truth file
   TIME_LIMIT: "10:00" # Default time limit for all jobs
@@ -37,17 +42,39 @@ variables:
       - "mcore/draco-oci"
       - "mcore/eos"
     description: '"mcore/draco-oci" for OCI-IAD, "mcore/eos" for EOS'
+  CI_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:${CI_PIPELINE_ID} 
+  CACHE_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:buildcache
 
-include:
-  - jet-tests.yml
+build:
+  tags:
+    - 8xL40S
+  image: docker:26.1.4-dind
+  stage: build
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
+  script:
+    - |
+      docker build \
+        -f Dockerfile.ci \
+        -t ${CI_IMAGE} \
+        --cache-to type=inline \
+        --cache-from type=registry,ref=${CACHE_IMAGE} .
+
+      docker push ${CI_IMAGE} 
+
+      if [[ "$CI_COMMIT_BRANCH" = "main" ]]; then
+        docker tag ${CI_IMAGE} ${CACHE_IMAGE}
+        docker push ${CACHE_IMAGE}
+      fi
+  interruptible: true
 
 unit_tests:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
+  image: ${CI_IMAGE}
   tags:
     - 8xL40S
   stage: test
   script:
-    - torchrun --nproc_per_node=8 -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/unit_tests
+    - torchrun --nproc_per_node=8 -m pytest -x -v -s --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail tests/unit_tests
   coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
   artifacts:
     paths:
@@ -56,135 +83,142 @@ unit_tests:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  interruptible: true
 
 unit_tests-data:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
+  image: ${CI_IMAGE}
   tags:
     - 8xL40S
   stage: test
   script:
-    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/data
+    - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/data
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
       when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
+  interruptible: true
 
 unit_tests-dist-checkpointing:
-  timeout: 1h
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
+  image: ${CI_IMAGE}
   tags:
     - 8xL40S
   stage: test
   script:
-    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/dist_checkpointing
+    - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/dist_checkpointing
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
       when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
+  interruptible: true
 
 unit_tests-fusions:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
+  image: ${CI_IMAGE}
   tags:
     - 8xL40S
   stage: test
   script:
-    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/fusions
+    - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/fusions
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
       when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
+  interruptible: true
 
 unit_tests-inference:
-  timeout: 1h
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
+  image: ${CI_IMAGE}
   tags:
     - 8xL40S
   stage: test
   script:
-    - export CUDA_DEVICE_MAX_CONNECTIONS=1
-    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/inference
+    - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/inference
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
       when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
+  interruptible: true
 
 unit_tests-models:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
+  image: ${CI_IMAGE}
   tags:
     - 8xL40S
   stage: test
   script:
-    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/models
+    - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/models
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
       when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
+  interruptible: true
 
 unit_tests-pipeline-parallel:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
+  image: ${CI_IMAGE}
   tags:
     - 8xL40S
   stage: test
   script:
-    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/pipeline_parallel
+    - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/pipeline_parallel
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
       when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
+  interruptible: true
 
 unit_tests-tensor-parallel:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
+  image: ${CI_IMAGE}
   tags:
     - 8xL40S
   stage: test
   script:
-    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/tensor_parallel
+    - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/tensor_parallel
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
       when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
+  interruptible: true
 
 unit_tests-transformer:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
+  image: ${CI_IMAGE}
   tags:
     - 8xL40S
   stage: test
   script:
-    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/transformer
+    - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/transformer
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
       when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
+  interruptible: true
 
 unit_tests-top-py:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:24.01v3
+  image: ${CI_IMAGE}
   tags:
     - 8xL40S
   stage: test
   script:
-    - torchrun --nproc_per_node=8 -m pytest tests/unit_tests/*.py
+    - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/*.py
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
       when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
+  interruptible: true
 
 docs_build_test:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/python-format:0.0.1
@@ -200,6 +234,7 @@ docs_build_test:
   allow_failure: true
   except:
     - main
+  interruptible: true
 
 formatting:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/python-format:0.0.1
@@ -211,3 +246,7 @@ formatting:
     - isort megatron/core --check
   rules:
     - when: always
+  interruptible: true
+
+include:
+  - jet-tests.yml

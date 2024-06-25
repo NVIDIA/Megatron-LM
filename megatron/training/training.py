@@ -449,6 +449,9 @@ def get_optimizer_param_scheduler(optimizer):
             args.lr_decay_iters = args.train_iters
         lr_decay_steps = args.lr_decay_iters * args.global_batch_size
         wd_incr_steps = args.train_iters * args.global_batch_size
+        wsd_decay_steps = None
+        if args.lr_wsd_decay_iters is not None:
+            wsd_decay_steps = args.lr_wsd_decay_iters * args.global_batch_size
         if args.lr_warmup_fraction is not None:
             lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
         else:
@@ -463,6 +466,7 @@ def get_optimizer_param_scheduler(optimizer):
             args.lr_decay_samples = args.train_samples
         lr_decay_steps = args.lr_decay_samples
         wd_incr_steps = args.train_samples
+        wsd_decay_steps = args.lr_wsd_decay_samples
         if args.lr_warmup_fraction is not None:
             lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
         else:
@@ -484,7 +488,9 @@ def get_optimizer_param_scheduler(optimizer):
         wd_incr_steps=wd_incr_steps,
         wd_incr_style=args.weight_decay_incr_style,
         use_checkpoint_opt_param_scheduler=args.use_checkpoint_opt_param_scheduler,
-        override_opt_param_scheduler=args.override_opt_param_scheduler)
+        override_opt_param_scheduler=args.override_opt_param_scheduler,
+        wsd_decay_steps=wsd_decay_steps,
+        lr_wsd_decay_style=args.lr_wsd_decay_style)
 
     return opt_param_scheduler
 

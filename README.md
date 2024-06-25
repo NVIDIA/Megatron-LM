@@ -247,7 +247,6 @@ In `examples/pretrain_gpt3_175B.sh` we have provided an example of how to config
 
 With full global batch size of 1536 on 1024 A100 GPUs, each iteration takes around 32 seconds resulting in 138 teraFLOPs per GPU which is 44% of the theoretical peak FLOPs.
 
-
 ## Retro and InstructRetro
 
 
@@ -269,6 +268,10 @@ In this repo, we provide an end-to-end reproduction guide to implement Retro and
 - **Downstream task evaluation**, where we provide the text generation and evaluation scripts for zero-shot question answering tasks.
 
 Please see [tools/retro/README.md](tools/retro/README.md) for a detailed overview.
+
+## Mamba-based Language Models
+
+Please see [examples/mamba](./examples/mamba) for details.
 
 <!--
 ## REALM Pipeline
@@ -534,7 +537,7 @@ The Llama-2 checkpoints can be loaded into Megatron for inference and finetuning
 Megatron-Core (MCore) `GPTModel` family supports advanced quantization algorithms and high-performance inference through TensorRT-LLM.
 
 ## Quantization and TensorRT-LLM Deployment
-See [Megatron Model Optimization and Deployment](examples/inference/README.md) for `llama2` and `nemotron3` examples.
+See [Megatron Model Optimization and Deployment](examples/inference/quantization/README.md) for `llama2` and `nemotron3` examples.
 
 # Datasets
 We do not host any datasets for GPT or BERT training, however, we detail their collection so that our results may be reproduced.
@@ -575,3 +578,4 @@ Below are some of the projects where we have directly used Megatron:
 * [Exploring the Limits of Domain-Adaptive Training for Detoxifying Large-Scale Language Models](https://arxiv.org/abs/2202.04173)
 * [Shall We Pretrain Autoregressive Language Models with Retrieval? A Comprehensive Study](https://arxiv.org/abs/2304.06762)
 * [InstructRetro: Instruction Tuning post Retrieval-Augmented Pretraining](https://arxiv.org/abs/2310.07713)
+* [An Empirical Study of Mamba-based Language Models](https://arxiv.org/abs/2406.07887)

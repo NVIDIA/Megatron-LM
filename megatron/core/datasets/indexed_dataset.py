@@ -354,7 +354,7 @@ class IndexedDataset(torch.utils.data.Dataset):
         """Initialize the dataset
 
         This method is called by IndexedDataset.__init__ during object creation and by
-        IndexedDataset.__setstate__ during un-puckling
+        IndexedDataset.__setstate__ during un-pickling
 
         Args:
             path_prefix (str): The index (.idx) and data (.bin) prefix

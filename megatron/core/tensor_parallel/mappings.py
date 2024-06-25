@@ -22,7 +22,7 @@ def _reduce(input_):
         return input_
 
     # All-reduce.
-    torch.distributed.all_reduce(input_, group=get_tensor_model_parallel_group())
+    torch.distributed.all_reduce(input_.contiguous(), group=get_tensor_model_parallel_group())
 
     return input_
 

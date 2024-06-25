@@ -6,6 +6,7 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
@@ -33,7 +34,10 @@ class LanguageModule(MegatronModule):
         """
         # [b s] => [s b]
         labels = labels.transpose(0, 1).contiguous()
-        loss = tensor_parallel.vocab_parallel_cross_entropy(logits.float(), labels)
+        if self.config.cross_entropy_loss_fusion:
+            loss = fused_vocab_parallel_cross_entropy(logits, labels)
+        else:
+            loss = tensor_parallel.vocab_parallel_cross_entropy(logits, labels)
 
         # [s b] => [b, s]
         loss = loss.transpose(0, 1).contiguous()

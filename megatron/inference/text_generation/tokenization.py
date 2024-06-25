@@ -32,6 +32,7 @@ def detokenize_generations(tokens_gpu_tensor,
             for token in sequence_tokens:
                 if args.tokenizer_type in ['SentencePieceTokenizer',
                                            'GPTSentencePieceTokenizer',
+                                           'HuggingFaceTokenizer',
                                            'Llama2Tokenizer',
                                            'MistralTokenizer']:
                     word = tokenizer.decoder[token]
