@@ -69,10 +69,10 @@ jet-results-summary:
   before_script:
     - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $VAULT_JWT_TOKEN
   script: 
+    - env
     - python -m pip install -U --no-cache-dir prettytable
     - rc=0
-    - python tests/functional_tests/python_test_utils/jet_test_pipeline.py ${CI_PIPELINE_ID} --test exit --artifact_links $CI_JOB_ID || rc=$?
-    - python tests/functional_tests/python_test_utils/jet_test_pipeline.py ${CI_PIPELINE_ID} --download_scripts_dir ./scripts || rc=$?
+    - python tests/functional_tests/python_test_utils/jet_test_pipeline.py ${CI_PIPELINE_ID} --artifact_links $CI_JOB_ID --download_scripts_dir ./scripts || rc=$?
     - exit $rc
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
