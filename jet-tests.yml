@@ -3,7 +3,7 @@
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Build only/'
-    # If either $JET_CUSTOM_FILTER or both $CI_MODEL and $CI_TASK are provided
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
     - when: never
 
 default:
