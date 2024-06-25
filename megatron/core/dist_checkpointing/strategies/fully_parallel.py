@@ -178,6 +178,8 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
     ):
         super().__init__()
         self.base_strategy = strategy
+        if parallelization_group is None:
+            parallelization_group = dist.GroupMember.WORLD  # explicit group needed for torch.distributed.get_global_rank call
         self.parallelization_group = parallelization_group
         self.do_cache_distribution = do_cache_distribution
         self.exchange_algo = exchange_algo
@@ -478,7 +480,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                             local_ten = all_loaded_tensors[shard_id]
                         else:
                             local_ten = self._get_empty_tensor_for_exchange(
-                                shard_id, shard_to_metadata, unloaded_shards, all_loaded_tensors
+                                shard_id, unloaded_shards, shard_to_metadata, all_loaded_tensors
                             )
                     round_tensors.append(local_ten)
 
@@ -537,13 +539,14 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                 local_ten = all_loaded_tensors[shard_id]
             else:
                 local_ten = self._get_empty_tensor_for_exchange(
-                    shard_id, shard_to_metadata, unloaded_shards, all_loaded_tensors
+                    shard_id, unloaded_shards, shard_to_metadata, all_loaded_tensors
                 )
 
             global_src_rank = torch.distributed.get_global_rank(parallelization_group, rank)
             torch.distributed.broadcast(
                 local_ten, src=global_src_rank, group=parallelization_group, async_op=True
             )
+            del local_ten
 
         end = time()
         if torch.distributed.get_rank() == 0:
@@ -578,12 +581,15 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         local_unloaded_sh_ten = needed_shards.get(shard_id)
         if local_unloaded_sh_ten is None:
             sh_ten = unneeded_shards[shard_id]
-            sh_ten.init_data('cuda')
-            tensor = sh_ten.data
-            sh_ten.data = None  # won't be used. free memory
+            if sh_ten.data is None:
+                sh_ten.init_data('cuda')
+                tensor = sh_ten.data
+                sh_ten.data = None  # won't be used. free memory
+            else:
+                tensor = sh_ten.data.cuda()
         else:
             local_unloaded_sh_ten.init_data('cuda')
-            tensor = local_unloaded_sh_ten.data
+            tensor = local_unloaded_sh_ten.data.cuda()
             loaded_tensors[shard_id] = tensor
         return tensor
 
