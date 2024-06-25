@@ -13,7 +13,7 @@ try:
     HAVE_APEX=True
 
 except ImportError:
-    from torch.optim import Adam
+    from torch.optim import AdamW as Adam
     HAVE_APEX=False
 
 from .. import parallel_state, tensor_parallel
