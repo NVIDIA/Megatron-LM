@@ -199,21 +199,21 @@ class TestFullyParallelSaveAndLoad:
         load_strategy = ParallelLoadWithMemUsage(mock_strategy)
         torch.distributed.barrier()
 
-        # Each tensor is 32MB, 3GB in total.
+        # Each tensor is 4MB, 40MB in total.
         # We expect extra memory usage peak at ~32MB, not 1GB
         sharded_state_dict = {
-            f'ten_{i}': ShardedTensor.from_rank_offsets(f'ten_{i}', torch.rand(8 * megabytes, dtype=torch.float, device='cuda'),
+            f'ten_{i}': ShardedTensor.from_rank_offsets(f'ten_{i}', torch.rand(megabytes, dtype=torch.float, device='cuda'),
                                                         (0, Utils.rank, Utils.world_size))
-            for i in range(100)
+            for i in range(10)
         }
 
         mem_alloc_start = torch.cuda.memory_allocated()
 
         loaded_state_dict = load_strategy.load(sharded_state_dict, Path('mock_dir'))
 
-        # Each rank is expected to do 7 * 100 empty allocations
-        assert len(mem_alloc) == 7 * 100
-        # Peak mem usage should be within 64MB
-        assert max(mem_alloc) - mem_alloc_start < 65 * megabytes, (max(mem_alloc), mem_alloc_start)
+        # Each rank is expected to do 7 * 10 empty allocations
+        assert len(mem_alloc) == 7 * 10
+        # Peak mem usage should be within 4MB (single tensor)
+        assert max(mem_alloc) - mem_alloc_start < 4.01 * megabytes, (max(mem_alloc), mem_alloc_start)
 
         Utils.destroy_model_parallel()
