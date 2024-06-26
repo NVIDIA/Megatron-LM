@@ -12,7 +12,6 @@ class WrappedTorchLayerNorm(torch.nn.LayerNorm):
         zero_centered_gamma: bool = False,
         normalization: str = "LayerNorm",  # included to match TE interface
     ):
-        ## TODO: make sure computation is identical to fused LN version
         super().__init__(
             normalized_shape = hidden_size, ## applied to last len(normalized_shape.size) dimensions
             eps = eps,

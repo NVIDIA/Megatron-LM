@@ -103,7 +103,7 @@ class FusedLayerNorm(torch.nn.Module):
 
         if not persist_layer_norm and not HAVE_FUSED_LAYER_NORM:
             # TODO: Add pytorch only layer norm
-            raise ValueError(f'Apex must currently be installed to use megatron core.')
+            raise ValueError(f'Apex must be installed to use FusedLayerNorm.')
 
         if isinstance(hidden_size, numbers.Integral):
             hidden_size = (hidden_size,)
