@@ -36,10 +36,22 @@ jet-configure:
     - os/linux
   script:
     - |
-      IMAGE=$CI_IMAGE yq -i '. |= 
-        (select(.spec.name == "mcore-pyt") 
-        | .spec.source.arguments.FROM_IMAGE_NAME = env(IMAGE))
-      ' tests/functional_tests/jet_recipes/build-pyt.yaml
+      IMAGE=${CI_IMAGE}:${CI_PIPELINE_ID} yq '. |= 
+        (
+          select(.spec.name == "mcore-pyt") 
+          | .spec.source.image = env(IMAGE)
+        )
+      ' -i tests/functional_tests/jet_recipes/build-pyt.yaml
+
+      REF=$([[ $CI_PIPELINE_SOURCE == "merge_request_event" ]] && echo "merge-requests/${CI_MERGE_REQUEST_IID}/head" || echo "${CI_COMMIT_REF_NAME}")
+
+      REF=$REF yq '. |=
+        (
+          select(.spec.name == "mcore-nemo")
+          | .spec.source.ref = env(REF)
+        )
+      ' -i tests/functional_tests/jet_recipes/build-pyt.yaml
+
 
   artifacts:
     paths:
