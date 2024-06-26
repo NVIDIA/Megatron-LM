@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:experimental
 
-FROM python:3.10
+ARG FROM_IMAGE_NAME
+FROM $FROM_IMAGE_NAME
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN sed -i -e 's/^APT/# APT/' -e 's/^DPkg/# DPkg/' \

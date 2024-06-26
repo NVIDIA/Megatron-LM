@@ -5,11 +5,8 @@ spec:
   name: mcore-pyt
   platforms: [linux/amd64]
   source:
-    repo: https://gitlab-master.nvidia.com/ADLR/megatron-lm.git
-    ref: main
-    dockerfile: Dockerfile.ci
-    arguments:
-      FROM_IMAGE_NAME: gitlab-master.nvidia.com/adlr/megatron-lm/mcore_ci:24.01v3
+    image: gitlab-master.nvidia.com/adlr/megatron-lm/mcore_ci
+    
 
 ---
 type: build

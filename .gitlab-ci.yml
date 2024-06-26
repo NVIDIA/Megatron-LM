@@ -54,8 +54,10 @@ build_image:
     matrix:
       - IMAGE: CI_IMAGE
         FILE: Dockerfile.ci
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:24.01-py3
       - IMAGE: LINTING_IMAGE
         FILE: Dockerfile.linting
+        BASE_IMAGE: python:3.10
   before_script:
     - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
   script:
@@ -66,6 +68,7 @@ build_image:
         -f $FILE \
         -t ${IMAGE}:${CI_PIPELINE_ID}  \
         --cache-to type=inline \
+        --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
         --cache-from type=registry,ref=${IMAGE}:buildcache .
 
       docker push ${IMAGE}:${CI_PIPELINE_ID}  
