@@ -26,7 +26,7 @@ except ImportError:
     )
     multi_tensor_applier = local_multi_tensor_applier
     l2_norm_impl = local_multi_tensor_l2_norm
-    multi_tensor_scale_impl =local_multi_tensor_scale
+    multi_tensor_scale_impl = local_multi_tensor_scale
 
 def get_grad_norm_fp32(
     grads_for_norm: Union[List[torch.Tensor], torch.Tensor],
