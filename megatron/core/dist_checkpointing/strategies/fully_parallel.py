@@ -179,7 +179,9 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         super().__init__()
         self.base_strategy = strategy
         if parallelization_group is None:
-            parallelization_group = dist.GroupMember.WORLD  # explicit group needed for torch.distributed.get_global_rank call
+            parallelization_group = (
+                dist.GroupMember.WORLD
+            )  # explicit group needed for torch.distributed.get_global_rank call
         self.parallelization_group = parallelization_group
         self.do_cache_distribution = do_cache_distribution
         self.exchange_algo = exchange_algo
