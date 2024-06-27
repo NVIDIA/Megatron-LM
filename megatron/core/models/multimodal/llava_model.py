@@ -53,6 +53,7 @@ class LLaVAModel(MegatronModule):
         parallel_output: bool = True,
         language_position_embedding_type: str = 'learned_absolute',
         language_rotary_percent: float = 1.0,
+        language_rotary_base: int = 10000,
         img_embedding_idx: int = 0,
     ) -> None:
         super().__init__(config=language_transformer_config)
@@ -72,6 +73,7 @@ class LLaVAModel(MegatronModule):
             parallel_output=parallel_output,
             position_embedding_type=language_position_embedding_type,
             rotary_percent=language_rotary_percent,
+            rotary_base=language_rotary_base,
         )
 
         self.vision_model = CLIPViTModel(vision_transformer_config, vision_transformer_layer_spec)
