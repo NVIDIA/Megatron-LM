@@ -73,6 +73,12 @@ def validate_args(args, defaults={}):
     assert args.world_size % args.tensor_model_parallel_size == 0, 'world size'\
         ' ({}) is not divisible by tensor model parallel size ({})'.format(
             args.world_size, args.tensor_model_parallel_size)
+    # Zero bubble pipeline is defined on deepspeed's scheduler
+    if args.enable_zbh1_pipeline:
+        assert args.deepspeed, 'Use DeepSpeed to use zero-bubble H1 pipeline'
+        assert args.sequence_parallel == False, "Sequence Parallel not tested, proceed at own will by removing this line"
+    if args.enable_zbh1_exact_semantics:
+        assert args.enable_zbh1_pipeline, 'Exact semantics require ZBH1 pipeline enabled'
     # Pipeline model parallel size.
     args.pipeline_model_parallel_size = min(
         args.pipeline_model_parallel_size,
@@ -835,6 +841,10 @@ def _add_training_args(parser):
                        'uniformly divided recompute unit, '
                        '2) block: the number of individual Transformer layers '
                        'to recompute within each pipeline stage.')
+    group.add_argument('--enable-zbh1-pipeline', action='store_true',
+                       help='Activate zero bubble pipeline parallelism schedule method')
+    group.add_argument('--enable-zbh1-exact-semantics', action='store_true',
+                       help='Use an exact semantics for zbh1 schedule, might be slower than the default.')
 
     # deprecated
     # HACK: added back arguments because DeepSpeed still relies on the old
