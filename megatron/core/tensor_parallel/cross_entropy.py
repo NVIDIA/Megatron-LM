@@ -14,8 +14,9 @@ from .utils import VocabUtility
 
 
 class VocabParallelCrossEntropy:
-    """Computes the Cross Entropy Loss splitting the Vocab size across tensor parallel
-       ranks. This implementation is used in both fused and unfused cross entropy implementations
+    """
+    Computes the Cross Entropy Loss splitting the Vocab size across tensor parallel
+    ranks. This implementation is used in both fused and unfused cross entropy implementations
     """
 
     @staticmethod
@@ -31,18 +32,15 @@ class VocabParallelCrossEntropy:
 
     @staticmethod
     def calculate_predicted_logits(
-        vocab_parallel_logits: torch.Tensor, target: torch.Tensor, logits_max: torch.Tensor
+        vocab_parallel_logits: torch.Tensor,
+        target: torch.Tensor,
+        logits_max: torch.Tensor,
+        vocab_start_index: int,
+        vocab_end_index: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
         # In-place subtraction reduces memory pressure.
         vocab_parallel_logits -= logits_max.unsqueeze(dim=-1)
-
-        # Get the partition's vocab indices
-        get_vocab_range = VocabUtility.vocab_range_from_per_partition_vocab_size
-        partition_vocab_size = vocab_parallel_logits.size()[-1]
-        rank = get_tensor_model_parallel_rank()
-        world_size = get_tensor_model_parallel_world_size()
-        vocab_start_index, vocab_end_index = get_vocab_range(partition_vocab_size, rank, world_size)
 
         # Create a mask of valid vocab ids (1 means it needs to be masked).
         target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
@@ -52,6 +50,7 @@ class VocabParallelCrossEntropy:
         # Get predicted-logits = logits[target].
         # For Simplicity, we convert logits to a 2-D tensor with size
         # [*, partition-vocab-size] and target to a 1-D tensor of size [*].
+        partition_vocab_size = vocab_parallel_logits.size()[-1]
         logits_2d = vocab_parallel_logits.view(-1, partition_vocab_size)
         masked_target_1d = masked_target.view(-1)
         arange_1d = torch.arange(start=0, end=logits_2d.size()[0], device=logits_2d.device)
@@ -81,7 +80,8 @@ class VocabParallelCrossEntropy:
 
     @staticmethod
     def prepare_gradient_calculation_operands(
-        softmax: torch.Tensor, target_mask: torch.Tensor,
+        softmax: torch.Tensor,
+        target_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
         # All the inputs have softmax as thier gradient.
@@ -126,6 +126,13 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             logits_max, op=torch.distributed.ReduceOp.MAX, group=get_tensor_model_parallel_group()
         )
 
+        # Get the partition's vocab indices
+        get_vocab_range = VocabUtility.vocab_range_from_per_partition_vocab_size
+        partition_vocab_size = vocab_parallel_logits.size()[-1]
+        rank = get_tensor_model_parallel_rank()
+        world_size = get_tensor_model_parallel_world_size()
+        vocab_start_index, vocab_end_index = get_vocab_range(partition_vocab_size, rank, world_size)
+
         (
             target_mask,
             masked_target_1d,
@@ -133,7 +140,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             sum_exp_logits,
             exp_logits,
         ) = VocabParallelCrossEntropy.calculate_predicted_logits(
-            vocab_parallel_logits, target, logits_max
+            vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
         )
 
         # All reduce is needed to get the chunks from other GPUs.
