@@ -187,14 +187,6 @@ host="${HOSTNAME}"
 seed=1234
 num_workers=0
 
-data_path="BookCorpusDataset_text_document"
-if [ ! -f "BookCorpusDataset_text_document.bin" ]; then
-    wget https://the-eye.eu/public/AI/pile_neox/data/BookCorpusDataset_text_document.bin
-fi
-if [ ! -f "BookCorpusDataset_text_document.idx" ]; then
-    wget https://the-eye.eu/public/AI/pile_neox/data/BookCorpusDataset_text_document.idx
-fi
-
 vocab_path="gpt2-vocab.json"
 if [ ! -f "$vocab_path" ]; then
     wget https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-vocab.json
@@ -202,6 +194,24 @@ fi
 merge_path="gpt2-merges.txt"
 if [ ! -f "$merge_path" ]; then
     wget https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-merges.txt
+fi
+
+
+data_path="BookCorpusDataset_text_document"
+if [ ! -f "BookCorpusDataset_text_document.bin" ]; then
+    # Download the Bookcorpus dataset and convert to json
+    python preprocess_bookcorpus.py
+
+    # Process the dataset
+    python ${dir}/../../tools/preprocess_data.py \
+        --input ${data_path}.json \
+        --output-prefix "BookCorpusDataset" \
+        --vocab-file $vocab_path \
+        --merge-file $merge_path \
+        --dataset-impl mmap \
+        --tokenizer-type GPT2BPETokenizer \
+        --workers 32 \
+        --append-eod
 fi
 
 prescale_grad="true"
