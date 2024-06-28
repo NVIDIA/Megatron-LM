@@ -739,11 +739,6 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 gen_sd_optim = optimizer
                 gen_sd_opt_param_scheduler = opt_param_scheduler
 
-                # TODO: add DistributedOptimizer support for differing TPxPP
-                if ckpt_tp_pp != run_tp_pp and args.use_distributed_optimizer:
-                    raise RuntimeError("{}: not supported for DistributedOptimizer".format(mismatch_msg))
-
-
                 if args.use_distributed_optimizer:
                     optim_sd_kwargs['sharding_type'] = ('fully_sharded_model_space'
                                                         if getattr(state_dict['args'], 'ckpt_fully_parallel_save', False)
@@ -755,6 +750,10 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                                 print_rank_0('Detected deprecated `fully_sharded_bucket_space` DistributedOptimizer checkpoint format')
                                 optim_sd_kwargs['sharding_type'] = maybe_dist_opt_optim_state['param_state_sharding_type']
                             break
+
+                    if ckpt_tp_pp != run_tp_pp and optim_sd_kwargs['sharding_type'] != 'fully_sharded_model_space':
+                        raise RuntimeError(f"{mismatch_msg}: not supported for DistributedOptimizer with sharding type {optim_sd_kwargs['sharding_type']}."
+                                           f" Please use `--ckpt-fully-parallel-save` flag during checkpoint saving.")
             else:
                 gen_sd_optim = None
                 gen_sd_opt_param_scheduler = None

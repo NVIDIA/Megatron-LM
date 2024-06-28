@@ -1108,6 +1108,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         for key in dst_tensors:
                             dst_tensors[key].copy_(src_tensors[key])
 
+    @torch.no_grad()
     def load_parameter_state_from_fs_model_space(self, state_dict):
         """Loads the parameter state from a "model space" representation.
 
