@@ -4,12 +4,12 @@ splits:
   train:
     datasets:
       - weight: 1.
-        path: /workspace/data/sft/train/dataset
+        path: <path_to_sft_dataset_in_energon_format>
         subflavors:
           augmentation: false
   val:
     datasets:
       - weight: 1.
-        path: /workspace/data/sft/validation/dataset
+        path: <path_to_sft_dataset_in_energon_format>
         subflavors:
           augmentation: false

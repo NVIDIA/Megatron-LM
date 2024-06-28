@@ -25,7 +25,6 @@ from megatron.training import get_args, get_model, print_rank_0
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
 
-
 def add_text_generation_args(parser):
     """Text generation arguments."""
     group = parser.add_argument_group(title='Vision language model text generation')
@@ -246,9 +245,12 @@ def generate_samples(model):
             prompt = questions[idx]
         elif args.task == "VQAv2":
             prompt = questions[idx]
-            prompt += "\nAnswer the question using a single word or phrase."
+            prompt = "Given the image, answer the following question with a single word or phrase. " + prompt
         elif args.task == "MMMU":
             prompt = questions[idx]
+
+        prompt = prompt.replace("<image>", "")
+        prompt = prompt + "\n"
 
         forward_step = partial(VLMForwardStep, image, get_image_token_count())
 
@@ -280,7 +282,7 @@ def generate_samples(model):
                 elif args.task in ("TextVQA", "MMMU"):
                     output_name = "text"
 
-                generated = generation[len(prompt) :]
+                generated = generation[len(prompt) + 1 :]
                 output[output_name] = generated
 
                 if args.task == "captioning":

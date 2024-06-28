@@ -2,7 +2,7 @@
 
 export NCCL_IB_SL=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export NVTE_APPLY_QK_LAYER_SCALING=1
+export NVTE_APPLY_QK_LAYER_SCALING=0
 
 INPUT_METADATA_PATH="placeholder"
 GROUNDTRUTH_PATH="placeholder"
@@ -58,35 +58,45 @@ done
 
 # Please modify these as needed.
 NUM_PARTITIONS=100
-START=0
-END=2
+START=2
+END=0
 
 for PARTITION_ID in $( eval echo {$START..$END} )
 do
     torchrun --nproc_per_node 4 examples/multimodal/run_text_generation.py \
-        --use-flash-attn \
-        --language-model-type 8b \
+        --img-embedding-idx 1 \
         --apply-layernorm-1p \
+        --attention-softmax-in-fp32 \
+        --use-flash-attn \
+        --transformer-impl transformer_engine \
+        --use-te \
+        --use-checkpoint-args \
+        --normalization RMSNorm \
+        --language-model-type mistral_7b \
         --untie-embeddings-and-output-weights \
         --disable-bias-linear \
         --position-embedding-type rope \
-        --rotary-percent 0.5 \
-        --squared-relu \
+        --rotary-percent 1.0 \
+        --rotary-base 1000000 \
+        --swiglu \
         --attention-dropout 0.0 \
         --hidden-dropout 0.0 \
         --tensor-model-parallel-size 4 \
         --pipeline-model-parallel-size 1 \
+        --group-query-attention \
+        --num-query-groups 8 \
         --num-layers 32 \
         --hidden-size 4096 \
+        --ffn-hidden-size 14336 \
         --num-attention-heads 32 \
         --max-position-embeddings 4096 \
         --no-masked-softmax-fusion \
         --load ${MODEL_PATH} \
-        --tokenizer-type GPTSentencePieceTokenizer \
+        --tokenizer-type MistralTokenizer \
         --tokenizer-model ${TOKENIZER_PATH} \
         --bf16 \
         --micro-batch-size 1 \
-        --seq-length 99 \
+        --seq-length 2048 \
         --out-seq-length 700 \
         --temperature 1.0 \
         --img-h 336 \
@@ -94,12 +104,14 @@ do
         --patch-dim 14 \
         --seed 153 \
         --top_k 1 \
-        --disable-vision-class-token \
         --no-load-rng \
         --no-load-optim \
-        --input-path ${INPUT_PATH} \
+        --input-image-path ${INPUT_IMAGE_PATH} \
+        --input-metadata-path ${INPUT_METADATA_PATH} \
         --num-partitions ${NUM_PARTITIONS} \
         --partition-id ${PARTITION_ID} \
-        --output-path ${OUTPUT_PATH}/${PART_ID}.jsonl \
-        --gt-path ${GROUNDTRUTH_PATH}
+        --output-path ${OUTPUT_PATH}-${TASK}-${PARTITION_ID}.jsonl \
+        --gt-path ${GROUNDTRUTH_PATH} \
+        --task ${TASK} \
+        --disable-vision-class-token
 done

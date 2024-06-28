@@ -334,7 +334,7 @@ The following sections detail these steps.
 
 ## Download Huggingface checkpoints
 
-Users must first apply for access to download the Mistral-7b checkpoints through [Huggingface](https://huggingface.co/mistralai/Mistral-7B-v0.3) (HF). Megatron does not currently support the v0.1 or v0.2 checkpoints, ensure you download v0.3. Megatron also does not currently support using the raw weights directly from [Mistral](https://docs.mistral.ai/getting-started/open_weight_models/).
+Users must first apply for access to download the Mistral-7b checkpoints through [Huggingface](https://huggingface.co/mistralai/Mistral-7B-v0.3) (HF). Megatron does not currently support the v0.1 or v0.2 checkpoints, ensure you download v0.3. Megatron does not currently support using the raw weights directly from [Mistral](https://docs.mistral.ai/getting-started/open_weight_models/).
 
 ## Install the mistral-common package
 

@@ -4,12 +4,12 @@ splits:
   train:
     datasets:
       - weight: 1.
-        path: /workspace/data/pretrain/train/dataset
+        path: <path_to_pretraining_dataset_in_energon_format>
         subflavors:
           augmentation: false
   val:
     datasets:
       - weight: 1.
-        path: /workspace/data/pretrain/validation/dataset
+        path: <path_to_pretraining_dataset_in_energon_format>
         subflavors:
           augmentation: false

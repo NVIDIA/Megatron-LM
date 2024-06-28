@@ -57,14 +57,14 @@ def evaluate(result_file_path, groundtruth_path):
     with open(groundtruth_path) as groundtruth_file:
         groundtruth = json.load(groundtruth_file)["data"]
 
-    groundtruth = {(gt["image_id"], gt["question"].lower()): gt["answers"] for gt in groundtruth}
+    groundtruth = {(gt["image_id"]): gt["answers"] for gt in groundtruth}
 
     with open(result_file_path, "r") as result_file:
         results = json.load(result_file)
 
     predictions = []
     for result in results:
-        gt_answers = groundtruth[(result["sample_id"], prompt_processor(result["prompt"]))]
+        gt_answers = groundtruth[(result["sample_id"])]
         predictions.append({"pred_answer": result["text"], "gt_answers": gt_answers})
 
     evaluator = TextVQAAccuracyEvaluator()

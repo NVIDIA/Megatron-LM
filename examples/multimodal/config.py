@@ -32,7 +32,7 @@ def get_language_model_config(config):
         config.num_query_groups = 32
         config.kv_channels = 128
         config.rotary_interleaved = False
-    elif config.my_model_type == "llama3_8b":
+    elif config.language_model_type == "llama3_8b":
         config.activation_func = torch.nn.functional.silu
         config.add_bias_linear = False
         config.bias_activation_fusion = False
@@ -42,8 +42,19 @@ def get_language_model_config(config):
             False  # Zero centered gamma not supported for RMSNorm
         )
         config.bias_dropout_fusion = False
-        config.te_attn_mask_type = None
-        config.rotary_percent = 0.5
+        config.apply_rope_fusion = False
+        config.attention_softmax_in_fp32 = True
+        config.ffn_hidden_size = 14336
+    elif config.language_model_type == "mistral_7b":
+        config.activation_func = torch.nn.functional.silu
+        config.add_bias_linear = False
+        config.bias_activation_fusion = False
+        config.gated_linear_unit = True
+        config.apply_query_key_layer_scaling = False
+        config.layernorm_zero_centered_gamma = (
+            False  # Zero centered gamma not supported for RMSNorm
+        )
+        config.bias_dropout_fusion = False
         config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
         config.ffn_hidden_size = 14336
@@ -70,6 +81,7 @@ def get_vision_model_config(config, apply_query_key_layer_scaling=False):
     config.bias_activation_fusion = False
     config.bias_dropout_fusion = False
     config.attention_softmax_in_fp32 = True
+    config.normalization = 'LayerNorm'
 
     return config
 
@@ -86,6 +98,9 @@ def get_vision_projection_config(config, hidden_size):
         config.ffn_hidden_size = 16384
         config.activation_func = squared_relu
     elif config.language_model_type == "llama3_8b":
+        config.ffn_hidden_size = 14336
+        config.activation_func = torch.nn.functional.silu
+    elif config.language_model_type == "mistral_7b":
         config.ffn_hidden_size = 14336
         config.activation_func = torch.nn.functional.silu
 
