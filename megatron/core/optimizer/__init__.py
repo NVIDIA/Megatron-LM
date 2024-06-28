@@ -3,8 +3,13 @@ import logging
 from typing import Callable, Dict, List, Optional
 
 import torch
-from apex.optimizers import FusedAdam as Adam
-from apex.optimizers import FusedSGD as SGD
+
+try:
+    from transformer_engine.pytorch.optimizers import FusedAdam as Adam
+    from transformer_engine.pytorch.optimizers import FusedSGD as SGD
+except ImportError:
+    from apex.optimizers import FusedAdam as Adam
+    from apex.optimizers import FusedSGD as SGD
 
 from megatron.core import mpu
 
@@ -250,7 +255,11 @@ def _get_megatron_optimizer_based_on_param_groups(
             setattr(optimizer, 'model_parallel_group', model_parallel_group)
     else:
         # FP32 optimizer.
-        optimizer = FP32Optimizer(optimizer, config, init_state_fn,)
+        optimizer = FP32Optimizer(
+            optimizer,
+            config,
+            init_state_fn,
+        )
         setattr(optimizer, 'model_parallel_group', model_parallel_group)
 
     return optimizer

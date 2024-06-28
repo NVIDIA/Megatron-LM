@@ -9,7 +9,11 @@ from logging import getLogger
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
-from apex.optimizers import FusedAdam as Adam
+
+try:
+    from transformer_engine.pytorch.optimizers import FusedAdam as Adam
+except ImportError:
+    from apex.optimizers import FusedAdam as Adam
 
 from .. import parallel_state, tensor_parallel
 from ..dist_checkpointing import ShardedTensor
@@ -400,7 +404,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
 
         super().__init__(
-            optimizer, config, grad_scaler, init_state_fn,
+            optimizer,
+            config,
+            grad_scaler,
+            init_state_fn,
         )
 
         assert isinstance(
@@ -467,7 +474,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.param_to_all_gather_handle_index_map = {}
 
         self.pbuf_view_items = self._get_model_param_buffer_dp_views()
-        for (gbuf_index, dtype, bucket_index, _, _) in self.pbuf_view_items:
+        for gbuf_index, dtype, bucket_index, _, _ in self.pbuf_view_items:
             self.all_gather_handle_index_to_bucket_index_map.append(
                 (gbuf_index, dtype, bucket_index)
             )
@@ -597,7 +604,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         #   list.
         inner_state_dict = self.optimizer.state_dict()
         state_dict_param_groups = [
-            {**group, "params": list(inner_state_dict["param_groups"][idx]["params"]),}
+            {
+                **group,
+                "params": list(inner_state_dict["param_groups"][idx]["params"]),
+            }
             for idx, group in enumerate(state_dict["optimizer"]["param_groups"])
         ]
 
@@ -623,7 +633,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         )
 
                         state_dict_state.append(
-                            (state_order, {"exp_avg": init_shard(), "exp_avg_sq": init_shard(),})
+                            (
+                                state_order,
+                                {
+                                    "exp_avg": init_shard(),
+                                    "exp_avg_sq": init_shard(),
+                                },
+                            )
                         )
 
         # Sort by state order (see method docstring for details).
@@ -632,7 +648,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Optimizer.
         self.optimizer.load_state_dict(
-            {"state": state_dict_state, "param_groups": state_dict_param_groups,}
+            {
+                "state": state_dict_state,
+                "param_groups": state_dict_param_groups,
+            }
         )
 
         # Grad scaler.
@@ -1065,7 +1084,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return state
 
     def load_parameter_state_from_fs_bucket_space(self, state_dict):
-        """ Loads the parameter state from an internal representation.
+        """Loads the parameter state from an internal representation.
 
         Inverse of the `get_parameter_state_fs_bucket_space` method.
         """
@@ -1335,7 +1354,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             ]
             assert all_gather_handle_index < len(self.all_gather_handles)
             all_gather_handle = torch.distributed._all_gather_base(
-                pbuf, pbuf_views[data_parallel_rank], group=data_parallel_group, async_op=async_op,
+                pbuf,
+                pbuf_views[data_parallel_rank],
+                group=data_parallel_group,
+                async_op=async_op,
             )
             self.all_gather_handles[all_gather_handle_index] = all_gather_handle
             assert self.all_gather_handle_index_to_bucket_index_map[all_gather_handle_index] == (
