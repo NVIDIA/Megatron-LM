@@ -60,17 +60,23 @@ jet-configure:
 jet-trigger:
   stage: jet
   extends: [.jet_common, .jet-trigger]
-  needs:  [ jet-configure, jet-setup ]
+  needs:  [ metadata, jet-configure, jet-setup ]
   trigger:
     project: dl/jet/ci
-    branch: $JET_CLUSTER_BRANCH
+    branch: $JET_CI_BRANCH
     strategy: depend
   inherit:
     variables:
       - JET_CUSTOM_FILTER
-      - JET_CLUSTER_BRANCH
+      - SLURM_CLUSTER
+      - JET_CI_BRANCH
   variables:
     JET_WORKLOADS_FILTER: "$_JET_FILTER"
+    JET_CUSTOM_CONFIG: |
+      launchers:
+        ${SLURM_CLUSTER}:
+          additional_flags:
+            deadline: now+24hours
   interruptible: true
 
 jet-results-summary:

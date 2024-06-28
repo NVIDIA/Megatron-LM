@@ -36,20 +36,43 @@ variables:
   DISPLAY_OUTPUT: "True" # Set to true for new tests to copy the logs for creating golden truth file
   TIME_LIMIT: "10:00" # Default time limit for all jobs
   MOE_GROUPED_GEMM: 0 # Set to 1 to enable grouped gemm for MoE
-  JET_CLUSTER_BRANCH:
-    value: "mcore/draco-oci"
+  SLURM_CLUSTER:
+    value: "dgxa100_dracooci"
     options:
-      - "mcore/draco-oci"
-      - "mcore/eos"
-    description: '"mcore/draco-oci" for OCI-IAD, "mcore/eos" for EOS'
+      - "dgxa100_dracooci"
+      - "dgxh100_eos"
+    description: '"dgxa100_dracooci" for OCI-IAD, "dgxh100_eos" for EOS'
   CI_MCORE_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci
   CI_NEMO_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/nemo_ci
   LINTING_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_linting
+
+metadata:
+  image: python:3.10
+  stage: .pre
+  tags: 
+    - 8xL40S
+  script:
+    - env
+    - |
+      if [[ $SLURM_CLUSTER == dgxh100_eos ]]; then
+        JET_CI_BRANCH=mcore/eos;
+      elif [[ $SLURM_CLUSTER == dgxa100_dracooci ]]; then
+        JET_CI_BRANCH=mcore/draco-oci;
+      else
+        echo "Unsupported value of SLURM_CLUSTER=$SLURM_CLUSTER";
+        exit 1;
+      fi
+    - echo "JET_CI_BRANCH=$JET_CI_BRANCH" | tee -a build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+  interruptible: true
 
 build_image:
   tags:
     - 8xL40S
   image: docker:26.1.4-dind
+  needs: []  # May start ASAP
   stage: build
   timeout: 30m
   parallel:
