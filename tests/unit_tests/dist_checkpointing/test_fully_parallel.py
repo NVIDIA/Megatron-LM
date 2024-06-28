@@ -182,11 +182,12 @@ class TestFullyParallelSaveAndLoad:
 
         assert loaded_state_dict.keys() == state_dict.keys()
 
-    def test_memory_usage(self):
+    @pytest.mark.parametrize('state_dict_device', ['cpu', 'cuda'])
+    def test_memory_usage(self, state_dict_device):
         Utils.initialize_model_parallel(2, 1)
 
         megabytes = 1024 * 1024
-        mock_strategy = MockLoadStrategy('cuda')
+        mock_strategy = MockLoadStrategy(state_dict_device)
 
         mem_alloc = []
 
@@ -202,7 +203,7 @@ class TestFullyParallelSaveAndLoad:
         # Each tensor is 4MB, 40MB in total.
         # We expect extra memory usage peak at ~32MB, not 1GB
         sharded_state_dict = {
-            f'ten_{i}': ShardedTensor.from_rank_offsets(f'ten_{i}', torch.rand(megabytes, dtype=torch.float, device='cuda'),
+            f'ten_{i}': ShardedTensor.from_rank_offsets(f'ten_{i}', torch.rand(megabytes, dtype=torch.float, device=state_dict_device),
                                                         (0, Utils.rank, Utils.world_size))
             for i in range(10)
         }
