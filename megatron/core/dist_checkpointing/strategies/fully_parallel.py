@@ -35,7 +35,7 @@ _ShardId = Tuple[str, tuple, Optional[tuple]]
 
 
 class SaveLoadDistribution(NamedTuple):
-    """ Represents a save or load distribution of ShardedTensors.
+    """Represents a save or load distribution of ShardedTensors.
 
     Given distribution is valid only for a specific parallelization group,
     which is implicit here (not referenced by this class).
@@ -56,7 +56,7 @@ class SaveLoadDistribution(NamedTuple):
 
 
 class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
-    """ Wraps arbitrary strategy and distributes the save during `save`.
+    """Wraps arbitrary strategy and distributes the save during `save`.
 
     The save distribution happens without any *data* communication.
     Only the *metadata* is exchanged and based on data replication on different
@@ -106,7 +106,7 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
         return self.base_strategy.save(sharded_state_dict, checkpoint_dir)
 
     def apply_saving_parallelization(self, sharded_state_dict: ShardedStateDict) -> None:
-        """ Distributes the save across ranks by exchanging metadata.
+        """Distributes the save across ranks by exchanging metadata.
 
         Exchanges metadata from the state dict and computes the uniform
         (as close as possible) distribution of saves among the ranks.
@@ -144,7 +144,7 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
 
 
 class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
-    """ Wraps arbitrary load strategy and distributes the load during `load`.
+    """Wraps arbitrary load strategy and distributes the load during `load`.
 
     See `load` method docs for details.
 
@@ -189,7 +189,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         self.cached_distribution: Optional[SaveLoadDistribution] = None
 
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
-        """ Distributes the load and calls underlying strategy only for parts of the state dict.
+        """Distributes the load and calls underlying strategy only for parts of the state dict.
 
         Steps:
         1. Load metadata is exchanged between the ranks in the parallelization group.
@@ -264,7 +264,10 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             raise NotImplementedError(f'Unrecognized gather algorithm: {self.exchange_algo}')
 
         all_loaded_tensors = exchange_fn(
-            loaded_tensors, unloaded_shards, precomputed_distribution, self.parallelization_group,
+            loaded_tensors,
+            unloaded_shards,
+            precomputed_distribution,
+            self.parallelization_group,
         )
         if not set(unloaded_shards.keys()).issubset(all_loaded_tensors.keys()):
             missing_shards = set(unloaded_shards.keys()) - all_loaded_tensors.keys()
@@ -282,15 +285,13 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         merge(loaded_state_dict, sharded_tensors)
         return loaded_state_dict
 
-    def _defer_loading_sharded_tensors(
-        self, sharded_state_dict: ShardedStateDict
-    ) -> Tuple[
+    def _defer_loading_sharded_tensors(self, sharded_state_dict: ShardedStateDict) -> Tuple[
         ShardedStateDict,
         ShardedStateDict,
         Dict[_ShardId, ShardedTensor],
         Dict[_ShardId, ShardedTensor],
     ]:
-        """ Divides state dict into parts loaded by this vs other ranks.
+        """Divides state dict into parts loaded by this vs other ranks.
 
         ShardedTensors with main replica_id will be loaded by this rank,
         others will be received by other ranks (after loading from storage).
@@ -330,7 +331,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
     def apply_loading_parallelization(
         self, sharded_state_dict: ShardedStateDict
     ) -> Optional[SaveLoadDistribution]:
-        """ Distributes the load across ranks by exchanging metadata.
+        """Distributes the load across ranks by exchanging metadata.
 
         Exchanges metadata from the state dict and computes the uniform
         (as close as possible) distribution of loads among the ranks.
@@ -371,7 +372,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         precomputed_distribution: SaveLoadDistribution,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> Dict[_ShardId, torch.Tensor]:
-        """ Exchange the tensors loaded by different ranks with a simple all_gather_object call.
+        """Exchange the tensors loaded by different ranks with a simple all_gather_object call.
 
         This version can be used for debugging purposes do to its simplistic
         implementation. Shouldn't be used if performance is important.
@@ -419,7 +420,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         precomputed_distribution: SaveLoadDistribution = None,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> Dict[_ShardId, torch.Tensor]:
-        """ Exchange the tensors loaded by different ranks with several all_gather calls.
+        """Exchange the tensors loaded by different ranks with several all_gather calls.
 
         Groups tensors by dtype, divide tensors that will be exchanged into rounds
         and execute all_gather for tensors from each round.
@@ -518,7 +519,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         precomputed_distribution: SaveLoadDistribution = None,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> Dict[_ShardId, torch.Tensor]:
-        """ Exchange the tensors loaded by different ranks by a series of broadcasts.
+        """Exchange the tensors loaded by different ranks by a series of broadcasts.
 
         For each rank for each loaded tensor do a broadcast to the whole group.
         A reasonable tradeoff in terms of performance and simplicity.
@@ -580,7 +581,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         unneeded_shards: Dict[_ShardId, ShardedTensor],
         loaded_tensors: Dict[_ShardId, torch.Tensor],
     ) -> Tuple[torch.Tensor, Optional[torch.device]]:
-        """ Determines the empty tensor to use for exchange.
+        """Determines the empty tensor to use for exchange.
 
         If shard_id is needed by this rank, it will be in the `unloaded_shards`.
         Otherwise, the metadata for this tensor can be found in `shard_to_metadata`
@@ -622,7 +623,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
     def fill_in_deferred_sharded_tensors(
         self, sharded_state_dict: ShardedStateDict, loaded_tensors: Dict[_ShardId, torch.Tensor]
     ) -> None:
-        """ Fill in tensors not loaded by current rank with tensors from `loaded_tensors` map.
+        """Fill in tensors not loaded by current rank with tensors from `loaded_tensors` map.
 
         Args:
             sharded_state_dict (ShardedStateDict): sharded state dict to fill in.
@@ -662,7 +663,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
 
 
 def _sharded_tensor_shard_id(sharded_tensor: ShardedTensor) -> _ShardId:
-    """ Unique id of the sharded tensor data.
+    """Unique id of the sharded tensor data.
 
     Should yield the same value for same data replicated on different ranks.
 
@@ -680,7 +681,7 @@ def _sharded_tensor_shard_id(sharded_tensor: ShardedTensor) -> _ShardId:
 
 
 def _shard_size(sh_ten: ShardedTensor):
-    """ Returns size in bytes of a given sharded tensor. """
+    """Returns size in bytes of a given sharded tensor."""
     if sh_ten.flattened_range is None:
         numel = np.product(sh_ten.local_shape)
     else:
@@ -693,7 +694,7 @@ def determine_main_replica_uniform_distribution(
     parallelization_group: torch.distributed.ProcessGroup,
     is_loading: bool = False,
 ) -> Optional[SaveLoadDistribution]:
-    """ Computes the save distribution.
+    """Computes the save distribution.
 
     Should be used in conjunction with `distribute_main_replicas_with_precomputed_distribution`
     which applies the computed save distribution.
@@ -760,7 +761,7 @@ def distribute_main_replicas_with_precomputed_distribution(
     parallelization_group: torch.distributed.ProcessGroup,
     precomputed_distribution: Optional[SaveLoadDistribution],
 ):
-    """ Applies the save distribution computed with `determine_main_replica_uniform_distribution`.
+    """Applies the save distribution computed with `determine_main_replica_uniform_distribution`.
 
     Based on rank assignment, sets replica ids of the shards saved by current rank to 0
     and all the other replica ids to 1.
@@ -816,7 +817,7 @@ T = TypeVar('T')
 def distribute_shards_to_ranks(
     shard_to_ranks: Dict[T, List[int]], shard_to_size: Dict[T, int], num_ranks: int
 ) -> Dict[T, int]:
-    """ Computes uniform distribution of workload across ranks, based on sizes.
+    """Computes uniform distribution of workload across ranks, based on sizes.
 
     Currently, the assignment is greedy, based on:
     1. Firstly, the coverage of each shard
