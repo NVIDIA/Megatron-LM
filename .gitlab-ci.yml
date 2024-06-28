@@ -93,7 +93,6 @@ unit_tests:
     expire_in: 30 days
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
-      when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
   interruptible: true
 
@@ -105,9 +104,11 @@ unit_tests-data:
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/data
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      when: always
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
+      when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: always
   interruptible: true
 
 unit_tests-dist-checkpointing:
@@ -119,8 +120,10 @@ unit_tests-dist-checkpointing:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/dist_checkpointing
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
-      when: always
+      when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: always
   interruptible: true
 
 unit_tests-fusions:
@@ -131,9 +134,11 @@ unit_tests-fusions:
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/fusions
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      when: always
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
+      when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: always
   interruptible: true
 
 unit_tests-inference:
@@ -144,9 +149,11 @@ unit_tests-inference:
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/inference
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      when: always
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
+      when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: always
   interruptible: true
 
 unit_tests-models:
@@ -157,9 +164,11 @@ unit_tests-models:
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/models
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      when: always
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
+      when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: always
   interruptible: true
 
 unit_tests-pipeline-parallel:
@@ -170,9 +179,11 @@ unit_tests-pipeline-parallel:
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/pipeline_parallel
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      when: always
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
+      when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: always
   interruptible: true
 
 unit_tests-tensor-parallel:
@@ -183,9 +194,11 @@ unit_tests-tensor-parallel:
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/tensor_parallel
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      when: always
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
+      when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: always
   interruptible: true
 
 unit_tests-transformer:
@@ -196,9 +209,11 @@ unit_tests-transformer:
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/transformer
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      when: always
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
+      when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: always
   interruptible: true
 
 unit_tests-top-py:
@@ -209,9 +224,11 @@ unit_tests-top-py:
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/*.py
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      when: always
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
+      when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: always
   interruptible: true
 
 docs_build_test:
