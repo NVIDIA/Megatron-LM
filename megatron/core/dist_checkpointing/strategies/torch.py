@@ -34,24 +34,28 @@ from torch.distributed.checkpoint.default_planner import create_default_local_sa
 from torch.distributed.checkpoint.planner_helpers import _create_write_items
 
 from ..core import CheckpointingException
-from ..dict_utils import nested_values
+from ..dict_utils import extract_matching_values, nested_values
 from ..mapping import (
     ShardedBase,
     ShardedObject,
     ShardedStateDict,
     ShardedTensor,
+    ShardedTensorFactory,
     StateDict,
+    apply_factories,
+    apply_factory_merges,
     is_main_replica,
 )
 from .async_utils import AsyncRequest
-from .base import (
-    AsyncSaveShardedStrategy,
-    LoadShardedStrategy,
-    SaveShardedStrategy,
-    StrategyAction,
-    default_strategies,
-)
+from .base import AsyncSaveShardedStrategy, LoadShardedStrategy, StrategyAction, default_strategies
 from .filesystem_async import FileSystemWriterAsync
+from .resharding import (
+    TensorReformulationMetadata,
+    apply_nd_flattened_tensors_reformulation,
+    is_nd_flattened_tensor,
+    nd_flattened_tensor_reformulated_global_shape,
+    restore_nd_flattened_tensors_formulation,
+)
 from .state_dict_saver import save_state_dict_async_finalize, save_state_dict_async_plan
 
 _import_trigger = None
@@ -168,7 +172,7 @@ def sharded_tensor_to_torch_sharded_tensor(
             sh_ten.data = sh_ten.data.view((1,) * len(sh_ten.global_shape) + (-1,))
 
         # Global shape reformulation:
-        global_shape = some_sh_ten.axis_fragmentations + (int(np.prod(some_sh_ten.local_shape)),)
+        global_shape = nd_flattened_tensor_reformulated_global_shape(some_sh_ten)
         offsets_shape = (1,) * len(
             some_sh_ten.global_shape
         )  # reformulated global shape has shape equal ti number of local chunks
@@ -466,10 +470,10 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
     def _validate_global_shapes(self, metadata, sharded_tensors):
         for sh_ten in sharded_tensors:
             loaded_shape = metadata.state_dict_metadata[sh_ten.key].size
-            if sh_ten.flattened_range is None or len(sh_ten.global_shape) == 1:
+            if not is_nd_flattened_tensor(sh_ten):
                 expected_shape = sh_ten.global_shape
             else:
-                expected_shape = sh_ten.axis_fragmentations + (int(np.prod(sh_ten.local_shape)),)
+                expected_shape = nd_flattened_tensor_reformulated_global_shape(sh_ten)
             if loaded_shape != expected_shape:
                 _msg = (
                     f'Global shape mismatch for loaded ({loaded_shape})'
@@ -553,6 +557,29 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         return True
 
 
+def get_reformulation_metadata(
+    sharded_state_dict: ShardedStateDict, checkpoint_dir: Path
+) -> Dict[str, TensorReformulationMetadata]:
+    ckpt_metadata = FileSystemReader(checkpoint_dir).read_metadata()
+    reformulation_metadata = {}
+    for sh_ten in nested_values(sharded_state_dict):
+        if not is_nd_flattened_tensor(sh_ten):
+            continue
+        try:
+            ckpt_global_shape = ckpt_metadata.mcore_data[sh_ten.key][
+                'nd_reformulated_orig_global_shape'
+            ]
+        except KeyError as e:
+            raise CheckpointingException(
+                f'Cannot find global shape metadata for N-D flattened tensor {sh_ten} in checkpoint metadata: {ckpt_metadata.mcore_data}'
+            ) from e
+
+        reformulation_metadata[sh_ten.key] = TensorReformulationMetadata(
+            ckpt_global_shape, ckpt_metadata.state_dict_metadata[sh_ten.key].size
+        )
+    return reformulation_metadata
+
+
 class TorchDistLoadShardedStrategy(LoadShardedStrategy):
     """Basic load strategy for the PyT Distributed format. """
 
@@ -566,6 +593,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
 
         Returns: loaded state dict
         """
+        # Apply N-D tensors resharding
+        sharded_state_dict, formulation_restore_data = apply_nd_flattened_tensors_reformulation(
+            sharded_state_dict, get_reformulation_metadata(sharded_state_dict, checkpoint_dir)
+        )
+
         flexible_shape_sharded_tensors = [
             sh_ten
             for sh_ten in nested_values(sharded_state_dict)
@@ -600,6 +632,10 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             mcore_state_dict, flat_mapping, rename_mapping
         )
         _restore_dict_types(mcore_state_dict, orig_sharded_state_dict)
+        # Apply N-D tensors resharding postprocessing
+        mcore_state_dict = restore_nd_flattened_tensors_formulation(
+            mcore_state_dict, formulation_restore_data
+        )
         return mcore_state_dict
 
     def load_tensors_metadata(self, checkpoint_dir: Path):
