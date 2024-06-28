@@ -34,6 +34,7 @@ class LLaVAModel(MegatronModule):
         parallel_output (bool): Do not gather the outputs, keep them split across tensor parallel ranks. This is typically True for training and False for inference.
         language_position_embedding_type (str): Position embedding type to use in the language model. Default learned absolute.
         language_rotary_percent (float): Percent of rotary dimension to use for rotary position embeddings in the language model. Defaults to 1.0.
+        img_embedding_idx (int): Index in the language_embeddings tensor where image_embeddings should be inserted. Defaults to 0.
     """
 
     def __init__(
@@ -52,6 +53,8 @@ class LLaVAModel(MegatronModule):
         parallel_output: bool = True,
         language_position_embedding_type: str = 'learned_absolute',
         language_rotary_percent: float = 1.0,
+        language_rotary_base: int = 10000,
+        img_embedding_idx: int = 0,
     ) -> None:
         super().__init__(config=language_transformer_config)
 
@@ -70,6 +73,7 @@ class LLaVAModel(MegatronModule):
             parallel_output=parallel_output,
             position_embedding_type=language_position_embedding_type,
             rotary_percent=language_rotary_percent,
+            rotary_base=language_rotary_base,
         )
 
         self.vision_model = CLIPViTModel(vision_transformer_config, vision_transformer_layer_spec)
@@ -93,6 +97,8 @@ class LLaVAModel(MegatronModule):
             self.vision_projection.register_load_state_dict_post_hook(
                 partial(_load_state_dict_hook_ignore_param_names, vision_projection_param_names)
             )
+
+        self.img_embedding_idx = img_embedding_idx
 
     def set_input_tensor(self, input_tensor: torch.Tensor) -> None:
         """Sets input tensor to the model.
@@ -150,6 +156,7 @@ class LLaVAModel(MegatronModule):
         Returns:
             output (torch.Tensor): Loss of shape [b, s] if labels are provided, otherwise logits of shape [b, s, vocab_size].
         """
+
         language_embeddings = self.language_model.embedding(
             input_ids=input_ids, position_ids=position_ids
         )  # [text_seq_len, b, h_language]
@@ -176,12 +183,17 @@ class LLaVAModel(MegatronModule):
             # If running inference, the language model KV cache will be updated for image token positions.
             # Here we store the image tokens sequence length, which can be used as an offset to the KV cache later.
             if inference_params is not None:
-                inference_params.key_value_memory_dict[
-                    "image_tokens_count"
-                ] = image_embeddings.shape[0]
+                inference_params.key_value_memory_dict["image_tokens_count"] = (
+                    image_embeddings.shape[0]
+                )
 
             combined_embeddings = torch.cat(
-                [image_embeddings, language_embeddings], dim=0
+                [
+                    language_embeddings[: self.img_embedding_idx],
+                    image_embeddings,
+                    language_embeddings[self.img_embedding_idx :],
+                ],
+                dim=0,
             )  # [combined_seq_len, b, h_language]
 
         # Embedding is computed above so we can discard input and position ids.
@@ -218,4 +230,8 @@ def _load_state_dict_hook_ignore_param_names(
             keys when calling load_state_dict on this torch module, respectively.
     """
     for param_name in param_names:
-        incompatible_keys.missing_keys.remove(param_name)
+        if param_name in incompatible_keys.missing_keys:
+            logging.getLogger(__name__).warning(
+                f"{param_name} being removed from incompatible_keys.missing_keys in LlavaModel"
+            )
+            incompatible_keys.missing_keys.remove(param_name)

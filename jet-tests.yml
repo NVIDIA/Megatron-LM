@@ -3,7 +3,7 @@
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Build only/'
-    # If either $JET_CUSTOM_FILTER or both $CI_MODEL and $CI_TASK are provided
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
     - when: never
 
 default:
@@ -27,6 +27,7 @@ jet-setup:
   artifacts:
     reports:
       dotenv: config.env
+  interruptible: true
 
 jet-configure:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/ci_yq:v1
@@ -35,15 +36,28 @@ jet-configure:
     - os/linux
   script:
     - |
-      IMAGE=$CI_IMAGE yq -i '. |= 
-        (select(.spec.name == "mcore-pyt") 
-        | .spec.source.arguments.FROM_IMAGE_NAME = env(IMAGE))
-      ' tests/functional_tests/jet_recipes/build-pyt.yaml
+      IMAGE=${CI_IMAGE}:${CI_PIPELINE_ID} yq '. |= 
+        (
+          select(.spec.name == "mcore-pyt") 
+          | .spec.source.image = env(IMAGE)
+        )
+      ' -i tests/functional_tests/jet_recipes/build-pyt.yaml
+
+      REF=$([[ $CI_PIPELINE_SOURCE == "merge_request_event" ]] && echo "merge-requests/${CI_MERGE_REQUEST_IID}/head" || echo "${CI_COMMIT_REF_NAME}")
+
+      REF=$REF yq '. |=
+        (
+          select(.spec.name == "mcore-nemo")
+          | .spec.source.ref = env(REF)
+        )
+      ' -i tests/functional_tests/jet_recipes/build-pyt.yaml
+
 
   artifacts:
     paths:
       - tests/functional_tests/jet_recipes
-
+  interruptible: true
+  
 jet-trigger:
   stage: jet
   extends: [.jet_common, .jet-trigger]
@@ -58,7 +72,7 @@ jet-trigger:
       - JET_CLUSTER_BRANCH
   variables:
     JET_WORKLOADS_FILTER: "$_JET_FILTER"
-
+  interruptible: true
 
 jet-results-summary:
   stage: jet
@@ -69,10 +83,10 @@ jet-results-summary:
   before_script:
     - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $VAULT_JWT_TOKEN
   script: 
+    - env
     - python -m pip install -U --no-cache-dir prettytable
     - rc=0
-    - python tests/functional_tests/python_test_utils/jet_test_pipeline.py ${CI_PIPELINE_ID} --test exit --artifact_links $CI_JOB_ID || rc=$?
-    - python tests/functional_tests/python_test_utils/jet_test_pipeline.py ${CI_PIPELINE_ID} --download_scripts_dir ./scripts || rc=$?
+    - python tests/functional_tests/python_test_utils/jet_test_pipeline.py ${CI_PIPELINE_ID} --artifact_links $CI_JOB_ID --download_scripts_dir ./scripts || rc=$?
     - exit $rc
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
@@ -84,3 +98,4 @@ jet-results-summary:
     when: always
     paths:
       - scripts
+  interruptible: true

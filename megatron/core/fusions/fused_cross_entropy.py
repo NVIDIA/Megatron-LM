@@ -11,6 +11,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from megatron.core.tensor_parallel.cross_entropy import VocabParallelCrossEntropy
+from megatron.core.tensor_parallel.utils import VocabUtility
 
 
 @jit_fuser
@@ -25,7 +26,11 @@ def calculate_logits_max(vocab_parallel_logits: torch.Tensor) -> Tuple[torch.Ten
 
 @jit_fuser
 def calculate_predicted_logits(
-    vocab_parallel_logits: torch.Tensor, target: torch.Tensor, logits_max: torch.Tensor
+    vocab_parallel_logits: torch.Tensor,
+    target: torch.Tensor,
+    logits_max: torch.Tensor,
+    vocab_start_index: int,
+    vocab_end_index: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     (
@@ -35,7 +40,7 @@ def calculate_predicted_logits(
         sum_exp_logits,
         exp_logits,
     ) = VocabParallelCrossEntropy.calculate_predicted_logits(
-        vocab_parallel_logits, target, logits_max
+        vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
     )
 
     predicted_logits_sum_exp_logits = torch.cat((predicted_logits, sum_exp_logits))
@@ -77,7 +82,7 @@ def calculate_gradients(
         grad_2d, arange_1d, masked_target_1d, softmax_update, grad_input, grad_output
     )
 
-    grad_input = grad_input.bfloat16()
+    grad_input = grad_input.to(torch.bfloat16)
 
     return grad_input
 
@@ -91,12 +96,21 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             logits_max, op=torch.distributed.ReduceOp.MAX, group=get_tensor_model_parallel_group()
         )
 
+        # Get the partition's vocab indices
+        get_vocab_range = VocabUtility.vocab_range_from_per_partition_vocab_size
+        partition_vocab_size = vocab_parallel_logits.size()[-1]
+        rank = get_tensor_model_parallel_rank()
+        world_size = get_tensor_model_parallel_world_size()
+        vocab_start_index, vocab_end_index = get_vocab_range(partition_vocab_size, rank, world_size)
+
         (
             target_mask,
             masked_target_1d,
             predicted_logits_sum_exp_logits,
             exp_logits,
-        ) = calculate_predicted_logits(vocab_parallel_logits, target, logits_max)
+        ) = calculate_predicted_logits(
+            vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
+        )
 
         # All reduce is needed to get the chunks from other GPUs.
         # In the fused case, tensors are batches to invoke a single

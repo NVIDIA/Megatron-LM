@@ -1,6 +1,6 @@
 workflow:
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests and nightly/
+    - if: ($CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests and nightly/) || ($CI_PIPELINE_SOURCE == "schedule")
       variables:
         JET_CUSTOM_FILTER: "type == 'build' or 'mr' in spec.scope or 'nightly' in spec.scope"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/
@@ -18,6 +18,7 @@ workflow:
       when: never
     # run branch pipeline if no open MR
     - if: $CI_COMMIT_BRANCH
+    
 
 stages:
   - build
@@ -41,36 +42,45 @@ variables:
       - "mcore/draco-oci"
       - "mcore/eos"
     description: '"mcore/draco-oci" for OCI-IAD, "mcore/eos" for EOS'
-  CI_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:${CI_PIPELINE_ID} 
-  CACHE_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:buildcache
-include:
-  - jet-tests.yml
+  CI_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci
+  LINTING_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_linting
 
-build:
+build_image:
   tags:
     - 8xL40S
   image: docker:26.1.4-dind
   stage: build
+  parallel:
+    matrix:
+      - IMAGE: CI_IMAGE
+        FILE: Dockerfile.ci
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:24.01-py3
+      - IMAGE: LINTING_IMAGE
+        FILE: Dockerfile.linting
+        BASE_IMAGE: python:3.10
   before_script:
     - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
   script:
     - |
-      docker build \
-        -f Dockerfile.ci \
-        -t ${CI_IMAGE} \
-        --cache-to type=inline \
-        --cache-from type=registry,ref=${CACHE_IMAGE} .
+      eval "IMAGE=\$$IMAGE"
 
-      docker push ${CI_IMAGE} 
+      docker build \
+        -f $FILE \
+        -t ${IMAGE}:${CI_PIPELINE_ID}  \
+        --cache-to type=inline \
+        --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
+        --cache-from type=registry,ref=${IMAGE}:buildcache .
+
+      docker push ${IMAGE}:${CI_PIPELINE_ID}  
 
       if [[ "$CI_COMMIT_BRANCH" = "main" ]]; then
-        docker tag ${CI_IMAGE} ${CACHE_IMAGE}
-        docker push ${CACHE_IMAGE}
+        docker tag ${IMAGE}:${CI_PIPELINE_ID} ${IMAGE}:buildcache
+        docker push ${IMAGE}:buildcache
       fi
   interruptible: true
 
 unit_tests:
-  image: ${CI_IMAGE}
+  image: ${CI_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
   stage: test
@@ -83,26 +93,25 @@ unit_tests:
     expire_in: 30 days
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
+      when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-    
+  interruptible: true
 
 unit_tests-data:
-  image: ${CI_IMAGE}
+  image: ${CI_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
   stage: test
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/data
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
-      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: never
-    - when: always
   interruptible: true
 
 unit_tests-dist-checkpointing:
-  image: ${CI_IMAGE}
+  image: ${CI_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
   stage: test
@@ -110,115 +119,99 @@ unit_tests-dist-checkpointing:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/dist_checkpointing
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
-      when: never
+      when: always
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: never
-    - when: always
   interruptible: true
 
 unit_tests-fusions:
-  image: ${CI_IMAGE}
+  image: ${CI_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
   stage: test
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/fusions
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
-      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: never
-    - when: always
   interruptible: true
 
 unit_tests-inference:
-  image: ${CI_IMAGE}
+  image: ${CI_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
   stage: test
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/inference
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
-      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: never
-    - when: always
   interruptible: true
 
 unit_tests-models:
-  image: ${CI_IMAGE}
+  image: ${CI_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
   stage: test
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/models
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
-      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: never
-    - when: always
   interruptible: true
 
 unit_tests-pipeline-parallel:
-  image: ${CI_IMAGE}
+  image: ${CI_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
   stage: test
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/pipeline_parallel
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
-      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: never
-    - when: always
   interruptible: true
 
 unit_tests-tensor-parallel:
-  image: ${CI_IMAGE}
+  image: ${CI_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
   stage: test
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/tensor_parallel
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
-      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: never
-    - when: always
   interruptible: true
 
 unit_tests-transformer:
-  image: ${CI_IMAGE}
+  image: ${CI_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
   stage: test
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/transformer
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
-      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: never
-    - when: always
   interruptible: true
 
 unit_tests-top-py:
-  image: ${CI_IMAGE}
+  image: ${CI_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
   stage: test
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/*.py
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
-      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: never
-    - when: always
   interruptible: true
 
 docs_build_test:
@@ -238,13 +231,27 @@ docs_build_test:
   interruptible: true
 
 formatting:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/python-format:0.0.1
+  image: ${LINTING_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - os/linux
   stage: test
+  before_script:
+    - git fetch origin main
   script:
-    - black megatron/core --check --verbose --diff
-    - isort megatron/core --check
+    - |
+      set -x
+      CHANGED_FILES=$(git diff --name-only origin/main | grep '^megatron/core' || true)
+
+      if [ -n "$CHANGED_FILES" ]; then
+        black --check --verbose --diff $CHANGED_FILES
+      fi
+
+      if [ -n "$CHANGED_FILES" ]; then
+        isort --check $CHANGED_FILES    
+      fi
   rules:
     - when: always
   interruptible: true
+
+include:
+  - jet-tests.yml
