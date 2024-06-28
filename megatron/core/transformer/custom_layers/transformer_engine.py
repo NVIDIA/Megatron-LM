@@ -50,7 +50,10 @@ class TENorm:
 
     # TODO should we ditch normalization config and just use spec to choose LayerNorm vs RMSNorm?
     def __new__(
-        cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5,
+        cls,
+        config: TransformerConfig,
+        hidden_size: int,
+        eps: float = 1e-5,
     ):
         if config.normalization == "LayerNorm":
             instance = te.pytorch.LayerNorm(
@@ -148,9 +151,9 @@ class TELinear(te.pytorch.Linear):
             fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
             tp_group=get_tensor_model_parallel_group(check_initialized=False),
             tp_size=self.config.tensor_model_parallel_size,
-            get_rng_state_tracker=get_cuda_rng_tracker
-            if get_cuda_rng_tracker().is_initialized()
-            else None,
+            get_rng_state_tracker=(
+                get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+            ),
             init_method=condition_init_method(config, init_method),
             bias=bias,
             return_bias=self.te_return_bias,
@@ -258,9 +261,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
             tp_group=get_tensor_model_parallel_group(check_initialized=False),
             tp_size=self.config.tensor_model_parallel_size,
-            get_rng_state_tracker=get_cuda_rng_tracker
-            if get_cuda_rng_tracker().is_initialized()
-            else None,
+            get_rng_state_tracker=(
+                get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+            ),
             init_method=condition_init_method(config, init_method),
             bias=bias,
             return_bias=self.te_return_bias,
@@ -285,7 +288,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         return out, None
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
-        """ Sharding along axis 0, bias sharded """
+        """Sharding along axis 0, bias sharded"""
         state_dict = self.state_dict(prefix='', keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
             state_dict, prefix, {'weight': 0, 'bias': 0}, sharded_offsets
@@ -331,7 +334,7 @@ class TEColumnParallelLinear(TELinear):
         )
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
-        """ Sharding along axis 0, bias sharded """
+        """Sharding along axis 0, bias sharded"""
         state_dict = self.state_dict(prefix='', keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
             state_dict, prefix, {'weight': 0, 'bias': 0}, sharded_offsets
@@ -378,7 +381,7 @@ class TERowParallelLinear(TELinear):
         )
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
-        """ Sharding along axis 1, bias not sharded """
+        """Sharding along axis 1, bias not sharded"""
         state_dict = self.state_dict(prefix='', keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
             state_dict, prefix, {'weight': 1}, sharded_offsets
@@ -469,15 +472,15 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
             kv_channels=self.config.kv_channels,
-            attention_dropout=self.config.attention_dropout
-            if attention_dropout is None
-            else attention_dropout,
+            attention_dropout=(
+                self.config.attention_dropout if attention_dropout is None else attention_dropout
+            ),
             attn_mask_type=attn_mask_type.name,
             sequence_parallel=self.config.sequence_parallel,
             tp_size=self.config.tensor_model_parallel_size,
-            get_rng_state_tracker=get_cuda_rng_tracker
-            if get_cuda_rng_tracker().is_initialized()
-            else None,
+            get_rng_state_tracker=(
+                get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+            ),
             tp_group=get_tensor_model_parallel_group(check_initialized=False),
             layer_number=layer_number,
             **extra_kwargs,
@@ -519,6 +522,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 value = value.as_strided(value.shape, key.stride())
 
         if self.te_forward_mask_type:
+            if qkv_format == 'thd' and _te_version >= packaging.version.Version("1.7.0"):
+                # thd format uses flash attention with cuDNN kernel which requires is_padding=True, so the only
+                # acceptable mask types are `padding_causal` and `padding`. These do not necessarily indicate
+                # there are padded tokens in the sequence.
+                if attn_mask_type == AttnMaskType.causal:
+                    attn_mask_type = AttnMaskType.padding_causal
+                elif attn_mask_type == AttnMaskType.no_mask:
+                    attn_mask_type = AttnMaskType.padding
             core_attn_out = super().forward(
                 query,
                 key,
@@ -528,7 +539,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 **packed_seq_kwargs,
             )
         else:
-            core_attn_out = super().forward(query, key, value, attention_mask, **packed_seq_kwargs,)
+            core_attn_out = super().forward(
+                query,
+                key,
+                value,
+                attention_mask,
+                **packed_seq_kwargs,
+            )
 
         if self.config.apply_rope_fusion and qkv_format == 'bshd':
             return core_attn_out.transpose(0, 1)
