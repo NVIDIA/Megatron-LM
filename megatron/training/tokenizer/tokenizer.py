@@ -5,6 +5,8 @@
 from abc import ABC
 from abc import abstractmethod
 
+import types
+
 from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
 
 from .bert_tokenization import FullTokenizer as FullBertTokenizer
@@ -49,6 +51,8 @@ def build_tokenizer(args):
     elif args.tokenizer_type == 'MistralTokenizer':
         assert args.tokenizer_model is not None
         tokenizer = create_mistral_tokenizer(args.tokenizer_model)
+        tokenizer.vocab_size = 32768
+        tokenizer.eos_id = tokenizer.instruct_tokenizer.tokenizer.eos_id
     elif args.tokenizer_type == 'NullTokenizer':
         assert args.vocab_size is not None
         tokenizer = _NullTokenizer(args.vocab_size)
@@ -549,12 +553,20 @@ def create_llama3_tokenizer(*args, **kwargs):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
 
+        def instruct_tokenize(self, s: str, bos=True, eos=False):
+            '''Default args for text completion, not chat/dialog.'''
+
+            assert type(s) is str
+
+            t = self.encode(s, bos=bos, eos=eos, allowed_special='all')
+            return t
+
         def tokenize(self, s: str, bos=True, eos=False):
             '''Default args for text completion, not chat/dialog.'''
 
             assert type(s) is str
 
-            t = self.encode(s, bos=False, eos=eos, allowed_special='all')
+            t = self.encode(s, bos=bos, eos=eos, allowed_special='all')
             return t
 
         def detokenize(self, ids):
@@ -590,6 +602,8 @@ def create_llama3_tokenizer(*args, **kwargs):
 def create_mistral_tokenizer(*args, **kwargs):
     try:
         from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+        from mistral_common.tokens.instruct.request import InstructRequest
+        from mistral_common.protocol.instruct.messages import UserMessage
     except ImportError:
         raise ImportError("Module 'mistral-common' is required but not installed.")
 
@@ -597,7 +611,40 @@ def create_mistral_tokenizer(*args, **kwargs):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
 
-    return _MistralTokenizer.from_file(*args, **kwargs)
+    tokenizer = _MistralTokenizer.from_file(*args, **kwargs)
+
+    def tokenize(self, s: str, bos=True, eos=False):
+        '''Default args for text completion, not chat/dialog.'''
+
+        assert type(s) is str
+
+        t = self.instruct_tokenizer.tokenizer.encode(s, bos=bos, eos=eos)
+
+        return t
+
+    def instruct_tokenize(self, s: str):
+        '''Default args for text completion, not chat/dialog.'''
+
+        assert type(s) is str
+
+        t = self.instruct_tokenizer.encode_instruct(
+            InstructRequest(
+                messages=[
+                    UserMessage(content=s),
+                ],
+            )
+        )
+
+        return t.tokens[1:] # strip of box
+
+    def detokenize(self, ids):
+        return self.instruct_tokenizer.tokenizer.decode(ids)
+
+    tokenizer.tokenize = types.MethodType(tokenize, tokenizer)
+    tokenizer.detokenize = types.MethodType(detokenize, tokenizer)
+    tokenizer.instruct_tokenize = types.MethodType(instruct_tokenize, tokenizer)
+
+    return tokenizer
 
 
 class _NullTokenizer(MegatronTokenizer):

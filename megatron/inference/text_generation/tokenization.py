@@ -6,7 +6,7 @@
 import torch
 
 
-from megatron.training import get_tokenizer, get_args
+from megatron.training import get_args, get_tokenizer
 from .communication import broadcast_int_list, broadcast_tensor
 
 
@@ -15,8 +15,8 @@ def detokenize_generations(tokens_gpu_tensor,
                            return_segments):
     """Detokenize the generated tokens."""
 
-    tokenizer = get_tokenizer()
     args = get_args()
+    tokenizer = get_tokenizer(args)
     prompts_plus_generations = []
     if return_segments:
         prompts_plus_generations_segments = []
@@ -33,10 +33,9 @@ def detokenize_generations(tokens_gpu_tensor,
                 if args.tokenizer_type in ['SentencePieceTokenizer',
                                            'GPTSentencePieceTokenizer',
                                            'HuggingFaceTokenizer',
-                                           'Llama2Tokenizer',
-                                           'MistralTokenizer']:
+                                           'Llama2Tokenizer']:
                     word = tokenizer.decoder[token]
-                elif args.tokenizer_type == 'Llama3Tokenizer':
+                elif args.tokenizer_type in ['Llama3Tokenizer', 'MistralTokenizer']:
                     word = tokenizer.decode([token])
                 elif args.tokenizer_type == 'NullTokenizer':
                     word = str(token)
@@ -100,12 +99,19 @@ def _tokenize_prompts_and_batch(prompts, tokens_to_generate, add_BOS):
     """
 
     # Tokenize all the prompts.
-    tokenizer = get_tokenizer()
+    args = get_args()
+    tokenizer = get_tokenizer(args)
+    if hasattr(tokenizer, 'eod'):
+        eod_token = tokenizer.eod
+    elif hasattr(tokenizer, 'eos_id'):
+        eod_token = tokenizer.eos_id
+    else:
+        raise AttributeError('No eod token found in Tokenizer')
     if add_BOS:
-        prompts_tokens = [[tokenizer.eod] + tokenizer.tokenize(prompt)
+        prompts_tokens = [[eod_token] + tokenizer.tokenize(prompt)
                           for prompt in prompts]
     else:
-        prompts_tokens = [tokenizer.tokenize(prompt) for prompt in prompts]
+        prompts_tokens = [tokenizer.instruct_tokenize(prompt) for prompt in prompts]
 
     # Now we have a list of list of tokens which each list has a different
     # size. We want to extend this list to:
@@ -120,7 +126,7 @@ def _tokenize_prompts_and_batch(prompts, tokens_to_generate, add_BOS):
     # Now update the list of list to be of the same size: samples_length.
     for prompt_tokens, prompt_length in zip(prompts_tokens, prompts_length):
         padding_size = samples_length - prompt_length
-        prompt_tokens.extend([tokenizer.eod] * padding_size)
+        prompt_tokens.extend([eod_token] * padding_size)
 
     # Now we are in a structured format, we can convert to tensors.
     prompts_tokens_tensor = torch.tensor(prompts_tokens, dtype=torch.long, device='cuda')
