@@ -42,7 +42,8 @@ variables:
       - "mcore/draco-oci"
       - "mcore/eos"
     description: '"mcore/draco-oci" for OCI-IAD, "mcore/eos" for EOS'
-  CI_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci
+  CI_MCORE_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci
+  CI_NEMO_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/nemo_ci
   LINTING_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_linting
 
 build_image:
@@ -50,15 +51,20 @@ build_image:
     - 8xL40S
   image: docker:26.1.4-dind
   stage: build
+  timeout: 30m
   parallel:
     matrix:
-      - IMAGE: CI_IMAGE
+      - IMAGE: CI_MCORE_IMAGE
         FILE: Dockerfile.ci
         BASE_IMAGE: nvcr.io/nvidia/pytorch:24.01-py3
+      - IMAGE: CI_NEMO_IMAGE
+        FILE: Dockerfile.ci
+        BASE_IMAGE: nvcr.io/nvidian/nemo:nightly
       - IMAGE: LINTING_IMAGE
         FILE: Dockerfile.linting
         BASE_IMAGE: python:3.10
   before_script:
+    - echo "$NGC_API_KEY" | docker login nvcr.io -u '$oauthtoken' --password-stdin
     - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
   script:
     - |
@@ -80,7 +86,7 @@ build_image:
   interruptible: true
 
 unit_tests:
-  image: ${CI_IMAGE}:${CI_PIPELINE_ID} 
+  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
   stage: test
@@ -97,7 +103,7 @@ unit_tests:
   interruptible: true
 
 unit_tests-data:
-  image: ${CI_IMAGE}:${CI_PIPELINE_ID} 
+  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
   stage: test
@@ -112,7 +118,7 @@ unit_tests-data:
   interruptible: true
 
 unit_tests-dist-checkpointing:
-  image: ${CI_IMAGE}:${CI_PIPELINE_ID} 
+  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
   stage: test
@@ -127,7 +133,7 @@ unit_tests-dist-checkpointing:
   interruptible: true
 
 unit_tests-fusions:
-  image: ${CI_IMAGE}:${CI_PIPELINE_ID} 
+  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
   stage: test
@@ -142,7 +148,7 @@ unit_tests-fusions:
   interruptible: true
 
 unit_tests-inference:
-  image: ${CI_IMAGE}:${CI_PIPELINE_ID} 
+  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
   stage: test
@@ -157,7 +163,7 @@ unit_tests-inference:
   interruptible: true
 
 unit_tests-models:
-  image: ${CI_IMAGE}:${CI_PIPELINE_ID} 
+  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
   stage: test
@@ -172,7 +178,7 @@ unit_tests-models:
   interruptible: true
 
 unit_tests-pipeline-parallel:
-  image: ${CI_IMAGE}:${CI_PIPELINE_ID} 
+  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
   stage: test
@@ -187,7 +193,7 @@ unit_tests-pipeline-parallel:
   interruptible: true
 
 unit_tests-tensor-parallel:
-  image: ${CI_IMAGE}:${CI_PIPELINE_ID} 
+  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
   stage: test
@@ -202,7 +208,7 @@ unit_tests-tensor-parallel:
   interruptible: true
 
 unit_tests-transformer:
-  image: ${CI_IMAGE}:${CI_PIPELINE_ID} 
+  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
   stage: test
@@ -217,7 +223,7 @@ unit_tests-transformer:
   interruptible: true
 
 unit_tests-top-py:
-  image: ${CI_IMAGE}:${CI_PIPELINE_ID} 
+  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
   stage: test
