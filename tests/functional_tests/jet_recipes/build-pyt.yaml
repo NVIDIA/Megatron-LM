@@ -5,6 +5,8 @@ spec:
   name: mcore-pyt
   platforms: [linux/amd64]
   source:
+    # The image tag will be added via `jet-tests.yaml`
+    # Tags are one of {buildcache, $CI_PIPELINE_ID}
     image: gitlab-master.nvidia.com/adlr/megatron-lm/mcore_ci
     
 
@@ -16,8 +18,6 @@ spec:
   name: mcore-nemo
   platforms: [linux/amd64]
   source:
-    repo: https://gitlab-master.nvidia.com/ADLR/megatron-lm.git
-    ref: main
-    dockerfile: Dockerfile.ci
-    arguments:
-      FROM_IMAGE_NAME: nvcr.io/nvidian/nemo:nightly
+    # The image tag will be added via `jet-tests.yaml`
+    # Tags are one of {buildcache, $CI_PIPELINE_ID}
+    image: gitlab-master.nvidia.com/adlr/megatron-lm/nemo_ci
