@@ -3,7 +3,7 @@ from typing import List, Tuple
 
 import torch
 
-from megatron.core.inference.inference_model_wrappers.abstract_model_inference_wrapper import (
+from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
 from megatron.core.models.gpt import GPTModel

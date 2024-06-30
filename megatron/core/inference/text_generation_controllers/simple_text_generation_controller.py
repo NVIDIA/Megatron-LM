@@ -6,10 +6,10 @@ import torch.nn.functional as F
 from megatron.core import parallel_state
 from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.communication_utils import broadcast_from_last_pipeline_stage
-from megatron.core.inference.inference_model_wrappers.abstract_model_inference_wrapper import (
+from megatron.core.inference.inference_request import InferenceRequest, Status
+from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
-from megatron.core.inference.inference_request import InferenceRequest, Status
 
 
 class SimpleTextGenerationController:
@@ -334,7 +334,7 @@ class SimpleTextGenerationController:
             )
             # Extract only the generated tokens
             required_result_tokens = batch_prompt_tokens_with_generations[
-                idx, input_prompt_length:(input_prompt_length + required_sequence_length)
+                idx, input_prompt_length : (input_prompt_length + required_sequence_length)
             ]
 
             request.generated_length = required_sequence_length
