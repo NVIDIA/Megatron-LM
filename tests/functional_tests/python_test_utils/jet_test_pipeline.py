@@ -23,14 +23,14 @@ def query_results(triggering_pipeline_id):
         .filter(Field('obj_ci.obj_upstream.l_pipeline_id') == triggering_pipeline_id)
         .filter(Field('obj_workload.s_type') == 'basic')
         .select(
-            'l_exit_code', 
-            'nested_assets', 
-            'obj_workload.s_key', 
-            'obj_workload.obj_spec', 
-            'obj_ci', 
-            'ts_created', 
+            'l_exit_code',
+            'nested_assets',
+            'obj_workload.s_key',
+            'obj_workload.obj_spec',
+            'obj_ci',
+            'ts_created',
             'obj_status.s_message',
-            'obj_ci.l_job_id'
+            'obj_ci.l_job_id',
         )
         .orderby('ts_created')  # increasing (least recent in case of timestamp)
     )
@@ -65,7 +65,9 @@ def pretty_print_results(results, summary_jobid):
         names.append(result['obj_workload']['obj_spec']['s_name'])
         result_message.append(result['obj_status']['s_message'])
         metrics_file_urls.append(select_asset(result, 'results.json'))
-        jet_log_urls.append(f"https://gitlab-master.nvidia.com/dl/jet/ci/-/jobs/{result['obj_ci']['l_job_id']}")
+        jet_log_urls.append(
+            f"https://gitlab-master.nvidia.com/dl/jet/ci/-/jobs/{result['obj_ci']['l_job_id']}"
+        )
 
     # Results metrics table
     metrics_table = PrettyTable()
@@ -75,7 +77,13 @@ def pretty_print_results(results, summary_jobid):
     metrics_table.add_column("SLURM Log URL", log_urls)
     metrics_table.add_column("Results Data", metrics_file_urls, align="l")
 
+    exit_codes_good = [ec == 0 for ec in exit_codes]
+    if not (len(exit_codes_good)):
+        raise Exception("Can't find any jobs, something went wrong.\n" + metrics_table.get_string())
+    if not all(exit_codes_good):
+        raise Exception("Some jobs failed to complete successfully\n" + metrics_table.get_string())
     print(metrics_table)
+    print("All jobs completed successfully!")
 
 
 def save_scripts(results, save_dir):
@@ -88,6 +96,7 @@ def save_scripts(results, save_dir):
         target_path = os.path.join(save_dir, target_path)
 
         from textwrap import dedent
+
         if result['obj_workload']['obj_spec']['flat_artifacts']:
             dataset_mount = list(result['obj_workload']['obj_spec']['flat_artifacts'].keys())[0]
             content = f'''
@@ -112,10 +121,16 @@ def save_scripts(results, save_dir):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        'pipeline_id', help="Pipeline ID for pipeline in MLM repo that triggers the JET CI")
-    parser.add_argument('--download_scripts_dir', required=False,
-                        help="Directory in which to save the job script.")
-    parser.add_argument('--artifact_links', required=False, help="Enables job script artifact link table. Provide results summary job's ID.")
+        'pipeline_id', help="Pipeline ID for pipeline in MLM repo that triggers the JET CI"
+    )
+    parser.add_argument(
+        '--download_scripts_dir', required=False, help="Directory in which to save the job script."
+    )
+    parser.add_argument(
+        '--artifact_links',
+        required=False,
+        help="Enables job script artifact link table. Provide results summary job's ID.",
+    )
     args = parser.parse_args()
 
     results = query_results(args.pipeline_id)

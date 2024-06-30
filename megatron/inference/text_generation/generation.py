@@ -147,8 +147,12 @@ def generate_tokens_probs_and_return_on_first_stage(
     # generation once that id is generated.
     if hasattr(args, 'eos_id'):
         termination_id = args.eos_id
-    else:
+    elif hasattr(tokenizer, 'eod'):
         termination_id = tokenizer.eod
+    elif hasattr(tokenizer, 'eos_id'):
+        termination_id = tokenizer.eos_id
+    else:
+        raise AttributeError('No eod token found in tokenizer or args')
 
     # ===================
     # Pre-allocate memory

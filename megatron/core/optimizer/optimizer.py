@@ -8,9 +8,13 @@ from itertools import chain
 from logging import getLogger
 from typing import Any, Callable, List, Optional, Tuple
 
-import amp_C
 import torch
-from apex.multi_tensor_apply import multi_tensor_applier
+
+try:
+    from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_scale
+except ImportError:
+    from apex.multi_tensor_apply import multi_tensor_applier
+    from amp_C import multi_tensor_scale
 
 from .. import parallel_state, tensor_parallel
 from ..dist_checkpointing.mapping import ShardedStateDict
@@ -57,7 +61,7 @@ def _multi_tensor_copy_this_to_that(
     if overflow_buf:
         overflow_buf.fill_(0)
         # Scaling with factor `1.0` is equivalent to copy.
-        multi_tensor_applier(amp_C.multi_tensor_scale, overflow_buf, [this, that], 1.0)
+        multi_tensor_applier(multi_tensor_scale, overflow_buf, [this, that], 1.0)
     else:
         for this_, that_ in zip(this, that):
             that_.copy_(this_)
@@ -79,7 +83,6 @@ class MegatronOptimizer(ABC):
         config: OptimizerConfig,
         init_state_fn: Callable = lambda x: None,
     ):
-
         """Input optimizer is the base optimizer (e.g., Adam)."""
         self.optimizer = optimizer
         assert self.optimizer, 'no optimizer is provided.'
@@ -137,7 +140,8 @@ class MegatronOptimizer(ABC):
     def get_grad_norm(self):
         grads_for_norm = self.get_main_grads_for_grad_norm()
         total_norm = get_grad_norm_fp32(
-            grads_for_norm, model_parallel_group=self.get_model_parallel_group(),
+            grads_for_norm,
+            model_parallel_group=self.get_model_parallel_group(),
         )
         return total_norm
 
@@ -226,7 +230,7 @@ class MegatronOptimizer(ABC):
     def sharded_state_dict(
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
     ) -> ShardedStateDict:
-        """ Builds sharded state dict for the optimizer, based on model's sharded state dict.
+        """Builds sharded state dict for the optimizer, based on model's sharded state dict.
 
         Args:
             model_sharded_state_dict (ShardedStateDict): sharded state dict of the model
@@ -260,7 +264,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
     ):
 
         super().__init__(
-            optimizer, config, init_state_fn,
+            optimizer,
+            config,
+            init_state_fn,
         )
         self.grad_scaler = grad_scaler
 
@@ -434,7 +440,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
     ):
 
         super().__init__(
-            optimizer, config, grad_scaler, init_state_fn,
+            optimizer,
+            config,
+            grad_scaler,
+            init_state_fn,
         )
 
         # Handle main parameters.
@@ -651,11 +660,16 @@ class FP32Optimizer(MegatronOptimizer):
     """
 
     def __init__(
-        self, optimizer: torch.optim.Optimizer, config: OptimizerConfig, init_state_fn: Callable,
+        self,
+        optimizer: torch.optim.Optimizer,
+        config: OptimizerConfig,
+        init_state_fn: Callable,
     ):
 
         super(FP32Optimizer, self).__init__(
-            optimizer, config, init_state_fn,
+            optimizer,
+            config,
+            init_state_fn,
         )
 
         self._scale = torch.tensor([1.0], dtype=torch.float, device='cuda')
@@ -908,8 +922,7 @@ class ChainedOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def step(self):
-        """ChainedOptimizer will step all optimizers one by one.
-        """
+        """ChainedOptimizer will step all optimizers one by one."""
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
             return False, None, None
@@ -919,7 +932,7 @@ class ChainedOptimizer(MegatronOptimizer):
         for optimizer in self.chained_optimizers:
             _grad_norm = optimizer.get_grad_norm()
             grad_norms += [_grad_norm if _grad_norm else 0.0]
-        grad_norm = math.sqrt(sum([x ** 2 for x in grad_norms]))
+        grad_norm = math.sqrt(sum([x**2 for x in grad_norms]))
 
         # Clip gradients.
         for optimizer in self.chained_optimizers:
@@ -985,7 +998,6 @@ class ChainedOptimizer(MegatronOptimizer):
             optimizer.load_parameter_state_from_dp_zero(state_dict)
 
     def finish_param_sync(self, model_index: int):
-        """Finish parameter synchronization for all optimizers.
-        """
+        """Finish parameter synchronization for all optimizers."""
         for optimizer in self.chained_optimizers:
             optimizer.finish_param_sync(model_index)

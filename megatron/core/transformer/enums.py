@@ -24,3 +24,4 @@ class AttnMaskType(enum.Enum):
     padding = 1
     causal = 2
     no_mask = 3  # only used for TE
+    padding_causal = 4  # only used for thd attention

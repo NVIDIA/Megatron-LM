@@ -173,15 +173,27 @@ class TopKRouter(Router):
         Returns:
             torch.Tensor: The activation tensor with the attached gradient function.
         """
-        moe_aux_loss_coeff = (
-            self.config.moe_aux_loss_coeff / parallel_state.get_tensor_model_parallel_world_size()
-        )
+        moe_aux_loss_coeff = self.config.moe_aux_loss_coeff
+        scale_for_logging = 1.0
+        sequence_partition_group = None
+        if self.config.moe_token_dispatcher_type == "allgather":
+            sequence_partition_group = parallel_state.get_tensor_model_parallel_group()
+        elif self.config.moe_token_dispatcher_type == "alltoall":
+            moe_aux_loss_coeff /= parallel_state.get_tensor_model_parallel_world_size()
+
+        if sequence_partition_group is not None:
+            scale_for_logging *= torch.distributed.get_world_size(group=sequence_partition_group)
+
         aux_loss = switch_load_balancing_loss_func(
-            probs, num_local_tokens_per_expert, self.topk, moe_aux_loss_coeff
+            probs,
+            num_local_tokens_per_expert,
+            self.topk,
+            moe_aux_loss_coeff,
+            sequence_partition_group=sequence_partition_group,
         )
         save_to_aux_losses_tracker(
             "load_balancing_loss",
-            aux_loss / moe_aux_loss_coeff,
+            aux_loss / moe_aux_loss_coeff * scale_for_logging,
             self.layer_number,
             self.config.num_layers,
         )
@@ -205,10 +217,7 @@ class TopKRouter(Router):
             z_loss = z_loss_func(logits, moe_z_loss_coeff)
             logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
             save_to_aux_losses_tracker(
-                "z_loss",
-                z_loss / self.config.moe_z_loss_coeff,
-                self.layer_number,
-                self.config.num_layers,
+                "z_loss", z_loss / moe_z_loss_coeff, self.layer_number, self.config.num_layers,
             )
         return logits
 

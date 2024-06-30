@@ -51,7 +51,7 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
         language_transformer_layer_spec = get_layer_spec(is_vit=False)
 
     vision_config = deepcopy(base_config)
-    vision_config = get_vision_model_config(vision_config, apply_query_key_layer_scaling=use_te)
+    vision_config = get_vision_model_config(vision_config, apply_query_key_layer_scaling=args.apply_query_key_layer_scaling)
 
     if use_te:
         vision_transformer_layer_spec = get_layer_spec_te(is_vit=True)
@@ -77,6 +77,8 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
         parallel_output=parallel_output,
         language_position_embedding_type=args.position_embedding_type,
         language_rotary_percent=args.rotary_percent,
+        language_rotary_base=args.rotary_base,
+        img_embedding_idx=args.img_embedding_idx,
     )
 
     model.freeze(freeze_language_model=args.freeze_LM, freeze_vision_model=args.freeze_ViT, freeze_vision_projection=False)
@@ -116,12 +118,15 @@ def get_batch(data_iterator):
     tokenizer = get_tokenizer()
     tokens = tokens_[:, :args.seq_length].contiguous()
     labels = tokens_[:, 1:args.seq_length+1].contiguous()
-
     torch.cuda.nvtx.range_pop()
 
     torch.cuda.nvtx.range_push("get_ltor_masks_and_position_ids")
+    if hasattr(tokenizer, 'eod'):
+        eod_token = tokenizer.eod
+    elif hasattr(tokenizer, 'eos_id'):
+        eod_token = tokenizer.eos_id
     attention_mask, loss_mask, position_ids = \
-        get_ltor_masks_and_position_ids(tokens, tokenizer.eod,
+        get_ltor_masks_and_position_ids(tokens, eod_token,
                                         args.reset_position_ids,
                                         args.reset_attention_mask,
                                         args.eod_mask_loss,
@@ -203,7 +208,7 @@ def get_ltor_masks_and_position_ids(data,
 
     if question_length is not None:
         for b in range(micro_batch_size):
-            loss_mask[b, :max(0, question_length[b].item() - 1)] = 0.0
+            loss_mask[b, :max(0, question_length[b].item())] = 0.0
 
     if reset_position_ids or reset_attention_mask:
         # Loop through the batches:
@@ -261,6 +266,7 @@ def forward_step(data_iterator, model: LLaVAModel):
         output_tensor (torch.Tensor): Loss of shape [b, s] if labels are provided, otherwise logits of shape [b, s, vocab_size].
         loss_func (callable): Loss function with a loss mask specified.
     """
+    args = get_args()
     timers = get_timers()
 
     # Get the batch.
@@ -288,6 +294,10 @@ def add_multimodal_extra_args(parser):
     group.add_argument("--disable-vision-class-token", action="store_true", default=False)
     group.add_argument("--allow-missing-vision-projection-checkpoint", action="store_true", default=False)
     group.add_argument("--use-te", action="store_true", default=False)
+    group.add_argument("--img-embedding-idx", type=int, default=0,
+                       help='Llava specific parameter. Defines at which index'
+                       'in the language_embedding tensor the image_embeddings'
+                       'should be inserted')
     return parser
 
 

@@ -554,6 +554,20 @@ def validate_args(args, defaults={}):
     if args.apply_query_key_layer_scaling:
         args.attention_softmax_in_fp32 = True
 
+    # Checkpointing
+    if args.ckpt_fully_parallel_save_deprecated and args.rank == 0:
+        print('--ckpt-fully-parallel-save flag is deprecated and has no effect.'
+              ' Use --no-ckpt-fully-parallel-save to disable parallel save.')
+    if (
+        args.use_dist_ckpt
+        and not args.ckpt_fully_parallel_save
+        and args.use_distributed_optimizer
+        and args.rank == 0
+    ):
+        print('Warning: With non-parallel ckpt save and DistributedOptimizer,'
+              ' it will be impossible to resume training with different parallelism.'
+              ' Consider removing flag --no-ckpt-fully-parallel-save.')
+
     # Print arguments.
     _print_args("arguments", args)
 
@@ -754,6 +768,8 @@ def _add_network_size_args(parser):
     group.add_argument('--use-rotary-position-embeddings', action='store_true',
                        help='Use rotary positional embeddings or not. '
                        'Deprecated: use --position-embedding-type')
+    group.add_argument('--rotary-base', type=int, default=10000,
+                       help='Base to use for rotary positional embeddings, default 10000')
     group.add_argument('--rotary-percent', type=float, default=1.0,
                        help='Percent of rotary dimension to use, default 100%%')
     group.add_argument('--rotary-interleaved', action='store_true',
@@ -1286,9 +1302,14 @@ def _add_checkpointing_args(parser):
                        choices=['zarr', 'torch_dist'],
                        help='Distributed checkpoint format to use.')
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
-                       help='Apply full save parallelization across DP for'
+                       dest='ckpt_fully_parallel_save_deprecated',
+                       help='Deprecated: see --no-ckpt-fully-parallel-save.')
+    group.add_argument('--no-ckpt-fully-parallel-save', action='store_false',
+                       dest='ckpt_fully_parallel_save',
+                       help='Disable applying full save parallelization across DP for'
                             ' distributed checkpoints. Depending on ckpt format'
-                            ' might increase number of files in the checkpoint.')
+                            ' might decrease the number of files in the checkpoint.'
+                            ' Makes DistributedOptimizer checkpoint non-reshardable.')
     group.add_argument('--async-save', action='store_true', default=None,
                        help='Apply async checkpointing save. Currently works only with'
                             '`torch_dist` distributed checkpoint format.')

@@ -85,6 +85,23 @@ class SwigluFactoryModel(torch.nn.Module):
         return sharded_state_dict
 
 
+class SwigluFactoryModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(5, 64 // parallel_state.get_tensor_model_parallel_world_size(), bias=False)
+        self.config = TransformerConfig(hidden_size=8, num_attention_heads=1, num_layers=1)
+
+    def sharded_state_dict(self):
+        sharded_state_dict = self.state_dict(keep_vars=True)
+        sharded_state_dict['linear.weight'] = ShardedTensor.from_rank_offsets(
+            'linear.weight', sharded_state_dict['linear.weight'],
+            ((0, parallel_state.get_tensor_model_parallel_rank(), parallel_state.get_tensor_model_parallel_world_size())),
+            replica_id=((parallel_state.get_pipeline_model_parallel_rank(), 0, parallel_state.get_data_parallel_rank(with_context_parallel=True)))
+        )
+        sharded_state_dict['linear.weight'] = apply_swiglu_sharded_factory(sharded_state_dict['linear.weight'], ())
+        return sharded_state_dict
+
+
 class TestOptimizer:
     def test_optimizer_params(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(1,1)
@@ -177,13 +194,13 @@ def load_checkpoint_no_arg_checks(*args, **kwargs):
             return load_checkpoint(*args, **kwargs)
 
 
-def setup_model_and_optimizer(seed, initialize_fn, bf16=True):
+def setup_model_and_optimizer(seed, initialize_fn=initialize_gpt_model, bf16=True, dist_opt=True):
     mock_args = SimpleNamespace()
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, bf16=bf16)
         model = get_model(partial(initialize_fn, seed=seed))
 
-    config = OptimizerConfig(bf16=bf16, params_dtype=torch.bfloat16 if bf16 else torch.float, use_distributed_optimizer=bf16)
+    config = OptimizerConfig(bf16=bf16, params_dtype=torch.bfloat16 if bf16 else torch.float, use_distributed_optimizer=dist_opt)
     optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)
@@ -405,3 +422,49 @@ class TestFP32Optimizer:
                 diffs = diff(plain_state_dict_A, plain_state_dict_B)
                 assert not any(map(bool, diffs)), diffs
                 Utils.destroy_model_parallel()
+
+
+class TestOptimizerResharding:
+    @pytest.mark.parametrize(
+        ('use_dist_opt', 'bf16'),
+        (
+            (False, True),  # regular BF16
+            (True, True),   # DistOpt BF16
+            # (False, False), # FP32
+        )
+    )
+    @pytest.mark.parametrize(
+        ('src_tp_pp', 'dest_tp_pp',),
+        [
+            ((2, 4), (2, 4)),
+            ((2, 4), (2, 2)),
+            ((2, 4), (4, 2)),
+            ((8, 1), (1, 2)),
+        ]
+    )
+    def test_optimizer_resharding(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_dist_opt, bf16):
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=False) as ckpt_dir_A:
+            with TempNamedDir(tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=False) as ckpt_dir_B:
+                Utils.initialize_model_parallel(*src_tp_pp)
+                model_A, optimizer_A = setup_model_and_optimizer(seed=2, bf16=bf16, dist_opt=use_dist_opt)
+
+                save(optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()), ckpt_dir_A)
+                Utils.destroy_model_parallel()
+
+                # Load checkpoint A with different TP/PP and save as checkpoint B
+                Utils.initialize_model_parallel(*dest_tp_pp)
+                model_B, optimizer_B = setup_model_and_optimizer(seed=3, bf16=bf16, dist_opt=use_dist_opt)
+                load_sharded_state_dict = optimizer_B.sharded_state_dict(model_B[0].sharded_state_dict())
+                state_dict = load(load_sharded_state_dict, ckpt_dir_A)
+
+                optimizer_B.load_state_dict(state_dict)
+                save(optimizer_B.sharded_state_dict(model_B[0].sharded_state_dict()), ckpt_dir_B)
+                Utils.destroy_model_parallel()
+
+                # Test both checkpoints are equal
+                Utils.initialize_model_parallel(1, 1)
+                plain_state_dict_A = load_plain_tensors(ckpt_dir_A)
+                plain_state_dict_B = load_plain_tensors(ckpt_dir_B)
+                diffs = diff(plain_state_dict_A, plain_state_dict_B)
+                assert not any(map(bool, diffs)), diffs
+        Utils.destroy_model_parallel()
