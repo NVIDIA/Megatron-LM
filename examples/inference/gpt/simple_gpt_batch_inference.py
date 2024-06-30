@@ -5,7 +5,7 @@ from argparse import Namespace
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines.mcore_engine import MCoreEngine
 from megatron.core.inference.common_inference_params import CommonInferenceParams
-from megatron.core.inference.inference_model_wrappers.gpt.gpt_inference_wrapper import GPTInferenceWrapper
+from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import GPTInferenceWrapper
 from megatron.core.inference.inference_request import InferenceRequest
 from megatron.core.inference.text_generation_controllers.simple_text_generation_controller import SimpleTextGenerationController
 from megatron.core.transformer.module import MegatronModule

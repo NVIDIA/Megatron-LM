@@ -332,8 +332,9 @@ class SimpleTextGenerationController:
             required_sequence_length = int(
                 min(generated_sequence_lengths[idx], common_inference_params.num_tokens_to_generate)
             )
+            # Extract only the generated tokens
             required_result_tokens = batch_prompt_tokens_with_generations[
-                idx, input_prompt_length:required_sequence_length
+                idx, input_prompt_length:(input_prompt_length + required_sequence_length)
             ]
 
             request.generated_length = required_sequence_length

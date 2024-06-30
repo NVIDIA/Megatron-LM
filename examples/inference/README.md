@@ -148,7 +148,7 @@ The following is what happens in the [simple_gpt_batch_inference.py](./gpt/simpl
 * The scheduler in the engine will add these prompts to the [active requests] pool (../../megatron/core/inference/inference_request.py) until we hit the max batch size, and then it will put the rest in the waiting requests pool. 
 * The engine will then run until all requests (waiting + active) are completed 
     * The active requests are passed into  **generate_all_output_tokens_static_batch()** of the text generation controller . 
-    * This function uses the [model_inference_wrappers](../../megatron/core/inference/inference_model_wrappers/abstract_model_inference_wrapper.py) **prep_model_for_inference()** , and then runs an auto regressive loop
+    * This function uses the [model_inference_wrappers](../../megatron/core/inference/model_inference_wrappers/abstract_model_inference_wrapper.py) **prep_model_for_inference()** , and then runs an auto regressive loop
     * In the auto regressive loop, the **get_batch_for_context_window()** method of the inference wrapper is called to get the required input, passes it into the **run_one_forward_step()** method, which calls the appropriate (PP, TP) model `.forward()` methods to get the output logits
     * The output logits are synchronized across all pipeline parallel ranks
     * The text generation controller obtains the log probabilities and samples tokens based on the strategy defined in the common inference parameters.
@@ -229,7 +229,7 @@ class SimpleTextGenerationController:
 <br>
 
 ##### 3.3. Support Other Models
-In order to support other models please extend the [abstract_model_inference_wrapper.py](./../../megatron/core/inference/inference_model_wrappers/abstract_model_inference_wrapper.py) file. The abstract wrapper already supports the following :
+In order to support other models please extend the [abstract_model_inference_wrapper.py](./../../megatron/core/inference/model_inference_wrappers/abstract_model_inference_wrapper.py) file. The abstract wrapper already supports the following :
 * Forward method which automatically calls the appropriate forward method (PP or TP etc) depending on model parallel settings
 * Initalizes the model and puts it in eval mode
 * Obtains the input parameters (batch size, max seq length) and has an instance of the input 
@@ -250,7 +250,7 @@ class AbstractModelInferenceWrapper:
         This function gets called iteratively in the inference loop . It can be used to extract relevant input from the prompt tokens, attention mask etc. required for each step in inference.
 ```
 
-Refer to [gpt_inference_wrapper.py](../../megatron/core/inference/inference_model_wrappers/gpt/gpt_inference_wrapper.py) for an example of extending this for GPTModel.
+Refer to [gpt_inference_wrapper.py](../../megatron/core/inference/model_inference_wrappers/gpt/gpt_inference_wrapper.py) for an example of extending this for GPTModel.
 
 <br>
 
