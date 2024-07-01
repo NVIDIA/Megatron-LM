@@ -109,6 +109,7 @@ def load(
         return_lists_as_dicts=True,
     )
     apply_factories(sharded_state_dict)
+
     # Data inside sh_ten_factories no longer needed so delete them to reduce memory usage
     def unlink_data(x):
         x.data = None
@@ -141,9 +142,10 @@ def load(
 
 
 def _verify_checkpoint_and_load_strategy(
-    checkpoint_dir: str, sharded_strategy: Union[LoadShardedStrategy, Tuple[str, int], None] = None,
+    checkpoint_dir: str,
+    sharded_strategy: Union[LoadShardedStrategy, Tuple[str, int], None] = None,
 ) -> LoadShardedStrategy:
-    """ Verifies if checkpoint metadata exists and matches given strategy.
+    """Verifies if checkpoint metadata exists and matches given strategy.
 
     Args:
         checkpoint_dir (str): checkpoint directory
@@ -173,7 +175,7 @@ def _verify_checkpoint_and_load_strategy(
 
 # TODO: implement it as common torch strategy
 def load_common_state_dict(checkpoint_dir: Path) -> StateDict:
-    """ Load common (non-sharded) objects state dict from the checkpoint.
+    """Load common (non-sharded) objects state dict from the checkpoint.
 
     Args:
         checkpoint_dir (Path): checkpoint directory
@@ -192,7 +194,7 @@ def load_common_state_dict(checkpoint_dir: Path) -> StateDict:
 
 
 def load_sharded_objects(sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
-    """ Replaces all ShardedObject from a given state dict with values loaded from the checkpoint.
+    """Replaces all ShardedObject from a given state dict with values loaded from the checkpoint.
 
     Args:
         sharded_state_dict (ShardedStateDict): sharded state dict defining what objects should be loaded.
@@ -404,7 +406,7 @@ def _extract_and_save_sharded_objects(
 
 
 def validate_sharding_integrity(sharded_tensors: Iterable[ShardedTensor]):
-    """ Validate if the ShardedTensors from multiple processes define correct sharding of a global tensor.
+    """Validate if the ShardedTensors from multiple processes define correct sharding of a global tensor.
 
     Local ShardedTensors metadata is exchanged with `torch.distributed.all_gather_object`
     and then process with global rank 0 checks if main replicas of the shards:
@@ -508,12 +510,12 @@ def _validate_sharding_for_key_flattened(tensors_by_shard):
             f'Flattened ranges dont cover the whole shard {tensors_by_shard[0]}. Ranges: {(starts, stops)}'
         )
         raise CheckpointingException(
-            f'Flattened ranges dont cover the whole shard {tensors_by_shard[0]}'
+            f'Flattened ranges dont cover the whole shard {tensors_by_shard[0]}. Ranges: {(starts, stops)}'
         )
 
 
 def _validate_objects_for_key(sharded_objects: List[ShardedObject]):
-    """ Ensure uniqueness of saved objects. """
+    """Ensure uniqueness of saved objects."""
     unique_keys = [
         sh_obj.unique_key for _, sh_obj in sharded_objects if is_main_replica(sh_obj.replica_id)
     ]
