@@ -18,10 +18,10 @@ class InferenceWrapperConfig:
 
     inference_batch_times_seqlen_threshold: int
     """if batch-size times sequence-length is smaller than this threshold then we will not use pipelining, otherwise we will."""
-    
+
     padded_vocab_size: int
-    """The final padded vocab size (Padded to make it divisible by --make-vocab-size-divisible-by value)"""    
-    
+    """The final padded vocab size (Padded to make it divisible by --make-vocab-size-divisible-by value)"""
+
     fp32_residual_connection: bool = False
     """Move residual connections to fp32. Obtained from arguments.py"""
 

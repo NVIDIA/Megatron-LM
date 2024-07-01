@@ -6,7 +6,8 @@ class CommonInferenceParams:
     """Inference parameters sent along with the prompts
 
     For an explanation of these parameters refer to this blog https://ivibudh.medium.com/a-guide-to-controlling-llm-model-output-exploring-top-k-top-p-and-temperature-parameters-ed6a31313910
-    """    
+    """
+
     temperature: float = 1.0
     top_k: int = 0
     top_p: float = 0.0
