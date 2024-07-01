@@ -1,13 +1,19 @@
 #!/bin/bash
+set -euox pipefail
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+CHECK_ONLY=${CHECK_ONLY:-false}
+CHANGED_FILES=$(git diff --name-only --merge-base origin/main | grep '^megatron/core' || true)
+ADDITIONAL_ARGS=""
 
-CHANGED_FILES=$(git diff --name-only origin/main | grep '^megatron/core' || true)
+if [[ $CHECK_ONLY == true ]]; then
+    ADDITIONAL_ARGS="--check "
+fi
 
 # for now we just format core
-
-
 if [[ -n "$CHANGED_FILES" ]]; then
-    black $CHANGED_FILES
-    isort $CHANGED_FILES
+    black $ADDITIONAL_ARGS --verbose --diff $CHANGED_FILES
+    isort $ADDITIONAL_ARGS $CHANGED_FILES
+else
+    echo Changeset is empty, all good.
 fi

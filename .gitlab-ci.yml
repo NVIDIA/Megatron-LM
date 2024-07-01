@@ -284,17 +284,8 @@ formatting:
   before_script:
     - git fetch origin main
   script:
-    - |
-      set -x
-      CHANGED_FILES=$(git diff --name-only origin/main | grep '^megatron/core' || true)
+    - CHECK_ONLY=true bash tools/autoformat.sh
 
-      if [ -n "$CHANGED_FILES" ]; then
-        black --check --verbose --diff $CHANGED_FILES
-      fi
-
-      if [ -n "$CHANGED_FILES" ]; then
-        isort --check $CHANGED_FILES    
-      fi
   rules:
     - when: always
   interruptible: true
