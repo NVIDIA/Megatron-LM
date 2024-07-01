@@ -1,5 +1,6 @@
 from argparse import Namespace
 from megatron.core import parallel_state
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import InferenceWrapperConfig
 import torch
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import GPTInferenceWrapper
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, get_gpt_layer_with_transformer_engine_spec
@@ -27,14 +28,15 @@ class TestGPTInferenceWrapper:
             max_sequence_length=self.sequence_length, 
             parallel_output = False).cuda()
 
-        args = Namespace()
-        args.hidden_size = hidden_size
-        args.fp32_residual_connection = False
-        args.params_dtype = torch.float
-        args.inference_batch_times_seqlen_threshold = 20
-        args.padded_vocab_size = self.vocab_size
+        inference_wrapper_config = InferenceWrapperConfig(
+            hidden_size=hidden_size,
+            inference_batch_times_seqlen_threshold=20,
+            fp32_residual_connection=False,
+            params_dtype=torch.float,
+            padded_vocab_size=self.vocab_size
+        )
 
-        self.inference_wrapped_model = GPTInferenceWrapper(gpt_model, args)
+        self.inference_wrapped_model = GPTInferenceWrapper(gpt_model, inference_wrapper_config)
      
     # This will call the inference_wrapped_model.forward_pass_with_pipeline_parallel_small_input_batch()    
     def test_inference_pipeline_parallel_small_size(self):

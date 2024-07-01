@@ -1,10 +1,10 @@
 
 from collections import OrderedDict
 from typing import Dict
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import InferenceWrapperConfig
 import torch
 import random
 import string 
-from argparse import Namespace
 from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import GPTInferenceWrapper
 from megatron.core.inference.inference_request import InferenceRequest, Status
@@ -37,14 +37,15 @@ class TestTextGenerationController:
             max_sequence_length=self.sequence_length, 
             parallel_output = False).cuda()
         
-        args = Namespace()
-        args.hidden_size = self.hidden_size
-        args.fp32_residual_connection = False
-        args.params_dtype = torch.float
-        args.inference_batch_times_seqlen_threshold = 400
-        args.padded_vocab_size = self.vocab_size
+        inference_wrapper_config = InferenceWrapperConfig(
+            hidden_size=self.hidden_size,
+            inference_batch_times_seqlen_threshold=20,
+            fp32_residual_connection=False,
+            params_dtype=torch.float,
+            padded_vocab_size=self.vocab_size
+        )
 
-        inference_wrapped_model = GPTInferenceWrapper(gpt_model, args)
+        inference_wrapped_model = GPTInferenceWrapper(gpt_model, inference_wrapper_config)
 
         self.mock_tokenizer = mock.Mock()
 
