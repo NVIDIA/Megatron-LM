@@ -68,12 +68,19 @@ def test_bucket_sizes(bucket_size: int, use_distributed_optimizer: bool, bias: b
         bucket.grad_data.numel() for bucket in param_and_grad_buffer.buckets
     ]
 
-    def _pad_if_needed(numel_unpadded):
-        # Want 128-byte alignment for distributed optimizer.
-        divisor = math.lcm(parallel_state.get_data_parallel_world_size(), 128)
+    def _pad_if_needed(numel_unpadded, divisor):
         if use_distributed_optimizer:
             return math.ceil(numel_unpadded / divisor) * divisor
         return numel_unpadded
+
+    def _pad_bucket_if_needed(numel_unpadded):
+        # Want 128-byte alignment for distributed optimizer.
+        divisor = math.lcm(parallel_state.get_data_parallel_world_size(), 128)
+        return _pad_if_needed(numel_unpadded, divisor)
+
+    def _pad_param_if_needed(numel_unpadded):
+        # Want 64-byte alignment for params.
+        return _pad_if_needed(numel_unpadded, 64)
 
     if bucket_size is None:
         # If bucket_size is infinite (None), number of buckets should be 1.
@@ -83,19 +90,26 @@ def test_bucket_sizes(bucket_size: int, use_distributed_optimizer: bool, bias: b
         numel_in_each_bucket = []
         numel_padded_in_each_bucket = []
         numel_in_last_bucket = 0
+        param_sizes = []
         for _ in range(num_layers):
-            numel_in_last_bucket += input_dim * output_dim
-            if bias:
-                numel_in_last_bucket += output_dim  # Include bias term.
+            param_sizes.append(input_dim * output_dim)
+            if bias:  # Include bias term.
+                param_sizes.append(output_dim)
+        # Iterate through params in backward direction.
+        for param_size in param_sizes[::-1]:
+            numel_in_last_bucket = _pad_param_if_needed(numel_in_last_bucket)
+            numel_in_last_bucket += param_size
             if numel_in_last_bucket >= bucket_size:
                 numel_in_each_bucket.append(numel_in_last_bucket)
-                numel_padded_in_each_bucket.append(_pad_if_needed(numel_in_last_bucket))
+                numel_padded_in_each_bucket.append(_pad_bucket_if_needed(numel_in_last_bucket))
                 numel_in_last_bucket = 0
         if numel_in_last_bucket > 0:
             numel_in_each_bucket.append(numel_in_last_bucket)
-            numel_padded_in_each_bucket.append(_pad_if_needed(numel_in_last_bucket))
+            numel_padded_in_each_bucket.append(_pad_bucket_if_needed(numel_in_last_bucket))
 
-        assert len(param_and_grad_buffer.buckets) == len(numel_in_each_bucket)
+        assert len(param_and_grad_buffer.buckets) == len(
+            numel_in_each_bucket
+        ), f"Buckets don't match (got {actual_numel_in_each_bucket} but should be {numel_in_each_bucket})"
         assert actual_numel_in_each_bucket == numel_in_each_bucket, (
             f"Number of parameters in each bucket should be {numel_in_each_bucket}, "
             f"but is {actual_numel_in_each_bucket}"

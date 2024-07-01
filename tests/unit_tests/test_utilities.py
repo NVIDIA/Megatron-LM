@@ -15,6 +15,7 @@ class Utils:
 
     world_size = torch.cuda.device_count()
     rank = int(os.environ['LOCAL_RANK'])
+    inited = False
 
     @staticmethod
     def initialize_distributed():
@@ -35,6 +36,7 @@ class Utils:
             )
 
             torch.distributed.barrier()
+        Utils.inited = True
 
     @staticmethod
     def set_world_size(world_size=None, rank=None):
@@ -54,8 +56,11 @@ class Utils:
 
     @staticmethod
     def destroy_model_parallel():
+        if not Utils.inited:
+            return
         ps.destroy_model_parallel()
         torch.distributed.barrier()
+        Utils.inited = False
 
     @staticmethod
     def initialize_model_parallel(
@@ -74,3 +79,4 @@ class Utils:
             pipeline_model_parallel_split_rank,
             **kwargs,
         )
+        Utils.inited = True
