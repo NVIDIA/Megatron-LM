@@ -111,7 +111,8 @@ class FileSystemWriterAsync(FileSystemWriter):
             self.write_results = ctx.Manager().dict()
         else:
             self.write_results = {}
-        logger.debug(f"D2H and push, time: {time() - start}")
+        end = time()
+        logger.debug(f"D2H and push, time: {end - start}")
 
     def get_save_function_and_args(self) -> Tuple[Optional[Callable], Tuple]:
         """
@@ -197,7 +198,11 @@ class FileSystemWriterAsync(FileSystemWriter):
             f"{local_proc_idx} consumed: {mem_after - mem_before}, before: {mem_before}, after: {mem_after}"
         )
 
-    def write_data(self, plan: SavePlan, planner: SavePlanner,) -> Future[List[WriteResult]]:
+    def write_data(
+        self,
+        plan: SavePlan,
+        planner: SavePlanner,
+    ) -> Future[List[WriteResult]]:
         raise NotImplementedError('write_data not implemented for FileSystemWriterAsync')
 
     def retrieve_write_results(self) -> List[WriteResult]:

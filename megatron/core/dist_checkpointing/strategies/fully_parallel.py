@@ -93,7 +93,11 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
 
         self.cached_distribution: Optional[SaveLoadDistribution] = None
 
-    def async_save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    def async_save(
+        self,
+        sharded_state_dict: ShardedStateDict,
+        checkpoint_dir: Path,
+    ):
         if not isinstance(self.base_strategy, AsyncSaveShardedStrategy):
             raise CheckpointingException(
                 f'Cannot apply async_save to non-async base strategy {self.base_strategy}'
@@ -101,7 +105,11 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
         self.apply_saving_parallelization(sharded_state_dict)
         return self.base_strategy.async_save(sharded_state_dict, checkpoint_dir)
 
-    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    def save(
+        self,
+        sharded_state_dict: ShardedStateDict,
+        checkpoint_dir: Path,
+    ):
         self.apply_saving_parallelization(sharded_state_dict)
         return self.base_strategy.save(sharded_state_dict, checkpoint_dir)
 
@@ -120,6 +128,7 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
 
         Returns: None
         """
+        start = time()
         if self.do_cache_distribution and self.cached_distribution is not None:
             logger.debug(f'Apply *cached* save parallelization')
             precomputed_distribution = self.cached_distribution
@@ -137,6 +146,8 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
             validate_sharding_integrity(nested_values(sharded_state_dict))
         if self.do_cache_distribution:
             self.cached_distribution = precomputed_distribution
+        end = time()
+        logger.debug(f"parallel save sharding, time: {end - start}")
 
     @property
     def can_handle_sharded_objects(self):
