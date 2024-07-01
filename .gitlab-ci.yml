@@ -6,9 +6,6 @@ workflow:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/
       variables:
         JET_CUSTOM_FILTER: "type == 'build' or 'mr' in spec.scope"
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Build only/
-      variables:
-        JET_CUSTOM_FILTER: "type == 'build'"
     # always run MR pipelines
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     # always run web pipelines
@@ -26,16 +23,11 @@ stages:
   - functional_tests
 
 variables:
-  SELENE_ADLR_CI_PATH: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron"
-  DATA_DIR: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron/data"
-  PYTHON_VIRTUAL_ENV: /lustre/fsw/adlr/adlr-nlp/adlr_ci/cienv/bin/activate
   JET_CUSTOM_FILTER:
     description: |
       Selects what functional tests to run. For mr tests: "type == 'build' or 'mr' in spec.scope". For nightly tests: "type == 'build' or 'nightly' in spec.scope"
     value: ""
-  DISPLAY_OUTPUT: "True" # Set to true for new tests to copy the logs for creating golden truth file
   TIME_LIMIT: "10:00" # Default time limit for all jobs
-  MOE_GROUPED_GEMM: 0 # Set to 1 to enable grouped gemm for MoE
   SLURM_CLUSTER:
     value: "dgxa100_dracooci"
     options:
@@ -108,11 +100,20 @@ build_image:
       fi
   interruptible: true
 
-unit_tests:
+.unit_test_common:
   image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
+  stage: unit_tests
+  needs: [build_image]
   tags:
     - 8xL40S
-  stage: unit_tests
+  variables:
+    MOE_GROUPED_GEMM: 0 # Set to 1 to enable grouped gemm for MoE
+  interruptible: true
+  retry:
+    max: 2
+
+unit_tests:
+  extends: [.unit_test_common]
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail tests/unit_tests
   coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
@@ -123,15 +124,9 @@ unit_tests:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-  interruptible: true
-  retry:
-    max: 2
 
 unit_tests-data:
-  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
-  tags:
-    - 8xL40S
-  stage: unit_tests
+  extends: [.unit_test_common]
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/data
   rules:
@@ -140,15 +135,9 @@ unit_tests-data:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-  interruptible: true
-  retry:
-    max: 2
 
 unit_tests-dist-checkpointing:
-  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
-  tags:
-    - 8xL40S
-  stage: unit_tests
+  extends: [.unit_test_common]
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/dist_checkpointing
   rules:
@@ -157,15 +146,15 @@ unit_tests-dist-checkpointing:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-  interruptible: true
-  retry:
-    max: 2
 
 unit_tests-fusions:
   image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
   stage: unit_tests
+
+unit_tests-fusions:
+  extends: [.unit_test_common]
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/fusions
   rules:
@@ -174,15 +163,9 @@ unit_tests-fusions:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-  interruptible: true
-  retry:
-    max: 2
-
+    
 unit_tests-inference:
-  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
-  tags:
-    - 8xL40S
-  stage: unit_tests
+  extends: [.unit_test_common]
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/inference
   rules:
@@ -191,15 +174,9 @@ unit_tests-inference:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-  interruptible: true
-  retry:
-    max: 2
 
 unit_tests-models:
-  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
-  tags:
-    - 8xL40S
-  stage: unit_tests
+  extends: [.unit_test_common]
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/models
   rules:
@@ -208,15 +185,9 @@ unit_tests-models:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-  interruptible: true
-  retry:
-    max: 2
 
 unit_tests-pipeline-parallel:
-  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
-  tags:
-    - 8xL40S
-  stage: unit_tests
+  extends: [.unit_test_common]
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/pipeline_parallel
   rules:
@@ -225,15 +196,9 @@ unit_tests-pipeline-parallel:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-  interruptible: true
-  retry:
-    max: 2
 
 unit_tests-tensor-parallel:
-  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
-  tags:
-    - 8xL40S
-  stage: unit_tests
+  extends: [.unit_test_common]
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/tensor_parallel
   rules:
@@ -242,15 +207,9 @@ unit_tests-tensor-parallel:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-  interruptible: true
-  retry:
-    max: 2
 
 unit_tests-transformer:
-  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
-  tags:
-    - 8xL40S
-  stage: unit_tests
+  extends: [.unit_test_common]
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/transformer
   rules:
@@ -259,15 +218,9 @@ unit_tests-transformer:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-  interruptible: true
-  retry:
-    max: 2
 
 unit_tests-top-py:
-  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
-  tags:
-    - 8xL40S
-  stage: unit_tests
+  extends: [.unit_test_common]
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/*.py
   rules:
@@ -276,9 +229,6 @@ unit_tests-top-py:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-  interruptible: true
-  retry:
-    max: 2
 
 docs_build_test:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/python-format:0.0.1
