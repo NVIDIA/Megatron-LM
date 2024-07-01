@@ -1,5 +1,5 @@
-from argparse import Namespace
 from typing import List
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import InferenceWrapperConfig
 import torch
 import random 
 import string
@@ -32,15 +32,16 @@ class TestMCoreEngine:
             vocab_size=self.vocab_size, 
             max_sequence_length=self.sequence_length, 
             parallel_output = False).cuda()
-        
-        args = Namespace()
-        args.hidden_size = self.hidden_size
-        args.fp32_residual_connection = False
-        args.params_dtype = torch.float
-        args.inference_batch_times_seqlen_threshold = 400
-        args.padded_vocab_size = self.vocab_size
 
-        inference_wrapped_model = GPTInferenceWrapper(gpt_model, args)
+        inference_wrapper_config = InferenceWrapperConfig(
+            hidden_size=self.hidden_size,
+            inference_batch_times_seqlen_threshold=400,
+            fp32_residual_connection=False,
+            params_dtype=torch.float,
+            padded_vocab_size=self.vocab_size
+        )
+
+        inference_wrapped_model = GPTInferenceWrapper(gpt_model, inference_wrapper_config)
         self.mock_tokenizer = mock.Mock()
         text_generation_controller = SimpleTextGenerationController(inference_wrapped_model=inference_wrapped_model, tokenizer=self.mock_tokenizer)       
 

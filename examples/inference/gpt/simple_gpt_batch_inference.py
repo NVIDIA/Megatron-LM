@@ -1,4 +1,6 @@
 import os
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import InferenceWrapperConfig
+from pretrain_gpt import model_provider
 import torch
 import sys
 from argparse import Namespace
@@ -14,71 +16,11 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
 
 from megatron.training import get_args
 from megatron.training import get_tokenizer
-from megatron.training import print_rank_0
 from megatron.training.checkpointing import load_checkpoint
 from megatron.core import mpu
 from megatron.training.initialize import initialize_megatron
-from megatron.legacy.model.gpt_model import GPTModel as LegacyGPTModel
 from megatron.training import get_model
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core.models.gpt import GPTModel
-from typing import List, Union
-from megatron.core.transformer.spec_utils import import_module
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, get_gpt_layer_with_transformer_engine_spec
-
-def model_provider(pre_process=True, post_process=True) -> Union[LegacyGPTModel, GPTModel]:
-    """Builds the model.
-
-    If you set the use_legacy_models to True, it will  use the legacy GPT model and if not by default it will use the mcore GPT model. 
-
-    Args:
-        pre_process (bool, optional): Set to true if you need to compute embeddings. Defaults to True.
-        post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
-
-
-    Returns:
-        Union[GPTModel, LegacyGPTModel]: The returned model
-    """
-    args = get_args()
-    use_te = args.transformer_impl == "transformer_engine"
-    print_rank_0('building GPT model ...')
-    config = core_transformer_config_from_args(args)
-
-    if args.use_legacy_models:
-        assert(args.context_parallel_size == 1), "Context parallelism is only supported with Megatron Core!"
-
-        model = LegacyGPTModel(
-            config,
-            num_tokentypes=0,
-            parallel_output=False, 
-            pre_process=pre_process,
-            post_process=post_process
-        )
-    else:
-        if args.spec is not None:
-            transformer_layer_spec = import_module(args.spec)
-        else:
-            if use_te:
-                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm)
-            else:
-                transformer_layer_spec = get_gpt_layer_local_spec(args.num_experts, args.moe_grouped_gemm)
-
-        model = GPTModel(
-            config=config,
-            transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.padded_vocab_size,
-            max_sequence_length=args.max_position_embeddings,
-            pre_process=pre_process,
-            post_process=post_process,
-            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
-            parallel_output=False,
-            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-            position_embedding_type=args.position_embedding_type,
-            rotary_percent=args.rotary_percent
-        )
-
-    return model
+from typing import List
 
 def add_text_generate_args(parser):
     """Text generation arguments."""
@@ -115,7 +57,15 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
     """
     tokenizer = get_tokenizer()
 
-    inference_wrapped_model = GPTInferenceWrapper(model, args)
+    inference_wrapper_config = InferenceWrapperConfig(
+        hidden_size=args.hidden_size,
+        inference_batch_times_seqlen_threshold=args.inference_batch_times_seqlen_threshold,
+        fp32_residual_connection=args.fp32_residual_connection,
+        params_dtype=args.params_dtype,
+        padded_vocab_size=args.padded_vocab_size
+    )
+
+    inference_wrapped_model = GPTInferenceWrapper(model, inference_wrapper_config)
     text_generation_controller = SimpleTextGenerationController(inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer)
     return MCoreEngine(text_generation_controller=text_generation_controller, max_batch_size=args.max_batch_size)
             

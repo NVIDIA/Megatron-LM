@@ -5,18 +5,21 @@ from typing import Iterable, List, Union
 
 import torch
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.communication_utils import (
     recv_from_prev_pipeline_rank_,
     send_to_next_pipeline_rank,
+)
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
 )
 from megatron.core.inference_params import InferenceParams
 from megatron.core.models.gpt.gpt_model import GPTModel
 
 
 class AbstractModelInferenceWrapper(abc.ABC):
-    def __init__(self, model: Union['LegacyGPTModel', GPTModel], args: Namespace):
+    def __init__(self, model: Union['LegacyGPTModel', GPTModel], inference_wrapper_config: InferenceWrapperConfig):
         """Constructor for the model inference wrapper
 
         The wrapper prepares the model for inference, provides the required input data and runs the forward pass.
@@ -29,7 +32,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             model, Iterable
         ), 'interleaving schedule is not supported for inference'
         self.model = model
-        self.args = args
+        self.inference_wrapper_config = inference_wrapper_config
 
     def prep_model_for_inference(self, prompts_tokens: torch.Tensor):
         """A utility function for preparing model for inference
@@ -74,13 +77,15 @@ class AbstractModelInferenceWrapper(abc.ABC):
         logits = self.model(
             tokens, position_ids, attention_mask, inference_params=self.inference_params
         )
+        logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits)
         self.inference_params.sequence_len_offset += tokens.size(1)
+  
         return logits
 
     def _allocate_recv_buffer(self, batch_size, seq_len):
         """Receive happens between the layers with size [seq_len, batch_size, hidden_size]."""
-        recv_size = (seq_len, batch_size, self.args.hidden_size)
-        dtype = torch.float if self.args.fp32_residual_connection else self.args.params_dtype
+        recv_size = (seq_len, batch_size, self.inference_wrapper_config.hidden_size)
+        dtype = torch.float if self.inference_wrapper_config.fp32_residual_connection else self.inference_wrapper_config.params_dtype
         return torch.empty(recv_size, dtype=dtype, device=torch.cuda.current_device())
 
     def forward_pass_with_pipeline_parallel_small_input_batch(
@@ -117,6 +122,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         logits = None
         if parallel_state.is_pipeline_last_stage():
             logits = output_tensor
+            logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits)
 
         return logits
 
@@ -135,7 +141,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         """
         tokens, position_ids, attention_mask = inference_input
         micro_batch_size = max(
-            1, self.args.inference_batch_times_seqlen_threshold // tokens.size(1)
+            1, self.inference_wrapper_config.inference_batch_times_seqlen_threshold // tokens.size(1)
         )
         batch_size, seq_len = tokens.shape
         # Round up to account for the last partial micro batch if present
@@ -145,7 +151,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         # Preallocate memory for output logits.
         if parallel_state.is_pipeline_last_stage():
             logits = torch.empty(
-                (batch_size, seq_len, self.args.padded_vocab_size),
+                (batch_size, seq_len, self.inference_wrapper_config.padded_vocab_size),
                 dtype=torch.float32,
                 device=torch.cuda.current_device(),
             )
@@ -178,6 +184,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             self.inference_params.batch_size_offset += current_micro_batch_size
 
             if parallel_state.is_pipeline_last_stage():
+                output_tensor = tensor_parallel.gather_from_tensor_model_parallel_region(output_tensor)
                 logits[start:end, ...] = output_tensor
 
         # Once done with all micro batches, we reset batch size offset and seq len offset
@@ -202,7 +209,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             tokens = inference_input[0]
             current_batch_size, seq_len = tokens.shape
             # If input batch is large, we need to split into micro batches and run the forward pass
-            if current_batch_size * seq_len > self.args.inference_batch_times_seqlen_threshold:
+            if current_batch_size * seq_len > self.inference_wrapper_config.inference_batch_times_seqlen_threshold:
                 return self.forward_pass_with_pipeline_parallel_large_input_batch(inference_input)
             else:
                 # If input batch is very small we can do a simple forward pass on the entire global batch
