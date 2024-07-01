@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class AsyncRequest(NamedTuple):
-    """ Represents an async request that needs to be scheduled for execution.
+    """Represents an async request that needs to be scheduled for execution.
 
     Args:
         async_fn (Callable, optional): async function to call. None represents noop.
@@ -32,7 +32,7 @@ class AsyncRequest(NamedTuple):
     is_frozen: bool = False
 
     def add_finalize_fn(self, fn: Callable) -> None:
-        """ Adds a new finalize function to the request.
+        """Adds a new finalize function to the request.
 
         Args:
             fn (Callable): function to add to the async request. This function
@@ -46,7 +46,7 @@ class AsyncRequest(NamedTuple):
         self.finalize_fns.append(fn)
 
     def execute_sync(self) -> None:
-        """ Helper to synchronously execute the request.
+        """Helper to synchronously execute the request.
 
         This logic is equivalent to what should happen in case of the async call.
         """
@@ -57,7 +57,7 @@ class AsyncRequest(NamedTuple):
             finalize_fn()
 
     def freeze(self) -> 'AsyncRequest':
-        """ Freezes the async request, disallowing adding new finalization functions.
+        """Freezes the async request, disallowing adding new finalization functions.
 
         Returns:
             AsyncRequest: new async request with all same fields except for the
@@ -67,7 +67,7 @@ class AsyncRequest(NamedTuple):
 
 
 class DistributedAsyncCaller:
-    """ Wrapper around mp.Process that ensures correct semantic of distributed finalization.
+    """Wrapper around mp.Process that ensures correct semantic of distributed finalization.
 
     Starts process asynchronously and allows checking if all processes on all ranks are done.
     """
@@ -76,9 +76,13 @@ class DistributedAsyncCaller:
         self.process: Optional[mp.Process] = None
         self.start_time: Optional[float] = None
 
-    def schedule_async_call(self, async_fn: Optional[Callable], save_args: Tuple,) -> None:
-        """ Spawn a process with `async_fn` as the target.
-        
+    def schedule_async_call(
+        self,
+        async_fn: Optional[Callable],
+        save_args: Tuple,
+    ) -> None:
+        """Spawn a process with `async_fn` as the target.
+
         This method must be called on all ranks.
 
         Args:
@@ -88,14 +92,27 @@ class DistributedAsyncCaller:
         """
         if async_fn is None:
             return  # nothing to do
+        start_sync = time()
         torch.cuda.synchronize()
+        end_sync = time()
+        logger.debug(
+            f"rank: {torch.distributed.get_rank()}, takes {end_sync - start_sync} to finish D2H "
+        )
+
         ctx = mp.get_context('fork')
         self.start_time = time()
-        self.process = ctx.Process(target=async_fn, args=save_args,)
+        self.process = ctx.Process(
+            target=async_fn,
+            args=save_args,
+        )
         self.process.start()
+        init_time = time()
+        logger.debug(
+            f"rank: {torch.distributed.get_rank()}, takes {init_time - self.start_time} to schedule async ckpt "
+        )
 
     def is_current_async_call_done(self, blocking=False) -> bool:
-        """ Check if async save is finished on all ranks.
+        """Check if async save is finished on all ranks.
 
         For semantic correctness, requires rank synchronization in each check.
         This method must be called on all ranks.
@@ -132,7 +149,7 @@ class DistributedAsyncCaller:
 
 
 class _ActiveAsyncRequest(NamedTuple):
-    """ Helper to represent an active async call.
+    """Helper to represent an active async call.
 
     Args:
         idx (int): index of the call (starting from 0)
@@ -147,7 +164,7 @@ class _ActiveAsyncRequest(NamedTuple):
 
 
 class AsyncCallsQueue:
-    """ Manages a queue of async calls.
+    """Manages a queue of async calls.
 
     Allows adding a new async call with `schedule_async_request` and finalizing
     active calls with `maybe_finalize_async_calls`.
@@ -158,8 +175,8 @@ class AsyncCallsQueue:
         self.call_idx: int = -1
 
     def schedule_async_request(self, async_request: AsyncRequest) -> int:
-        """ Start a new async call and add it to a queue of active async calls.
-        
+        """Start a new async call and add it to a queue of active async calls.
+
         This method must be called on all ranks.
 
         Args:
@@ -177,7 +194,7 @@ class AsyncCallsQueue:
         return self.call_idx
 
     def maybe_finalize_async_calls(self, blocking=False) -> List[int]:
-        """ Finalizes all available calls.
+        """Finalizes all available calls.
 
         This method must be called on all ranks.
 
@@ -206,9 +223,9 @@ class AsyncCallsQueue:
         return call_idx_finalized
 
     def get_num_unfinalized_calls(self):
-        """ Get the number of active async calls. """
+        """Get the number of active async calls."""
         return len(self.async_calls)
 
     def close(self):
-        """ Finalize all calls upon closing. """
+        """Finalize all calls upon closing."""
         self.maybe_finalize_async_calls(blocking=True)

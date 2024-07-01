@@ -2,10 +2,12 @@
 
 """Input/output checkpointing."""
 
+from logging import getLogger
 import os
 import random
 import sys
 import numpy as np
+from time import time
 
 import torch
 
@@ -35,6 +37,7 @@ except Exception:
 
 _CHECKPOINT_VERSION = None
 
+logger = getLogger(__name__)
 
 def set_checkpoint_version(value):
     global _CHECKPOINT_VERSION
@@ -288,6 +291,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
     Checkpointing context is used to persist some checkpointing state
     throughout a single job. Must be initialized externally (not used if None).
     """
+    start_ckpt = time()
     args = get_args()
 
     # Only rank zero of the data parallel writes to the disk.
@@ -338,6 +342,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
             validate_sharding_integrity = True
             save_strategy = (checkpointing_context or {}).get('save_strategy',
                                                               get_default_save_sharded_strategy(args.dist_ckpt_format))
+            if args.ckpt_assume_constant_structure and args.dist_ckpt_format == 'torch_dist':
+                save_strategy.use_cached_ckpt_structure = args.ckpt_assume_constant_structure
             if args.ckpt_fully_parallel_save:
                 if checkpointing_context is not None and 'save_strategy' in checkpointing_context:
                     # Already saved once before - don't need to rerun sharding validation
@@ -348,6 +354,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
             # Store save strategy for future checkpoint saves
             if checkpointing_context is not None:
                 checkpointing_context['save_strategy'] = save_strategy
+            end_ckpt = time()
+            logger.debug(f"rank: {torch.distributed.get_rank()}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt ")
             async_save_request = dist_checkpointing.save(state_dict, checkpoint_name, save_strategy,
                                                          async_sharded_save=args.async_save)
 
@@ -362,7 +370,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
             # Save.
             ensure_directory_exists(checkpoint_name)
             torch.save(state_dict, checkpoint_name)
-
+    start_misc = time()
     if not args.async_save:
         assert async_save_request is None
         # Wait so everyone is done (necessary)
@@ -398,6 +406,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
+    end_misc = time()
+    logger.debug(f"rank: {torch.distributed.get_rank()}, takes {end_misc - start_misc} to finalize ckpt save ")
 
 def generate_state_dict(args, model, optimizer, opt_param_scheduler,
                         rng_state, use_dist_ckpt=False, iteration=None,
