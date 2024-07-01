@@ -314,7 +314,7 @@ class ShardedTensor(ShardedBase):
 
 
 def is_main_replica(replica_id: ReplicaId):
-    """ Checks if given `replica_id` is considered as main.
+    """Checks if given `replica_id` is considered as main.
 
     "Main" replica is:
     - integer 0
@@ -333,10 +333,10 @@ def is_main_replica(replica_id: ReplicaId):
     return all(r == 0 for r in replica_id)
 
 
-class LocalNonpersitentObject:
+class LocalNonpersistentObject:
     """Object that should not be stored in a checkpoint, but restored locally.
 
-    Wrapping any object inside the state dict with LocalNonpersitentObject
+    Wrapping any object inside the state dict with LocalNonpersistentObject
     will result in:
     - during saving, this object will *not* be stored in the checkpoint
     - during loading, a local version of this object will be placed in a state dict
@@ -347,6 +347,10 @@ class LocalNonpersitentObject:
 
     def unwrap(self):
         return self.obj
+
+
+# TODO: Delete once NeMo fixes typo.
+LocalNonpersitentObject = LocalNonpersistentObject
 
 
 @dataclass
@@ -396,7 +400,7 @@ class ShardedObject(ShardedBase):
 
 @dataclass
 class ShardedTensorFactory(ShardedBase):
-    """ Allows to apply transformations to tensors before/after serialization.
+    """Allows to apply transformations to tensors before/after serialization.
 
     The essence of those transformations is that they can be applied to
     optimizer states the same way they are applied to the model params.
@@ -432,7 +436,7 @@ class ShardedTensorFactory(ShardedBase):
 
 
 def apply_factories(sharded_state_dict: ShardedStateDict):
-    """ Turn ShardedTensorFactories into ShardedTensors *in-place*.
+    """Turn ShardedTensorFactories into ShardedTensors *in-place*.
 
     Args:
         sharded_state_dict (ShardedStateDict): state dict possibly containing ShardedTensorFactory objects
@@ -452,7 +456,7 @@ def apply_factories(sharded_state_dict: ShardedStateDict):
 def apply_factory_merges(
     x1: StateDict, x2: ShardedStateDict, key: Tuple[str, ...] = ()
 ) -> StateDict:
-    """ Apply merges defined by ShardedTensorFactories *in-place*.
+    """Apply merges defined by ShardedTensorFactories *in-place*.
 
     Args:
         x1 (StateDict): state dict loaded from the checkpoint

@@ -19,7 +19,7 @@ from .. import parallel_state, tensor_parallel
 from ..dist_checkpointing import ShardedTensor
 from ..dist_checkpointing.dict_utils import nested_values
 from ..dist_checkpointing.mapping import (
-    LocalNonpersitentObject,
+    LocalNonpersistentObject,
     ShardedObject,
     ShardedStateDict,
     ShardedTensorFactory,
@@ -758,7 +758,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 world_tensors = {}
                 if data_parallel_rank == 0:
                     world_tensors = {
-                        key: torch.empty(
+                        key: torch.zeros(
                             (buffer_numel_unpadded,), dtype=torch.float32, device="cpu"
                         )
                         for key in ("param", "exp_avg", "exp_avg_sq")
@@ -778,7 +778,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     assert gbuf_world_numel_unpadded <= gbuf_world_numel
 
                     local_shards = {
-                        key: torch.empty((gbuf_local_numel,), dtype=torch.float32, device="cpu")
+                        key: torch.zeros((gbuf_local_numel,), dtype=torch.float32, device="cpu")
                         for key in ("param", "exp_avg", "exp_avg_sq")
                     }
 
@@ -809,7 +809,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # Gather tensor list.
                         if data_parallel_rank == 0:
                             recv_tensors = [
-                                torch.empty((gbuf_local_numel,), dtype=torch.float32, device="cpu")
+                                torch.zeros((gbuf_local_numel,), dtype=torch.float32, device="cpu")
                                 for _ in range(data_parallel_world_size)
                             ]
                         else:
@@ -931,7 +931,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             )
         else:
             # DP ranks > 0 don't save. During loading, the param_state needs to be None.
-            param_state = LocalNonpersitentObject(None)
+            param_state = LocalNonpersistentObject(None)
 
         return param_state
 
@@ -970,10 +970,35 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     # The global ckpt tensors must be fully covered.
                     # We add extra empty padding if necessary
                     assert bucket_state, 'empty bucket encountered'
+
+                    # Insert padding between parameter tensors to ensure full coverage as needed.
+                    all_pad_tensors = {}
+                    for i in range(len(bucket_state) - 1):
+                        next_param_start = bucket_state[i + 1]['gbuf_local_start']
+                        cur_param_end = bucket_state[i]['gbuf_local_end']
+                        if next_param_start != cur_param_end:
+                            pad_tensors = {
+                                k: torch.empty(
+                                    next_param_start - cur_param_end,
+                                    dtype=v.dtype,
+                                    device=v.device,
+                                )
+                                for k, v in bucket_state[i].items()
+                                if isinstance(v, torch.Tensor)
+                            }
+                            all_pad_tensors[i + 1] = {
+                                **pad_tensors,
+                                'gbuf_local_start': cur_param_end,
+                                'gbuf_local_end': next_param_start,
+                                'padding': True,
+                            }
+
+                    # Insert from end so that insertion positions are still correct.
+                    indices_to_insert = sorted(list(all_pad_tensors.keys()))
+                    for index_to_insert in reversed(indices_to_insert):
+                        bucket_state.insert(index_to_insert, all_pad_tensors[index_to_insert])
+
                     if bucket_state[-1]['gbuf_local_end'] != gbuf_local_numel:
-                        assert (
-                            data_parallel_rank == data_parallel_world_size - 1
-                        ), 'encountered padding on non-last DP rank'
                         pad_tensors = {
                             k: torch.empty(
                                 gbuf_local_numel - bucket_state[-1]['gbuf_local_end'],
@@ -988,6 +1013,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 **pad_tensors,
                                 'gbuf_local_start': bucket_state[-1]['gbuf_local_end'],
                                 'gbuf_local_end': gbuf_local_numel,
+                                'padding': True,
                             }
                         )
 
@@ -997,8 +1023,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensors = bucket_state[bucket_params_idx]
                         gbuf_local_start = tensors.pop('gbuf_local_start')
                         gbuf_local_end = tensors.pop('gbuf_local_end')
+                        if 'padding' not in tensors:
+                            tensors['padding'] = False
 
                         for key in tensors:
+                            if key == 'padding':
+                                tensors[key] = LocalNonpersistentObject(tensors[key])
+                                continue
                             assert tensors[key].shape == (gbuf_local_end - gbuf_local_start,), (
                                 tensors[key].shape,
                                 gbuf_local_start,
@@ -1106,12 +1137,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
                 for bucket_idx, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
                     bucket_state = state_dict[gbuf_idx][dtype][bucket_idx]
+                    bucket_state = [
+                        bucket_state_elem
+                        for bucket_state_elem in bucket_state
+                        if not bucket_state_elem['padding']
+                    ]
 
-                    # State dict bucket state can be 1 entry longer in case of padding
-                    assert len(bucket_state) in (
+                    assert len(bucket_state) == len(gbuf_range_map["param_map"]), (
+                        len(bucket_state),
                         len(gbuf_range_map["param_map"]),
-                        len(gbuf_range_map["param_map"]) + 1,
-                    ), (len(bucket_state), len(gbuf_range_map["param_map"]))
+                    )
                     for src_tensors, (model_param, param_range_map) in zip(
                         bucket_state, gbuf_range_map["param_map"].items()
                     ):
@@ -1197,7 +1232,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         assert gbuf_world_numel_unpadded <= gbuf_world_numel
 
                         # Contiguous local shards (received from DP rank 0).
-                        recv_tensor = torch.empty(
+                        recv_tensor = torch.zeros(
                             (gbuf_local_numel,), dtype=torch.float32, device="cpu"
                         )
 

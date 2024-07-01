@@ -22,8 +22,8 @@ workflow:
 
 stages:
   - build
-  - test
-  - jet
+  - unit_tests
+  - functional_tests
 
 variables:
   SELENE_ADLR_CI_PATH: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron"
@@ -112,7 +112,7 @@ unit_tests:
   image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
-  stage: test
+  stage: unit_tests
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail tests/unit_tests
   coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
@@ -124,12 +124,14 @@ unit_tests:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
   interruptible: true
+  retry:
+    max: 2
 
 unit_tests-data:
   image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
-  stage: test
+  stage: unit_tests
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/data
   rules:
@@ -139,12 +141,14 @@ unit_tests-data:
       when: never
     - when: always
   interruptible: true
+  retry:
+    max: 2
 
 unit_tests-dist-checkpointing:
   image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
-  stage: test
+  stage: unit_tests
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/dist_checkpointing
   rules:
@@ -154,12 +158,14 @@ unit_tests-dist-checkpointing:
       when: never
     - when: always
   interruptible: true
+  retry:
+    max: 2
 
 unit_tests-fusions:
   image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
-  stage: test
+  stage: unit_tests
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/fusions
   rules:
@@ -169,12 +175,14 @@ unit_tests-fusions:
       when: never
     - when: always
   interruptible: true
+  retry:
+    max: 2
 
 unit_tests-inference:
   image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
-  stage: test
+  stage: unit_tests
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/inference
   rules:
@@ -184,12 +192,14 @@ unit_tests-inference:
       when: never
     - when: always
   interruptible: true
+  retry:
+    max: 2
 
 unit_tests-models:
   image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
-  stage: test
+  stage: unit_tests
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/models
   rules:
@@ -199,12 +209,14 @@ unit_tests-models:
       when: never
     - when: always
   interruptible: true
+  retry:
+    max: 2
 
 unit_tests-pipeline-parallel:
   image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
-  stage: test
+  stage: unit_tests
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/pipeline_parallel
   rules:
@@ -214,12 +226,14 @@ unit_tests-pipeline-parallel:
       when: never
     - when: always
   interruptible: true
+  retry:
+    max: 2
 
 unit_tests-tensor-parallel:
   image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
-  stage: test
+  stage: unit_tests
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/tensor_parallel
   rules:
@@ -229,12 +243,14 @@ unit_tests-tensor-parallel:
       when: never
     - when: always
   interruptible: true
+  retry:
+    max: 2
 
 unit_tests-transformer:
   image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
-  stage: test
+  stage: unit_tests
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/transformer
   rules:
@@ -244,12 +260,14 @@ unit_tests-transformer:
       when: never
     - when: always
   interruptible: true
+  retry:
+    max: 2
 
 unit_tests-top-py:
   image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - 8xL40S
-  stage: test
+  stage: unit_tests
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/*.py
   rules:
@@ -259,10 +277,12 @@ unit_tests-top-py:
       when: never
     - when: always
   interruptible: true
+  retry:
+    max: 2
 
 docs_build_test:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/python-format:0.0.1
-  stage: test
+  stage: unit_tests
   tags:
     - os/linux
   script:
@@ -280,21 +300,12 @@ formatting:
   image: ${LINTING_IMAGE}:${CI_PIPELINE_ID} 
   tags:
     - os/linux
-  stage: test
+  stage: unit_tests
   before_script:
     - git fetch origin main
   script:
-    - |
-      set -x
-      CHANGED_FILES=$(git diff --name-only origin/main | grep '^megatron/core' || true)
+    - CHECK_ONLY=true bash tools/autoformat.sh
 
-      if [ -n "$CHANGED_FILES" ]; then
-        black --check --verbose --diff $CHANGED_FILES
-      fi
-
-      if [ -n "$CHANGED_FILES" ]; then
-        isort --check $CHANGED_FILES    
-      fi
   rules:
     - when: always
   interruptible: true

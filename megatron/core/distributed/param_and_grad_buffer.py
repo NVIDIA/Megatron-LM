@@ -244,17 +244,27 @@ class ParamAndGradBuffer:
         def _pad(number_to_be_padded: int, divisor: int) -> int:
             return int(math.ceil(number_to_be_padded / divisor) * divisor)
 
-        def _pad_if_needed(data_index: int) -> int:
+        def _pad_end_of_bucket_if_needed(bucket_end_index: int) -> int:
             """
-            Pads data indices if using distributed optimizer (to ensure uniform sharding).
+            Pads end index of bucket if using distributed optimizer (to ensure uniform sharding).
             """
             if self.ddp_config.use_distributed_optimizer:
                 # Workaround for TE bug causing cuBLAS to pick an incompatible algorithm.
                 # This also helps cuBLAS pick more efficient algorithms for GEMMs.
                 # We now ensure that all buckets start at a memory address that is 256-byte
                 # aligned (128 values since params and grads use >= 16-bit precision).
-                return _pad(data_index, math.lcm(self.data_parallel_world_size, 128))
-            return data_index
+                return _pad(bucket_end_index, math.lcm(self.data_parallel_world_size, 128))
+            return bucket_end_index
+
+        def _pad_start_of_param_if_needed(param_start_index: int) -> int:
+            """
+            Pads start index of param if using distributed optimizer (to ensure "good" alignment).
+            """
+            if self.ddp_config.use_distributed_optimizer:
+                # Ensure that params start at 128-byte aligned addresses (64 values
+                # since params are >= 16-bit precision).
+                return _pad(param_start_index, 64)
+            return param_start_index
 
         # First, figure out how many elements should be in the underlying buffer storage.
         # Note that if we need to split the buffer into smaller buckets, each of these
@@ -273,7 +283,7 @@ class ParamAndGradBuffer:
             """
             nonlocal bucket_data_start_index, bucket_params, bucket_id
             per_bucket_numel_unpadded.append(data_end_index - bucket_data_start_index)
-            data_end_index = _pad_if_needed(data_end_index)
+            data_end_index = _pad_end_of_bucket_if_needed(data_end_index)
             # Update bucket metadata.
             self.bucket_indices.append((bucket_data_start_index, data_end_index))
             bucket_data_start_index = data_end_index
@@ -289,6 +299,7 @@ class ParamAndGradBuffer:
             if not param.requires_grad:
                 continue
             this_numel = param.data.nelement()
+            data_start_index = _pad_start_of_param_if_needed(data_start_index)
             data_end_index = data_start_index + this_numel
 
             def _does_param_require_new_bucket(param):
@@ -383,7 +394,7 @@ class ParamAndGradBuffer:
                 param.data.shape, data_start_index, buffer_type=BufferType.GRAD
             )
             if bucket_id != cur_bucket_id:
-                bucket_data_end_index = _pad_if_needed(data_start_index)
+                bucket_data_end_index = _pad_end_of_bucket_if_needed(data_start_index)
                 self._set_bucket(
                     bucket_params=bucket_params,
                     start_index=bucket_data_start_index,
@@ -400,7 +411,7 @@ class ParamAndGradBuffer:
 
         # Add remaining params to a new bucket.
         if len(bucket_params) > 0:
-            bucket_data_end_index = _pad_if_needed(data_end_index)
+            bucket_data_end_index = _pad_end_of_bucket_if_needed(data_end_index)
             self._set_bucket(
                 bucket_params=bucket_params,
                 start_index=bucket_data_start_index,

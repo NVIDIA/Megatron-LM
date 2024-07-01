@@ -103,6 +103,15 @@ class SwigluFactoryModel(torch.nn.Module):
 
 
 class TestOptimizer:
+    def setup_class(cls):
+        Utils.initialize_distributed()
+
+    @pytest.fixture(scope='function', autouse=True)
+    def cleanup_model_parallel(self):
+        # pass for initialize
+        yield
+        Utils.destroy_model_parallel()
+
     def test_optimizer_params(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(1,1)
         model = Model()
@@ -218,6 +227,15 @@ def setup_model_and_optimizer(seed, initialize_fn=initialize_gpt_model, bf16=Tru
 
 
 class TestDistributedOptimizer:
+    def setup_class(cls):
+        Utils.initialize_distributed()
+
+    @pytest.fixture(scope='function', autouse=True)
+    def cleanup_model_parallel(self):
+        # pass for initialize
+        yield
+        Utils.destroy_model_parallel()
+
     @pytest.mark.parametrize("initialize_fn", [initialize_small_model, initialize_gpt_model])
     @pytest.mark.parametrize("use_fpsl", [False, True])
     @pytest.mark.parametrize("tp_pp,src_dp,dest_dp", [
@@ -235,7 +253,8 @@ class TestDistributedOptimizer:
 
         sharding_type = 'fully_sharded_model_space' if use_fpsl else 'dp_zero_gather_scatter'
 
-        with TempNamedDir(tmp_path_dist_ckpt / 'test_dp_sharding', sync=False) as ckpt_dir:
+        # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_dp_sharding', sync=True) as ckpt_dir:
             try:
                 Utils.set_world_size(src_world_size)
                 if Utils.rank >= 0:
@@ -284,7 +303,6 @@ class TestDistributedOptimizer:
                     diffs = diff(optim_param_state_A, optim_param_state_B)
                     assert not any(map(bool, diffs)), diffs
 
-                    Utils.destroy_model_parallel()
                 else:
                     # this prevents NCCL errors when changing DP. TODO: fix it properly
                     sleep(20)
@@ -300,7 +318,8 @@ class TestDistributedOptimizer:
         ]
     )
     def test_finetune_doesnt_load_optimizer(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_glu):
-        with TempNamedDir(tmp_path_dist_ckpt / 'test_finetune_doesnt_load_optimizer') as ckpt_dir:
+        # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_finetune_doesnt_load_optimizer', sync=True) as ckpt_dir:
             mock_args = SimpleNamespace()
             with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
                 init_basic_mock_args(mock_args)
@@ -352,10 +371,10 @@ class TestDistributedOptimizer:
                 assert not diffs[0] and not diffs[1] and diffs[2]
                 assert not any(diff(optimizer.state_dict(), optim_unloaded_state_dict))
 
-                Utils.destroy_model_parallel()
 
     def test_can_load_deprecated_bucket_space_format(self, tmp_path_dist_ckpt):
-        with TempNamedDir(tmp_path_dist_ckpt / 'test_can_load_deprecated_bucket_space_format') as ckpt_dir:
+        # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_can_load_deprecated_bucket_space_format', sync=True) as ckpt_dir:
             mock_args = SimpleNamespace()
             with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
                 init_basic_mock_args(mock_args)
@@ -375,19 +394,37 @@ class TestDistributedOptimizer:
                 optimizer.sharded_state_dict = MethodType(sharded_state_dict_bucket_space, optimizer)
                 save_checkpoint(10, model, optimizer, None, 0)
 
+                flag = 0
+                key_list = []
                 torch.distributed.barrier()
                 if Utils.rank == 0:
                     sharded_metadata = load_tensors_metadata(ckpt_dir / 'iter_0000010')
-                    # Check if actually using `fully_parallel_bucket_space` format
-                    assert 'optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_(torch.bfloat16, torch.bfloat16).bucket_idx_0.exp_avg_sq' in sharded_metadata, sharded_metadata.keys()
+                    key_list = list(sharded_metadata.keys())
+                    # Check if actually using `fully_parallel_bucket_space` format.
+                    key = 'optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_(torch.bfloat16, torch.bfloat16).bucket_idx_0.exp_avg_sq'
+                    if key in key_list:
+                        flag = 1
+
+                tensor = torch.tensor([flag], dtype=torch.long, device='cuda')
+                torch.distributed.broadcast(tensor, 0)
+                flag = tensor[0].item()
+                assert flag == 1, key_list
 
                 optimizer.sharded_state_dict = orig_optim_sharded_state_dict_fn
                 load_checkpoint_no_arg_checks(model, optimizer, None)
 
-                Utils.destroy_model_parallel()
 
 
 class TestFP32Optimizer:
+    def setup_class(cls):
+        Utils.initialize_distributed()
+
+    @pytest.fixture(scope='function', autouse=True)
+    def cleanup_model_parallel(self):
+        # pass for initialize
+        yield
+        Utils.destroy_model_parallel()
+
     @pytest.mark.parametrize(
         ('src_tp_pp', 'dest_tp_pp'),
         [
@@ -397,8 +434,9 @@ class TestFP32Optimizer:
         ]
     )
     def test_fp32_optimizer_resharding(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp):
-        with TempNamedDir(tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=False) as ckpt_dir_A:
-            with TempNamedDir(tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=False) as ckpt_dir_B:
+        # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=True) as ckpt_dir_A:
+            with TempNamedDir(tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=True) as ckpt_dir_B:
                 Utils.initialize_model_parallel(*src_tp_pp)
                 model_A, optimizer_A = setup_model_and_optimizer(seed=2, initialize_fn=initialize_small_model, bf16=False)
 
@@ -421,10 +459,15 @@ class TestFP32Optimizer:
                 plain_state_dict_B = load_plain_tensors(ckpt_dir_B)
                 diffs = diff(plain_state_dict_A, plain_state_dict_B)
                 assert not any(map(bool, diffs)), diffs
-                Utils.destroy_model_parallel()
 
 
 class TestOptimizerResharding:
+    @pytest.fixture(scope='function', autouse=True)
+    def cleanup_model_parallel(self):
+        # pass for initialize
+        yield
+        Utils.destroy_model_parallel()
+
     @pytest.mark.parametrize(
         ('use_dist_opt', 'bf16'),
         (
@@ -467,4 +510,3 @@ class TestOptimizerResharding:
                 plain_state_dict_B = load_plain_tensors(ckpt_dir_B)
                 diffs = diff(plain_state_dict_A, plain_state_dict_B)
                 assert not any(map(bool, diffs)), diffs
-        Utils.destroy_model_parallel()

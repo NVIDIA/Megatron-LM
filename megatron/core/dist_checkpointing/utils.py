@@ -6,7 +6,7 @@ from typing import Dict, Tuple
 
 from .dict_utils import dict_list_map_inplace, extract_matching_values
 from .mapping import (
-    LocalNonpersitentObject,
+    LocalNonpersistentObject,
     ShardedBase,
     ShardedObject,
     ShardedStateDict,
@@ -19,7 +19,7 @@ from .mapping import (
 def extract_sharded_tensors(
     sharded_state_dict: ShardedStateDict,
 ) -> Tuple[ShardedStateDict, StateDict]:
-    """ Extract a dict consisting of only ShardedTensor objects from a given state dict with any objects.
+    """Extract a dict consisting of only ShardedTensor objects from a given state dict with any objects.
 
     Args:
         sharded_state_dict: state dict possibly containing ShardedTensor objects
@@ -35,7 +35,7 @@ def extract_sharded_tensors(
 def extract_sharded_tensors_and_factories(
     sharded_state_dict: ShardedStateDict,
 ) -> Tuple[ShardedStateDict, StateDict]:
-    """ Extract a dict consisting of only ShardedTensor and ShardedTensorFactory objects from a given state dict with any objects.
+    """Extract a dict consisting of only ShardedTensor and ShardedTensorFactory objects from a given state dict with any objects.
 
     Args:
         sharded_state_dict: state dict possibly containing ShardedTensor and ShardedTensorFactory objects
@@ -53,39 +53,43 @@ def extract_sharded_tensors_and_factories(
 def extract_sharded_tensors_or_nonpersistent(
     sharded_state_dict: ShardedStateDict,
 ) -> Tuple[ShardedStateDict, StateDict]:
-    """ Extract a dict consisting of only ShardedTensor, ShardedTensorFactory and LocalNonpersitentObject
+    """Extract a dict consisting of only ShardedTensor, ShardedTensorFactory and LocalNonpersistentObject
     objects from a given state dict with any objects.
 
     Args:
-        sharded_state_dict: state dict possibly containing ShardedTensor, ShardedTensorFactory and LocalNonpersitentObject objects
+        sharded_state_dict: state dict possibly containing ShardedTensor, ShardedTensorFactory and LocalNonpersistentObject objects
 
     Returns:
         Tuple[ShardedStateDict, StateDict]: tuple of:
-            - state dict with all ShardedTensor, ShardedTensorFactory and LocalNonpersitentObject (keeping the original state dict structure)
+            - state dict with all ShardedTensor, ShardedTensorFactory and LocalNonpersistentObject (keeping the original state dict structure)
             - state dict with all other objects (keeping the original state dict structure)
     """
     return extract_matching_values(
         sharded_state_dict,
-        lambda v: isinstance(v, (ShardedTensor, LocalNonpersitentObject, ShardedTensorFactory)),
+        lambda v: isinstance(v, (ShardedTensor, LocalNonpersistentObject, ShardedTensorFactory)),
     )
 
 
 def extract_sharded_base(
     sharded_state_dict: ShardedStateDict,
 ) -> Tuple[ShardedStateDict, StateDict]:
-    return extract_matching_values(sharded_state_dict, lambda v: isinstance(v, ShardedBase),)
+    return extract_matching_values(
+        sharded_state_dict,
+        lambda v: isinstance(v, ShardedBase),
+    )
 
 
 def extract_nonpersistent(
     sharded_state_dict: ShardedStateDict,
 ) -> Tuple[ShardedStateDict, StateDict]:
     return extract_matching_values(
-        sharded_state_dict, lambda v: isinstance(v, LocalNonpersitentObject),
+        sharded_state_dict,
+        lambda v: isinstance(v, LocalNonpersistentObject),
     )
 
 
 def add_prefix_for_sharding(sharded_state_dict: ShardedStateDict, prefix: str):
-    """ Prepend a given prefix to all ShardedBase objects in a given state dict *in-place*.
+    """Prepend a given prefix to all ShardedBase objects in a given state dict *in-place*.
 
     Args:
         sharded_state_dict (ShardedStateDict): sharded state dict
@@ -106,7 +110,7 @@ def add_prefix_for_sharding(sharded_state_dict: ShardedStateDict, prefix: str):
 def replace_prefix_for_sharding(
     sharded_state_dict: ShardedStateDict, old_prefix: str, new_prefix: str
 ):
-    """ Replaces the given prefix in *all* sharded keys in a given state dict.
+    """Replaces the given prefix in *all* sharded keys in a given state dict.
 
     Errors out if some key does not begin with a given prefix.
 
@@ -130,7 +134,7 @@ def replace_prefix_for_sharding(
 
 
 def apply_prefix_mapping(sharded_state_dict: ShardedStateDict, prefix_map: Dict[str, str]):
-    """ Replaces prefixes *only in keys matching* with one of prefixes in the map.
+    """Replaces prefixes *only in keys matching* with one of prefixes in the map.
 
     Args:
         sharded_state_dict (ShardedStateDict): sharded state dict to replace keys in

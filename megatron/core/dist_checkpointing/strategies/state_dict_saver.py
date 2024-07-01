@@ -11,7 +11,7 @@ import torch.distributed as dist
 from torch.distributed.checkpoint import CheckpointException
 from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
-from torch.distributed.checkpoint.planner import SavePlanner
+from torch.distributed.checkpoint.planner import SavePlan, SavePlanner
 from torch.distributed.checkpoint.utils import _DistWrapper, _get_failure_dict
 
 if TYPE_CHECKING:
@@ -27,7 +27,8 @@ def save_state_dict_async_plan(
     process_group: Optional[dist.ProcessGroup] = None,
     coordinator_rank: int = 0,
     planner: Optional[SavePlanner] = None,
-) -> Tuple['FileSystemWriterAsync', Metadata, _DistWrapper]:
+    cached_ckpt_structure: Optional[Tuple[SavePlan, SavePlan, bool]] = None,
+) -> Tuple[Tuple['FileSystemWriterAsync', Metadata, _DistWrapper], SavePlan, bool]:
     """
     First stage of saving a state dict to storage.
 
@@ -50,14 +51,26 @@ def save_state_dict_async_plan(
         process_group (dist.ProcessGroup, optional): process group used for save planning
         coordinator_rank (int, optional): coordinator rank for planning. Defaults to 0.
         planner (SavePlanner, optional): save planner for torch.distributed.checkpoint format
+        cached_ckpt_structure (Tuple[SavePlan, SavePlan, bool], Optional):
+            Each object of this tuple will be used in the order as following
+            cached_central_plan (SavePlan): a globally coordinated save plan
+                cached in the previous iteration
+            cached_local_plan (SavePlan): a local plan
+                cached in the previous iteration
+            validated_cache_reuse (bool): boolean value to tell global_metadata and planning dict
+                is consistent over iterations
 
     Returns: Tuple of:
         - storage writer (the one passed as input)
         - metadata from planning
         - distributed wrapper used for planning
     The return value of this function should be passed as an input to
-    `save_state_dict_async_finalize`.
+    `save_state_dict_async_finalize` and cached_plan to skip `reduce_scatter` at planning.
     """
+    cached_central_plan, cached_local_plan, validated_cache_reuse = (None, None, False)
+    if cached_ckpt_structure:
+        cached_central_plan, cached_local_plan, validated_cache_reuse = cached_ckpt_structure
+
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     dist_wrapper = _DistWrapper(process_group, True, coordinator_rank)
     if planner is None:
@@ -65,18 +78,21 @@ def save_state_dict_async_plan(
     assert planner is not None
 
     global_metadata = None
+    logger.debug(f"rank: {rank}, starting state dict save")
+    local_plan = cached_local_plan
 
     def local_step():
+        nonlocal local_plan
         assert planner is not None
         planner.set_up_planner(state_dict, dist_wrapper.is_coordinator)
         storage_writer.set_up_storage_writer(dist_wrapper.is_coordinator)
-        local_plan = planner.create_local_plan()
+        if not validated_cache_reuse and local_plan is None:
+            local_plan = planner.create_local_plan()
         local_plan = storage_writer.prepare_local_plan(local_plan)
         return local_plan
 
     def global_step(all_local_plans):
         nonlocal global_metadata
-
         assert planner is not None
         all_local_plans, global_metadata = planner.create_global_plan(all_local_plans)
         all_local_plans = storage_writer.prepare_global_plan(all_local_plans)
@@ -84,21 +100,33 @@ def save_state_dict_async_plan(
 
     # Execute local and global planning
     start_plan = time()
-    central_plan = dist_wrapper.reduce_scatter("plan", local_step, global_step)
-    logger.debug(f"rank: {rank}, plan time: {time() - start_plan}")
-
+    if validated_cache_reuse and cached_central_plan:
+        logger.debug(f"rank: {rank}, Passed cache reusable")
+        local_step()
+        central_plan = cached_central_plan
+    else:
+        central_plan = dist_wrapper.reduce_scatter("plan", local_step, global_step)
+    central_plan = planner.finish_plan(central_plan)
+    end_plan = time()
+    logger.debug(f"rank: {rank}, plan time: {end_plan - start_plan}")
     # Prepare async writing of tensors.
     # The `storage_writer` will store the information about tensors it needs to save
     start = time()
-    final_local_plan = planner.finish_plan(central_plan)
-    storage_writer.prepare_write_data(final_local_plan, planner)
+    storage_writer.prepare_write_data(central_plan, planner)
     end = time()
     logger.debug(f"{time()} rank: {rank}, write(async) time: {end - start}")
-    return storage_writer, cast(Metadata, global_metadata), dist_wrapper
+    return (
+        (storage_writer, cast(Metadata, global_metadata), dist_wrapper),
+        central_plan,
+        local_plan,
+        cached_central_plan == central_plan,
+    )
 
 
 def save_state_dict_async_finalize(
-    storage_writer: 'FileSystemWriterAsync', global_metadata: Metadata, dist_wrapper: _DistWrapper,
+    storage_writer: 'FileSystemWriterAsync',
+    global_metadata: Metadata,
+    dist_wrapper: _DistWrapper,
 ) -> None:
     """
     Finalization of save_state_dict_async_plan.

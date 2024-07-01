@@ -1,5 +1,5 @@
 .jet_common:
-  stage: jet
+  stage: functional_tests
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Build only/'
@@ -17,8 +17,8 @@ include:
     file: downstreams.yml
 
 jet-setup:
-  extends: [ .jet_common ]
-  tags: 
+  extends: [.jet_common]
+  tags:
     - os/linux
   script:
     - set -x
@@ -28,6 +28,8 @@ jet-setup:
     reports:
       dotenv: config.env
   interruptible: true
+  retry:
+    max: 2
 
 jet-configure:
   image: 
@@ -51,16 +53,17 @@ jet-configure:
           | .spec.source.image = env(IMAGE)
         )
       ' -i tests/functional_tests/jet_recipes/build-pyt.yaml
-
   artifacts:
     paths:
       - tests/functional_tests/jet_recipes
   interruptible: true
-  
+  retry:
+    max: 2
+
 jet-trigger:
-  stage: jet
+  stage: functional_tests
   extends: [.jet_common, .jet-trigger]
-  needs:  [ metadata, jet-configure, jet-setup ]
+  needs: [metadata, jet-configure, jet-setup]
   trigger:
     project: dl/jet/ci
     branch: $JET_CI_BRANCH
@@ -71,7 +74,7 @@ jet-trigger:
       - SLURM_CLUSTER
       - JET_CI_BRANCH
   variables:
-    JET_WORKLOADS_FILTER: "$_JET_FILTER"
+    JET_WORKLOADS_FILTER: '$_JET_FILTER'
     JET_CUSTOM_CONFIG: |
       launchers:
         ${SLURM_CLUSTER}:
@@ -80,14 +83,14 @@ jet-trigger:
   interruptible: true
 
 jet-results-summary:
-  stage: jet
+  stage: functional_tests
   image: gitlab-master.nvidia.com:5005/dl/jet/api:latest
   tags:
     - os/linux
-  needs: [ jet-trigger ]
+  needs: [jet-trigger]
   before_script:
     - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $VAULT_JWT_TOKEN
-  script: 
+  script:
     - env
     - RW_API_TOKEN=${PROJECT_ACCESS_TOKEN} ENDPOINT=${PROJECT_ENDPOINT} bash tests/functional_tests/shell_test_utils/restart_jet_log_jobs.sh ${CI_PIPELINE_ID}
     - python -m pip install -U --no-cache-dir prettytable
@@ -105,3 +108,4 @@ jet-results-summary:
     paths:
       - scripts
   interruptible: true
+
