@@ -3,15 +3,19 @@
 import pytest
 
 import torch
+import types
 
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.gpt.gpt_embedding import GPTEmbedding
+from megatron.global_vars import set_args
 
 from deepspeed.accelerator import get_accelerator
 device_name = get_accelerator().device_name()
 
 @pytest.fixture
 def gpt_embedding(transformer_config):
+    args = types.SimpleNamespace(params_dtype=torch.float32, embed_layernorm=False)
+    set_args(args)
     embedding = GPTEmbedding(config=transformer_config, vocab_size=100, max_sequence_length=4)
     return embedding
 
