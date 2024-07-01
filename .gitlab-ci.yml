@@ -16,8 +16,8 @@ workflow:
     # do not run branch pipelines if open MR exists
     - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
       when: never
-    # run branch pipeline if no open MR
-    - if: $CI_COMMIT_BRANCH
+    # run branch pipeline if no open MR and on main
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
     
 
 stages:
