@@ -26,7 +26,7 @@ class TestGPTInferenceWrapper:
             transformer_layer_spec=get_gpt_layer_local_spec(), 
             vocab_size=self.vocab_size, 
             max_sequence_length=self.sequence_length, 
-            parallel_output = False).cuda()
+            parallel_output = True).cuda()
 
         inference_wrapper_config = InferenceWrapperConfig(
             hidden_size=hidden_size,
