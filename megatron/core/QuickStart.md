@@ -39,7 +39,7 @@ from megatron.core import parallel_state
 def initialize_distributed(tensor_model_parallel_size = 1, pipeline_model_parallel_size = 1):
     # Torch setup for distributed training
     rank = int(os.environ['LOCAL_RANK'])
-    world_size = torch.cuda.device_count()
+    world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(rank)
     torch.distributed.init_process_group(world_size=world_size, rank=rank)
 
