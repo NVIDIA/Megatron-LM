@@ -70,7 +70,8 @@ class TransformerBlockSubmodules:
 
 
 def _get_block_submodules(
-    config: TransformerConfig, spec: Union[TransformerBlockSubmodules, ModuleSpec],
+    config: TransformerConfig,
+    spec: Union[TransformerBlockSubmodules, ModuleSpec],
 ) -> TransformerBlockSubmodules:
 
     # Transformer block submodules.
@@ -85,7 +86,10 @@ def _get_block_submodules(
             return spec.submodules
         elif issubclass(spec.module, BaseTransformerLayer):
             num_layers = get_num_layers_to_build(config)
-            return TransformerBlockSubmodules(layer_specs=[spec] * num_layers, layer_norm=TENorm,)
+            return TransformerBlockSubmodules(
+                layer_specs=[spec] * num_layers,
+                layer_norm=TENorm,
+            )
         else:
             raise Exception(f"specialize for {spec.module.__name__}.")
     else:
@@ -153,7 +157,11 @@ class TransformerBlock(MegatronModule):
         #     coeff = self.layer_number
         #     self.norm_factor *= coeff
         def build_layer(layer_spec, layer_number):
-            return build_module(layer_spec, config=self.config, layer_number=layer_number,)
+            return build_module(
+                layer_spec,
+                config=self.config,
+                layer_number=layer_number,
+            )
 
         # offset is implicit in TransformerLayer
         self.layers = torch.nn.ModuleList(
@@ -339,7 +347,9 @@ class TransformerBlock(MegatronModule):
         #   already creates viewless tensors. That said, make_viewless_tensor()
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = make_viewless_tensor(
-            inp=hidden_states, requires_grad=True, keep_graph=True,
+            inp=hidden_states,
+            requires_grad=True,
+            keep_graph=True,
         )
 
         if self.config.sequence_parallel:
@@ -410,7 +420,8 @@ class TransformerBlock(MegatronModule):
                                 self.current_microbatch < len(self.cuda_graphs[l_no])
                             )
                             hidden_states = self.cuda_graphs[l_no][self.current_microbatch](
-                                hidden_states, is_first_microbatch=(self.current_microbatch == 0),
+                                hidden_states,
+                                is_first_microbatch=(self.current_microbatch == 0),
                             )
 
                     if (
