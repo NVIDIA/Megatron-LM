@@ -8,7 +8,13 @@ logger = getLogger(__name__)
 
 
 def mcore_gpt_load_legacy_state_dict_pre_hook(
-    state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs,
+    state_dict,
+    prefix,
+    local_metadata,
+    strict,
+    missing_keys,
+    unexpected_keys,
+    error_msgs,
 ):
     """Register a pre-hook to fix the state_dict key difference.
 
@@ -81,7 +87,13 @@ def mcore_gpt_load_legacy_state_dict_pre_hook(
 
 
 def mcore_gpt_load_te_state_dict_pre_hook(
-    state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs,
+    state_dict,
+    prefix,
+    local_metadata,
+    strict,
+    missing_keys,
+    unexpected_keys,
+    error_msgs,
 ):
     """Register a pre-hook to fix the state_dict key difference of.
 

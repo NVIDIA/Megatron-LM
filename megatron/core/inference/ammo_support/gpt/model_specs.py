@@ -47,7 +47,8 @@ def get_gpt_layer_modelopt_spec(
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(
-                    linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear,
+                    linear_fc1=ColumnParallelLinear,
+                    linear_fc2=RowParallelLinear,
                 ),
             ),
             mlp_bda=get_bias_dropout_add,

@@ -5,7 +5,7 @@ import torch
 
 @dataclass
 class InferenceWrapperConfig:
-    """Config for the model inference wrapper   
+    """Config for the model inference wrapper
 
     NOTE : All the arguments here are obtained from arguments.py file
     """

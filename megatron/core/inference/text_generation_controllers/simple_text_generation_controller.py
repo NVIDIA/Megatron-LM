@@ -37,7 +37,7 @@ class SimpleTextGenerationController:
             prompt (str): The input prompt
 
         Returns:
-            torch.Tensor: Returns the tokenized prompt 
+            torch.Tensor: Returns the tokenized prompt
         """
         return self.tokenizer.tokenize(prompt)
 
@@ -69,7 +69,7 @@ class SimpleTextGenerationController:
             vocab_size (int): Obtained from the tokenizer. Defaults to None
 
         Returns:
-            torch.Tensor: 1D tensor of the sampled logits with [batch_size] elements 
+            torch.Tensor: 1D tensor of the sampled logits with [batch_size] elements
         """
 
         top_p = common_inference_params.top_p
@@ -144,13 +144,13 @@ class SimpleTextGenerationController:
 
         Args:
             updated_prompts_tokens (torch.Tensor): The prompts tokens updated with the latest generated tokens. A tensor of shape [batch_size, max_seq_len] (i.e max_seq_len = max_prompt_len + tokens_to_generate)
-            generation_started (torch.Tensor): A boolean tensor of shape [batch_size]. True indicates the prompt at that index has started generating tokens. 
-            current_context_end_position (int): An integer indicating which position to extract from the prompts tokens to get the latest generated tokens. 
-            is_generation_done_tensor (torch.Tensor): A boolean tensor of shape [batch_size]. True indicates the prompt at that index has reached end condition.  
+            generation_started (torch.Tensor): A boolean tensor of shape [batch_size]. True indicates the prompt at that index has started generating tokens.
+            current_context_end_position (int): An integer indicating which position to extract from the prompts tokens to get the latest generated tokens.
+            is_generation_done_tensor (torch.Tensor): A boolean tensor of shape [batch_size]. True indicates the prompt at that index has reached end condition.
             generated_sequence_lengths (torch.Tensor): A int tensor of shape [batch_size]. Each value represents the generated sequence lengths for that prompt.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Returns the boolean is_generation_done_tensor and the generated_sequence_lengths after updating it  
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Returns the boolean is_generation_done_tensor and the generated_sequence_lengths after updating it
         """
         latest_samples = updated_prompts_tokens[:, current_context_end_position]
         # Make sure we are checking eod criterion only for prompts that have started generating (i.e) We only look at the generated tokenns and not the input tokens.
@@ -177,7 +177,7 @@ class SimpleTextGenerationController:
             num_tokens_togenerate (int): The number of tokens to generate for each prompt
 
         Returns:
-            torch.Tensor: A torch tensor of shape [bs, max_seq_len] (i.e) max_seq_len = max_prompt_length_in_batch + num_tokens_to_generate, with extra indices for each tensor padded with mask id. 
+            torch.Tensor: A torch tensor of shape [bs, max_seq_len] (i.e) max_seq_len = max_prompt_length_in_batch + num_tokens_to_generate, with extra indices for each tensor padded with mask id.
         """
         max_seq_len = max_prompt_length_in_batch + num_tokens_to_generate
 
@@ -188,29 +188,31 @@ class SimpleTextGenerationController:
         return torch.tensor(batch_prompt_tokens_list).cuda()
 
     def generate_output_tokens_dynamic_batch(
-        self, active_requests: OrderedDict[int, InferenceRequest],
+        self,
+        active_requests: OrderedDict[int, InferenceRequest],
     ) -> OrderedDict[int, InferenceRequest]:
         """Utility to generate the output tokens and probabilities for the prompts
 
-        This utility generates the output tokens for a dynamic batch. It will run one forward step at a time, and pass control back to the engine, which will update the request pool and call this method again.  
-        
+        This utility generates the output tokens for a dynamic batch. It will run one forward step at a time, and pass control back to the engine, which will update the request pool and call this method again.
+
         Args:
-            active_requests (OrderedDict[int, InferenceRequest]): The input active requests. 
+            active_requests (OrderedDict[int, InferenceRequest]): The input active requests.
 
         Returns:
-            OrderedDict[int, InferenceRequest]: The result for each of the incoming requests after running one forward step. 
+            OrderedDict[int, InferenceRequest]: The result for each of the incoming requests after running one forward step.
         """
         raise Exception("Not implemented yet")
 
     def generate_all_output_tokens_static_batch(
-        self, active_requests: OrderedDict[int, InferenceRequest],
+        self,
+        active_requests: OrderedDict[int, InferenceRequest],
     ) -> OrderedDict[int, InferenceRequest]:
         """Utility to generate the all the output tokens and probabilities for the prompts .
 
         This utility generates the output tokens for a static batch. It runs the forward steps till all prompts complete generation, updates the status of these requests to completed, adds the generated result and returns these requests
 
         Args:
-            active_requests (OrderedDict[int, InferenceRequest]): The input active requests. 
+            active_requests (OrderedDict[int, InferenceRequest]): The input active requests.
 
         Returns:
             OrderedDict[int, InferenceRequest]: The result for each of the incoming requests

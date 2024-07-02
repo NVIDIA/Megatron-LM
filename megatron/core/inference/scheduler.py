@@ -17,7 +17,7 @@ class Scheduler:
         This class is responsible for handing of all the incomign requests
 
         Args:
-            max_batch_size (int): The max batch size that we can pass to the inference engine at a time. 
+            max_batch_size (int): The max batch size that we can pass to the inference engine at a time.
         """
         self.max_batch_size = max_batch_size
         self.active_request_pool: Dict[int, InferenceRequest] = OrderedDict()
@@ -34,7 +34,7 @@ class Scheduler:
     ):
         """Add an incoming request
 
-        This method will add the request to either the active pool or the waiting pool depending on the batch size. 
+        This method will add the request to either the active pool or the waiting pool depending on the batch size.
 
         Args:
             prompt (str): Input prompt string
@@ -70,7 +70,7 @@ class Scheduler:
     def have_requests_pending(self) -> bool:
         """Method to check if there are requests pending
 
-        This method returns False only when there are no active requests or waiting requests. 
+        This method returns False only when there are no active requests or waiting requests.
         """
         num_requests_pending = len(self.active_request_pool) + len(self.waiting_request_pool)
         return num_requests_pending > 0
@@ -94,8 +94,8 @@ class Scheduler:
     def update_requests_pools(self, result_dict: typing.OrderedDict[int, InferenceRequest] = None):
         """Update request pool status
 
-        This method will full up the active request pool, if it has less than max batch size elements from the waiting request pool. 
-        If provided with a request dict, it will put the completed requests into the completed request pool and add waiting request into active pool.  
+        This method will full up the active request pool, if it has less than max batch size elements from the waiting request pool.
+        If provided with a request dict, it will put the completed requests into the completed request pool and add waiting request into active pool.
 
         Args:
             result (typing.OrderedDict[int, InferenceRequest], optional): The result returned by the engine. A dictionary with keys as the request ids, and values as the requests. Defaults to None

@@ -64,17 +64,17 @@ class MCoreEngine(AbstractEngine):
     def run_engine(self):
         """Main functionality to run inference
 
-        Runs the engine until there are no requests in the queue. 
+        Runs the engine until there are no requests in the queue.
 
         Args:
             dynamic_generation (bool, optional): Set this to True, if you want to enable dynamic batching. Mainly used with an inference server. Defaults to False.
         """
         while self.scheduler.have_requests_pending():
             active_requests: Dict[int, InferenceRequest] = self.scheduler.active_request_pool.copy()
-            result_dict: Dict[
-                int, InferenceRequest
-            ] = self.text_generation_controller.generate_all_output_tokens_static_batch(
-                active_requests
+            result_dict: Dict[int, InferenceRequest] = (
+                self.text_generation_controller.generate_all_output_tokens_static_batch(
+                    active_requests
+                )
             )
 
             self.scheduler.update_requests_pools(result_dict=result_dict)
