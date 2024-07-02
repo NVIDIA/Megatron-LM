@@ -33,8 +33,11 @@ The following utility when called initalizes your distributed setup.
 
 ```python
 import os
+
 import torch
+
 from megatron.core import parallel_state
+
 
 def initialize_distributed(tensor_model_parallel_size = 1, pipeline_model_parallel_size = 1):
     # Torch setup for distributed training
@@ -51,9 +54,10 @@ def initialize_distributed(tensor_model_parallel_size = 1, pipeline_model_parall
 **STEP 2 - GPT Model Setup**
 The following step shows you how you can quickly create a GPT model. For a list of other configs that you can pass into the model look into [transformer_config.py](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/transformer/transformer_config.py)
 ```
-from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.transformer.transformer_config import TransformerConfig
+
 
 def model_provider():
     """Build the model."""
@@ -86,8 +90,8 @@ from torch.utils.data import DataLoader
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
-from megatron.training.tokenizer.tokenizer import _NullTokenizer
 from megatron.core.datasets.utils import compile_helpers
+from megatron.training.tokenizer.tokenizer import _NullTokenizer
 
 _SEQUENCE_LENGTH = 64
 
@@ -127,6 +131,7 @@ In megatron core, we use [schedules.py](https://github.com/NVIDIA/Megatron-LM/tr
 ```python
 from functools import partial
 
+
 def forward_step_func(data_iterator, model):
    
     def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
@@ -159,6 +164,7 @@ Megatron core uses distributed checkpoint for loading and saving model. This giv
 ```python
 from megatron.core import dist_checkpointing
 
+
 def save_distributed_checkpoint(checkpoint_path, gpt_model):
     sharded_state_dict = gpt_model.sharded_state_dict(prefix='')
     dist_checkpointing.save(sharded_state_dict=sharded_state_dict, checkpoint_dir=checkpoint_path)
@@ -176,7 +182,9 @@ The following is the main function that needs to go into your script.
 
 ```python
 from pathlib import Path
+
 from torch.optim import Adam
+
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 

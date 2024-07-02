@@ -37,6 +37,11 @@ class AbstractModelInferenceWrapper(abc.ABC):
         ), 'interleaving schedule is not supported for inference'
         self.model = model
         self.inference_wrapper_config = inference_wrapper_config
+        self.pipeline_communication_dtype = (
+            torch.float
+            if self.inference_wrapper_config.fp32_residual_connection
+            else self.inference_wrapper_config.params_dtype
+        )
 
     def prep_model_for_inference(self, prompts_tokens: torch.Tensor):
         """A utility function for preparing model for inference
@@ -89,12 +94,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
     def _allocate_recv_buffer(self, batch_size, seq_len):
         """Receive happens between the layers with size [seq_len, batch_size, hidden_size]."""
         recv_size = (seq_len, batch_size, self.inference_wrapper_config.hidden_size)
-        dtype = (
-            torch.float
-            if self.inference_wrapper_config.fp32_residual_connection
-            else self.inference_wrapper_config.params_dtype
-        )
-        return torch.empty(recv_size, dtype=dtype, device=torch.cuda.current_device())
+        return torch.empty(recv_size, dtype=self.pipeline_communication_dtype, device=torch.cuda.current_device())
 
     def forward_pass_with_pipeline_parallel_small_input_batch(
         self, inference_input: List
@@ -109,7 +109,6 @@ class AbstractModelInferenceWrapper(abc.ABC):
         Returns:
             torch.Tensor: The output logits of shape [batch_size, seq_len, padded_vocab_size]
         """
-
         tokens, position_ids, attention_mask = inference_input
         batch_size, seq_len = tokens.shape
         recv_buffer = None
@@ -123,7 +122,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         )
 
         if not parallel_state.is_pipeline_last_stage():
-            send_to_next_pipeline_rank(output_tensor)
+            send_to_next_pipeline_rank(output_tensor.type(dtype=self.pipeline_communication_dtype))
 
         self.inference_params.sequence_len_offset += seq_len
 
