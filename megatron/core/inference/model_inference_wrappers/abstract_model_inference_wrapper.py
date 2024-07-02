@@ -94,7 +94,9 @@ class AbstractModelInferenceWrapper(abc.ABC):
     def _allocate_recv_buffer(self, batch_size, seq_len):
         """Receive happens between the layers with size [seq_len, batch_size, hidden_size]."""
         recv_size = (seq_len, batch_size, self.inference_wrapper_config.hidden_size)
-        return torch.empty(recv_size, dtype=self.pipeline_communication_dtype, device=torch.cuda.current_device())
+        return torch.empty(
+            recv_size, dtype=self.pipeline_communication_dtype, device=torch.cuda.current_device()
+        )
 
     def forward_pass_with_pipeline_parallel_small_input_batch(
         self, inference_input: List
