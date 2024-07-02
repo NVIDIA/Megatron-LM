@@ -43,7 +43,7 @@ The StragglerDetector class supports context, and its implementation is a Single
 - Initialization 
 
 ```
- initialization, where StragglerDetector will be used
+ # initialization, where StragglerDetector will be used
    from megatron.core.utils import StragglerDetector
    stimer = StragglerDetector()
 ```
