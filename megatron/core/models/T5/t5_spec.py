@@ -48,7 +48,8 @@ def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(
-                    linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear,
+                    linear_fc1=TELayerNormColumnParallelLinear,
+                    linear_fc2=TERowParallelLinear,
                 ),
             ),
             mlp_bda=get_bias_dropout_add,
@@ -88,7 +89,8 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(
-                    linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear,
+                    linear_fc1=TELayerNormColumnParallelLinear,
+                    linear_fc2=TERowParallelLinear,
                 ),
             ),
             mlp_bda=get_bias_dropout_add,
@@ -119,7 +121,8 @@ def encoder_model_with_local_spec() -> ModuleSpec:
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(
-                    linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear,
+                    linear_fc1=ColumnParallelLinear,
+                    linear_fc2=RowParallelLinear,
                 ),
             ),
             mlp_bda=get_bias_dropout_add,
@@ -165,7 +168,8 @@ def decoder_model_with_local_spec() -> ModuleSpec:
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(
-                    linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear,
+                    linear_fc1=ColumnParallelLinear,
+                    linear_fc2=RowParallelLinear,
                 ),
             ),
             mlp_bda=get_bias_dropout_add,
@@ -187,7 +191,7 @@ def get_t5_encoder_with_transformer_engine_block_spec(
     """
 
     layer_spec = encoder_model_with_transformer_engine_default_spec()
-    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers)
+    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=TENorm)
     return block_spec
 
 
@@ -201,7 +205,7 @@ def get_t5_decoder_with_transformer_engine_block_spec(
     """
 
     layer_spec = decoder_model_with_transformer_engine_default_spec()
-    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers)
+    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=TENorm)
     return block_spec
 
 
@@ -213,7 +217,7 @@ def get_t5_encoder_with_local_block_spec(num_layers: int) -> TransformerBlockSub
     """
 
     layer_spec = encoder_model_with_local_spec()
-    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers)
+    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=TENorm)
     return block_spec
 
 
@@ -225,5 +229,5 @@ def get_t5_decoder_with_local_block_spec(num_layers: int) -> TransformerBlockSub
     """
 
     layer_spec = decoder_model_with_local_spec()
-    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers)
+    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=TENorm)
     return block_spec
