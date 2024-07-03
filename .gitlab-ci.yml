@@ -83,18 +83,34 @@ build_image:
     - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
   script:
     - |
+      set -x
       eval "IMAGE=\$$IMAGE"
+
+      OLD_IMAGES=$(docker image ls --format "{{.ID}} {{.Repository}}:{{.Tag}}" \
+                    | grep -v 'nvcr.io/nvidia/pytorch:24.01-py3' \
+                    | grep -v 'gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:buildcache' \
+                    | grep -v 'gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_nemo:buildcache' \
+                    | grep -v 'gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_linting:buildcache' \
+                    | grep -v 'nvcr.io/nvidian/nemo:nightly' \
+                    | grep -v 'python:3.10' | awk '{ print $1 }'
+                 )
+      docker rmi $OLD_IMAGES || true
+
+      if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
+        ADDITIONAL_PARAMS="--pull"
+      fi
 
       docker build \
         -f $FILE \
-        -t ${IMAGE}:${CI_PIPELINE_ID}  \
+        -t ${IMAGE}:${CI_PIPELINE_ID} \
         --cache-to type=inline \
+        --cache-from type=registry,ref=${IMAGE}:buildcache \
         --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
-        --cache-from type=registry,ref=${IMAGE}:buildcache .
+        ${ADDITIONAL_PARAMS} .
 
       docker push ${IMAGE}:${CI_PIPELINE_ID}  
 
-      if [[ "$CI_COMMIT_BRANCH" = "main" ]]; then
+      if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
         docker tag ${IMAGE}:${CI_PIPELINE_ID} ${IMAGE}:buildcache
         docker push ${IMAGE}:buildcache
       fi
