@@ -18,10 +18,11 @@ from megatron.core.dist_checkpointing.serialization import get_default_load_shar
 from megatron.core.dist_checkpointing.strategies.fully_parallel import \
     FullyParallelSaveStrategyWrapper, FullyParallelLoadStrategyWrapper
 from .async_utils import schedule_async_save
-from .global_vars import get_args
-from .utils import unwrap_model, print_rank_0, append_to_progress_log
+from .global_vars import get_args, get_one_logger
+from .utils import unwrap_model, print_rank_0, append_to_progress_log, is_last_rank
 from ..core.dist_checkpointing.serialization import \
     get_default_save_sharded_strategy
+from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
 
 # [ModelOpt]: Import
 try:
@@ -294,6 +295,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
     start_ckpt = time()
     args = get_args()
 
+    # Prepare E2E metrics at start of save checkpoint
+    productive_metrics = on_save_checkpoint_start(args.async_save)
+
     # Only rank zero of the data parallel writes to the disk.
     model = unwrap_model(model)
 
@@ -396,6 +400,17 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
             async_save_request.add_finalize_fn(iter_finalize_fn)
         else:
             iter_finalize_fn()
+
+    # Additional callback for one_logger (last rank)
+    if not torch.distributed.is_initialized() \
+       or is_last_rank():
+        def onelogger_finalize_fn():
+            on_save_checkpoint_success(productive_metrics, args.async_save)
+        if args.async_save:
+            assert async_save_request is not None
+            async_save_request.add_finalize_fn(onelogger_finalize_fn)
+        else:
+            onelogger_finalize_fn()
 
     if args.async_save:
         schedule_async_save(async_save_request)

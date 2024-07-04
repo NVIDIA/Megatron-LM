@@ -295,9 +295,8 @@ log_loss_scale_to_tensorboard: True
 wandb_project: ''
 wandb_exp_name: ''
 wandb_save_dir: ''
-enable_one_logger: False
-one_logger_project: e2e-tracking
-one_logger_entity: hwinf_dcm
+enable_one_logger: True
+one_logger_project: megatron-lm
 one_logger_run_name: null
 log_interval: 100
 tensorboard_dir: null
