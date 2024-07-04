@@ -186,20 +186,24 @@ def _set_one_logger(args):
     _ensure_var_is_not_initialized(_GLOBAL_ONE_LOGGER, 'one logger')
 
     if args.enable_one_logger and args.rank == (args.world_size - 1):
+        if args.one_logger_async or getattr(args, 'wandb_project', ''):
+            one_logger_async = True
+        else:
+            one_logger_async = False
         try:
-            from one_logger.core import OneLogger
+            from one_logger import OneLogger
             config = {
                'project': args.one_logger_project,
-               'entity': args.one_logger_entity,
-               'name': args.one_logger_run_name
+               'name': args.one_logger_run_name,
+               'async': one_logger_async,
             }
             one_logger = OneLogger(config=config)
             _GLOBAL_ONE_LOGGER = one_logger
         except BaseException:
             print('WARNING: one_logger package is required to enable e2e metrics '
-                  'tracking. Try pip install '
-                  '--index-url=https://sc-hw-artf.nvidia.com/api/pypi/hwinf-ml-pypi/simple'
-                  ' one_logger to install it')
+                  'tracking. please go to '
+                  'https://confluence.nvidia.com/display/MLWFO/Package+Repositories'
+                  ' for details to install it')
 
 def _set_adlr_autoresume(args):
     """Initialize ADLR autoresume."""

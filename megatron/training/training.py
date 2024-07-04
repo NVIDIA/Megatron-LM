@@ -56,6 +56,7 @@ from .global_vars import (
     get_current_global_batch_size,
     get_num_microbatches,
     update_num_microbatches)
+from . import one_logger_utils
 
 
 stimer = StragglerDetector()
@@ -209,30 +210,36 @@ def pretrain(train_valid_test_dataset_provider,
     torch.distributed.all_reduce(start_time_tensor,
                                  op=torch.distributed.ReduceOp.MIN)
     _TRAIN_START_TIME = start_time_tensor.item()
+
+    app_metrics = {}
+    app_metrics['app_start_time'] = round(_TRAIN_START_TIME * 1000.0)
+    app_metrics['app_model_init_start_time'] = round(_TRAIN_START_TIME * 1000.0)
+
     print_rank_0('time to initialize megatron (seconds): {:.3f}'.format(
         time.time() - _TRAIN_START_TIME))
     print_datetime('after megatron is initialized')
+    app_metrics['app_model_init_finish_time'] = one_logger_utils.get_timestamp_in_ms()
 
     args = get_args()
     timers = get_timers()
 
-    one_logger = get_one_logger()
-    if one_logger:
-        one_logger.log_metrics({
-            'train_iterations_warmup': 5
-        })
+    # Track E2E metrics on pretrain start
+    one_logger_utils.on_pretrain_start()
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
+    app_metrics['app_build_optimizer_start_time'] = one_logger_utils.get_timestamp_in_ms()
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
         model_provider, model_type)
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate '
                    'scheduler are built')
+    app_metrics['app_build_optimizer_finish_time'] = one_logger_utils.get_timestamp_in_ms()
     config = get_model_config(model[0])
 
     # Data stuff.
+    app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(
         barrier=True)
     if args.virtual_pipeline_model_parallel_size is not None:
@@ -252,6 +259,12 @@ def pretrain(train_valid_test_dataset_provider,
                 train_valid_test_dataset_provider)
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
+    app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
+
+    # Track if training is enabled. Can only be done once args.do_train is assigned after dataloader is built.
+    one_logger_utils.track_config_flags(args.train_iters, args.skip_train, args.do_train,
+                                        args.do_valid, args.do_test, args.dataloader_type,
+                                        args.retro_project_dir, args.retro_cyclic_train_iters)
 
     # Context used for persisting some state between checkpoint saves.
     checkpointing_context = {}
@@ -260,6 +273,9 @@ def pretrain(train_valid_test_dataset_provider,
     print_rank_0('done with setup ...')
     timers.log(['model-and-optimizer-setup',
                 'train/valid/test-data-iterators-setup'], barrier=True)
+
+    one_logger = get_one_logger()
+    one_logger and one_logger.log_metrics(app_metrics)
 
     if not args.skip_train:
         print_rank_0('training ...')
@@ -282,6 +298,11 @@ def pretrain(train_valid_test_dataset_provider,
         if args.save and iteration != 0 and iteration % args.save_interval != 0:
             save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
                             num_floating_point_operations_so_far, checkpointing_context)
+
+        one_logger and one_logger.log_metrics({
+            'app_train_loop_finish_time': one_logger_utils.get_timestamp_in_ms()
+        })
+
     else:
         print_rank_0('skipping training (--skip-train is on) ...')
 
@@ -303,6 +324,10 @@ def pretrain(train_valid_test_dataset_provider,
 
     maybe_finalize_async_save(blocking=True)
 
+    one_logger and one_logger.log_metrics({
+        'app_finish_time': one_logger_utils.get_timestamp_in_ms()
+    })
+    one_logger_utils.finish()
 
 
 def update_train_iters(args):
@@ -503,6 +528,7 @@ def setup_model_and_optimizer(model_provider_func,
     """Setup model and optimizer."""
     args = get_args()
     timers = get_timers()
+    one_logger = get_one_logger()
 
     model = get_model(model_provider_func, model_type)
     unwrapped_model = unwrap_model(model)
@@ -518,11 +544,18 @@ def setup_model_and_optimizer(model_provider_func,
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     if args.load is not None or args.pretrained_checkpoint is not None:
+        one_logger and one_logger.log_metrics({
+            'load_checkpoint_start_time': one_logger_utils.get_timestamp_in_ms()
+        })
         timers('load-checkpoint', log_level=0).start(barrier=True)
         args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
             model, optimizer, opt_param_scheduler)
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
+        one_logger and one_logger.log_metrics({
+            'load_checkpoint_finish_time': one_logger_utils.get_timestamp_in_ms(),
+            'load_checkpoint_time': timers('load-checkpoint').active_time()
+        })
     else:
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
@@ -689,10 +722,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         get_num_microbatches()
 
     # Track app tag & app tag ID
-    if one_logger:
-        job_name = os.environ.get('SLURM_JOB_NAME', None)
-        current_app_tag = f'{job_name}_{batch_size}_{args.world_size}'
-        one_logger.log_app_tag(current_app_tag)
+    one_logger_utils.track_app_tag(batch_size, args.world_size, args.seq_length)
 
     total_iterations = total_loss_dict[advanced_iters_key] + \
                        total_loss_dict[skipped_iters_key]
@@ -784,6 +814,9 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
 
         throughput = num_floating_point_operations(args, batch_size) / (
             elapsed_time_per_iteration * 10**12 * args.world_size)
+
+        one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
+
         if args.log_timers_to_tensorboard:
             if writer:
                 writer.add_scalar('iteration-time',
@@ -888,8 +921,17 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
                              num_floating_point_operations_so_far, checkpointing_context):
     args = get_args()
     timers = get_timers()
+
+    # Stop timer to get accurate train interval time and exclude checkpointing duration
+    timers('interval-time').stop()
+
     # Extra barrier is added to make sure all ranks report the max time.
     timers('save-checkpoint', log_level=0).start(barrier=True)
+    save_checkpoint_start_time = timers('save-checkpoint').active_time()
+
+    # Log E2E metrics before save-checkpoint
+    one_logger_utils.track_e2e_metrics()
+
     if args.use_distributed_optimizer and args.overlap_param_gather:
         optimizer.disable_pre_hook()
     save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
@@ -898,10 +940,20 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
         optimizer.enable_pre_hook()
     timers('save-checkpoint').stop(barrier=True)
     timers.log(['save-checkpoint'])
+    save_checkpoint_finish_time = timers('save-checkpoint').active_time()
+
+    # Log E2E metrics after save-checkpoint
+    one_logger_utils.track_e2e_metrics()
+    save_checkpoint_duration = save_checkpoint_finish_time - save_checkpoint_start_time
+    one_logger_utils.on_save_checkpoint_end(save_checkpoint_duration, iteration, args.async_save)
+
 
     if args.log_progress:
         compute_throughputs_and_append_to_progress_log(iteration,
                                                        num_floating_point_operations_so_far)
+
+    # Recover timing
+    timers('interval-time', log_level=0).start(barrier=True)
 
 
 def train(forward_step_func, model, optimizer, opt_param_scheduler,
@@ -910,6 +962,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     """Train the model function."""
     args = get_args()
     timers = get_timers()
+    one_logger = get_one_logger()
 
     # Write args to tensorboard
     write_args_to_tensorboard()
@@ -923,17 +976,13 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
     # Iterations.
     iteration = args.iteration
-    one_logger = get_one_logger()
-    if one_logger:
-        iteration_start = iteration
-        train_samples_start = args.consumed_train_samples
-        train_samples_target = args.train_samples
-        one_logger.log_metrics({
-            'train_samples_start': args.consumed_train_samples,
-            'train_iterations_start': iteration,
-            'train_samples_target': train_samples_target,
-            'train_iterations_target': args.train_iters,
-        })
+
+    # Track E2E metrics at the start of training
+    one_logger_utils.on_train_start(iteration=iteration, consumed_train_samples=args.consumed_train_samples,
+                                    train_samples=args.train_samples, seq_length=args.seq_length,
+                                    train_iters=args.train_iters, save=args.save, async_save=args.async_save,
+                                    log_throughput=args.log_throughput,
+                                    num_floating_point_operations_so_far=args.num_floating_point_operations_so_far)
 
     num_floating_point_operations_so_far = args.num_floating_point_operations_so_far
 
@@ -986,26 +1035,25 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     num_microbatches = get_num_microbatches()
     eval_duration = 0.0
     eval_iterations = 0
-    def track_e2e_metrics():
-        # Nested function to track a bunch of E2E APP metrics
-        if one_logger:
-            train_duration = timers('interval-time').active_time()  # overall_elapsed
-            train_samples = args.consumed_train_samples - train_samples_start
-            train_iterations = iteration - iteration_start
-            train_iterations_time_msecs_avg = (train_duration * 1000.0) / train_iterations
-            if eval_iterations:
-                validation_iterations_time_msecs_avg = (eval_duration * 1000.0) / eval_iterations
-            else:
-                validation_iterations_time_msecs_avg = None
 
-            one_logger.log_metrics({
-                'train_iterations_end': iteration,
-                'train_samples_end': args.consumed_train_samples,
-                'train_iterations': train_iterations,
-                'train_samples': train_samples,
-                'train_iterations_time_msecs_avg': train_iterations_time_msecs_avg,
-                'validation_iterations_time_msecs_avg': validation_iterations_time_msecs_avg
-            })
+    def get_e2e_base_metrics():
+        """Get base metrics values for one-logger to calculate E2E tracking metrics.
+        """
+        return {
+            'iteration': iteration,
+            'train_duration': timers('interval-time').active_time(),
+            'eval_duration': eval_duration,
+            'eval_iterations': eval_iterations,
+            'total_flops': total_flops,
+            'num_floating_point_operations_so_far': num_floating_point_operations_so_far,
+            'consumed_train_samples': args.consumed_train_samples,
+            'world_size': args.world_size,
+            'seq_length': args.seq_length
+        }
+    # Cache into one-logger for callback
+    if one_logger:
+        with one_logger.get_context_manager():
+            one_logger.store_set('get_e2e_base_metrics', get_e2e_base_metrics)
 
     while iteration < args.train_iters:
         if args.profile and \
@@ -1054,9 +1102,6 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
 
-        if iteration % args.log_interval == 0:
-            track_e2e_metrics()
-
         learning_rate = None
         decoupled_learning_rate = None
         for param_group in optimizer.param_groups:
@@ -1070,6 +1115,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
                                           grad_norm, params_norm, num_zeros_in_grad)
+
         # StragglerDetector
         if iteration % args.log_interval == 0 and args.log_straggler:
             stimer.report(total_flops, args.log_interval)
@@ -1110,6 +1156,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             eval_duration += timers('eval-time').elapsed()
             eval_iterations += args.eval_iters
             timers('eval-time').stop()
+            one_logger_utils.track_e2e_metrics()
+
             if args.manual_gc and args.manual_gc_eval:
                 # Collect only the objects created and used in evaluation.
                 gc.collect(generation=0)
@@ -1132,13 +1180,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
         if args.save and args.save_interval and \
            iteration % args.save_interval == 0:
-            timers('interval-time').stop()
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler,
                                      num_floating_point_operations_so_far,
                                      checkpointing_context)
             saved_checkpoint = True
-            timers('interval-time', log_level=0).start(barrier=True)
 
         # Exiting based on duration
         if args.exit_duration_in_mins:
@@ -1180,9 +1226,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:
                 gc.collect()
 
-    track_e2e_metrics()
+    one_logger_utils.track_e2e_metrics()
 
-    # Flush TensorBoard and WandB writers.
+    # Flush TensorBoard, WandB writers and one-logger
     writer = get_tensorboard_writer()
     if writer:
         writer.flush()

@@ -45,6 +45,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_transformer_engine_args(parser)
     parser = _add_retro_args(parser)
     parser = _add_experimental_args(parser)
+    parser = _add_one_logger_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -825,6 +826,34 @@ def _add_straggler_detector_args(parser):
                        help='Number of ranks to report with high/low estimated throughput')
     return parser
 
+def _add_one_logger_args(parser):
+    group = parser.add_argument_group(title='one logger')
+    group.add_argument('--no-one-logger', action='store_false',
+                       help='If set, disable using one_logger to track E2E metrics'
+                       'Note that one_logger is an internal tool and not '
+                       'available externally. For installation, please go to '
+                       'https://confluence.nvidia.com/display/MLWFO/Package+Repositories'
+                       'for more details',
+                       dest='enable_one_logger')
+    group.add_argument('--one-logger-project', type=str, default='megatron-lm',
+                       help='The one-logger project name. Will ignore if '
+                       '--no-one-logger is set')
+    group.add_argument('--one-logger-run-name', type=str, default=None,
+                       help='The one-logger run name displayed. Will ignore if '
+                       '--no-one-logger is set')
+    group.add_argument('--one-logger-async', action='store_true',
+                       help='If set, forces one_logger to use async mode.')
+    group.add_argument('--app-tag-run-name', type=str, default=None,
+                       help='Jobs belonging to same training run, suppose to '
+                       'have the same name. It will be used to track progress of '
+                       'a training done over multiple different jobs')
+    group.add_argument('--app-tag-run-version', type=str, default='0.0.0',
+                       help='The version of the training of which current job is '
+                       'part of. It will be used to track the changes in the '
+                       'application side which might change the performance '
+                       'baseline')
+    return parser
+
 def _add_logging_args(parser):
     group = parser.add_argument_group(title='logging')
 
@@ -898,22 +927,6 @@ def _add_logging_args(parser):
                        help='The wandb experiment name.')
     group.add_argument('--wandb-save-dir', type=str, default='',
                        help='Path to save the wandb results locally.')
-    group.add_argument('--enable-one-logger', action='store_true',
-                       help='If set, use one_logger to track E2E metrics'
-                       'Note that one_logger is an internal tool and not available externally. '
-                       'For installation, please try command: `pip install '
-                       '--index-url=https://sc-hw-artf.nvidia.com/api/pypi/hwinf-ml-pypi/simple'
-                       ' one_logger` or go to https://gitlab-master.nvidia.com/hwinf-dcm/onelogger '
-                       'for more details')
-    group.add_argument('--one-logger-project', type=str, default='e2e-tracking',
-                       help='The one-logger project name. Will ignore if '
-                       '--enable-one-logger is not set')
-    group.add_argument('--one-logger-entity', type=str, default='hwinf_dcm',
-                       help='The one-logger username or team name. Will ignore if '
-                       '--enable-one-logger is not set')
-    group.add_argument('--one-logger-run-name', type=str, default=None,
-                       help='The one-logger run name displayed. Will ignore if '
-                       '--enable-one-logger is not set')
     group.add_argument('--logging-level', type=int, default=None,
                        help='Set default logging level')
     return parser
