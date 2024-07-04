@@ -1,9 +1,10 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import re
+import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -65,10 +66,12 @@ def get_num_layers_to_build(config: TransformerConfig) -> int:
 @dataclass
 class TransformerBlockSubmodules:
     layer_specs: List[ModuleSpec] = None
+    layer_norm: Optional[Union[ModuleSpec, torch.nn.Module]] = None
 
 
 def _get_block_submodules(
-    config: TransformerConfig, spec: Union[TransformerBlockSubmodules, ModuleSpec],
+    config: TransformerConfig,
+    spec: Union[TransformerBlockSubmodules, ModuleSpec],
 ) -> TransformerBlockSubmodules:
 
     # Transformer block submodules.
@@ -83,7 +86,10 @@ def _get_block_submodules(
             return spec.submodules
         elif issubclass(spec.module, BaseTransformerLayer):
             num_layers = get_num_layers_to_build(config)
-            return TransformerBlockSubmodules(layer_specs=[spec] * num_layers)
+            return TransformerBlockSubmodules(
+                layer_specs=[spec] * num_layers,
+                layer_norm=TENorm,
+            )
         else:
             raise Exception(f"specialize for {spec.module.__name__}.")
     else:
@@ -151,7 +157,11 @@ class TransformerBlock(MegatronModule):
         #     coeff = self.layer_number
         #     self.norm_factor *= coeff
         def build_layer(layer_spec, layer_number):
-            return build_module(layer_spec, config=self.config, layer_number=layer_number,)
+            return build_module(
+                layer_spec,
+                config=self.config,
+                layer_number=layer_number,
+            )
 
         # offset is implicit in TransformerLayer
         self.layers = torch.nn.ModuleList(
@@ -176,13 +186,17 @@ class TransformerBlock(MegatronModule):
         # else:
         #     self.layers = torch.nn.ModuleList([build_layer(i + 1 + offset) for i in range(self.num_layers)])
 
-        if self.post_process and self.post_layer_norm:
-            # Final layer norm before output.
-            self.final_layernorm = TENorm(
+        # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
+        # self.post_process and self.post_layer_norm guide this behavior
+        if self.submodules.layer_norm and self.post_process and self.post_layer_norm:
+            self.final_layernorm = build_module(
+                self.submodules.layer_norm,
                 config=self.config,
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
+        else:
+            self.final_layernorm = None  # Either this or nn.Identity
 
     def _get_layer(self, layer_number: int):
         return self.layers[layer_number]
@@ -333,7 +347,9 @@ class TransformerBlock(MegatronModule):
         #   already creates viewless tensors. That said, make_viewless_tensor()
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = make_viewless_tensor(
-            inp=hidden_states, requires_grad=True, keep_graph=True,
+            inp=hidden_states,
+            requires_grad=True,
+            keep_graph=True,
         )
 
         if self.config.sequence_parallel:
@@ -404,7 +420,8 @@ class TransformerBlock(MegatronModule):
                                 self.current_microbatch < len(self.cuda_graphs[l_no])
                             )
                             hidden_states = self.cuda_graphs[l_no][self.current_microbatch](
-                                hidden_states, is_first_microbatch=(self.current_microbatch == 0),
+                                hidden_states,
+                                is_first_microbatch=(self.current_microbatch == 0),
                             )
 
                     if (
@@ -415,7 +432,7 @@ class TransformerBlock(MegatronModule):
                         hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
 
         # Final layer norm.
-        if self.post_process and self.post_layer_norm:
+        if self.final_layernorm is not None:
             hidden_states = self.final_layernorm(hidden_states)
 
         return hidden_states
