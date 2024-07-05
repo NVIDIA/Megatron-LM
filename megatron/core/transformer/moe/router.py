@@ -92,7 +92,10 @@ class Router(ABC, MegatronModule):
 class TopKRouter(Router):
     """Route each token to the top-k experts."""
 
-    def __init__(self, config: TransformerConfig,) -> None:
+    def __init__(
+        self,
+        config: TransformerConfig,
+    ) -> None:
         """Initialize the zero token dropping router.
 
         Args:
@@ -137,12 +140,12 @@ class TopKRouter(Router):
     def aux_loss_load_balancing(self, logits: torch.Tensor):
         """Apply loss-based load balancing to the logits tensor.
 
-            Args:
-                logits (torch.Tensor): the logits tensor after gating, shape: [num_tokens, num_experts].
+        Args:
+            logits (torch.Tensor): the logits tensor after gating, shape: [num_tokens, num_experts].
 
-            Returns:
-                probs (torch.Tensor): the probabilities tensor after load balancing.
-                indices (torch.Tensor): the indices tensor after top-k selection.
+        Returns:
+            probs (torch.Tensor): the probabilities tensor after load balancing.
+            indices (torch.Tensor): the indices tensor after top-k selection.
         """
         probs, indices, tokens_per_expert = topk_softmax_with_capacity(
             logits,
@@ -152,9 +155,10 @@ class TopKRouter(Router):
             drop_policy=self.config.moe_token_drop_policy,
         )
 
-        # Apply load balancing loss
-        scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
-        probs = self.apply_load_balancing_loss(scores, tokens_per_expert, activation=probs)
+        if self.training:
+            # Apply load balancing loss
+            scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+            probs = self.apply_load_balancing_loss(scores, tokens_per_expert, activation=probs)
         return probs, indices
 
     def apply_load_balancing_loss(
@@ -210,14 +214,17 @@ class TopKRouter(Router):
         Returns:
             torch.Tensor: The logits after applying the z-loss.
         """
-        if self.config.moe_z_loss_coeff is not None:
+        if self.config.moe_z_loss_coeff is not None and self.training:
             moe_z_loss_coeff = (
                 self.config.moe_z_loss_coeff / parallel_state.get_tensor_model_parallel_world_size()
             )
             z_loss = z_loss_func(logits, moe_z_loss_coeff)
             logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
             save_to_aux_losses_tracker(
-                "z_loss", z_loss / moe_z_loss_coeff, self.layer_number, self.config.num_layers,
+                "z_loss",
+                z_loss / moe_z_loss_coeff,
+                self.layer_number,
+                self.config.num_layers,
             )
         return logits
 
