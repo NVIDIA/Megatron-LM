@@ -42,7 +42,7 @@ metadata:
   image: python:3.10
   stage: .pre
   tags: 
-    - 8xL40S
+    - os/linux
   script:
     - env
     - |
@@ -59,6 +59,61 @@ metadata:
     reports:
       dotenv: build.env
   interruptible: true
+
+ppp_capacity_statistics:
+  tags: [mcore-ssh-agent]
+  stage: .pre
+  script:
+    - |
+      set -x
+
+      ALL_USER=$(sshare -aP | grep coreai_dlalgo_mcore | tail -n +2 | awk -F '|' '{print $2}' | tr '\n' ',')
+
+      # Get the current year, month, and day
+      YEAR=$(date +%Y)
+      MONTH=$(date +%m)
+      DAY=$([[ "$(date +%d)" -lt 8 ]] && echo "01" || echo "15")
+      TIMESTAMP="${YEAR}-${MONTH}-${DAY}T00:00:01"
+
+      CLUSTER_ID=$(curl "${RESOURCE_ENDPOINT}/api/v1/clusters" \
+        -H "accept: application/json, text/plain, */*" \
+        -H "accept-language: en-US,en;q=0.9" \
+        -H "authorization: Bearer $CSRG_API_KEY" | jq '.[] | select(.name == "draco-oci-iad") | .id' | tr -d '"')
+
+      INITIATIVE_ITEM_ID=$(curl "${RESOURCE_ENDPOINT}/api/v1/initiative-items" \
+        -H "accept: application/json, text/plain, */*" \
+        -H "accept-language: en-US,en;q=0.9" \
+        -H "authorization: Bearer $CSRG_API_KEY" | jq '.[] | select(.name == "coreai_dlalgo_mcore") | .id' | tr -d '"')
+
+      QUOTA=$(curl "${RESOURCE_ENDPOINT}/api/v1/capacity-requests" \
+        -H "accept: application/json, text/plain, */*" \
+        -H "accept-language: en-US,en;q=0.9" \
+        -H "authorization: Bearer $CSRG_API_KEY" | jq --arg CLUSTER_ID $CLUSTER_ID --arg INITIATIVE_ITEM_ID $INITIATIVE_ITEM_ID '[.[] | select(.clusterId == $CLUSTER_ID and .initiativeItemId == $INITIATIVE_ITEM_ID)] | to_entries | [last] | .[0].value.quantity')
+
+      USED_CAPA=$(sacct \
+        -u ${ALL_USER} \
+        --partition batch_block1,batch_block3,batch_block4 \
+        --truncate \
+        -A coreai_dlalgo_mcore \
+        -S ${TIMESTAMP} \
+        -X \
+        --format JobID,JobName%20,Partition,AllocNodes,ElapsedRaw \
+        -p \
+        -n \
+      | awk -F "|" '{{sum+=$4*$5}} END {{print sum*8/3600}}')
+      TOTAL_CAPA=$(( $QUOTA*24*30 ))
+
+      USAGE=$(echo "$USED_CAPA $TOTAL_CAPA" | awk '{print (1 - $1/$2)*100}')%
+
+      echo "Usage left: $USAGE"
+      echo "Disclaimer: Please be careful with this number. Usage does not imply
+        what we are guaranteed to get a slot, SLURM scheduling is more complicated
+        than that. The number is rather a proxy to the FairShare that determines
+        our job-scheduling-priority.
+
+        Most important take-away of this number is to get a sense how much much
+        we are eating up our budget such that we can discuss this with capacity planning.
+        "
 
 build_image:
   tags:
