@@ -86,7 +86,7 @@ set +x
 # Runs the "345M" parameter model
 
 build_torch_run_cmd() {
-  DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
+  DISTRIBUTED_ARGS="--max-restarts 3 --nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
   [[ -n "$RUN_CMD" ]] && run_cmd=$RUN_CMD || run_cmd="torchrun $DISTRIBUTED_ARGS"
   torch_run_cmd="$run_cmd \
        pretrain_gpt.py \
