@@ -117,7 +117,7 @@ ppp_capacity_statistics:
 
 build_image:
   tags:
-    - 8xL40S
+    - mcore-docker-node
   image: docker:26.1.4-dind
   needs: []  # May start ASAP
   stage: build
