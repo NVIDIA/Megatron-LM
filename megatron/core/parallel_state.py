@@ -84,7 +84,7 @@ _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
 _GLOBAL_MEMORY_BUFFER = None
 
 # MOE logging
-_MOE_AUX_LOSSES_LOGGING_TRACKER = {}
+_MOE_LAYER_WISE_LOGGING_TRACKER = {}
 
 
 def get_nccl_options(pg_name, nccl_comm_cfgs):
@@ -107,7 +107,9 @@ def get_nccl_options(pg_name, nccl_comm_cfgs):
 
 
 def generate_masked_orthogonal_rank_groups(
-    world_size: int, parallel_size: List[int], mask: List[bool],
+    world_size: int,
+    parallel_size: List[int],
+    mask: List[bool],
 ) -> List[List[int]]:
     """Generate orthogonal parallel groups based on the parallel size and mask.
 
@@ -121,9 +123,9 @@ def generate_masked_orthogonal_rank_groups(
 
         mask (List[bool]):
             The mask controls which parallel methods the generated groups represent. If mask[i] is
-            True, it means the generated group contains the i-th parallelism method. For example, 
-            if parallel_size = [tp_size, pp_size, dp_size], and mask = [True, False , True], then 
-            the generated group is the `tp-dp` group, if the mask = [False, True, False], then the 
+            True, it means the generated group contains the i-th parallelism method. For example,
+            if parallel_size = [tp_size, pp_size, dp_size], and mask = [True, False , True], then
+            the generated group is the `tp-dp` group, if the mask = [False, True, False], then the
             generated group is the `pp` group.
 
     Algorithm:
@@ -135,7 +137,7 @@ def generate_masked_orthogonal_rank_groups(
                 pp_rank \in [0, pp_size)
 
         If we want to get the `dp_group` (tp_size * pp_size groups of dp_size ranks each.
-        For example,  if the gpu size is 8 and order is 'tp-pp-dp', size is '2-2-2', and the 
+        For example,  if the gpu size is 8 and order is 'tp-pp-dp', size is '2-2-2', and the
         dp_group here is [[0, 4], [1, 5], [2, 6], [3, 7]].)
         The tp_rank and pp_rank will be combined to form the `dp_group_index`.
             dp_group_index = tp_rank + pp_rank * tp_size (2)
@@ -143,7 +145,7 @@ def generate_masked_orthogonal_rank_groups(
         So, Given that tp_rank and pp_rank satisfy equation (2), and dp_rank in
         range(0, dp_size), the ranks in dp_group[dp_group_index] satisfies the
         equation (1).
-        
+
         This function solve this math problem.
 
     For example, if the parallel_size = [tp_size, dp_size, pp_size] = [2, 3, 4],
@@ -170,9 +172,9 @@ def generate_masked_orthogonal_rank_groups(
         return sum([x * y for x, y in zip(a, b)])
 
     def decompose(index, shape, stride=None):
-        ''' 
+        '''
         This function solve the math problem below:
-            There is an equation: 
+            There is an equation:
                 index = sum(idx[i] * stride[i])
             And given the value of index, stride.
             Return the idx.
@@ -376,7 +378,7 @@ def initialize_model_parallel(
             all-reduce is required in backward. For simplicity, we piggyback
             GPUs of context parallelism on data parallel group for
             weight gradient all-reduce.
-        
+
         expert_model_parallel_size (int, default = 1):
             The number of Mixture of Experts parallel GPUs in each expert
             parallel group.
@@ -712,7 +714,8 @@ def is_unitialized() -> bool:
 
     """
     warnings.warn(
-        "is_unitialized is deprecated, use is_initialized instead", DeprecationWarning,
+        "is_unitialized is deprecated, use is_initialized instead",
+        DeprecationWarning,
     )
     return not is_initialized()
 
@@ -966,8 +969,10 @@ def is_pipeline_last_stage(ignore_virtual=False):
         virtual_pipeline_model_parallel_world_size = (
             get_virtual_pipeline_model_parallel_world_size()
         )
-        if virtual_pipeline_model_parallel_world_size is not None and get_virtual_pipeline_model_parallel_rank() != (
-            virtual_pipeline_model_parallel_world_size - 1
+        if (
+            virtual_pipeline_model_parallel_world_size is not None
+            and get_virtual_pipeline_model_parallel_rank()
+            != (virtual_pipeline_model_parallel_world_size - 1)
         ):
             return False
     return get_pipeline_model_parallel_rank() == (get_pipeline_model_parallel_world_size() - 1)
@@ -1156,7 +1161,7 @@ def get_expert_model_parallel_world_size():
 
 def get_tensor_and_expert_parallel_world_size():
     """Return world size for the expert model parallel group times model parallel group.
-       Currently, each expert will also be distributed across TP group by default.
+    Currently, each expert will also be distributed across TP group by default.
     """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         tensor_and_expert_parallel_world_size = torch.distributed.get_world_size(
@@ -1213,6 +1218,12 @@ def destroy_global_memory_buffer():
     """Sets the global memory buffer to None"""
     global _GLOBAL_MEMORY_BUFFER
     _GLOBAL_MEMORY_BUFFER = None
+
+
+def get_moe_layer_wise_logging_tracker():
+    """Return the moe layer wise tracker."""
+    global _MOE_LAYER_WISE_LOGGING_TRACKER
+    return _MOE_LAYER_WISE_LOGGING_TRACKER
 
 
 def destroy_model_parallel():

@@ -2,7 +2,7 @@
 
 import pytest
 import torch
-from megatron.core.transformer.moe.moe_utils import get_aux_losses_tracker, clear_aux_losses_tracker
+from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
 
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.moe.test_token_dispatcher import MoEModelTestContainer
@@ -24,7 +24,7 @@ class AuxlossTestContainer(MoEModelTestContainer):
         torch.distributed.barrier()
         ans = self.partition_input(baseline_grad)
         assert torch.allclose(aux_loss_grad, ans), f"Diff: {(aux_loss_grad/ans).mean()}"
-        loss = get_aux_losses_tracker()['load_balancing_loss']
+        loss = parallel_state.get_moe_layer_wise_logging_tracker()['load_balancing_loss']
         clear_aux_losses_tracker()
 
 class TestAuxLoss:

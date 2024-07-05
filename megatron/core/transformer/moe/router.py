@@ -178,15 +178,11 @@ class TopKRouter(Router):
             torch.Tensor: The activation tensor with the attached gradient function.
         """
         moe_aux_loss_coeff = self.config.moe_aux_loss_coeff
-        scale_for_logging = 1.0
         sequence_partition_group = None
         if self.config.moe_token_dispatcher_type == "allgather":
             sequence_partition_group = parallel_state.get_tensor_model_parallel_group()
         elif self.config.moe_token_dispatcher_type == "alltoall":
             moe_aux_loss_coeff /= parallel_state.get_tensor_model_parallel_world_size()
-
-        if sequence_partition_group is not None:
-            scale_for_logging *= torch.distributed.get_world_size(group=sequence_partition_group)
 
         aux_loss = switch_load_balancing_loss_func(
             probs,
@@ -197,9 +193,10 @@ class TopKRouter(Router):
         )
         save_to_aux_losses_tracker(
             "load_balancing_loss",
-            aux_loss / moe_aux_loss_coeff * scale_for_logging,
+            aux_loss / moe_aux_loss_coeff,
             self.layer_number,
             self.config.num_layers,
+            reduce_group=sequence_partition_group,
         )
         activation = MoEAuxLossAutoScaler.apply(activation, aux_loss)
         return activation
