@@ -6,6 +6,8 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
+from dataclasses import dataclass
+from typing import Union
 
 import torch
 import torch.nn as nn
@@ -13,15 +15,11 @@ import torch.nn.functional as F
 
 from megatron.core.parallel_state import get_tensor_model_parallel_world_size
 from megatron.core.tensor_parallel import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-    copy_to_tensor_model_parallel_region,
-    gather_from_sequence_parallel_region,
     get_cuda_rng_tracker,
     reduce_from_tensor_model_parallel_region,
-    reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 try:
@@ -37,7 +35,10 @@ except ImportError:
 
 try:
     from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
-    from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+    from mamba_ssm.ops.triton.ssd_combined import (
+        mamba_chunk_scan_combined,
+        mamba_split_conv1d_scan_combined,
+    )
 except ImportError:
     raise ImportError("mamba-ssm is required by the Mamba model but cannot be imported")
 
@@ -47,10 +48,17 @@ except ImportError:
     raise ImportError("einops is required by the Mamba model but cannot be imported")
 
 
-class Mamba(MegatronModule):
+@dataclass
+class MambaMixerSubmodules:
+    in_proj: Union[ModuleSpec, type] = None
+    out_proj: Union[ModuleSpec, type] = None
+
+
+class MambaMixer(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
+        submodules: MambaMixerSubmodules,
         d_model,
         d_state=128,
         d_conv=4,
@@ -71,7 +79,7 @@ class Mamba(MegatronModule):
         conv_bias=True,
         # Fused kernel and sharding options
         chunk_size=128,
-        use_fast_path=True,
+        use_mem_eff_path=True,
         layer_idx=None,
     ):
         super().__init__(config)
@@ -90,7 +98,7 @@ class Mamba(MegatronModule):
         self.rmsnorm = rmsnorm
         self.norm_before_gate = norm_before_gate
         self.chunk_size = chunk_size
-        self.use_fast_path = use_fast_path
+        self.use_mem_eff_path = use_mem_eff_path
         self.layer_idx = layer_idx
 
         self.tensor_model_parallel_size = get_tensor_model_parallel_world_size()
@@ -98,6 +106,7 @@ class Mamba(MegatronModule):
         assert self.ngroups % self.tensor_model_parallel_size == 0
         assert self.nheads % self.tensor_model_parallel_size == 0
         assert not bias
+        assert not self.norm_before_gate
 
         self.d_inner_local = self.d_inner // self.tensor_model_parallel_size
         self.ngroups_local = self.ngroups // self.tensor_model_parallel_size
@@ -107,13 +116,17 @@ class Mamba(MegatronModule):
 
         # Assume sequence parallelism: input is already partitioned along the
         # sequence dimension
-        self.in_proj = ColumnParallelLinear(
+        self.in_proj = build_module(
+            submodules.in_proj,
             self.d_model,
             self.d_inner * 2 + 2 * self.ngroups * self.d_state + self.nheads,
             config=self.config,
             init_method=self.config.init_method,
             gather_output=False,
             bias=bias,
+            skip_bias_add=False,
+            is_expert=False,
+            tp_comm_buffer_name='fc1',
         )
 
         conv_dim = self.d_inner_local + 2 * self.ngroups_local * self.d_state
@@ -181,21 +194,24 @@ class Mamba(MegatronModule):
                 self.d_inner_local,
                 eps=1e-5,
                 group_size=self.d_inner_local // self.ngroups_local,
-                norm_before_gate=False,
+                norm_before_gate=self.norm_before_gate,
                 device=torch.cuda.current_device(),
                 dtype=config.params_dtype,
             )
 
         # Assume sequence parallelism: input is partitioned along d_inner and
         # output is partitioned along the sequence dimension
-        self.out_proj = RowParallelLinear(
+        self.out_proj = build_module(
+            submodules.out_proj,
             self.d_inner,
             self.d_model,
             config=self.config,
             init_method=self.config.output_layer_init_method,
             bias=bias,
             input_is_parallel=True,
-            skip_bias_add=False,
+            skip_bias_add=True,
+            is_expert=False,
+            tp_comm_buffer_name='fc2',
         )
 
     def forward(self, hidden_states, inference_params=None):
@@ -217,102 +233,123 @@ class Mamba(MegatronModule):
         # (nheads_local)
         A = -torch.exp(self.A_log.float())
 
-        # pl b d ->  l b p(2d)
-        # TODO move transpose to GEMM
-        if self.config.sequence_parallel:
-            # gather data along sequenece dimension
-            hidden_states = gather_from_sequence_parallel_region(hidden_states)
-        else:
-            hidden_states = copy_to_tensor_model_parallel_region(hidden_states)
-        xz = hidden_states @ self.in_proj.weight.t()
+        xz, _ = self.in_proj(hidden_states)
 
-        z, xBC, dt = torch.split(
-            xz,
-            [
-                self.d_inner_local,
-                self.d_inner_local + 2 * self.ngroups_local * self.d_state,
-                self.nheads_local,
-            ],
-            dim=-1,
-        )
+        # transpose: l b pd --> b l pd
+        xz = rearrange(xz, "l b d -> b l d").contiguous()
 
-        # transpose: l b pd --> b pd l
-        xBC = rearrange(xBC, "l b d -> b d l")
-        xBC = xBC.contiguous()
+        if self.use_mem_eff_path and inference_params is None:
+            assert ssm_state is None
 
-        # Compute short convolution
-        if conv_state is not None:
-            # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
-            # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
-            conv_state.copy_(F.pad(xBC, (self.d_conv - xBC.shape[-1], 0)))  # Update state (B D W)
+            if self.conv1d.bias is not None:
+                self.conv1d.bias.data_ptr()
 
-        seqlen = xBC.size(2)
-        if causal_conv1d_fn is None:
-            xBC = self.act(self.conv1d(xBC)[..., :seqlen])
-        else:
-            assert self.activation in ["silu", "swish"]
-            xBC = causal_conv1d_fn(
-                x=xBC,
-                weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                bias=self.conv1d.bias,
+            y = mamba_split_conv1d_scan_combined(
+                xz,
+                rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                self.conv1d.bias,
+                self.dt_bias.float(),
+                A,
+                D=(
+                    rearrange(self.D.float(), "(h p) -> h p", p=self.headdim)
+                    if self.D_has_hdim
+                    else self.D
+                ),
+                chunk_size=self.chunk_size,
                 activation=self.activation,
+                headdim=None if self.D_has_hdim else self.headdim,
+                ngroups=self.ngroups_local,
+                norm_before_gate=self.norm_before_gate,
             )
 
-        # transpose b pd l --> l b pd
-        xBC = rearrange(xBC, "b d l ->  l b d")
-        xBC = xBC.contiguous()
-
-        x, B, C = torch.split(
-            xBC,
-            [
-                self.d_inner_local,
-                self.ngroups_local * self.d_state,
-                self.ngroups_local * self.d_state,
-            ],
-            dim=-1,
-        )
-
-        # TODO Vijay: fuse most of the transposes with the GEMMS
-        x = rearrange(x, "l b (h p) -> b l h p", p=self.headdim).contiguous()
-        dt = rearrange(dt, "l b d -> b l d").contiguous()
-        B = rearrange(B, "l b (g n) -> b l g n", n=self.d_state).contiguous()
-        C = rearrange(C, "l b (g n) -> b l g n", n=self.d_state).contiguous()
-        z = rearrange(z, "l b (h p) -> b l h p", p=self.headdim).contiguous()
-        y = mamba_chunk_scan_combined(
-            x,
-            dt,
-            A,
-            B,
-            C,
-            self.chunk_size,
-            D=rearrange(self.D.float(), "(h p) -> h p", p=self.headdim)
-            if self.D_has_hdim
-            else self.D,
-            z=z if not self.rmsnorm else None,
-            dt_bias=self.dt_bias.float(),
-            dt_softplus=True,
-            return_final_states=ssm_state is not None,
-        )
-
-        if ssm_state is not None:
-            y, last_state = y
-            ssm_state.copy_(last_state)
-
-        if self.rmsnorm:
-            y = rearrange(y, "b l h p -> b l (h p)").contiguous()
-            z = rearrange(z, "b l h p -> b l (h p)").contiguous()
-            y = self.norm(y, z)
-            y = rearrange(y, "b l d -> l b d").contiguous()
+            if self.rmsnorm:
+                y = self.norm(y)
         else:
-            y = rearrange(y, "b l h p -> l b (h p)").contiguous()
+            z, xBC, dt = torch.split(
+                xz,
+                [
+                    self.d_inner_local,
+                    self.d_inner_local + 2 * self.ngroups_local * self.d_state,
+                    self.nheads_local,
+                ],
+                dim=-1,
+            )
 
-        #  l b pd --> pl b d
-        out_full = y @ self.out_proj.weight.t()
-        if self.config.sequence_parallel:
-            out = reduce_scatter_to_sequence_parallel_region(out_full)
-        else:
-            out = reduce_from_tensor_model_parallel_region(out_full)
-        return out
+            # transpose: b l pd --> b pd l
+            xBC = rearrange(xBC, "b l d -> b d l").contiguous()
+
+            # Compute short convolution
+            if conv_state is not None:
+                # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
+                # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
+                conv_state.copy_(
+                    F.pad(xBC, (self.d_conv - xBC.shape[-1], 0))
+                )  # Update state (B D W)
+
+            seqlen = xBC.size(2)
+            if causal_conv1d_fn is None:
+                xBC = self.act(self.conv1d(xBC)[..., :seqlen])
+            else:
+                assert self.activation in ["silu", "swish"]
+                xBC = causal_conv1d_fn(
+                    x=xBC,
+                    weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                )
+
+            # transpose b pd l --> b l pd
+            xBC = rearrange(xBC, "b d l ->  b l d").contiguous()
+
+            x, B, C = torch.split(
+                xBC,
+                [
+                    self.d_inner_local,
+                    self.ngroups_local * self.d_state,
+                    self.ngroups_local * self.d_state,
+                ],
+                dim=-1,
+            )
+
+            # TODO Vijay: fuse most of the transposes with the GEMMS
+            x = rearrange(x, "b l (h p) -> b l h p", p=self.headdim).contiguous()
+            dt = dt.contiguous()
+            B = rearrange(B, "b l (g n) -> b l g n", n=self.d_state).contiguous()
+            C = rearrange(C, "b l (g n) -> b l g n", n=self.d_state).contiguous()
+            z = rearrange(z, "b l (h p) -> b l h p", p=self.headdim).contiguous()
+            y = mamba_chunk_scan_combined(
+                x,
+                dt,
+                A,
+                B,
+                C,
+                self.chunk_size,
+                D=(
+                    rearrange(self.D.float(), "(h p) -> h p", p=self.headdim)
+                    if self.D_has_hdim
+                    else self.D
+                ),
+                z=z if not self.rmsnorm else None,
+                dt_bias=self.dt_bias.float(),
+                dt_softplus=True,
+                return_final_states=ssm_state is not None,
+            )
+
+            if ssm_state is not None:
+                y, last_state = y
+                ssm_state.copy_(last_state)
+
+            if self.rmsnorm:
+                y = rearrange(y, "b l h p -> b l (h p)").contiguous()
+                z = rearrange(z, "b l h p -> b l (h p)").contiguous()
+                y = self.norm(y, z)
+            else:
+                y = rearrange(y, "b l h p -> b l (h p)").contiguous()
+
+        y = rearrange(y, "b l d -> l b d").contiguous()
+        out, out_bias = self.out_proj(y)
+
+        return out, out_bias
 
     def step(self, hidden_states, conv_state, ssm_state):
         # assert self.ngroups_local == 1, "Only support ngroups=1 for inference for now"
