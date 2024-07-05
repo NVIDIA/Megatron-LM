@@ -284,8 +284,8 @@ def get_rng_state(use_dist_ckpt: bool = False):
     return rng_state_list
 
 
-def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
-                    num_floating_point_operations_so_far, checkpointing_context=None):
+def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, checkpointing_context=None,
+                    pipeline_rank=None,expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None):
     """Save a model checkpoint.
 
     Checkpointing context is used to persist some checkpointing state
@@ -305,7 +305,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
     rng_state = get_rng_state(args.use_dist_ckpt)
 
     # Checkpoint name.
-    checkpoint_name = get_checkpoint_name(args.save, iteration, return_base_dir=args.use_dist_ckpt)
+    checkpoint_name = get_checkpoint_name(args.save, iteration, release=False, pipeline_parallel=pipeline_parallel,
+        tensor_rank=tensor_rank, pipeline_rank=pipeline_rank, expert_parallel=expert_parallel, expert_rank=expert_rank, return_base_dir=args.use_dist_ckpt)
 
     # Save distributed optimizer's custom parameter state.
     if args.use_distributed_optimizer and not args.no_save_optim and optimizer is not None and not args.use_dist_ckpt:
