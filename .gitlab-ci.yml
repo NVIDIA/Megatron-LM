@@ -42,7 +42,7 @@ metadata:
   image: python:3.10
   stage: .pre
   tags: 
-    - 8xL40S
+    - os/linux
   script:
     - env
     - |
@@ -62,7 +62,7 @@ metadata:
 
 build_image:
   tags:
-    - 8xL40S
+    - mcore-docker-node
   image: docker:26.1.4-dind
   needs: []  # May start ASAP
   stage: build
