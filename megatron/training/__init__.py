@@ -3,10 +3,7 @@
 import torch
 
 from .global_vars import get_args
-from .global_vars import get_current_global_batch_size
-from .global_vars import get_num_microbatches
 from .global_vars import get_signal_handler
-from .global_vars import update_num_microbatches
 from .global_vars import get_tokenizer
 from .global_vars import get_tensorboard_writer
 from .global_vars import get_wandb_writer

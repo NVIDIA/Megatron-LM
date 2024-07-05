@@ -4,6 +4,7 @@ from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.inference_params import InferenceParams
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator
 from megatron.core.package_info import (
     __contact_emails__,
     __contact_names__,
@@ -28,6 +29,7 @@ __all__ = [
     "utils",
     "DistributedDataParallel",
     "InferenceParams",
+    "init_num_microbatches_calculator",
     "ModelParallelConfig",
     "Timers",
 ]
