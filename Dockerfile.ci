@@ -8,8 +8,11 @@ RUN sed -i -e 's/^APT/# APT/' -e 's/^DPkg/# DPkg/' \
       /etc/apt/apt.conf.d/docker-clean
 
 RUN apt-get update && \
-      apt-get install -y --no-install-recommends && \
+      apt-get install -y --no-install-recommends gettext && \
       apt-get clean
+
+RUN wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq && \
+chmod a+x /usr/local/bin/yq
 
 RUN pip3 install --no-cache-dir \
       einops \
