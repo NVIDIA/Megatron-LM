@@ -115,7 +115,11 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
         return
     assert isinstance(out, torch.Tensor), "expected Tensor, found %s." % type(out).__name__
     assert out._base is None, "counter-productive to free a view of another tensor."
-    out.data = torch.empty((1,), device=out.device, dtype=out.dtype,)
+    out.data = torch.empty(
+        (1,),
+        device=out.device,
+        dtype=out.dtype,
+    )
 
 
 def custom_backward(output, grad_output):
@@ -136,7 +140,10 @@ def custom_backward(output, grad_output):
     # Handle scalar output
     if grad_output is None:
         assert output.numel() == 1, "implicit grad requires scalar output."
-        grad_output = torch.ones_like(output, memory_format=torch.preserve_format,)
+        grad_output = torch.ones_like(
+            output,
+            memory_format=torch.preserve_format,
+        )
 
     # Call c++ engine [ see torch/csrc/autograd/python_engine.cpp ]
     Variable._execution_engine.run_backward(
@@ -174,7 +181,6 @@ def forward_step(
     is_first_microbatch=False,
     current_microbatch=None,
 ):
-
     """Forward step for passed-in model.
 
     If first stage, input tensor is obtained from data_iterator, otherwise
@@ -648,7 +654,9 @@ def forward_backward_pipelining_with_interleaving(
             collect_non_loss_data,
             checkpoint_activations_microbatch,
             check_first_val_step(
-                first_val_step, forward_only, is_first_microbatch_for_model_chunk(microbatch_id),
+                first_val_step,
+                forward_only,
+                is_first_microbatch_for_model_chunk(microbatch_id),
             ),
             current_microbatch=current_microbatch,
         )
@@ -1100,7 +1108,7 @@ def recv_backward(tensor_shapes, config):
 def send_forward(output_tensors, tensor_shapes, config):
     if not isinstance(output_tensors, list):
         output_tensors = [output_tensors]
-    for (output_tensor, tensor_shape) in zip(output_tensors, tensor_shapes):
+    for output_tensor, tensor_shape in zip(output_tensors, tensor_shapes):
         if tensor_shape is None:
             continue
         p2p_communication.send_forward(output_tensor, config)
@@ -1109,7 +1117,7 @@ def send_forward(output_tensors, tensor_shapes, config):
 def send_backward(input_tensor_grads, tensor_shapes, config):
     if not isinstance(input_tensor_grads, list):
         input_tensor_grads = [input_tensor_grads]
-    for (input_tensor_grad, tensor_shape) in zip(input_tensor_grads, tensor_shapes):
+    for input_tensor_grad, tensor_shape in zip(input_tensor_grads, tensor_shapes):
         if tensor_shape is None:
             continue
         p2p_communication.send_backward(input_tensor_grad, config)
@@ -1119,7 +1127,7 @@ def send_forward_recv_backward(output_tensors, tensor_shapes, config):
     if not isinstance(output_tensors, list):
         output_tensors = [output_tensors]
     output_tensor_grads = []
-    for (output_tensor, tensor_shape) in zip(output_tensors, tensor_shapes):
+    for output_tensor, tensor_shape in zip(output_tensors, tensor_shapes):
         if tensor_shape is None:
             output_tensor_grads.append(None)
             continue
@@ -1134,7 +1142,7 @@ def send_backward_recv_forward(input_tensor_grads, tensor_shapes, config):
     if not isinstance(input_tensor_grads, list):
         input_tensor_grads = [input_tensor_grads]
     input_tensors = []
-    for (input_tensor_grad, tensor_shape) in zip(input_tensor_grads, tensor_shapes):
+    for input_tensor_grad, tensor_shape in zip(input_tensor_grads, tensor_shapes):
         if tensor_shape is None:
             input_tensors.append(None)
             continue

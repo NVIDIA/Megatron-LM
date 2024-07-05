@@ -28,6 +28,7 @@ class MambaLayer(MegatronModule):
         self,
         config: TransformerConfig,
         submodules: MambaLayerSubmodules,
+        mamba_ssm_ngroups=8,
         layer_idx=None,
         residual_in_fp32=False,
     ):
@@ -38,7 +39,11 @@ class MambaLayer(MegatronModule):
         self.config = config
         self.residual_in_fp32 = residual_in_fp32
         self.mixer = build_module(
-            submodules.mixer, self.config, self.config.hidden_size, layer_idx=layer_idx,
+            submodules.mixer,
+            self.config,
+            self.config.hidden_size,
+            ngroups=mamba_ssm_ngroups,
+            layer_idx=layer_idx,
         )
         self.norm = build_module(submodules.norm, self.config, self.config.hidden_size)
 
