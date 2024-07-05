@@ -65,6 +65,8 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
             self.unique_description.encode("utf-8")
         ).hexdigest()
 
+        self.built_anew_on_cache_miss = False
+
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: LowLevelDataset) -> int:
         """Return the number of elements in the underlying low level dataset for the purpose of
