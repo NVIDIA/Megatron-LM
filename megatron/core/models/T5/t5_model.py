@@ -198,6 +198,8 @@ class T5Model(LanguageModule):
         decoder_attn_mask: Tensor,
         encoder_decoder_attn_mask: Tensor,
         lm_labels: Tensor = None,
+        encoder_hidden_states: Tensor = None,
+        output_encoder_hidden_only: bool = False,
         inference_params: InferenceParams = None,
     ) -> Tensor:
         """Forward pass.
@@ -222,36 +224,45 @@ class T5Model(LanguageModule):
         ) = t5_extended_attention_mask(
             [encoder_attn_mask, decoder_attn_mask, encoder_decoder_attn_mask]
         )
-        encoder_position_ids = t5_position_ids(encoder_input_ids)
-        decoder_position_ids = t5_position_ids(decoder_input_ids)
 
         ## Encoder forward
-        # Encoder embedding.
-        if self.pre_process:
-            encoder_input = self.embedding(
-                input_ids=encoder_input_ids, position_ids=encoder_position_ids
-            )
-        else:
-            # intermediate stage of pipeline
-            encoder_input = None
+        if encoder_hidden_states is None:
+            # Encoder position ids
+            encoder_position_ids = t5_position_ids(encoder_input_ids)
 
-        # Rotary positional embeddings
-        rotary_pos_emb = None
-        if self.position_embedding_type == 'rope':
-            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_params, self.encoder, encoder_input, self.config
-            )
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+            # Encoder embedding.
+            if self.pre_process:
+                encoder_input = self.embedding(
+                    input_ids=encoder_input_ids, position_ids=encoder_position_ids
+                )
+            else:
+                # intermediate stage of pipeline
+                encoder_input = None
 
-        # Run encoder.
-        encoder_hidden_states = self.encoder(
-            hidden_states=encoder_input,
-            attention_mask=encoder_attn_mask,
-            inference_params=inference_params,
-            rotary_pos_emb=rotary_pos_emb,
-        )
+            # Rotary positional embeddings
+            rotary_pos_emb = None
+            if self.position_embedding_type == 'rope':
+                rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                    inference_params, self.encoder, encoder_input, self.config
+                )
+                rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+
+            # Run encoder.
+            encoder_hidden_states = self.encoder(
+                hidden_states=encoder_input,
+                attention_mask=encoder_attn_mask,
+                inference_params=inference_params,
+                rotary_pos_emb=rotary_pos_emb,
+            )
+
+        # Return encoder hiddenstates if output_encoder_hidden_only is True
+        if output_encoder_hidden_only:
+            return encoder_hidden_states
 
         ## Decoder forward
+        # Decoder position ids
+        decoder_position_ids = t5_position_ids(decoder_input_ids)
+
         # Decoder embedding.
         if self.pre_process:
             decoder_input = self.embedding(
@@ -298,7 +309,7 @@ class T5Model(LanguageModule):
         return loss
 
     def set_input_tensor(self, input_tensor):
-        """ See megatron.model.transformer.set_input_tensor()"""
+        """See megatron.model.transformer.set_input_tensor()"""
 
         # This is usually handled in schedules.py but some inference code still
         # gives us non-lists or None
@@ -416,7 +427,10 @@ def t5_extended_attention_mask(attention_mask_list: List[Tensor]) -> List[Tensor
         extended_attention_mask = attn_mask.unsqueeze(1)
         return extended_attention_mask
 
-    return [attn_mask_postprocess(attn_mask) for attn_mask in attention_mask_list]
+    return [
+        (attn_mask_postprocess(attn_mask) if attn_mask is not None else None)
+        for attn_mask in attention_mask_list
+    ]
 
 
 def t5_position_ids(token_ids: Tensor) -> Tensor:
