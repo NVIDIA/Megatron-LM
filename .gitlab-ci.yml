@@ -127,6 +127,7 @@ build_image:
   interruptible: true
   retry:
     max: 2
+    when: job_execution_timeout
 
 unit_tests:
   extends: [.unit_test_common]
@@ -162,12 +163,6 @@ unit_tests-dist-checkpointing:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: never
     - when: always
-
-unit_tests-fusions:
-  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
-  tags:
-    - 8xL40S
-  stage: unit_tests
 
 unit_tests-fusions:
   extends: [.unit_test_common]

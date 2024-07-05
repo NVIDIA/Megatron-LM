@@ -30,6 +30,7 @@ jet-setup:
   interruptible: true
   retry:
     max: 2
+    when: job_execution_timeout
 
 jet-configure:
   image: 
@@ -59,6 +60,7 @@ jet-configure:
   interruptible: true
   retry:
     max: 2
+    when: job_execution_timeout
 
 jet-trigger:
   stage: functional_tests
