@@ -10,15 +10,27 @@ import os
 import shutil
 import struct
 import time
+from abc import ABC, abstractmethod
 from enum import Enum
 from functools import lru_cache
 from itertools import accumulate
 from types import TracebackType
 from typing import List, Optional, Tuple, Type, Union
 
+try:
+    import boto3
+except ModuleNotFoundError:
+    pass
 import numpy
 import torch
 
+from megatron.core.datasets.utils_s3 import (
+    S3Config,
+    is_s3_path,
+    maybe_download_file,
+    object_exists,
+    parse_s3_path,
+)
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -27,8 +39,7 @@ _INDEX_HEADER = b"MMIDIDX\x00\x00"
 
 
 class DType(Enum):
-    """The NumPy data type Enum for writing/reading the IndexedDataset indices
-    """
+    """The NumPy data type Enum for writing/reading the IndexedDataset indices"""
 
     uint8 = 1
     int8 = 2
@@ -300,8 +311,7 @@ class _IndexReader(object):
         )
 
     def __del__(self) -> None:
-        """Clean up the object
-        """
+        """Clean up the object"""
         if hasattr(self, "bin_buffer_mmap"):
             self.bin_buffer_mmap._mmap.close()
             del self.bin_buffer_mmap
@@ -331,26 +341,212 @@ class _IndexReader(object):
         )
 
 
+class _BinReader(ABC):
+    """Abstract class to read the data (.bin) file"""
+
+    @abstractmethod
+    def read(self, dtype: Type[numpy.number], count: int, offset: int) -> numpy.ndarray:
+        """Read bytes into a numpy array.
+
+        Args:
+            dtype (Type[numpy.number]): Data-type of the returned array.
+
+            count (int): Number of items to read.
+
+            offset (int): Start reading from this offset (in bytes).
+
+        Returns:
+            numpy.ndarray: An array with `count` items and data-type `dtype` constructed from reading bytes from the data file starting at `offset`.
+        """
+        pass
+
+
+class _MMapBinReader(_BinReader):
+    """A _BinReader that memory maps the data (.bin) file
+
+    Args:
+        bin_path (str): bin_path (str): The path to the data (.bin) file.
+    """
+
+    def __init__(self, bin_path: str) -> None:
+        self._bin_buffer_mmap = numpy.memmap(bin_path, mode="r", order="C")
+        self._bin_buffer = memoryview(self._bin_buffer_mmap)
+
+    def read(self, dtype: Type[numpy.number], count: int, offset: int) -> numpy.ndarray:
+        """Read bytes into a numpy array.
+
+        Args:
+            dtype (Type[numpy.number]): Data-type of the returned array.
+
+            count (int): Number of items to read.
+
+            offset (int): Start reading from this offset (in bytes).
+
+        Returns:
+            numpy.ndarray: An array with `count` items and data-type `dtype` constructed from reading bytes from the data file starting at `offset`.
+        """
+        return numpy.frombuffer(
+            self._bin_buffer,
+            dtype=dtype,
+            count=count,
+            offset=offset,
+        )
+
+    def __del__(self) -> None:
+        """Clean up the object."""
+        if self._bin_buffer_mmap is not None:
+            self._bin_buffer_mmap._mmap.close()
+        del self._bin_buffer_mmap
+
+
+class _FileBinReader(_BinReader):
+    """A _BinReader that reads from the data (.bin) file using a file pointer
+
+    Args:
+        bin_path (str): bin_path (str): The path to the data (.bin) file.
+    """
+
+    def __init__(self, bin_path: str) -> None:
+        self._bin_path = bin_path
+
+    def read(self, dtype: Type[numpy.number], count: int, offset: int) -> numpy.ndarray:
+        """Read bytes into a numpy array.
+
+        Args:
+            dtype (Type[numpy.number]): Data-type of the returned array.
+
+            count (int): Number of items to read.
+
+            offset (int): Start reading from this offset (in bytes).
+
+        Returns:
+            numpy.ndarray: An array with `count` items and data-type `dtype` constructed from reading bytes from the data file starting at `offset`.
+        """
+        sequence = numpy.empty(count, dtype=dtype)
+        with open(self._bin_path, mode='rb', buffering=0) as bin_buffer_file:
+            bin_buffer_file.seek(offset)
+            bin_buffer_file.readinto(sequence)
+        return sequence
+
+
+class _S3BinReader(_BinReader):
+    """A _BinReader that reads from the data (.bin) file from S3
+
+    Args:
+        bin_path (str): bin_path (str): The path to the data (.bin) file.
+
+        bin_chunk_nbytes (int, optional): If not None, then maintain an in-memory cache to speed up calls to the `read` method. Furthermore, on a cache miss, download this number of bytes to refresh the cache. Otherwise (None), do not maintain an in-memory cache. A class that inherits from _BinReader may not implement caching in which case it should assert that `bin_chunk_nbytes` is None at initialization.
+    """
+
+    def __init__(self, bin_path: str, bin_chunk_nbytes: int) -> None:
+        assert bin_chunk_nbytes > 0
+        self._client = boto3.client("s3")
+        self._s3_bucket, self._s3_key = parse_s3_path(bin_path)
+        self._cache = None
+        self._cache_bytes_start = None
+        self._cache_bytes_end = None
+        self._cache_nbytes = bin_chunk_nbytes
+
+    def _extract_from_cache(self, offset: int, size: int) -> bytes:
+        """Extract `size` bytes starting at `offset` bytes into the cache"""
+        start = offset - self._cache_bytes_start
+        assert start >= 0
+        end = start + size
+        assert end <= len(self._cache)
+        return self._cache[start:end]
+
+    def read(self, dtype: Type[numpy.number], count: int, offset: int) -> numpy.ndarray:
+        """Read bytes into a numpy array.
+
+        Let `size` be the `count` * `DType.size(dtype)`. If the requested span of bytes [`offset`,
+        `offset` + `size`) is covered by the in-memory cache maintained by this class, then this
+        function extracts the requested span from that cache and returns it. Otherwise, this
+        function first refreshes the cache and then extracts the requested span from the refreshed
+        cache and returns it.
+
+        The cache is refreshed based on `offset` and `size`. In particular, we divide all the bytes
+        in an S3 object into blocks, where each block contains `bin_chunk_nbytes` bytes. We assign
+        each block an index starting from 0. We take the block with index (`offset` //
+        `bin_chunk_nbytes`) to refresh the cache. If this new block still does not cover the
+        requested span, we extend it just enough to include `offset` + `size`.
+
+        Args:
+            dtype (Type[numpy.number]): Data-type of the returned array.
+
+            count (int): Number of items to read.
+
+            offset (int): Start reading from this offset (in bytes).
+
+        Returns:
+            numpy.ndarray: An array with `count` items and data-type `dtype` constructed from reading bytes from the data file starting at `offset`.
+        """
+        size = count * DType.size(dtype)
+        if (
+            self._cache is not None
+            and offset >= self._cache_bytes_start
+            and offset + size <= self._cache_bytes_end
+        ):
+            return numpy.frombuffer(self._extract_from_cache(offset, size), dtype=dtype)
+
+        bytes_start = (offset // self._cache_nbytes) * self._cache_nbytes
+        assert bytes_start >= 0
+        assert offset >= bytes_start
+        bytes_end = max(bytes_start + self._cache_nbytes, offset + size)
+        assert bytes_end >= 1
+        self._cache = self._client.get_object(
+            Bucket=self._s3_bucket,
+            Key=self._s3_key,
+            # Subtract 1, because the end of Range is inclusive.
+            Range=f'bytes={bytes_start}-{bytes_end-1}',
+        )['Body'].read()
+        self._cache_bytes_start = bytes_start
+        self._cache_bytes_end = bytes_end
+        return numpy.frombuffer(self._extract_from_cache(offset, size), dtype=dtype)
+
+    def __del__(self) -> None:
+        """Clean up the object"""
+        self._client.close()
+
+
 class IndexedDataset(torch.utils.data.Dataset):
     """The low-level interface dataset class
 
     Args:
         path_prefix (str): The index (.idx) and data (.bin) prefix
 
-        multimodal (bool, optional): Whether the dataset is multimodal. Defaults to False.
+        multimodal (bool): Whether the dataset is multimodal. Defaults to False.
 
-        mmap (bool, optional): Whether to mmap the .bin files. Defaults to True.
+        mmap (bool): Whether to mmap the .bin files. Defaults to True.
+
+        s3_config (Optional[S3Config]): Supplied only for data stored on S3. IndexedDataset downloads the index (.idx) file to `s3_config.path_to_idx_cache` and streams data from the data (.bin) file in `s3_config.bin_chunk_nbytes` blocks. Note that `mmap` must be disabled for S3 data loading. Defaults to None.
     """
 
-    def __init__(self, path_prefix: str, multimodal: bool = False, mmap: bool = True) -> None:
+    def __init__(
+        self,
+        path_prefix: str,
+        multimodal: bool = False,
+        mmap: bool = True,
+        s3_config: Optional[S3Config] = None,
+    ) -> None:
         super().__init__()
         self.path_prefix = None
         self.multimodal = None
         self.mmap = None
+        self.s3_config = None
 
-        self.initialize(path_prefix, multimodal, mmap)
+        self.index = None
+        self.bin_reader = None
 
-    def initialize(self, path_prefix: str, multimodal: bool, mmap: bool) -> None:
+        if is_s3_path(path_prefix) and s3_config is not None:
+            idx_path = get_idx_path(path_prefix)
+            cache_idx_path = os.path.join(s3_config.path_to_idx_cache, os.path.basename(idx_path))
+            maybe_download_file(idx_path, cache_idx_path)
+
+        self.initialize(path_prefix, multimodal, mmap, s3_config)
+
+    def initialize(
+        self, path_prefix: str, multimodal: bool, mmap: bool, s3_config: Optional[S3Config]
+    ) -> None:
         """Initialize the dataset
 
         This method is called by IndexedDataset.__init__ during object creation and by
@@ -362,47 +558,52 @@ class IndexedDataset(torch.utils.data.Dataset):
             multimodal (bool): Whether the dataset is multimodal
 
             mmap (bool): Whether to mmap the .bin file
+
+            s3_config (Optional[S3Config]): See IndexedDataset docstring for details.
         """
         idx_path = get_idx_path(path_prefix)
         bin_path = get_bin_path(path_prefix)
-        assert os.path.exists(idx_path) and os.path.exists(
-            bin_path
-        ), f"One or both of the .idx and .bin files cannot be found at the path prefix {path_prefix}"
-
+        if s3_config is None:
+            assert os.path.exists(idx_path) and os.path.exists(
+                bin_path
+            ), f"One or both of the .idx and .bin files cannot be found at the path prefix {path_prefix}"
         self.path_prefix = path_prefix
         self.multimodal = multimodal
         self.mmap = mmap
-
-        self.index = _IndexReader(idx_path, self.multimodal)
-        self.bin_buffer = None
-        self.bin_buffer_mmap = None
+        self.s3_config = s3_config
         if mmap:
-            self.bin_buffer_mmap = numpy.memmap(bin_path, mode="r", order="C")
-            self.bin_buffer = memoryview(self.bin_buffer_mmap)
+            assert not s3_config
+            self.bin_reader = _MMapBinReader(bin_path)
+        elif s3_config:
+            assert not mmap
+            self.bin_reader = _S3BinReader(bin_path, s3_config.bin_chunk_nbytes)
+            idx_path = os.path.join(
+                s3_config.path_to_idx_cache, os.path.basename(get_idx_path(path_prefix))
+            )
+        else:
+            self.bin_reader = _FileBinReader(bin_path)
+        self.index = _IndexReader(idx_path, self.multimodal)
 
-    def __getstate__(self) -> Tuple[str, bool, bool]:
+    def __getstate__(self) -> Tuple[str, bool, bool, Optional[S3Config]]:
         """Get the state during pickling
 
         Returns:
-            Tuple[str, bool, bool]: The state tuple
+            Tuple[str, bool, bool, Optional[S3Config]]: The state tuple
         """
-        return self.path_prefix, self.multimodal, self.mmap
+        return self.path_prefix, self.multimodal, self.mmap, self.s3_config
 
-    def __setstate__(self, state: Tuple[str, bool, bool]) -> None:
+    def __setstate__(self, state: Tuple[str, bool, bool, Optional[S3Config]]) -> None:
         """Set the state during un-pickling
 
         Args:
-            state (Tuple[str, bool, bool]): The state tuple
+            state (Tuple[str, bool, bool, Optional[S3Config]]): The state tuple
         """
-        path_prefix, multimodal, mmap = state
-        self.initialize(path_prefix, multimodal, mmap)
+        path_prefix, multimodal, mmap, s3_config = state
+        self.initialize(path_prefix, multimodal, mmap, s3_config)
 
     def __del__(self) -> None:
-        """Clean up the object
-        """
-        if self.bin_buffer_mmap is not None:
-            self.bin_buffer_mmap._mmap.close()
-        del self.bin_buffer_mmap
+        """Clean up the object"""
+        del self.bin_reader
         del self.index
 
     def __len__(self) -> int:
@@ -412,80 +613,6 @@ class IndexedDataset(torch.utils.data.Dataset):
             int: The length of the dataset
         """
         return len(self.index)
-
-    def _getitem_mmap(
-        self, idx: Union[int, numpy.integer, slice]
-    ) -> Union[numpy.ndarray, Tuple[numpy.ndarray, numpy.ndarray]]:
-        """Return from the dataset by mmap-ing .bin file
-
-        Args:
-            idx (Union[int, numpy.integer, slice]): The index or index slice into the dataset
-
-        Raises:
-            ValueError: When the index slice is non-contiguous
-
-            TypeError: When the index is of an unexpected type
-
-        Returns:
-            Union[numpy.ndarray, Tuple[numpy.ndarray, numpy.ndarray]]: The sequence tokens and modes at the index or index slice
-        """
-        if isinstance(idx, (int, numpy.integer)):
-            sequence_pointer, sequence_length, sequence_mode = self.index[idx]
-            sequence = numpy.frombuffer(
-                self.bin_buffer,
-                dtype=self.index.dtype,
-                count=sequence_length,
-                offset=sequence_pointer,
-            )
-            return (sequence, sequence_mode) if sequence_mode is not None else sequence
-        elif isinstance(idx, slice):
-            start, stop, step = idx.indices(len(self))
-            if step != 1:
-                raise ValueError("Slices into indexed_dataset must be contiguous")
-            sequence_lengths = self.index.sequence_lengths[idx]
-            sequence_modes = self.index.sequence_modes[idx] if self.multimodal else None
-            sequence_offsets = list(accumulate(sequence_lengths))
-            sequences = numpy.split(
-                numpy.frombuffer(
-                    self.bin_buffer,
-                    dtype=self.index.dtype,
-                    count=sum(sequence_lengths),
-                    offset=self.index.sequence_pointers[start],
-                ),
-                sequence_offsets[:-1],
-            )
-            return (sequences, sequence_modes) if sequence_modes is not None else sequences
-        else:
-            raise TypeError("Unexpected type received for idx: {}".format(type(idx)))
-
-    def _getitem_file(
-        self, idx: Union[int, numpy.integer, slice]
-    ) -> Union[numpy.ndarray, Tuple[numpy.ndarray, numpy.ndarray]]:
-        """Return from the dataset by using file pointer
-
-        Args:
-            idx (Union[int, numpy.integer, slice]): The index or index slice into the dataset
-
-        Raises:
-            ValueError: When the index slice is non-contiguous
-
-            TypeError: When the index is of an unexpected type
-
-        Returns:
-            Union[numpy.ndarray, Tuple[numpy.ndarray, numpy.ndarray]]: The sequence tokens and
-            modes at the index or index slice
-        """
-        if isinstance(idx, (int, numpy.integer)):
-            sequence_pointer, sequence_length, sequence_mode = self.index[idx]
-            sequence = numpy.empty(sequence_length, dtype=self.index.dtype)
-            with open(get_bin_path(self.path_prefix), mode='rb', buffering=0) as bin_buffer_file:
-                bin_buffer_file.seek(sequence_pointer)
-                bin_buffer_file.readinto(sequence)
-            return (sequence, sequence_mode) if sequence_mode is not None else sequence
-        elif isinstance(idx, slice):
-            assert False, "slicing not implemented without mmap"
-        else:
-            raise TypeError("Unexpected type received for idx: {}".format(type(idx)))
 
     def __getitem__(
         self, idx: Union[int, numpy.integer, slice]
@@ -501,13 +628,34 @@ class IndexedDataset(torch.utils.data.Dataset):
             TypeError: When the index is of an unexpected type
 
         Returns:
-            Union[numpy.ndarray, Tuple[numpy.ndarray, numpy.ndarray]]: The sequence tokens and
-            modes at the index or index slice
+            Union[numpy.ndarray, Tuple[numpy.ndarray, numpy.ndarray]]: The sequence tokens and modes at the index or index slice
         """
-        if self.bin_buffer_mmap is not None:
-            return self._getitem_mmap(idx)
+        if isinstance(idx, (int, numpy.integer)):
+            sequence_pointer, sequence_length, sequence_mode = self.index[idx]
+            sequence = self.bin_reader.read(
+                dtype=self.index.dtype,
+                count=sequence_length,
+                offset=sequence_pointer,
+            )
+            return (sequence, sequence_mode) if sequence_mode is not None else sequence
+        elif isinstance(idx, slice):
+            start, stop, step = idx.indices(len(self))
+            if step != 1:
+                raise ValueError("Slices into indexed_dataset must be contiguous")
+            sequence_lengths = self.index.sequence_lengths[idx]
+            sequence_modes = self.index.sequence_modes[idx] if self.multimodal else None
+            sequence_offsets = list(accumulate(sequence_lengths))
+            sequences = numpy.split(
+                self.bin_reader.read(
+                    dtype=self.index.dtype,
+                    count=sum(sequence_lengths),
+                    offset=self.index.sequence_pointers[start],
+                ),
+                sequence_offsets[:-1],
+            )
+            return (sequences, sequence_modes) if sequence_modes is not None else sequences
         else:
-            return self._getitem_file(idx)
+            raise TypeError("Unexpected type received for idx: {}".format(type(idx)))
 
     def get(self, idx: int, offset: int = 0, length: Optional[int] = None) -> numpy.ndarray:
         """Retrieve a single item from the dataset with the option to only
@@ -529,16 +677,9 @@ class IndexedDataset(torch.utils.data.Dataset):
         if length is None:
             length = sequence_length - offset
         sequence_pointer += offset * DType.size(self.index.dtype)
-        if self.bin_buffer:
-            sequence = numpy.frombuffer(
-                self.bin_buffer, dtype=self.index.dtype, count=length, offset=sequence_pointer
-            )
-        else:
-            sequence = numpy.empty(length, dtype=self.index.dtype)
-            with open(get_bin_path(self.path_prefix), mode='rb', buffering=0) as bin_buffer_file:
-                bin_buffer_file.seek(sequence_pointer)
-                bin_buffer_file.readinto(sequence)
-
+        sequence = self.bin_reader.read(
+            dtype=self.index.dtype, count=length, offset=sequence_pointer
+        )
         return (sequence, sequence_mode) if sequence_mode is not None else sequence
 
     @property
@@ -598,6 +739,11 @@ class IndexedDataset(torch.utils.data.Dataset):
         Returns:
             bool: Whether the IndexedDataset exists on disk at the prefix
         """
+        if is_s3_path(path_prefix):
+            s3_client = boto3.client("s3")
+            return object_exists(s3_client, get_idx_path(path_prefix)) and object_exists(
+                s3_client, get_bin_path(path_prefix)
+            )
         return os.path.exists(get_idx_path(path_prefix)) and os.path.exists(
             get_bin_path(path_prefix)
         )
@@ -659,8 +805,7 @@ class IndexedDatasetBuilder(object):
             self.sequence_modes.extend(modes if modes is not None else [0] * lengths)
 
     def end_document(self) -> None:
-        """Finalize the document, for use with IndexedDatasetBuilder.add_item
-        """
+        """Finalize the document, for use with IndexedDatasetBuilder.add_item"""
         self.document_indices.append(len(self.sequence_lengths))
 
     def add_index(self, path_prefix: str) -> None:
