@@ -273,7 +273,6 @@ def unpermute_with_padded_tokens(
         restore_shape,
         dtype=combined_output.dtype,
         device=combined_output.device,
-        requires_grad=True,
     )
 
     # Scatter the combined tokens back to their original positions
