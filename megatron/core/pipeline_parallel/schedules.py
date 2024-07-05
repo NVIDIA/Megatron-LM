@@ -10,7 +10,12 @@ from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import p2p_communication
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
-from megatron.core.utils import get_attr_wrapped_model, get_model_config, get_model_type
+from megatron.core.utils import (
+    drain_embedding_wgrad_compute,
+    get_attr_wrapped_model,
+    get_model_config,
+    get_model_type,
+)
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -434,6 +439,45 @@ def forward_backward_no_pipelining(
     return forward_data_store
 
 
+def clear_embedding_activation_buffer(config, model):
+
+    if (
+        parallel_state.is_pipeline_last_stage(ignore_virtual=True)
+        and config.defer_embedding_wgrad_compute
+    ):
+        if isinstance(model, list):
+            embedding_module = get_attr_wrapped_model(
+                model[-1], 'post_process', return_model_obj=True
+            )
+        else:
+            embedding_module = get_attr_wrapped_model(model, 'post_process', return_model_obj=True)
+
+        # Need to ensure no stray activations exists in this buffer
+        embedding_module.embedding_activation_buffer.clear()
+
+        return embedding_module
+    else:
+        return None
+
+
+def finish_embedding_wgrad_compute(config, embedding_module):
+    if (
+        parallel_state.is_pipeline_last_stage(ignore_virtual=True)
+        and config.defer_embedding_wgrad_compute
+    ):
+        embedding_activation_buffer = embedding_module.embedding_activation_buffer
+        grad_output_buffer = embedding_module.grad_output_buffer
+        weight = (
+            embedding_module.output_layer.weight
+            if embedding_module.share_embeddings_and_output_weights
+            else embedding_module.shared_embedding_or_output_weight()
+        )
+
+        drain_embedding_wgrad_compute(
+            config, embedding_activation_buffer, grad_output_buffer, weight
+        )
+
+
 def forward_backward_pipelining_with_interleaving(
     *,
     forward_step_func,
@@ -460,6 +504,10 @@ def forward_backward_pipelining_with_interleaving(
     config = get_model_config(model[0])
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
+
+    # Needed only when gradients are finalized in M-Core
+    if config.finalize_model_grads_func is not None and not forward_only:
+        embedding_module = clear_embedding_activation_buffer(config, model)
 
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
@@ -1031,6 +1079,11 @@ def forward_backward_pipelining_with_interleaving(
                     synchronized_model_chunks.add(model_chunk_id)
 
     if config.finalize_model_grads_func is not None and not forward_only:
+
+        # If defer_embedding_wgrad_compute is enabled we need to do the
+        # weight gradient GEMM's here.
+        finish_embedding_wgrad_compute(config, embedding_module)
+
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism, layernorm all-reduce for sequence parallelism, and
         # embedding all-reduce for pipeline parallelism).
@@ -1187,6 +1240,10 @@ def forward_backward_pipelining_without_interleaving(
         raise ValueError(
             "Non-interleaved pipeline parallelism does not support overlapping p2p communication"
         )
+
+    # Needed only when gradients are finalized in M-Core
+    if config.finalize_model_grads_func is not None and not forward_only:
+        embedding_module = clear_embedding_activation_buffer(config, model)
 
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
@@ -1402,6 +1459,11 @@ def forward_backward_pipelining_without_interleaving(
                 config.grad_sync_func(model.parameters())
 
     if config.finalize_model_grads_func is not None and not forward_only:
+
+        # If defer_embedding_wgrad_compute is enabled we need to do the
+        # weight gradient GEMM's here.
+        finish_embedding_wgrad_compute(config, embedding_module)
+
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism, layernorm all-reduce for sequence parallelism, and
         # embedding all-reduce for pipeline parallelism).

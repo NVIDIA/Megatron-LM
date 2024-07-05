@@ -1399,6 +1399,13 @@ def _add_distributed_args(parser):
                        help='Timeout minutes for torch.distributed.')
     group.add_argument('--overlap-grad-reduce', action='store_true',
                        default=False, help='If set, overlap DDP grad reduce.')
+    group.add_argument('--defer-embedding-wgrad-compute', action='store_true',
+                       default=False, help='If set, defers the vocabulary projection linear layer weight' 
+                       'gradient compute to pipeline flush.', dest='defer_embedding_wgrad_compute')
+    group.add_argument('--wgrad-deferral-limit', type=int, default=0, help='Number of micro-batches for which'
+                       'weight gradient computation of vocabulary projection is deferred, defaults to 0 which'
+                       'means all the micro-batches are deferred. Invalid if `defer-embedding-wgrad-compute`'
+                       'is not set')
     group.add_argument('--no-delay-grad-reduce', action='store_false',
                        help='If not set, delay / synchronize grad reductions in all but first PP stage.',
                        dest='delay_grad_reduce')

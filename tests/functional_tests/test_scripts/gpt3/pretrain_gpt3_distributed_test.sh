@@ -39,6 +39,10 @@ else
    ADDITIONAL_PARAMS+=" --deterministic-mode"
 fi
 
+if [[ $USE_GA -eq 0 ]]; then
+   ADDITIONAL_PARAMS+=" --no-gradient-accumulation-fusion"
+fi
+
 USE_LEGACY=1
 if [[ $USE_CORE -eq 1 ]]; then
        echo "Running using megatron core"
@@ -129,7 +133,6 @@ build_torch_run_cmd() {
        ${EP_SIZE:+--expert-model-parallel-size "$EP_SIZE"} \
        ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
        ${USE_LEGACY:+--use-legacy-models} \
-       --no-gradient-accumulation-fusion \
        ${DATA_CACHE:+--data-cache-path "$DATA_CACHE"} \
        --${TRAINING_DTYPE}"
 

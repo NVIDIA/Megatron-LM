@@ -27,6 +27,7 @@ def test_LinearWithFrozenWeight(tensor_parallel, allreduce_dgrad):
     async_grad_allreduce = allreduce_dgrad
     sequence_parallel = False
     grad_output_buffer = None
+    wgrad_deferral_limit = None
 
     output_parallel = linear_with_frozen_weight(
         input_data,
@@ -36,6 +37,7 @@ def test_LinearWithFrozenWeight(tensor_parallel, allreduce_dgrad):
         async_grad_allreduce,
         sequence_parallel,
         grad_output_buffer,
+        wgrad_deferral_limit,
         allreduce_dgrad,
     )
     output = gather_from_tensor_model_parallel_region(
