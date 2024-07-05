@@ -54,7 +54,7 @@ else
     __SAVE_INTERVAL=10000 # inf
 fi
 # Runs the "345M" parameter model
-DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
+DISTRIBUTED_ARGS="--max-restarts 3 --nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 
 torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        pretrain_bert.py \
