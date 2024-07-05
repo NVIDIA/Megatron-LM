@@ -14,6 +14,7 @@ from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
 from megatron.core.datasets.utils import Split
+from megatron.core.datasets.utils_s3 import S3Config, is_s3_path
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Option to draw sequences with one extra token to ensure the sample input tokens and sample
        output tokens are both of the desired sequence length
     """
+
+    s3_cache_path: str = None
+    """Path for caching indices for s3 dataloading."""
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
@@ -137,6 +141,13 @@ class GPTDataset(MegatronDataset):
         Returns:
             IndexedDataset: The underlying IndexedDataset
         """
+        if is_s3_path(dataset_path):
+            return IndexedDataset(
+                dataset_path,
+                multimodal=False,
+                mmap=config.mmap_bin_files,
+                s3_config=S3Config(path_to_idx_cache=config.s3_cache_path),
+            )
         return IndexedDataset(dataset_path, multimodal=False, mmap=config.mmap_bin_files)
 
     def __len__(self) -> int:

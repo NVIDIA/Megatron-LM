@@ -1565,6 +1565,8 @@ def _add_data_args(parser):
                        dest='create_attention_mask_in_dataloader')
     group.add_argument('--num-dataset-builder-threads', type=int, default=1,
                        help='Number of parallel threads per rank for dataset builder')
+    group.add_argument('--s3-cache-path', type=str, default=None,
+                       help='Path to cache index files when using s3 dataloader')
     return parser
 
 

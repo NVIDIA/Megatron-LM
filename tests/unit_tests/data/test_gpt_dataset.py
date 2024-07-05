@@ -20,7 +20,6 @@ else:
 ##
 
 import random
-from types import SimpleNamespace
 
 import numpy
 
