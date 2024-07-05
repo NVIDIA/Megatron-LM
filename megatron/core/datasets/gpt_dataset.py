@@ -48,8 +48,7 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """
 
     def __post_init__(self) -> None:
-        """Do asserts and set fields post init
-        """
+        """Do asserts and set fields post init"""
         super().__post_init__()
 
         assert self.tokenizer is not None
@@ -296,7 +295,7 @@ class GPTDataset(MegatronDataset):
         self,
     ) -> Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]:
         """Build the document index, the sample index, and the shuffle index
-        
+
         The document index:
             -- 1-D
             -- An ordered array of document ids
@@ -351,6 +350,7 @@ class GPTDataset(MegatronDataset):
                 logging.INFO,
                 f"Build and save the {type(self).__name__} {self.index_split.name} indices",
             )
+            self.built_anew_on_cache_miss = True
             t_beg = time.time()
 
             sequence_length = self.config.sequence_length
@@ -579,7 +579,7 @@ def _build_shuffle_index(
     num_samples: int, total_size: int, numpy_random_state: numpy.random.RandomState
 ) -> numpy.ndarray:
     """Build the range [0, size) and shuffle
-    
+
     Args:
         num_samples (int): The size of the first shuffle range [0, num_samples)
 

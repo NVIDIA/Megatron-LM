@@ -47,8 +47,7 @@ class MaskedWordPieceDatasetConfig(BlendedMegatronDatasetConfig):
     """
 
     def __post_init__(self) -> None:
-        """Do asserts and set fields post init
-        """
+        """Do asserts and set fields post init"""
         super().__post_init__()
 
         assert self.tokenizer is not None
@@ -84,7 +83,7 @@ class MaskedWordPieceDataset(MegatronDataset):
     NB: WordPiece tokenization prepends a double hash "##" to all tokens/pieces in a word, save the
     first token/piece.
 
-    Args:    
+    Args:
         indexed_dataset (IndexedDataset): The IndexedDataset around which to build the MegatronDataset
 
         dataset_path (str): The real path on disk to the dataset, for bookkeeping
@@ -155,7 +154,15 @@ class MaskedWordPieceDataset(MegatronDataset):
         )
         path_to_description = get_path_to("description.txt")
         path_to_sample_index = get_path_to("sample_index.npy")
-        cache_hit = all(map(os.path.isfile, [path_to_description, path_to_sample_index,],))
+        cache_hit = all(
+            map(
+                os.path.isfile,
+                [
+                    path_to_description,
+                    path_to_sample_index,
+                ],
+            )
+        )
 
         if self.num_samples is not None:
             num_epochs = numpy.iinfo(numpy.int32).max - 1
@@ -168,6 +175,7 @@ class MaskedWordPieceDataset(MegatronDataset):
                 logging.INFO,
                 f"Build and save the {type(self).__name__} {self.index_split.name} indices",
             )
+            self.built_anew_on_cache_miss = True
 
             os.makedirs(path_to_cache, exist_ok=True)
 
