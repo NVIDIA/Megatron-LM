@@ -25,10 +25,18 @@ from megatron.core.utils import make_viewless_tensor
 
 
 def create_mamba_block(
-    config, mamba_layer_spec, residual_in_fp32=False, layer_idx=None,
+    config,
+    mamba_layer_spec,
+    mamba_ssm_ngroups=8,
+    residual_in_fp32=False,
+    layer_idx=None,
 ):
     block = build_module(
-        mamba_layer_spec, config, residual_in_fp32=residual_in_fp32, layer_idx=layer_idx,
+        mamba_layer_spec,
+        config,
+        mamba_ssm_ngroups=mamba_ssm_ngroups,
+        residual_in_fp32=residual_in_fp32,
+        layer_idx=layer_idx,
     )
     block.layer_idx = layer_idx
     return block
@@ -85,6 +93,7 @@ class MambaStack(MegatronModule):
         self,
         config: TransformerConfig,
         submodules: MambaStackSubmodules,
+        mamba_ssm_ngroups: int = 8,
         residual_in_fp32=False,
         pre_process: bool = True,
         hybrid_attention_ratio: float = 0.0,
@@ -128,6 +137,7 @@ class MambaStack(MegatronModule):
                 block = create_mamba_block(
                     self.config,
                     submodules.mamba_layer,
+                    mamba_ssm_ngroups=mamba_ssm_ngroups,
                     residual_in_fp32=residual_in_fp32,
                     layer_idx=layer_idx,
                 )
@@ -156,7 +166,12 @@ class MambaStack(MegatronModule):
                 eps=self.config.layernorm_epsilon,
             )
 
-        self.apply(partial(_init_weights, n_layer=self.config.num_layers,))
+        self.apply(
+            partial(
+                _init_weights,
+                n_layer=self.config.num_layers,
+            )
+        )
 
     def _select_layers_for_pipeline_parallel(self, layer_type_list):
         pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()

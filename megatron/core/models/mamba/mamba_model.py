@@ -22,6 +22,7 @@ class MambaModel(LanguageModule):
         vocab_size (int): Vocabulary size
         max_sequence_length (int): maximum size of sequence. This is used for positional embedding
         pre_process (bool, optional): Include embedding layer (used with pipeline parallelism). Defaults to True.
+        mamba_ssm_ngroups (int, optional): Specifies the number of groups to use. The default value is 8, as in the NVIDIA Mamba2 (pure and hybrid) 8b. However, in the original Mamba2 paper, the checkpoints use a setting of 1. Defaults to 8.
         hybrid_attention_ratio (float, optional): The target ratio of attention layers to total layers
         hybrid_mlp_ratio (float, optional): The target ratio of mlp layers to total layers
         hybrid_override_pattern (str, optional): The hybrid layer pattern to override with
@@ -41,6 +42,7 @@ class MambaModel(LanguageModule):
         mamba_stack_spec: ModuleSpec,
         vocab_size: int,
         max_sequence_length: int,
+        mamba_ssm_ngroups: int = 8,
         pre_process: bool = True,
         hybrid_attention_ratio: float = 0.0,
         hybrid_mlp_ratio: float = 0.0,
@@ -60,6 +62,7 @@ class MambaModel(LanguageModule):
         self.mamba_stack_spec: ModuleSpec = mamba_stack_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
+        self.mamba_ssm_ngroups = mamba_ssm_ngroups
         self.pre_process = pre_process
         self.hybrid_attention_ratio = hybrid_attention_ratio
         self.hybrid_mlp_ratio = hybrid_mlp_ratio
@@ -93,6 +96,7 @@ class MambaModel(LanguageModule):
         self.decoder = build_module(
             mamba_stack_spec,
             self.config,
+            mamba_ssm_ngroups=self.mamba_ssm_ngroups,
             pre_process=self.pre_process,
             hybrid_attention_ratio=self.hybrid_attention_ratio,
             hybrid_mlp_ratio=self.hybrid_mlp_ratio,
