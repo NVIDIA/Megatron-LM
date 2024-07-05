@@ -16,7 +16,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe.experts import GroupedMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.dist_checkpointing.models.test_sequential_mlp import initialize_sequential_mlp
+from tests.unit_tests.dist_checkpointing.models.test_sequential_mlp import initialize_expert_layer
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -136,7 +136,7 @@ class TestGroupedMLPReconfiguration:
             # Save checkpoint A
             Utils.initialize_model_parallel(src_tp, src_pp, expert_model_parallel_size=src_exp)
             if src_module == 'sequential':
-                model_A = initialize_sequential_mlp(1, use_glu, add_bias_linear=False)
+                model_A = initialize_expert_layer(1, use_glu, add_bias_linear=False, moe_grouped_gemm=False)
             else:
                 model_A = initialize_grouped_mlp(1, use_glu)
             sharded_state_dict = model_A.sharded_state_dict(sharded_offsets=get_pp_offsets())
@@ -149,7 +149,7 @@ class TestGroupedMLPReconfiguration:
             if src_module == 'sequential':
                 model_B = initialize_grouped_mlp(1, use_glu)
             else:
-                model_B = initialize_sequential_mlp(1, use_glu, add_bias_linear=False)
+                model_B = initialize_expert_layer(1, use_glu, add_bias_linear=False, moe_grouped_gemm=False)
             load_strategy = None
             state_dict = load(model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_A, load_strategy)
             model_B.load_state_dict(state_dict)

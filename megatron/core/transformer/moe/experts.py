@@ -2,26 +2,33 @@
 
 from copy import deepcopy
 from functools import partial
-from typing import Optional
+from typing import Optional, Tuple
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
+from megatron.core.dist_checkpointing.mapping import (
+    ReplicaId,
+    ShardedStateDict,
+    ShardedTensorFactory,
+)
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
+from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
+from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
+from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     _initialize_affine_weight_gpu,
 )
 from megatron.core.tensor_parallel.utils import divide
-from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.mlp import MLP, MLPSubmodules, apply_swiglu_sharded_factory
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe import grouped_gemm_util as gg
+from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import make_sharded_object_for_checkpoint
 
@@ -328,6 +335,149 @@ class GroupedMLP(MegatronModule):
                     )
                 )
 
+        return sharded_state_dict
+
+
+class TEGroupedMLP(MegatronModule):
+    """An efficient implementation of the Experts layer using TE's GroupedLinear.
+
+    This class is designed to execute multiple experts in parallel, thereby maximizing computational efficiency.
+    """
+
+    def __init__(self, num_local_experts, config: TransformerConfig, submodules: MLPSubmodules):
+        super().__init__(config=config)
+        self.moe_extended_tp = config.moe_extended_tp
+        self.num_local_experts = num_local_experts
+        self.input_size = self.config.hidden_size
+
+        # If this is a gated linear unit we double the output width, see https://arxiv.org/pdf/2002.05202.pdf
+        ffn_hidden_size = self.config.ffn_hidden_size
+        if self.config.gated_linear_unit:
+            ffn_hidden_size *= 2
+
+        self.linear_fc1 = build_module(
+            submodules.linear_fc1,
+            self.num_local_experts,
+            self.input_size,
+            ffn_hidden_size,
+            config=self.config,
+            init_method=self.config.init_method,
+            bias=self.config.add_bias_linear,
+            skip_bias_add=True,
+            is_expert=True,
+            tp_comm_buffer_name='fc1',
+        )
+
+        self.activation_func = self.config.activation_func
+
+        self.linear_fc2 = build_module(
+            submodules.linear_fc2,
+            self.num_local_experts,
+            self.config.ffn_hidden_size,
+            self.config.hidden_size,
+            config=self.config,
+            init_method=self.config.output_layer_init_method,
+            bias=self.config.add_bias_linear,
+            skip_bias_add=True,
+            is_expert=True,
+            tp_comm_buffer_name='fc2',
+        )
+
+        def remove_extra_states_check(self, incompatible_keys):
+            """
+            Remove extra _extra_state from unexpected keys.
+            These keys are for dist ckpt compatibility with SequentialMLP.
+            """
+            keys = deepcopy(incompatible_keys.unexpected_keys)
+            for key in keys:
+                if '_extra_state' in key:
+                    incompatible_keys.unexpected_keys.remove(key)
+
+        self.register_load_state_dict_post_hook(remove_extra_states_check)
+
+    def forward(
+        self, permuted_local_hidden_states: torch.Tensor, tokens_per_expert: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Forward of TEGroupedMLP
+
+        Args:
+            permuted_local_hidden_states (torch.Tensor): The permuted input hidden states of the
+            local experts.
+            tokens_per_expert (torch.Tensor): The number of tokens per expert.
+
+        Return:
+            output (torch.Tensor): The output of the local experts.
+        """
+        tokens_per_expert = tokens_per_expert.tolist()
+        intermediate_parallel, bias_parallel = self.linear_fc1(
+            permuted_local_hidden_states, tokens_per_expert
+        )
+
+        if self.config.bias_activation_fusion:
+            if self.activation_func == F.gelu:
+                if self.config.gated_linear_unit:
+                    intermediate_parallel = bias_geglu_impl(intermediate_parallel, bias_parallel)
+                else:
+                    assert self.config.add_bias_linear is True
+                    intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+            elif self.activation_func == F.silu and self.config.gated_linear_unit:
+                intermediate_parallel = bias_swiglu_impl(
+                    intermediate_parallel,
+                    bias_parallel,
+                    self.config.activation_func_fp8_input_store,
+                )
+            else:
+                raise ValueError("Only support fusion of gelu and swiglu")
+        else:
+            if bias_parallel is not None:
+                intermediate_parallel = intermediate_parallel + bias_parallel
+            if self.config.gated_linear_unit:
+
+                def glu(x):
+                    x = torch.chunk(x, 2, dim=-1)
+                    return self.config.activation_func(x[0]) * x[1]
+
+                intermediate_parallel = glu(intermediate_parallel)
+            else:
+                intermediate_parallel = self.activation_func(intermediate_parallel)
+
+        output, output_bias = self.linear_fc2(intermediate_parallel, tokens_per_expert)
+
+        return output, output_bias
+
+    def sharded_state_dict(
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
+    ) -> ShardedStateDict:
+        """
+        Maps local expert to global experts.
+        The sharded state dict is interchangable with SequentialMLP's.
+        """
+        if self.moe_extended_tp:
+            raise NotImplementedError(
+                'Currently distributed checkpointing is not supported for moe_extended_tp'
+            )
+        sharded_state_dict = {}
+        for name, module in self._modules.items():
+            sub_sd = module.sharded_state_dict(f'{name}.', sharded_offsets, metadata)
+            if name == 'linear_fc1' and self.config.gated_linear_unit:
+                num_global_experts = (
+                    parallel_state.get_expert_model_parallel_world_size() * self.num_local_experts
+                )
+                local_expert_indices_offset = (
+                    parallel_state.get_expert_model_parallel_rank() * self.num_local_experts
+                )
+                ep_axis = len(sharded_offsets)
+                for i in range(self.num_local_experts):
+                    new_sharded_offsets = (
+                        *sharded_offsets,
+                        (ep_axis, local_expert_indices_offset + i, num_global_experts),
+                    )
+                    for k in (f'{name}.weight{i}', f'{name}.bias{i}'):
+                        if k in sub_sd:
+                            sub_sd[k] = apply_swiglu_sharded_factory(sub_sd[k], new_sharded_offsets)
+            # Add prefix here to match sequential's keys
+            replace_prefix_for_sharding(sub_sd, f'{name}.', f'{prefix}experts.{name}.')
+            sharded_state_dict.update({f"{prefix}{k}": v for k, v in sub_sd.items()})
         return sharded_state_dict
 
 

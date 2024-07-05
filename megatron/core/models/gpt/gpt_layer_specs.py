@@ -5,9 +5,11 @@ from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.custom_layers.transformer_engine import (
+    TEColumnParallelGroupedLinear,
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
     TENorm,
+    TERowParallelGroupedLinear,
     TERowParallelLinear,
 )
 from megatron.core.transformer.dot_product_attention import DotProductAttention
@@ -100,9 +102,20 @@ def _get_mlp_module_spec(
         )
     else:
         # Mixture of experts with modules in megatron core.
+        if use_te and moe_grouped_gemm:
+            linear_fc1 = TEColumnParallelGroupedLinear
+            linear_fc2 = TERowParallelGroupedLinear
+        else:
+            linear_fc1 = ColumnParallelLinear
+            linear_fc2 = RowParallelLinear
+
+        use_te_grouped_gemm = use_te and TEColumnParallelGroupedLinear is not None
+
         return ModuleSpec(
             module=MoELayer,
-            submodules=MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear,)
-            if not moe_grouped_gemm
-            else None,
+            submodules=(
+                MLPSubmodules(linear_fc1=linear_fc1, linear_fc2=linear_fc2)
+                if not moe_grouped_gemm or use_te_grouped_gemm
+                else None
+            ),
         )

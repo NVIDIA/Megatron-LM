@@ -30,6 +30,7 @@ from .random import (
     checkpoint,
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name,
+    get_expert_parallel_rng_tracker_name,
     model_parallel_cuda_manual_seed,
 )
 from .utils import (
@@ -64,6 +65,7 @@ __all__ = [
     "checkpoint",
     "get_cuda_rng_tracker",
     "model_parallel_cuda_manual_seed",
+    "get_expert_parallel_rng_tracker_name",
     # utils.py
     "split_tensor_along_last_dim",
     "split_tensor_into_1d_equal_chunks",
