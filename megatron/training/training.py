@@ -35,6 +35,11 @@ from megatron.training.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.num_microbatches_calculator import (
+    get_current_global_batch_size,
+    get_num_microbatches,
+    update_num_microbatches)
+
 from .async_utils import maybe_finalize_async_save
 from .utils import (
     calc_params_l2_norm,
@@ -52,10 +57,7 @@ from .global_vars import (
     get_timers,
     get_tensorboard_writer,
     get_wandb_writer,
-    get_one_logger,
-    get_current_global_batch_size,
-    get_num_microbatches,
-    update_num_microbatches)
+    get_one_logger)
 from . import one_logger_utils
 
 

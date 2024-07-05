@@ -14,3 +14,4 @@ API Guide
    dist_checkpointing
    distributed
    datasets
+   num_microbatches_calculator
