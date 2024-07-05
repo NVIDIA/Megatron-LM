@@ -37,6 +37,10 @@ class ShardedBase(ABC):
     def validate_metadata_integrity(self):
         """Codifies the constraints on metadata attributes."""
 
+    @abstractmethod
+    def without_data(self) -> 'ShardedBase':
+        raise NotImplementedError
+
 
 @dataclass
 class ShardedTensor(ShardedBase):
@@ -397,6 +401,18 @@ class ShardedObject(ShardedBase):
     def __str__(self):
         return f'{self.__class__.__name__}(key=\'{self.key}\')'
 
+    @classmethod
+    def empty_from_unique_key(cls, unique_key, replica_id: ReplicaId = 0) -> 'ShardedObject':
+        key, shard_key = unique_key.split('/')
+        shard_str, offset, shape = shard_key.split('_')
+        assert shard_str == 'shard'
+        offset = tuple(map(int, offset.split('.')))
+        shape = tuple(map(int, shape.split('.')))
+        if len(shape) + 1 == len(offset):
+            # This is a backward-compatible fix. We don't know the last element of global shape so set it to -1.
+            shape += (-1,)
+        return cls(key, None, shape, offset, replica_id)
+
 
 @dataclass
 class ShardedTensorFactory(ShardedBase):
@@ -433,6 +449,9 @@ class ShardedTensorFactory(ShardedBase):
     def validate_metadata_integrity(self):
         """No reasonable checks can be applied"""
         pass
+
+    def without_data(self):
+        return replace(self, data=None)
 
 
 def apply_factories(sharded_state_dict: ShardedStateDict):

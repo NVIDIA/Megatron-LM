@@ -10,6 +10,7 @@ from megatron.core.dist_checkpointing.serialization import \
     get_default_save_sharded_strategy, get_default_load_sharded_strategy
 from megatron.core.dist_checkpointing.strategies.fully_parallel import \
     FullyParallelSaveStrategyWrapper, FullyParallelLoadStrategyWrapper
+from megatron.core.dist_checkpointing.validation import StrictHandling
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -27,7 +28,10 @@ def common_test_simple_sharded_state_dict_save_load(initialize_model_fn, tmp_pat
         # Load
         gpt_model = initialize_model_fn(2, dst_layer_spec_fn)
         sharded_state_dict = gpt_model.sharded_state_dict()
-        state_dict = load(sharded_state_dict, ckpt_dir)
+        state_dict, missing_keys, unexpected_keys = load(sharded_state_dict, ckpt_dir, strict=StrictHandling.RETURN_ALL)
+        # Potential mismatch is because of extra states which is ok
+        assert all('_extra_state' in k for k in missing_keys)
+        assert all('_extra_state' in k for k in unexpected_keys)
         gpt_model.load_state_dict(state_dict)
     Utils.destroy_model_parallel()
 
@@ -61,7 +65,10 @@ def common_test_parallel_reconfiguration_e2e(initialize_model_fn, tmp_path_dist_
             load_strategy = FullyParallelLoadStrategyWrapper(load_strategy)
         else:
             load_strategy = None
-        state_dict = load(gpt_model_B.sharded_state_dict(), ckpt_dir_A, load_strategy)
+        state_dict, missing_keys, unexpected_keys = load(gpt_model_B.sharded_state_dict(), ckpt_dir_A, load_strategy, strict=StrictHandling.RETURN_ALL)
+        # Potential mismatch is because of extra states which is ok
+        assert all('_extra_state' in k for k in missing_keys)
+        assert all('_extra_state' in k for k in unexpected_keys)
         gpt_model_B.load_state_dict(state_dict)
         save(gpt_model_B.sharded_state_dict(), ckpt_dir_B)
         regular_state_dict_B = gpt_model_A.state_dict()

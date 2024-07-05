@@ -19,11 +19,14 @@ from megatron.core.dist_checkpointing.dict_utils import (
     nested_values,
 )
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, StateDict, is_main_replica
-from megatron.core.dist_checkpointing.serialization import validate_sharding_integrity
 from megatron.core.dist_checkpointing.strategies.base import (
     AsyncSaveShardedStrategy,
     LoadShardedStrategy,
     SaveShardedStrategy,
+)
+from megatron.core.dist_checkpointing.validation import (
+    determine_global_metadata,
+    validate_sharding_integrity,
 )
 
 logger = logging.getLogger(__name__)
@@ -143,7 +146,7 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
         )
         if self.cached_distribution is None:
             # First time applying the parallelization
-            validate_sharding_integrity(nested_values(sharded_state_dict))
+            validate_sharding_integrity(determine_global_metadata(sharded_state_dict)[1])
         if self.do_cache_distribution:
             self.cached_distribution = precomputed_distribution
         end = time()
@@ -664,13 +667,16 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         return self.base_strategy.can_handle_sharded_objects
 
     def load_tensors_metadata(self, checkpoint_dir: Path):
-        self.base_strategy.load_tensors_metadata(checkpoint_dir)
+        return self.base_strategy.load_tensors_metadata(checkpoint_dir)
+
+    def load_sharded_metadata(self, checkpoint_dir: Path):
+        return self.base_strategy.load_sharded_metadata(checkpoint_dir)
 
     def check_backend_compatibility(self, loaded_version):
-        self.base_strategy.check_backend_compatibility(loaded_version)
+        return self.base_strategy.check_backend_compatibility(loaded_version)
 
     def check_version_compatibility(self, loaded_version):
-        self.base_strategy.check_version_compatibility(loaded_version)
+        return self.base_strategy.check_version_compatibility(loaded_version)
 
 
 def _sharded_tensor_shard_id(sharded_tensor: ShardedTensor) -> _ShardId:

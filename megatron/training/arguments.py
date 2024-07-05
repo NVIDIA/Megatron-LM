@@ -11,6 +11,8 @@ import torch
 import types
 
 import torch.nn.functional as F
+
+from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.models.retro.utils import (
     get_config_path as get_retro_config_path,
     get_gpt_data_dir as get_retro_data_dir,
@@ -1335,6 +1337,12 @@ def _add_checkpointing_args(parser):
                        help='If the model and optimizer state dict structure is'
                             'constant throughout a *single training job*, it allows for'
                             'different checkpointing performance optimizations.')
+    group.add_argument('--dist-ckpt-strictness', type=str, default='assume_ok_unexpected',
+                       choices=[e.value for e in StrictHandling],
+                       help='Determine handling of key mismatch during checkpoint load.'
+                            ' Check StrictHandling docs for flags meaning.'
+                            ' NOTE: This flag controls only distributed checkpoint'
+                            ' load from storage, not loading state dict into the model.')
     return parser
 
 

@@ -598,7 +598,7 @@ def _load_base_checkpoint(load_dir, rank0=False, sharded_state_dict=None,
         if args.ckpt_fully_parallel_load:
             load_strategy = FullyParallelLoadStrategyWrapper(load_strategy,
                                                              mpu.get_data_parallel_group(with_context_parallel=True))
-        state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name, load_strategy)
+        state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name, load_strategy, strict=args.dist_ckpt_strictness)
         return state_dict, checkpoint_name, release
 
     try:

@@ -1,11 +1,12 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import io
+import logging
 
 import numpy as np
 import pytest
 import torch
-from torch.distributed.checkpoint import CheckpointException
+from torch.distributed.checkpoint import CheckpointException as PyTCheckpointingException
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor, save, load
@@ -14,7 +15,11 @@ from megatron.core.dist_checkpointing.core import CheckpointingException, \
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory, \
     ShardedObject
-from megatron.core.dist_checkpointing.serialization import load_tensors_metadata
+from megatron.core.dist_checkpointing.serialization import \
+    load_tensors_metadata, load_sharded_metadata
+from megatron.core.dist_checkpointing.strategies.base import StrategyAction, \
+    get_default_strategy
+from megatron.core.dist_checkpointing.validation import StrictHandling
 
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -269,8 +274,7 @@ class TestSerialization:
             torch.distributed.barrier()
             save(state_dict, ckpt_dir)
             sh_ten.key = 'different_key'
-            # TODO: remove torch exception
-            with pytest.raises((CheckpointingException, CheckpointException)) as exc_info:
+            with pytest.raises((CheckpointingException, PyTCheckpointingException)) as exc_info:
                 load(state_dict, ckpt_dir)
             assert "different_key" in str(exc_info.value)
 
@@ -326,7 +330,7 @@ class TestSerialization:
             state_dict = {
                 'rigid': ShardedTensor.from_rank_offsets('keyA', torch.ones(2, 7), (1, pp_rank, pp_size), replica_id=tp_rank),
             }
-            with pytest.raises((CheckpointingException, CheckpointException)):
+            with pytest.raises((CheckpointingException, PyTCheckpointingException)):
                 load(state_dict, ckpt_dir)
 
             state_dict = {
@@ -340,7 +344,7 @@ class TestSerialization:
             state_dict = {
                 'rigid': ShardedTensor.from_rank_offsets('keyA', torch.ones(2, 9), (1, pp_rank, pp_size), replica_id=tp_rank),
             }
-            with pytest.raises((CheckpointingException, CheckpointException)):
+            with pytest.raises((CheckpointingException, PyTCheckpointingException)):
                 load(state_dict, ckpt_dir)
 
             state_dict = {
@@ -356,3 +360,190 @@ class TestSerialization:
             assert torch.all(loaded_state_dict['flexible'] == expected_tensor)
 
         Utils.destroy_model_parallel()
+
+
+class TestNonStrictLoad:
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(2, 4)  # doesn't matter for this test
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _get_base_state_dict(self):
+        return {
+            'TenA': ShardedTensor.from_rank_offsets('TenA', torch.arange(2), replica_id=Utils.rank),
+            'TenB': ShardedTensor.from_rank_offsets('TenB', torch.arange(3), (0, Utils.rank, Utils.world_size), replica_id=0),
+            'TenC': ShardedTensor.from_rank_offsets('TenC', torch.arange(3), replica_id=Utils.world_size - Utils.rank - 1),
+            'ObjA': ShardedObject('ObjA', list(range(10)), (1,), (0,), replica_id=Utils.rank),
+            'ObjB': ShardedObject('ObjB', {Utils.rank + 7}, (1, Utils.world_size), (0, Utils.rank), replica_id=0),
+        }
+
+    @pytest.mark.parametrize('validate_integrity', [True, False])
+    def test_unexpected_keys_handling_during_validation(self, caplog, tmp_path_dist_ckpt, validate_integrity):
+        sharded_state_dict = self._get_base_state_dict()
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_unexpected_keys_raises_error_during_validation') as ckpt_dir:
+            save(sharded_state_dict, ckpt_dir)
+
+            def load_with_flag(strict):
+                sharded_state_dict = self._get_base_state_dict()
+                sharded_state_dict['TenD'] = ShardedTensor.from_rank_offsets('UnexpectedTenD', torch.arange(3), replica_id=Utils.rank)
+                sharded_state_dict['ObjD'] = ShardedTensor.from_rank_offsets('UnexpectedObjD', torch.arange(3), replica_id=Utils.rank)
+                return load(sharded_state_dict, ckpt_dir, validate_access_integrity=validate_integrity, strict=strict)
+
+            def test_error(error_msg):
+                assert 'Unexpected keys' in error_msg
+                assert 'UnexpectedTenD' in error_msg
+                assert 'UnexpectedObjD' in error_msg
+                assert 'Missing keys' not in error_msg
+
+            # ASSUME_OK_UNEXPECTED results in an exception raised by the underlying strategy
+            with pytest.raises(PyTCheckpointingException) as exc_info:
+                load_with_flag(StrictHandling.ASSUME_OK_UNEXPECTED)
+            # Informative exceptions with `RAISE_*` options:
+            with pytest.raises(CheckpointingException) as exc_info:
+                load_with_flag(StrictHandling.RAISE_UNEXPECTED)
+            test_error(str(exc_info.value))
+            with pytest.raises(CheckpointingException) as exc_info:
+                load_with_flag(StrictHandling.RAISE_ALL)
+            test_error(str(exc_info.value))
+
+            # Logged mismatches:
+            with caplog.at_level(logging.WARNING):
+                loaded_state_dict = load_with_flag(StrictHandling.LOG_UNEXPECTED)
+            assert 'TenA' in loaded_state_dict
+            test_error(caplog.text)
+            with caplog.at_level(logging.WARNING):
+                loaded_state_dict = load_with_flag(StrictHandling.LOG_ALL)
+            assert 'TenA' in loaded_state_dict
+            test_error(caplog.text)
+
+            # Returned mismatches
+            loaded_state_dict, missing_keys, unexpected_keys = load_with_flag(StrictHandling.RETURN_UNEXPECTED)
+            assert 'TenA' in loaded_state_dict
+            assert unexpected_keys == {'UnexpectedTenD', 'UnexpectedObjD'}
+            assert missing_keys == set()
+            loaded_state_dict, missing_keys, unexpected_keys = load_with_flag(StrictHandling.RETURN_ALL)
+            assert 'TenA' in loaded_state_dict
+            assert unexpected_keys == {'UnexpectedTenD', 'UnexpectedObjD'}
+            assert missing_keys == set()
+
+            # Ignore mismatch
+            loaded_state_dict = load_with_flag(StrictHandling.IGNORE_ALL)
+            assert 'TenA' in loaded_state_dict
+
+
+    @pytest.mark.parametrize('validate_integrity', [True, False])
+    def test_missing_keys_raises_error_during_validation(self, caplog, tmp_path_dist_ckpt, validate_integrity):
+        sharded_state_dict = self._get_base_state_dict()
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_missing_keys_raises_error_during_validation') as ckpt_dir:
+            save(sharded_state_dict, ckpt_dir)
+
+            def load_with_flag(strict):
+                sharded_state_dict = self._get_base_state_dict()
+                del sharded_state_dict['TenA']
+                del sharded_state_dict['ObjB']
+                return load(sharded_state_dict, ckpt_dir, validate_access_integrity=validate_integrity, strict=strict)
+
+            def test_error(error_msg):
+                assert 'Unexpected keys' not in error_msg
+                assert 'TenA' in error_msg
+                assert 'ObjB' in error_msg
+                assert 'Missing keys' in error_msg
+
+            # no mismatch for `*_UNEXPECTED` flag
+            loaded_state_dict = load_with_flag(StrictHandling.ASSUME_OK_UNEXPECTED)
+            assert 'TenB' in loaded_state_dict
+
+            loaded_state_dict = load_with_flag(StrictHandling.RAISE_UNEXPECTED)
+            assert 'TenB' in loaded_state_dict
+
+            with caplog.at_level(logging.WARNING):
+                loaded_state_dict = load_with_flag(StrictHandling.LOG_UNEXPECTED)
+            assert caplog.text == ''
+            assert 'TenB' in loaded_state_dict
+
+            loaded_state_dict, missing_keys, unexpected_keys = load_with_flag(StrictHandling.RETURN_UNEXPECTED)
+            assert 'TenB' in loaded_state_dict
+            assert missing_keys == set()
+            assert unexpected_keys == set()
+
+            loaded_state_dict = load_with_flag(StrictHandling.IGNORE_ALL)
+            assert 'TenB' in loaded_state_dict
+
+            # Informative exceptions with `RAISE_ALL` option:
+            with pytest.raises(CheckpointingException) as exc_info:
+                load_with_flag(StrictHandling.RAISE_ALL)
+            test_error(str(exc_info.value))
+
+            # Logged mismatches:
+            with caplog.at_level(logging.WARNING):
+                loaded_state_dict = load_with_flag(StrictHandling.LOG_ALL)
+            assert 'TenB' in loaded_state_dict
+            test_error(caplog.text)
+
+            # Returned mismatches
+            loaded_state_dict, missing_keys, unexpected_keys = load_with_flag(StrictHandling.RETURN_ALL)
+            assert 'TenB' in loaded_state_dict
+            assert unexpected_keys == set()
+            assert missing_keys == {'TenA', 'ObjB'}
+
+    @pytest.mark.parametrize('validate_integrity', [True, False])
+    def test_exact_load_handling(self, caplog, tmp_path_dist_ckpt, validate_integrity):
+        sharded_state_dict = self._get_base_state_dict()
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_exact_load_handling') as ckpt_dir:
+            save(sharded_state_dict, ckpt_dir)
+
+            def load_with_flag(strict):
+                sharded_state_dict = self._get_base_state_dict()
+                return load(sharded_state_dict, ckpt_dir, validate_access_integrity=validate_integrity, strict=strict)
+
+            for strict in (
+                StrictHandling.ASSUME_OK_UNEXPECTED,
+                StrictHandling.LOG_UNEXPECTED,
+                StrictHandling.LOG_ALL,
+                StrictHandling.RAISE_UNEXPECTED,
+                StrictHandling.RAISE_ALL,
+                StrictHandling.IGNORE_ALL,
+            ):
+                with caplog.at_level(logging.WARNING):
+                    loaded_state_dict = load_with_flag(strict)
+                assert caplog.text == ''
+                assert 'TenB' in loaded_state_dict
+                assert 'ObjB' in loaded_state_dict
+
+            for strict in (
+                StrictHandling.RETURN_UNEXPECTED,
+                StrictHandling.RETURN_ALL,
+            ):
+                with caplog.at_level(logging.WARNING):
+                    loaded_state_dict, missing_keys, unexpected_keys = load_with_flag(strict)
+                assert caplog.text == ''
+                assert 'TenB' in loaded_state_dict
+                assert 'ObjB' in loaded_state_dict
+                assert missing_keys == set()
+                assert unexpected_keys == set()
+
+    @pytest.mark.parametrize('save_format', ['zarr', 'torch_dist'])
+    def test_sharded_metadata(self, tmp_path_dist_ckpt, save_format):
+
+        sharded_state_dict = self._get_base_state_dict()
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_exact_load_handling') as ckpt_dir:
+            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, save_format, 1)
+            save(sharded_state_dict, ckpt_dir, save_strategy)
+            torch.distributed.barrier()
+            sharded_metadata = load_sharded_metadata(ckpt_dir)
+            assert set(sh_base.key for sh_base in sharded_metadata.values()) == {'TenA', 'TenB', 'TenC', 'ObjA', 'ObjB'}
+            assert set(sharded_metadata.keys()) == {
+                'TenA', 'TenB', 'TenC',
+                'ObjA/shard_0_1',
+                *(f'ObjB/shard_0.{i}_1.8' for i in range(8)),
+            }
+
+            loaded_state_dict = load(sharded_metadata, ckpt_dir, validate_access_integrity=False)
+
+            assert loaded_state_dict['ObjA/shard_0_1'] == list(range(10))
+            for shard_idx in range(8):
+                assert loaded_state_dict[f'ObjB/shard_0.{shard_idx}_1.8'] == {shard_idx + 7}
+            assert torch.all(loaded_state_dict['TenA'] == torch.arange(2))
+            assert torch.all(loaded_state_dict['TenB'] == torch.arange(3).repeat(8))
+            assert torch.all(loaded_state_dict['TenC'] == torch.arange(3))

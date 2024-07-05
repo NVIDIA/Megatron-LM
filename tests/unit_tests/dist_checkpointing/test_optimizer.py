@@ -195,6 +195,7 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.retro_add_retriever = False
     args.no_load_optim = False
     args.no_load_rng = False
+    args.dist_ckpt_strictness = 'assume_ok_unexpected'
 
 
 def load_checkpoint_no_arg_checks(*args, **kwargs):
