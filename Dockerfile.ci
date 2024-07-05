@@ -20,7 +20,9 @@ RUN pip3 install --no-cache-dir \
       pytest_mock \
       sentencepiece \
       wrapt \
-      git+https://github.com/fanshiqing/grouped_gemm@v1.1.2
+      git+https://github.com/fanshiqing/grouped_gemm@v1.1.2 \
+      zarr \
+      tensorstore==0.1.45
 
 COPY . /workspace/megatron-lm
 

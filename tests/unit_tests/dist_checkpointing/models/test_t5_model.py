@@ -6,6 +6,7 @@ import torch
 
 from megatron.core.dist_checkpointing import save, load, load_plain_tensors
 from megatron.core import parallel_state as ps
+from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.models.T5 import T5Model
 from megatron.core.models.T5.t5_spec import \
     encoder_model_with_transformer_engine_default_spec as t5_encoder_te_spec, \
@@ -75,7 +76,10 @@ class TestT5Model:
             gpt_model = initialize_t5_model(2, dst_encoder_spec_fn, dst_decoder_spec_fn)
             sharded_state_dict = gpt_model.sharded_state_dict()
 
-            state_dict = load(sharded_state_dict, ckpt_dir)
+            state_dict, missing_keys, unexpected_keys = load(sharded_state_dict, ckpt_dir, strict=StrictHandling.RETURN_ALL)
+            # Potential mismatch is because of extra states which is ok
+            assert all('_extra_state' in k for k in missing_keys)
+            assert all('_extra_state' in k for k in unexpected_keys)
             gpt_model.load_state_dict(state_dict)
 
         Utils.destroy_model_parallel()
