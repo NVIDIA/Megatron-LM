@@ -14,6 +14,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union, cast
 
 import numpy as np
 import torch
+from pkg_resources import packaging
 from torch.distributed import checkpoint
 from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed._shard.sharded_tensor import Shard, ShardedTensorMetadata, TensorProperties
@@ -414,9 +415,13 @@ class MCoreSavePlanner(DefaultSavePlanner):
     def __init__(
         self,
         *args,
+        dedup_replicated_tensors: Optional[bool] = None,
         nd_flattened_global_shapes: Optional[Dict[str, Tuple[int, ...]]] = None,
         **kwargs,
     ) -> None:
+        # `dedup_replicated_tensors` was deprecated in 2.3 - this avoids tons of warnings during saving
+        if packaging.version.Version(torch.__version__) < packaging.version.Version("2.3.0"):
+            kwargs['dedup_replicated_tensors'] = dedup_replicated_tensors
         super().__init__(*args, **kwargs)
         self.nd_flattened_global_shapes = nd_flattened_global_shapes or {}
 
