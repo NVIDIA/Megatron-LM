@@ -4,10 +4,11 @@
 
 import logging
 import os
+import queue
 from itertools import chain
 from pathlib import Path
 from time import time
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import psutil
 import torch
@@ -21,6 +22,16 @@ from torch.futures import Future
 logger = logging.getLogger(__name__)
 
 WriteBucket = Tuple[Path, str, Tuple[list, list]]  # represents writes to a single file
+
+_results_queue = None
+
+
+def _get_write_results_queue():
+    global _results_queue
+    if _results_queue is None:
+        ctx = mp.get_context('spawn')
+        _results_queue = ctx.Queue()
+    return _results_queue
 
 
 class FileSystemWriterAsync(FileSystemWriter):
@@ -53,7 +64,7 @@ class FileSystemWriterAsync(FileSystemWriter):
 
         # Intermediate state between preparation and finalization
         self.write_buckets: Optional[List[WriteBucket]] = None
-        self.write_results: Optional[Dict[int, List[WriteResult]]] = None
+        self.results_queue: Optional[mp.Queue] = None
 
     def prepare_write_data(self, plan: SavePlan, planner: SavePlanner) -> None:
         """
@@ -107,10 +118,9 @@ class FileSystemWriterAsync(FileSystemWriter):
                 len(self.write_buckets),
                 self.thread_count,
             )
-            ctx = mp.get_context('fork')
-            self.write_results = ctx.Manager().dict()
+            self.results_queue = _get_write_results_queue()
         else:
-            self.write_results = {}
+            self.results_queue = None
         end = time()
         logger.debug(f"D2H and push, time: {end - start}")
 
@@ -125,34 +135,69 @@ class FileSystemWriterAsync(FileSystemWriter):
         """
         if not self.write_buckets:
             return None, ()
-        return (self.write_preloaded_data_multiproc, (self.write_buckets, self.write_results))
+        return (self.write_preloaded_data_multiproc, (self.write_buckets, self.results_queue))
 
     @staticmethod
     def write_preloaded_data_multiproc(
-        write_buckets: List[WriteBucket], write_results: Dict[int, List[WriteResult]]
+        write_buckets: List[WriteBucket],
+        global_results_queue: mp.Queue,
+        worker_timeout: int = 600,
     ) -> None:
         """
         Performs saving data to storage with multiple processes.
 
         Args:
             write_buckets (List[WriteBucket]): write plan
-            write_results: (Dict[int, List[WriteResult]]): dict to store the write results to.
-                Assumes multiprocessing save, so keys are local process indices
+            global_results_queue (mp.Queue): mp.Queue to collect Dict[List[WriteResults]] (or an Exception)
+                from parallel write processes to the main training process
+            worker_timeout (int): time to wait for the worker completion
         Returns: None
         """
         w_start = time()
+        write_results_or_exc: Union[dict, Exception] = dict()
         ctx = mp.get_context('fork')
-        p_list = [
-            ctx.Process(
-                target=FileSystemWriterAsync.write_preloaded_data,
-                args=(i, write_bucket, write_results, True),
-            )
-            for i, write_bucket in enumerate(write_buckets)
-        ]
-        for p in p_list:
-            p.start()
-        for p in p_list:
-            p.join()
+        local_results_queue = ctx.Queue()
+        p_list = []
+        for i, write_bucket in enumerate(write_buckets):
+            try:
+                p_list.append(
+                    ctx.Process(
+                        target=FileSystemWriterAsync.write_preloaded_data,
+                        args=(i, write_bucket, local_results_queue, True),
+                    )
+                )
+            except Exception as e:
+                err_msg = f'An error is caught while a proc {i} is created, error: {e}'
+                logger.error(err_msg)
+                write_results_or_exc = RuntimeError(err_msg)
+
+        if not isinstance(write_results_or_exc, Exception):
+            for p in p_list:
+                p.start()
+
+            # We expect exactly `len(write_buckets)` items
+            for completed_proc_num in range(len(write_buckets)):
+                try:
+                    local_proc_idx, local_results_or_exc = local_results_queue.get(
+                        timeout=worker_timeout
+                    )
+                except queue.Empty:
+                    write_results_or_exc = RuntimeError(
+                        f'Unexpected empty `local_results_queue` (got only {completed_proc_num}/{len(write_buckets)} items)'
+                    )
+                    break
+                else:
+                    if isinstance(local_results_or_exc, Exception):
+                        err_msg = f"Local process {local_proc_idx} encountered an error: {local_results_or_exc}"
+                        logger.error(err_msg)
+                        write_results_or_exc = local_results_or_exc
+                        break
+                    else:
+                        assert isinstance(local_results_or_exc, list), type(local_results_or_exc)
+                        write_results_or_exc[local_proc_idx] = local_results_or_exc
+                        p_list[local_proc_idx].join()
+
+        global_results_queue.put(write_results_or_exc)
 
         w_end = time()
         logger.debug(
@@ -163,7 +208,7 @@ class FileSystemWriterAsync(FileSystemWriter):
     def write_preloaded_data(
         local_proc_idx: int,
         write_bucket: WriteBucket,
-        write_results: Dict[int, List[WriteResult]],
+        results_queue: mp.Queue,
         use_fsync: bool,
     ) -> None:
         """
@@ -172,27 +217,32 @@ class FileSystemWriterAsync(FileSystemWriter):
         Args:
             local_proc_idx (int): index of a local process that performs writing
             write_bucket (WriteBucket): data to write to storage
-            write_results (Dict[int, List[WriteResult]]): dict to store the write results to.
-                Assumes multiprocessing save, so keys are local process indices
+            results_queue (mp.Queue): queue to return the write results to the proxy checkpoint process.
             use_fsync (bool): if True, calls os.fsync at the end of saving
 
-        Returns: None, the write result are written to the `write_results` dict
+        Returns: None, the write result are put into the `queue`
         """
         mem_before = _process_memory()
 
         local_results = []
-        file_name, storage_key, (bytes_data, tensor_data) = write_bucket
-        with open(file_name, "wb") as stream:
-            for write_item, data in bytes_data:
-                local_results.append(_write_item(stream, data, write_item, storage_key))
+        try:
+            file_name, storage_key, (bytes_data, tensor_data) = write_bucket
+            with open(file_name, "wb") as stream:
+                for write_item, data in bytes_data:
+                    local_results.append(_write_item(stream, data, write_item, storage_key))
 
-            for write_item, tensor in tensor_data:
-                assert tensor.is_cpu
-                local_results.append(_write_item(stream, tensor, write_item, storage_key))
+                for write_item, tensor in tensor_data:
+                    assert tensor.is_cpu
+                    local_results.append(_write_item(stream, tensor, write_item, storage_key))
 
-            if use_fsync:
-                os.fsync(stream.fileno())
-        write_results[local_proc_idx] = local_results
+                if use_fsync:
+                    os.fsync(stream.fileno())
+            local_output = (local_proc_idx, local_results)
+        except Exception as e:
+            local_output = (local_proc_idx, e)
+
+        results_queue.put(local_output)
+
         mem_after = _process_memory()
         logger.debug(
             f"{local_proc_idx} consumed: {mem_after - mem_before}, before: {mem_before}, after: {mem_after}"
@@ -207,19 +257,30 @@ class FileSystemWriterAsync(FileSystemWriter):
 
     def retrieve_write_results(self) -> List[WriteResult]:
         """
-        Turn self.write_results into a single results lists. Includes error check.
+        Turn the latest dict including write results from `self.results_queue` into a single results lists. Includes error check.
 
         Returns (List[WriteResult]): the list of write results from all local processes performing the save.
 
         """
-        assert self.write_results is not None
         assert self.write_buckets is not None
-        if len(self.write_results) != len(self.write_buckets):
+
+        if self.results_queue is None:
+            write_results_or_exc = {}
+        else:
+            try:
+                write_results_or_exc = self.results_queue.get_nowait()
+            except queue.Empty:
+                raise RuntimeError(f'results_queue should not be empty')
+
+        if isinstance(write_results_or_exc, Exception):
+            raise RuntimeError(f'Worker failure: {write_results_or_exc}') from write_results_or_exc
+        write_results: dict = write_results_or_exc
+        if len(write_results) != len(self.write_buckets):
             raise RuntimeError(
-                f'Incomplete worker results (expected {len(self.write_buckets)}, got {len(self.write_results)}.'
+                f'Incomplete worker results (expected {len(self.write_buckets)}, got {len(write_results)}.'
                 f' This probably indicates a worker failure.'
             )
-        return list(chain.from_iterable(self.write_results.values()))
+        return list(chain.from_iterable(write_results.values()))
 
 
 def _split_by_size_and_type(bins: int, items: List[WriteItem]) -> List[List[WriteItem]]:
