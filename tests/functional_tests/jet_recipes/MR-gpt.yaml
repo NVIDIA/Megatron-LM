@@ -32,6 +32,7 @@ spec:
   ckpt_format: torch_dist
   ckpt_resume: 0
   allow_nondeterministic: 0
+  gradient_accumulation_fusion: False
   reshard_tp_size: null
   reshard_pp_size: null
   reshard_ep_size: null
@@ -47,6 +48,7 @@ spec:
         MERGE_FILE=/workspace/data/gpt3_data/bpe/merges.txt \
         DATA_CACHE=/workspace/data/index-cache \
         USE_TE={"1" if use_te else "0"} \
+        USE_GA={"1" if gradient_accumulation_fusion else "0"} \
         TP_SIZE={tp_size} \
         PP_SIZE={pp_size} \
         NUM_NODES={nodes} \
@@ -94,6 +96,7 @@ products:
   - {tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1], ckpt_format: [torch], extra_args: ['"--decoupled-lr 0.0002"'], args_meta: ["decoupled_lr"]}
   - {tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce"'], args_meta: ["dist_optimizer_overlap_grad_reduce"]}
   - {tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --untie-embeddings-and-output-weights"'], args_meta: ["dist_optimizer_overlap_grad_reduce_untied"]}
+  - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], gradient_accumulation_fusion: [True], extra_args: ['"--defer-embedding-wgrad-compute --wgrad-deferral-limit 2"'], args_meta: ["defer_embedding_wgrad_compute"]}
   - {tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather --check-weight-hash-across-dp-replicas-interval 10 --ckpt-fully-parallel-load"'], args_meta: ["dist_optimizer_overlap_grad_reduce_param_gather"]}
   - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], extra_args: ["--cross-entropy-loss-fusion"], args_meta: ["cross_entropy_loss_fusion"]}
   # Non-MCore, only legacy checkpoints supported
