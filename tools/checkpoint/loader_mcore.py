@@ -64,6 +64,7 @@ def _load_checkpoint(queue, args):
                 '--no-save-optim',
                 '--no-save-rng',
                 '--no-initialization',
+                '--mock-data', # To pass the "blend data checks" in arguments.py
                 '--load', args.load_dir,
                 '--position-embedding-type', args.position_embedding_type,
                 ]
