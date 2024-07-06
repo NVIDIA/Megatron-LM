@@ -328,7 +328,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     # Collect args, model, RNG.
     if not torch.distributed.is_initialized() \
-            or mpu.get_data_modulo_expert_parallel_rank() == 0 \
+            or mpu.get_data_modulo_expert_parallel_rank(with_context_parallel=True) == 0 \
             or args.use_dist_ckpt:
 
         optim_sd_kwargs = {}
@@ -618,8 +618,8 @@ def _load_base_checkpoint(load_dir, rank0=False, sharded_state_dict=None,
         sys.modules.pop('megatron.fp16.loss_scaler', None)
         sys.modules.pop('megatron.model', None)
     except BaseException as e:
-        print_rank_0('could not load the checkpoint')
-        print_rank_0(e)
+        print('could not load the checkpoint')
+        print(e)
         sys.exit()
 
     return state_dict, checkpoint_name, release

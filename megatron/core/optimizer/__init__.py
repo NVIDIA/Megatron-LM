@@ -343,8 +343,12 @@ def get_megatron_optimizer(
                 param_groups=moe_param_groups,
                 per_model_buffers=per_model_ep_buffers,
                 model_parallel_group=mpu.get_model_parallel_group(with_expert_parallel=True),
-                data_parallel_group=mpu.get_data_modulo_expert_parallel_group(),
-                data_parallel_group_gloo=mpu.get_data_modulo_expert_parallel_group_gloo(),
+                data_parallel_group=mpu.get_data_modulo_expert_parallel_group(
+                    with_context_parallel=True
+                ),
+                data_parallel_group_gloo=mpu.get_data_modulo_expert_parallel_group_gloo(
+                    with_context_parallel=True
+                ),
                 data_parallel_group_idx=expert_parallel_rank * model_parallel_world_size
                 + model_parallel_rank,
             )

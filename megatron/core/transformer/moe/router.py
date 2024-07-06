@@ -183,8 +183,9 @@ class TopKRouter(Router):
         moe_aux_loss_coeff = self.config.moe_aux_loss_coeff
         sequence_partition_group = None
         if self.config.moe_token_dispatcher_type == "allgather":
-            sequence_partition_group = parallel_state.get_tensor_model_parallel_group()
+            sequence_partition_group = parallel_state.get_tensor_and_context_parallel_group()
         elif self.config.moe_token_dispatcher_type == "alltoall":
+            sequence_partition_group = parallel_state.get_context_parallel_group()
             moe_aux_loss_coeff /= parallel_state.get_tensor_model_parallel_world_size()
 
         aux_loss = switch_load_balancing_loss_func(
@@ -216,7 +217,8 @@ class TopKRouter(Router):
         """
         if self.config.moe_z_loss_coeff is not None and self.training:
             moe_z_loss_coeff = (
-                self.config.moe_z_loss_coeff / parallel_state.get_tensor_model_parallel_world_size()
+                self.config.moe_z_loss_coeff
+                / parallel_state.get_tensor_and_context_parallel_world_size()
             )
             z_loss = z_loss_func(logits, moe_z_loss_coeff)
             logits = MoEAuxLossAutoScaler.apply(logits, z_loss)

@@ -234,6 +234,10 @@ def test_different_initialize_order_unconsistency(src_tp_pp, ep_size):
         (3, 8, 8, 3, 1, 1),
         (4, 8, 2, 4, 1, 1),
         (8, 8, 8, 8, 1, 1),
+        (8, 8, 2, 1, 1, 4),
+        (8, 8, 2, 2, 2, 4),
+        (8, 8, 2, 1, 4, 8),
+        (8, 8, 2, 2, 2, 8),
         (16, 8, 4, 8, 1, 1),
         (16, 8, 4, 8, 1, 4),
         (16, 8, 4, 8, 4, 1),
@@ -244,9 +248,11 @@ def test_different_initialize_order_unconsistency(src_tp_pp, ep_size):
         (32, 8, 8, 8, 1, 1),
         (32, 8, 4, 8, 1, 4),
         (32, 8, 8, 8, 4, 1),
+        (64, 8, 4, 2, 8, 8),
         (64, 8, 4, 8, 1, 1),
         (64, 8, 8, 8, 1, 1),
         (96, 8, 4, 8, 1, 1),
+        (128, 8, 4, 2, 8, 8),
         (128, 8, 4, 8, 1, 1),
         (256, 8, 4, 8, 1, 1),
         (316, 8, 4, 8, 1, 1),
@@ -346,26 +352,46 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
 
         tp_ep_group = []
         dp_no_ep_group = []
+        dp_no_ep_group_with_cp = []
 
-        tensor_and_data_group_size: int = tensor_model_parallel_size * data_parallel_size
-        num_tensor_and_data_groups: int = world_size // tensor_and_data_group_size
-        tensor_and_expert_group_size: int = tensor_model_parallel_size * expert_model_parallel_size
-        num_expert_groups: int = data_parallel_size // expert_model_parallel_size
-        for i in range(num_tensor_and_data_groups):
-            for j in range(num_expert_groups):
-                start_rank = i * tensor_and_data_group_size + j * tensor_and_expert_group_size
-                end_rank = (
-                    i * tensor_and_data_group_size + (j + 1) * tensor_and_expert_group_size
-                )
-                ranks = range(start_rank, end_rank)
-                tp_ep_group.append(list(ranks))
-
-        for i in range(num_tensor_and_data_groups):
-            start_rank = i * tensor_and_data_group_size
-            end_rank = (i + 1) * tensor_and_data_group_size
-            for j in range(tensor_and_expert_group_size):
-                ranks = range(start_rank + j, end_rank, tensor_and_expert_group_size)
-                dp_no_ep_group.append(list(ranks))
+        all_ranks = torch.arange(world_size).reshape((
+            pipeline_model_parallel_size,
+            data_parallel_size // expert_model_parallel_size,
+            expert_model_parallel_size,
+            context_parallel_size,
+            tensor_model_parallel_size
+        ))
+        # 'pp edp ep cp tp -> (pp edp cp) (ep tp)'
+        tp_ep_rearrange = torch.transpose(all_ranks, 2, 3)
+        tp_ep_rearrange = torch.reshape(tp_ep_rearrange, (-1, expert_model_parallel_size * tensor_model_parallel_size))
+        tp_ep_rearrange = tp_ep_rearrange.tolist()
+        tp_ep_rearrange.sort()
+        for tensor_and_expert_parallel_ranks in tp_ep_rearrange:
+            tensor_and_expert_parallel_ranks = list(tensor_and_expert_parallel_ranks)
+            tensor_and_expert_parallel_ranks.sort()
+            tp_ep_group.append(tensor_and_expert_parallel_ranks)
+        # 'pp edp ep cp tp -> (pp ep cp tp) edp'
+        edp_rearrange = torch.transpose(all_ranks, 1, 4)
+        edp_rearrange = torch.reshape(edp_rearrange, (-1, data_parallel_size // expert_model_parallel_size))
+        edp_rearrange = edp_rearrange.tolist()
+        edp_rearrange.sort()
+        for expert_data_parallel_ranks in edp_rearrange:
+            expert_data_parallel_ranks = list(expert_data_parallel_ranks)
+            expert_data_parallel_ranks.sort()
+            dp_no_ep_group.append(expert_data_parallel_ranks)
+        # 'pp edp ep cp tp -> (pp ep tp) (cp edp)'
+        edp_cp_rearrange = torch.transpose(all_ranks, 1, 2)
+        edp_cp_rearrange = torch.transpose(edp_cp_rearrange, 2, 4)
+        edp_cp_rearrange = torch.reshape(
+            edp_cp_rearrange,
+            (-1, context_parallel_size * data_parallel_size // expert_model_parallel_size)
+        )
+        edp_cp_rearrange = edp_cp_rearrange.tolist()
+        edp_cp_rearrange.sort()
+        for expert_data_parallel_ranksj_with_cp in edp_cp_rearrange:
+            expert_data_parallel_ranksj_with_cp = list(expert_data_parallel_ranksj_with_cp)
+            expert_data_parallel_ranksj_with_cp.sort()
+            dp_no_ep_group_with_cp.append(expert_data_parallel_ranksj_with_cp)
 
         return (
             dp_groups,
@@ -378,6 +404,7 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
             tp_dp_cp_group,
             tp_ep_group,
             dp_no_ep_group,
+            dp_no_ep_group_with_cp,
         )
 
     world_size = nodes * num_gpu
@@ -386,7 +413,6 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
     assert (
         world_size % (tp * pp * cp) == 0
     ), f"world_size ({world_size}) is not divisible by tp {tp} x pp {pp} x cp {cp}."
-    assert ep == 1 or cp == 1, "combination of ep and cp is not supported"
     (
         dp_groups,
         dp_groups_with_cp,
@@ -398,6 +424,7 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
         tp_dp_cp_group,
         tp_ep_group,
         dp_no_ep_group,
+        dp_no_ep_group_with_cp,
     ) = golden_rank_result_from_past_code(
         world_size=world_size,
         tensor_model_parallel_size=tp,
@@ -430,12 +457,12 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
     assert tp_dp_cp_group == rank_generator.get_ranks(
         "tp-dp-cp"
     ), f"{tp_dp_cp_group} != {rank_generator.get_ranks('tp-dp-cp')}"
-    if cp == 1:
-        # only test ep if cp == 1. If cp > 1, the old code will return an incorrect ranks.
-        assert tp_ep_group == rank_generator.get_ranks(
-            "tp-ep", independent_ep=True
-        ), f"{tp_ep_group} != {rank_generator.get_ranks('tp-ep', independent_ep=True)}."
-        assert dp_no_ep_group == rank_generator.get_ranks(
-            "dp", independent_ep=True
-        ), f"{dp_no_ep_group} != {rank_generator.get_ranks('dp', independent_ep=True)}."
-
+    assert tp_ep_group == rank_generator.get_ranks(
+        "tp-ep", independent_ep=True
+    ), f"{tp_ep_group} != {rank_generator.get_ranks('tp-ep', independent_ep=True)}."
+    assert dp_no_ep_group == rank_generator.get_ranks(
+        "dp", independent_ep=True
+    ), f"{dp_no_ep_group} != {rank_generator.get_ranks('dp', independent_ep=True)}."
+    assert dp_no_ep_group_with_cp == rank_generator.get_ranks(
+        "dp-cp", independent_ep=True
+    ), f"{dp_no_ep_group_with_cp} != {rank_generator.get_ranks('dp-cp', independent_ep=True)}."
