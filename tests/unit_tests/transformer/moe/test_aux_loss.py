@@ -10,11 +10,11 @@ from megatron.core import parallel_state
 
 class AuxlossTestContainer(MoEModelTestContainer):
     def partition_input(self, input):
-        partitioned_input = input.chunk(parallel_state.get_tensor_model_parallel_world_size(), dim=1)[parallel_state.get_tensor_model_parallel_rank()]
+        partitioned_input = input.chunk(parallel_state.get_tensor_and_context_parallel_world_size(), dim=1)[parallel_state.get_tensor_and_context_parallel_rank()]
         output = partitioned_input.clone().detach()
         output.requires_grad = True
         return output
-    
+
     def aux_loss_test(self, input, baseline_grad):
         partitioned_input = self.partition_input(input)
         moe_layer = self.moe_layer
@@ -48,7 +48,6 @@ class TestAuxLoss:
         self.baseline_grad = self.input.grad
         self.input.grad = None
         clear_aux_losses_tracker()
-        
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -57,6 +56,9 @@ class TestAuxLoss:
     @pytest.mark.parametrize("tp_size,ep_size,cp_size", [
         (8, 1, 1),
         (4, 2, 1),
+        (1, 1, 8),
+        (2, 1, 4),
+        (2, 2, 2),
     ])
     def test_allgather_dispatcher(self, tp_size, ep_size, cp_size):
         container = AuxlossTestContainer(
@@ -71,11 +73,14 @@ class TestAuxLoss:
             moe_aux_loss_coeff=0.1,
         )
         container.aux_loss_test(self.input, self.baseline_grad)
-        
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("tp_size,ep_size,cp_size", [
         (8, 1, 1),
         (4, 2, 1),
+        (1, 1, 8),
+        (2, 1, 4),
+        (2, 2, 2),
     ])
     def test_a2a_dispatcher(self, tp_size, ep_size, cp_size):
         container = AuxlossTestContainer(
@@ -90,4 +95,3 @@ class TestAuxLoss:
             moe_aux_loss_coeff=0.1,
         )
         container.aux_loss_test(self.input, self.baseline_grad)
-

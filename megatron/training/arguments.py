@@ -390,6 +390,11 @@ def validate_args(args, defaults={}):
         assert args.hidden_size % args.num_attention_heads == 0
         args.kv_channels = args.hidden_size // args.num_attention_heads
 
+    if args.seq_length is not None and args.context_parallel_size > 1:
+        assert args.seq_length % (args.context_parallel_size * 2) == 0, \
+            'seq-length should be a multiple of 2 * context-parallel-size ' \
+            'if context-parallel-size > 1.'
+
     if args.seq_length is not None:
         assert args.encoder_seq_length is None
         args.encoder_seq_length = args.seq_length

@@ -209,7 +209,11 @@ class GroupedMLP(MegatronModule):
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
 
         prepend_axis_num = len(sharded_offsets)
-        replica_id = (0, 0, parallel_state.get_data_modulo_expert_parallel_rank())
+        replica_id = (
+            0,
+            0,
+            parallel_state.get_data_modulo_expert_parallel_rank(with_context_parallel=True),
+        )
 
         @torch.no_grad()
         def sh_ten_build_fn(
@@ -316,7 +320,7 @@ class GroupedMLP(MegatronModule):
         replica_id = (
             0,
             parallel_state.get_tensor_model_parallel_rank(),
-            parallel_state.get_data_modulo_expert_parallel_rank(),
+            parallel_state.get_data_modulo_expert_parallel_rank(with_context_parallel=True),
         )
         # Add fake _extra_state to be compatible with SequentialMLP
         for expert_local_idx in range(self.num_local_experts):
@@ -560,7 +564,7 @@ class SequentialMLP(MegatronModule):
                 ), f'Expected replica_id for {k} to be in (PP, TP, DP) format, got: {replica_id}'
                 sh_ten.replica_id = (
                     *replica_id[:2],
-                    parallel_state.get_data_modulo_expert_parallel_rank(),
+                    parallel_state.get_data_modulo_expert_parallel_rank(with_context_parallel=True),
                 )
 
             sharded_state_dict.update(expert_state_dict)
