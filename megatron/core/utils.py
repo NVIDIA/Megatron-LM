@@ -666,7 +666,7 @@ class StragglerDetector:
             amp (float, optional): Set to 3.0 if we only use timers in fwd pass.
                                    Defaults to 3.0.
             port (int, optional): Control port, useful only for rank-0. Defaults to 65535.
-            prefill (int, optional): Howmany Events to pre-populate. Defaults to 1024.
+            prefill (int, optional): How many Events to pre-populate. Defaults to 1024.
             enabled (bool, optional): Whether or not collection is enabled on startup.
                                       Defaults to False.
         """
@@ -917,7 +917,7 @@ class StragglerDetector:
         indirectly from report() is the only way to activate the change that is made
         via rank-0
         """
-        # If no change just commnunicate the current
+        # If no change just communicate the current
         off = self._off
         if self.rank == 0 and self.toggle:
             off = not self._off
@@ -1123,7 +1123,7 @@ class StragglerDetector:
 
     @property
     def configured(self) -> bool:
-        """Can be called to check if the the instance is already configured
+        """Can be called to check if the instance is already configured
 
         Returns:
             bool: returns True if configure was called and was a success, else False
