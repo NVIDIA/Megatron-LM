@@ -1148,7 +1148,7 @@ def get_context_parallel_rank():
 
 def get_expert_model_parallel_world_size():
     """Return world size for the expert model parallel group"""
-    if _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE:
+    if _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE is not None:
         return _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         tensor_and_expert_parallel_world_size = torch.distributed.get_world_size(
@@ -1174,7 +1174,7 @@ def get_tensor_and_expert_parallel_world_size():
 
 def get_expert_model_parallel_rank():
     """Return my rank for the expert parallel group"""
-    if _MPU_EXPERT_MODEL_PARALLEL_RANK:
+    if _MPU_EXPERT_MODEL_PARALLEL_RANK is not None:
         return _MPU_EXPERT_MODEL_PARALLEL_RANK
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         tensor_and_expert_parallel_rank = torch.distributed.get_rank(
