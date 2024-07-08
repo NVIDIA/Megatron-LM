@@ -53,7 +53,7 @@ def build_tokenizer(args):
         assert args.vocab_size is not None
         tokenizer = _NullTokenizer(args.vocab_size)
     elif args.tokenizer_type == "PretrainedFromHF":
-        assert args.tokenizer_name_or_path is not None
+        assert args.tokenizer_model is not None
 
         # prevent transformers from logging info and warnings on each rank
         import transformers
@@ -66,7 +66,7 @@ def build_tokenizer(args):
 
         if args.rank == 0:
             print(" vocab file is un-used. loading tokenizer from pre-trained model")
-        tokenizer = _AutoTokenizer(args.tokenizer_name_or_path, vocab_extra_ids=args.vocab_extra_ids)
+        tokenizer = _AutoTokenizer(args.tokenizer_model, vocab_extra_ids=args.vocab_extra_ids)
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
@@ -330,7 +330,7 @@ class _SentencePieceTokenizer(MegatronTokenizer):
                 self._inv_vocab[next_id] = t
             self._special_tokens[t] = self._vocab[t]
             self._inv_special_tokens[self._vocab[t]] = t
-
+        """
         _add_special_token('<CLS>')
         self._cls_id = self._vocab['<CLS>']
         _add_special_token('<SEP>')
@@ -339,7 +339,7 @@ class _SentencePieceTokenizer(MegatronTokenizer):
         self._eod_id = self._vocab['<EOD>']
         _add_special_token('<MASK>')
         self._mask_id = self._vocab['<MASK>']
-
+        
         pad_id = self.tokenizer.pad_id()
         try:
             pad_token = self.tokenizer.id_to_piece(pad_id)
@@ -368,6 +368,10 @@ class _SentencePieceTokenizer(MegatronTokenizer):
             t = "<extra_id_{}>".format(i)
             _add_special_token(t)
             self._t5_tokens += [t]
+        """
+        self._bos_id = self._vocab['<s>']
+        self._eos_id = self._vocab['</s>']
+
 
     @property
     def vocab_size(self):
@@ -432,15 +436,15 @@ class _SentencePieceTokenizer(MegatronTokenizer):
 
     @property
     def cls(self):
-        return self._cls_id
+        return -1
 
     @property
     def sep(self):
-        return self._sep_id
+        return -1
 
     @property
     def pad(self):
-        return self._pad_id
+        return -1
 
     @property
     def bos(self):
@@ -448,7 +452,7 @@ class _SentencePieceTokenizer(MegatronTokenizer):
 
     @property
     def eod(self):
-        return self._eod_id
+        return self._eos_id
 
     @property
     def eos(self):
@@ -456,7 +460,7 @@ class _SentencePieceTokenizer(MegatronTokenizer):
 
     @property
     def mask(self):
-        return self._mask_id
+        return -1
 
     @property
     def additional_special_tokens_ids(self):
@@ -660,7 +664,7 @@ class _NullTokenizer(MegatronTokenizer):
     def additional_special_tokens_ids(self):
         return None
 
-class _AutoTokenizer(_SentencePieceTokenizer):
+class _AutoTokenizer(MegatronTokenizer):
     """AutoTokenizer for Hf Pretrained model loading."""
 
     def __init__(self, tokenizer_name_or_path, vocab_extra_ids):
