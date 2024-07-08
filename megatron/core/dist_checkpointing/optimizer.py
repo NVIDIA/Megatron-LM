@@ -22,6 +22,15 @@ from .mapping import (
 )
 from .utils import extract_sharded_tensors_and_factories
 
+HAVE_APEX_OR_TE = True
+try:
+    import transformer_engine
+except ModuleNotFoundError:
+    try:
+        import apex
+    except ModuleNotFoundError:
+        HAVE_APEX_OR_TE = False
+
 
 def get_optim_param_to_id_map(optim_params_iter: Iterable[torch.nn.Parameter]) -> Dict[int, int]:
     param_mappings = {}
@@ -116,7 +125,9 @@ def optim_state_to_sharding_state(
         for state_key, param in param_state.items():
             if state_key in exclude_keys:
                 continue
-            if param_id in id_to_sharded_param_map:
+            if not HAVE_APEX_OR_TE and state_key == 'step':
+                sharded_state[param_id][state_key] = param
+            elif param_id in id_to_sharded_param_map:
                 sharded_state[param_id][state_key] = make_sharded_optimizer_tensor(
                     id_to_sharded_param_map[param_id], param, prefix=f'optimizer.state.{state_key}'
                 )

@@ -46,8 +46,6 @@ fi
 USE_LEGACY=1
 if [[ $USE_CORE -eq 1 ]]; then
        echo "Running using megatron core"
-       TRANSFORMER_IMPL=transformer_engine
-       TRAINING_DTYPE=bf16
        unset USE_LEGACY
 fi
 

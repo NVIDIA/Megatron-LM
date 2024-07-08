@@ -10,11 +10,27 @@ from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 
+HAVE_APEX_OR_TE = True
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_scale
 except ImportError:
-    from apex.multi_tensor_apply import multi_tensor_applier
-    from amp_C import multi_tensor_scale
+    try:
+        from apex.multi_tensor_apply import multi_tensor_applier
+    except ImportError:
+        from megatron.core.utils import local_multi_tensor_applier
+
+        multi_tensor_applier = local_multi_tensor_applier
+    try:
+        import amp_C
+
+        l2_norm_impl = amp_C.multi_tensor_l2norm
+        multi_tensor_scale_impl = amp_C.multi_tensor_scale
+    except ImportError:
+        HAVE_APEX_OR_TE = False
+        from megatron.core.utils import local_multi_tensor_l2_norm, local_multi_tensor_scale
+
+        l2_norm_impl = local_multi_tensor_l2_norm
+        multi_tensor_scale_impl = local_multi_tensor_scale
 
 from .. import parallel_state, tensor_parallel
 from ..dist_checkpointing.mapping import ShardedStateDict
@@ -61,7 +77,7 @@ def _multi_tensor_copy_this_to_that(
     if overflow_buf:
         overflow_buf.fill_(0)
         # Scaling with factor `1.0` is equivalent to copy.
-        multi_tensor_applier(multi_tensor_scale, overflow_buf, [this, that], 1.0)
+        multi_tensor_applier(multi_tensor_scale_impl, overflow_buf, [this, that], 1.0)
     else:
         for this_, that_ in zip(this, that):
             that_.copy_(this_)
@@ -584,6 +600,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
     def sharded_state_dict(
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
     ):
+
         if is_loading:
             self.init_state_fn(self.optimizer)
 
@@ -616,6 +633,12 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         return state_dict
 
     def load_state_dict(self, state_dict):
+        pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
+        assert HAVE_APEX_OR_TE or pipeline_parallel_size == 1, (
+            f'When Apex and TE are not installed, restoring from a checkpoint with pipeline '
+            'parallel world size > 1 is currently unsupported.'
+        )
+
         # Optimizer.
         optimizer_key = 'optimizer'
         if optimizer_key not in state_dict:
@@ -759,6 +782,12 @@ class FP32Optimizer(MegatronOptimizer):
         return self.optimizer.state_dict()
 
     def load_state_dict(self, state_dict):
+        pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
+        assert HAVE_APEX_OR_TE or pipeline_parallel_size == 1, (
+            f'When Apex and TE are not installed, restoring from a checkpoint with pipeline '
+            'parallel world size > 1 is currently unsupported.'
+        )
+
         self.optimizer.load_state_dict(state_dict)
 
     def sharded_state_dict(
@@ -772,7 +801,6 @@ class FP32Optimizer(MegatronOptimizer):
             model_sharded_state_dict, self.get_parameters()
         )
         optim_state_to_sharding_state(state_dict, id_to_sharded_param_map)
-
         return state_dict
 
 
