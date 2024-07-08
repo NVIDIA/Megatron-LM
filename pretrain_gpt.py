@@ -172,7 +172,14 @@ def forward_step(data_iterator, model: GPTModel):
     with stimer:
         output_tensor = model(tokens, position_ids, attention_mask,
                               labels=labels)
-
+    """
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("/gpfs/projects/ehpc12/pre-training/tokenizer/")
+    print('...................................................')
+    for i in tokens:
+        print('------------------')
+        print(tokenizer.decode(i))
+    """
     return output_tensor, partial(loss_func, loss_mask)
 
 
