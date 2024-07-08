@@ -72,8 +72,8 @@ def get_norm(config):
         if args.apply_layernorm_1p:
             raise NotImplementedError('RMSNorm does not currently support the layernorm_1p formulation.')
 
-        return RMSNorm(dim=config.hidden_size,
-                       eps=config.layernorm_epsilon,
-                       sequence_parallel=config.sequence_parallel)
+        return RMSNorm(config.hidden_size,
+                       eps=config.layernorm_epsilon,)
+                       #sequence_parallel=config.sequence_parallel)
     else:
         raise Exception(f"unsupported norm type '{args.normalization}'.")

@@ -1,7 +1,8 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from .fused_layer_norm import MixedFusedLayerNorm as LayerNorm
-from .rms_norm import RMSNorm
+#from .rms_norm import RMSNorm
+from apex.normalization import MixedFusedRMSNorm as RMSNorm
 
 from .bert_model import BertModel
 from .gpt_model import GPTModel
