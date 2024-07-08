@@ -10,10 +10,14 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
+HAVE_APEX_OR_TE = True
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as Adam
 except ImportError:
-    from apex.optimizers import FusedAdam as Adam
+    try:
+        from apex.optimizers import FusedAdam as Adam
+    except ImportError:
+        HAVE_APEX_OR_TE = False
 
 from .. import parallel_state, tensor_parallel
 from ..dist_checkpointing import ShardedTensor
@@ -402,6 +406,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             data_parallel_group_idx (int): index in data-parallel group (used by
                 distributed checkpointing logic).
         """
+
+        assert (
+            HAVE_APEX_OR_TE
+        ), f'Please install Apex or Transformer Engine to use DistributedOptimizer.'
 
         super().__init__(
             optimizer,

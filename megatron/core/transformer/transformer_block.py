@@ -14,12 +14,6 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.transformer.custom_layers.transformer_engine import (
-    TEDelayedScaling,
-    TENorm,
-    get_cpu_offload_context,
-    te_checkpoint,
-)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -27,6 +21,28 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
+
+try:
+    from megatron.core.transformer.custom_layers.transformer_engine import (
+        TEDelayedScaling,
+        TENorm,
+        get_cpu_offload_context,
+        te_checkpoint,
+    )
+
+    HAVE_TE = True
+    LayerNormImpl = TENorm
+except ImportError:
+    HAVE_TE = False
+    get_cpu_offload_context = None
+    try:
+        import apex
+
+        LayerNormImpl = FusedLayerNorm
+    except ModuleNotFoundError:
+        from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
+
+        LayerNormImpl = WrappedTorchLayerNorm
 
 
 def get_num_layers_to_build(config: TransformerConfig) -> int:
@@ -88,7 +104,7 @@ def _get_block_submodules(
             num_layers = get_num_layers_to_build(config)
             return TransformerBlockSubmodules(
                 layer_specs=[spec] * num_layers,
-                layer_norm=TENorm,
+                layer_norm=LayerNormImpl,
             )
         else:
             raise Exception(f"specialize for {spec.module.__name__}.")

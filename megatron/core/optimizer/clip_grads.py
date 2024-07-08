@@ -14,9 +14,35 @@ try:
         multi_tensor_l2norm,
         multi_tensor_scale,
     )
+
+    l2_norm_impl = multi_tensor_l2norm
+    multi_tensor_scale_impl = multi_tensor_scale
 except ImportError:
-    from apex.multi_tensor_apply import multi_tensor_applier
-    from amp_C import multi_tensor_l2norm, multi_tensor_scale
+    try:
+        import amp_C
+        from apex.multi_tensor_apply import multi_tensor_applier
+
+        l2_norm_impl = amp_C.multi_tensor_l2norm
+        multi_tensor_scale_impl = amp_C.multi_tensor_scale
+    except ImportError:
+        import warnings
+
+        warnings.warn(
+            f'Transformer Engine and Apex are not installed. '
+            'Falling back to local implementations of multi_tensor_applier, '
+            'multi_tensor_l2norm, and multi_tensor_scale'
+        )
+
+        from megatron.core.utils import (
+            local_multi_tensor_applier,
+            local_multi_tensor_l2_norm,
+            local_multi_tensor_scale,
+        )
+
+        multi_tensor_applier = local_multi_tensor_applier
+        l2_norm_impl = local_multi_tensor_l2_norm
+        multi_tensor_scale_impl = local_multi_tensor_scale
+
 
 from ..tensor_parallel import param_is_not_tensor_parallel_duplicate
 from ..transformer.module import param_is_not_shared
@@ -69,7 +95,7 @@ def get_grad_norm_fp32(
             # and performs the operation on that list all in one kernel.
             if grads_for_norm:
                 grad_norm, _ = multi_tensor_applier(
-                    multi_tensor_l2norm,
+                    l2_norm_impl,
                     dummy_overflow_buf,
                     [grads_for_norm],
                     False,  # no per-parameter norm
@@ -120,7 +146,9 @@ def clip_grad_by_total_norm_fp32(
     clip_coeff = max_norm / (total_norm + 1.0e-6)
     if clip_coeff < 1.0:
         dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
-        multi_tensor_applier(multi_tensor_scale, dummy_overflow_buf, [grads, grads], clip_coeff)
+        multi_tensor_applier(
+            multi_tensor_scale_impl, dummy_overflow_buf, [grads, grads], clip_coeff
+        )
 
 
 def count_zeros_fp32(

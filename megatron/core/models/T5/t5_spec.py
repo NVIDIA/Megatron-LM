@@ -1,18 +1,10 @@
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import (
     CrossAttention,
     CrossAttentionSubmodules,
     SelfAttention,
     SelfAttentionSubmodules,
-)
-from megatron.core.transformer.custom_layers.transformer_engine import (
-    TEColumnParallelLinear,
-    TEDotProductAttention,
-    TELayerNormColumnParallelLinear,
-    TENorm,
-    TERowParallelLinear,
 )
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
@@ -25,6 +17,34 @@ from megatron.core.transformer.transformer_block import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+
+try:
+    from megatron.core.transformer.custom_layers.transformer_engine import (
+        TEColumnParallelLinear,
+        TEDotProductAttention,
+        TELayerNormColumnParallelLinear,
+        TENorm,
+        TERowParallelLinear,
+    )
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
+try:
+    import apex
+
+    from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+
+    HAVE_APEX = True
+    LNImpl = FusedLayerNorm
+except ImportError:
+    import warnings
+
+    from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
+
+    warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
+    LNImpl = WrappedTorchLayerNorm
 
 
 def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
@@ -104,7 +124,7 @@ def encoder_model_with_local_spec() -> ModuleSpec:
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
-            input_layernorm=FusedLayerNorm,
+            input_layernorm=LNImpl,
             self_attention=ModuleSpec(
                 module=SelfAttention,
                 params={"attn_mask_type": AttnMaskType.padding},
@@ -117,7 +137,7 @@ def encoder_model_with_local_spec() -> ModuleSpec:
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=FusedLayerNorm,
+            pre_mlp_layernorm=LNImpl,
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(
@@ -140,7 +160,7 @@ def decoder_model_with_local_spec() -> ModuleSpec:
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
-            input_layernorm=FusedLayerNorm,
+            input_layernorm=LNImpl,
             self_attention=ModuleSpec(
                 module=SelfAttention,
                 params={"attn_mask_type": AttnMaskType.causal},
@@ -153,7 +173,7 @@ def decoder_model_with_local_spec() -> ModuleSpec:
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_cross_attn_layernorm=FusedLayerNorm,
+            pre_cross_attn_layernorm=LNImpl,
             cross_attention=ModuleSpec(
                 module=CrossAttention,
                 submodules=CrossAttentionSubmodules(
@@ -164,7 +184,7 @@ def decoder_model_with_local_spec() -> ModuleSpec:
                 ),
             ),
             cross_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=FusedLayerNorm,
+            pre_mlp_layernorm=LNImpl,
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(
