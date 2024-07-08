@@ -16,7 +16,10 @@ class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, inputs, scale):
-        import scaled_upper_triang_masked_softmax_cuda
+        try:
+            import scaled_upper_triang_masked_softmax_cuda
+        except (ImportError, ModuleNotFoundError):
+            print(f'Please install Apex to use fused_softmax')
 
         scale_t = torch.tensor([scale])
         softmax_results = scaled_upper_triang_masked_softmax_cuda.forward(
@@ -28,7 +31,10 @@ class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, output_grads):
-        import scaled_upper_triang_masked_softmax_cuda
+        try:
+            import scaled_upper_triang_masked_softmax_cuda
+        except (ImportError, ModuleNotFoundError):
+            print(f'Please install Apex to use fused_softmax')
 
         softmax_results, scale_t = ctx.saved_tensors
         input_grads = scaled_upper_triang_masked_softmax_cuda.backward(
@@ -48,7 +54,10 @@ class ScaledMaskedSoftmax(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, inputs, mask, scale):
-        import scaled_masked_softmax_cuda
+        try:
+            import scaled_masked_softmax_cuda
+        except (ImportError, ModuleNotFoundError):
+            print(f'Please install Apex to use fused_softmax')
 
         scale_t = torch.tensor([scale])
 
@@ -58,7 +67,10 @@ class ScaledMaskedSoftmax(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, output_grads):
-        import scaled_masked_softmax_cuda
+        try:
+            import scaled_masked_softmax_cuda
+        except (ImportError, ModuleNotFoundError):
+            print(f'Please install Apex to use fused_softmax')
 
         softmax_results, scale_t = ctx.saved_tensors
 
@@ -77,7 +89,10 @@ class ScaledSoftmax(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, inputs, scale):
-        import scaled_softmax_cuda
+        try:
+            import scaled_softmax_cuda
+        except (ImportError, ModuleNotFoundError):
+            print(f'Please install Apex to use fused_softmax')
 
         scale_t = torch.tensor([scale])
 
@@ -89,7 +104,10 @@ class ScaledSoftmax(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, output_grads):
-        import scaled_softmax_cuda
+        try:
+            import scaled_softmax_cudaa
+        except (ImportError, ModuleNotFoundError):
+            print(f'Please install Apex to use fused_softmax')
 
         softmax_results, scale_t = ctx.saved_tensors
 
@@ -208,6 +226,9 @@ class FusedScaleMaskSoftmax(nn.Module):
 
     @staticmethod
     def get_batch_per_block(sq, sk, b, np):
-        import scaled_masked_softmax_cuda
+        try:
+            import scaled_masked_softmax_cuda
+        except (ImportError, ModuleNotFoundError):
+            print(f'Please install Apex to use fused_softmax')
 
         return scaled_masked_softmax_cuda.get_batch_per_block(sq, sk, b, np)

@@ -18,7 +18,17 @@ except ImportError:
     try:
         from amp_C import multi_tensor_l2norm
     except ImportError:
-        multi_tensor_l2norm = None
+        import warnings
+        warnings.warn(
+            f'Transformer Engine and Apex are not installed. '
+            'Falling back to local implementations of '
+            'multi_tensor_applier and multi_tensor_l2norm'
+        )
+
+        from megatron.core.utils import (
+            local_multi_tensor_l2_norm as multi_tensor_l2norm,
+            local_multi_tensor_applier as multi_tensor_applier,
+        )
 
 from megatron.training import (
     get_args,
@@ -67,10 +77,6 @@ def calc_params_l2_norm(model):
                 is_not_shared = param_is_not_shared(param)
                 if is_not_shared and is_not_tp_duplicate:
                     params_data.append(param.data.float() if args.bf16 else param.data)
-
-    # Check the availability of multi_tensor_applier and multi_tensor_l2norm
-    assert multi_tensor_applier is not None and multi_tensor_l2norm is not None, \
-        "Please install either TransformerEngine >= 1.8 or Apex from https://github.com/NVIDIA/apex."
 
     # Calculate norm
     dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
