@@ -46,8 +46,9 @@ class Router(ABC, MegatronModule):
         self.weight = torch.nn.Parameter(
             torch.empty((self.config.num_moe_experts, self.config.hidden_size))
         )
-        with get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
-            config.init_method(self.weight)
+        if config.perform_initialization:
+            with get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
+                config.init_method(self.weight)
         setattr(self.weight, 'sequence_parallel', config.sequence_parallel)
 
     def gating(self, input: torch.Tensor):
