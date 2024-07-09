@@ -773,7 +773,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
 
     # Set iteration.
-    if args.finetune or release:
+    if args.finetune or release or args.annealing:
         iteration = 0
     else:
         try:
@@ -790,7 +790,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     # Check arguments.
     assert args.consumed_train_samples == 0
     assert args.consumed_valid_samples == 0
-    if 'args' in state_dict and not args.finetune:
+    if 'args' in state_dict and not args.finetune and not args.annealing:
         checkpoint_args = state_dict['args']
         check_checkpoint_args(checkpoint_args)
         args.consumed_train_samples = getattr(checkpoint_args,
@@ -842,7 +842,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 optimizer.load_parameter_state(optim_checkpoint_name)
 
             # Load scheduler.
-            if opt_param_scheduler is not None:
+            if opt_param_scheduler is not None and not args.annealing:
                 if 'lr_scheduler' in state_dict: # backward compatbility
                     opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
                 else:
