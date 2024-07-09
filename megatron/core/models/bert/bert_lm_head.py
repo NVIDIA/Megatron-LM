@@ -50,10 +50,10 @@ class BertLMHead(MegatronModule):
             eps=config.layernorm_epsilon,
         )
 
-        self.gelu = torch.nn.functional.gelu
+        self.activation = config.activation_func
 
     def forward(self, hidden_states: Tensor) -> Tensor:
         hidden_states = self.dense(hidden_states)
-        hidden_states = self.gelu(hidden_states)
+        hidden_states = self.activation(hidden_states)
         hidden_states = self.layer_norm(hidden_states)
         return hidden_states
