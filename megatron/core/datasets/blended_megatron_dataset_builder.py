@@ -346,7 +346,6 @@ class BlendedMegatronDatasetBuilder(object):
                             megatron_datasets[j].append(megatron_datasets_split[j])
                     except Exception as err:
                         raise err
-            return megatron_datasets
 
         megatron_datasets = [[] for _ in range(len(Split))]
         num_dataset_builder_threads = self.config.num_dataset_builder_threads
@@ -413,6 +412,13 @@ class BlendedMegatronDatasetBuilder(object):
         Returns:
             List[Optional[MidLevelDataset]]: The MidLevelDataset (or None) per split
         """
+        # short-cut if we are not building on this rank
+        if torch.distributed.is_initialized() and not self.is_built_on_rank():
+            for i in range(len(Split)):
+                if split[i] is not None and synchronize_ranks:
+                    torch.distributed.barrier()
+            return [None] * len(Split)
+
         # Build the low level dataset
         low_level_dataset = self.cls.build_low_level_dataset(dataset_path, self.config)
 
