@@ -19,7 +19,7 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import \
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from .async_utils import schedule_async_save
 from .global_vars import get_args, get_one_logger
-from .utils import unwrap_model, print_rank_0, append_to_progress_log, is_last_rank
+from .utils import unwrap_model, print_rank_0, append_to_progress_log, is_last_rank, maybe_get_current_rank
 from ..core.dist_checkpointing.serialization import \
     get_default_save_sharded_strategy
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
