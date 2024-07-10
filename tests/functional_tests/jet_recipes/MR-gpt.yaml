@@ -109,8 +109,7 @@ products:
   - {tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather --check-weight-hash-across-dp-replicas-interval 10 --ckpt-fully-parallel-load"'], args_meta: ["dist_optimizer_overlap_grad_reduce_param_gather"]}
   - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], extra_args: ["--cross-entropy-loss-fusion"], args_meta: ["cross_entropy_loss_fusion"]}
   # Mcore, no TE
-  - {tp_size: [2], pp_size: [1], ckpt_resume: [1], uninstall_te: [1], use_te: [False], extra_args: ['"--no-persist-layer-norm --no-masked-softmax-fusion"'], skip_pytest: [1]} ## TODO(ashors): add baseline
-  - {tp_size: [2], pp_size: [2], ckpt_resume: [0], uninstall_te: [1], use_te: [False], extra_args: ['"--no-persist-layer-norm --no-masked-softmax-fusion"'], skip_pytest: [1]} ## TODO(ashors): add baseline
+  - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], uninstall_te: [1], use_te: [False], extra_args: ['"--no-persist-layer-norm --no-masked-softmax-fusion"'], skip_pytest: [1]} ## TODO(ashors): add baseline
   # Non-MCore, only legacy checkpoints supported
   - {use_mcore: [False], use_te: [False, True], tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], ckpt_format: [torch]}
   - {use_mcore: [False],  use_te: [False], tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1], ckpt_format: [torch]}
