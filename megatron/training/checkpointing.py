@@ -360,7 +360,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             if checkpointing_context is not None:
                 checkpointing_context['save_strategy'] = save_strategy
             end_ckpt = time()
-            logger.debug(f"rank: {torch.distributed.get_rank()}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt ")
+            logger.debug(f"rank: {maybe_get_current_rank()}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt ")
             async_save_request = dist_checkpointing.save(state_dict, checkpoint_name, save_strategy,
                                                          async_sharded_save=args.async_save)
 
@@ -423,7 +423,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         torch.distributed.barrier()
 
     end_misc = time()
-    logger.debug(f"rank: {torch.distributed.get_rank()}, takes {end_misc - start_misc} to finalize ckpt save ")
+
+    logger.debug(f"rank: {maybe_get_current_rank()}, takes {end_misc - start_misc} to finalize ckpt save ")
 
 def generate_state_dict(args, model, optimizer, opt_param_scheduler,
                         rng_state, use_dist_ckpt=False, iteration=None,

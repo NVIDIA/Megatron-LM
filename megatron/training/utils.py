@@ -282,6 +282,11 @@ def print_rank_last(message):
     else:
         print(message, flush=True)
 
+def maybe_get_current_rank():
+    if not torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    else:
+        return "N/A"
 
 def append_to_progress_log(string, barrier=True):
     """ Append given string to progress log. """
