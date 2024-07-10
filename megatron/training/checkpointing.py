@@ -326,11 +326,12 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         elif args.dist_ckpt_format != 'torch_dist':
             raise NotImplementedError(f'Async checkpoint save not implemented for {args.dist_ckpt_format} distributed checkpoint format')
 
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
     # Collect args, model, RNG.
     if not torch.distributed.is_initialized() \
             or mpu.get_data_modulo_expert_parallel_rank(with_context_parallel=True) == 0 \
             or args.use_dist_ckpt:
-
         optim_sd_kwargs = {}
         if args.use_dist_ckpt and args.use_distributed_optimizer:
             optim_sd_kwargs['sharding_type'] = ('fully_sharded_model_space'
@@ -360,7 +361,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             if checkpointing_context is not None:
                 checkpointing_context['save_strategy'] = save_strategy
             end_ckpt = time()
-            logger.debug(f"rank: {torch.distributed.get_rank()}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt ")
+            logger.debug(f"rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt ")
             async_save_request = dist_checkpointing.save(state_dict, checkpoint_name, save_strategy,
                                                          async_sharded_save=args.async_save)
 
@@ -423,7 +424,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         torch.distributed.barrier()
 
     end_misc = time()
-    logger.debug(f"rank: {torch.distributed.get_rank()}, takes {end_misc - start_misc} to finalize ckpt save ")
+    logger.debug(f"rank: {rank}, takes {end_misc - start_misc} to finalize ckpt save ")
 
 def generate_state_dict(args, model, optimizer, opt_param_scheduler,
                         rng_state, use_dist_ckpt=False, iteration=None,
