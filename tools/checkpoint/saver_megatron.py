@@ -305,16 +305,28 @@ def save_checkpoint(queue, args):
             # Save them to the model
             for tp_rank in range(args.target_tensor_parallel_size):
                 l = models[tp_rank].language_model.encoder.layers[layer]
-                l.input_norm.weight.data.copy_(input_norm_weight)
+                if margs.transformer_impl == 'local':
+                    l.input_norm.weight.data.copy_(input_norm_weight)
+                else:  # transformer_engine
+                    l.self_attention.layernorm_qkv.layer_norm_weight.data.copy_(input_norm_weight)
                 if md.norm_has_bias:
                     l.input_norm.bias.data.copy_(input_norm_bias)
-                l.self_attention.query_key_value.weight.data.copy_(qkv_weight[tp_rank])
-                l.self_attention.dense.weight.data.copy_(dense_weight[tp_rank])
-                l.post_attention_norm.weight.data.copy_(post_norm_weight)
+                if margs.transformer_impl == 'local':
+                    l.self_attention.query_key_value.weight.data.copy_(qkv_weight[tp_rank])
+                    l.self_attention.dense.weight.data.copy_(dense_weight[tp_rank])
+                    l.post_attention_norm.weight.data.copy_(post_norm_weight)
+                else:  # transformer_engine
+                    l.self_attention.layernorm_qkv.weight.data.copy_(qkv_weight[tp_rank])
+                    l.self_attention.proj.weight.data.copy_(dense_weight[tp_rank])
+                    l.layernorm_mlp.layer_norm_weight.data.copy_(post_norm_weight)
                 if md.norm_has_bias:
                     l.post_attention_norm.bias.data.copy_(post_norm_bias)
-                l.mlp.dense_h_to_4h.weight.data.copy_(mlp_l0_weight[tp_rank])
-                l.mlp.dense_4h_to_h.weight.data.copy_(mlp_l1_weight[tp_rank])
+                if margs.transformer_impl == 'local':
+                    l.mlp.dense_h_to_4h.weight.data.copy_(mlp_l0_weight[tp_rank])
+                    l.mlp.dense_4h_to_h.weight.data.copy_(mlp_l1_weight[tp_rank])
+                else:  # transformer_engine
+                    l.layernorm_mlp.fc1.weight.data.copy_(mlp_l0_weight[tp_rank])
+                    l.layernorm_mlp.fc2.weight.data.copy_(mlp_l1_weight[tp_rank])
                 if md.linear_bias:
                     l.self_attention.query_key_value.bias.data.copy_(qkv_bias[tp_rank])
                     l.self_attention.dense.bias.data.copy_(dense_bias)
