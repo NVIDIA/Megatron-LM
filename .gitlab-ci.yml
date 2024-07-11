@@ -72,7 +72,7 @@ ppp_capacity_statistics:
       # Get the current year, month, and day
       YEAR=$(date +%Y)
       MONTH=$(date +%m)
-      DAY=$([[ "$(date +%d)" -lt 8 ]] && echo "01" || echo "15")
+      DAY=$([[ $(date +%-d) -le 15 ]] && echo "01" || echo "15")
       TIMESTAMP="${YEAR}-${MONTH}-${DAY}T00:00:01"
 
       CLUSTER_ID=$(curl "${RESOURCE_ENDPOINT}/api/v1/clusters" \
