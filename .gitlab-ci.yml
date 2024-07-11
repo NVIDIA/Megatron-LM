@@ -1,64 +1,102 @@
 workflow:
   rules:
-    - if: ($CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests and nightly/) || ($CI_PIPELINE_SOURCE == "schedule")
+    - if: $CI_PIPELINE_SOURCE == "schedule"
       variables:
-        JET_CUSTOM_FILTER: "type == 'build' or 'mr' in spec.scope or 'nightly' in spec.scope"
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/
-      variables:
-        JET_CUSTOM_FILTER: "type == 'build' or 'mr' in spec.scope"
-    # always run MR pipelines
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    # always run web pipelines
+        FUNCTIONAL_TEST: "yes"
     - if: $CI_PIPELINE_SOURCE == "web"
-    # do not run branch pipelines if open MR exists
-    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
-      when: never
-    # run branch pipeline if no open MR and on main
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-    
+      variables:
+        FUNCTIONAL_TEST: "no"
+    - if: $CI_COMMIT_BRANCH =~ /^core_r/
+      variables:
+        FUNCTIONAL_TEST: "no"
+    - if: $CI_MERGE_REQUEST_LABELS =~ /Run tests and nightly/
+      variables:
+        FUNCTIONAL_TEST: "yes"
+        SLURM_CLUSTER: dgxa100_dracooci
+        SCOPE: mr-and-nightly
+    - if: $CI_MERGE_REQUEST_LABELS =~ /Run tests/
+      variables:
+        FUNCTIONAL_TEST: "yes"
+        SLURM_CLUSTER: dgxa100_dracooci
+        SCOPE: mr
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      variables:
+        FUNCTIONAL_TEST: "no"
+    - when: never
+  auto_cancel:
+    on_new_commit: interruptible
 
 stages:
   - build
   - unit_tests
   - functional_tests
 
+default:
+  interruptible: false
+
 variables:
-  JET_CUSTOM_FILTER:
-    description: |
-      Selects what functional tests to run. For mr tests: "type == 'build' or 'mr' in spec.scope". For nightly tests: "type == 'build' or 'nightly' in spec.scope"
-    value: ""
-  TIME_LIMIT: "10:00" # Default time limit for all jobs
+  FUNCTIONAL_TEST: "yes"
+  SCOPE:
+    value: "mr"
+    options:
+      - "mr"
+      - "nightly"
+      - "mr-and-nightly"
+      - "weekly"
+      - "release"
+    description: "Testsuite to run"
   SLURM_CLUSTER:
     value: "dgxa100_dracooci"
     options:
       - "dgxa100_dracooci"
       - "dgxh100_eos"
     description: '"dgxa100_dracooci" for OCI-IAD, "dgxh100_eos" for EOS'
+  # CI wide variables
   CI_MCORE_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci
   CI_NEMO_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/nemo_ci
   LINTING_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_linting
-
+  
 metadata:
   image: python:3.10
   stage: .pre
   tags: 
     - os/linux
   script:
+    - set -x
     - env
+    - JET_CUSTOM_FILTER="type == 'basic'"
     - |
       if [[ $SLURM_CLUSTER == dgxh100_eos ]]; then
-        JET_CI_BRANCH=mcore/eos;
+        JET_CI_BRANCH=mcore/eos
+        JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and 'dgx_h100' in spec.platforms"
       elif [[ $SLURM_CLUSTER == dgxa100_dracooci ]]; then
-        JET_CI_BRANCH=mcore/draco-oci;
-      else
-        echo "Unsupported value of SLURM_CLUSTER=$SLURM_CLUSTER";
-        exit 1;
+        JET_CI_BRANCH=mcore/draco-oci
+        JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and 'dgx_a100' in spec.platforms"
+      fi
+    - |
+      if [[ $SCOPE == mr ]]; then
+        JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and 'mr' in spec.scope"
+      elif [[ $SCOPE == nightly ]]; then
+        JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and 'nightly' in spec.scope"
+      elif [[ $SCOPE == mr-and-nightly ]]; then
+        JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and ('mr' in spec.scope or 'nightly' in spec.scope)"
+      elif [[ $SCOPE == weekly ]]; then
+        JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and 'weekly' in spec.scope"
+      elif [[ $SCOPE == release ]]; then
+        JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and 'release' in spec.scope"
+      fi
+    - |
+      if [[ "$JET_CUSTOM_FILTER" == "type == 'basic'" ]]; then
+        JET_CUSTOM_FILTER="False"
       fi
     - echo "JET_CI_BRANCH=$JET_CI_BRANCH" | tee -a build.env
+    - echo "JET_CUSTOM_FILTER=$JET_CUSTOM_FILTER" | tee -a build.env
   artifacts:
     reports:
       dotenv: build.env
-  interruptible: true
+  rules:
+    - if: '$FUNCTIONAL_TEST == "yes"'
 
 ppp_capacity_statistics:
   tags: [mcore-ssh-agent]
@@ -174,7 +212,6 @@ build_image:
         docker tag ${IMAGE}:${CI_PIPELINE_ID} ${IMAGE}:v${CI_COMMIT_BRANCH#core_r}-${CI_PIPELINE_ID}
         docker push ${IMAGE}:v${CI_COMMIT_BRANCH#core_r}-${CI_PIPELINE_ID}
       fi
-  interruptible: true
 
 .unit_test_common:
   image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
@@ -184,7 +221,6 @@ build_image:
     - 8xL40S
   variables:
     MOE_GROUPED_GEMM: 0 # Set to 1 to enable grouped gemm for MoE
-  interruptible: true
   retry:
     max: 2
     when: job_execution_timeout
@@ -193,113 +229,76 @@ unit_tests:
   extends: [.unit_test_common]
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail tests/unit_tests
+  rules:
+    - if: '$FUNCTIONAL_TEST == "yes"'
   coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
   artifacts:
     paths:
       - coverage
     expire_in: 30 days
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 unit_tests-data:
   extends: [.unit_test_common]
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/data
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
-      when: never
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: never
-    - when: always
+    - if: '$FUNCTIONAL_TEST == "no"'
 
 unit_tests-dist-checkpointing:
   extends: [.unit_test_common]
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/dist_checkpointing
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
-      when: never
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: never
-    - when: always
+    - if: '$FUNCTIONAL_TEST == "no"'
 
 unit_tests-fusions:
   extends: [.unit_test_common]
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/fusions
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
-      when: never
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: never
-    - when: always
+    - if: '$FUNCTIONAL_TEST == "no"'
     
 unit_tests-inference:
   extends: [.unit_test_common]
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/inference
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
-      when: never
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: never
-    - when: always
+    - if: '$FUNCTIONAL_TEST == "no"'
 
 unit_tests-models:
   extends: [.unit_test_common]
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/models
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
-      when: never
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: never
-    - when: always
+    - if: '$FUNCTIONAL_TEST == "no"'
 
 unit_tests-pipeline-parallel:
   extends: [.unit_test_common]
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/pipeline_parallel
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
-      when: never
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: never
-    - when: always
+    - if: '$FUNCTIONAL_TEST == "no"'
 
 unit_tests-tensor-parallel:
   extends: [.unit_test_common]
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/tensor_parallel
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
-      when: never
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: never
-    - when: always
+    - if: '$FUNCTIONAL_TEST == "no"'
 
 unit_tests-transformer:
   extends: [.unit_test_common]
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/transformer
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
-      when: never
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: never
-    - when: always
+    - if: '$FUNCTIONAL_TEST == "no"'
 
 unit_tests-top-py:
   extends: [.unit_test_common]
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/*.py
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
-      when: never
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: never
-    - when: always
+    - if: '$FUNCTIONAL_TEST == "no"'
 
 docs_build_test:
   image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/python-format:0.0.1
