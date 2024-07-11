@@ -169,6 +169,11 @@ build_image:
         docker tag ${IMAGE}:${CI_PIPELINE_ID} ${IMAGE}:buildcache
         docker push ${IMAGE}:buildcache
       fi
+
+      if [[ $CI_COMMIT_BRANCH == core_r* ]]; then
+        docker tag ${IMAGE}:${CI_PIPELINE_ID} ${IMAGE}:v${CI_COMMIT_BRANCH#core_r}-${CI_PIPELINE_ID}
+        docker push ${IMAGE}:v${CI_COMMIT_BRANCH#core_r}-${CI_PIPELINE_ID}
+      fi
   interruptible: true
 
 .unit_test_common:
