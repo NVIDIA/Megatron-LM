@@ -62,7 +62,7 @@ def _init_weights(
 
         for name, p in module.named_parameters():
             if name in ["in_proj.weight", "x_proj.weight", "conv1d.weight", "out_proj.weight"]:
-                nn.init.kaiming_uniform(p, a=math.sqrt(5))
+                nn.init.kaiming_uniform_(p, a=math.sqrt(5))
 
         if rescale_prenorm_residual:
             # Reinitialize selected weights subject to the OpenAI GPT-2 Paper Scheme:
