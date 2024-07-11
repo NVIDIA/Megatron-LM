@@ -2,15 +2,15 @@
 
 """Megatron optimizer."""
 
+import copy
 import math
 from abc import ABC, abstractmethod
 from itertools import chain
 from logging import getLogger
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
-HAVE_APEX_OR_TE = True
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_scale
 except ImportError:
@@ -26,7 +26,6 @@ except ImportError:
         l2_norm_impl = amp_C.multi_tensor_l2norm
         multi_tensor_scale_impl = amp_C.multi_tensor_scale
     except ImportError:
-        HAVE_APEX_OR_TE = False
         from megatron.core.utils import local_multi_tensor_l2_norm, local_multi_tensor_scale
 
         l2_norm_impl = local_multi_tensor_l2_norm
@@ -255,6 +254,26 @@ class MegatronOptimizer(ABC):
 
         Returns: optimizer sharded state dict
         """
+
+    @staticmethod
+    def _extract_common_per_param_step(state_dict) -> Union[int, torch.Tensor]:
+        common_step = None
+        for param_idx, param_state in state_dict['state'].items():
+            param_step = param_state.get('step', None)
+            if param_step is not None:
+                if common_step is None:
+                    common_step = param_step
+                elif common_step != param_step:
+                    raise ValueError(
+                        "The optimizer step differs per parameter. Mcore only supports "
+                        "optimizers whose step is shared across all parameters."
+                    )
+        return common_step
+
+    @staticmethod
+    def _restore_common_per_param_step(state_dict: Dict, step: Union[int, torch.Tensor]):
+        for param_idx, param_state in state_dict['state'].items():
+            param_state['step'] = copy.deepcopy(step)
 
 
 class MixedPrecisionOptimizer(MegatronOptimizer):
@@ -628,22 +647,30 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             )
         ]
 
+        step = self._extract_common_per_param_step(state_dict['optimizer'])
+
         # Convert regular optimizer state
-        optim_state_to_sharding_state(state_dict['optimizer'], id_to_sharded_param_map)
+        # all optimizer parameters passed to optim_state_to_sharding_state are
+        # expected to have the same shape as the model parameters,
+        # so we save the step separately and ignore it here
+        optim_state_to_sharding_state(
+            state_dict['optimizer'], id_to_sharded_param_map, exclude_keys="step"
+        )
+        # save step as a shared step among all parameters. Separate per-parameter
+        # steps are not supported
+        state_dict['optimizer']['state']['common_step'] = step
         return state_dict
 
     def load_state_dict(self, state_dict):
         pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
-        assert HAVE_APEX_OR_TE or pipeline_parallel_size == 1, (
-            f'When Apex and TE are not installed, restoring from a checkpoint with pipeline '
-            'parallel world size > 1 is currently unsupported.'
-        )
-
         # Optimizer.
         optimizer_key = 'optimizer'
         if optimizer_key not in state_dict:
             optimizer_key = 'optimizer_state_dict'
             logger.info('***WARNING*** loading optimizer from ' 'an old checkpoint ...')
+        if 'common_step' in state_dict[optimizer_key]['state']:
+            common_step = state_dict[optimizer_key]['state'].pop('common_step')
+            self._restore_common_per_param_step(state_dict[optimizer_key], common_step)
         self.optimizer.load_state_dict(state_dict[optimizer_key])
 
         # Grad scaler.
@@ -783,11 +810,9 @@ class FP32Optimizer(MegatronOptimizer):
 
     def load_state_dict(self, state_dict):
         pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
-        assert HAVE_APEX_OR_TE or pipeline_parallel_size == 1, (
-            f'When Apex and TE are not installed, restoring from a checkpoint with pipeline '
-            'parallel world size > 1 is currently unsupported.'
-        )
-
+        if 'common_step' in state_dict['state']:
+            common_step = state_dict['state'].pop('common_step')
+            self._restore_common_per_param_step(state_dict, common_step)
         self.optimizer.load_state_dict(state_dict)
 
     def sharded_state_dict(
@@ -800,7 +825,15 @@ class FP32Optimizer(MegatronOptimizer):
         id_to_sharded_param_map = get_param_id_to_sharded_param_map(
             model_sharded_state_dict, self.get_parameters()
         )
-        optim_state_to_sharding_state(state_dict, id_to_sharded_param_map)
+        step = self._extract_common_per_param_step(state_dict)
+
+        # all optimizer parameters passed to optim_state_to_sharding_state are
+        # expected to have the same shape as the model parameters,
+        # so we save the step separately and ignore it here
+        optim_state_to_sharding_state(state_dict, id_to_sharded_param_map, exclude_keys="step")
+        # save step as a shared step among all parameters. Separate per-parameter
+        # steps are not supported
+        state_dict['state']['common_step'] = step
         return state_dict
 
 
