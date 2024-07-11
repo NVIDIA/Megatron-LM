@@ -121,7 +121,7 @@ build_image:
   image: docker:26.1.4-dind
   needs: []  # May start ASAP
   stage: build
-  timeout: 30m
+  timeout: 45m
   parallel:
     matrix:
       - IMAGE: CI_MCORE_IMAGE
