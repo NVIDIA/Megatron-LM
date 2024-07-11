@@ -80,7 +80,7 @@ class MambaMixer(MegatronModule):
         # Fused kernel and sharding options
         chunk_size=128,
         use_mem_eff_path=True,
-        layer_idx=None,
+        layer_number=None,
     ):
         super().__init__(config)
         self.config = config
@@ -99,7 +99,7 @@ class MambaMixer(MegatronModule):
         self.norm_before_gate = norm_before_gate
         self.chunk_size = chunk_size
         self.use_mem_eff_path = use_mem_eff_path
-        self.layer_idx = layer_idx
+        self.layer_number = layer_number
 
         self.tensor_model_parallel_size = get_tensor_model_parallel_world_size()
         assert self.d_inner % self.tensor_model_parallel_size == 0
@@ -495,8 +495,8 @@ class MambaMixer(MegatronModule):
         return conv_state, ssm_state
 
     def _get_states_from_cache(self, inference_params, batch_size, initialize_states=False):
-        assert self.layer_idx is not None
-        if self.layer_idx not in inference_params.key_value_memory_dict:
+        assert self.layer_number is not None
+        if self.layer_number not in inference_params.key_value_memory_dict:
             conv_state = torch.zeros(
                 batch_size,
                 self.conv1d.weight.shape[0],
@@ -512,9 +512,9 @@ class MambaMixer(MegatronModule):
                 device=self.in_proj.weight.device,
                 dtype=self.in_proj.weight.dtype,
             )
-            inference_params.key_value_memory_dict[self.layer_idx] = (conv_state, ssm_state)
+            inference_params.key_value_memory_dict[self.layer_number] = (conv_state, ssm_state)
         else:
-            conv_state, ssm_state = inference_params.key_value_memory_dict[self.layer_idx]
+            conv_state, ssm_state = inference_params.key_value_memory_dict[self.layer_number]
             # TODO: What if batch size changes between generation, and we reuse the same states?
             if initialize_states:
                 conv_state.zero_()
