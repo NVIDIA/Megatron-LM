@@ -3,7 +3,7 @@ set -euox pipefail
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 CHECK_ONLY=${CHECK_ONLY:-false}
-CHANGED_FILES=$(git diff --name-only --merge-base origin/main | grep '^megatron/core' || true)
+CHANGED_FILES=$(git diff --name-only --diff-filter=d --merge-base origin/main megatron/core | grep '\.py$' || true)
 ADDITIONAL_ARGS=""
 
 if [[ $CHECK_ONLY == true ]]; then
