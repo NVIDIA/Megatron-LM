@@ -8,6 +8,9 @@ This document is an entrypoint into the code used for
 We are releasing the parameters for some of the models described in that
 technical report via
 [HuggingFace](https://huggingface.co/collections/nvidia/ssms-666a362c5c3bb7e4a6bcfb9c).
+The code in the `main` branch is no longer compatible with the `Mamba2-*`
+checkpoints. You can load them using the
+[fixed snapshot of the code used for the technical report](https://github.com/NVIDIA/Megatron-LM/tree/ssm/examples/mamba).
 
 ## Installation
 
