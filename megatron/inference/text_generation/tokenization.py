@@ -16,7 +16,7 @@ def detokenize_generations(tokens_gpu_tensor,
     """Detokenize the generated tokens."""
 
     args = get_args()
-    tokenizer = get_tokenizer(args)
+    tokenizer = get_tokenizer()
     prompts_plus_generations = []
     if return_segments:
         prompts_plus_generations_segments = []
@@ -100,7 +100,7 @@ def _tokenize_prompts_and_batch(prompts, tokens_to_generate, add_BOS):
 
     # Tokenize all the prompts.
     args = get_args()
-    tokenizer = get_tokenizer(args)
+    tokenizer = get_tokenizer()
     if hasattr(tokenizer, 'eod'):
         eod_token = tokenizer.eod
     elif hasattr(tokenizer, 'eos_id'):
