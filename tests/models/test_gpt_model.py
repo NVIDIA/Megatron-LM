@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import pytest

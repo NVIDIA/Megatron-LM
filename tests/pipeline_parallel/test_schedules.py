@@ -1,3 +1,5 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+
 import torch
 from tests.test_utilities import Utils
 from megatron.core import ModelParallelConfig
