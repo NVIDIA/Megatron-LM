@@ -188,6 +188,7 @@ build_image:
                     | grep -v 'python:3.10' | awk '{ print $1 }'
                  )
       docker rmi $OLD_IMAGES || true
+      docker builder prune  -a --filter "until=24h" -f
 
       if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
         ADDITIONAL_PARAMS="--pull"
