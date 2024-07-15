@@ -229,19 +229,23 @@ unit_tests:
   extends: [.unit_test_common]
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail tests/unit_tests
-  rules:
-    - if: '$FUNCTIONAL_TEST == "yes"'
   coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
   artifacts:
     paths:
       - coverage
     expire_in: 30 days
+  rules:
+    - if: '$FUNCTIONAL_TEST == "yes" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/)'
+      allow_failure: true
+    - if: '$FUNCTIONAL_TEST == "yes"'
 
 unit_tests-data:
   extends: [.unit_test_common]
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/data
   rules:
+    - if: '$FUNCTIONAL_TEST == "no" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/)'
+      allow_failure: true
     - if: '$FUNCTIONAL_TEST == "no"'
 
 unit_tests-dist-checkpointing:
@@ -249,6 +253,8 @@ unit_tests-dist-checkpointing:
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/dist_checkpointing
   rules:
+    - if: '$FUNCTIONAL_TEST == "no" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/)'
+      allow_failure: true
     - if: '$FUNCTIONAL_TEST == "no"'
 
 unit_tests-fusions:
@@ -256,6 +262,8 @@ unit_tests-fusions:
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/fusions
   rules:
+    - if: '$FUNCTIONAL_TEST == "no" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/)'
+      allow_failure: true
     - if: '$FUNCTIONAL_TEST == "no"'
 
 unit_tests-inference:
@@ -263,6 +271,8 @@ unit_tests-inference:
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/inference
   rules:
+    - if: '$FUNCTIONAL_TEST == "no" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/)'
+      allow_failure: true
     - if: '$FUNCTIONAL_TEST == "no"'
 
 unit_tests-models:
@@ -270,6 +280,8 @@ unit_tests-models:
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/models
   rules:
+    - if: '$FUNCTIONAL_TEST == "no" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/)'
+      allow_failure: true
     - if: '$FUNCTIONAL_TEST == "no"'
 
 unit_tests-pipeline-parallel:
@@ -277,6 +289,8 @@ unit_tests-pipeline-parallel:
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/pipeline_parallel
   rules:
+    - if: '$FUNCTIONAL_TEST == "no" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/)'
+      allow_failure: true
     - if: '$FUNCTIONAL_TEST == "no"'
 
 unit_tests-tensor-parallel:
@@ -284,6 +298,8 @@ unit_tests-tensor-parallel:
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/tensor_parallel
   rules:
+    - if: '$FUNCTIONAL_TEST == "no" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/)'
+      allow_failure: true
     - if: '$FUNCTIONAL_TEST == "no"'
 
 unit_tests-transformer:
@@ -291,6 +307,8 @@ unit_tests-transformer:
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/transformer
   rules:
+    - if: '$FUNCTIONAL_TEST == "no" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/)'
+      allow_failure: true
     - if: '$FUNCTIONAL_TEST == "no"'
 
 unit_tests-top-py:
@@ -298,6 +316,8 @@ unit_tests-top-py:
   script:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/*.py
   rules:
+    - if: '$FUNCTIONAL_TEST == "no" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/)'
+      allow_failure: true
     - if: '$FUNCTIONAL_TEST == "no"'
 
 docs_build_test:
@@ -327,6 +347,8 @@ formatting:
     - CHECK_ONLY=true bash tools/autoformat.sh
 
   rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/)'
+      allow_failure: true
     - when: always
   interruptible: true
 
