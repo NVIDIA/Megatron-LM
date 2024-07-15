@@ -33,7 +33,7 @@ stages:
   - functional_tests
 
 default:
-  interruptible: false
+  interruptible: true
 
 variables:
   FUNCTIONAL_TEST: "yes"
