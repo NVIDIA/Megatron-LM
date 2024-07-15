@@ -11,6 +11,8 @@ import torch
 import types
 
 import torch.nn.functional as F
+
+from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.models.retro.utils import (
     get_config_path as get_retro_config_path,
     get_gpt_data_dir as get_retro_data_dir,
@@ -45,6 +47,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_transformer_engine_args(parser)
     parser = _add_retro_args(parser)
     parser = _add_experimental_args(parser)
+    parser = _add_one_logger_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -186,10 +189,14 @@ def validate_args(args, defaults={}):
                   args.context_parallel_size,
                   args.tensor_model_parallel_size,
                   args.pipeline_model_parallel_size), flush=True)
+
+    if args.pipeline_model_parallel_split_rank is not None:
+        args.encoder_pipeline_model_parallel_size = args.pipeline_model_parallel_split_rank
+
     if args.pipeline_model_parallel_size > 1:
-        if args.pipeline_model_parallel_split_rank is not None:
-            assert args.pipeline_model_parallel_split_rank < \
-                    args.pipeline_model_parallel_size, 'split rank needs'\
+        if args.encoder_pipeline_model_parallel_size is not None:
+            assert args.encoder_pipeline_model_parallel_size < \
+                    args.pipeline_model_parallel_size, 'encoder pipeline size needs '\
                     ' to be less than pipeline model parallel size ({})'.format(
                             args.pipeline_model_parallel_size)
 
@@ -387,6 +394,11 @@ def validate_args(args, defaults={}):
         assert args.hidden_size % args.num_attention_heads == 0
         args.kv_channels = args.hidden_size // args.num_attention_heads
 
+    if args.seq_length is not None and args.context_parallel_size > 1:
+        assert args.seq_length % (args.context_parallel_size * 2) == 0, \
+            'seq-length should be a multiple of 2 * context-parallel-size ' \
+            'if context-parallel-size > 1.'
+
     if args.seq_length is not None:
         assert args.encoder_seq_length is None
         args.encoder_seq_length = args.seq_length
@@ -513,6 +525,8 @@ def validate_args(args, defaults={}):
         raise RuntimeError('--no-position-embedding is deprecated, use --position-embedding-type')
 
     # MoE Spec check
+    if args.num_experts == 0:
+        args.num_experts = None
     if args.num_experts is not None:
         assert args.spec is None, "Model Spec must be None when using MoEs"
 
@@ -553,6 +567,20 @@ def validate_args(args, defaults={}):
     # Update the printed args to reflect that `apply_query_key_layer_scaling` also controls `attention_softmax_in_fp32`
     if args.apply_query_key_layer_scaling:
         args.attention_softmax_in_fp32 = True
+
+    # Checkpointing
+    if args.ckpt_fully_parallel_save_deprecated and args.rank == 0:
+        print('--ckpt-fully-parallel-save flag is deprecated and has no effect.'
+              ' Use --no-ckpt-fully-parallel-save to disable parallel save.')
+    if (
+        args.use_dist_ckpt
+        and not args.ckpt_fully_parallel_save
+        and args.use_distributed_optimizer
+        and args.rank == 0
+    ):
+        print('Warning: With non-parallel ckpt save and DistributedOptimizer,'
+              ' it will be impossible to resume training with different parallelism.'
+              ' Consider removing flag --no-ckpt-fully-parallel-save.')
 
     # Print arguments.
     _print_args("arguments", args)
@@ -754,6 +782,8 @@ def _add_network_size_args(parser):
     group.add_argument('--use-rotary-position-embeddings', action='store_true',
                        help='Use rotary positional embeddings or not. '
                        'Deprecated: use --position-embedding-type')
+    group.add_argument('--rotary-base', type=int, default=10000,
+                       help='Base to use for rotary positional embeddings, default 10000')
     group.add_argument('--rotary-percent', type=float, default=1.0,
                        help='Percent of rotary dimension to use, default 100%%')
     group.add_argument('--rotary-interleaved', action='store_true',
@@ -807,6 +837,34 @@ def _add_straggler_detector_args(parser):
                        help='Port number to toggle StragglerDetector on/off at runtime')
     group.add_argument('--straggler-minmax-count', type=int, default=1,
                        help='Number of ranks to report with high/low estimated throughput')
+    return parser
+
+def _add_one_logger_args(parser):
+    group = parser.add_argument_group(title='one logger')
+    group.add_argument('--no-one-logger', action='store_false',
+                       help='If set, disable using one_logger to track E2E metrics'
+                       'Note that one_logger is an internal tool and not '
+                       'available externally. For installation, please go to '
+                       'https://confluence.nvidia.com/display/MLWFO/Package+Repositories'
+                       'for more details',
+                       dest='enable_one_logger')
+    group.add_argument('--one-logger-project', type=str, default='megatron-lm',
+                       help='The one-logger project name. Will ignore if '
+                       '--no-one-logger is set')
+    group.add_argument('--one-logger-run-name', type=str, default=None,
+                       help='The one-logger run name displayed. Will ignore if '
+                       '--no-one-logger is set')
+    group.add_argument('--one-logger-async', action='store_true',
+                       help='If set, forces one_logger to use async mode.')
+    group.add_argument('--app-tag-run-name', type=str, default=None,
+                       help='Jobs belonging to same training run, suppose to '
+                       'have the same name. It will be used to track progress of '
+                       'a training done over multiple different jobs')
+    group.add_argument('--app-tag-run-version', type=str, default='0.0.0',
+                       help='The version of the training of which current job is '
+                       'part of. It will be used to track the changes in the '
+                       'application side which might change the performance '
+                       'baseline')
     return parser
 
 def _add_logging_args(parser):
@@ -882,22 +940,6 @@ def _add_logging_args(parser):
                        help='The wandb experiment name.')
     group.add_argument('--wandb-save-dir', type=str, default='',
                        help='Path to save the wandb results locally.')
-    group.add_argument('--enable-one-logger', action='store_true',
-                       help='If set, use one_logger to track E2E metrics'
-                       'Note that one_logger is an internal tool and not available externally. '
-                       'For installation, please try command: `pip install '
-                       '--index-url=https://sc-hw-artf.nvidia.com/api/pypi/hwinf-ml-pypi/simple'
-                       ' one_logger` or go to https://gitlab-master.nvidia.com/hwinf-dcm/onelogger '
-                       'for more details')
-    group.add_argument('--one-logger-project', type=str, default='e2e-tracking',
-                       help='The one-logger project name. Will ignore if '
-                       '--enable-one-logger is not set')
-    group.add_argument('--one-logger-entity', type=str, default='hwinf_dcm',
-                       help='The one-logger username or team name. Will ignore if '
-                       '--enable-one-logger is not set')
-    group.add_argument('--one-logger-run-name', type=str, default=None,
-                       help='The one-logger run name displayed. Will ignore if '
-                       '--enable-one-logger is not set')
     group.add_argument('--logging-level', type=int, default=None,
                        help='Set default logging level')
     return parser
@@ -1286,9 +1328,14 @@ def _add_checkpointing_args(parser):
                        choices=['zarr', 'torch_dist'],
                        help='Distributed checkpoint format to use.')
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
-                       help='Apply full save parallelization across DP for'
+                       dest='ckpt_fully_parallel_save_deprecated',
+                       help='Deprecated: see --no-ckpt-fully-parallel-save.')
+    group.add_argument('--no-ckpt-fully-parallel-save', action='store_false',
+                       dest='ckpt_fully_parallel_save',
+                       help='Disable applying full save parallelization across DP for'
                             ' distributed checkpoints. Depending on ckpt format'
-                            ' might increase number of files in the checkpoint.')
+                            ' might decrease the number of files in the checkpoint.'
+                            ' Makes DistributedOptimizer checkpoint non-reshardable.')
     group.add_argument('--async-save', action='store_true', default=None,
                        help='Apply async checkpointing save. Currently works only with'
                             '`torch_dist` distributed checkpoint format.')
@@ -1299,6 +1346,12 @@ def _add_checkpointing_args(parser):
                        help='If the model and optimizer state dict structure is'
                             'constant throughout a *single training job*, it allows for'
                             'different checkpointing performance optimizations.')
+    group.add_argument('--dist-ckpt-strictness', type=str, default='assume_ok_unexpected',
+                       choices=[e.value for e in StrictHandling],
+                       help='Determine handling of key mismatch during checkpoint load.'
+                            ' Check StrictHandling docs for flags meaning.'
+                            ' NOTE: This flag controls only distributed checkpoint'
+                            ' load from storage, not loading state dict into the model.')
     return parser
 
 
@@ -1345,9 +1398,12 @@ def _add_distributed_args(parser):
                        help='Degree of tensor model parallelism.')
     group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
                        help='Degree of pipeline model parallelism.')
+    group.add_argument('--encoder-pipeline-model-parallel-size', type=int, default=None,
+                       help='Degree of pipeline model parallelism in the encoder.')
     group.add_argument('--pipeline-model-parallel-split-rank',
                        type=int, default=None,
-                       help='Rank where encoder and decoder should be split.')
+                       help=('Rank where encoder and decoder should be split. '
+                             'Deprecated; use --encoder-pipeline-model-parallel-size instead.'))
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')
@@ -1363,6 +1419,13 @@ def _add_distributed_args(parser):
                        help='Timeout minutes for torch.distributed.')
     group.add_argument('--overlap-grad-reduce', action='store_true',
                        default=False, help='If set, overlap DDP grad reduce.')
+    group.add_argument('--defer-embedding-wgrad-compute', action='store_true',
+                       default=False, help='If set, defers the vocabulary projection linear layer weight' 
+                       'gradient compute to pipeline flush.', dest='defer_embedding_wgrad_compute')
+    group.add_argument('--wgrad-deferral-limit', type=int, default=0, help='Number of micro-batches for which'
+                       'weight gradient computation of vocabulary projection is deferred, defaults to 0 which'
+                       'means all the micro-batches are deferred. Invalid if `defer-embedding-wgrad-compute`'
+                       'is not set')
     group.add_argument('--no-delay-grad-reduce', action='store_false',
                        help='If not set, delay / synchronize grad reductions in all but first PP stage.',
                        dest='delay_grad_reduce')
@@ -1499,10 +1562,17 @@ def _add_data_args(parser):
                                 'Llama2Tokenizer',
                                 'Llama3Tokenizer',
                                 'MistralTokenizer',
+                                'TikTokenizer',
                                 'NullTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='Sentencepiece tokenizer model.')
+    group.add_argument('--tiktoken-pattern', type=str, default=None,
+                       help='Which tiktoken pattern to use. Options: [v1, v2]')
+    group.add_argument('--tiktoken-num-special-tokens', type=int, default=1000,
+                       help='Number of special tokens in tiktoken tokenizer')
+    group.add_argument('--tiktoken-special-tokens', type=str, nargs='+', default=None,
+                       help='List of tiktoken special tokens, needs to have ["<unk>", "<s>", "</s>"]')
     group.add_argument('--reset-position-ids', action='store_true',
                        help='Reset posistion ids after end-of-document token.')
     group.add_argument('--reset-attention-mask', action='store_true',
@@ -1515,6 +1585,8 @@ def _add_data_args(parser):
                        dest='create_attention_mask_in_dataloader')
     group.add_argument('--num-dataset-builder-threads', type=int, default=1,
                        help='Number of parallel threads per rank for dataset builder')
+    group.add_argument('--s3-cache-path', type=str, default=None,
+                       help='Path to cache index files when using s3 dataloader')
     return parser
 
 
@@ -1665,7 +1737,7 @@ def _add_moe_args(parser):
     group.add_argument('--num-experts', type=int, default=None,
                        help='Number of Experts in MoE (None means no MoE)')
     group.add_argument('--moe-router-load-balancing-type', type=str,
-                       choices=['aux_loss', 'sinkhorn', "none"],
+                       choices=['aux_loss', 'sinkhorn', 'none'],
                        default='aux_loss',
                        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
     group.add_argument('--moe-router-topk', type=int, default=2,

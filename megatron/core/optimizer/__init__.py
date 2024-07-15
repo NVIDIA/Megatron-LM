@@ -3,8 +3,24 @@ import logging
 from typing import Callable, Dict, List, Optional
 
 import torch
-from apex.optimizers import FusedAdam as Adam
-from apex.optimizers import FusedSGD as SGD
+
+try:
+    from transformer_engine.pytorch.optimizers import FusedAdam as Adam
+    from transformer_engine.pytorch.optimizers import FusedSGD as SGD
+except ImportError:
+    try:
+        from apex.optimizers import FusedAdam as Adam
+        from apex.optimizers import FusedSGD as SGD
+    except ImportError:
+        import warnings
+
+        warnings.warn(
+            f'Transformer Engine and Apex are not installed. Falling back to Torch optimizers.'
+        )
+
+        ## apex's FusedAdam is a drop-in replacement for torch's AdamW
+        ## see https://github.com/NVIDIA/apex/blob/7b73b12361068a10b0f44844534613f252a5ea75/apex/optimizers/fused_adam.py#L16
+        from torch.optim import AdamW as Adam, SGD
 
 from megatron.core import mpu
 
@@ -250,7 +266,11 @@ def _get_megatron_optimizer_based_on_param_groups(
             setattr(optimizer, 'model_parallel_group', model_parallel_group)
     else:
         # FP32 optimizer.
-        optimizer = FP32Optimizer(optimizer, config, init_state_fn,)
+        optimizer = FP32Optimizer(
+            optimizer,
+            config,
+            init_state_fn,
+        )
         setattr(optimizer, 'model_parallel_group', model_parallel_group)
 
     return optimizer
@@ -334,8 +354,12 @@ def get_megatron_optimizer(
                 param_groups=moe_param_groups,
                 per_model_buffers=per_model_ep_buffers,
                 model_parallel_group=mpu.get_model_parallel_group(with_expert_parallel=True),
-                data_parallel_group=mpu.get_data_modulo_expert_parallel_group(),
-                data_parallel_group_gloo=mpu.get_data_modulo_expert_parallel_group_gloo(),
+                data_parallel_group=mpu.get_data_modulo_expert_parallel_group(
+                    with_context_parallel=True
+                ),
+                data_parallel_group_gloo=mpu.get_data_modulo_expert_parallel_group_gloo(
+                    with_context_parallel=True
+                ),
                 data_parallel_group_idx=expert_parallel_rank * model_parallel_world_size
                 + model_parallel_rank,
             )

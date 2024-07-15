@@ -4,6 +4,7 @@ from copy import deepcopy
 from functools import partial
 import os
 import sys
+import warnings
 
 import torch
 
@@ -22,12 +23,18 @@ from megatron.training.utils import average_losses_across_data_parallel_group
 from dataloader_provider import train_valid_test_dataloaders_provider
 
 
-def model_provider(pre_process=True, post_process=True, parallel_output=True) -> LLaVAModel:
+def model_provider(
+    pre_process=True, post_process=True, add_encoder=True, add_decoder=True,
+    parallel_output=True) -> LLaVAModel:
     """Builds the model.
 
     Args:
-        pre_process (bool): Enable preprocessing in the model. NOTE: Not used at the moment.
-        post_process (bool): Enable postprocessing in the model. NOTE: Not used at the moment.
+        pre_process (bool): Include the embedding layer in the gpt decoder (used with pipeline parallelism). Defaults to True.
+        post_process (bool): Include an output layer and a layernorm in the gpt decoder (used with pipeline parallelism). Defaults to True.
+        add_encoder (bool): Construct the encoder module (used with pipeline parallelism). Defaults to True. When we use pipelining, the encoder
+            will live on only a subset of the pipeline stages (specifically, only the first stage).
+        add_decoder (bool): Construct the decoder module (used with pipeline parallelism). Defaults to True. When we use pipelining, the decoder
+            will live on only a subset of the pipeline stages (specifically, every stage after the first one).
         parallel_output (bool): Enable parallel model output.
 
     Returns:
@@ -38,6 +45,18 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
     use_te = args.use_te
 
     print_rank_0('building a multimodal model ...')
+
+    num_image_tokens = get_image_token_count()
+
+    old_seq_length = args.seq_length
+    args.decoder_seq_length = args.seq_length + num_image_tokens
+    args.seq_length = num_image_tokens
+    if torch.distributed.get_rank() == 0:
+        warnings.warn("Changed decoder_seq_length to num_image_tokens ({num_image_tokens}) + user-specified seq_length ({old_seq_length}).")
+
+    if args.decoder_seq_length > args.max_position_embeddings:
+        args.max_position_embeddings = args.decoder_seq_length
+        warnings.warn("Expanded max_position_embeddings to {args.max_position_embeddings} to accommodate the full sequence of vit output + llm output.")
 
     base_config = core_transformer_config_from_args(get_args())
     base_config.language_model_type = args.language_model_type
@@ -51,7 +70,10 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
         language_transformer_layer_spec = get_layer_spec(is_vit=False)
 
     vision_config = deepcopy(base_config)
-    vision_config = get_vision_model_config(vision_config, apply_query_key_layer_scaling=use_te)
+    vision_config = get_vision_model_config(vision_config, apply_query_key_layer_scaling=args.apply_query_key_layer_scaling)
+    if args.pipeline_model_parallel_size > 1:
+        assert args.encoder_pipeline_model_parallel_size == 1, "ViT can only live on 1 pipeline stage."
+        vision_config.pipeline_model_parallel_size = args.encoder_pipeline_model_parallel_size
 
     if use_te:
         vision_transformer_layer_spec = get_layer_spec_te(is_vit=True)
@@ -77,6 +99,15 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
         parallel_output=parallel_output,
         language_position_embedding_type=args.position_embedding_type,
         language_rotary_percent=args.rotary_percent,
+        pre_process=pre_process,
+        post_process=post_process,
+        add_encoder=add_encoder,
+        add_decoder=add_decoder,
+        img_h=args.img_h,
+        img_w=args.img_w,
+        patch_dim=args.patch_dim,
+        language_rotary_base=args.rotary_base,
+        img_embedding_idx=args.img_embedding_idx,
     )
 
     model.freeze(freeze_language_model=args.freeze_LM, freeze_vision_model=args.freeze_ViT, freeze_vision_projection=False)
@@ -114,14 +145,20 @@ def get_batch(data_iterator):
 
     torch.cuda.nvtx.range_push("index tokens")
     tokenizer = get_tokenizer()
-    tokens = tokens_[:, :args.seq_length].contiguous()
-    labels = tokens_[:, 1:args.seq_length+1].contiguous()
+    text_length = args.decoder_seq_length - args.seq_length
+    tokens = tokens_[:, :text_length].contiguous()
+    labels = tokens_[:, 1:text_length+1].contiguous()
 
+    assert tokens.shape == labels.shape, f"tokens: {tokens.shape} != labels: {labels.shape}"
     torch.cuda.nvtx.range_pop()
 
     torch.cuda.nvtx.range_push("get_ltor_masks_and_position_ids")
+    if hasattr(tokenizer, 'eod'):
+        eod_token = tokenizer.eod
+    elif hasattr(tokenizer, 'eos_id'):
+        eod_token = tokenizer.eos_id
     attention_mask, loss_mask, position_ids = \
-        get_ltor_masks_and_position_ids(tokens, tokenizer.eod,
+        get_ltor_masks_and_position_ids(tokens, eod_token,
                                         args.reset_position_ids,
                                         args.reset_attention_mask,
                                         args.eod_mask_loss,
@@ -203,7 +240,7 @@ def get_ltor_masks_and_position_ids(data,
 
     if question_length is not None:
         for b in range(micro_batch_size):
-            loss_mask[b, :max(0, question_length[b].item() - 1)] = 0.0
+            loss_mask[b, :max(0, question_length[b].item())] = 0.0
 
     if reset_position_ids or reset_attention_mask:
         # Loop through the batches:
@@ -261,6 +298,7 @@ def forward_step(data_iterator, model: LLaVAModel):
         output_tensor (torch.Tensor): Loss of shape [b, s] if labels are provided, otherwise logits of shape [b, s, vocab_size].
         loss_func (callable): Loss function with a loss mask specified.
     """
+    args = get_args()
     timers = get_timers()
 
     # Get the batch.
@@ -288,7 +326,45 @@ def add_multimodal_extra_args(parser):
     group.add_argument("--disable-vision-class-token", action="store_true", default=False)
     group.add_argument("--allow-missing-vision-projection-checkpoint", action="store_true", default=False)
     group.add_argument("--use-te", action="store_true", default=False)
+    group.add_argument("--img-embedding-idx", type=int, default=0,
+                       help='Llava specific parameter. Defines at which index'
+                       'in the language_embedding tensor the image_embeddings'
+                       'should be inserted')
     return parser
+
+
+def llava_embedding_ranks(pp_ranks):
+    """LLava's embedding ranks consist of the decoder's first and last ranks (ie, the ViT has no embeddings).
+    Args:
+        pp_ranks: A list of global ranks that constitute a pipeline group.
+    """
+    args = get_args()
+
+    # encoder size is also the index to the first rank of the decoder.
+    epp = args.encoder_pipeline_model_parallel_size
+
+    last_rank = pp_ranks[-1]
+    if len(pp_ranks) == 1 or pp_ranks[epp] == last_rank:
+        return [last_rank]
+    else:
+        return [pp_ranks[epp], last_rank]
+
+
+def llava_position_embedding_ranks(pp_ranks):
+    """LLava's embedding ranks consist of the singular rank of the model or the decoder's first rank.
+    Args:
+        pp_ranks: A list of global ranks that constitute a pipeline group.
+    """
+    args = get_args()
+
+    # encoder size is also the index to the first rank of the decoder.
+    epp = args.encoder_pipeline_model_parallel_size
+
+    last_rank = pp_ranks[-1]
+    if len(pp_ranks) == 1:
+        return [last_rank]
+    else:
+        return [pp_ranks[epp]]
 
 
 if __name__ == "__main__":
@@ -297,8 +373,10 @@ if __name__ == "__main__":
     pretrain(
         train_valid_test_dataloaders_provider,
         model_provider,
-        ModelType.encoder_or_decoder,
+        ModelType.encoder_and_decoder,
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
         extra_args_provider=add_multimodal_extra_args,
+        get_embedding_ranks=llava_embedding_ranks,
+        get_position_embedding_ranks=llava_position_embedding_ranks,
     )

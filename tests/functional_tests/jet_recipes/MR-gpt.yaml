@@ -3,21 +3,25 @@ format_version: 1
 maintainers: [maanug]
 loggers: [stdout]
 spec:
-  name: "{model}_{variant}_{scope}_{platforms}_{nodes}N{gpus}G_\
+  name: "{model}_{scope}_\
          {'mcore_' if use_mcore else ''}{'te_' if use_te else ''}\
          tp{tp_size}_pp{pp_size}{'_vp'+str(vp_size) if vp_size else ''}\
          {'_resume_'+str(ckpt_format) if ckpt_resume else ''}\
-         {'_'+args_meta if args_meta else ''}"
+         {'_reshard_'+str(reshard_tp_size)+'x'+str(reshard_pp_size)+'x'+str(reshard_ep_size) if reshard_tp_size or reshard_pp_size or reshard_ep_size else ''}\
+         {'_'+args_meta if args_meta else ''}\
+         {'_uninstall_te' if uninstall_te==1 else ''}\
+         _{platforms}_{nodes}N{gpus}G"
   model: gpt3
   variant: 345m
   build: mcore-pyt
-  scope: merge-request
+  scope: mr
   nodes: 1
   gpus: 8
   platforms: dgx_a100
-  use_te: False
+  use_te: True
   use_mcore: True
   vp_size: null
+  ep_size: null
   extra_args: null
   args_meta: null
   micro_batch_size: 4 # MBS
@@ -29,9 +33,20 @@ spec:
   ckpt_format: torch_dist
   ckpt_resume: 0
   allow_nondeterministic: 0
+  uninstall_te: 0
+  gradient_accumulation_fusion: False
+  reshard_tp_size: null
+  reshard_pp_size: null
+  reshard_ep_size: null
+  skip_pytest: null
   script: |-
     ls
     cd /workspace/megatron-lm
+
+    if [[ {uninstall_te} == 1 ]]; then
+        pip uninstall -y transformer_engine
+        pip uninstall -y Apex ## TODO: remove once Apex dependency has been removed completely
+    fi
 
     ./tests/functional_tests/test_scripts/gpt3/pretrain_gpt3_distributed_test.sh \
         DATA_PATH=/workspace/data/gpt3_data/my-gpt3_00_text_document \
@@ -41,12 +56,14 @@ spec:
         MERGE_FILE=/workspace/data/gpt3_data/bpe/merges.txt \
         DATA_CACHE=/workspace/data/index-cache \
         USE_TE={"1" if use_te else "0"} \
+        USE_GA={"1" if gradient_accumulation_fusion else "0"} \
         TP_SIZE={tp_size} \
         PP_SIZE={pp_size} \
         NUM_NODES={nodes} \
         MAX_STEPS={100 if ckpt_resume else 50} \
         USE_CORE={"1" if use_mcore else "0"} \
         VP_SIZE={vp_size if vp_size is not None else '""'} \
+        EP_SIZE={ep_size if ep_size is not None else '""'} \
         MBS={micro_batch_size} \
         GBS={batch_size} \
         MOE_GROUPED_GEMM={moe_grouped_gemm} \
@@ -54,39 +71,49 @@ spec:
         CHECKPOINT_RESUME_TEST={ckpt_resume} \
         ALLOW_NONDETERMINISTIC={allow_nondeterministic} \
         JOB_NAME={name} \
-        ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'}
+        ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'} \
+        {'RESUME_OVERRIDE_TP_SIZE='+str(reshard_tp_size)+' RESUME_OVERRIDE_PP_SIZE='+str(reshard_pp_size) if reshard_tp_size or reshard_pp_size else ''} \
+        {'RESUME_OVERRIDE_EP_SIZE='+str(reshard_ep_size) if reshard_ep_size else ''} \
+        {'SKIP_PYTEST=1' if skip_pytest else ''}
 products:
   # MCore
   - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1]}
   - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], extra_args: ["--no-create-attention-mask-in-dataloader"], args_meta: ["no_create_attention_mask_in_dataloader"]}
-  - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], extra_args: ["--no-mmap-bin-files"], args_meta: ["no_mmap_bin_files"]}
+  - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], extra_args: ["--no-mmap-bin-files --no-ckpt-fully-parallel-save"], args_meta: ["no_mmap_bin_files"]}
   - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], extra_args: ["--ddp-average-in-collective"], args_meta: ["ddp_average_in_collective"]}
   - {tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1]}
   - {tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1], extra_args: ["--calculate-per-token-loss"], args_meta: ["calculate_per_token_loss"]}
   - {tp_size: [4], pp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--qk-layernorm --test-mode"'], args_meta: ["qk_layernorm_test_mode"]}
-  - {tp_size: [1], pp_size: [2], ckpt_resume: [0, 1], extra_args: ['"--position-embedding-type rope"'], args_meta: ["rope_embeddings"]}
+  - {tp_size: [1], pp_size: [2], ckpt_resume: [0, 1], extra_args: ['"--position-embedding-type rope --no-ckpt-fully-parallel-save"'], args_meta: ["rope_embeddings"]}
   - {tp_size: [1], pp_size: [2], ckpt_resume: [0, 1], extra_args: ['"--position-embedding-type rope --rotary-interleaved --no-rope-fusion"'], args_meta: ["rope_embeddings_interleaved_no_fusion"]}
   - {tp_size: [1], pp_size: [4], ckpt_resume: [0, 1], extra_args: ['"--disable-bias-linear --async-save"'], args_meta: ["disable_bias_linear"]}
-  - {tp_size: [1], pp_size: [4], ckpt_resume: [0, 1], extra_args: ['"--swiglu --ckpt-fully-parallel-save --ckpt-fully-parallel-load --async-save"'], args_meta: ["swiglu"]}
+  - {tp_size: [1], pp_size: [4], ckpt_resume: [0, 1], extra_args: ['"--swiglu --ckpt-fully-parallel-load --async-save"'], args_meta: ["swiglu"]}
   - {tp_size: [1], pp_size: [4], ckpt_resume: [0, 1], extra_args: ["--untie-embeddings-and-output-weights"], args_meta: ["untie_embeddings_and_outputs"]}
-  - {tp_size: [1], pp_size: [4], ckpt_resume: [0, 1], extra_args: ['"--sequence-parallel --ckpt-fully-parallel-save --ckpt-fully-parallel-load"'], args_meta: ["sequence_parallel"]}
+  - {tp_size: [1], pp_size: [4], ckpt_resume: [0, 1], extra_args: ['"--sequence-parallel --ckpt-fully-parallel-load"'], args_meta: ["sequence_parallel"]}
   - {tp_size: [1], pp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--recompute-granularity full --recompute-method uniform --recompute-num-layers 1"'], args_meta: ["uniform_full_recompute"]}
   - {tp_size: [2], pp_size: [1,2], ckpt_resume: [0, 1], allow_nondeterministic: [1], extra_args: ['"--context-parallel-size 2 --sequence-parallel --hidden-dropout 0.0 --attention-dropout 0.0"'], args_meta: ["cp2_nondeterministic"]}
-  - {tp_size: [2], pp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1 --ckpt-fully-parallel-save --ckpt-fully-parallel-load"'], args_meta: ["te_8experts2parallel"]}
-  - {tp_size: [2], pp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --use-distributed-optimizer --moe-router-load-balancing-type sinkhorn --moe-router-topk 1 --ckpt-fully-parallel-save --ckpt-fully-parallel-load"'], args_meta: ["te_8experts2parallel_dist_optimizer"]}
+  - {tp_size: [2], pp_size: [1], ep_size: [2], ckpt_resume: [0, 1], extra_args: ['"--sequence-parallel --num-experts 8 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1 --ckpt-fully-parallel-load"'], args_meta: ["te_8experts2parallel"]}
+  - {tp_size: [2], pp_size: [1], ep_size: [2], ckpt_resume: [0, 1], extra_args: ['"--sequence-parallel --num-experts 8 --use-distributed-optimizer --moe-router-load-balancing-type sinkhorn --moe-router-topk 1 --ckpt-fully-parallel-load"'], args_meta: ["te_8experts2parallel_dist_optimizer"]}
     ## TODO: MoE GroupedMLP dist-ckpt not supported, so must use 'torch' ckpt format
-  - {tp_size: [2], pp_size: [1], ckpt_resume: [0, 1], ckpt_format: [torch], extra_args: ['"--moe-grouped-gemm --disable-bias-linear --sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --use-distributed-optimizer --moe-router-load-balancing-type sinkhorn --moe-router-topk 1 --overlap-grad-reduce --overlap-param-gather"'], moe_grouped_gemm: [1], args_meta: ["te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM"]}
-  - {tp_size: [2], pp_size: [1], ckpt_resume: [0, 1], ckpt_format: [torch], extra_args: ['"--moe-grouped-gemm --disable-bias-linear --sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"'], moe_grouped_gemm: [1], args_meta: ["te_8experts2parallel_groupedGEMM"]}
-  - {tp_size: [2], pp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--disable-bias-linear --sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --moe-router-load-balancing-type aux_loss --moe-router-topk 2 --moe-aux-loss-coeff 1e-2"'], moe_grouped_gemm: [1], args_meta: ["te_8experts2parallel_top2router"]}
-  - {tp_size: [1], pp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--use-distributed-optimizer --async-save"'], args_meta: ["dist_optimizer"]}
+  - {tp_size: [2], pp_size: [1], ep_size: [2], ckpt_resume: [0, 1], extra_args: ['"--no-ckpt-fully-parallel-save --moe-grouped-gemm --disable-bias-linear --sequence-parallel --num-experts 8 --use-distributed-optimizer --moe-router-load-balancing-type sinkhorn --moe-router-topk 1 --overlap-grad-reduce --overlap-param-gather"'], moe_grouped_gemm: [1], args_meta: ["te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM"]}
+  - {tp_size: [2], pp_size: [1], ep_size: [2], ckpt_resume: [0, 1], extra_args: ['"--no-ckpt-fully-parallel-save --moe-grouped-gemm --disable-bias-linear --sequence-parallel --num-experts 8 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"'], moe_grouped_gemm: [1], args_meta: ["te_8experts2parallel_groupedGEMM"]}
+  - {tp_size: [2], pp_size: [1], ep_size: [2], ckpt_resume: [0, 1], extra_args: ['"--disable-bias-linear --sequence-parallel --num-experts 8 --moe-router-load-balancing-type aux_loss --moe-router-topk 2 --moe-aux-loss-coeff 1e-2"'], moe_grouped_gemm: [1], args_meta: ["te_8experts2parallel_top2router"]}
+  - {tp_size: [1], pp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--use-distributed-optimizer --no-ckpt-fully-parallel-save --async-save"'], args_meta: ["dist_optimizer"]}
   - {tp_size: [1], pp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--use-distributed-optimizer --no-mmap-bin-files"'], args_meta: ["dist_optimizer_no_mmap_bin_files"]}
   - {tp_size: [4], pp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce"'], args_meta: ["dist_optimizer_overlap_grad_reduce"]}
   - {tp_size: [4], pp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather"'], args_meta: ["dist_optimizer_overlap_grad_reduce_param_gather"]}
   - {tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1], ckpt_format: [torch], extra_args: ['"--decoupled-lr 0.0002"'], args_meta: ["decoupled_lr"]}
   - {tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce"'], args_meta: ["dist_optimizer_overlap_grad_reduce"]}
   - {tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --untie-embeddings-and-output-weights"'], args_meta: ["dist_optimizer_overlap_grad_reduce_untied"]}
-  - {tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather --check-weight-hash-across-dp-replicas-interval 10 --ckpt-fully-parallel-save --ckpt-fully-parallel-load"'], args_meta: ["dist_optimizer_overlap_grad_reduce_param_gather"]}
+  - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], gradient_accumulation_fusion: [True], extra_args: ['"--defer-embedding-wgrad-compute --wgrad-deferral-limit 2"'], args_meta: ["defer_embedding_wgrad_compute"]}
+  - {tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather --check-weight-hash-across-dp-replicas-interval 10 --ckpt-fully-parallel-load"'], args_meta: ["dist_optimizer_overlap_grad_reduce_param_gather"]}
   - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], extra_args: ["--cross-entropy-loss-fusion"], args_meta: ["cross_entropy_loss_fusion"]}
+  # Mcore, no TE
+  - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], uninstall_te: [1], use_te: [False], extra_args: ['"--no-persist-layer-norm --no-masked-softmax-fusion"'], skip_pytest: [1]} ## TODO(ashors): add baseline
   # Non-MCore, only legacy checkpoints supported
   - {use_mcore: [False], use_te: [False, True], tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], ckpt_format: [torch]}
-  - {use_mcore: [False], tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1], ckpt_format: [torch]}
+  - {use_mcore: [False],  use_te: [False], tp_size: [1], pp_size: [4], vp_size: [1], ckpt_resume: [0, 1], ckpt_format: [torch]}
+  # TPxPP resharding tests (TP changing results in non-deterministic losses)
+  - {tp_size: [2], pp_size: [2], ckpt_resume: [1], allow_nondeterministic: [1], reshard_tp_size: [1], reshard_pp_size: [4]}
+  - {tp_size: [4], pp_size: [2], ckpt_resume: [1], allow_nondeterministic: [1], reshard_tp_size: [8], reshard_pp_size: [1], extra_args: ['"--use-distributed-optimizer --async-save --ckpt-fully-parallel-save"']}
+  - {tp_size: [1], pp_size: [2], ep_size: [2], ckpt_resume: [1], allow_nondeterministic: [1], reshard_tp_size: [2], reshard_pp_size: [1], reshard_ep_size: [4], extra_args: ['"--sequence-parallel --num-experts 8 --use-distributed-optimizer --moe-router-load-balancing-type sinkhorn --moe-router-topk 1 --ckpt-fully-parallel-save --ckpt-fully-parallel-load"'], args_meta: ["te_8experts2parallel_dist_optimizer"]}

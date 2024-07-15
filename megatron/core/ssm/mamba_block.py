@@ -24,16 +24,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_viewless_tensor
 
 
-def create_mamba_block(
-    config, mamba_layer_spec, residual_in_fp32=False, layer_idx=None,
-):
-    block = build_module(
-        mamba_layer_spec, config, residual_in_fp32=residual_in_fp32, layer_idx=layer_idx,
-    )
-    block.layer_idx = layer_idx
-    return block
-
-
 # https://github.com/huggingface/transformers/blob/c28d04e9e252a1a099944e325685f14d242ecdcd/src/transformers/models/gpt2/modeling_gpt2.py#L454
 def _init_weights(
     module,
@@ -54,7 +44,7 @@ def _init_weights(
 
         for name, p in module.named_parameters():
             if name in ["in_proj.weight", "x_proj.weight", "conv1d.weight", "out_proj.weight"]:
-                nn.init.kaiming_uniform(p, a=math.sqrt(5))
+                nn.init.kaiming_uniform_(p, a=math.sqrt(5))
 
         if rescale_prenorm_residual:
             # Reinitialize selected weights subject to the OpenAI GPT-2 Paper Scheme:
@@ -85,6 +75,7 @@ class MambaStack(MegatronModule):
         self,
         config: TransformerConfig,
         submodules: MambaStackSubmodules,
+        mamba_ssm_ngroups: int = 8,
         residual_in_fp32=False,
         pre_process: bool = True,
         hybrid_attention_ratio: float = 0.0,
@@ -124,26 +115,24 @@ class MambaStack(MegatronModule):
         self.layers = nn.ModuleList()
         for i, layer_type in enumerate(layer_type_list):
             if layer_type == LayerSymbols.MAMBA:
-                layer_idx = i + pp_layer_offset
-                block = create_mamba_block(
-                    self.config,
+                layer = build_module(
                     submodules.mamba_layer,
+                    config=self.config,
+                    mamba_ssm_ngroups=mamba_ssm_ngroups,
                     residual_in_fp32=residual_in_fp32,
-                    layer_idx=layer_idx,
+                    layer_number=i + 1 + pp_layer_offset,
                 )
             elif layer_type == LayerSymbols.ATTENTION:
-                # Wondering if layer_number should be i+1. See TransformerBlock
-                # and TransformerLayer::sharded_state_dict
-                # Also, transformer layers apply their own pp_layer_offset
-                block = build_module(submodules.attention_layer, config=self.config, layer_number=i)
+                # Transformer layers apply their own pp_layer_offset
+                layer = build_module(
+                    submodules.attention_layer, config=self.config, layer_number=i + 1
+                )
             elif layer_type == LayerSymbols.MLP:
-                # Wondering if layer_number should be i+1. See TransformerBlock
-                # and TransformerLayer::sharded_state_dict
-                # Also, transformer layers apply their own pp_layer_offset
-                block = build_module(submodules.mlp_layer, config=self.config, layer_number=i)
+                # Transformer layers apply their own pp_layer_offset
+                layer = build_module(submodules.mlp_layer, config=self.config, layer_number=i + 1)
             else:
                 assert True, "unexpected layer_type"
-            self.layers.append(block)
+            self.layers.append(layer)
 
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)
@@ -156,7 +145,12 @@ class MambaStack(MegatronModule):
                 eps=self.config.layernorm_epsilon,
             )
 
-        self.apply(partial(_init_weights, n_layer=self.config.num_layers,))
+        self.apply(
+            partial(
+                _init_weights,
+                n_layer=self.config.num_layers,
+            )
+        )
 
     def _select_layers_for_pipeline_parallel(self, layer_type_list):
         pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()

@@ -21,7 +21,7 @@ class TestLLaVAModel:
             num_layers=3, hidden_size=128, num_attention_heads=8, use_cpu_initialization=True
         )
         vision_config = TransformerConfig(
-            num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
+            num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True,
         )
         vision_projection_config = TransformerConfig(
             num_layers=2,
@@ -45,6 +45,9 @@ class TestLLaVAModel:
             drop_vision_class_token=False,
             vision_projection_config=vision_projection_config,
             vision_projection_layer_spec=vision_projection_spec,
+            img_h=336,
+            img_w=336,
+            patch_dim=14,
         )
 
     def teardown_method(self, method):
@@ -75,7 +78,7 @@ class TestLLaVAModel:
         labels = torch.randint(0, 2048, (2, 1601)).cuda()
 
         # Try with labels.
-        loss = self.model.forward(img, input_ids, position_ids, attention_mask, labels)
+        loss = self.model.forward(img, input_ids, position_ids, attention_mask, labels=labels)
         assert loss.shape == torch.Size((2, 1601))
 
         # Try without labels and without inference params.

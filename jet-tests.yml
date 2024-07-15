@@ -1,9 +1,9 @@
 .jet_common:
-  stage: jet
+  stage: functional_tests
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Build only/'
-    # If either $JET_CUSTOM_FILTER or both $CI_MODEL and $CI_TASK are provided
+    - if: '$FUNCTIONAL_TEST == "yes" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/ )'
+      allow_failure: true
+    - if: '$FUNCTIONAL_TEST == "yes"'
     - when: never
 
 default:
@@ -16,72 +16,68 @@ include:
     ref: main
     file: downstreams.yml
 
-jet-setup:
-  extends: [ .jet_common ]
-  tags: 
-    - os/linux
-  script:
-    - set -x
-    - JET_FILTER=${JET_CUSTOM_FILTER:-False}
-    - echo "_JET_FILTER=$JET_FILTER" | tee -a config.env
-  artifacts:
-    reports:
-      dotenv: config.env
-
 jet-configure:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/ci_yq:v1
+  image:
+    name: mikefarah/yq:4.35.2
+    entrypoint: [""]
   extends: [.jet_common, .jet-configure]
   tags:
     - os/linux
   script:
-    - cd tests/functional_tests/jet_recipes
+    - set -x
+    - JET_FILTER=${JET_CUSTOM_FILTER:-False}
+    - echo "_JET_FILTER=$JET_FILTER" | tee -a jet.env
     - |
-      if [[ $CI_PIPELINE_SOURCE == "merge_request_event" ]]; then
-        yq e ".spec.source.ref = \"merge-requests/${CI_MERGE_REQUEST_IID}/head\"" -i build-pyt.yaml
-      else
-        yq e ".spec.source.ref = \"${CI_COMMIT_REF_NAME}\"" -i build-pyt.yaml
-      fi
+      IMAGE=${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} yq '. |=
+        (
+          select(.spec.name == "mcore-pyt")
+          | .spec.source.image = env(IMAGE)
+        )
+      ' -i tests/functional_tests/jet_recipes/build-pyt.yaml
+
+      IMAGE=${CI_NEMO_IMAGE}:${CI_PIPELINE_ID} yq '. |=
+        (
+          select(.spec.name == "mcore-nemo")
+          | .spec.source.image = env(IMAGE)
+        )
+      ' -i tests/functional_tests/jet_recipes/build-pyt.yaml
   artifacts:
+    reports:
+      dotenv: jet.env
     paths:
       - tests/functional_tests/jet_recipes
+  retry:
+    max: 2
+    when: job_execution_timeout
 
 jet-trigger:
-  stage: jet
   extends: [.jet_common, .jet-trigger]
-  needs:  [ jet-configure, jet-setup ]
+  needs: [metadata, jet-configure]
   trigger:
     project: dl/jet/ci
-    branch: $JET_CLUSTER_BRANCH
+    branch: $JET_CI_BRANCH
     strategy: depend
-  inherit:
-    variables:
-      - JET_CUSTOM_FILTER
-      - JET_CLUSTER_BRANCH
   variables:
-    JET_WORKLOADS_FILTER: "$_JET_FILTER"
-
+    JET_WORKLOADS_FILTER: '$_JET_FILTER'
+  inherit:
+    variables: true
 
 jet-results-summary:
-  stage: jet
+  extends: [.jet_common]
   image: gitlab-master.nvidia.com:5005/dl/jet/api:latest
   tags:
     - os/linux
-  needs: [ jet-trigger ]
   before_script:
     - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $VAULT_JWT_TOKEN
-  script: 
+  script:
+    - env
+    - RW_API_TOKEN=${PROJECT_ACCESS_TOKEN} ENDPOINT=${PROJECT_ENDPOINT} bash tests/functional_tests/shell_test_utils/restart_jet_log_jobs.sh ${CI_PIPELINE_ID}
     - python -m pip install -U --no-cache-dir prettytable
     - rc=0
-    - python tests/functional_tests/python_test_utils/jet_test_pipeline.py ${CI_PIPELINE_ID} --test exit --artifact_links $CI_JOB_ID || rc=$?
-    - python tests/functional_tests/python_test_utils/jet_test_pipeline.py ${CI_PIPELINE_ID} --download_scripts_dir ./scripts || rc=$?
+    - python tests/functional_tests/python_test_utils/jet_test_pipeline.py ${CI_PIPELINE_ID} --artifact_links $CI_JOB_ID --download_scripts_dir ./scripts || rc=$?
     - exit $rc
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /Run tests/'
-      when: always
-    - if: $JET_CUSTOM_FILTER != "" && $CI_PIPELINE_SOURCE != 'merge_request_event'
-      when: always
-    - when: never
   artifacts:
     when: always
     paths:
       - scripts
+  allow_failure: true

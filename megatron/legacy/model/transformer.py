@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from typing import Optional
 
 from megatron import core
-from megatron.training import get_timers, get_args, get_num_microbatches
+from megatron.training import get_timers, get_args
 from .module import MegatronModule
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
@@ -18,6 +18,7 @@ from megatron.legacy.model.enums import AttnMaskType, LayerType, AttnType
 from megatron.legacy.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.legacy.model.fused_bias_gelu import bias_gelu_impl
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding, apply_rotary_pos_emb
+from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.legacy.model.utils import attention_mask_func, openai_gelu, erf_gelu, get_norm
 from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region_to_moe,
@@ -163,7 +164,7 @@ def sinkhorn(cost, tol=0.0001):
     cost = torch.exp(cost)
     d0 = torch.ones(cost.size(0), device=cost.device, dtype=cost.dtype)
     d1 = torch.ones(cost.size(1), device=cost.device, dtype=cost.dtype)
-    
+
     eps = 0.00000001
     error = 1e9
     d1_old = d1
@@ -231,7 +232,7 @@ class SwitchMLP(MegatronModule):
         b = hidden_states.size(1)
         h = hidden_states.size(2)
         route = self.router(hidden_states).view(-1, args.num_experts)
-        
+
         # TODO (rprenger) Right now we're just using the sinkhorn algorithm
         # for load balancing. There should be an option to do no load balancing
         # and the algorithm and parametets should be further tested
@@ -1311,47 +1312,21 @@ def _get_num_layers(args, model_type, is_decoder=False):
     if model_type == ModelType.retro_encoder:
         num_layers = args.retro_encoder_layers
     elif mpu.get_pipeline_model_parallel_world_size() > 1:
-        if is_encoder_and_decoder_model:
-            assert args.pipeline_model_parallel_split_rank is not None
+        assert not is_encoder_and_decoder_model, "This is no longer supported."
+        assert args.num_layers == args.encoder_num_layers
+        assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
+            'num_layers must be divisible by transformer_pipeline_model_parallel_size'
 
-            # When a standalone embedding stage is used, a rank is taken from
-            # the encoder's ranks, to be used for the encoder's embedding
-            # layer. This way, the rank referenced by the 'split rank' remains
-            # the same whether or not a standalone embedding stage is used.
-            num_ranks_in_encoder = (
-                args.pipeline_model_parallel_split_rank - 1
-                if args.standalone_embedding_stage else
-                args.pipeline_model_parallel_split_rank
-            )
-            num_ranks_in_decoder = args.transformer_pipeline_model_parallel_size - num_ranks_in_encoder
-            assert args.encoder_num_layers % num_ranks_in_encoder == 0, \
-                    'encoder_num_layers (%d) must be divisible by number of ranks given to encoder (%d)' % (args.encoder_num_layers, num_ranks_in_encoder)
-            assert args.decoder_num_layers % num_ranks_in_decoder == 0, \
-                    'decoder_num_layers (%d) must be divisible by number of ranks given to decoder (%d)' % (args.decoder_num_layers, num_ranks_in_decoder)
-            if mpu.is_pipeline_stage_before_split():
-                num_layers = (
-                    0
-                    if args.standalone_embedding_stage
-                    and mpu.get_pipeline_model_parallel_rank() == 0 else
-                    args.encoder_num_layers // num_ranks_in_encoder
-                )
-            else:
-                num_layers = args.decoder_num_layers // num_ranks_in_decoder
-        else:
-            assert args.num_layers == args.encoder_num_layers
-            assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
-                'num_layers must be divisible by transformer_pipeline_model_parallel_size'
-
-            # When a standalone embedding stage is used, all transformer layers
-            # are divided among pipeline rank >= 1, while on pipeline rank 0,
-            # ranks either contain the input embedding layer (virtual pp rank 0),
-            # or no layers at all (virtual pp rank >= 1).
-            num_layers = (
-                0
-                if args.standalone_embedding_stage
-                and mpu.get_pipeline_model_parallel_rank() == 0 else
-                args.num_layers // args.transformer_pipeline_model_parallel_size
-            )
+        # When a standalone embedding stage is used, all transformer layers
+        # are divided among pipeline rank >= 1, while on pipeline rank 0,
+        # ranks either contain the input embedding layer (virtual pp rank 0),
+        # or no layers at all (virtual pp rank >= 1).
+        num_layers = (
+            0
+            if args.standalone_embedding_stage
+            and mpu.get_pipeline_model_parallel_rank() == 0 else
+            args.num_layers // args.transformer_pipeline_model_parallel_size
+        )
     else:
         if not is_decoder:
             num_layers = args.encoder_num_layers
@@ -1517,8 +1492,11 @@ class ParallelTransformer(MegatronModule):
                     layer_number=layer_number,
                     kv_channels=config.kv_channels,
                     self_attn_mask_type=self_attn_mask_type.name,
-                    tp_group=mpu.get_tensor_model_parallel_group(),
-                    get_rng_state_tracker=tensor_parallel.get_cuda_rng_tracker,
+                    tp_group=mpu.get_tensor_model_parallel_group() if mpu.is_initialized() else None,
+                    tp_size=mpu.get_tensor_model_parallel_world_size(),
+                    get_rng_state_tracker=get_cuda_rng_tracker
+                    if get_cuda_rng_tracker().is_initialized()
+                    else None,
                     fuse_wgrad_accumulation=config.gradient_accumulation_fusion,
                     seq_length=args.seq_length,
                     micro_batch_size=args.micro_batch_size,

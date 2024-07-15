@@ -232,7 +232,12 @@ class Tokenizer:
     def initializer(self):
         # Use Encoder class as a container for global data
         Tokenizer.tokenizer = build_tokenizer(self.args)
-        self.eod_token = Tokenizer.tokenizer.eod
+        if hasattr(Tokenizer.tokenizer, 'eod'):
+            self.eod_token = Tokenizer.tokenizer.eod
+        elif hasattr(Tokenizer.tokenizer, 'eos_id'):
+            self.eod_token = Tokenizer.tokenizer.eos_id
+        else:
+            raise AttributeError('No eod token found in Tokenizer')
         self.split_token = 313131
 
         if (
@@ -279,7 +284,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
 
         self.tokenizer = Tokenizer()
         self.manual_prompts = json.load(open(self.args.prompt_path))
-        self.seq_len = self.args.seq_length
+        self.seq_len = self.args.decoder_seq_length - self.args.seq_length
 
         self.txt_to_token_dict = {}
 
@@ -402,16 +407,19 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
         if task_name != 'pretrain' and sample.context[-1:] != "\n":
             sample.context = sample.context + "\n"
 
-        question_token = self.tokenizer(sample.context)
+        question = sample.context
+
         if isinstance(sample.answers, list):
             answer_list = sample.answers
             weight_list = np.array(sample.answer_weights).astype(np.float32)
             weight_list = weight_list / np.sum(weight_list)
             answer_idx = np.random.choice(weight_list.shape[0], 1, p=weight_list)[0]
             answer = answer_list[answer_idx]
-            answer_token = self.tokenizer(answer)
         else:
-            answer_token = self.tokenizer(sample.answers)
+            answer = sample.answers
+
+        question_token = self.tokenizer.tokenizer.instruct_tokenize(question)
+        answer_token = self.tokenizer(answer)
 
         prompt_len = len(question_token)
 

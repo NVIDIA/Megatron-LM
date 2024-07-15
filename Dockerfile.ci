@@ -1,7 +1,68 @@
-ARG FROM_IMAGE_NAME
-FROM ${FROM_IMAGE_NAME}
+# syntax=docker/dockerfile:experimental
 
-COPY . megatron-lm
+ARG FROM_IMAGE_NAME
+FROM $FROM_IMAGE_NAME
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN sed -i -e 's/^APT/# APT/' -e 's/^DPkg/# DPkg/' \
+      /etc/apt/apt.conf.d/docker-clean
+
+RUN apt-get update && \
+      apt-get install -y --no-install-recommends gettext && \
+      apt-get clean
+
+RUN wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq && \
+chmod a+x /usr/local/bin/yq
+
+RUN pip3 install --no-cache-dir \
+      einops \
+      flask-restful \
+      nltk \
+      pytest \
+      pytest-cov \
+      pytest_mock \
+      sentencepiece \
+      wrapt \
+      git+https://github.com/fanshiqing/grouped_gemm@v1.1.2 \
+      zarr \
+      tensorstore==0.1.45
+
+##### For Mamba begin #####
+RUN pip uninstall -y triton && \
+    pip install triton==2.1.0
+
+# The causal-conv1d and mamba-ssm packages below are built from scratch here
+# (which takes significant time) because there are no wheels available on PyPI
+# for these relatively newer versions of the packages that are compatible with
+# the older NGC-variant PyTorch version (e.g. version 2.2.0.dev231106) that we
+# are using (in the NGC base container). Generally, if the package is not
+# compatible with the PyTorch version, then it will generate a Python import
+# error. The package authors tend to only release wheels for new versions of
+# these pacakges which are compatible with the versions of regular PyTorch and
+# NGC-variant PyTorch that are newer at the time of release. So, to use newer
+# versions of these packages with relatively older versions of the NGC PyTorch
+# container, we tend to have to build the packages from scratch.
+
+RUN cd /tmp && \
+    pip uninstall -y causal-conv1d && \
+    git clone https://github.com/Dao-AILab/causal-conv1d.git && \
+    cd causal-conv1d && \
+    git checkout v1.2.2.post1 && \
+    CAUSAL_CONV1D_FORCE_BUILD=TRUE pip install . && \
+    cd .. && \
+    rm -rf causal-conv1d
+
+RUN cd /tmp && \
+    pip uninstall -y mamba-ssm && \
+    git clone https://github.com/state-spaces/mamba.git && \
+    cd mamba && \
+    git checkout v2.0.3 && \
+    MAMBA_FORCE_BUILD=TRUE pip install . && \
+    cd .. && \
+    rm -rf mamba
+##### For Mamba end #####
+
+COPY . /workspace/megatron-lm
 
 RUN cp -r /workspace/megatron-lm /opt && \
     pip install /opt/megatron-lm

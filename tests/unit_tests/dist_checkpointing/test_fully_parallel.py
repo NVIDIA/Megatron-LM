@@ -1,6 +1,8 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 from pathlib import Path
+from typing import Dict
 
+import numpy as np
 import pytest
 
 import torch
@@ -14,7 +16,7 @@ from megatron.core.dist_checkpointing.strategies.base import \
     SaveShardedStrategy, LoadShardedStrategy
 from megatron.core.dist_checkpointing.strategies.fully_parallel import \
     FullyParallelSaveStrategyWrapper, _sharded_tensor_shard_id, \
-    FullyParallelLoadStrategyWrapper
+    FullyParallelLoadStrategyWrapper, _ShardId
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -29,8 +31,9 @@ class MockSaveStrategy(SaveShardedStrategy):
 
 
 class MockLoadStrategy(LoadShardedStrategy):
-    def __init__(self):
+    def __init__(self, device='cpu'):
         super().__init__()
+        self.device = device
         self.load_keys = set()
 
     def load(self, sharded_state_dict, ckpt_dir):
@@ -39,7 +42,7 @@ class MockLoadStrategy(LoadShardedStrategy):
 
         def load_rand(x):
             assert isinstance(x, ShardedTensor)
-            x.init_data('cpu')
+            x.init_data(self.device)
             x.data.fill_(Utils.rank)
             return x.data
 
@@ -178,3 +181,40 @@ class TestFullyParallelSaveAndLoad:
         assert mock_strategy.load_keys == expected_keys_saved_by_current_rank, (Utils.rank, mock_strategy.load_keys, expected_keys_saved_by_current_rank)
 
         assert loaded_state_dict.keys() == state_dict.keys()
+
+    @pytest.mark.parametrize('state_dict_device', ['cpu', 'cuda'])
+    def test_memory_usage(self, state_dict_device):
+        Utils.initialize_model_parallel(2, 1)
+
+        megabytes = 1024 * 1024
+        mock_strategy = MockLoadStrategy(state_dict_device)
+
+        mem_alloc = []
+
+        class ParallelLoadWithMemUsage(FullyParallelLoadStrategyWrapper):
+            def _get_empty_tensor_for_exchange(self, *args, **kwargs) -> torch.Tensor:
+                ret = super()._get_empty_tensor_for_exchange(*args, **kwargs)
+                mem_alloc.append(torch.cuda.memory_allocated())
+                return ret
+
+        load_strategy = ParallelLoadWithMemUsage(mock_strategy)
+        torch.distributed.barrier()
+
+        # Each tensor is 4MB, 40MB in total.
+        # We expect extra memory usage peak at ~32MB, not 1GB
+        sharded_state_dict = {
+            f'ten_{i}': ShardedTensor.from_rank_offsets(f'ten_{i}', torch.rand(megabytes, dtype=torch.float, device=state_dict_device),
+                                                        (0, Utils.rank, Utils.world_size))
+            for i in range(10)
+        }
+
+        mem_alloc_start = torch.cuda.memory_allocated()
+
+        loaded_state_dict = load_strategy.load(sharded_state_dict, Path('mock_dir'))
+
+        # Each rank is expected to do 7 * 10 empty allocations
+        assert len(mem_alloc) == 7 * 10
+        # Peak mem usage should be within 4MB (single tensor)
+        assert max(mem_alloc) - mem_alloc_start < 4.01 * megabytes, (max(mem_alloc), mem_alloc_start)
+
+        Utils.destroy_model_parallel()

@@ -60,15 +60,14 @@ class LanguageModule(MegatronModule):
         if not self.share_embeddings_and_output_weights:
             return
 
-        if self.pre_process and self.post_process:
+        if parallel_state.get_pipeline_model_parallel_world_size() == 1:
             # Zero out wgrad if sharing embeddings between two layers on same
             # pipeline stage to make sure grad accumulation into main_grad is
             # correct and does not include garbage values (e.g., from torch.empty).
             self.shared_embedding_or_output_weight().zero_out_wgrad = True
             return
 
-        if self.pre_process and not self.post_process:
-            assert parallel_state.is_pipeline_first_stage()
+        if parallel_state.is_pipeline_first_stage() and self.pre_process and not self.post_process:
             self.shared_embedding_or_output_weight().shared_embedding = True
 
         if self.post_process and not self.pre_process:
@@ -130,7 +129,7 @@ class LanguageModule(MegatronModule):
         sharded_offsets: Tuple[Tuple[int, int, int]] = (),
         metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
-        """ Sharded state dict implementation that handles the output layer weights tying.
+        """Sharded state dict implementation that handles the output layer weights tying.
 
         Args:
             prefix (str): Module name prefix.

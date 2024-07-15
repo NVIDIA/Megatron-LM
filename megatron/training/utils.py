@@ -8,14 +8,27 @@ from datetime import datetime
 import torch
 
 try:
-    from apex.multi_tensor_apply import multi_tensor_applier
+    from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
 except ImportError:
-    multi_tensor_applier = None
+    try:
+        from apex.multi_tensor_apply import multi_tensor_applier
+    except ImportError:
+        multi_tensor_applier = None
 
-try:
-    import amp_C
-except ImportError:
-    amp_C = None
+    try:
+        from amp_C import multi_tensor_l2norm
+    except ImportError:
+        import warnings
+        warnings.warn(
+            f'Transformer Engine and Apex are not installed. '
+            'Falling back to local implementations of '
+            'multi_tensor_applier and multi_tensor_l2norm'
+        )
+
+        from megatron.core.utils import (
+            local_multi_tensor_l2_norm as multi_tensor_l2norm,
+            local_multi_tensor_applier as multi_tensor_applier,
+        )
 
 from megatron.training import (
     get_args,
@@ -65,14 +78,10 @@ def calc_params_l2_norm(model):
                 if is_not_shared and is_not_tp_duplicate:
                     params_data.append(param.data.float() if args.bf16 else param.data)
 
-    # Check the availability of apex
-    assert multi_tensor_applier is not None and amp_C is not None, \
-        "apex is not available, please install it from https://github.com/NVIDIA/apex"
-
     # Calculate norm
     dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
     norm, _ = multi_tensor_applier(
-        amp_C.multi_tensor_l2norm,
+        multi_tensor_l2norm,
         dummy_overflow_buf,
         [params_data],
         False # no per-parameter norm

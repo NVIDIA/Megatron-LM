@@ -8,24 +8,41 @@ from megatron.core import parallel_state
 
 
 def switch_load_balancing_loss_func(
-    probs: torch.Tensor, tokens_per_expert: torch.Tensor, topk: int, moe_aux_loss_coeff: float
+    probs: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    topk: int,
+    moe_aux_loss_coeff: float,
+    sequence_partition_group=None,
 ):
-    """Calculate the auxiliary loss for better load balacing. 
-    Please refer to the Switch Transformer paper (https://arxiv.org/abs/2101.03961) for details.
+    """Calculate the auxiliary loss for load balancing.
+    Refer to the Switch Transformer paper (https://arxiv.org/abs/2101.03961) for details.
 
     Args:
-        probs (torch.Tensor): The softmax probs output by the router for each token. [num_tokens, num_experts]
-        tokens_per_expert (torch.Tensor): The number of assigned tokens for each expert. [num_experts]
+        probs (torch.Tensor): Softmax probabilities output by the router for each token. [num_tokens, num_experts]
+        tokens_per_expert (torch.Tensor): Number of tokens assigned to each expert. [num_experts]
+        topk (int): The number of experts selected for each token.
+        moe_aux_loss_coeff (float): The coefficient for the auxiliary loss.
+        sequence_partition_group (optional): The parallel group over which the sequence is partitioned. If None, no partitioning is applied. Defaults to None.
 
     Returns:
         torch.Tensor: The auxiliary loss for load balancing.
     """
-    num_tokens = probs.shape[0] * topk
+    num_sub_sequence = 1
+
+    # If the sequence is partitioned by certain parallelism strategies like Sequence Parallelism or Context Parallelism, compute the gradient of the auxiliary loss with respect to the full sequence.
+    if sequence_partition_group is not None:
+        # We can keep `aggregated_probs_per_expert` local since we don't need the gradient for `tokens_per_expert`, saving one allreduce operation for `aggregated_probs_per_expert`.
+        num_sub_sequence = torch.distributed.get_world_size(sequence_partition_group)
+        torch.distributed.all_reduce(tokens_per_expert, group=sequence_partition_group)
+
+    num_tokens = probs.shape[0] * num_sub_sequence
     num_experts = probs.shape[1]
 
-    probs_mean_per_expert = probs.mean(dim=0)
-    aux_loss = torch.sum(probs_mean_per_expert * tokens_per_expert) * (
-        num_experts / num_tokens * moe_aux_loss_coeff
+    # The formula of aux_loss: aux_loss = sum((probs_per_expert/num_tokens) * (tokens_per_expert/(num_tokens*topk))) * num_experts * moe_aux_loss_coeff.
+    # This can be simplified to fuse the division and multiplication operations.
+    aggregated_probs_per_expert = probs.sum(dim=0)
+    aux_loss = torch.sum(aggregated_probs_per_expert * tokens_per_expert) * (
+        num_experts * moe_aux_loss_coeff / (num_tokens * num_tokens * topk)
     )
     return aux_loss
 
@@ -33,10 +50,10 @@ def switch_load_balancing_loss_func(
 def z_loss_func(logits, z_loss_coeff):
     """Encourages the router's logits to remain small to enhance stability.
     Please refer to the ST-MoE paper (https://arxiv.org/pdf/2202.08906.pdf) for details.
-    
+
     Args:
         logits (torch.Tensor): The logits of the router.
-    
+
     Returns:
         torch.Tensor: The logits after applying the z-loss.
     """
@@ -64,17 +81,17 @@ def sinkhorn(cost: torch.Tensor, tol: float = 0.0001):
 
 def get_capacity(num_tokens: int, num_experts: int, capacity_factor: float, min_capacity=None):
     """
-        Calculate the capacity of each expert.
+    Calculate the capacity of each expert.
 
-        Args:
-            num_tokens (int): num of the input tokens.
-            num_experts (int): num of the experts.
-            capacity_factor (float): Capacity factor.
-            min_capacity (int, optional): Minimum capacity. Defaults to None.
+    Args:
+        num_tokens (int): num of the input tokens.
+        num_experts (int): num of the experts.
+        capacity_factor (float): Capacity factor.
+        min_capacity (int, optional): Minimum capacity. Defaults to None.
 
-        Returns:
-            Tensor: Capacity of each expert.
-        """
+    Returns:
+        Tensor: Capacity of each expert.
+    """
     capacity = math.ceil((num_tokens / num_experts) * capacity_factor)
     if min_capacity is not None and capacity < min_capacity:
         capacity = min_capacity
@@ -82,16 +99,14 @@ def get_capacity(num_tokens: int, num_experts: int, capacity_factor: float, min_
 
 
 class MoEAuxLossAutoScaler(torch.autograd.Function):
-    """An AutoScaler that compute and scales the grad for auxiliary loss.
-
-    """
+    """An AutoScaler that compute and scales the grad for auxiliary loss."""
 
     main_loss_backward_scale: torch.Tensor = torch.tensor(1.0)
 
     @staticmethod
     def forward(ctx, output: torch.Tensor, aux_loss: torch.Tensor):
         """Preserve the aux_loss by storing it in the context to avoid garbage collection.
-        
+
         Args:
             output (torch.Tensor): The output tensor.
             aux_loss (torch.Tensor): The auxiliary loss tensor.
@@ -120,7 +135,7 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
     @staticmethod
     def set_loss_scale(scale: torch.Tensor):
         """set the scale of the aux loss.
-        
+
         Args:
             scale (torch.Tensor): The scale value to set. Please ensure that the scale passed in matches the scale of the main_loss.
         """
@@ -129,7 +144,7 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
 
 def permute(tokens, indices, num_out_tokens: int = None, padded_mode: bool = False):
     """Permute the tokens based on the indices. Token with the same index will be grouped together.
-       The input indices shape is [tokens, top_k], it indicates which experts were selected by each token separately. 
+       The input indices shape is [tokens, top_k], it indicates which experts were selected by each token separately.
     Args:
         tokens (torch.Tensor): The input token tensor.
         indices (torch.Tensor): The token to expert indices tensor, should have a shape of [num_tokens] or [num_tokens, topk].
@@ -204,7 +219,7 @@ def unpermute(
 
 
 def permute_with_padded_tokens(tokens, indices):
-    """Permute the tokens based on the indices, only used in padding mode. 
+    """Permute the tokens based on the indices, only used in padding mode.
        The input indices shape is [num_expert, capacity], it indicates which tokens were selected by each expert separately.
     Args:
         tokens (torch.Tensor): The input token tensor.
@@ -227,15 +242,15 @@ def unpermute_with_padded_tokens(
 ) -> torch.Tensor:
     """
     Unpermutes a padded permuted tokens based on sorted indices and merges the tokens with their corresponding probabilities.
-    
+
     This function takes a tensor of permuted tokens and reorders them according to the provided indices. It also combines the tokens with their associated probabilities.
-    
+
     Parameters:
         permuted_tokens (torch.Tensor): A 2D tensor containing permuted tokens.
         indices (torch.Tensor): A tensor with shape [num_expert, capacity], indicating the selected tokens for each expert.
         probs (torch.Tensor): A tensor with the same shape as indices, containing probabilities corresponding to each token.
         restore_shape (torch.Size): The target shape for the unpermuted tokens tensor.
-    
+
     Returns:
         torch.Tensor: A tensor of unpermuted tokens, merged with their probabilities.
 
@@ -258,7 +273,6 @@ def unpermute_with_padded_tokens(
         restore_shape,
         dtype=combined_output.dtype,
         device=combined_output.device,
-        requires_grad=True,
     )
 
     # Scatter the combined tokens back to their original positions
@@ -275,19 +289,19 @@ def topk_softmax_with_capacity(
     drop_policy: str = "probs",
 ):
     """Apply capacity and padding to the top-k selection.
-        Args:
-            logits (torch.Tensor): Logits tensor.
-            topk (int): The number of experts to select for each token.
-            capacity_factor (int): The capacity factor of each expert. Will drop tokens if the number of tokens exceeds the capacity.
-            pad_to_capacity (bool): Whether to need padding in token drop mode.
-            drop_policy (str): The policy to drop tokens. Can be either "prob" or "position". If "prob", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.
+    Args:
+        logits (torch.Tensor): Logits tensor.
+        topk (int): The number of experts to select for each token.
+        capacity_factor (int): The capacity factor of each expert. Will drop tokens if the number of tokens exceeds the capacity.
+        pad_to_capacity (bool): Whether to need padding in token drop mode.
+        drop_policy (str): The policy to drop tokens. Can be either "prob" or "position". If "prob", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.
 
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Probs, indices and tokens_per_expert tensor.
-            
-            (1) If there's no token padding, the shape of probs and indices is [tokens, top_k], indicating the selected experts for each token.
-            (2) If there's token padding, the shape of probs and indices is [num_expert, capacity], indicating the tokens selected for each expert.
-        """
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Probs, indices and tokens_per_expert tensor.
+
+        (1) If there's no token padding, the shape of probs and indices is [tokens, top_k], indicating the selected experts for each token.
+        (2) If there's token padding, the shape of probs and indices is [num_expert, capacity], indicating the tokens selected for each expert.
+    """
     # TODO: Add Pre softmax.
     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
     num_tokens = logits.shape[0]
@@ -303,7 +317,9 @@ def topk_softmax_with_capacity(
     else:
         # TopK with capacity
         expert_capacity = get_capacity(
-            num_tokens=num_tokens * topk, num_experts=num_experts, capacity_factor=capacity_factor,
+            num_tokens=num_tokens * topk,
+            num_experts=num_experts,
+            capacity_factor=capacity_factor,
         )
         # TopK selection, Maskout unused experts
         topk_masked_gates = torch.zeros_like(logits).scatter(1, top_indices, probs)
@@ -341,50 +357,73 @@ def topk_softmax_with_capacity(
         return final_probs, final_indices, tokens_per_expert_before_capacity
 
 
-def save_to_aux_losses_tracker(name: str, loss: torch.Tensor, layer_number: int, num_layers: int):
+def save_to_aux_losses_tracker(
+    name: str,
+    loss: torch.Tensor,
+    layer_number: int,
+    num_layers: int,
+    reduce_group: torch.distributed.ProcessGroup = None,
+    avg_group: torch.distributed.ProcessGroup = None,
+):
     """Save the auxiliary loss for logging.
     Args:
         name (str): The name of the loss.
         loss (torch.Tensor): The loss tensor.
         layer_number (int): Layer index of the loss.
         num_layers (int): The number of total layers.
+        reduce_group (torch.distributed.ProcessGroup): The group for reducing the loss.
+        mean_group (torch.distributed.ProcessGroup): The group for averaging the loss.
     """
     # Skip aux loss logging if layer_number is None.
     if layer_number is None:
         return
 
-    if name not in parallel_state._MOE_AUX_LOSSES_LOGGING_TRACKER:
-        parallel_state._MOE_AUX_LOSSES_LOGGING_TRACKER[name] = torch.zeros(
-            num_layers, device=loss.device
-        )
-    parallel_state._MOE_AUX_LOSSES_LOGGING_TRACKER[name][layer_number - 1] += loss.detach()
+    tracker = parallel_state.get_moe_layer_wise_logging_tracker()
+    if name not in tracker:
+        tracker[name] = {}
+        tracker[name]["values"] = torch.zeros(num_layers, device=loss.device)
+    tracker[name]["values"][layer_number - 1] += loss.detach()  # Aggregate the loss for the layer.
+    tracker[name]["reduce_group"] = reduce_group
+    tracker[name]["avg_group"] = avg_group
 
 
 def clear_aux_losses_tracker():
     """Clear the auxiliary losses."""
-    for name in parallel_state._MOE_AUX_LOSSES_LOGGING_TRACKER:
-        parallel_state._MOE_AUX_LOSSES_LOGGING_TRACKER[name].zero_()
+    tracker = parallel_state.get_moe_layer_wise_logging_tracker()
+    for name in tracker:
+        tracker[name]["values"].zero_()
+        tracker[name]["reduce_group"] = None
+        tracker[name]["avg_group"] = None
 
 
-def get_aux_losses_tracker():
-    """Return the auxiliary losses."""
-    return parallel_state._MOE_AUX_LOSSES_LOGGING_TRACKER
-
-
-def aggregate_aux_losses_tracker_across_pipeline_parallel():
-    """Sum aux losses across PP."""
-    for name in parallel_state._MOE_AUX_LOSSES_LOGGING_TRACKER:
-        loss = parallel_state._MOE_AUX_LOSSES_LOGGING_TRACKER[name]
-        torch.distributed.all_reduce(loss, group=parallel_state.get_pipeline_model_parallel_group())
+def reduce_aux_losses_tracker_across_ranks():
+    """Collect and reduce the auxiliary losses across ranks."""
+    tracker = parallel_state.get_moe_layer_wise_logging_tracker()
+    for name in tracker:
+        values = tracker[name]["values"]
+        # Collect aux losses across PP.
+        torch.distributed.all_reduce(
+            values, group=parallel_state.get_pipeline_model_parallel_group()
+        )
+        # Reduce aux losses across ranks.
+        if tracker[name].get('reduce_group') is not None:
+            torch.distributed.all_reduce(values, group=tracker[name].get('reduce_group'))
+        if tracker[name].get('avg_group') is not None:
+            torch.distributed.all_reduce(
+                values,
+                group=tracker[name]['avg_group'],
+                op=torch.distributed.ReduceOp.AVG,
+            )
 
 
 def track_moe_metrics(
     loss_scale, iteration, writer, wandb_writer=None, total_loss_dict=None, per_layer_logging=False
 ):
     # Aux loss logging
-    aggregate_aux_losses_tracker_across_pipeline_parallel()
+    reduce_aux_losses_tracker_across_ranks()
+    tracker = parallel_state.get_moe_layer_wise_logging_tracker()
     if writer is not None:
-        aux_losses = {k: v.float() * loss_scale for k, v in get_aux_losses_tracker().items()}
+        aux_losses = {k: v['values'].float() * loss_scale for k, v in tracker.items()}
         for name, loss_list in aux_losses.items():
             if total_loss_dict is not None:
                 if name not in total_loss_dict:

@@ -7,6 +7,7 @@ import torch
 
 from megatron.core.dist_checkpointing import save, load, load_plain_tensors
 from megatron.core import parallel_state as ps
+from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.models.retro import get_retro_decoder_block_spec, RetroConfig, RetroModel
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -65,7 +66,11 @@ class TestRetroModel:
             gpt_model = initialize_retro_model(2, decoder_spec_fn, dst_spec_type)
             sharded_state_dict = gpt_model.sharded_state_dict()
 
-            state_dict = load(sharded_state_dict, ckpt_dir)
+            state_dict, missing_keys, unexpected_keys = load(sharded_state_dict, ckpt_dir, strict=StrictHandling.RETURN_ALL)
+            # Potential mismatch is because of extra states which is ok
+            assert all('_extra_state' in k for k in missing_keys)
+            assert all('_extra_state' in k for k in unexpected_keys)
+            gpt_model.load_state_dict(state_dict)
             gpt_model.load_state_dict(state_dict)
 
         Utils.destroy_model_parallel()

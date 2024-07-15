@@ -25,3 +25,6 @@ class InferenceParams:
                 new_inference_key_memory,
                 new_inference_value_memory,
             )
+
+    def __str__(self):
+        return f"InferenceParams(max_seq_len = {self.max_sequence_length}, max_batch_size = {self.max_batch_size}, sequence_len_offset = {self.sequence_len_offset}, batch_size_offset = {self.batch_size_offset}, key_value_memory_dict = {self.key_value_memory_dict.keys()})"

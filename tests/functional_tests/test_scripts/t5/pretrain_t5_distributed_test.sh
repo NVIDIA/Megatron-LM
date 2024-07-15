@@ -55,6 +55,7 @@ if [[ $USE_TE -eq 1 ]]; then
        echo "Running with TransformerEngine ..."
        TRANSFORMER_IMPL=transformer_engine
        TRAINING_DTYPE=bf16
+       ADDITIONAL_PARAMS+=" --attention-softmax-in-fp32"
 else
        echo "Running with local transformer implementation ..."
 fi
@@ -75,7 +76,7 @@ set +x
 pip install pydantic==2.2.1
 
 # Runs the "220M" parameter model
-DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
+DISTRIBUTED_ARGS="--max-restarts 3 --nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 
 torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     pretrain_t5.py \
@@ -107,6 +108,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --data-path $DATA_PATH \
     --vocab-file $VOCAB_PATH \
     --tokenizer-type BertWordPieceCase \
+    --calculate-per-token-loss \
     --split 99982,9,9 \
     --save $CHECKPOINT_PATH \
     --load $CHECKPOINT_PATH \

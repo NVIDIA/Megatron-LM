@@ -70,6 +70,13 @@ def get_model_type(model):
     return get_attr_wrapped_model(model, 'model_type')
 
 
+def get_model_xattn(model):
+    try:
+        return get_attr_wrapped_model(model, 'xattn_needed')
+    except RuntimeError:
+        return False
+
+
 def get_model_config(model):
     return get_attr_wrapped_model(model, 'config', allow_none=False)
 
@@ -104,7 +111,12 @@ def _kernel_make_viewless_tensor(inp, requires_grad):
     data, without linking the viewed tensor, referenced via the '._base'
     field.
     '''
-    out = torch.empty((1,), dtype=inp.dtype, device=inp.device, requires_grad=requires_grad,)
+    out = torch.empty(
+        (1,),
+        dtype=inp.dtype,
+        device=inp.device,
+        requires_grad=requires_grad,
+    )
     out.data = inp.data
     return out
 
@@ -258,7 +270,7 @@ def check_param_hashes_across_dp_replicas(model: List[torch.nn.Module]) -> bool:
     params = []
     local_param_hashes = []
     for model_chunk_id, model_chunk in enumerate(model):
-        for (param_name, param) in model_chunk.named_parameters():
+        for param_name, param in model_chunk.named_parameters():
             param_hash = torch.frombuffer(
                 array.array(
                     'B', hashlib.sha1(param.data.to("cpu").float().numpy(force=True)).digest()
@@ -293,7 +305,7 @@ def check_param_hashes_across_dp_replicas(model: List[torch.nn.Module]) -> bool:
 def make_tp_sharded_tensor_for_checkpoint(
     tensor, key, tp_axis=0, replica_id=None, prepend_offsets=(), **kwargs
 ):
-    """ Helper for instantiating a ShardedTensor where the `tp_axis` dimension is sharded across TP group.
+    """Helper for instantiating a ShardedTensor where the `tp_axis` dimension is sharded across TP group.
 
     Optionally, can provide offsets which prepend new dimensions to the tensor.
     """
@@ -319,7 +331,7 @@ def make_tp_sharded_tensor_for_checkpoint(
 
 
 def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_id=None, **kwargs):
-    """ Helper for instantiating a non-sharded ShardedTensor (replicated across TP and DP group).
+    """Helper for instantiating a non-sharded ShardedTensor (replicated across TP and DP group).
 
     Optionally, can provide offsets which prepend new dimensions to the tensor.
     """
@@ -363,7 +375,7 @@ def prepare_input_tensors_for_wgrad_compute(grad_output, all_gathered_input):
 
 
 def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_output_buffer, weight):
-    """ Helper for performing embedding wgrad GEMM's during the pipeline drain phase, pipelines the AllGather and GEMM's.
+    """Helper for performing embedding wgrad GEMM's during the pipeline drain phase, pipelines the AllGather and GEMM's.
 
     Should only be used when pipeline model parallelism and gradient accumulation fusion are enabled.
     """
@@ -447,6 +459,31 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
     input, all_gathered_input[1], grad_output = None, None, None
 
 
+def local_multi_tensor_applier(op, noop_flag_buffer, tensor_lists, *args):
+    return op(2048 * 32, noop_flag_buffer, tensor_lists, *args)
+
+
+## computes l2 norm for a list of contiguous tensors
+## works as a drop-in replacement for amp_C.multi_tensor_l2norm
+def local_multi_tensor_l2_norm(chunk_size, noop_flag, tensor_lists, per_tensor, *args):
+    l2 = [[(torch.norm(tensor)) for tensor in tensor_list] for tensor_list in tensor_lists]
+    l2_reduced = torch.norm(torch.tensor(l2))
+    l2_cuda = torch.tensor([float(l2_reduced)], dtype=torch.float, device='cuda')
+    return l2_cuda, None
+
+
+## works as a drop-in replacement for amp_C.multi_tensor_scale
+def local_multi_tensor_scale(chunk_size, noop_flag, tensor_lists, scale):
+    inputs, targets = tensor_lists[0], tensor_lists[1]
+    if inputs == targets:
+        for i in range(len(targets)):
+            ## for parity with apex implementation
+            targets[i] *= scale
+    else:
+        for i in range(len(targets)):
+            targets[i] = inputs[i] * scale
+
+
 class _ValueWithRank:
     """This is an internal class, not for use outside this module
 
@@ -469,7 +506,7 @@ class _ValueWithRank:
         self._unit = unit
 
     def __lt__(self, other) -> bool:
-        """ Check if value of self is smaller than other's value
+        """Check if value of self is smaller than other's value
 
         Args:
             other (_ValueWithRank): The other object to compare with
@@ -492,7 +529,7 @@ class _ValueWithRank:
 
     def __call__(self) -> Tuple[float, int, str]:
         """Returns the value, the rank, and unit as a Tuple
-            
+
         Returns:
             Tuple[float, int, str]: value, rank, unit
         """
@@ -865,12 +902,18 @@ class StragglerDetector:
             ptime = elapsed / (log_interval * 1.0)  # avg per iteration elapsed time, ms
             api_flops = total_flops / (log_interval * 1.0)  # avg per iteration flops, ms
             apir_flops = api_flops / (
-                ptime * 10 ** 9 * self.world
+                ptime * 10**9 * self.world
             )  # this is avg per iteration this rank's thruput, TFLOP/s (note 10**9),
             et_flops = apir_flops / self.amp  # Estimated TFLOPs, not tracing backward
 
             o_dt = self._min_max(
-                ptime, btime, float(temp), float(power), float(util), float(clock), et_flops,
+                ptime,
+                btime,
+                float(temp),
+                float(power),
+                float(util),
+                float(clock),
+                et_flops,
             )
             if self.rank == 0 and o_dt is not None and o_dt.aflops is not None:
                 now = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"

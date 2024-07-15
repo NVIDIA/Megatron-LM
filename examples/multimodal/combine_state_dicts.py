@@ -36,6 +36,9 @@ def combine(input_files, module_prefixes, output_files):
             for k, v in current_state_dict["model"].items():
                 combined_state_dict["model"]["%s.%s" % (module_prefix, k)] = v
 
+        output_dir = os.path.dirname(output_file)
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
         torch.save(combined_state_dict, output_file)
         print("saved:", output_file)
 
@@ -45,15 +48,15 @@ def combine(input_files, module_prefixes, output_files):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="""
-Combine multiple state dicts into a single state dict.
-The combined state dict is first initialized by taking a copy of the first provided input state dict.
-To avoid conflicts in model parameter names, a prefix must be provided for each input file.
-Model parameter names will be renamed from <original name> to <model prefix>.<original name>.
+        Combine multiple state dicts into a single state dict.
+        The combined state dict is first initialized by taking a copy of the first provided input state dict.
+        To avoid conflicts in model parameter names, a prefix must be provided for each input file.
+        Model parameter names will be renamed from <original name> to <model prefix>.<original name>.
 
 
-Example usage:
-python combine_state_dicts.py --input language_model.pt vision_model.pt --prefixes language_model vision_model --output multimodal.pt
-""",
+        Example usage:
+        python combine_state_dicts.py --input language_model.pt vision_model.pt --prefixes language_model vision_model --output multimodal.pt
+        """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--input", nargs="*", required=True, help="paths to input state dict files")

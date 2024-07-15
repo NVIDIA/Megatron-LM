@@ -39,11 +39,13 @@ else
    ADDITIONAL_PARAMS+=" --deterministic-mode"
 fi
 
+if [[ $USE_GA -eq 0 ]]; then
+   ADDITIONAL_PARAMS+=" --no-gradient-accumulation-fusion"
+fi
+
 USE_LEGACY=1
 if [[ $USE_CORE -eq 1 ]]; then
        echo "Running using megatron core"
-       TRANSFORMER_IMPL=transformer_engine
-       TRAINING_DTYPE=bf16
        unset USE_LEGACY
 fi
 
@@ -86,7 +88,7 @@ set +x
 # Runs the "345M" parameter model
 
 build_torch_run_cmd() {
-  DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
+  DISTRIBUTED_ARGS="--max-restarts 3 --nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
   [[ -n "$RUN_CMD" ]] && run_cmd=$RUN_CMD || run_cmd="torchrun $DISTRIBUTED_ARGS"
   torch_run_cmd="$run_cmd \
        pretrain_gpt.py \
@@ -126,9 +128,9 @@ build_torch_run_cmd() {
        --tensor-model-parallel-size $TP_SIZE \
        --pipeline-model-parallel-size $PP_SIZE \
        ${VP_SIZE:+--num-layers-per-virtual-pipeline-stage "$VP_SIZE"} \
+       ${EP_SIZE:+--expert-model-parallel-size "$EP_SIZE"} \
        ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
        ${USE_LEGACY:+--use-legacy-models} \
-       --no-gradient-accumulation-fusion \
        ${DATA_CACHE:+--data-cache-path "$DATA_CACHE"} \
        --${TRAINING_DTYPE}"
 

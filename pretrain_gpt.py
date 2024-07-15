@@ -87,6 +87,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
+            rotary_base=args.rotary_base
         )
 
     return model
@@ -203,6 +204,7 @@ def core_gpt_dataset_config_from_args(args):
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
         create_attention_mask=args.create_attention_mask_in_dataloader,
+        s3_cache_path = args.s3_cache_path
     )
 
 

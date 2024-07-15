@@ -93,7 +93,9 @@ class DistributedDataParallel(MegatronModule):
                 expert_parallel_params.append(param)
 
         def allocate_buffers_for_parameters(
-            input_params, data_parallel_group, gradient_scaling_factor,
+            input_params,
+            data_parallel_group,
+            gradient_scaling_factor,
         ):
             param_and_grad_dtype_to_params = {}
 
@@ -165,7 +167,7 @@ class DistributedDataParallel(MegatronModule):
         # Allocate separate param+grad buffers for expert parallel params' grads.
         self.expert_parallel_buffers = allocate_buffers_for_parameters(
             expert_parallel_params,
-            parallel_state.get_data_modulo_expert_parallel_group(),
+            parallel_state.get_data_modulo_expert_parallel_group(with_context_parallel=True),
             gradient_scaling_factor=expert_gradient_scaling_factor,
         )
 
@@ -288,7 +290,9 @@ class DistributedDataParallel(MegatronModule):
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
             if is_expert_parallel:
-                data_parallel_group = parallel_state.get_data_modulo_expert_parallel_group()
+                data_parallel_group = parallel_state.get_data_modulo_expert_parallel_group(
+                    with_context_parallel=True
+                )
             else:
                 data_parallel_group = parallel_state.get_data_parallel_group(
                     with_context_parallel=True
