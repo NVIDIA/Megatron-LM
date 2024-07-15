@@ -75,6 +75,8 @@ class T5Model(LanguageModule):
     Args:
         config (TransformerConfig): transformer config
 
+        encoder_config (TransformerConfig): encoder transformer config
+
         transformer_encoder_layer_spec (ModuleSpec): transformer layer customization specs for encoder
 
         transformer_decoder_layer_spec (ModuleSpec): transformer layer customization specs for decoder
@@ -84,6 +86,7 @@ class T5Model(LanguageModule):
         max_sequence_length (int): maximum size of sequence. This is used for positional embedding
 
         pre_process (bool): Include embedding layer (used with pipeline parallelism)
+
         post_process (bool): Include an output layer (used with pipeline parallelism)
 
         fp16_lm_cross_entropy (bool, optional): Defaults to False
@@ -101,11 +104,18 @@ class T5Model(LanguageModule):
 
         seq_len_interpolation_factor (float): scale of linearly interpolating RoPE for longer sequences.
             The value must be a float larger than 1.0. Defaults to None.
+
+        add_encoder (bool): Create the encoder (used with pipeline parallelism). When using pipelining,
+            the encoder will only be created on a subset of the pipeline ranks.
+
+        add_decoder (bool): Include an output layer (used with pipeline parallelism). As with `add_encoder`, when
+            using this model and pipelining, the decoder will only be created on a subset of the pipeline ranks.
     """
 
     def __init__(
         self,
         config: TransformerConfig,
+        encoder_config: TransformerConfig,
         transformer_encoder_layer_spec: ModuleSpec,
         transformer_decoder_layer_spec: ModuleSpec,
         vocab_size: int,
@@ -118,28 +128,35 @@ class T5Model(LanguageModule):
         position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
         rotary_percent: float = 1.0,
         seq_len_interpolation_factor: Optional[float] = None,
+        add_encoder: bool = True,
+        add_decoder: bool = True,
     ):
 
         super(T5Model, self).__init__(config=config)
 
         self.config: TransformerConfig = config
+        self.encoder_config: TransformerConfig = encoder_config
         self.transformer_encoder_layer_spec: ModuleSpec = transformer_encoder_layer_spec
         self.transformer_decoder_layer_spec: ModuleSpec = transformer_decoder_layer_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
         self.pre_process = pre_process
         self.post_process = post_process
-        self.add_encoder = True
-        self.add_decoder = True
+        self.add_encoder = add_encoder
+        self.add_decoder = add_decoder
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
+        self.encoder_hidden_state = None
 
-        # megatron core pipelining currently depends on model type
-        self.model_type = ModelType.encoder_and_decoder
+        # Tells schedules.py that this model has a skip connection between the encoder's output and the decoder
+        # (and hence both the encoder and decoder's tensors are required for correct backprop).
+        self.xattn_needed = True
 
-        # Embeddings.
+        # specify the position embeddings as a member variable in the T5 class
+        # so that they are easy to find for `finalize_model_grads._allreduce_position_embedding_grads`
+        self.position_embeddings = None
         if self.pre_process:
             self.embedding = LanguageModelEmbedding(
                 config=self.config,
@@ -147,6 +164,7 @@ class T5Model(LanguageModule):
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type=self.position_embedding_type,
             )
+            self.position_embeddings = self.embedding.position_embeddings
 
         # Rotary Position Embeddings
         if self.position_embedding_type == 'rope':
@@ -162,19 +180,26 @@ class T5Model(LanguageModule):
             self.transformer_encoder_layer_spec,
             self.transformer_decoder_layer_spec,
         )
-        self.encoder = TransformerBlock(
-            config=self.config,
-            spec=encoder_spec,
-            pre_process=self.pre_process,
-            post_process=self.post_process,
-        )
-        # Transformer decoder
-        self.decoder = TransformerBlock(
-            config=self.config,
-            spec=decoder_spec,
-            pre_process=self.pre_process,
-            post_process=self.post_process,
-        )
+        if self.add_encoder:
+            self.encoder = TransformerBlock(
+                config=self.encoder_config,
+                spec=encoder_spec,
+                pre_process=self.pre_process,
+                post_process=self.post_process,
+            )
+        else:
+            self.encoder = None
+
+        if self.add_decoder:
+            # Transformer decoder
+            self.decoder = TransformerBlock(
+                config=self.config,
+                spec=decoder_spec,
+                pre_process=self.pre_process,
+                post_process=self.post_process,
+            )
+        else:
+            self.decoder = None
 
         # Output
         if post_process:
@@ -247,16 +272,18 @@ class T5Model(LanguageModule):
                 )
                 rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
-            # Run encoder.
+        # Run encoder.
+        if self.add_encoder:
             encoder_hidden_states = self.encoder(
                 hidden_states=encoder_input,
                 attention_mask=encoder_attn_mask,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb,
             )
+        else:
+            encoder_hidden_states = self.encoder_hidden_state
 
-        # Return encoder hiddenstates if output_encoder_hidden_only is True
-        if output_encoder_hidden_only:
+        if not self.add_decoder or output_encoder_hidden_only:
             return encoder_hidden_states
 
         ## Decoder forward
@@ -290,23 +317,19 @@ class T5Model(LanguageModule):
             rotary_pos_emb=rotary_pos_emb,
         )
 
-        # Return if not post_process
-        if not self.post_process:
+        if self.post_process:
+            lm_logits = self.lm_head(
+                decoder_hidden_states, self.shared_embedding_or_output_weight()
+            )
+            if lm_labels is None:
+                # [s b h] => [b s h]
+                return lm_logits.transpose(0, 1).contiguous()
+            else:
+                # [b s] => [s b]
+                lm_loss = self.compute_language_model_loss(lm_labels, lm_logits)
+                return lm_loss
+        else:
             return decoder_hidden_states
-
-        # logits and loss
-        output_weight = None
-        if self.share_embeddings_and_output_weights:
-            output_weight = self.shared_embedding_or_output_weight()
-        logits = self.lm_head(decoder_hidden_states, word_embeddings_weight=output_weight)
-
-        if lm_labels is None:
-            # [s b h] => [b s h]
-            return logits.transpose(0, 1).contiguous()
-
-        loss = self.compute_language_model_loss(lm_labels, logits)
-
-        return loss
 
     def set_input_tensor(self, input_tensor):
         """See megatron.model.transformer.set_input_tensor()"""

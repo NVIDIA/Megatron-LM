@@ -70,6 +70,13 @@ def get_model_type(model):
     return get_attr_wrapped_model(model, 'model_type')
 
 
+def get_model_xattn(model):
+    try:
+        return get_attr_wrapped_model(model, 'xattn_needed')
+    except RuntimeError:
+        return False
+
+
 def get_model_config(model):
     return get_attr_wrapped_model(model, 'config', allow_none=False)
 

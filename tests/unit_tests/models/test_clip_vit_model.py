@@ -16,10 +16,13 @@ class TestCLIPViTModel:
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
         transformer_config = TransformerConfig(
-            num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
+            num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True,
         )
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec()
-        self.model = CLIPViTModel(transformer_config, transformer_layer_spec)
+        self.model = CLIPViTModel(
+            transformer_config, transformer_layer_spec,
+            img_h=336, img_w=336, patch_dim=14,
+        )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()

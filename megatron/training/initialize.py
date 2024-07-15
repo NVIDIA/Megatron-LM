@@ -31,6 +31,8 @@ def initialize_megatron(
     ignore_unknown_args=False,
     allow_no_cuda=False,
     skip_mpu_initialization=False,
+    get_embedding_ranks=None,
+    get_position_embedding_ranks=None
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -68,7 +70,7 @@ def initialize_megatron(
     def finish_mpu_init():
         args = get_args()
         # Pytorch distributed.
-        _initialize_distributed()
+        _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks)
 
         # Random seeds for reproducibility.
         if args.rank == 0:
@@ -179,7 +181,7 @@ def _compile_dependencies():
         )
 
 def _initialize_tp_communicators():
-    """ initializing the communicators with user buffers for high-performance tensor-model-parallel 
+    """ initializing the communicators with user buffers for high-performance tensor-model-parallel
         communication overlap """
 
     try:
@@ -190,26 +192,26 @@ def _initialize_tp_communicators():
 
     except ImportError:
        raise RuntimeError("Tensor Parallel Communication/GEMM Overlap optimization needs 'yaml' and "
-             "'transformer_engine' packages") 
+             "'transformer_engine' packages")
 
     args = get_args()
 
     if args.tp_comm_overlap_cfg is not None:
-       with open(args.tp_comm_overlap_cfg,"r") as stream:    
+       with open(args.tp_comm_overlap_cfg,"r") as stream:
           ub_cfgs = yaml.safe_load(stream)
     else:
        ub_cfgs = {}
 
     input_shape = [(args.seq_length * args.micro_batch_size) // args.context_parallel_size , args.hidden_size]
 
-    #We create a MPI process group, which is needed to bootstrap the pipelined 
+    #We create a MPI process group, which is needed to bootstrap the pipelined
     #tensor-model-parallel communication overlap
     torch.distributed.new_group(backend='mpi')
 
-    te_module.base.initialize_ub(shape = input_shape, tp_size = args.tensor_model_parallel_size, 
+    te_module.base.initialize_ub(shape = input_shape, tp_size = args.tensor_model_parallel_size,
                                  use_fp8 = (args.fp8 is not None) , ub_cfgs = ub_cfgs,)
 
-def _initialize_distributed():
+def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
     """Initialize torch.distributed and core model parallel."""
     args = get_args()
 
@@ -263,6 +265,9 @@ def _initialize_distributed():
                 distributed_timeout_minutes=args.distributed_timeout_minutes,
                 nccl_communicator_config_path=args.nccl_communicator_config_path,
                 order='tp-cp-ep-dp-pp' if not args.use_tp_pp_dp_mapping else 'tp-pp-dp',
+                encoder_pipeline_model_parallel_size=args.encoder_pipeline_model_parallel_size,
+                get_embedding_ranks=get_embedding_ranks,
+                get_position_embedding_ranks=get_position_embedding_ranks,
             )
             if args.rank == 0:
                 print(

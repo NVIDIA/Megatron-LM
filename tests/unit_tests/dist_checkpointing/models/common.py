@@ -15,18 +15,20 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
-def common_test_simple_sharded_state_dict_save_load(initialize_model_fn, tmp_path_dist_ckpt,
-                                             src_layer_spec_fn, dst_layer_spec_fn):
+def common_test_simple_sharded_state_dict_save_load(
+    initialize_model_fn, tmp_path_dist_ckpt, src_layer_spec_fn, dst_layer_spec_fn):
     """ Simple save and load sanity check, without any equality tests. """
-    Utils.initialize_model_parallel(2,4)
-    gpt_model = initialize_model_fn(1, src_layer_spec_fn)
+    tp = 2
+    pp = 4
+    Utils.initialize_model_parallel(tp, pp)
+    gpt_model = initialize_model_fn(1, src_layer_spec_fn, tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
     with TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model') as ckpt_dir:
         # Save
         sharded_state_dict = gpt_model.sharded_state_dict()
         save(sharded_state_dict, ckpt_dir)
 
         # Load
-        gpt_model = initialize_model_fn(2, dst_layer_spec_fn)
+        gpt_model = initialize_model_fn(2, dst_layer_spec_fn, tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
         sharded_state_dict = gpt_model.sharded_state_dict()
         state_dict, missing_keys, unexpected_keys = load(sharded_state_dict, ckpt_dir, strict=StrictHandling.RETURN_ALL)
         # Potential mismatch is because of extra states which is ok
@@ -44,7 +46,7 @@ def common_test_parallel_reconfiguration_e2e(initialize_model_fn, tmp_path_dist_
          TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_B') as ckpt_dir_B:
         # Save checkpoint A
         Utils.initialize_model_parallel(*src_tp_pp, order=load_order)
-        gpt_model_A = initialize_model_fn(1, src_layer_spec_fn)
+        gpt_model_A = initialize_model_fn(1, src_layer_spec_fn, tensor_model_parallel_size=src_tp_pp[0], pipeline_model_parallel_size=src_tp_pp[1])
         save_strategy = get_default_save_sharded_strategy()
         if use_fpsl:
             save_strategy = FullyParallelSaveStrategyWrapper(
@@ -59,7 +61,7 @@ def common_test_parallel_reconfiguration_e2e(initialize_model_fn, tmp_path_dist_
         # Load checkpoint A with different TP/PP and save as checkpoint B
         # No FPS this time, only FPL
         Utils.initialize_model_parallel(*dest_tp_pp, order=store_order)
-        gpt_model_B = initialize_model_fn(2, dst_layer_spec_fn)
+        gpt_model_B = initialize_model_fn(2, dst_layer_spec_fn, tensor_model_parallel_size=dest_tp_pp[0], pipeline_model_parallel_size=dest_tp_pp[1])
         if use_fpsl:
             load_strategy = get_default_load_sharded_strategy(ckpt_dir_A)
             load_strategy = FullyParallelLoadStrategyWrapper(load_strategy)
@@ -92,12 +94,14 @@ def common_test_parallel_reconfiguration_e2e(initialize_model_fn, tmp_path_dist_
 
 
 def common_test_state_dict_comparison(initialize_model_fn, tmp_path_dist_ckpt):
-    Utils.initialize_model_parallel(2, 4)
+    tp = 2
+    pp = 4
+    Utils.initialize_model_parallel(tp, pp)
     with TempNamedDir(tmp_path_dist_ckpt / 'test_state_dict_comparison_A') as ckpt_dir_A, \
          TempNamedDir(tmp_path_dist_ckpt / 'test_state_dict_comparison_B') as ckpt_dir_B:
-        gpt_model_A = initialize_model_fn(1)
+        gpt_model_A = initialize_model_fn(1, tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
         save(gpt_model_A.sharded_state_dict(), ckpt_dir_A)
-        gpt_model_B = initialize_model_fn(2)
+        gpt_model_B = initialize_model_fn(2, tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
         save(gpt_model_B.sharded_state_dict(), ckpt_dir_B)
 
         state_dict_A = load_plain_tensors(ckpt_dir_A)
@@ -131,13 +135,13 @@ def common_test_vocab_size_padding_change(initialize_model_fn, tmp_path_dist_ckp
          TempNamedDir(tmp_path_dist_ckpt / 'test_vocab_size_padding_change_B') as ckpt_dir_B:
         # Save checkpoint A
         Utils.initialize_model_parallel(*src_tp_pp)
-        gpt_model_A = initialize_model_fn(1, vocab_size=get_test_vocab_size())
+        gpt_model_A = initialize_model_fn(1, tensor_model_parallel_size=src_tp_pp[0], pipeline_model_parallel_size=src_tp_pp[1], vocab_size=get_test_vocab_size())
         save(gpt_model_A.sharded_state_dict(), ckpt_dir_A)
         Utils.destroy_model_parallel()
 
         # Load checkpoint A with different TP/PP and save as checkpoint B
         Utils.initialize_model_parallel(*dest_tp_pp)
-        gpt_model_B = initialize_model_fn(2, vocab_size=get_test_vocab_size())
+        gpt_model_B = initialize_model_fn(2, tensor_model_parallel_size=dest_tp_pp[0], pipeline_model_parallel_size=dest_tp_pp[1], vocab_size=get_test_vocab_size())
         state_dict = load(gpt_model_B.sharded_state_dict(), ckpt_dir_A)
         gpt_model_B.load_state_dict(state_dict)
         save(gpt_model_B.sharded_state_dict(), ckpt_dir_B)

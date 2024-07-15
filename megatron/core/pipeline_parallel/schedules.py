@@ -15,6 +15,7 @@ from megatron.core.utils import (
     get_attr_wrapped_model,
     get_model_config,
     get_model_type,
+    get_model_xattn,
 )
 
 # Types
@@ -185,6 +186,7 @@ def forward_step(
     checkpoint_activations_microbatch=None,
     is_first_microbatch=False,
     current_microbatch=None,
+    encoder_decoder_xattn=False,
 ):
     """Forward step for passed-in model.
 
@@ -254,13 +256,13 @@ def forward_step(
         # Set the loss scale
         MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
 
-    # If T5 model (or other model with encoder and decoder)
-    # and in decoder stack, then send encoder_hidden_state
+    # If T5 model and in decoder stack, then send encoder_hidden_state
     # downstream as well.
     model_type = get_model_type(model)
     if (
-        parallel_state.is_pipeline_stage_after_split()
-        and model_type == ModelType.encoder_and_decoder
+        model_type == ModelType.encoder_and_decoder
+        and encoder_decoder_xattn
+        and parallel_state.is_inside_decoder()
     ):
         return [output_tensor, input_tensor[-1]], num_tokens
 
@@ -322,10 +324,11 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     # model with encoder and decoder).
     if (
         parallel_state.get_pipeline_model_parallel_world_size() > 1
-        and parallel_state.is_pipeline_stage_after_split()
         and model_type == ModelType.encoder_and_decoder
+        and len(output_tensor_grad) > 1  # excludes models that lack a skip connection.
     ):
         if output_tensor_grad[1] is not None:
+            assert input_tensor_grad[-1] is not None
             input_tensor_grad[-1].add_(output_tensor_grad[1])
     if unwrap_input_tensor_grad:
         input_tensor_grad = input_tensor_grad[0]
@@ -1105,15 +1108,15 @@ def get_tensor_shapes(
     micro_batch_size: int,
     decoder_seq_length: int,
     config,
+    encoder_decoder_xattn: bool,
 ):
-    # Determine right tensor sizes (based on position of rank with respect to split
-    # rank) and model size.
-    # Send two tensors if model is T5 and rank is in decoder stage:
-    #     first tensor is decoder (pre-transpose),
-    #     second tensor is encoder (post-transpose).
-    # If model is T5 and rank is at the boundary:
-    #     send one tensor (post-transpose from encoder).
-    # Otherwise, send one tensor (pre-transpose).
+    # Determine right tensor sizes (based on position of rank with respect to split rank) and model size.
+    # Send two tensors if model decoder requires the encoder's output (via cross-attention) and rank is in decoder stage.
+    #     first tensor is decoder.
+    #     second tensor is encoder.
+    # If model has an encoder & decoder and rank is at the boundary:
+    #     send one tensor.
+    # Otherwise, send one tensor.
     tensor_shapes = []
 
     seq_length = seq_length // parallel_state.get_context_parallel_world_size()
@@ -1128,12 +1131,14 @@ def get_tensor_shapes(
             )
 
     if model_type == ModelType.encoder_and_decoder:
-        if parallel_state.is_pipeline_stage_before_split(rank):
+        if parallel_state.is_inside_encoder(rank):
+            tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
+        elif encoder_decoder_xattn:
+            tensor_shapes.append((decoder_seq_length, micro_batch_size, config.hidden_size))
             tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
         else:
             tensor_shapes.append((decoder_seq_length, micro_batch_size, config.hidden_size))
-            tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
-    else:
+    else:  # model_type == ModelType.encoder_or_decoder
         tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
     return tensor_shapes
 
@@ -1292,6 +1297,7 @@ def forward_backward_pipelining_without_interleaving(
         max_outstanding_backprops = num_warmup_microbatches + 1
 
     model_type = get_model_type(model)
+    encoder_decoder_xattn = get_model_xattn(model)
 
     rank = parallel_state.get_pipeline_model_parallel_rank()
     recv_tensor_shapes = get_tensor_shapes(
@@ -1301,6 +1307,7 @@ def forward_backward_pipelining_without_interleaving(
         micro_batch_size=micro_batch_size,
         decoder_seq_length=decoder_seq_length,
         config=config,
+        encoder_decoder_xattn=encoder_decoder_xattn,
     )
     send_tensor_shapes = get_tensor_shapes(
         rank=rank,
@@ -1309,6 +1316,7 @@ def forward_backward_pipelining_without_interleaving(
         micro_batch_size=micro_batch_size,
         decoder_seq_length=decoder_seq_length,
         config=config,
+        encoder_decoder_xattn=encoder_decoder_xattn,
     )
 
     # Input, output tensors only need to be saved when doing backward passes
@@ -1345,6 +1353,7 @@ def forward_backward_pipelining_without_interleaving(
             checkpoint_activations_microbatch,
             check_first_val_step(first_val_step, forward_only, i == 0),
             current_microbatch=i,
+            encoder_decoder_xattn=encoder_decoder_xattn,
         )
         send_forward(output_tensor, send_tensor_shapes, config)
         total_num_tokens += num_tokens.item()
@@ -1386,6 +1395,7 @@ def forward_backward_pipelining_without_interleaving(
                 first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
             ),
             current_microbatch=i + num_warmup_microbatches,
+            encoder_decoder_xattn=encoder_decoder_xattn,
         )
         total_num_tokens += num_tokens.item()
 

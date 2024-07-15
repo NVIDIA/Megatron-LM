@@ -160,7 +160,7 @@ def initialize_small_model(pre_process=True, post_process=True, seed=0, **config
     return SwigluFactoryModel()
 
 
-def init_basic_mock_args(args, bf16=True):
+def init_basic_mock_args(args, tp, pp, bf16=True):
     args.data_parallel_random_init = False
     args.virtual_pipeline_model_parallel_size = None
     args.fp16 = False
@@ -171,6 +171,8 @@ def init_basic_mock_args(args, bf16=True):
     args.ddp_bucket_size = None
     args.check_for_nan_in_loss_and_grad = False
     args.ddp_average_in_collective = False
+    args.tensor_model_parallel_size = tp
+    args.pipeline_model_parallel_size = pp
     return args
 
 
@@ -204,11 +206,13 @@ def load_checkpoint_no_arg_checks(*args, **kwargs):
             return load_checkpoint(*args, **kwargs)
 
 
-def setup_model_and_optimizer(seed, initialize_fn=initialize_gpt_model, bf16=True, dist_opt=True):
+def setup_model_and_optimizer(seed, tp, pp, initialize_fn=initialize_gpt_model, bf16=True, dist_opt=True):
     mock_args = SimpleNamespace()
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
-        init_basic_mock_args(mock_args, bf16=bf16)
-        model = get_model(partial(initialize_fn, seed=seed))
+        init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
+        model = get_model(partial(
+            initialize_fn, seed=seed, tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp, pipeline_dtype=torch.bfloat16
+        ))
 
     config = OptimizerConfig(bf16=bf16, params_dtype=torch.bfloat16 if bf16 else torch.float, use_distributed_optimizer=dist_opt)
     optimizer = get_megatron_optimizer(config, model)
@@ -261,7 +265,7 @@ class TestDistributedOptimizer:
                 if Utils.rank >= 0:
                     # Save checkpoint A
                     Utils.initialize_model_parallel(*tp_pp)
-                    model, optimizer_A = setup_model_and_optimizer(seed=2, initialize_fn=initialize_fn)
+                    model, optimizer_A = setup_model_and_optimizer(seed=2, tp=tp_pp[0], pp=tp_pp[1], initialize_fn=initialize_fn)
 
                     save_strategy = get_default_save_sharded_strategy()
                     if use_fpsl:
@@ -284,7 +288,7 @@ class TestDistributedOptimizer:
                 if Utils.rank >= 0:
                     Utils.initialize_model_parallel(*tp_pp)
 
-                    model, optimizer_B = setup_model_and_optimizer(seed=3, initialize_fn=initialize_fn)
+                    model, optimizer_B = setup_model_and_optimizer(seed=3, tp=tp_pp[0], pp=tp_pp[1], initialize_fn=initialize_fn)
                     optim_param_state_B = optimizer_B.get_parameter_state_dp_zero()
                     diffs = diff(optim_param_state_A, optim_param_state_B)
                     # Expect a mismatch in values - diffs[2] nonempty
@@ -323,20 +327,21 @@ class TestDistributedOptimizer:
         with TempNamedDir(tmp_path_dist_ckpt / 'test_finetune_doesnt_load_optimizer', sync=True) as ckpt_dir:
             mock_args = SimpleNamespace()
             with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
-                init_basic_mock_args(mock_args)
+                init_basic_mock_args(mock_args, tp=src_tp_pp[0], pp=src_tp_pp[1])
                 init_checkpointing_mock_args(mock_args, ckpt_dir, False)
 
                 Utils.initialize_model_parallel(*src_tp_pp)
-                model, optimizer = setup_model_and_optimizer(seed=2, initialize_fn=partial(initialize_gpt_model, use_glu=use_glu))
+                model, optimizer = setup_model_and_optimizer(
+                    seed=2, tp=src_tp_pp[0], pp=src_tp_pp[1], initialize_fn=partial(initialize_gpt_model, use_glu=use_glu)
+                )
 
-                # We need to save the TPxPP of the source model
-                mock_args.tensor_model_parallel_size = src_tp_pp[0]
-                mock_args.pipeline_model_parallel_size = src_tp_pp[1]
                 save_checkpoint(10, model, optimizer, None, 0)
                 Utils.destroy_model_parallel()
 
                 Utils.initialize_model_parallel(*dest_tp_pp)
-                model, optimizer = setup_model_and_optimizer(seed=3, initialize_fn=partial(initialize_gpt_model, use_glu=use_glu))
+                model, optimizer = setup_model_and_optimizer(
+                    seed=3, tp=dest_tp_pp[0], pp=dest_tp_pp[1], initialize_fn=partial(initialize_gpt_model, use_glu=use_glu)
+                )
                 model_unloaded_state_dict = deepcopy(model[0].state_dict())
                 optim_unloaded_state_dict = deepcopy(optimizer.state_dict())
 
@@ -360,7 +365,9 @@ class TestDistributedOptimizer:
                 assert not any(diff(optimizer.state_dict(), optim_unloaded_state_dict))
 
                 # ... or `no_load_optim` flag
-                model, optimizer = setup_model_and_optimizer(seed=3, initialize_fn=partial(initialize_gpt_model, use_glu=use_glu))
+                model, optimizer = setup_model_and_optimizer(
+                    seed=3, tp=dest_tp_pp[0], pp=dest_tp_pp[1], initialize_fn=partial(initialize_gpt_model, use_glu=use_glu)
+                )
                 mock_args.finetune = False
                 mock_args.no_load_optim = True
                 mock_args.no_load_rng = True
@@ -378,14 +385,14 @@ class TestDistributedOptimizer:
         with TempNamedDir(tmp_path_dist_ckpt / 'test_can_load_deprecated_bucket_space_format', sync=True) as ckpt_dir:
             mock_args = SimpleNamespace()
             with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
-                init_basic_mock_args(mock_args)
+                tp = 4
+                pp = 2
+
+                init_basic_mock_args(mock_args, tp=tp, pp=pp)
                 init_checkpointing_mock_args(mock_args, ckpt_dir, True)
 
-                Utils.initialize_model_parallel(4, 2)
-                model, optimizer = setup_model_and_optimizer(seed=2, initialize_fn=initialize_gpt_model)
-
-                mock_args.tensor_model_parallel_size = 4
-                mock_args.pipeline_model_parallel_size = 2
+                Utils.initialize_model_parallel(tp, pp)
+                model, optimizer = setup_model_and_optimizer(seed=2, tp=tp, pp=pp, initialize_fn=initialize_gpt_model)
 
                 # Mock optimizer sharded_state_dict so that it ignores the externally passed sharding_type and uses 'fully_sharded_bucket_space' instead
                 orig_optim_sharded_state_dict_fn = optimizer.sharded_state_dict
@@ -439,14 +446,18 @@ class TestFP32Optimizer:
         with TempNamedDir(tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=True) as ckpt_dir_A:
             with TempNamedDir(tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=True) as ckpt_dir_B:
                 Utils.initialize_model_parallel(*src_tp_pp)
-                model_A, optimizer_A = setup_model_and_optimizer(seed=2, initialize_fn=initialize_small_model, bf16=False)
+                model_A, optimizer_A = setup_model_and_optimizer(
+                    seed=2, tp=src_tp_pp[0], pp=src_tp_pp[1], initialize_fn=initialize_small_model, bf16=False
+                )
 
                 save(optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()), ckpt_dir_A)
                 Utils.destroy_model_parallel()
 
                 # Load checkpoint A with different TP/PP and save as checkpoint B
                 Utils.initialize_model_parallel(*dest_tp_pp)
-                model_B, optimizer_B = setup_model_and_optimizer(seed=3, initialize_fn=initialize_small_model, bf16=False)
+                model_B, optimizer_B = setup_model_and_optimizer(
+                    seed=3, tp=dest_tp_pp[0], pp=dest_tp_pp[1], initialize_fn=initialize_small_model, bf16=False
+                )
                 load_sharded_state_dict = optimizer_B.sharded_state_dict(model_B[0].sharded_state_dict())
                 state_dict = load(load_sharded_state_dict, ckpt_dir_A)
 
@@ -490,14 +501,14 @@ class TestOptimizerResharding:
         with TempNamedDir(tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=False) as ckpt_dir_A:
             with TempNamedDir(tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=False) as ckpt_dir_B:
                 Utils.initialize_model_parallel(*src_tp_pp)
-                model_A, optimizer_A = setup_model_and_optimizer(seed=2, bf16=bf16, dist_opt=use_dist_opt)
+                model_A, optimizer_A = setup_model_and_optimizer(seed=2, tp=src_tp_pp[0], pp=src_tp_pp[1], bf16=bf16, dist_opt=use_dist_opt)
 
                 save(optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()), ckpt_dir_A)
                 Utils.destroy_model_parallel()
 
                 # Load checkpoint A with different TP/PP and save as checkpoint B
                 Utils.initialize_model_parallel(*dest_tp_pp)
-                model_B, optimizer_B = setup_model_and_optimizer(seed=3, bf16=bf16, dist_opt=use_dist_opt)
+                model_B, optimizer_B = setup_model_and_optimizer(seed=3, tp=dest_tp_pp[0], pp=dest_tp_pp[1], bf16=bf16, dist_opt=use_dist_opt)
                 load_sharded_state_dict = optimizer_B.sharded_state_dict(model_B[0].sharded_state_dict())
                 state_dict = load(load_sharded_state_dict, ckpt_dir_A)
 

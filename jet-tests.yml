@@ -15,7 +15,7 @@ include:
     file: downstreams.yml
 
 jet-configure:
-  image: 
+  image:
     name: mikefarah/yq:4.35.2
     entrypoint: [""]
   extends: [.jet_common, .jet-configure]
@@ -26,16 +26,16 @@ jet-configure:
     - JET_FILTER=${JET_CUSTOM_FILTER:-False}
     - echo "_JET_FILTER=$JET_FILTER" | tee -a jet.env
     - |
-      IMAGE=${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} yq '. |= 
+      IMAGE=${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} yq '. |=
         (
-          select(.spec.name == "mcore-pyt") 
+          select(.spec.name == "mcore-pyt")
           | .spec.source.image = env(IMAGE)
         )
       ' -i tests/functional_tests/jet_recipes/build-pyt.yaml
 
-      IMAGE=${CI_NEMO_IMAGE}:${CI_PIPELINE_ID} yq '. |= 
+      IMAGE=${CI_NEMO_IMAGE}:${CI_PIPELINE_ID} yq '. |=
         (
-          select(.spec.name == "mcore-nemo") 
+          select(.spec.name == "mcore-nemo")
           | .spec.source.image = env(IMAGE)
         )
       ' -i tests/functional_tests/jet_recipes/build-pyt.yaml

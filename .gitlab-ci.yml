@@ -56,11 +56,11 @@ variables:
   CI_MCORE_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci
   CI_NEMO_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/nemo_ci
   LINTING_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_linting
-  
+
 metadata:
   image: python:3.10
   stage: .pre
-  tags: 
+  tags:
     - os/linux
   script:
     - set -x
@@ -201,7 +201,7 @@ build_image:
         --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
         ${ADDITIONAL_PARAMS} .
 
-      docker push ${IMAGE}:${CI_PIPELINE_ID}  
+      docker push ${IMAGE}:${CI_PIPELINE_ID}
 
       if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
         docker tag ${IMAGE}:${CI_PIPELINE_ID} ${IMAGE}:buildcache
@@ -214,7 +214,7 @@ build_image:
       fi
 
 .unit_test_common:
-  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} 
+  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
   stage: unit_tests
   needs: [build_image]
   tags:
@@ -257,7 +257,7 @@ unit_tests-fusions:
     - torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/fusions
   rules:
     - if: '$FUNCTIONAL_TEST == "no"'
-    
+
 unit_tests-inference:
   extends: [.unit_test_common]
   script:
@@ -317,7 +317,7 @@ docs_build_test:
   interruptible: true
 
 formatting:
-  image: ${LINTING_IMAGE}:${CI_PIPELINE_ID} 
+  image: ${LINTING_IMAGE}:${CI_PIPELINE_ID}
   tags:
     - os/linux
   stage: unit_tests

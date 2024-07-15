@@ -19,7 +19,7 @@ def initialize_gpt_model(seed, layer_spec_fn=gpt_te_spec, vocab_size=128, **conf
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
 
-    default_config_kwargs=dict(num_layers=8, hidden_size=16, num_attention_heads=8, use_cpu_initialization=True)
+    default_config_kwargs=dict(num_layers=8, hidden_size=16, num_attention_heads=8, use_cpu_initialization=True, pipeline_dtype=torch.bfloat16)
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs)
     pre_process = ps.is_pipeline_first_stage()

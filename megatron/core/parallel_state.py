@@ -5,7 +5,8 @@
 import os
 import warnings
 from datetime import timedelta
-from typing import List, Optional
+from functools import partial
+from typing import Callable, List, Optional
 
 import torch
 
@@ -41,6 +42,8 @@ _DATA_MODULO_EXPERT_PARALLEL_GROUP_WITH_CP_GLOO = None
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = None
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = None
 _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = None
+
+_PIPELINE_MODEL_PARALLEL_DECODER_START = None
 
 # These values enable us to change the mpu sizes on the fly.
 _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = None
@@ -304,6 +307,30 @@ class RankGenerator(object):
         return ranks
 
 
+def default_embedding_ranks(pp_ranks, split_rank=None):
+    """Return the default ranks that constitute the stages on which the word embeddings live.
+    For most models, these are the first and last pipeline stages.
+
+    We also support the deprecated split rank argument for backwards compatibility."""
+    if len(pp_ranks) == 1:
+        return [pp_ranks[0]]
+    elif split_rank is not None and pp_ranks[split_rank] not in (pp_ranks[0], pp_ranks[-1]):
+        return [pp_ranks[0], pp_ranks[split_rank], pp_ranks[-1]]
+    else:
+        return [pp_ranks[0], pp_ranks[-1]]
+
+
+def default_position_embedding_ranks(pp_ranks, split_rank=None):
+    """Return the default ranks that constitute the stages on which the position embeddings live.
+    For most models, this is only the first pipeline stage.
+
+    We also support the deprecated split rank argument for backwards compatibility."""
+    if split_rank is not None and pp_ranks[0] != pp_ranks[split_rank]:
+        return [pp_ranks[0], pp_ranks[split_rank]]
+    else:
+        return [pp_ranks[0]]
+
+
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
@@ -315,6 +342,9 @@ def initialize_model_parallel(
     nccl_communicator_config_path: Optional[str] = None,
     distributed_timeout_minutes: int = 30,
     order: str = "tp-cp-ep-dp-pp",
+    encoder_pipeline_model_parallel_size: Optional[int] = None,
+    get_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
+    get_position_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -345,7 +375,7 @@ def initialize_model_parallel(
             GPU 3: [7, 8] [15, 16]
 
         pipeline_model_parallel_split_rank (int, optional):
-            For models with both an encoder and decoder, the rank in
+            DEPRECATED. For models with both an encoder and decoder, the rank in
             pipeline to switch between encoder and decoder (i.e. the
             first rank of the decoder). This allows the user to set
             the pipeline parallel size of the encoder and decoder
@@ -403,6 +433,20 @@ def initialize_model_parallel(
             The rank initialization order of parallelism. Now we support
             tp-dp-pp and tp-pp-dp orders.
 
+        encoder_pipeline_model_parallel_size (int, optional):
+            The number of tensor parallel GPU groups to allocate to the encoder. Must be
+            smaller than pipeline_model_parallel_size. As an example, if pipeline_model_parallel_size is 4
+            and encoder_pipeline_model_parallel_size is 2, then the encoder will use the first two pipeline
+            stages for its layers.
+
+        get_embedding_ranks (Callable[[List[int], Optional[int]], List[int]], optional, default=None):
+            A function that takes in a list of ranks for a pipeline group and returns
+            those ranks that should have embeddings.
+
+        get_position_embedding_ranks (Callable[[List[int], Optional[int]], List[int]], optional, default=None):
+            A function that takes in a list of ranks for a pipeline group, and returns
+            those ranks that should have position embeddings.
+
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
     the model pipeline. The present function will
@@ -420,6 +464,20 @@ def initialize_model_parallel(
     ranks 8 to 15 belong to the second box.
 
     """
+    if get_embedding_ranks is None:
+        get_embedding_ranks = partial(
+            default_embedding_ranks, split_rank=pipeline_model_parallel_split_rank
+        )
+
+    if get_position_embedding_ranks is None:
+        get_position_embedding_ranks = partial(
+            default_position_embedding_ranks, split_rank=pipeline_model_parallel_split_rank
+        )
+
+    if encoder_pipeline_model_parallel_size is not None:
+        global _PIPELINE_MODEL_PARALLEL_DECODER_START
+        _PIPELINE_MODEL_PARALLEL_DECODER_START = encoder_pipeline_model_parallel_size
+
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
@@ -601,32 +659,18 @@ def initialize_model_parallel(
         if rank in ranks:
             _PIPELINE_MODEL_PARALLEL_GROUP = group
             _PIPELINE_GLOBAL_RANKS = ranks
-        # Setup embedding group (to exchange gradients between
-        # first and last stages).
-        if len(ranks) > 1:
-            embedding_ranks = [ranks[0], ranks[-1]]
-            position_embedding_ranks = [ranks[0]]
-            if pipeline_model_parallel_split_rank is not None:
-                if ranks[pipeline_model_parallel_split_rank] not in embedding_ranks:
-                    embedding_ranks = [
-                        ranks[0],
-                        ranks[pipeline_model_parallel_split_rank],
-                        ranks[-1],
-                    ]
-                if ranks[pipeline_model_parallel_split_rank] not in position_embedding_ranks:
-                    position_embedding_ranks = [ranks[0], ranks[pipeline_model_parallel_split_rank]]
-        else:
-            embedding_ranks = ranks
-            position_embedding_ranks = ranks
 
+        embedding_ranks = get_embedding_ranks(ranks)
         group = torch.distributed.new_group(
-            embedding_ranks, timeout=timeout, pg_options=get_nccl_options('embd', nccl_comm_cfgs)
+            embedding_ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options('embd', nccl_comm_cfgs),
         )
         if rank in embedding_ranks:
             _EMBEDDING_GROUP = group
-        if rank in ranks:
             _EMBEDDING_GLOBAL_RANKS = embedding_ranks
 
+        position_embedding_ranks = get_position_embedding_ranks(ranks)
         group = torch.distributed.new_group(
             position_embedding_ranks,
             timeout=timeout,
@@ -634,7 +678,6 @@ def initialize_model_parallel(
         )
         if rank in position_embedding_ranks:
             _POSITION_EMBEDDING_GROUP = group
-        if rank in ranks:
             _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
 
     # Build the tensor + data parallel groups.
@@ -974,7 +1017,7 @@ def set_pipeline_model_parallel_rank(rank):
 
 
 def set_pipeline_model_parallel_split_rank(rank):
-    """Set pipeline model parallel split rank."""
+    """Set pipeline model parallel split rank. DEPRECATED."""
     global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
     _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = rank
 
@@ -1031,6 +1074,8 @@ def is_rank_in_embedding_group(ignore_virtual=False):
     """Return true if current rank is in embedding group, False otherwise."""
     rank = torch.distributed.get_rank()
     global _EMBEDDING_GLOBAL_RANKS
+    if _EMBEDDING_GLOBAL_RANKS is None:
+        return False
     if ignore_virtual:
         return rank in _EMBEDDING_GLOBAL_RANKS
     if rank in _EMBEDDING_GLOBAL_RANKS:
@@ -1047,7 +1092,7 @@ def is_rank_in_position_embedding_group():
     """Return true if current rank is in position embedding group, False otherwise."""
     rank = torch.distributed.get_rank()
     global _POSITION_EMBEDDING_GLOBAL_RANKS
-    return rank in _POSITION_EMBEDDING_GLOBAL_RANKS
+    return _POSITION_EMBEDDING_GLOBAL_RANKS is not None and rank in _POSITION_EMBEDDING_GLOBAL_RANKS
 
 
 def is_pipeline_stage_before_split(rank=None):
@@ -1076,6 +1121,36 @@ def is_pipeline_stage_after_split(rank=None):
     if _PIPELINE_MODEL_PARALLEL_SPLIT_RANK is None:
         return True
     if rank >= _PIPELINE_MODEL_PARALLEL_SPLIT_RANK:
+        return True
+    return False
+
+
+def is_inside_encoder(rank=None):
+    """Return True if pipeline stage executes encoder block for a model
+    with both encoder and decoder."""
+    if get_pipeline_model_parallel_world_size() == 1:
+        return True
+    if rank is None:
+        rank = get_pipeline_model_parallel_rank()
+    global _PIPELINE_MODEL_PARALLEL_DECODER_START
+    if _PIPELINE_MODEL_PARALLEL_DECODER_START is None:
+        return True
+    if rank < _PIPELINE_MODEL_PARALLEL_DECODER_START:
+        return True
+    return False
+
+
+def is_inside_decoder(rank=None):
+    """Return True if pipeline stage executes decoder block for a model
+    with both encoder and decoder."""
+    if get_pipeline_model_parallel_world_size() == 1:
+        return True
+    if rank is None:
+        rank = get_pipeline_model_parallel_rank()
+    global _PIPELINE_MODEL_PARALLEL_DECODER_START
+    if _PIPELINE_MODEL_PARALLEL_DECODER_START is None:
+        return True
+    if rank >= _PIPELINE_MODEL_PARALLEL_DECODER_START:
         return True
     return False
 
