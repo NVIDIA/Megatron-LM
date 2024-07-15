@@ -55,6 +55,7 @@ if [[ $USE_TE -eq 1 ]]; then
        echo "Running with TransformerEngine ..."
        TRANSFORMER_IMPL=transformer_engine
        TRAINING_DTYPE=bf16
+       ADDITIONAL_PARAMS+=" --attention-softmax-in-fp32"
 else
        echo "Running with local transformer implementation ..."
 fi
@@ -107,6 +108,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --data-path $DATA_PATH \
     --vocab-file $VOCAB_PATH \
     --tokenizer-type BertWordPieceCase \
+    --calculate-per-token-loss \
     --split 99982,9,9 \
     --save $CHECKPOINT_PATH \
     --load $CHECKPOINT_PATH \

@@ -46,7 +46,7 @@ class ModelParallelConfig:
     """Alternative parallelization strategy for expert parallelism. Instead of distributing experts
        across expert_model_parallel_size, each expert is sharded along extendended tensor parallel
        domain (tensor_model_paralle_size * expert_model_parallel_size). It avoids the load balancing
-       problem with MOE training. 
+       problem with MOE training.
     """
 
     ###################
@@ -247,7 +247,7 @@ class ModelParallelConfig:
 
     wgrad_deferral_limit: int = 0
     """This value tunes the number of micro-batches for which the embedding weight gradient compute
-       needs to be deferred to pipeline flush, this argument is invalid if `defer_embedding_wgrad_compute` is False. 
+       needs to be deferred to pipeline flush, this argument is invalid if `defer_embedding_wgrad_compute` is False.
        Defaults to 0, which means all micro-batches are deferred.
     """
 

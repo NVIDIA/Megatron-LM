@@ -3,7 +3,7 @@
 import pytest
 
 import torch
-import os 
+import os
 
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.bert.bert_model import BertModel
@@ -15,13 +15,22 @@ class TestBertModel:
 
     def setup_method(self, method):
         os.environ['NVTE_ALLOW_NONDETERMINISTIC_ALGO'] = '0' #Bert does not support flash attention
-        Utils.initialize_model_parallel(1,1)
+        tp = 1
+        pp = 1
+        Utils.initialize_model_parallel(tp, pp)
         model_parallel_cuda_manual_seed(123)
-        transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True, perform_initialization=True)
-        self.bert_model = BertModel(config=transformer_config, num_tokentypes=0, transformer_layer_spec=bert_layer_with_transformer_engine_spec, vocab_size=100, max_sequence_length=4)
+        transformer_config = TransformerConfig(
+            num_layers=2, hidden_size=12, num_attention_heads=4,
+            use_cpu_initialization=True, perform_initialization=True,
+            tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp, pipeline_dtype=torch.bfloat16
+        )
+        self.bert_model = BertModel(
+            config=transformer_config, num_tokentypes=0,
+            transformer_layer_spec=bert_layer_with_transformer_engine_spec, vocab_size=100, max_sequence_length=4
+        )
 
     def teardown_method(self, method):
-        Utils.destroy_model_parallel()    
+        Utils.destroy_model_parallel()
 
     def test_constructor(self):
         assert isinstance(self.bert_model, BertModel)

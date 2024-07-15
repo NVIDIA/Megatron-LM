@@ -153,13 +153,17 @@ def get_start_time_from_progress_log():
         start_num_floating_point_operations
 
 
-def pretrain(train_valid_test_dataset_provider,
-             model_provider,
-             model_type,
-             forward_step_func,
-             process_non_loss_data_func=None,
-             extra_args_provider=None,
-             args_defaults={}):
+def pretrain(
+    train_valid_test_dataset_provider,
+    model_provider,
+    model_type,
+    forward_step_func,
+    process_non_loss_data_func=None,
+    extra_args_provider=None,
+    args_defaults={},
+    get_embedding_ranks=None,
+    get_position_embedding_ranks=None,
+):
     """Main training program.
 
     This function will run the followings in the order provided:
@@ -190,8 +194,12 @@ def pretrain(train_valid_test_dataset_provider,
     """
 
     # Initalize and get arguments, timers, and Tensorboard writer.
-    initialize_megatron(extra_args_provider=extra_args_provider,
-                        args_defaults=args_defaults)
+    initialize_megatron(
+        extra_args_provider=extra_args_provider,
+        args_defaults=args_defaults,
+        get_embedding_ranks=get_embedding_ranks,
+        get_position_embedding_ranks=get_position_embedding_ranks
+    )
 
     args = get_args()
     timers = get_timers()
@@ -391,16 +399,13 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         add_decoder = True
         if model_type == ModelType.encoder_and_decoder:
             if mpu.get_pipeline_model_parallel_world_size() > 1:
-                assert args.pipeline_model_parallel_split_rank is not None, \
-                    "Split rank needs to be specified for model with both encoder and decoder"
                 rank = mpu.get_pipeline_model_parallel_rank()
-                split_rank = args.pipeline_model_parallel_split_rank
+                first_decoder_rank = args.encoder_pipeline_model_parallel_size
                 world_size = mpu.get_pipeline_model_parallel_world_size()
-                pre_process = rank == 0 or rank == split_rank
-                post_process = (rank == (split_rank - 1)) or (
-                        rank == (world_size - 1))
-                add_encoder = mpu.is_pipeline_stage_before_split()
-                add_decoder = mpu.is_pipeline_stage_after_split()
+                pre_process = rank == 0 or rank == first_decoder_rank
+                post_process = (rank == (first_decoder_rank - 1)) or (rank == (world_size - 1))
+                add_encoder = mpu.is_inside_encoder(rank)
+                add_decoder = mpu.is_inside_decoder(rank)
             model = model_provider_func(
                 pre_process=pre_process,
                 post_process=post_process,

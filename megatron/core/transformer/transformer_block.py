@@ -20,7 +20,11 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
+from megatron.core.utils import (
+    assert_viewless_tensor,
+    make_sharded_tensor_for_checkpoint,
+    make_viewless_tensor,
+)
 
 try:
     from megatron.core.transformer.custom_layers.transformer_engine import (
@@ -47,9 +51,9 @@ except ImportError:
 
 def get_num_layers_to_build(config: TransformerConfig) -> int:
 
-    num_layers_per_pipeline_rank = (
-        config.num_layers // parallel_state.get_pipeline_model_parallel_world_size()
-    )
+    pipeline_ranks = config.pipeline_model_parallel_size
+
+    num_layers_per_pipeline_rank = config.num_layers // pipeline_ranks
 
     if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
         # Interleaved pipeline parallelism:
@@ -446,6 +450,14 @@ class TransformerBlock(MegatronModule):
         # Final layer norm.
         if self.final_layernorm is not None:
             hidden_states = self.final_layernorm(hidden_states)
+            # TENorm produces a "viewed" tensor. This will result in schedule.py's
+            # deallocate_output_tensor() throwing an error, so a viewless tensor is
+            # created to prevent this.
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states,
+                requires_grad=True,
+                keep_graph=True,
+            )
 
         return hidden_states
 

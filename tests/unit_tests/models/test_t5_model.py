@@ -18,10 +18,16 @@ class TestT5Model:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1,1)
         model_parallel_cuda_manual_seed(123)
-        transformer_config = TransformerConfig(num_layers=12, hidden_size=768, num_attention_heads=12, kv_channels=64, ffn_hidden_size=3072, use_cpu_initialization=True)
+        transformer_config = TransformerConfig(
+            num_layers=12, hidden_size=768, num_attention_heads=12, kv_channels=64, ffn_hidden_size=3072,
+            use_cpu_initialization=True, pipeline_dtype=torch.bfloat16
+        )
         en_block_spec = get_t5_encoder_with_transformer_engine_block_spec(12)
         de_block_spec = get_t5_decoder_with_transformer_engine_block_spec(12)
-        self.t5_model = T5Model(config=transformer_config, transformer_encoder_layer_spec=en_block_spec, transformer_decoder_layer_spec=de_block_spec,  vocab_size=29184, max_sequence_length=4)
+        self.t5_model = T5Model(
+            encoder_config=transformer_config, config=transformer_config, transformer_encoder_layer_spec=en_block_spec,
+            transformer_decoder_layer_spec=de_block_spec,  vocab_size=29184, max_sequence_length=4
+        )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -60,8 +66,8 @@ class TestT5Model:
         encoder_decoder_attn_mask = torch.ones((1, sequence_length, sequence_length), dtype=bool).cuda()
 
         logits = self.t5_model.forward(
-            encoder_input_ids=encoder_input_ids, 
-            decoder_input_ids=decoder_input_ids, 
+            encoder_input_ids=encoder_input_ids,
+            decoder_input_ids=decoder_input_ids,
             encoder_attn_mask=encoder_attn_mask,
             decoder_attn_mask=decoder_attn_mask,
             encoder_decoder_attn_mask=encoder_decoder_attn_mask

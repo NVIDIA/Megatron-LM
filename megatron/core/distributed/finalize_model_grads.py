@@ -15,25 +15,20 @@ def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: Transf
     All-reduce word embedding grads.
 
     Reduce grads across first and last stages to ensure that word_embeddings parameters stay in
-    sync. This should only run for models that support pipelined model parallelism (BERT and GPT).
+    sync.
     """
 
     if (
         parallel_state.is_rank_in_embedding_group(ignore_virtual=True)
-        and parallel_state.get_pipeline_model_parallel_world_size() > 1
+        and torch.distributed.get_world_size(parallel_state.get_embedding_group()) > 1
     ):
         if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
             model_module = model[0]
         elif parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             model_module = model[-1]
-        else:  # We do not support the interleaved schedule for T5 yet.
+        else:  # We do not support an interleaved schedule for models with encoders yet.
             model_module = model[0]
 
-        # Look for module with 'pre_process' attribute to get around the fact that DDP and
-        # other wrapper classes inherit from non-core MegatronModule that has
-        # 'share_embeddings_and_output_weights' and 'shared_embedding_or_output_weight'
-        # attributes already, causing get_attr_wrapped_model() to not unwrap anything here.
-        # TODO: Clean this up once the wrapper classes inherit from core MegatronModule.
         model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
         if model_module.share_embeddings_and_output_weights:
             weight = model_module.shared_embedding_or_output_weight()
@@ -43,19 +38,23 @@ def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: Transf
 
 def _allreduce_position_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig):
     """
-    All-reduce position_embeddings grad across first (encoder) and split (decoder) stages to
-    ensure that position embeddings parameters stay in sync. This should only run for T5 models
-    with pipeline parallelism.
+    All-reduce position_embeddings grad across encoder and decoder stages to ensure that position
+    embeddings parameters stay in sync.
     """
     if (
         parallel_state.is_rank_in_position_embedding_group()
-        and parallel_state.get_pipeline_model_parallel_world_size() > 1
-        and config.pipeline_model_parallel_split_rank is not None
+        and torch.distributed.get_world_size(parallel_state.get_position_embedding_group()) > 1
     ):
-        model_module = model[0]
-        grad = get_attr_wrapped_model(
-            model_module, 'language_model.embedding.position_embeddings.weight.main_grad'
-        )
+        if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+            model_module = model[0]
+        elif parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+            model_module = model[-1]
+        else:  # We do not support an interleaved schedule for models with encoders yet.
+            model_module = model[0]
+
+        model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
+        assert hasattr(model_module, 'position_embeddings')
+        grad = model_module.position_embeddings.weight.main_grad
         torch.distributed.all_reduce(grad, group=parallel_state.get_position_embedding_group())
 
 

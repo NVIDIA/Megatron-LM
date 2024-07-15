@@ -284,7 +284,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
 
         self.tokenizer = Tokenizer()
         self.manual_prompts = json.load(open(self.args.prompt_path))
-        self.seq_len = self.args.seq_length
+        self.seq_len = self.args.decoder_seq_length - self.args.seq_length
 
         self.txt_to_token_dict = {}
 

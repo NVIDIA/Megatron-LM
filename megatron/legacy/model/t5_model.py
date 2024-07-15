@@ -94,11 +94,20 @@ class T5Model(MegatronModule):
 
         self.initialize_word_embeddings()
 
+        if self.pre_process:
+            self.position_embeddings = self.language_model.embedding.position_embeddings
+        else:
+            self.position_embeddings = None
+
         if self.post_process and self.add_decoder:
             self.lm_head = T5LMHead(
                 self.shared_embedding_or_output_weight().size(0),
                 parallel_output)
             self._lm_head_key = 'lm_head'
+
+        # Tells schedules.py that this model has a skip connection between the encoder's output and the decoder
+        # (and hence both the encoder and decoder's tensors are required for correct backprop).
+        self.xattn_needed = True
 
     def set_input_tensor(self, input_tensor):
         """See megatron.legacy.model.transformer.set_input_tensor()"""
