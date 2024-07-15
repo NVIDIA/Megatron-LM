@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Pretrain utilities."""
@@ -43,6 +44,7 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.utils import report_memory, throughput_calculator, checkpoint_throughput_calculator, update_rotary_pos_emb
 from megatron.model.vision.knn_monitor import compute_feature_bank
 from megatron.arguments import core_transformer_config_from_args
+from megatron.profiler import setup_profiler, trigger, on_step_begin, on_step_end
 
 import deepspeed
 from deepspeed.accelerator import get_accelerator
@@ -1161,6 +1163,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     # Write args to tensorboard
     write_args_to_tensorboard()
 
+    setup_profiler(args, get_accelerator().device_name())
+
     if args.random_ltd:
         # random-ltd requires different randomness on each rank
         import random
@@ -1191,6 +1195,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         
     while iteration < args.train_iters and (args.train_tokens is None or \
         args.consumed_train_tokens < args.train_tokens):
+        trigger(on_step_begin)
         update_num_microbatches(args.consumed_train_samples)
         if args.deepspeed:
             # inform deepspeed of any batch size changes
@@ -1311,6 +1316,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             torch.distributed.barrier()
             print_datetime('exiting program at iteration {}'.format(iteration))
             sys.exit()
+        trigger(on_step_end)
 
 
     return iteration
