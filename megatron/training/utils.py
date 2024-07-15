@@ -283,7 +283,7 @@ def print_rank_last(message):
         print(message, flush=True)
 
 def safe_get_rank():
-    if not torch.distributed.is_initialized():
+    if torch.distributed.is_initialized():
         return torch.distributed.get_rank()
     else:
         return "N/A"
