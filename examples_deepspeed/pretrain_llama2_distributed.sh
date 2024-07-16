@@ -41,6 +41,17 @@ GRAD_CLIP=1
 # activation_checkpoint="true"
 activation_checkpoint="false"
 
+LOG_TO_WANDB=0
+WANDB_ARGS=
+if [ $LOG_TO_WANDB -eq 1 ]
+then
+WANDB_ARGS="\
+       --wandb-project pretrain-llama2 \
+       --wandb-exp-name exp0 \
+       --wandb-save-dir ${BASE_PATH}/wandb \
+       "
+fi
+
 # Below configuration required for llama model as per llama paper
 # --no-query-key-layer-scaling \
 # --attention-dropout 0 \
@@ -51,7 +62,6 @@ activation_checkpoint="false"
 # --normalization rmsnorm \
 # --disable-bias-linear \
 ######################################
-
 
 
 cat <<EOT > $DS_CONFIG
@@ -132,4 +142,5 @@ torchrun $DISTRIBUTED_ARGS \
        --normalization rmsnorm \
        --disable-bias-linear \
        --num-key-value-heads $NUM_KV_HEADS \
+       $WANDB_ARGS \
        $ds_args

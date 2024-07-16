@@ -8,16 +8,22 @@ import math
 import sys
 import time
 import json
+try:
+    import wandb
+except (ImportError, ModuleNotFoundError):
+    wandb = None
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 import torch
 from collections import OrderedDict
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+from enum import Enum
 
 from megatron import get_args
 from megatron import get_signal_handler
 from megatron import get_timers
 from megatron import get_tensorboard_writer
+from megatron import get_wandb_writer
 from megatron import get_current_global_batch_size
 from megatron import get_num_microbatches
 from megatron import is_last_rank
@@ -53,12 +59,6 @@ from deepspeed.runtime.data_pipeline.data_routing.helper import convert_to_rando
 from megatron.model.transformer import ParallelTransformerLayer
 
 from deepspeed import comm as dist
-
-try:
-    import wandb
-except (ImportError, ModuleNotFoundError):
-    wandb = None
-
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -787,6 +787,65 @@ def train_step(forward_step_func, data_iterator,
     return {}, skipped_iter, grad_norm, num_zeros_in_grad
 
 
+class InteropLoggingTool(Enum):
+    TENSORBOARD = 1
+    WANDB = 2
+
+
+class interop_tool_logger:
+    def __init__(self, tb_writer=None, wandb_writer=None):
+        self.tb_writer = tb_writer
+        self.wandb_writer = wandb_writer
+        self.custom_x_axis = []
+        self.custom_y_axis = {}
+        self.args = get_args()
+        if not hasattr(self.args, "logger_iteration"):
+            self.args.logger_iteration = 1
+
+    def is_enabled(self):
+        return self.tb_writer or self.wandb_writer
+
+    def add_scalar(self, key, scalar_value, step, custom_step_name=None, \
+                   tool_list=[InteropLoggingTool.TENSORBOARD, InteropLoggingTool.WANDB]):
+        if self.tb_writer and \
+            InteropLoggingTool.TENSORBOARD in tool_list:
+            self.tb_writer.add_scalar(key, scalar_value, step)
+
+        if self.wandb_writer and \
+            InteropLoggingTool.WANDB in tool_list:
+            if not custom_step_name:
+                self.wandb_writer.log({key: scalar_value}, step=step)
+                if self.args.logger_iteration < step:
+                    # Updating iteration
+                    self.args.logger_iteration = step
+
+            else:
+                if custom_step_name not in self.custom_x_axis:
+                    self.custom_x_axis.append(custom_step_name)
+                    wandb.define_metric(custom_step_name)
+
+                if key not in self.custom_y_axis:
+                    self.custom_y_axis[key] = custom_step_name
+                    wandb.define_metric(key, step_metric=custom_step_name)
+
+                self.wandb_writer.log({key: scalar_value, custom_step_name: step}, \
+                                      step=self.args.logger_iteration)
+
+
+    def add_scalar_to_tb(self, key, scalar_value, step):
+        return self.add_scalar(key, scalar_value, step, None, [InteropLoggingTool.TENSORBOARD])
+
+    def add_scalar_to_wandb(self, key, scalar_value, step, custom_step_name=None):
+        return self.add_scalar(key, scalar_value, step, custom_step_name, [InteropLoggingTool.WANDB])
+
+    def add_images(self, key, img_tensor, step=None):
+        if self.tb_writer:
+            self.tb_writer.add_images(key, img_tensor, step)
+
+        if self.wandb_writer:
+            self.wandb_writer.log({key: wandb.Image(img_tensor)}, step)
+
+
 def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                  loss_scale, report_memory_flag, skipped_iter,
                  grad_norm, params_norm, num_zeros_in_grad,
@@ -794,8 +853,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     """Log training information such as losses, timing, ...."""
     args = get_args()
     timers = get_timers()
-    writer = get_tensorboard_writer()
-
+    writer = interop_tool_logger(tb_writer=get_tensorboard_writer(), \
+                                 wandb_writer=get_wandb_writer())
+    x_axis_samples = 'Samples'
+    x_axis_tokens = 'Tokens'
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
     skipped_iters_key = 'skipped iterations'
@@ -866,80 +927,80 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
        (iteration % args.tensorboard_log_interval == 0):
         timers.write(timers_to_log, writer, iteration,
                      normalizer=total_iterations)
-    if writer and (iteration % args.tensorboard_log_interval == 0):
-        writer.add_scalar('steps-vs-samples/y=steps,x=samples', iteration, args.consumed_train_samples)
+    if writer.is_enabled() and (iteration % args.tensorboard_log_interval == 0):
+        writer.add_scalar('steps-vs-samples/y=steps,x=samples', iteration, args.consumed_train_samples, x_axis_samples)
         writer.add_scalar('steps-vs-samples/y=samples,x=steps', args.consumed_train_samples, iteration)
-        writer.add_scalar('steps-vs-tokens/y=steps,x=tokens', iteration, args.consumed_train_tokens)
+        writer.add_scalar('steps-vs-tokens/y=steps,x=tokens', iteration, args.consumed_train_tokens, x_axis_tokens)
         writer.add_scalar('steps-vs-tokens/y=tokens,x=steps', args.consumed_train_tokens, iteration)
         if args.log_learning_rate_to_tensorboard:
             writer.add_scalar('learning-rate/learning-rate', learning_rate, iteration)
             writer.add_scalar('learning-rate/learning-rate vs samples', learning_rate,
-                              args.consumed_train_samples)
+                              args.consumed_train_samples, x_axis_samples)
             writer.add_scalar('learning-rate/learning-rate vs tokens', learning_rate,
-                              args.consumed_train_tokens)
+                              args.consumed_train_tokens, x_axis_tokens)
         if args.log_batch_size_to_tensorboard:
             writer.add_scalar('batch-size/batch-size', batch_size, iteration)
             writer.add_scalar('batch-size/batch-size vs samples', batch_size,
-                              args.consumed_train_samples)
+                              args.consumed_train_samples, x_axis_samples)
             writer.add_scalar('batch-size/batch-size vs tokens', batch_size,
-                              args.consumed_train_tokens)
+                              args.consumed_train_tokens, x_axis_tokens)
         for key in loss_dict:
             writer.add_scalar(f"lm-loss-training/{key}", loss_dict[key], iteration)
             writer.add_scalar(f"lm-loss-training/{key}" + ' vs samples', loss_dict[key],
-                              args.consumed_train_samples)
+                              args.consumed_train_samples, x_axis_samples)
             writer.add_scalar(f"lm-loss-training/{key}" + ' vs tokens', loss_dict[key],
-                              args.consumed_train_tokens)
+                              args.consumed_train_tokens, x_axis_tokens)
         if args.fp16 and loss_scale and args.log_loss_scale_to_tensorboard:
             writer.add_scalar('loss-scale/loss-scale', loss_scale, iteration)
             writer.add_scalar('loss-scale/loss-scale vs samples', loss_scale,
-                              args.consumed_train_samples)
+                              args.consumed_train_samples, x_axis_samples)
             writer.add_scalar('loss-scale/loss-scale vs tokens', loss_scale,
-                              args.consumed_train_tokens)
+                              args.consumed_train_tokens, x_axis_tokens)
         if args.log_world_size_to_tensorboard:
             writer.add_scalar('world-size/world-size', args.world_size, iteration)
             writer.add_scalar('world-size/world-size vs samples', args.world_size,
-                              args.consumed_train_samples)
+                              args.consumed_train_samples, x_axis_samples)
             writer.add_scalar('world-size/world-size vs tokens', args.world_size,
-                              args.consumed_train_tokens)
+                              args.consumed_train_tokens, x_axis_tokens)
         if grad_norm is not None:
             writer.add_scalar('grad-norm/grad-norm', grad_norm, iteration)
             writer.add_scalar('grad-norm/grad-norm vs samples', grad_norm,
-                              args.consumed_train_samples)
+                              args.consumed_train_samples, x_axis_samples)
             writer.add_scalar('grad-norm/grad-norm vs tokens', grad_norm,
-                              args.consumed_train_tokens)
+                              args.consumed_train_tokens, x_axis_tokens)
         if num_zeros_in_grad is not None:
             writer.add_scalar('num-zeros/num-zeros', num_zeros_in_grad, iteration)
             writer.add_scalar('num-zeros/num-zeros vs samples', num_zeros_in_grad,
-                              args.consumed_train_samples)
+                              args.consumed_train_samples, x_axis_samples)
             writer.add_scalar('num-zeros/num-zeros vs tokens', num_zeros_in_grad,
-                              args.consumed_train_tokens)
+                              args.consumed_train_tokens, x_axis_tokens)
         if params_norm is not None:
             writer.add_scalar('params-norm/params-norm', params_norm, iteration)
             writer.add_scalar('params-norm/params-norm vs samples', params_norm,
-                              args.consumed_train_samples)
+                              args.consumed_train_samples, x_axis_samples)
             writer.add_scalar('params-norm/params-norm vs tokens', params_norm,
-                              args.consumed_train_tokens)
+                              args.consumed_train_tokens, x_axis_tokens)
         if hasattr(args, 'actual_seq_length'):
             writer.add_scalar('seqlen/actual_seq_length', args.actual_seq_length,
                               iteration)
             writer.add_scalar('seqlen/actual_seq_length vs samples', args.actual_seq_length,
-                              args.consumed_train_samples)
+                              args.consumed_train_samples, x_axis_samples)
             writer.add_scalar('seqlen/actual_seq_length vs tokens', args.actual_seq_length,
-                              args.consumed_train_tokens)
+                              args.consumed_train_tokens, x_axis_tokens)
         if args.curriculum_learning_legacy or args.data_efficiency_curriculum_learning:
             writer.add_scalar('seqlen/curriculum_seqlen', args.curriculum_seqlen,
                               iteration)
             writer.add_scalar('seqlen/curriculum_seqlen vs samples', args.curriculum_seqlen,
-                              args.consumed_train_samples)
+                              args.consumed_train_samples, x_axis_samples)
             writer.add_scalar('seqlen/curriculum_seqlen vs tokens', args.curriculum_seqlen,
-                              args.consumed_train_tokens)
+                              args.consumed_train_tokens, x_axis_tokens)
         if args.random_ltd:
             writer.add_scalar('seqlen/random_ltd_reserved_length', args.random_ltd_reserved_length,
                               iteration)
             writer.add_scalar('seqlen/random_ltd_reserved_length vs samples', args.random_ltd_reserved_length,
-                              args.consumed_train_samples)
+                              args.consumed_train_samples, x_axis_samples)
             writer.add_scalar('seqlen/random_ltd_reserved_length vs tokens', args.random_ltd_reserved_length,
-                              args.consumed_train_tokens)
+                              args.consumed_train_tokens, x_axis_tokens)
         if args.log_memory_to_tensorboard:
             mem_stats = torch.cuda.memory_stats()
             writer.add_scalar(
@@ -1002,19 +1063,19 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                     group=mpu.get_pipeline_model_parallel_group())
 
             # print('step {} rank {} after sync opt_stats {}, {}'.format(iteration, torch.distributed.get_rank(), opt_stats_2, opt_stats))
-            if writer and is_last_rank():
-                writer.add_scalar('optimizer/variance_l2 vs tokens', opt_stats[0]**0.5, args.consumed_train_tokens)
-                writer.add_scalar('optimizer/variance_sqrt_l2 vs tokens', opt_stats[1]**0.5, args.consumed_train_tokens)
-                writer.add_scalar('optimizer/momentum_l2 vs tokens', opt_stats[2]**0.5, args.consumed_train_tokens)
-                writer.add_scalar('optimizer/weight_l2 vs tokens', opt_stats[3]**0.5, args.consumed_train_tokens)
-                writer.add_scalar('optimizer/variance_l1 vs tokens', opt_stats[4], args.consumed_train_tokens)
-                writer.add_scalar('optimizer/variance_sqrt_l1 vs tokens', opt_stats[5], args.consumed_train_tokens)
-                writer.add_scalar('optimizer/momentum_l1 vs tokens', opt_stats[6], args.consumed_train_tokens)
-                writer.add_scalar('optimizer/weight_l1 vs tokens', opt_stats[7], args.consumed_train_tokens)
-                writer.add_scalar('optimizer/variance_abs_max vs tokens', opt_stats_2[0], args.consumed_train_tokens)
-                writer.add_scalar('optimizer/variance_sqrt_abs_max vs tokens', opt_stats_2[1], args.consumed_train_tokens)
-                writer.add_scalar('optimizer/momentum_abs_max vs tokens', opt_stats_2[2], args.consumed_train_tokens)
-                writer.add_scalar('optimizer/weight_abs_max vs tokens', opt_stats_2[3], args.consumed_train_tokens)
+            if writer.is_enabled() and is_last_rank():
+                writer.add_scalar('optimizer/variance_l2 vs tokens', opt_stats[0]**0.5, args.consumed_train_tokens, x_axis_tokens)
+                writer.add_scalar('optimizer/variance_sqrt_l2 vs tokens', opt_stats[1]**0.5, args.consumed_train_tokens, x_axis_tokens)
+                writer.add_scalar('optimizer/momentum_l2 vs tokens', opt_stats[2]**0.5, args.consumed_train_tokens, x_axis_tokens)
+                writer.add_scalar('optimizer/weight_l2 vs tokens', opt_stats[3]**0.5, args.consumed_train_tokens, x_axis_tokens)
+                writer.add_scalar('optimizer/variance_l1 vs tokens', opt_stats[4], args.consumed_train_tokens, x_axis_tokens)
+                writer.add_scalar('optimizer/variance_sqrt_l1 vs tokens', opt_stats[5], args.consumed_train_tokens, x_axis_tokens)
+                writer.add_scalar('optimizer/momentum_l1 vs tokens', opt_stats[6], args.consumed_train_tokens, x_axis_tokens)
+                writer.add_scalar('optimizer/weight_l1 vs tokens', opt_stats[7], args.consumed_train_tokens, x_axis_tokens)
+                writer.add_scalar('optimizer/variance_abs_max vs tokens', opt_stats_2[0], args.consumed_train_tokens, x_axis_tokens)
+                writer.add_scalar('optimizer/variance_sqrt_abs_max vs tokens', opt_stats_2[1], args.consumed_train_tokens, x_axis_tokens)
+                writer.add_scalar('optimizer/momentum_abs_max vs tokens', opt_stats_2[2], args.consumed_train_tokens, x_axis_tokens)
+                writer.add_scalar('optimizer/weight_abs_max vs tokens', opt_stats_2[3], args.consumed_train_tokens, x_axis_tokens)
 
                 writer.add_scalar('optimizer/variance_l2', opt_stats[0]**0.5, iteration)
                 writer.add_scalar('optimizer/variance_sqrt_l2', opt_stats[1]**0.5, iteration)
@@ -1046,34 +1107,29 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         tokens_per_sec_per_replica = tokens_per_sec / args.data_parallel_size
         tokens_per_gpu_per_second = tokens_per_sec / args.world_size
         tokens_per_gpu_per_second_per_replica = tokens_per_gpu_per_second / args.data_parallel_size
-        if wandb is not None and getattr(wandb, 'run', None) is not None:
-            assert wandb.run is not None
-            wandb_metrics = {
-                'throughput/iteration-time': elapsed_time_per_iteration,  # 1000 ms / s
-                'throughput/samples_per_sec': samples_per_sec,
-                'throughput/samples_per_sec_per_replica': samples_per_sec_per_replica,
-                'throughput/tokens_per_sec': tokens_per_sec,
-                'throughput/tokens_per_sec_per_replica': tokens_per_sec_per_replica,
-                'throughput/tokens_per_gpu_per_sec': tokens_per_gpu_per_second,
-                'throughput/tokens_per_gpu_per_sec_per_replica': tokens_per_gpu_per_second_per_replica,
-                'throughput/tflops': tflops,
-                'throughput/approx_params_in_billions': approx_parameters_in_billions,
-                'throughput/elapsed_ms_per_iteration': elapsed_time_per_iteration,
-                'throughput/iteration': iteration,
-            }
+
+        if writer.is_enabled():
+            writer.add_scalar_to_wandb('throughput/iteration-time', elapsed_time_per_iteration, iteration)  # 1000 ms / s
+            writer.add_scalar_to_wandb('throughput/samples_per_sec', samples_per_sec, iteration)
+            writer.add_scalar_to_wandb('throughput/samples_per_sec_per_replica', samples_per_sec_per_replica, iteration)
+            writer.add_scalar_to_wandb('throughput/tokens_per_sec', tokens_per_sec, iteration)
+            writer.add_scalar_to_wandb('throughput/tokens_per_sec_per_replica', tokens_per_sec_per_replica, iteration)
+            writer.add_scalar_to_wandb('throughput/tokens_per_gpu_per_sec', tokens_per_gpu_per_second, iteration)
+            writer.add_scalar_to_wandb('throughput/tokens_per_gpu_per_sec_per_replica', tokens_per_gpu_per_second_per_replica, iteration)
+            writer.add_scalar_to_wandb('throughput/tflops', tflops, iteration)
+            writer.add_scalar_to_wandb('throughput/approx_params_in_billions', approx_parameters_in_billions, iteration)
+            writer.add_scalar_to_wandb('throughput/elapsed_ms_per_iteration', elapsed_time_per_iteration, iteration)
             if loss_dict is not None:
-                wandb_metrics |= {
-                    f'loss/{k}': v for k, v in loss_dict.items()
-                }
-                wandb_metrics |= {'loss/iteration': iteration}
-        if writer:
+                for k, v in loss_dict.items():
+                    writer.add_scalar_to_wandb(f'loss/{k}', v, iteration)
+
             if args.log_timers_to_tensorboard:
                 writer.add_scalar('iteration-time/iteration-time',
                                   elapsed_time_per_iteration, iteration)
                 writer.add_scalar('iteration-time/iteration-time vs samples',
-                                  elapsed_time_per_iteration, args.consumed_train_samples)
+                                  elapsed_time_per_iteration, args.consumed_train_samples, x_axis_samples)
                 writer.add_scalar('iteration-time/iteration-time vs tokens',
-                                  elapsed_time_per_iteration, args.consumed_train_tokens)
+                                  elapsed_time_per_iteration, args.consumed_train_tokens, x_axis_tokens)
         log_string = ' iteration {:8d}/{:8d} |'.format(
             iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(
@@ -1084,21 +1140,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             elapsed_time_per_iteration * 1000.0)
         log_string += ' learning rate: {:.3E} |'.format(learning_rate)
         log_string += ' global batch size: {:5d} |'.format(batch_size)
-        if wandb is not None and getattr(wandb, 'run', None) is not None:
-            wandb_metrics |= {
-                'training/iteration': iteration,
-                'training/iteration_time': elapsed_time_per_iteration,
-                'training/iteration_time_vs_tokens': (
-                    (elapsed_time_per_iteration
-                        / args.consumed_train_tokens)
-                ),
-                'training/iteration_time_vs_samples': (
-                    (elapsed_time_per_iteration
-                        / args.consumed_train_samples),
-                ),
-                'training/consumed_samples': args.consumed_train_samples,
-                'training/consumed_tokens': args.consumed_train_tokens,
-            }
+
         for key in total_loss_dict:
             if key not in [advanced_iters_key, skipped_iters_key,
                            nan_iters_key]:
@@ -1107,8 +1149,6 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                 if avg > 0.0:
                     log_string += ' {}: {:.6E} |'.format(key, avg)
                 total_loss_dict[key] = get_accelerator().FloatTensor([0.0])
-        if wandb is not None and getattr(wandb, 'run', None) is not None:
-            wandb.log(wandb_metrics)
         if loss_scale is not None:
             log_string += ' loss scale: {:.1f} |'.format(loss_scale)
         if grad_norm is not None:
@@ -1433,9 +1473,11 @@ def evaluate_and_print_results(prefix, forward_step_func,
     """Helper function to evaluate and dump results on screen."""
     args = get_args()
     if write_to_tensorboard:
-        writer = get_tensorboard_writer()
+        writer = interop_tool_logger(tb_writer=get_tensorboard_writer(), wandb_writer=get_wandb_writer())
     else:
-        writer = None
+        writer = interop_tool_logger()
+    x_axis_samples = 'Samples'
+    x_axis_tokens = 'Tokens'
 
     total_loss_dict, collected_non_loss_data = evaluate(
         forward_step_func, data_iterator, model,
@@ -1445,26 +1487,28 @@ def evaluate_and_print_results(prefix, forward_step_func,
         string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())
         ppl = math.exp(min(20, total_loss_dict[key].item()))
         string += '{} PPL: {:.6E} | '.format(key, ppl)
-        if writer and is_last_rank():
+        if writer.is_enabled() and is_last_rank():
             data_type = 'test' if test else 'validation'
             writer.add_scalar(f'lm-loss-validation/{key} {data_type}',
                               total_loss_dict[key].item(),
                               iteration)
             writer.add_scalar(f'lm-loss-validation/{key} {data_type} vs samples',
                               total_loss_dict[key].item(),
-                              args.consumed_train_samples)
+                              args.consumed_train_samples,
+                              x_axis_samples)
             writer.add_scalar(f'lm-loss-validation/{key} {data_type} vs tokens',
                               total_loss_dict[key].item(),
-                              args.consumed_train_tokens)
+                              args.consumed_train_tokens,
+                              x_axis_tokens)
             if args.log_validation_ppl_to_tensorboard:
                 writer.add_scalar(f'lm-loss-validation/{key} {data_type} ppl', ppl,
                                   iteration)
                 writer.add_scalar(f'lm-loss-validation/{key} {data_type} ppl vs samples',
-                                  ppl, args.consumed_train_samples)
+                                  ppl, args.consumed_train_samples, x_axis_samples)
                 writer.add_scalar(f'lm-loss-validation/{key} {data_type} ppl vs tokens',
-                                  ppl, args.consumed_train_tokens)
+                                  ppl, args.consumed_train_tokens, x_axis_tokens)
 
-    if process_non_loss_data_func is not None and writer and is_last_rank():
+    if process_non_loss_data_func is not None and writer.is_enabled() and is_last_rank():
         process_non_loss_data_func(collected_non_loss_data, iteration, writer)
 
     length = len(string) + 1

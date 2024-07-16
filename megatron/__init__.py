@@ -9,6 +9,7 @@ from .global_vars import get_signal_handler
 from .global_vars import update_num_microbatches
 from .global_vars import get_tokenizer
 from .global_vars import get_tensorboard_writer
+from .global_vars import get_wandb_writer
 from .global_vars import get_adlr_autoresume
 from .global_vars import get_timers
 from .initialize  import initialize_megatron
