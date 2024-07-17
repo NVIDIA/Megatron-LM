@@ -381,3 +381,11 @@ def dump_weights(preamble, iteration, model, optimizer, tensor=None):
                 p = model[0].module.tied_modules.embed.word_embeddings.weight._hp_param
                 fh.write(f"{get_fingerprint(p)} module.tied_modules.embed.word_embeddings.weight._hp_param {p.shape}\n")
 
+
+def found_kill_switch():
+    args = get_args()
+    if args.kill_switch_file is not None and os.path.exists(args.kill_switch_file):
+        return True
+    else:
+        return False
+
