@@ -925,7 +925,8 @@ def compute_throughputs_and_append_to_progress_log(iteration,
 
 
 def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
-                             num_floating_point_operations_so_far, checkpointing_context):
+                             num_floating_point_operations_so_far, checkpointing_context,
+                             non_persistent_ckpt=False):
     args = get_args()
     timers = get_timers()
 
@@ -933,7 +934,8 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
     timers('interval-time').stop()
 
     # Extra barrier is added to make sure all ranks report the max time.
-    timers('save-checkpoint', log_level=0).start(barrier=True)
+    timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
+    timers(timer_key, log_level=0).start(barrier=True)
     save_checkpoint_start_time = timers('save-checkpoint').active_time()
 
     # Log E2E metrics before save-checkpoint
@@ -942,11 +944,12 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
     if args.use_distributed_optimizer and args.overlap_param_gather:
         optimizer.disable_pre_hook()
     save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
-                    num_floating_point_operations_so_far, checkpointing_context)
+                    num_floating_point_operations_so_far, checkpointing_context,
+                    non_persistent_ckpt=non_persistent_ckpt)
     if args.use_distributed_optimizer and args.overlap_param_gather:
         optimizer.enable_pre_hook()
-    timers('save-checkpoint').stop(barrier=True)
-    timers.log(['save-checkpoint'])
+    timers(timer_key).stop(barrier=True)
+    timers.log([timer_key])
     save_checkpoint_finish_time = timers('save-checkpoint').active_time()
 
     # Log E2E metrics after save-checkpoint
@@ -954,8 +957,7 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
     save_checkpoint_duration = save_checkpoint_finish_time - save_checkpoint_start_time
     one_logger_utils.on_save_checkpoint_end(save_checkpoint_duration, iteration, args.async_save)
 
-
-    if args.log_progress:
+    if args.log_progress and not non_persistent_ckpt:
         compute_throughputs_and_append_to_progress_log(iteration,
                                                        num_floating_point_operations_so_far)
 
@@ -1192,6 +1194,16 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                      num_floating_point_operations_so_far,
                                      checkpointing_context)
             saved_checkpoint = True
+
+        elif args.save and args.non_persistent_save_interval and \
+           iteration % args.non_persistent_save_interval == 0:
+            timers('interval-time').stop()
+            save_checkpoint_and_time(iteration, model, optimizer,
+                                     opt_param_scheduler,
+                                     num_floating_point_operations_so_far,
+                                     non_persistent_ckpt=True)
+            saved_checkpoint = True
+            timers('interval-time', log_level=0).start(barrier=True)
 
         # Exiting based on duration
         if args.exit_duration_in_mins:

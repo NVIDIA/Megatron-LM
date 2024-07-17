@@ -6,6 +6,12 @@ from tempfile import TemporaryDirectory
 from typing import Union, Optional
 
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.dist_checkpointing.utils import (
+    setup_model_and_optimizer,
+    init_basic_mock_args,
+    init_checkpointing_mock_args,
+    initialize_gpt_model,
+)
 
 
 def empty_dir(path: Path):
@@ -18,7 +24,6 @@ def empty_dir(path: Path):
             p.unlink()
 
 
-
 class TempNamedDir(TemporaryDirectory):
     """ TemporaryDirectory with a fully named directory. Empties the dir if not empty. """
     def __init__(self, name: Union[str, Path], sync=True,
@@ -27,16 +32,22 @@ class TempNamedDir(TemporaryDirectory):
         if Utils.rank == 0:
             os.makedirs(name, exist_ok=True)
             empty_dir(Path(name))
+        if sync:
+            import torch
+            torch.distributed.barrier()
+        else:
+            os.makedirs(name, exist_ok=True)
 
         self._ignore_cleanup_errors = ignore_cleanup_errors
         self._finalizer = weakref.finalize(
             self, self._cleanup, self.name,
-            warn_message="Implicitly cleaning up {!r}".format(self))
+            warn_message="Implicitly cleaning up {!r}".format(self)
+        )
         self.sync = sync
 
     def cleanup(self, override_sync: Optional[bool] = None) -> None:
         sync = self.sync if override_sync is None else override_sync
-        if sync :
+        if sync:
             import torch
             torch.distributed.barrier()
 
@@ -54,4 +65,3 @@ class TempNamedDir(TemporaryDirectory):
         raised = exc_type is not None
         if not raised:
             self.cleanup()
-
