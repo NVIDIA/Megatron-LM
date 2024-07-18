@@ -64,14 +64,16 @@ jet-trigger:
 
 jet-results-summary:
   extends: [.jet_common]
-  image: gitlab-master.nvidia.com:5005/dl/jet/api:latest
+  image: ${GITLAB_ENDPOINT}:5005/dl/jet/api:latest
   tags:
     - os/linux
   before_script:
     - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $VAULT_JWT_TOKEN
   script:
     - env
-    - RW_API_TOKEN=${PROJECT_ACCESS_TOKEN} ENDPOINT=${PROJECT_ENDPOINT} bash tests/functional_tests/shell_test_utils/restart_jet_log_jobs.sh ${CI_PIPELINE_ID}
+    - export RW_API_TOKEN=${PROJECT_ACCESS_TOKEN}
+    - export GITLAB_ENDPOINT
+    - bash tests/functional_tests/shell_test_utils/restart_jet_log_jobs.sh ${CI_PIPELINE_ID}
     - python -m pip install -U --no-cache-dir prettytable
     - rc=0
     - python tests/functional_tests/python_test_utils/jet_test_pipeline.py ${CI_PIPELINE_ID} --artifact_links $CI_JOB_ID --download_scripts_dir ./scripts || rc=$?
@@ -81,3 +83,26 @@ jet-results-summary:
     paths:
       - scripts
   allow_failure: true
+
+jet-results-notify:
+  extends: [.jet_common]
+  image: ${GITLAB_ENDPOINT}:5005/dl/jet/api:latest
+  tags:
+    - os/linux
+  before_script:
+    - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $VAULT_JWT_TOKEN
+  script:
+    - env
+    - export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
+    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
+    - export GITLAB_ENDPOINT
+    - export CONTEXT=$SCOPE
+    - export DATE=$(date +"%Y-%m-%d")
+    - bash tests/functional_tests/shell_test_utils/notify.sh ${CI_PIPELINE_ID}
+  artifacts:
+    when: always
+    paths:
+      - scripts
+  allow_failure: true
+  rules:
+   - if: $CI_PIPELINE_SOURCE == "schedule" && '$FUNCTIONAL_TEST == "yes"'

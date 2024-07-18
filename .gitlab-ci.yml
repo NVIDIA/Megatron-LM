@@ -53,10 +53,10 @@ variables:
       - "dgxh100_eos"
     description: '"dgxa100_dracooci" for OCI-IAD, "dgxh100_eos" for EOS'
   # CI wide variables
-  CI_MCORE_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci
-  CI_NEMO_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/nemo_ci
-  LINTING_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_linting
-
+  CI_MCORE_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_ci
+  CI_NEMO_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/nemo_ci
+  LINTING_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_linting
+  
 metadata:
   image: python:3.10
   stage: .pre
@@ -181,9 +181,9 @@ build_image:
 
       OLD_IMAGES=$(docker image ls --format "{{.ID}} {{.Repository}}:{{.Tag}}" \
                     | grep -v 'nvcr.io/nvidia/pytorch:24.01-py3' \
-                    | grep -v 'gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:buildcache' \
-                    | grep -v 'gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_nemo:buildcache' \
-                    | grep -v 'gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_linting:buildcache' \
+                    | grep -v ${GITLAB_ENDPOINT}':5005/adlr/megatron-lm/mcore_ci:buildcache' \
+                    | grep -v ${GITLAB_ENDPOINT}':5005/adlr/megatron-lm/mcore_nemo:buildcache' \
+                    | grep -v ${GITLAB_ENDPOINT}':5005/adlr/megatron-lm/mcore_linting:buildcache' \
                     | grep -v 'nvcr.io/nvidian/nemo:nightly' \
                     | grep -v 'python:3.10' | awk '{ print $1 }'
                  )
@@ -322,13 +322,13 @@ unit_tests-top-py:
     - if: '$FUNCTIONAL_TEST == "no"'
 
 docs_build_test:
-  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/python-format:0.0.1
+  image: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/python-format:0.0.1
   stage: unit_tests
   tags:
     - os/linux
   script:
     - cd ..
-    - rm -rf documentation && git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab-master.nvidia.com/nemo-megatron-core-tme/documentation.git
+    - rm -rf documentation && git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/nemo-megatron-core-tme/documentation.git
     - mv megatron-lm/ documentation/
     - cd documentation/
     - ./repo docs
