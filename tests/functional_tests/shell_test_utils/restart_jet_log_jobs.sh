@@ -13,7 +13,7 @@ collect_jet_jobs () {
                   -s \
                   --globoff \
                   --header "PRIVATE-TOKEN: $RW_API_TOKEN" \
-                  "${ENDPOINT}/pipelines/${JET_PIPELINE_ID}/jobs?page=$PAGE&per_page=$PER_PAGE"
+                  "${GITLAB_ENDPOINT}/api/v4/projects/70847/pipelines/${JET_PIPELINE_ID}/jobs?page=$PAGE&per_page=$PER_PAGE"
               )
     # Combine the results
     RESULTS=$(jq -s '.[0] + .[1]' <<< "$RESULTS $RESPONSE")
@@ -34,7 +34,7 @@ if [[ $# -ne 1 ]]; then
     echo "Usage: $0 <jet-ci-pipeline-id>"
     exit 1
 elif [[ -z "${RW_API_TOKEN}" ]]; then
-    echo "RW_API_TOKEN empty, get one at https://gitlab-master.nvidia.com/-/user_settings/personal_access_tokens"
+    echo "RW_API_TOKEN empty, get one at ${GITLAB_ENDPOINT}/-/user_settings/personal_access_tokens"
     exit 1
 fi
 
@@ -47,7 +47,7 @@ PIPELINE_JSON=$(curl \
                   --fail \
                   --silent \
                   --header "PRIVATE-TOKEN: ${RW_API_TOKEN}" \
-                  "https://gitlab-master.nvidia.com/api/v4/projects/${CI_PROJECT_ID}/pipelines/${CI_PIPELINE_ID}/bridges?per_page=100"
+                  "${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/pipelines/${CI_PIPELINE_ID}/bridges?per_page=100"
                 ) || ret_code=$?
 set -x
 if [[ ${ret_code:-0} -ne 0 ]]; then
@@ -62,7 +62,7 @@ JET_PIPELINE_JSON=$(curl \
                       --fail \
                       --silent \
                       --header "PRIVATE-TOKEN: ${RW_API_TOKEN}" \
-                      "${ENDPOINT}/pipelines/${DOWNSTREAM_PIPELINE_ID}/bridges?per_page=100"
+                      "${GITLAB_ENDPOINT}/api/v4/projects/70847/pipelines/${DOWNSTREAM_PIPELINE_ID}/bridges?per_page=100"
                     )
 set -x
 JET_PIPELINE_ID=$(jq '.[0].downstream_pipeline.id' <<< "$JET_PIPELINE_JSON")
@@ -72,7 +72,7 @@ JET_LOGS=$(collect_jet_jobs)
 set -x
 
 LAST_STAGE_TEST_JOBS=$(jq \
-  --arg ENDPOINT ${ENDPOINT} '[
+  --arg ENDPOINT ${GITLAB_ENDPOINT}/api/v4/projects/70847 '[
     .[] 
     | select(.name | contains("3 logs_after"))
     | select(.name | startswith("build/") | not)
