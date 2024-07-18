@@ -105,13 +105,13 @@ else
             ) 
 
     FAILED_JET_LOGS=$(echo "$JET_LOGS" \
-                | jq --arg ENDPOINT https://${GITLAB_ENDPOINT}/api/v4/projects/70847 '[
+                | jq --arg GITLAB_ENDPOINT "$GITLAB_ENDPOINT" '[
                     .[] 
                     | select(.status != "success")
                     | {
                         "name": (.name[6:] | split(" ")[0]),
                         id,
-                        "url": ("https://${GITLAB_ENDPOINT}/dl/jet/ci/-/jobs/" + (.id | tostring)),
+                        "url": ("https://" + $GITLAB_ENDPOINT + "/dl/jet/ci/-/jobs/" + (.id | tostring)),
                     }
                 ]'
             ) 

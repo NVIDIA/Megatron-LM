@@ -65,6 +65,7 @@ jet-trigger:
 jet-results-summary:
   extends: [.jet_common]
   image: ${GITLAB_ENDPOINT}:5005/dl/jet/api:latest
+  needs: [jet-trigger]
   tags:
     - os/linux
   before_script:
@@ -87,6 +88,7 @@ jet-results-summary:
 jet-results-notify:
   extends: [.jet_common]
   image: ${GITLAB_ENDPOINT}:5005/dl/jet/api:latest
+  needs: [jet-trigger]
   tags:
     - os/linux
   before_script:
