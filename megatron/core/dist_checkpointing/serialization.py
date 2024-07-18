@@ -123,18 +123,10 @@ def load(
     dict_list_map_inplace(lambda o: o.unwrap(), nonpersistent_state_dict)
     merge(common_state_dict, nonpersistent_state_dict)
 
-    # Sharded base
-    if not sharded_strategy.can_handle_sharded_objects:
-        validate_sharded_objects_handling(sharded_strategy, common_strategy)
-        sharded_objects_state_dict, sharded_state_dict = extract_matching_values(
-            sharded_state_dict, lambda v: isinstance(v, ShardedObject)
-        )
-        sharded_objects = common_strategy.load_sharded_objects(
-            sharded_objects_state_dict, checkpoint_dir
-        )
-        merge(common_state_dict, sharded_objects)
+    # At this point we are only dealing with ShardedBase objects
     sharded_state_dict, _ = extract_sharded_base(sharded_state_dict)
 
+    # Validation
     ckpt_sharded_metadata = None
     local_metadata, global_metadata = None, None
     strict = parse_strict_flag(strict)
@@ -153,6 +145,17 @@ def load(
         global_metadata,
         ckpt_sharded_metadata,
     )
+
+    # ShardedBase loading
+    if not sharded_strategy.can_handle_sharded_objects:
+        validate_sharded_objects_handling(sharded_strategy, common_strategy)
+        sharded_objects_state_dict, sharded_state_dict = extract_matching_values(
+            sharded_state_dict, lambda v: isinstance(v, ShardedObject)
+        )
+        sharded_objects = common_strategy.load_sharded_objects(
+            sharded_objects_state_dict, checkpoint_dir
+        )
+        merge(common_state_dict, sharded_objects)
 
     loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir)
 
