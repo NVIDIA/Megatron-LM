@@ -8,7 +8,7 @@ from enum import Enum
 from pathlib import Path
 
 from ..mapping import CheckpointingException, ShardedStateDict, StateDict
-from .async_utils import AsyncRequest
+from .async_utils import AsyncCallsQueue, AsyncRequest
 
 
 class StrategyAction(Enum):
@@ -19,6 +19,8 @@ class StrategyAction(Enum):
 
 
 default_strategies = defaultdict(dict)
+
+async_calls = AsyncCallsQueue()
 
 
 def get_default_strategy(action: StrategyAction, backend: str, version: int):
@@ -176,4 +178,8 @@ class AsyncSaveShardedStrategy(SaveShardedStrategy):
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         """Each async strategy can be trivially used as a sync strategy."""
         async_request = self.async_save(sharded_state_dict, checkpoint_dir)
-        async_request.execute_sync()
+        # multiprocessing routines  may cause issue when called on parent process
+        # We keep this verbose call for now
+        global async_calls
+        async_calls.schedule_async_request(async_request)
+        async_calls.maybe_finalize_async_calls(blocking=True)

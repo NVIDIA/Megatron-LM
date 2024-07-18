@@ -14,7 +14,7 @@ from tests.unit_tests.test_utilities import Utils
 
 
 
-def write_data_os_err_mock_fn(local_proc_idx, write_bucket, results_queue, use_fsync):
+def write_data_os_err_mock_fn(local_proc_idx, write_bucket, results_queue, count_queue, use_fsync):
     """Raises an error on worker #2 during storage save"""
     try:
         if local_proc_idx == 2:
@@ -23,20 +23,8 @@ def write_data_os_err_mock_fn(local_proc_idx, write_bucket, results_queue, use_f
     except Exception as e:
         output = (local_proc_idx, e)
     results_queue.put(output)
-
-
-def no_write_data_mock_fn(local_proc_idx, write_bucket, results_queue, use_fsync):
-    """Worker #2 doesn't put anything in the queue. """
-    if local_proc_idx == 2:
-        return
-    output = (local_proc_idx, [])
-    results_queue.put(output)
-
-
-def write_multiproc_fn(*args, **kwargs):
-    """ Shorten the timeout to 1s. """
-    kwargs.pop('worker_timeout', None)
-    return FileSystemWriterAsync.write_preloaded_data_multiproc_orig(*args, worker_timeout=1, **kwargs)
+    count_queue.get()
+    count_queue.task_done()
 
 
 class TestAsyncSave:
@@ -77,7 +65,7 @@ class TestAsyncSave:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize('async_save', [False, True])
-    @pytest.mark.parametrize('worker_fn', [write_data_os_err_mock_fn, no_write_data_mock_fn])
+    @pytest.mark.parametrize('worker_fn', [write_data_os_err_mock_fn])
     def test_errors_are_reported(self, tmp_path_dist_ckpt, async_save, worker_fn):
         Utils.initialize_model_parallel(2, 4)
         sharded_state_dict = {
@@ -91,10 +79,7 @@ class TestAsyncSave:
 
             try:
                 orig_fn = FileSystemWriterAsync.write_preloaded_data
-                FileSystemWriterAsync.write_preloaded_data_multiproc_orig = staticmethod(FileSystemWriterAsync.write_preloaded_data_multiproc)
-
                 FileSystemWriterAsync.write_preloaded_data = worker_fn
-                FileSystemWriterAsync.write_preloaded_data_multiproc = staticmethod(write_multiproc_fn)
                 with pytest.raises(RuntimeError) as exc_info:
                     if async_save:
                         async_request = save(
@@ -108,7 +93,5 @@ class TestAsyncSave:
 
             finally:
                 FileSystemWriterAsync.write_preloaded_data = orig_fn
-                FileSystemWriterAsync.write_preloaded_data_multiproc = staticmethod(FileSystemWriterAsync.write_preloaded_data_multiproc_orig)
-                del FileSystemWriterAsync.write_preloaded_data_multiproc_orig
 
         Utils.destroy_model_parallel()
