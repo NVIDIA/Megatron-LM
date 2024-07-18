@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron tokenizers."""
@@ -40,7 +41,9 @@ def build_tokenizer(args):
         tokenizer = _NullTokenizer(args.vocab_size)
     elif args.tokenizer_type == 'HFTokenizer':
         assert args.tokenizer_model is not None
-        tokenizer = _HFTokenizer(args.tokenizer_model,args.seq_length)
+        tokenizer = _HFTokenizer(args.tokenizer_model,
+                                 args.seq_length,
+                                 args.trust_remote_code)
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
@@ -540,10 +543,13 @@ class _NullTokenizer:
 
 class _HFTokenizer(AbstractTokenizer):
     """HF Tokenizer"""
-    def __init__(self, tokenizer_name_or_path,max_seq_len):
+    def __init__(self, tokenizer_name_or_path, max_seq_len, trust_remote_code):
         name = tokenizer_name_or_path
         super().__init__(name)
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path,padding_side="right",use_fast=False)
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path,
+                                                       padding_side="right",
+                                                       trust_remote_code=trust_remote_code,
+                                                       use_fast=False)
         
         DEFAULT_PAD_TOKEN = "[PAD]"
         DEFAULT_EOS_TOKEN = "</s>"
