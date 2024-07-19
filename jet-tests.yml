@@ -84,7 +84,13 @@ jet-results-summary:
     paths:
       - scripts
   allow_failure: true
-
+  rules:
+    - if: '$FUNCTIONAL_TEST == "yes" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/ )'
+      allow_failure: true
+      when: always
+    - if: '$FUNCTIONAL_TEST == "yes"'
+      when: always
+      
 jet-results-notify:
   extends: [.jet_common]
   image: ${GITLAB_ENDPOINT}:5005/dl/jet/api:latest
@@ -107,4 +113,8 @@ jet-results-notify:
       - scripts
   allow_failure: true
   rules:
-   - if: $CI_PIPELINE_SOURCE == "schedule" && '$FUNCTIONAL_TEST == "yes"'
+    - if: '$FUNCTIONAL_TEST == "yes" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/ )'
+      allow_failure: true
+      when: always
+    - if: '$FUNCTIONAL_TEST == "yes"'
+      when: always
