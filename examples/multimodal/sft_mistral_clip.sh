@@ -107,6 +107,7 @@ OPTIONS=" \
     --save ${FINETUNE_DIR} \
     --load ${FINETUNE_DIR} \
     --pretrained-checkpoint ${CHECKPOINT_DIR} \
+    --dataloader-save ${FINETUNE_DIR}/dataloader \
     --split 100,0,0 \
     --clip-grad 0.5 \
     --weight-decay 0.1 \
