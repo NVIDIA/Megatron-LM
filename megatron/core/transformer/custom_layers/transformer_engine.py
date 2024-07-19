@@ -846,7 +846,6 @@ def te_checkpoint(
     context,
     context_mask,
     rotary_pos_emb,
-    packed_seq_params,
 ):
     from transformer_engine.pytorch.distributed import checkpoint
 
@@ -858,7 +857,6 @@ def te_checkpoint(
             context,
             context_mask,
             rotary_pos_emb,
-            packed_seq_params,
             distribute_saved_activations=distribute_saved_activations,
             get_rng_state_tracker=get_rng_state_tracker,
             tp_group=tp_group,
@@ -874,7 +872,6 @@ def te_checkpoint(
             context,
             context_mask,
             rotary_pos_emb,
-            packed_seq_params,
         )
 
 

@@ -5,7 +5,7 @@ import pytest
 
 import torch
 from megatron.core import dist_checkpointing
-
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -18,7 +18,7 @@ class TestParallelTransformerBlock:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1,1)
         model_parallel_cuda_manual_seed(123)
-        self.transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
+        self.transformer_config = TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True)   
         self.parallel_transformer_block = TransformerBlock(self.transformer_config,
                                                            get_gpt_layer_with_transformer_engine_spec())
 
@@ -29,7 +29,7 @@ class TestParallelTransformerBlock:
         parallel_transformer_block = self.parallel_transformer_block
         assert isinstance(parallel_transformer_block, TransformerBlock)
         num_weights = sum([p.numel() for p in parallel_transformer_block.parameters()])
-        assert num_weights == 3792
+        assert num_weights == 100096
         assert parallel_transformer_block.num_layers_per_pipeline_rank == 2
         assert len(parallel_transformer_block.layers) == 2
         layer_0: TransformerLayer = parallel_transformer_block._get_layer(0)
@@ -57,15 +57,29 @@ class TestParallelTransformerBlock:
         assert hidden_states.shape[2] == config.hidden_size
 
     def test_gpu_forward_full_checkpoint(self):
+        self._run_full_checkpoint_test(fp8=None)
+
+    def test_gpu_forward_full_checkpoint_fp8(self):
+        self._run_full_checkpoint_test(fp8="e4m3")
+
+    def test_gpu_forward_selective_checkpoint(self):
+        self._run_selective_checkpoint_test(fp8=None)
+
+    def test_gpu_forward_selective_checkpoint_fp8(self):
+        self._run_selective_checkpoint_test(fp8="e4m3")
+
+    def _run_full_checkpoint_test(self, fp8):
         transformer_config = self.transformer_config
         config = transformer_config
         config.recompute_granularity = 'full'
         config.recompute_method = 'block'
+        config.fp8 = fp8
         config.recompute_num_layers = config.num_layers
         full_transformer_block = TransformerBlock(config,
                                                   get_gpt_layer_with_transformer_engine_spec())
         assert full_transformer_block.config.recompute_granularity == 'full'
         assert full_transformer_block.config.recompute_method == 'block'
+        assert full_transformer_block.config.fp8 == fp8
 
         sequence_length = 32
         micro_batch_size = 2
@@ -82,14 +96,16 @@ class TestParallelTransformerBlock:
         assert hidden_states.shape[1] == micro_batch_size
         assert hidden_states.shape[2] == config.hidden_size
 
-    def test_gpu_forward_selective_checkpoint(self):
+    def _run_selective_checkpoint_test(self, fp8):
         transformer_config = self.transformer_config
         config = transformer_config
         config.recompute_granularity = 'selective'
+        config.fp8 = fp8
         selective_transformer_block = TransformerBlock(config,
                                                        get_gpt_layer_with_transformer_engine_spec())
         assert selective_transformer_block.config.recompute_granularity == 'selective'
         assert selective_transformer_block.checkpoint_core_attention
+        assert selective_transformer_block.config.fp8 == fp8
 
         sequence_length = 32
         micro_batch_size = 2
