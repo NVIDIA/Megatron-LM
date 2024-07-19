@@ -108,7 +108,7 @@ def get_checkpoint_name(checkpoints_path, iteration, release=False,
                         pipeline_parallel=None,
                         tensor_rank=None, pipeline_rank=None,
                         expert_parallel=None, expert_rank=None,
-                        return_base_dir=False):
+                        return_base_dir=False, basename="model_optim_rng.pt"):
     """Determine the directory name for this rank's checkpoint."""
     if release:
         directory = 'release'
@@ -143,7 +143,7 @@ def get_checkpoint_name(checkpoints_path, iteration, release=False,
     if expert_parallel:
         common_path = common_path + f'_{expert_rank:03d}'
 
-    return os.path.join(common_path, "model_optim_rng.pt")
+    return os.path.join(common_path, basename)
 
 
 def get_distributed_optimizer_checkpoint_name(model_checkpoint_name):
@@ -291,9 +291,10 @@ def get_rng_state(use_dist_ckpt: bool = False):
     return rng_state_list
 
 
-def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, checkpointing_context=None,
-                    pipeline_rank=None,expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False):
-    """Save a model checkpoint.
+def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
+                    checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
+                    train_data_iterator=None):
+    """Save a model, optimizer and optionally dataloader checkpoint.
 
     Checkpointing context is used to persist some checkpointing state
     throughout a single job. Must be initialized externally (not used if None).
@@ -304,6 +305,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     "global" - Saved as a standard checkpoint (e.g., on Lustre) with old checkpoints being removed.
     "local" - [TBD] Each rank saves a portion of the checkpoint locally (e.g., on SSD/ramdisk).
     "in_memory" - [TBD] A special kind of local checkpoint that avoids serialization.
+
+    Dataloader checkpoint is only saved if the dataloader supports it. Currently this applies only
+    to the Megatron Energon dataloader (multimodal) and not the built-in Megatron dataloader (text-only).
     """
     start_ckpt = time()
     args = get_args()
@@ -337,6 +341,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     # Checkpoint name.
     checkpoint_name = get_checkpoint_name(save_dir, iteration, release=False, pipeline_parallel=pipeline_parallel,
         tensor_rank=tensor_rank, pipeline_rank=pipeline_rank, expert_parallel=expert_parallel, expert_rank=expert_rank, return_base_dir=use_dist_ckpt)
+
+    # Save dataloader state if the dataloader supports it (currently only Megatron Energon).
+    save_dataloader_state(train_data_iterator, iteration, getattr(args, "dataloader_save", None))
 
     # Save distributed optimizer's custom parameter state.
     if args.use_distributed_optimizer and not args.no_save_optim and optimizer is not None and not use_dist_ckpt:
@@ -457,6 +464,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     end_misc = time()
     logger.debug(f"rank: {rank}, takes {end_misc - start_misc} to finalize ckpt save ")
 
+
 def cleanup_old_non_persistent_checkpoint(save_dir, leave_ckpt_num=1, do_async=False):
     if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
         return
@@ -478,6 +486,54 @@ def cleanup_old_non_persistent_checkpoint(save_dir, leave_ckpt_num=1, do_async=F
         threading.Thread(target=remove_iter_ckpts, args=(rm_iter_ckpts,)).start()
     else:
         remove_iter_ckpts(rm_iter_ckpts)
+
+
+def save_dataloader_state(train_iterator, iteration, dataloader_save_path):
+    """Saves dataloader state if the dataloader supports it.
+
+    Currently, this is only used by Megatron Energon dataloader (multimodal) to store its state at a
+    specific iteration. The Megatron built-in dataloader (text-only) creates index files upfront
+    to track its state.
+
+    If the provided dataloader has `save_state` method, then it is called to save the state.
+    Otherwise, no state is saved.
+
+    Args:
+        train_iterator (iterable): Train dataloader.
+        iteration (int): Current iteration.
+        dataloader_save_path (str): Path where the dataloader state is saved.
+    """
+    # If no dataloader or saving path is provided, then exit early.
+    if train_iterator is None or dataloader_save_path is None:
+        return
+
+    # If dataloader doesn't support saving state, exit early.
+    if not hasattr(train_iterator, "save_state"):
+        return
+
+    # Save dataloader state for each data parallel rank only once.
+    first_rank = mpu.is_pipeline_first_stage(ignore_virtual=True) and mpu.get_tensor_model_parallel_rank() == 0
+    if not first_rank:
+        return
+
+    dp_rank = mpu.get_data_parallel_rank()
+    print(f"saving dataloader checkpoint at iteration {iteration} to {dataloader_save_path}")
+    train_dataloader_state_dict = train_iterator.save_state()
+    data_state_save_path = get_checkpoint_name(
+        dataloader_save_path, iteration,
+        basename=f'train_dataloader_dprank{dp_rank:03d}.pt'
+    )
+
+    torch.distributed.barrier(group=mpu.get_data_parallel_group())
+
+    if mpu.get_data_parallel_rank() == 0:
+        ensure_directory_exists(data_state_save_path)
+
+    torch.distributed.barrier(group=mpu.get_data_parallel_group())
+
+    dataloader_save_dict = {}
+    dataloader_save_dict['dataloader_state_dict'] = train_dataloader_state_dict
+    torch.save(dataloader_save_dict, data_state_save_path)
 
 
 def generate_state_dict(args, model, optimizer, opt_param_scheduler,

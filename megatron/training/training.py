@@ -318,7 +318,8 @@ def pretrain(
 
         if args.save and iteration != 0 and iteration % args.save_interval != 0:
             save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
-                            num_floating_point_operations_so_far, checkpointing_context)
+                            num_floating_point_operations_so_far, checkpointing_context,
+                            train_data_iterator=train_data_iterator)
 
         one_logger and one_logger.log_metrics({
             'app_train_loop_finish_time': one_logger_utils.get_timestamp_in_ms()
@@ -937,7 +938,7 @@ def compute_throughputs_and_append_to_progress_log(iteration,
 
 def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
                              num_floating_point_operations_so_far, checkpointing_context,
-                             non_persistent_ckpt=False):
+                             non_persistent_ckpt=False, train_data_iterator=None):
     args = get_args()
     timers = get_timers()
 
@@ -956,7 +957,7 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
         optimizer.disable_pre_hook()
     save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
                     num_floating_point_operations_so_far, checkpointing_context,
-                    non_persistent_ckpt=non_persistent_ckpt)
+                    non_persistent_ckpt=non_persistent_ckpt, train_data_iterator=train_data_iterator)
     if args.use_distributed_optimizer and args.overlap_param_gather:
         optimizer.enable_pre_hook()
     timers(timer_key).stop(barrier=True)
@@ -1095,7 +1096,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler,
                                      num_floating_point_operations_so_far,
-                                     checkpointing_context)
+                                     checkpointing_context, train_data_iterator=train_data_iterator)
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True)
 
@@ -1193,7 +1194,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 save_checkpoint_and_time(iteration, model, optimizer,
                                          opt_param_scheduler,
                                          num_floating_point_operations_so_far,
-                                         checkpointing_context)
+                                         checkpointing_context, train_data_iterator=train_data_iterator)
                 print_datetime('exiting program after receiving SIGTERM.')
                 exit = True
                 break
@@ -1203,7 +1204,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler,
                                      num_floating_point_operations_so_far,
-                                     checkpointing_context)
+                                     checkpointing_context, train_data_iterator=train_data_iterator)
             saved_checkpoint = True
 
         elif args.save and args.non_persistent_save_interval and \
@@ -1212,7 +1213,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler,
                                      num_floating_point_operations_so_far,
-                                     non_persistent_ckpt=True)
+                                     non_persistent_ckpt=True, train_data_iterator=train_data_iterator)
             saved_checkpoint = True
             timers('interval-time', log_level=0).start(barrier=True)
 
@@ -1230,7 +1231,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                     save_checkpoint_and_time(iteration, model, optimizer,
                                              opt_param_scheduler,
                                              num_floating_point_operations_so_far,
-                                             checkpointing_context)
+                                             checkpointing_context, train_data_iterator=train_data_iterator)
                 print_datetime('exiting program after {} minutes'.format(train_time))
                 exit = True
                 break
@@ -1241,7 +1242,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 save_checkpoint_and_time(iteration, model, optimizer,
                                          opt_param_scheduler,
                                          num_floating_point_operations_so_far,
-                                         checkpointing_context)
+                                         checkpointing_context, train_data_iterator=train_data_iterator)
             torch.distributed.barrier()
             print_datetime('exiting program at iteration {}'.format(iteration))
             exit = True
