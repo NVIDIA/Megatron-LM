@@ -654,11 +654,16 @@ class ParallelAttention(MegatronModule):
         slen, batch, num_key_value_heads_per_partition, head_dim = hidden_states.shape
         if n_rep == 1:
             return hidden_states
-        hidden_states = hidden_states[:, :, :, None, :].expand(
-            slen, batch, num_key_value_heads_per_partition, n_rep, head_dim)
-        return hidden_states.reshape(slen, batch,
-                                     num_key_value_heads_per_partition * n_rep,
-                                     head_dim)
+        elif num_key_value_heads_per_partition == 1:
+            # If no of KV heads is 1 then just perform expand operation
+            # instead of unsqueeze, expand and reshape to match query states.
+            return hidden_states.expand(slen, batch, n_rep, head_dim)
+        else:
+            hidden_states = hidden_states[:, :, :, None, :].expand(
+                slen, batch, num_key_value_heads_per_partition, n_rep, head_dim)
+            return hidden_states.reshape(slen, batch,
+                                         num_key_value_heads_per_partition * n_rep,
+                                         head_dim)
                                      
     def split_tensor(self, mixed_x_layer):
         query_layer, key_layer, value_layer = torch.split(mixed_x_layer, [self.num_key_value_groups, 1, 1], dim=-2)
