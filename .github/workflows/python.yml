@@ -32,4 +32,4 @@ jobs:
           python --version
       - name: Install Megatron-DeepSpeed
         run: |
-        pip3 install .
+          pip3 install .
