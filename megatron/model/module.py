@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron Module"""
@@ -10,10 +11,9 @@ from megatron import get_args
 from megatron.core import mpu, tensor_parallel
 
 
-_FLOAT_TYPES = [get_accelerator().FloatTensor(0).dtype]
-_HALF_TYPES = [get_accelerator().HalfTensor(0).dtype]
-_BF16_TYPES = [get_accelerator().BFloat16Tensor(0).dtype]
-
+_FLOAT_TYPES = None
+_HALF_TYPES = None
+_BF16_TYPES = None
 
 
 def param_is_not_shared(param):
@@ -131,6 +131,9 @@ def conversion_helper(val, conversion):
 
 def fp32_to_float16(val, float16_convertor):
     """Convert fp32 `val` to fp16/bf16"""
+    global _FLOAT_TYPES
+    if _FLOAT_TYPES is None:
+        _FLOAT_TYPES = [get_accelerator().FloatTensor(0).dtype]
     def half_conversion(val):
         val_typecheck = val
         if isinstance(val_typecheck, (Parameter, Variable)):
@@ -143,6 +146,11 @@ def fp32_to_float16(val, float16_convertor):
 
 def float16_to_fp32(val):
     """Convert fp16/bf16 `val` to fp32"""
+    global _HALF_TYPES, _BF16_TYPES
+    if _HALF_TYPES is None:
+        _HALF_TYPES = [get_accelerator().HalfTensor(0).dtype]
+    if _BF16_TYPES is None:
+        _BF16_TYPES = [get_accelerator().BFloat16Tensor(0).dtype]
     def float_conversion(val):
         val_typecheck = val
         if isinstance(val_typecheck, (Parameter, Variable)):

@@ -235,7 +235,7 @@ def get_args():
         print("Are you sure you don't want to split sentences?")
 
     # some default/dummy values for the tokenizer
-    args.rank = 1
+    args.rank = 0
     args.make_vocab_size_divisible_by = 128
     args.tensor_model_parallel_size = 1
     args.vocab_extra_ids = 0
