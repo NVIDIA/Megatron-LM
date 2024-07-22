@@ -29,6 +29,10 @@ try:
 
     HAVE_TE = True
 except ImportError:
+    import warnings
+
+    warnings.warn(f'Transformer Engine is not installed. Falling back to Megatron Local')
+    
     HAVE_TE = False
 
 try:
@@ -50,6 +54,9 @@ except ImportError:
 def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
     """T5 encoder TE spec (uses Transformer Engine components)."""
 
+    if not HAVE_TE:
+        return encoder_model_with_local_spec()
+    
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
@@ -80,6 +87,9 @@ def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
 def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
     """T5 decoder TE spec (uses Transformer Engine components)."""
 
+    if not HAVE_TE:
+        return decoder_model_with_local_spec()
+    
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(

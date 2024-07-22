@@ -3,7 +3,20 @@
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
-from megatron.core.transformer.custom_layers.transformer_engine import TEDotProductAttention, TENorm
+
+try:
+    from megatron.core.transformer.custom_layers.transformer_engine import (
+            TEDotProductAttention as DotProductAttention, TENorm as WrappedTorchLayerNorm
+    )
+except ImportError:
+    import warnings
+
+    warnings.warn(f'Transformer Engine is not installed. Falling back to Megatron Local')
+    
+    from megatron.core.transformer.dot_product_attention import DotProductAttention
+    from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
+
+
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
@@ -30,20 +43,20 @@ def get_gpt_layer_modelopt_spec(
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
-            input_layernorm=TENorm,
+            input_layernorm=WrappedTorchLayerNorm,
             self_attention=ModuleSpec(
                 module=SelfAttention,
                 params={"attn_mask_type": AttnMaskType.causal},
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=ColumnParallelLinear,
-                    core_attention=TEDotProductAttention,
+                    core_attention=DotProductAttention,
                     linear_proj=RowParallelLinear,
-                    q_layernorm=TENorm if qk_layernorm else IdentityOp,
-                    k_layernorm=TENorm if qk_layernorm else IdentityOp,
+                    q_layernorm=WrappedTorchLayerNorm if qk_layernorm else IdentityOp,
+                    k_layernorm=WrappedTorchLayerNorm if qk_layernorm else IdentityOp,
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=TENorm,
+            pre_mlp_layernorm=WrappedTorchLayerNorm,
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(

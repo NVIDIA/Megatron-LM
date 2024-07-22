@@ -24,6 +24,8 @@ try:
 
     HAVE_TE = True
 except ImportError:
+    import warnings
+    warnings.warn(f'Transformer Engine is not installed. Falling back to Megatron Local')
     HAVE_TE = False
 
 try:
@@ -46,6 +48,12 @@ except ImportError:
 def get_gpt_layer_with_transformer_engine_spec(
     num_experts: int = None, moe_grouped_gemm: bool = False, qk_layernorm: bool = False
 ) -> ModuleSpec:
+    
+    if not HAVE_TE:
+        return get_gpt_layer_local_spec(num_experts=num_experts,
+                                        moe_grouped_gemm=moe_grouped_gemm,
+                                        qk_layernorm=qk_layernorm,
+                                        )
     mlp = _get_mlp_module_spec(
         use_te=True, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
     )

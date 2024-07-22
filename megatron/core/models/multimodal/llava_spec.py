@@ -7,13 +7,25 @@ from megatron.core.transformer.attention import (
     SelfAttention,
     SelfAttentionSubmodules,
 )
-from megatron.core.transformer.custom_layers.transformer_engine import (
-    TEColumnParallelLinear,
-    TEDotProductAttention,
-    TELayerNormColumnParallelLinear,
-    TENorm,
-    TERowParallelLinear,
-)
+try :
+    from megatron.core.transformer.custom_layers.transformer_engine import (
+        TEColumnParallelLinear,
+        TEDotProductAttention,
+        TELayerNormColumnParallelLinear,
+        TENorm,
+        TERowParallelLinear,
+    )
+    HAVE_TE=True
+except ImportError:
+    from megatron.core.transformer.dot_product_attention import DotProductAttention
+    from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
+    from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+    import warnings
+
+    warnings.warn(f'Transformer Engine is not installed. Falling back to Megatron Local')
+    
+    HAVE_TE = False
+
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
@@ -31,8 +43,41 @@ def decoder_model_with_transformer_engine_default_spec(
     num_experts: int = None, moe_grouped_gemm: bool = False, qk_layernorm: bool = False
 ) -> ModuleSpec:
     """LLava decoder TE spec (uses Transformer Engine components)."""
+
+    if not HAVE_TE:
+        return decoder_model_with_local_default_spec(num_experts=num_experts,
+                                                     moe_grouped_gemm=moe_grouped_gemm,
+                                                     qk_layernorm=qk_layernorm)
     mlp = _get_mlp_module_spec(
         use_te=True, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
+    )
+    return ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            self_attention=ModuleSpec(
+                module=SelfAttention,
+                params={"attn_mask_type": AttnMaskType.causal},
+                submodules=SelfAttentionSubmodules(
+                    linear_qkv=TELayerNormColumnParallelLinear,
+                    core_attention=TEDotProductAttention,
+                    linear_proj=TERowParallelLinear,
+                    q_layernorm=TENorm if qk_layernorm else IdentityOp,
+                    k_layernorm=TENorm if qk_layernorm else IdentityOp,
+                ),
+            ),
+            self_attn_bda=get_bias_dropout_add,
+            mlp=mlp,
+            mlp_bda=get_bias_dropout_add,
+        ),
+    )
+
+
+def decoder_model_with_local_default_spec(
+    num_experts: int = None, moe_grouped_gemm: bool = False, qk_layernorm: bool = False
+) -> ModuleSpec:
+    """LLava decoder TE spec (uses Transformer Engine components)."""
+    mlp = _get_mlp_module_spec(
+        use_te=False, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
     )
     return ModuleSpec(
         module=TransformerLayer,

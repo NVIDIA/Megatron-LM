@@ -16,7 +16,18 @@ from megatron.core import parallel_state
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers
 from megatron.core.tensor_parallel import get_device_rng_tracker
-from megatron.core.transformer.custom_layers.transformer_engine import TENorm
+
+try:
+    from megatron.core.transformer.custom_layers.transformer_engine import (
+            TENorm as WrappedTorchLayerNorm
+    )
+except ImportError:
+    from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
+    import warnings
+
+    warnings.warn(f'Transformer Engine is not installed. Falling back to Megatron Local')
+   
+
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -139,7 +150,7 @@ class MambaStack(MegatronModule):
 
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
-            self.final_norm = TENorm(
+            self.final_norm = WrappedTorchLayerNorm(
                 config=self.config,
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,

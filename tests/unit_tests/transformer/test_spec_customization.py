@@ -14,12 +14,18 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
-from megatron.core.transformer.custom_layers.transformer_engine import (
-    TEDotProductAttention,
-    TELayerNormColumnParallelLinear,
-    TENorm,
-    TERowParallelLinear,
-)
+
+try: 
+    from megatron.core.transformer.custom_layers.transformer_engine import (
+        TEDotProductAttention,
+        TELayerNormColumnParallelLinear,
+        TENorm,
+        TERowParallelLinear,
+    )
+    HAVE_TE=True
+except ImportError:
+    HAVE_TE = False
+
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
@@ -30,6 +36,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayer, Transf
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine is not available")
 class TestSpecCustomization:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)

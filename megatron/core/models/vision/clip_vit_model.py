@@ -6,7 +6,17 @@ from megatron.core.device_utils import get_current_device
 import torch
 
 from megatron.core.models.common.vision_module.vision_module import VisionModule
-from megatron.core.transformer.custom_layers.transformer_engine import TENorm
+try:
+    from megatron.core.transformer.custom_layers.transformer_engine import (
+            TENorm as WrappedTorchLayerNorm
+    )
+except ImportError:
+    from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
+    import warnings
+
+    warnings.warn(f'Transformer Engine is not installed. Falling back to Megatron Local')
+    
+
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -32,7 +42,7 @@ class CLIPViTModel(VisionModule):
         self,
         transformer_config: TransformerConfig,
         transformer_layer_spec: ModuleSpec,
-        ln_pre_impl: Union[ModuleSpec, type] = TENorm,
+        ln_pre_impl: Union[ModuleSpec, type] = WrappedTorchLayerNorm,
         add_class_token: bool = True,
         class_token_len: int = 1,
         patch_dim: int = 14,
