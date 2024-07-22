@@ -85,11 +85,9 @@ jet-results-summary:
       - scripts
   allow_failure: true
   rules:
-    - if: '$FUNCTIONAL_TEST == "yes" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/ )'
-      allow_failure: true
-      when: always
     - if: '$FUNCTIONAL_TEST == "yes"'
       when: always
+    - when: never
       
 jet-results-notify:
   extends: [.jet_common]
@@ -113,8 +111,6 @@ jet-results-notify:
       - scripts
   allow_failure: true
   rules:
-    - if: '$FUNCTIONAL_TEST == "yes" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/ )'
-      allow_failure: true
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
       when: always
-    - if: '$FUNCTIONAL_TEST == "yes"'
-      when: always
+    - when: never
