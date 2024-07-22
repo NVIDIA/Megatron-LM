@@ -6,6 +6,7 @@ import os
 from enum import Enum
 from typing import Dict, List, Optional
 
+from ..device_utils import get_current_device
 import torch
 
 from ..utils import log_on_each_pipeline_stage
@@ -114,7 +115,7 @@ class Bucket:
             assert not norm.isnan(), (
                 f'Rank {global_rank}: found NaN in local grad norm in '
                 f'backward pass before data-parallel communication collective. '
-                f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
+                f'Device: {get_current_device()}, node: {os.uname()[1]}'
             )
 
         # gradient_scaling_factor already takes into account whether we are computing
@@ -360,13 +361,13 @@ class ParamAndGradBuffer:
             self.param_data = torch.zeros(
                 self.numel,
                 dtype=self.param_dtype,
-                device=torch.cuda.current_device(),
+                device=get_current_device(),
                 requires_grad=False,
             )
         self.grad_data = torch.zeros(
             self.numel,
             dtype=self.grad_dtype,
-            device=torch.cuda.current_device(),
+            device=get_current_device(),
             requires_grad=False,
         )
 

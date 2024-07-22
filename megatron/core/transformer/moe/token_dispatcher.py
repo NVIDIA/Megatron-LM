@@ -3,6 +3,7 @@
 from abc import abstractmethod
 from typing import List, Optional, Tuple
 
+from megatron.core.device_utils import get_current_device
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
@@ -266,7 +267,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
                 unpermuted_global_hidden = torch.zeros(
                     global_hidden_shape,
                     dtype=hidden_states.dtype,
-                    device=torch.cuda.current_device(),
+                    device=get_current_device(),
                 )
                 output_total = unpermuted_global_hidden.scatter_add(
                     0, self.global_local_map, unpermuted_local_hidden
@@ -320,7 +321,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.expert_ids_per_ep_rank = torch.tensor(
                 [i % self.num_local_experts for i in range(self.num_experts)],
                 dtype=torch.int32,
-                device=torch.cuda.current_device(),
+                device=get_current_device(),
             )
         self.local_expert_indices = local_expert_indices
         assert (

@@ -1,3 +1,4 @@
+from megatron.core.device_utils import get_current_device
 import torch
 
 from megatron.core import parallel_state
@@ -16,7 +17,7 @@ def broadcast_from_last_pipeline_stage(size, dtype, tensor=None):
         _is_cuda(tensor)
         assert tensor.is_contiguous()
     else:
-        tensor = torch.empty(size, dtype=dtype, device=torch.cuda.current_device())
+        tensor = torch.empty(size, dtype=dtype, device=get_current_device())
     # Get the group and corresponding source rank.
     src = parallel_state.get_pipeline_model_parallel_last_rank()
     group = parallel_state.get_pipeline_model_parallel_group()
@@ -34,7 +35,8 @@ def recv_from_prev_pipeline_rank_(recv_buffer=None):
     for req in reqs:
         req.wait()
     # To protect against race condition when using batch_isend_irecv().
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
 
 def send_to_next_pipeline_rank(tensor=None):
@@ -46,4 +48,5 @@ def send_to_next_pipeline_rank(tensor=None):
     for req in reqs:
         req.wait()
     # To protect against race condition when using batch_isend_irecv().
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+            torch.cuda.synchronize()

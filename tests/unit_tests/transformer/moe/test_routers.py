@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.core.device_utils import get_current_device
 import pytest
 
 import torch
@@ -48,10 +49,10 @@ class TestTop2Router:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_router_forward(self):
         with torch.no_grad():
-            self.router = self.router.cuda()
+            self.router = self.router.to(device=get_current_device())
             # [num tokens, hidden size]
             hidden_states = torch.randn((32, 2, self.router.config.hidden_size))
-            hidden_states = hidden_states.cuda()
+            hidden_states = hidden_states.to(device=get_current_device())
             scores, indices = self.router(hidden_states)
             print(scores.shape, indices.shape)
             assert scores.shape == (64, 2)
@@ -62,11 +63,11 @@ class TestTop2Router:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_aux_loss(self):
-        self.sequential_mlp = self.sequential_mlp.cuda()
+        self.sequential_mlp = self.sequential_mlp.to(device=get_current_device())
         
         # Without aux loss
         hidden_states = torch.randn((32, 2, self.router.config.hidden_size))
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
         out = self.sequential_mlp(hidden_states)[0]
         out.sum().mul_(0).backward()
         assert self.sequential_mlp.router.weight.grad.abs().sum() == 0

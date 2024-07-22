@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.core.device_utils import get_current_device
 import pytest
 
 import torch
@@ -46,11 +47,11 @@ class TestBaseEmbedding:
         assert embeddings.shape[2] == self.base_embedding.config.hidden_size
 
     def test_gpu_forward(self):
-        self.base_embedding.cuda()
+        self.base_embedding.to(device=get_current_device())
         input_ids = torch.tensor(
-            [0, 1, 2, 3], dtype=torch.int64).repeat((2, 1)).cuda()
+            [0, 1, 2, 3], dtype=torch.int64).repeat((2, 1)).to(device=get_current_device())
         position_ids = torch.tensor(
-            [0, 1, 2, 3], dtype=torch.int64).repeat((2, 1)).cuda()
+            [0, 1, 2, 3], dtype=torch.int64).repeat((2, 1)).to(device=get_current_device())
         embeddings = self.base_embedding(input_ids, position_ids)
         assert embeddings.device.type == 'cuda'
         assert embeddings.shape[0] == self.base_embedding.max_sequence_length

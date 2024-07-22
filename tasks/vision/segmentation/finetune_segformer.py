@@ -2,6 +2,7 @@
 
 """Vision-classification finetuning/evaluation."""
 
+from megatron.core.device_utils import get_current_device
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -73,8 +74,8 @@ def segmentation():
 
     def process_batch(batch):
         """Process batch and produce inputs for the model."""
-        images = batch[0].cuda().contiguous()
-        masks = batch[1].cuda().contiguous()
+        images = batch[0].to(device=get_current_device()).contiguous()
+        masks = batch[1].to(device=get_current_device()).contiguous()
         return images, masks
 
     def calculate_weight(masks, num_classes):
@@ -182,7 +183,7 @@ def segmentation():
             m.train()
         # Reduce.
         if mpu.is_pipeline_last_stage():
-            performs_tensor = torch.cuda.FloatTensor(performs)
+            performs_tensor = torch.tensor(performs, dtype=torch.float, device=get_current_device())
             torch.distributed.all_reduce(performs_tensor,
                                          group=mpu.get_data_parallel_group())
             hist = performs_tensor.cpu().numpy()

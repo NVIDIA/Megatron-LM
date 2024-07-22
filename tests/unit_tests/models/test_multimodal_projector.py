@@ -1,5 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import os
+from megatron.core.device_utils import get_current_device
 import pytest
 
 import torch
@@ -7,17 +9,16 @@ import torch
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from tests.unit_tests.test_utilities import Utils
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.models.gpt.gpt_layer_specs import _get_mlp_module_spec
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
-
 
 class TestMultimodalProjector:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1,1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         transformer_config = TransformerConfig(num_layers=1, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True)
         mlp_layer_spec = _get_mlp_module_spec().submodules
         
@@ -42,10 +43,10 @@ class TestMultimodalProjector:
         assert num_weights == 65600
 
     def test_forward(self):
-        self.mlp.cuda()
-        self.affine.cuda()
+        self.mlp.to(device=get_current_device())
+        self.affine.to(device=get_current_device())
 
-        image_projection = torch.zeros((2, 1024)).cuda()
+        image_projection = torch.zeros((2, 1024)).to(device=get_current_device())
 
         logits = self.mlp.forward(image_projection)
         assert len(logits) == 2

@@ -2,6 +2,7 @@
 
 """Finetune utilities."""
 
+from megatron.core.device_utils import get_current_device
 import torch
 import torch.nn.functional as F
 from megatron.training import get_args
@@ -21,8 +22,8 @@ from megatron.core.enums import ModelType
 
 def process_batch(batch):
     """Process batch and produce inputs for the model."""
-    images = batch[0].cuda().contiguous()
-    labels = batch[1].cuda().contiguous()
+    images = batch[0].to(device=get_current_device()).contiguous()
+    labels = batch[1].to(device=get_current_device()).contiguous()
     return images, labels
 
 

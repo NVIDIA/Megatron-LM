@@ -1,3 +1,4 @@
+from megatron.core.device_utils import get_current_device
 import torch.nn.functional as F
 import torch
 from megatron.training import print_rank_0, get_args
@@ -53,8 +54,8 @@ def compute_feature_bank(model):
 
     with torch.no_grad():
         for i, batch in enumerate(dataloader):
-            images = batch[0].cuda().contiguous()
-            labels = batch[1].cuda().contiguous()
+            images = batch[0].to(device=get_current_device()).contiguous()
+            labels = batch[1].to(device=get_current_device()).contiguous()
             student_feature, teacher_feature = model[0](images)
             feature = F.normalize(teacher_feature.float(), dim=1)
             feature_bank.append(feature)

@@ -2,6 +2,7 @@
 
 
 """Generation utilities."""
+from megatron.core.device_utils import get_current_device
 import torch
 import torch.nn.functional as F
 from megatron.training import get_args, get_tokenizer
@@ -96,14 +97,14 @@ def retro_generate_tokens_probs_and_return_on_first_stage(
         if return_output_log_probs:
             output_log_probs = torch.empty(output_log_probs_size,
                                            dtype=torch.float32,
-                                           device=torch.cuda.current_device())
+                                           device=get_current_device())
         generated_sequence_lengths = torch.ones(
             batch_size, dtype=torch.int64,
-            device=torch.cuda.current_device()) * max_sequence_length
+            device=get_current_device()) * max_sequence_length
 
     # Whether we have reached a termination id.
     is_generation_done = torch.zeros(batch_size, dtype=torch.uint8,
-                                     device=torch.cuda.current_device())
+                                     device=get_current_device())
 
     # =============
     # Run infernece
@@ -120,8 +121,9 @@ def retro_generate_tokens_probs_and_return_on_first_stage(
             # get the chunks for retrieval
             if torch.distributed.get_rank() == 0:
                 neighbor_tokens = neighbours_array
-                neighbor_tokens_cuda_long_tensor = torch.cuda.LongTensor(
-                    neighbor_tokens.reshape((-1, retro_args.retro_gpt_retrieved_length)))
+                neighbor_tokens_cuda_long_tensor = torch.tensor(
+                    neighbor_tokens.reshape((-1, retro_args.retro_gpt_retrieved_length)),
+                    dtype=torch.long, device=get_current_device())
                 sizes_list = [neighbor_tokens_cuda_long_tensor.size(0),  # Batch size
                               neighbor_tokens_cuda_long_tensor.size(1)]  # Sequence lenght
             sizes_tensor = broadcast_int_list(2, int_list=sizes_list)

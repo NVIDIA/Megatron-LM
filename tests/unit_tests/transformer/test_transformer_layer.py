@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 
+from megatron.core.device_utils import get_current_device
 import pytest
 
 import torch
@@ -8,7 +9,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from tests.unit_tests.test_utilities import Utils
@@ -18,7 +19,7 @@ class TestParallelTransformerLayer:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1,1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
         self.parallel_transformer_layer = TransformerLayer(transformer_config,
                                                            get_gpt_layer_with_transformer_engine_spec().submodules)
@@ -39,13 +40,13 @@ class TestParallelTransformerLayer:
         config: TransformerConfig = parallel_transformer_layer.config
         sequence_length = 32
         micro_batch_size = 2
-        parallel_transformer_layer.cuda()
+        parallel_transformer_layer.to(device=get_current_device())
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones((sequence_length, micro_batch_size, config.hidden_size))
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
 
-        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).to(device=get_current_device())
 
         hidden_states, context = parallel_transformer_layer(hidden_states=hidden_states, attention_mask=attention_mask)
         assert hidden_states.shape[0] == sequence_length
@@ -58,7 +59,7 @@ class TestParallelTransformerLayer:
         Utils.destroy_model_parallel()
         Utils.initialize_model_parallel(*tp_pp, order=order)
 
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         transformer_config = TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=8, use_cpu_initialization=True)
         parallel_transformer_layer = TransformerLayer(transformer_config,
                                                       get_gpt_layer_with_transformer_engine_spec().submodules)

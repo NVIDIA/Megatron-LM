@@ -4,6 +4,7 @@ from commons import set_random_seed
 from commons import IdentityLayer
 from commons import print_separator
 from commons import initialize_distributed
+from megatron.core.device_utils import get_current_device
 from mpu.cross_entropy import vocab_parallel_cross_entropy
 import mpu
 import torch.nn.functional as F
@@ -17,10 +18,9 @@ def torch_cross_entropy(batch_size, seq_length, vocab_size,
                         logits_scale, seed):
     set_random_seed(seed)
     identity = IdentityLayer((batch_size, seq_length, vocab_size),
-                             scale=logits_scale).cuda()
+                             scale=logits_scale).to(device=get_current_device())
     logits = identity()
-    target = torch.cuda.LongTensor(
-        size=(batch_size, seq_length)).random_(0, vocab_size)
+    target=torch.randint(low=0, high=vocab_size, size=(batch_size, seq_length), dtype=torch.long, evice=get_current_device())
     loss = F.cross_entropy(logits.view(-1, logits.size()[-1]),
                            target.view(-1),
                            reduction='none').view_as(target).mean()
@@ -32,11 +32,10 @@ def mpu_cross_entropy(batch_size, seq_length, vocab_size,
                       logits_scale, seed):
     set_random_seed(seed)
     identity = IdentityLayer((batch_size, seq_length, vocab_size),
-                             scale=logits_scale).cuda()
+                             scale=logits_scale).to(device=get_current_device())
     logits = identity()
     logits_parallel = mpu.scatter_to_tensor_model_parallel_region(logits)
-    target = torch.cuda.LongTensor(
-        size=(batch_size, seq_length)).random_(0, vocab_size)
+    target=torch.randint(low=0, high=vocab_size, size=(batch_size, seq_length), dtype=torch.long, device=get_current_device())
     loss = vocab_parallel_cross_entropy(logits_parallel, target).mean()
     loss.backward()
     return loss, identity.weight.grad

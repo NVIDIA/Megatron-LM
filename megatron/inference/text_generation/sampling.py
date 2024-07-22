@@ -53,7 +53,8 @@ def sample(logits, top_k=0, top_p=0.0, temperature=1.0, vocab_size=None):
 
     # Check logits for consistency.
     assert logits.ndim == 2, 'expected the logits to be of [b, v] shape.'
-    assert logits.type() == 'torch.cuda.FloatTensor', \
+    logits_type = logits.type().split('.')[-1]
+    assert logits_type == 'FloatTensor', \
         'input logits should be floats.'
 
 

@@ -6,6 +6,7 @@ from pathlib import Path
 from time import time
 from typing import Dict, List, NamedTuple, Optional, Set, Tuple, TypeVar, cast
 
+from megatron.core.device_utils import get_current_device
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -290,7 +291,8 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             )
 
         sync_start = time()
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         end = time()
         logger.debug(f'torch.cuda.synchronize took {end - sync_start}s')
         logger.debug(f'self.exchange_loaded_tensors took {end - start}s')
@@ -496,7 +498,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                                 all_loaded_tensors.keys(),
                             )
                             orig_device = all_loaded_tensors[shard_id]
-                            all_loaded_tensors[shard_id] = all_loaded_tensors[shard_id].cuda()
+                            all_loaded_tensors[shard_id] = all_loaded_tensors[shard_id].to(device=get_current_device())
                             local_ten = all_loaded_tensors[shard_id]
                         else:
                             local_ten, orig_device = self._get_empty_tensor_for_exchange(
@@ -563,7 +565,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             if rank == local_rank:
                 assert shard_id in all_loaded_tensors, (shard_id, all_loaded_tensors.keys())
                 orig_device = all_loaded_tensors[shard_id].device
-                local_ten = all_loaded_tensors[shard_id].cuda()
+                local_ten = all_loaded_tensors[shard_id].to(device=get_current_device())
             else:
                 local_ten, orig_device = self._get_empty_tensor_for_exchange(
                     shard_id, unloaded_shards, shard_to_metadata, all_loaded_tensors

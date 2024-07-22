@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from importlib.metadata import version
 from typing import Union
 
+from megatron.core.device_utils import get_current_device
 import torch
 from pkg_resources import packaging
 
@@ -170,7 +171,7 @@ class Attention(MegatronModule, ABC):
             self.num_query_groups_per_partition,
             self.hidden_size_per_attention_head,
             dtype=dtype,
-            device=torch.cuda.current_device(),
+            device=get_current_device(),
         )
 
     def _adjust_key_value_for_inference(self, inference_params, key, value, rotary_pos_emb):

@@ -9,6 +9,8 @@ import logging
 import math
 import os
 import sys
+
+from megatron.core.device_utils import get_current_device
 from .log_handler import CustomHandler
 # Make default logging level INFO, but filter out all log messages not from MCore.
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
@@ -440,7 +442,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     # GPU allocation.
     for model_module in model:
-        model_module.cuda(torch.cuda.current_device())
+        model_module.cuda(get_current_device())
 
     # Fp16 conversion.
     if args.fp16 or args.bf16:
@@ -603,7 +605,7 @@ def train_step(forward_step_func, data_iterator,
         forward_only=False)
 
     # Empty unused memory.
-    if args.empty_unused_memory_level >= 1:
+    if args.empty_unused_memory_level >= 1 and torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     # Vision gradients.
@@ -1315,7 +1317,7 @@ def evaluate(forward_step_func,
                 for loss_dict in loss_dicts:
                     for key in loss_dict:
                         if key not in total_loss_dict:
-                            total_loss_dict[key] = torch.tensor([0.0, 0.0], dtype=torch.float).cuda()
+                            total_loss_dict[key] = torch.tensor([0.0, 0.0], dtype=torch.float).to(device=get_current_device())
                         val = loss_dict[key]
                         if isinstance(val, tuple) or isinstance(val, list):
                             total_loss_dict[key][0] += val[0]

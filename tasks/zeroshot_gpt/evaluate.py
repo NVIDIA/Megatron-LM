@@ -4,6 +4,7 @@
 
 import math
 
+from megatron.core.device_utils import get_current_device
 import torch
 
 from megatron.training import get_args
@@ -52,8 +53,8 @@ def process_batch(batch):
     args = get_args()
     tokenizer = get_tokenizer()
 
-    loss_mask = batch['pad_mask'].long().cuda().contiguous().byte()
-    tokens_ = batch['text'].long().cuda().contiguous()
+    loss_mask = batch['pad_mask'].long().to(device=get_current_device()).contiguous().byte()
+    tokens_ = batch['text'].long().to(device=get_current_device()).contiguous()
     labels = tokens_[:, 1:].contiguous()
     tokens = tokens_[:, :-1].contiguous()
 

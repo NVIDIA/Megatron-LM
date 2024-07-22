@@ -2,6 +2,7 @@
 """Pretrain Mamba."""
 
 import os
+from megatron.core.device_utils import get_current_device
 import torch
 from functools import partial
 
@@ -128,7 +129,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
         global_rank = torch.distributed.get_rank()
         assert not loss[0].isnan(), (
             f'Rank {global_rank}: found NaN in local forward loss calculation. '
-            f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
+            f'Device: {get_current_device()}, node: {os.uname()[1]}'
         )
 
     # Reduce loss for logging.

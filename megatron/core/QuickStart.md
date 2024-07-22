@@ -36,15 +36,19 @@ import os
 import torch
 from megatron.core import parallel_state
 
-def initialize_distributed(tensor_model_parallel_size = 1, pipeline_model_parallel_size = 1):
+def initialize_distributed(tensor_model_parallel_size=1, pipeline_model_parallel_size=1):
+    parallel_state.destroy_model_parallel()
+
     # Torch setup for distributed training
-    rank = int(os.environ['LOCAL_RANK'])
-    world_size = torch.cuda.device_count()
-    torch.cuda.set_device(rank)
-    torch.distributed.init_process_group(world_size=world_size, rank=rank)
+    local_rank = int(os.environ['LOCAL_RANK'])
+    local_world_size = get_local_device_count()
+    torch.distributed.init_process_group(backend=get_distributed_backend(), 
+                                         init_nmethod=get_distributed_init_method(), 
+                                         world_size=local_world_size, rank=local_rank)
 
     # Megatron core distributed training initialization
     parallel_state.initialize_model_parallel(tensor_model_parallel_size, pipeline_model_parallel_size)
+
 ```
 <br>
 
@@ -178,14 +182,14 @@ The following is the main function that needs to go into your script.
 from pathlib import Path
 from torch.optim import Adam
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 
 if __name__ == "__main__":
     initialize_distributed(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
-    model_parallel_cuda_manual_seed(123)
+    model_parallel_device_manual_seed(123)
 
     gpt_model = model_provider()
-    device = torch.device("cuda")
+    device = get_current_device()
     gpt_model.to(device)
 
     optim = Adam(gpt_model.parameters())

@@ -1,21 +1,22 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import os
+from megatron.core.device_utils import get_current_device
 import pytest
 import torch
 
 from megatron.core import InferenceParams
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
-
 
 class TestMambaModel:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         transformer_config = TransformerConfig(
             num_layers=3,  # 1 Mamba layer, 1 attention layer, 1 MLP layer
             hidden_size=256,  # The Mamba layer places several constraints on this
@@ -61,14 +62,14 @@ class TestMambaModel:
         sequence_length = self.model.max_sequence_length
         micro_batch_size = 2
 
-        self.model.cuda()
+        self.model.to(device=get_current_device())
 
         data = list(range(sequence_length))
-        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device=get_current_device())
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device=get_current_device())
         attention_mask = torch.ones(
             (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
-        ).cuda()
+        ).to(device=get_current_device())
 
         logits = self.model.forward(
             input_ids=input_ids,
@@ -88,7 +89,7 @@ class TestMambaModel:
         )
         prompt_length = self.model.max_sequence_length - 1
 
-        self.model.cuda()
+        self.model.to(device=get_current_device())
 
         # load-context/first-output-token, step/generate
         for offset in (0, prompt_length):
@@ -99,13 +100,13 @@ class TestMambaModel:
             inference_params.sequence_len_offset = offset
 
             data = list(range(sequence_length))
-            input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+            input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device=get_current_device())
             position_ids = (
-                torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+                torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device=get_current_device())
             )
             attention_mask = torch.ones(
                 (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
-            ).cuda()
+            ).to(device=get_current_device())
 
             logits = self.model.forward(
                 input_ids=input_ids,

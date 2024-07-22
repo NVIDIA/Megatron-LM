@@ -9,6 +9,7 @@ from collections import deque
 from time import time
 from typing import Callable, List, NamedTuple, Optional, Tuple
 
+from megatron.core.device_utils import get_current_device
 import torch
 from torch import multiprocessing as mp
 
@@ -93,7 +94,8 @@ class DistributedAsyncCaller:
         if async_fn is None:
             return  # nothing to do
         start_sync = time()
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         end_sync = time()
         logger.debug(
             f"rank: {torch.distributed.get_rank()}, takes {end_sync - start_sync} to finish D2H "
@@ -128,7 +130,7 @@ class DistributedAsyncCaller:
         """
         # The following takes the same overhead as torch.distributed.barrier (single integer all-reduce)
         is_alive = int(self.process.is_alive()) if self.process is not None else 0
-        ten = torch.tensor([is_alive], dtype=torch.int, device=torch.cuda.current_device())
+        ten = torch.tensor([is_alive], dtype=torch.int, device=get_current_device())
         logger.debug(
             f"rank: {torch.distributed.get_rank()}, DistributedAsyncCaller is_alive: {is_alive}"
         )
@@ -214,7 +216,7 @@ class AsyncCallsQueue:
             call_idx, _, async_request = self.async_calls.popleft()
             for finalize_fn in async_request.finalize_fns:
                 finalize_fn()
-            ten = torch.tensor([call_idx], dtype=torch.int, device=torch.cuda.current_device())
+            ten = torch.tensor([call_idx], dtype=torch.int, device=get_current_device())
             torch.distributed.all_reduce(ten, op=torch.distributed.ReduceOp.MAX)
             assert (
                 ten.item() == call_idx

@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.core.device_utils import get_current_device
 import pytest
 from pkg_resources import packaging
 from importlib.metadata import version
@@ -133,15 +134,15 @@ class TestParallelGroupedMLP:
         not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8, reason='GroupedGEMM kernels are not supported on this device.'
     )
     def test_gpu_forward(self):
-        self.sequential_mlp.cuda()
-        self.grouped_mlp.cuda()
+        self.sequential_mlp.to(device=get_current_device())
+        self.grouped_mlp.to(device=get_current_device())
         # [sequence length, batch size, hidden size]
         seq_len = 3 #32
         batch_size = 2
         hidden_states = torch.rand(
             (seq_len, batch_size, self.sequential_mlp.config.hidden_size),
             dtype=torch.bfloat16)
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
         output_smm, _ = self.sequential_mlp(hidden_states)
         output_gmm, _ = self.grouped_mlp(hidden_states)
 
@@ -159,7 +160,7 @@ class TestParallelGroupedMLP:
         num_allocated_tokens = 0
         tokens_per_expert = torch.zeros(self.num_experts)
         hidden_states = torch.rand((num_allocated_tokens, self.hidden_size), dtype=torch.bfloat16)
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
         try:
             gg.ops.gmm(hidden_states, w1, tokens_per_expert, trans_b=False)
         except Exception as e:
@@ -172,11 +173,11 @@ class TestParallelGroupedMLP:
     )
     def test_gradient_with_no_tokens_allocated(self):
         """Test that when no token is passed in, the parameters of the grouped MLP will also have gradients."""
-        self.grouped_mlp.cuda()
+        self.grouped_mlp.to(device=get_current_device())
         num_allocated_tokens = 0
         tokens_per_expert = torch.zeros(self.num_experts)
         hidden_states = torch.rand((num_allocated_tokens, self.hidden_size), dtype=torch.bfloat16)
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
         output_gmm, _ = self.grouped_mlp.experts(
             hidden_states,
             tokens_per_expert=tokens_per_expert,
@@ -285,8 +286,8 @@ class TestTEGroupedMLP:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_gpu_forward_backward(self):
-        self.sequential_mlp.cuda()
-        self.grouped_mlp.cuda()
+        self.sequential_mlp.to(device=get_current_device())
+        self.grouped_mlp.to(device=get_current_device())
         # Copy the weights to ensure the same init value
         with torch.no_grad():
             for i in range(self.num_experts):
@@ -302,7 +303,7 @@ class TestTEGroupedMLP:
         hidden_states = torch.rand(
             (seq_len, batch_size, self.hidden_size),
             dtype=torch.bfloat16,
-            device="cuda",
+            device=get_current_device(),
             requires_grad=True,
         )
         hidden_states.retain_grad()
@@ -328,11 +329,11 @@ class TestTEGroupedMLP:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_gpu_forward_backward_with_no_tokens_allocated(self):
         """Test the case when no token is allocated for groupedGEMM kernels."""
-        self.grouped_mlp.cuda()
+        self.grouped_mlp.to(device=get_current_device())
         num_allocated_tokens = 0
         tokens_per_expert = torch.zeros(self.num_experts, dtype=torch.int32)
         hidden_states = torch.rand((num_allocated_tokens, self.hidden_size), dtype=torch.bfloat16)
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
         output, _ = self.grouped_mlp.experts(hidden_states, tokens_per_expert=tokens_per_expert)
         assert torch.equal(output, torch.zeros_like(output))
         assert output.shape == (num_allocated_tokens, self.hidden_size)

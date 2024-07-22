@@ -13,6 +13,7 @@ sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 
+from megatron.core.device_utils import get_current_device
 import numpy as np
 import torch
 from PIL import Image
@@ -236,7 +237,7 @@ def generate_samples(model):
 
     idx = 0
     while idx < num_samples:
-        image = images[idx].cuda()
+        image = images[idx].to(device=get_current_device())
         sample_id = sample_ids[idx]
 
         if args.task == "captioning":

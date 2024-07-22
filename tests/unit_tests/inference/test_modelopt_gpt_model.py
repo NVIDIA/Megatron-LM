@@ -2,7 +2,7 @@
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.gpt.gpt_model import GPTModel
 from tests.unit_tests.test_utilities import Utils
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.inference.ammo_support.gpt.model_specs import get_gpt_layer_modelopt_spec
 from megatron.core.inference.ammo_support.gpt.state_dict_hooks import mcore_gpt_load_te_state_dict_pre_hook
@@ -12,7 +12,7 @@ class TestModelOptGPTModel:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1,1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         transformer_config = TransformerConfig(
             num_layers=2,
             hidden_size=12,

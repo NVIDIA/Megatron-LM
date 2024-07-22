@@ -8,6 +8,7 @@ from datetime import timedelta
 from functools import partial
 from typing import Callable, List, Optional
 
+from .device_utils import get_current_device
 import torch
 
 from .utils import GlobalMemoryBuffer
@@ -586,7 +587,7 @@ def initialize_model_parallel(
             )
         torch.distributed.barrier(
             group=get_data_parallel_group(with_context_parallel=True),
-            device_ids=[torch.cuda.current_device()],
+            device_ids=[get_current_device()],
         )
         # Set `NCCL_COLLNET_ENABLE=0` to restrict SHARP application to DP process groups
         os.environ["NCCL_COLLNET_ENABLE"] = "0"

@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.core.device_utils import get_current_device
 import pytest
 
 import torch
@@ -7,7 +8,7 @@ import torch
 from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 
 DEVICE_CAPABILITY = None
 if torch.cuda.is_available():
@@ -28,9 +29,9 @@ class TestMegatronModule:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1,1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
-        self.megatron_module = DummyModule(config=transformer_config).cuda()
+        self.megatron_module = DummyModule(config=transformer_config).to(device=get_current_device())
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()   
@@ -42,7 +43,7 @@ class TestMegatronModule:
         assert megatron_module.config.ffn_hidden_size == 48
         assert megatron_module.linear.weight.dtype == torch.float32
 
-        x = torch.ones((2, 2)).cuda()
+        x = torch.ones((2, 2)).to(device=get_current_device())
         assert megatron_module(x).dtype == torch.float32
 
         # TODO: test bad configs actually fail
@@ -55,9 +56,9 @@ class TestFloat16Module:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1,1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         self.transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
-        self.megatron_module = DummyModule(config=self.transformer_config).cuda()
+        self.megatron_module = DummyModule(config=self.transformer_config).to(device=get_current_device())
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()   
@@ -73,7 +74,7 @@ class TestFloat16Module:
         assert fp16_module.config.ffn_hidden_size == 48
         assert fp16_module.module.linear.weight.dtype == torch.float16
 
-        x = torch.ones((2, 2)).cuda()
+        x = torch.ones((2, 2)).to(device=get_current_device())
         # inputs are converted to fp16 then outputs are converted to fp32
         assert fp16_module(x).dtype == torch.float32
 
@@ -92,7 +93,7 @@ class TestFloat16Module:
         assert bf16_module.config.ffn_hidden_size == 48
         assert bf16_module.module.linear.weight.dtype == torch.bfloat16
 
-        x = torch.ones((2, 2)).cuda()
+        x = torch.ones((2, 2)).to(device=get_current_device())
         # inputs are converted to bf16 then outputs are converted to fp32
         assert bf16_module(x).dtype == torch.float32
 

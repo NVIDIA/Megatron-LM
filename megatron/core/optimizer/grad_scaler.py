@@ -5,6 +5,7 @@
 from abc import ABC, abstractmethod
 from typing import Dict
 
+from megatron.core.device_utils import get_current_device
 import torch
 
 
@@ -137,6 +138,6 @@ class DynamicGradScaler(MegatronGradScaler):
         return state_dict
 
     def load_state_dict(self, state_dict: Dict):
-        self._scale = state_dict['scale'].cuda(torch.cuda.current_device())
+        self._scale = state_dict['scale'].cuda(get_current_device())
         self._growth_tracker = state_dict['growth_tracker']
         self._hysteresis_tracker = state_dict['hysteresis_tracker']

@@ -1,4 +1,5 @@
 import os
+from megatron.core.device_utils import get_current_device
 import torch
 
 from megatron.training import get_args, print_rank_0
@@ -72,7 +73,7 @@ class ICTBertModel(MegatronModule):
     def embed_query(self, query_tokens, query_attention_mask):
         """Embed a batch of tokens using the query model"""
         if self.use_query_model:
-            query_types = torch.cuda.LongTensor(*query_tokens.shape).fill_(0)
+            query_types = torch.zeros(*query_tokens.shape).long().to(device=get_current_device())
             query_ict_logits, _ = self.query_model.forward(query_tokens, query_attention_mask, query_types)
             return query_ict_logits
         else:
@@ -81,7 +82,7 @@ class ICTBertModel(MegatronModule):
     def embed_block(self, block_tokens, block_attention_mask):
         """Embed a batch of tokens using the block model"""
         if self.use_block_model:
-            block_types = torch.cuda.LongTensor(*block_tokens.shape).fill_(0)
+            block_types = torch.zeros(*block_tokens.shape).long().to(device=get_current_device())
             block_ict_logits, _ = self.block_model.forward(block_tokens, block_attention_mask, block_types)
             return block_ict_logits
         else:

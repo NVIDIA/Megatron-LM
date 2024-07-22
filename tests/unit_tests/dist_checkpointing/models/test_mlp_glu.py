@@ -14,13 +14,13 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.dist_checkpointing import save, load, load_plain_tensors, \
     ShardedTensor
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 
 
 def initialize_mlp(glu=True):
-    model_parallel_cuda_manual_seed(123)
+    model_parallel_device_manual_seed(123)
     pp_size = parallel_state.get_pipeline_model_parallel_world_size()
     transformer_config = TransformerConfig(num_layers=pp_size, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True,
                                            gated_linear_unit=glu)

@@ -1,5 +1,6 @@
 from typing import List, OrderedDict, Tuple
 
+from megatron.core.device_utils import get_current_device
 import torch
 import torch.nn.functional as F
 
@@ -185,7 +186,7 @@ class SimpleTextGenerationController:
             padding_size = max_seq_len - len(prompt_tokens)
             prompt_tokens.extend([self.tokenizer.eod] * padding_size)
 
-        return torch.tensor(batch_prompt_tokens_list).cuda()
+        return torch.tensor(batch_prompt_tokens_list).to(device=get_current_device())
 
     def generate_output_tokens_dynamic_batch(
         self,
@@ -222,7 +223,7 @@ class SimpleTextGenerationController:
         )
         prompt_lengths_in_batch = torch.tensor(
             [len(prompt_tokens) for prompt_tokens in batch_prompt_tokens_list]
-        ).cuda()
+        ).to(device=get_current_device())
         max_prompt_length_in_batch = max(prompt_lengths_in_batch)
         min_prompt_length_in_batch = min(prompt_lengths_in_batch)
 
@@ -244,13 +245,13 @@ class SimpleTextGenerationController:
         if common_inference_params.return_log_probs:
             output_log_probs = torch.empty(
                 (batch_size, max_sequence_length - 1), dtype=torch.float32
-            ).cuda()
+            ).to(device=get_current_device())
 
         # An array to check which of the prompts have reached end of generation condition
-        is_generation_done_tensor = torch.zeros(batch_size, dtype=torch.bool).cuda()
+        is_generation_done_tensor = torch.zeros(batch_size, dtype=torch.bool).to(device=get_current_device())
 
         # An array to act as a counter to keep track of generated sequence lengths
-        generated_sequence_lengths = torch.zeros(batch_size).cuda()
+        generated_sequence_lengths = torch.zeros(batch_size).to(device=get_current_device())
 
         with torch.no_grad():
             self.inference_wrapped_model.prep_model_for_inference(

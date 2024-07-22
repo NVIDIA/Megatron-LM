@@ -2,6 +2,7 @@
 
 """Preprocessing for Wizard of Wikipedia and Wizard of Internet datasets"""
 
+from megatron.core.device_utils import get_current_device
 import torch
 import argparse
 from nltk import word_tokenize
@@ -328,18 +329,18 @@ def select_prompts_based_on_similarity(
     with torch.no_grad():
         # get the query embeddings
         query_ids = tokenizer.encode(query)
-        query_ids = torch.LongTensor([query_ids]).cuda()
+        query_ids = torch.LongTensor([query_ids]).to(device=get_current_device())
         query_emb = encoder(input_ids=query_ids).pooler_output
         query_emb = query_emb[0]
         
         # calculate embeddings for the samples in the database
         if topic in emb_dict:
             example_embeddings = emb_dict[topic]
-            example_embeddings = example_embeddings.cuda()
+            example_embeddings = example_embeddings.to(device=get_current_device())
         else:
             for idx, example in enumerate(dialog_list):
                 example_ids = tokenizer.encode(example)
-                example_ids = torch.LongTensor([example_ids]).cuda()
+                example_ids = torch.LongTensor([example_ids]).to(device=get_current_device())
                 example_emb = encoder(input_ids=example_ids).pooler_output
                 if idx == 0:
                     example_embeddings = example_emb
@@ -375,14 +376,14 @@ def prompt_selection_for_knowledge_generation(
     print("> loading tokenizer and encoder")
     tokenizer = DPRQuestionEncoderTokenizer.from_pretrained(
                     'facebook/dpr-question_encoder-single-nq-base')
-    encoder = torch.load(model_path).cuda()
+    encoder = torch.load(model_path).to(device=get_current_device())
 
     print("> getting dialog embeddings")
     with torch.no_grad():
         for idx, example in tqdm(enumerate(dialog_examples)):
             dialog = example[1]
             dialog_ids = tokenizer.encode(dialog)
-            dialog_ids = torch.LongTensor([dialog_ids]).cuda()
+            dialog_ids = torch.LongTensor([dialog_ids]).to(device=get_current_device())
             dialog_emb = encoder(input_ids=dialog_ids).pooler_output
 
             if idx == 0:
@@ -412,7 +413,7 @@ def prompt_selection_for_knowledge_generation(
             if topic not in train_data_by_topic:
                 # get the query embedding
                 query_ids = tokenizer.encode(query_sent)
-                query_ids = torch.LongTensor([query_ids]).cuda()
+                query_ids = torch.LongTensor([query_ids]).to(device=get_current_device())
                 query_emb = encoder(input_ids=query_ids).pooler_output
                 query_emb = query_emb[0]
 

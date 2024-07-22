@@ -18,6 +18,7 @@ from functools import reduce
 from types import TracebackType
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
+from megatron.core.device_utils import get_current_device
 import torch
 
 from megatron.core import parallel_state
@@ -96,7 +97,7 @@ class GlobalMemoryBuffer:
             or self.buffer[(name, dtype)].numel() < required_len
         ):
             self.buffer[(name, dtype)] = torch.empty(
-                required_len, dtype=dtype, device=torch.cuda.current_device(), requires_grad=False
+                required_len, dtype=dtype, device=get_current_device(), requires_grad=False
             )
 
         return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)

@@ -1,5 +1,6 @@
 from argparse import Namespace
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_current_device
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import InferenceWrapperConfig
 import torch
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import GPTInferenceWrapper
@@ -7,13 +8,13 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, g
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.gpt.gpt_model import GPTModel
 from tests.unit_tests.test_utilities import Utils
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 
 class TestGPTInferenceWrapper:
 
     def setup_model(self, tensor_parallel_size, pipeline_parallel_size):
         Utils.initialize_model_parallel(tensor_model_parallel_size=tensor_parallel_size,pipeline_model_parallel_size=pipeline_parallel_size)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         self.vocab_size = 100
         self.batch_size = 4
         self.sequence_length = 32
@@ -26,7 +27,7 @@ class TestGPTInferenceWrapper:
             transformer_layer_spec=get_gpt_layer_local_spec(), 
             vocab_size=self.vocab_size, 
             max_sequence_length=self.sequence_length, 
-            parallel_output = True).cuda()
+            parallel_output = True).to(device=get_current_device())
 
         inference_wrapper_config = InferenceWrapperConfig(
             hidden_size=hidden_size,
@@ -42,7 +43,7 @@ class TestGPTInferenceWrapper:
     def test_inference_pipeline_parallel_small_size(self):
         self.setup_model(tensor_parallel_size=2, pipeline_parallel_size=2)
         
-        batch_prompt_tokens = torch.randint(low = 0, high = self.vocab_size, size=(self.batch_size, self.sequence_length)).int().cuda()
+        batch_prompt_tokens = torch.randint(low = 0, high = self.vocab_size, size=(self.batch_size, self.sequence_length)).int().to(device=get_current_device())
         self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=batch_prompt_tokens)
  
         inference_input = self.inference_wrapped_model.get_batch_for_context_window(0, 5)
@@ -57,7 +58,7 @@ class TestGPTInferenceWrapper:
     def test_inference_pipeline_parallel_large__size(self):
         self.setup_model(tensor_parallel_size=2, pipeline_parallel_size=2)
         
-        batch_prompt_tokens = torch.randint(low = 0, high = self.vocab_size, size=(self.batch_size, self.sequence_length)).int().cuda()
+        batch_prompt_tokens = torch.randint(low = 0, high = self.vocab_size, size=(self.batch_size, self.sequence_length)).int().to(device=get_current_device())
         self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=batch_prompt_tokens)
 
         inference_input = self.inference_wrapped_model.get_batch_for_context_window(0, 10)
@@ -71,7 +72,7 @@ class TestGPTInferenceWrapper:
     def test_inference_only_tensor_parallel(self):
         self.setup_model(tensor_parallel_size=4, pipeline_parallel_size=1)
     
-        batch_prompt_tokens = torch.randint(low = 0, high = self.vocab_size, size=(self.batch_size, self.sequence_length)).int().cuda()
+        batch_prompt_tokens = torch.randint(low = 0, high = self.vocab_size, size=(self.batch_size, self.sequence_length)).int().to(device=get_current_device())
         self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=batch_prompt_tokens)
 
         inference_input = self.inference_wrapped_model.get_batch_for_context_window(0, 5)

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
+from megatron.core.device_utils import get_current_device
+
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.core.transformer.transformer_block import TransformerBlock
@@ -74,7 +76,7 @@ class RotaryEmbedding(nn.Module):
         self.inv_freq = 1.0 / (
             rotary_base
             ** (
-                torch.arange(0, dim, 2, dtype=torch.float32, device=torch.cuda.current_device())
+                torch.arange(0, dim, 2, dtype=torch.float32, device=get_current_device())
                 / dim
             )
         )

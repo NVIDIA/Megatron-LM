@@ -2,6 +2,7 @@
 
 """Vision-classification finetuning/evaluation."""
 
+from megatron.core.device_utils import get_current_device
 import torch
 import torch.nn.functional as F
 from functools import partial
@@ -39,8 +40,8 @@ def segmentation():
 
     def process_batch(batch):
         """Process batch and produce inputs for the model."""
-        images = batch[0].cuda().contiguous()
-        masks = batch[1].cuda().contiguous()
+        images = batch[0].to(device=get_current_device()).contiguous()
+        masks = batch[1].to(device=get_current_device()).contiguous()
         return images, masks
 
     def calculate_weight(masks, num_classes):

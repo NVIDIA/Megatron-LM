@@ -1,5 +1,6 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.core.device_utils import get_current_device
 import torch
 
 from megatron.core.parallel_state import (
@@ -80,7 +81,7 @@ def _gather_along_last_dim(input_):
     dim_size = list(input_.size())
     dim_size[0] = dim_size[0] * world_size
 
-    output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
+    output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
     torch.distributed.all_gather_into_tensor(
         output, input_.contiguous(), group=get_tensor_model_parallel_group()
     )
@@ -115,7 +116,7 @@ def _gather_along_first_dim(input_):
     dim_size = list(input_.size())
     dim_size[0] = dim_size[0] * world_size
 
-    output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
+    output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
     torch.distributed._all_gather_base(
         output, input_.contiguous(), group=get_tensor_model_parallel_group()
     )
@@ -137,7 +138,7 @@ def _reduce_scatter_along_first_dim(input_):
 
     dim_size[0] = dim_size[0] // world_size
 
-    output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
+    output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
     torch.distributed._reduce_scatter_base(
         output, input_.contiguous(), group=get_tensor_model_parallel_group()
     )
@@ -158,7 +159,7 @@ def _gather_along_first_dim_moe(input_, use_global_buffer=False):
     if use_global_buffer:
         output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
     else:
-        output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
+        output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
     torch.distributed._all_gather_base(output, input_.contiguous(), group=group)
 
     return output
@@ -179,7 +180,7 @@ def _reduce_scatter_along_first_dim_moe(input_, use_global_buffer=False):
     if use_global_buffer:
         output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
     else:
-        output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
+        output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
     torch.distributed._reduce_scatter_base(output, input_.contiguous(), group=group)
     return output
 
@@ -195,7 +196,7 @@ def _gather_along_first_dim_expert_parallel(input_):
     dim_size = list(input_.size())
     dim_size[0] = dim_size[0] * world_size
 
-    output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
+    output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
     torch.distributed._all_gather_base(output, input_.contiguous(), group=group)
 
     return output
@@ -412,7 +413,7 @@ class _AllToAll(torch.autograd.Function):
             output = input.new_empty(
                 size=[sum(output_split_sizes)] + list(input.size()[1:]),
                 dtype=input.dtype,
-                device=torch.cuda.current_device(),
+                device=get_current_device(),
             )
         torch.distributed.all_to_all_single(
             output,

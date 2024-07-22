@@ -139,7 +139,8 @@ def clip_grad_by_total_norm_fp32(
     grads = []
     for param in parameters:
         if param.grad is not None:
-            assert param.grad.type() == 'torch.cuda.FloatTensor'
+            param_type = param.type().split('.')[-1]
+            assert param_type == 'FloatTensor'
             grads.append(param.grad.detach())
 
     # Scale.

@@ -2,6 +2,7 @@
 
 """Megatron Module"""
 
+from megatron.core.device_utils import get_current_device
 import torch
 from torch.autograd import Variable
 from torch.nn.parameter import Parameter
@@ -108,7 +109,7 @@ class MegatronModule(torch.nn.Module):
         # Ensure that first and last stages have the same initial parameter
         # values.
         if mpu.is_rank_in_embedding_group():
-            self.shared_embedding_or_output_weight().data = self.shared_embedding_or_output_weight().data.cuda()
+            self.shared_embedding_or_output_weight().data = self.shared_embedding_or_output_weight().data.to(device=get_current_device())
             torch.distributed.all_reduce(self.shared_embedding_or_output_weight().data,
                                          group=mpu.get_embedding_group())
 
@@ -118,7 +119,7 @@ class MegatronModule(torch.nn.Module):
         if mpu.is_rank_in_position_embedding_group() and \
                 args.pipeline_model_parallel_split_rank is not None:
             # TODO: Support tokentype embedding.
-            self.language_model.embedding.cuda()
+            self.language_model.embedding.to(device=get_current_device())
             position_embeddings = self.language_model.embedding.position_embeddings
             torch.distributed.all_reduce(position_embeddings.weight.data,
                                          group=mpu.get_position_embedding_group())

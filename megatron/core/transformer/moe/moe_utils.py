@@ -2,6 +2,7 @@
 
 import math
 
+from megatron.core.device_utils import get_current_device
 import torch
 
 from megatron.core import parallel_state
@@ -469,7 +470,7 @@ class moe_gather(torch.autograd.Function):
         map_ = ctx.map
 
         output = torch.zeros(
-            input_size, dtype=grad_output.dtype, device=torch.cuda.current_device()
+            input_size, dtype=grad_output.dtype, device=get_current_device()
         )
         output.scatter_add_(0, map_, grad_output)
         return output, None, None
@@ -482,7 +483,7 @@ class moe_scatter(torch.autograd.Function):
 
         if output_size is not None:
             output = torch.zeros(
-                output_size, dtype=input_.dtype, device=torch.cuda.current_device()
+                output_size, dtype=input_.dtype, device=get_current_device()
             )
         else:
             output = torch.zeros_like(input_)

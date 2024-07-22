@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import os
+from megatron.core.device_utils import get_current_device
 import pytest
 
 import torch
@@ -7,17 +9,18 @@ import torch
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.T5.t5_model import T5Model
 from tests.unit_tests.test_utilities import Utils
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.models.T5.t5_spec import (get_t5_encoder_with_transformer_engine_block_spec,
                                             get_t5_decoder_with_transformer_engine_block_spec,
                                             get_t5_encoder_with_local_block_spec,
                                             get_t5_decoder_with_local_block_spec)
 
+@pytest.mark.skipif(int(os.environ.get('ACCEL_MEMORY_GB', 16)) <= 24 , reason="insufficient accelerator memory")
 class TestT5Model:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1,1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         transformer_config = TransformerConfig(
             num_layers=12, hidden_size=768, num_attention_heads=12, kv_channels=64, ffn_hidden_size=3072,
             use_cpu_initialization=True, pipeline_dtype=torch.bfloat16
@@ -56,14 +59,14 @@ class TestT5Model:
         sequence_length = self.t5_model.max_sequence_length
         micro_batch_size = 2
 
-        self.t5_model.cuda()
+        self.t5_model.to(device=get_current_device())
 
         data = list(range(sequence_length))
-        encoder_input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-        decoder_input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-        encoder_attn_mask = torch.ones((1, sequence_length, sequence_length), dtype=bool).cuda()
-        decoder_attn_mask = torch.ones((1, sequence_length, sequence_length), dtype=bool).cuda()
-        encoder_decoder_attn_mask = torch.ones((1, sequence_length, sequence_length), dtype=bool).cuda()
+        encoder_input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device=get_current_device())
+        decoder_input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device=get_current_device())
+        encoder_attn_mask = torch.ones((1, sequence_length, sequence_length), dtype=bool).to(device=get_current_device())
+        decoder_attn_mask = torch.ones((1, sequence_length, sequence_length), dtype=bool).to(device=get_current_device())
+        encoder_decoder_attn_mask = torch.ones((1, sequence_length, sequence_length), dtype=bool).to(device=get_current_device())
 
         logits = self.t5_model.forward(
             encoder_input_ids=encoder_input_ids,

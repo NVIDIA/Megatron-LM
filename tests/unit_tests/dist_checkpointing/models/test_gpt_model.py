@@ -10,14 +10,14 @@ from tests.unit_tests.dist_checkpointing.models.common import \
     common_test_simple_sharded_state_dict_save_load, \
     common_test_parallel_reconfiguration_e2e, \
     common_test_state_dict_comparison, common_test_vocab_size_padding_change
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.models.gpt.gpt_layer_specs import \
     get_gpt_layer_with_transformer_engine_spec as gpt_te_spec, get_gpt_layer_local_spec as gpt_local_spec
 
 
 def initialize_gpt_model(seed, layer_spec_fn=gpt_te_spec, vocab_size=128, **config_kwargs):
     torch.manual_seed(seed)
-    model_parallel_cuda_manual_seed(seed)
+    model_parallel_device_manual_seed(seed)
 
     default_config_kwargs=dict(num_layers=8, hidden_size=16, num_attention_heads=8, use_cpu_initialization=True, pipeline_dtype=torch.bfloat16)
     default_config_kwargs.update(**config_kwargs)

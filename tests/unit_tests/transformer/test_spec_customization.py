@@ -4,6 +4,7 @@ import sys
 from dataclasses import dataclass, fields
 from importlib.metadata import version
 
+from megatron.core.device_utils import get_current_device
 import pytest
 import torch
 import transformer_engine as te
@@ -11,7 +12,7 @@ from pkg_resources import packaging
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.custom_layers.transformer_engine import (
     TEDotProductAttention,
@@ -32,7 +33,7 @@ from tests.unit_tests.test_utilities import Utils
 class TestSpecCustomization:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         self.config = TransformerConfig(
             num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
         )
@@ -201,7 +202,7 @@ class TestSpecCustomization:
         # and internally the `TransformerBlock` would fan out the single
         # `ModuleSpec` layer spec provided to all the layers of the block.
         layer_spec1 = ModuleSpec(module=TransformerLayer, submodules=layer_local_spec.submodules)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         torch.manual_seed(0)
         parallel_transformer_block1 = TransformerBlock(transformer_config, layer_spec1)
 
@@ -213,22 +214,22 @@ class TestSpecCustomization:
             layer_norm=TENorm,
         )
         # make sure the model init conditions are identical
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         torch.manual_seed(0)
         parallel_transformer_block2 = TransformerBlock(transformer_config, layer_spec2)
 
         sequence_length = 32
         micro_batch_size = 2
-        parallel_transformer_block1.cuda()
-        parallel_transformer_block2.cuda()
+        parallel_transformer_block1.to(device=get_current_device())
+        parallel_transformer_block2.to(device=get_current_device())
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones(
             (sequence_length, micro_batch_size, transformer_config.hidden_size)
         )
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
 
-        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).to(device=get_current_device())
 
         out1 = parallel_transformer_block1(
             hidden_states=hidden_states, attention_mask=attention_mask

@@ -5,6 +5,7 @@ import os
 from importlib.metadata import version
 from typing import Callable
 
+from megatron.core.device_utils import get_current_device
 import torch
 import transformer_engine as te
 from pkg_resources import packaging
@@ -18,7 +19,7 @@ from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_tensor_model_parallel_group,
 )
-from megatron.core.tensor_parallel import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
+from megatron.core.tensor_parallel import get_device_rng_tracker, get_expert_parallel_rng_tracker_name
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -36,7 +37,7 @@ def _get_extra_te_kwargs(config: TransformerConfig):
         if config.use_cpu_initialization:
             extra_transformer_engine_kwargs["device"] = 'cpu'
         else:
-            extra_transformer_engine_kwargs["device"] = torch.cuda.current_device()
+            extra_transformer_engine_kwargs["device"] = get_current_device()
     return extra_transformer_engine_kwargs
 
 
@@ -154,7 +155,7 @@ class TELinear(te.pytorch.Linear):
             tp_group=get_tensor_model_parallel_group(check_initialized=False),
             tp_size=self.config.tensor_model_parallel_size,
             get_rng_state_tracker=(
-                get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+                get_device_rng_tracker if get_device_rng_tracker().is_initialized() else None
             ),
             init_method=condition_init_method(config, init_method),
             bias=bias,
@@ -264,7 +265,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             tp_group=get_tensor_model_parallel_group(check_initialized=False),
             tp_size=self.config.tensor_model_parallel_size,
             get_rng_state_tracker=(
-                get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+                get_device_rng_tracker if get_device_rng_tracker().is_initialized() else None
             ),
             init_method=condition_init_method(config, init_method),
             bias=bias,
@@ -481,7 +482,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             sequence_parallel=self.config.sequence_parallel,
             tp_size=self.config.tensor_model_parallel_size,
             get_rng_state_tracker=(
-                get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+                get_device_rng_tracker if get_device_rng_tracker().is_initialized() else None
             ),
             tp_group=get_tensor_model_parallel_group(check_initialized=False),
             layer_number=layer_number,
@@ -626,7 +627,7 @@ if _te_version >= packaging.version.Version("1.9.0.dev0"):
                 tp_group=tp_group,
                 tp_size=tp_size,
                 get_rng_state_tracker=(
-                    get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+                    get_device_rng_tracker if get_device_rng_tracker().is_initialized() else None
                 ),
                 init_method=condition_init_method(config, init_method),
                 bias=bias,

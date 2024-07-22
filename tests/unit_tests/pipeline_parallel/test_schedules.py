@@ -1,3 +1,4 @@
+from megatron.core.device_utils import get_current_device
 import torch
 from tests.unit_tests.test_utilities import Utils
 from megatron.core import ModelParallelConfig
@@ -82,7 +83,7 @@ def test_forward_backward_func_with_pipeline_parallel(mocker):
         rank = int(os.environ['LOCAL_RANK'])
         def loss_func(output_tensor):
             return rank, {'loss_reduced':rank}
-        return torch.rand(512,8,256).cuda(), loss_func
+        return torch.rand(512,8,256).to(device=get_current_device()), loss_func
 
     model = torch.nn.Linear(4,1)
     model.model_type = 'unit-test'
@@ -132,7 +133,7 @@ def test_forward_backward_func_with_interleaving(mocker):
         rank = int(os.environ['LOCAL_RANK'])
         def loss_func(output_tensor):
             return rank, {'loss_reduced':rank}
-        return torch.rand(512,8,256).cuda(), loss_func
+        return torch.rand(512,8,256).to(device=get_current_device()), loss_func
 
     model = torch.nn.Linear(4,1)
     def set_input_tensor(input_tensor):

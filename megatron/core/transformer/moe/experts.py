@@ -4,6 +4,7 @@ from copy import deepcopy
 from functools import partial
 from typing import Optional, Tuple
 
+from megatron.core.device_utils import get_current_device
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
@@ -123,7 +124,7 @@ class GroupedMLP(MegatronModule):
                 torch.empty(
                     self.config.hidden_size,
                     fc1_output_size_per_partition,
-                    device=torch.cuda.current_device(),
+                    device=get_current_device(),
                     dtype=config.params_dtype,
                 )
             )
@@ -131,7 +132,7 @@ class GroupedMLP(MegatronModule):
                 torch.empty(
                     fc2_input_size_per_partition,
                     self.config.hidden_size,
-                    device=torch.cuda.current_device(),
+                    device=get_current_device(),
                     dtype=config.params_dtype,
                 )
             )

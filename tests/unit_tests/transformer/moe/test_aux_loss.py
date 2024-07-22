@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.core.device_utils import get_current_device
 import pytest
 import torch
 from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
@@ -41,7 +42,7 @@ class TestAuxLoss:
             moe_aux_loss_coeff=0.1,
         )
         moe_layer = baseline_container.moe_layer
-        self.input = torch.randn((32, 8, moe_layer.config.hidden_size)).cuda()
+        self.input = torch.randn((32, 8, moe_layer.config.hidden_size)).to(device=get_current_device())
         self.input.requires_grad = True
         probs, indices = moe_layer.router(self.input)
         probs.sum().mul_(0).backward() # zero out the main gradients

@@ -6,6 +6,8 @@ import random
 import os
 import time
 
+from megatron.core.device_utils import get_current_device, get_distributed_backend, get_local_device_count
+from megatron.core.device_utils import get_distributed_init_method
 import numpy as np
 import torch
 from datetime import timedelta
@@ -215,7 +217,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
     """Initialize torch.distributed and core model parallel."""
     args = get_args()
 
-    device_count = torch.cuda.device_count()
+    device_count = get_local_device_count()
     if torch.distributed.is_initialized():
 
         if args.rank == 0:
@@ -228,22 +230,12 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
         args.world_size = torch.distributed.get_world_size()
 
     else:
-
         if args.rank == 0:
             print("> initializing torch distributed ...", flush=True)
-        # Manually set the device ids.
-        if device_count > 0:
-            device = args.rank % device_count
-            if args.local_rank is not None:
-                assert (
-                    args.local_rank == device
-                ), "expected local-rank to be the same as rank % device-count."
-            else:
-                args.local_rank = device
-            torch.cuda.set_device(device)
         # Call the init process
         torch.distributed.init_process_group(
-            backend=args.distributed_backend,
+            backend=get_distributed_backend(backend=args.distributed_backend),
+            init_method=get_distributed_init_method(),
             world_size=args.world_size,
             rank=args.rank,
             timeout=timedelta(minutes=args.distributed_timeout_minutes),
@@ -300,8 +292,8 @@ def _set_random_seed(seed_, data_parallel_random_init=False):
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        if torch.cuda.device_count() > 0:
-            tensor_parallel.model_parallel_cuda_manual_seed(seed)
+        if get_local_device_count() > 0:
+            tensor_parallel.model_parallel_device_manual_seed(seed)
     else:
         raise ValueError("Seed ({}) should be a positive integer.".format(seed))
 
@@ -353,7 +345,7 @@ def _warmup_jit_function():
     bias = torch.rand(
         args.ffn_hidden_size // args.tensor_model_parallel_size,
         dtype=dtype,
-        device="cuda",
+        device=get_current_device(),
     )
     input = torch.rand(
         (
@@ -362,7 +354,7 @@ def _warmup_jit_function():
             args.ffn_hidden_size // args.tensor_model_parallel_size,
         ),
         dtype=dtype,
-        device="cuda",
+        device=get_current_device(),
     )
     # Warmup JIT fusions with the input grad_enable state of both forward
     # prop and recomputation
@@ -380,14 +372,14 @@ def _warmup_jit_function():
     input = torch.rand(
         (seq_length, args.micro_batch_size, args.hidden_size),
         dtype=dtype,
-        device="cuda",
+        device=get_current_device(),
     )
     residual = torch.rand(
         (seq_length, args.micro_batch_size, args.hidden_size),
         dtype=dtype,
-        device="cuda",
+        device=get_current_device(),
     )
-    bias = torch.rand((args.hidden_size), dtype=dtype, device="cuda").expand_as(
+    bias = torch.rand((args.hidden_size), dtype=dtype, device=get_current_device()).expand_as(
         residual
     )
     dropout_rate = 0.1
@@ -402,7 +394,8 @@ def _warmup_jit_function():
         for _ in range(5):
             output = bias_dropout_add_fused_train(input, bias, residual, dropout_rate)
     del bias, input, residual, output
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def setup_logging() -> None:

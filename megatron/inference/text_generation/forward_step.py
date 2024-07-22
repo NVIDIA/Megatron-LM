@@ -4,6 +4,7 @@
 
 from collections.abc import Iterable
 
+from megatron.core.device_utils import get_current_device
 import torch
 
 from megatron.training import get_args
@@ -113,7 +114,7 @@ class ForwardStep:
             args = get_args()
             logits = torch.empty(
                 (batch_size, sequence_length, args.padded_vocab_size),
-                dtype=torch.float32, device=torch.cuda.current_device())
+                dtype=torch.float32, device=get_current_device())
 
         # Preallocate recv buffer.
         recv_buffer = _allocate_recv_buffer(micro_batch_size, sequence_length)
@@ -161,4 +162,4 @@ def _allocate_recv_buffer(batch_size, sequence_length):
     recv_size = (sequence_length, batch_size, args.hidden_size)
     return torch.empty(recv_size,
                        dtype=_get_recv_buffer_dtype(args),
-                       device=torch.cuda.current_device())
+                       device=get_current_device())

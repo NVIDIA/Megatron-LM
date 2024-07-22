@@ -29,9 +29,9 @@ class TestCoreAttention:
 
         # destroy_global_memory_buffer()
         # _set_global_memory_buffer()
-        # model_parallel_cuda_manual_seed(123)
+        # model_parallel_device_manual_seed(123)
 
-        core_attention.cuda()
+        core_attention.to(device=get_current_device())
         config = core_attention.config
         sequence_length = 32
         micro_batch_size = 2
@@ -43,13 +43,13 @@ class TestCoreAttention:
                 config.num_attention_heads,
                 config.hidden_size // config.num_attention_heads,
             )
-        ).cuda()
+        ).to(device=get_current_device())
 
-        key_layer = torch.ones_like(query_layer).cuda()
+        key_layer = torch.ones_like(query_layer).to(device=get_current_device())
 
-        value_layer = torch.ones_like(query_layer).cuda()
+        value_layer = torch.ones_like(query_layer).to(device=get_current_device())
 
-        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).to(device=get_current_device())
 
         context_layer = core_attention(
             query_layer=query_layer, key_layer=key_layer, value_layer=value_layer, attention_mask=attention_mask

@@ -3,6 +3,7 @@ import math
 from argparse import Namespace
 from typing import Iterable, List, Union
 
+from megatron.core.device_utils import get_current_device
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
@@ -95,7 +96,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         """Receive happens between the layers with size [seq_len, batch_size, hidden_size]."""
         recv_size = (seq_len, batch_size, self.inference_wrapper_config.hidden_size)
         return torch.empty(
-            recv_size, dtype=self.pipeline_communication_dtype, device=torch.cuda.current_device()
+            recv_size, dtype=self.pipeline_communication_dtype, device=get_current_device()
         )
 
     def forward_pass_with_pipeline_parallel_small_input_batch(
@@ -163,7 +164,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             logits = torch.empty(
                 (batch_size, seq_len, self.inference_wrapper_config.padded_vocab_size),
                 dtype=torch.float32,
-                device=torch.cuda.current_device(),
+                device=get_current_device(),
             )
 
         recv_buffer = None

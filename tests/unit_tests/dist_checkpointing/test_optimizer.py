@@ -26,7 +26,7 @@ from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.optimizer import DistributedOptimizer, OptimizerConfig, \
     get_megatron_optimizer
-from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel import model_parallel_device_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
 from megatron.core.utils import get_model_config
@@ -138,7 +138,7 @@ class TestOptimizer:
 
 def initialize_gpt_model(pre_process=True, post_process=True, seed=0, use_glu=True, **config_kwargs):
     torch.manual_seed(seed)
-    model_parallel_cuda_manual_seed(seed)
+    model_parallel_device_manual_seed(seed)
 
     default_config_kwargs=dict(num_layers=8, hidden_size=16, num_attention_heads=8, use_cpu_initialization=True)
     default_config_kwargs.update(**config_kwargs)
@@ -155,7 +155,7 @@ def initialize_gpt_model(pre_process=True, post_process=True, seed=0, use_glu=Tr
 
 def initialize_small_model(pre_process=True, post_process=True, seed=0, **config_kwargs):
     torch.manual_seed(seed)
-    model_parallel_cuda_manual_seed(seed)
+    model_parallel_device_manual_seed(seed)
 
     return SwigluFactoryModel()
 
@@ -218,7 +218,7 @@ def setup_model_and_optimizer(seed, tp, pp, initialize_fn=initialize_gpt_model, 
     optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)
-    model_parallel_cuda_manual_seed(seed + 1)
+    model_parallel_device_manual_seed(seed + 1)
 
     for group in optimizer.optimizer.param_groups:
         for p in group['params']:

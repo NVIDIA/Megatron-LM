@@ -1,5 +1,6 @@
 from typing import List
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import InferenceWrapperConfig
+from megatron.core.device_utils import get_current_device
 import torch
 import random 
 import string
@@ -11,7 +12,7 @@ from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.text_generation_controllers.simple_text_generation_controller import SimpleTextGenerationController
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 from unittest import mock
@@ -19,7 +20,7 @@ from unittest import mock
 class TestMCoreEngine:
     def setup_method(self, method):
         Utils.initialize_model_parallel(tensor_model_parallel_size=1,pipeline_model_parallel_size=1)
-        model_parallel_cuda_manual_seed(123)          
+        model_parallel_device_manual_seed(123)          
         self.batch_size = 4
         self.hidden_size = 12
         self.vocab_size = 100
@@ -31,7 +32,7 @@ class TestMCoreEngine:
             transformer_layer_spec=get_gpt_layer_local_spec(), 
             vocab_size=self.vocab_size, 
             max_sequence_length=self.sequence_length, 
-            parallel_output = True).cuda()
+            parallel_output = True).to(device=get_current_device())
 
         inference_wrapper_config = InferenceWrapperConfig(
             hidden_size=self.hidden_size,

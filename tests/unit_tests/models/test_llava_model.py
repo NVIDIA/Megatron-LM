@@ -1,21 +1,23 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from copy import deepcopy
+import os
 
+from megatron.core.device_utils import get_current_device
 import pytest
 import torch
 
 from megatron.core import InferenceParams
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.multimodal.llava_model import LLaVAModel
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
-
+@pytest.mark.skipif(int(os.environ.get('ACCEL_MEMORY_GB', 16)) <= 24 , reason="insufficient accelerator memory")
 class TestLLaVAModel:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
 
         language_config = TransformerConfig(
             num_layers=3, hidden_size=128, num_attention_heads=8, use_cpu_initialization=True
@@ -66,16 +68,16 @@ class TestLLaVAModel:
         assert self.model.vision_model.decoder.input_tensor.shape == expected_shape
 
     def test_forward(self):
-        self.model.cuda()
+        self.model.to(device=get_current_device())
 
-        img = torch.randn((2, 3, 336, 336)).cuda()
-        input_ids = torch.randint(0, 2048, (2, 1024)).cuda()
-        position_ids = torch.arange(0, 1024, dtype=torch.int).cuda()
+        img = torch.randn((2, 3, 336, 336)).to(device=get_current_device())
+        input_ids = torch.randint(0, 2048, (2, 1024)).to(device=get_current_device())
+        position_ids = torch.arange(0, 1024, dtype=torch.int).to(device=get_current_device())
         position_ids = position_ids.expand(2, 1024)
         # With default image and patch sizes of 336 and 14, respectively, and a class token, the combined sequence length is 1024 + (336/14) ** 2 + 1 = 1601.
-        attention_mask = torch.tril(torch.ones((2, 1, 1601, 1601))).cuda()
+        attention_mask = torch.tril(torch.ones((2, 1, 1601, 1601))).to(device=get_current_device())
         attention_mask = attention_mask < 0.5
-        labels = torch.randint(0, 2048, (2, 1601)).cuda()
+        labels = torch.randint(0, 2048, (2, 1601)).to(device=get_current_device())
 
         # Try with labels.
         loss = self.model.forward(img, input_ids, position_ids, attention_mask, labels=labels)

@@ -1,5 +1,6 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.core.device_utils import get_current_device
 import torch
 
 from megatron.core.parallel_state import (
@@ -83,9 +84,9 @@ def broadcast_data(keys, data, datatype):
         # Check that all keys have the same data type.
         _check_data_types(keys, data, datatype)
         # Flatten the data associated with the keys
-        flatten_data = torch.cat([data[key].contiguous().view(-1) for key in keys], dim=0).cuda()
+        flatten_data = torch.cat([data[key].contiguous().view(-1) for key in keys], dim=0).to(device=get_current_device())
     else:
-        flatten_data = torch.empty(total_numel, device=torch.cuda.current_device(), dtype=datatype)
+        flatten_data = torch.empty(total_numel, device=get_current_device(), dtype=datatype)
 
     # Broadcast
     torch.distributed.broadcast(

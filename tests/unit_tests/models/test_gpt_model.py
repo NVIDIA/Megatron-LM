@@ -1,11 +1,12 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.core.device_utils import get_current_device
 import pytest
 import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -14,7 +15,7 @@ class TestGPTModel:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         transformer_config = TransformerConfig(
             num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
         )
@@ -55,14 +56,14 @@ class TestGPTModel:
         sequence_length = self.gpt_model.max_sequence_length
         micro_batch_size = 2
 
-        self.gpt_model.cuda()
+        self.gpt_model.to(device=get_current_device())
 
         data = list(range(sequence_length))
-        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device=get_current_device())
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device=get_current_device())
         attention_mask = torch.ones(
             (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
-        ).cuda()
+        ).to(device=get_current_device())
 
         logits = self.gpt_model.forward(
             input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask

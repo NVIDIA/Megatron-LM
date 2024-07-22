@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.core.device_utils import get_current_device
 import torch
 import types
 
@@ -13,7 +14,7 @@ from megatron.core.models.retro.encoder_attention import (
     RetroEncoderBiasDropoutAdd,
     RetroEncoderLayerNorm,
 )
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlock
 from tests.unit_tests.test_utilities import Utils
 
@@ -59,13 +60,13 @@ class TestRetroAttention:
 
         # GPU.
         if use_gpu:
-            [ m.cuda() for m in vars(modules).values() ]
+            [ m.to(device=get_current_device()) for m in vars(modules).values() ]
 
         return modules
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1,1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -114,18 +115,18 @@ class TestRetroAttention:
             seq_length,
             micro_batch_size,
             config.hidden_size,
-        )).cuda()
+        )).to(device=get_current_device())
         attention_mask = None
         decoder_context = torch.ones((
             config.retro_retrieved_length,
             config.retro_num_neighbors * micro_batch_size * n_chunks_per_sample,
             config.hidden_size,
-        )).cuda()
+        )).to(device=get_current_device())
         encoder_context = torch.ones((
             config.retro_chunk_length,
             micro_batch_size * n_chunks_per_sample,
             config.hidden_size,
-        )).cuda()
+        )).to(device=get_current_device())
 
         # Forward decoder.
         decoder_attn_output = modules.decoder_attn(

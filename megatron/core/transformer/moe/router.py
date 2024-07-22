@@ -7,11 +7,11 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
-    get_cuda_rng_tracker,
+    get_device_rng_tracker,
     get_data_parallel_rng_tracker_name,
 )
 from megatron.core.tensor_parallel.random import (
-    get_cuda_rng_tracker,
+    get_device_rng_tracker,
     get_data_parallel_rng_tracker_name,
 )
 from megatron.core.transformer.module import MegatronModule
@@ -46,8 +46,8 @@ class Router(ABC, MegatronModule):
         self.weight = torch.nn.Parameter(
             torch.empty((self.config.num_moe_experts, self.config.hidden_size))
         )
-        if get_cuda_rng_tracker().is_initialized():
-            with get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
+        if get_device_rng_tracker().is_initialized():
+            with get_device_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
                 config.init_method(self.weight)
         else:
             config.init_method(self.weight)

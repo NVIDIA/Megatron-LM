@@ -28,10 +28,10 @@ from .mappings import (
 )
 from .random import (
     checkpoint,
-    get_cuda_rng_tracker,
+    get_device_rng_tracker,
     get_data_parallel_rng_tracker_name,
     get_expert_parallel_rng_tracker_name,
-    model_parallel_cuda_manual_seed,
+    model_parallel_device_manual_seed,
 )
 from .utils import (
     gather_split_1d_tensor,
@@ -63,8 +63,8 @@ __all__ = [
     "scatter_to_sequence_parallel_region",
     # random.py
     "checkpoint",
-    "get_cuda_rng_tracker",
-    "model_parallel_cuda_manual_seed",
+    "get_device_rng_tracker",
+    "model_parallel_device_manual_seed",
     "get_expert_parallel_rng_tracker_name",
     # utils.py
     "split_tensor_along_last_dim",

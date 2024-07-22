@@ -6,7 +6,7 @@ import torch
 
 from megatron.core.tensor_parallel.layers import VocabParallelEmbedding, RowParallelLinear, ColumnParallelLinear
 from tests.unit_tests.test_utilities import Utils
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 
@@ -21,7 +21,7 @@ class Test:
 
         Utils.initialize_model_parallel(1, 1)
         torch.manual_seed(42)
-        model_parallel_cuda_manual_seed(42)
+        model_parallel_device_manual_seed(42)
         
 
         tp1 = VocabParallelEmbedding(num_embeddings=16, embedding_dim=4,
@@ -31,7 +31,7 @@ class Test:
 
         Utils.initialize_model_parallel(4, 1)
         torch.manual_seed(42)
-        model_parallel_cuda_manual_seed(41)  # intentionally different.
+        model_parallel_device_manual_seed(41)  # intentionally different.
         tp4 = VocabParallelEmbedding(num_embeddings=16, embedding_dim=4,
                                      init_method=self.transformer_config.init_method,
                                      config=self.transformer_config).weight
@@ -46,7 +46,7 @@ class Test:
 
         Utils.initialize_model_parallel(1, 1)
         torch.manual_seed(42)
-        model_parallel_cuda_manual_seed(42)
+        model_parallel_device_manual_seed(42)
 
         tp1 = RowParallelLinear(input_size=16, output_size=16,
                                 init_method=self.transformer_config.init_method,
@@ -57,7 +57,7 @@ class Test:
 
         Utils.initialize_model_parallel(4, 1)
         torch.manual_seed(42)
-        model_parallel_cuda_manual_seed(41)  # intentionally different.
+        model_parallel_device_manual_seed(41)  # intentionally different.
         tp4 = RowParallelLinear(input_size=16, output_size=16,
                                 init_method=self.transformer_config.init_method,
                                 bias=True,
@@ -75,7 +75,7 @@ class Test:
 
         Utils.initialize_model_parallel(1, 1)
         torch.manual_seed(42)
-        model_parallel_cuda_manual_seed(42)
+        model_parallel_device_manual_seed(42)
 
         tp1 = ColumnParallelLinear(input_size=16, output_size=16,
                                    init_method=self.transformer_config.init_method,
@@ -85,7 +85,7 @@ class Test:
 
         Utils.initialize_model_parallel(4, 1)
         torch.manual_seed(42)
-        model_parallel_cuda_manual_seed(41)  # intentionally different.
+        model_parallel_device_manual_seed(41)  # intentionally different.
         tp4 = ColumnParallelLinear(input_size=16, output_size=16,
                                    init_method=self.transformer_config.init_method,
                                    bias=True, config=self.transformer_config,

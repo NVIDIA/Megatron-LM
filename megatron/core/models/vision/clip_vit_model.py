@@ -2,6 +2,7 @@
 
 from typing import Optional, Union
 
+from megatron.core.device_utils import get_current_device
 import torch
 
 from megatron.core.models.common.vision_module.vision_module import VisionModule
@@ -65,7 +66,7 @@ class CLIPViTModel(VisionModule):
             bias=False,
         )
 
-        self.position_ids = torch.arange(self.seq_length).expand(1, -1).cuda()
+        self.position_ids = torch.arange(self.seq_length).expand(1, -1).to(device=get_current_device())
 
         self.position_embeddings = torch.nn.Embedding(self.seq_length, self.visual_hidden_size)
 
@@ -138,7 +139,7 @@ class CLIPViTModel(VisionModule):
         if attention_mask is None:
             attention_mask = torch.ones(
                 1, 1, self.seq_length, self.seq_length
-            ).cuda()  # [1, 1, s, s]
+            ).to(device=get_current_device())  # [1, 1, s, s]
             attention_mask = attention_mask < 0.5  # to bool
 
         x = self.decoder(x, attention_mask)

@@ -1,12 +1,13 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.core.device_utils import get_current_device
 import pytest
 
 import torch
 
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from tests.unit_tests.test_utilities import Utils
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 
@@ -14,7 +15,7 @@ class TestParallelSequentialMLP:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1,1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         print("done intializing")
         num_moe_experts = 2
         transformer_config = TransformerConfig(
@@ -46,10 +47,10 @@ class TestParallelSequentialMLP:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_gpu_forward(self):
         sequential_mlp = self.sequential_mlp
-        sequential_mlp.cuda()
+        sequential_mlp.to(device=get_current_device())
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones((32, 2, sequential_mlp.config.hidden_size))
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
         output, output_bias = sequential_mlp(hidden_states)
         assert output.shape[0] == 32
         assert output.shape[1] == 2

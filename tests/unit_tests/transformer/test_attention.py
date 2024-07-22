@@ -1,12 +1,13 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.core.device_utils import get_current_device
 import pytest
 
 import torch
 
 from megatron.core.transformer.attention import SelfAttention
 from tests.unit_tests.test_utilities import Utils
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 
@@ -14,7 +15,7 @@ class TestParallelAttention:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1,1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         self.transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
         self.parallel_attention = SelfAttention(self.transformer_config,
                                                 get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
@@ -41,13 +42,13 @@ class TestParallelAttention:
         sequence_length = 32
         micro_batch_size = 2
 
-        self.parallel_attention.cuda()
+        self.parallel_attention.to(device=get_current_device())
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones((sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size))
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
 
-        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).to(device=get_current_device())
 
         output, bias = self.parallel_attention(hidden_states, attention_mask)
 
@@ -63,14 +64,14 @@ class TestParallelAttention:
         sequence_length = 32
         micro_batch_size = 2
 
-        self.parallel_attention.cuda()
+        self.parallel_attention.to(device=get_current_device())
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones((sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size))
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
 
-        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
-        rotary_pos_emb = torch.ones(sequence_length, 1, 1, self.parallel_attention.config.kv_channels).cuda()
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).to(device=get_current_device())
+        rotary_pos_emb = torch.ones(sequence_length, 1, 1, self.parallel_attention.config.kv_channels).to(device=get_current_device())
         output, bias = self.parallel_attention(hidden_states, attention_mask, rotary_pos_emb=rotary_pos_emb)
 
         assert config.recompute_granularity is None
@@ -92,15 +93,15 @@ class TestParallelAttention:
         sequence_length = 32
         micro_batch_size = 2
 
-        checkpointed_parallel_attention.cuda()
+        checkpointed_parallel_attention.to(device=get_current_device())
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones(
             (sequence_length, micro_batch_size, checkpointed_parallel_attention.config.hidden_size)
         )
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
 
-        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).to(device=get_current_device())
 
         output, bias = checkpointed_parallel_attention(hidden_states, attention_mask)
 

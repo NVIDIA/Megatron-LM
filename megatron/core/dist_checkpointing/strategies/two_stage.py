@@ -12,6 +12,7 @@ from operator import attrgetter, itemgetter
 from pathlib import Path
 from typing import Iterable, List, NamedTuple, Optional, Tuple, Union
 
+from megatron.core.device_utils import get_current_device
 import torch
 
 from ..dict_utils import dict_list_map_inplace, map_reduce, nested_values
@@ -204,7 +205,7 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
             if self.dp_group_rank == ten_meta.dist_group_rank:
                 exchange_tensor = self.load_tensor_from_storage(checkpoint_dir, ten_meta)
                 if not self.cpu_transfer:
-                    exchange_tensor = exchange_tensor.cuda()
+                    exchange_tensor = exchange_tensor.to(device=get_current_device())
             else:
                 # TODO: for non-flattened ranges we could reuse the buffer from the start here
                 exchange_tensor = torch.empty(

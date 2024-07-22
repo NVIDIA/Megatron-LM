@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Sample Generate GPT"""
+from megatron.core.device_utils import get_current_device
 import torch
 import os
 import sys
@@ -215,7 +216,7 @@ def generate_samples_conditional(model):
         else:
             retro_generate_and_post_process(model)
 
-        terminate_runs_tensor = torch.cuda.LongTensor([terminate_runs])
+        terminate_runs_tensor = torch.tensor([terminate_runs], dtype=torch.long, device=get_current_device())
         torch.distributed.broadcast(terminate_runs_tensor, 0)
         terminate_runs = terminate_runs_tensor[0].item()
 

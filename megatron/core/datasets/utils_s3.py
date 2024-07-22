@@ -1,6 +1,7 @@
 import os
 from typing import Any, Dict, NamedTuple, Protocol, Tuple
 
+from megatron.core.device_utils import get_local_device_count
 import torch
 
 try:
@@ -130,7 +131,7 @@ def maybe_download_file(s3_path: str, local_path: str) -> None:
 
     if torch.distributed.is_initialized():
         rank = torch.distributed.get_rank()
-        local_rank = rank % torch.cuda.device_count()
+        local_rank = rank % get_local_device_count()
     else:
         rank = 0
         local_rank = 0

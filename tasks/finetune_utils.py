@@ -4,6 +4,7 @@
 
 from functools import partial
 import sys
+from megatron.core.device_utils import get_current_device
 import torch
 
 from megatron.training import get_args, get_num_microbatches
@@ -26,10 +27,10 @@ def process_batch(batch):
     """Process batch and produce inputs for the model."""
     args = get_args()
 
-    tokens = batch['text'].long().cuda().contiguous()
-    types = batch['types'].long().cuda().contiguous()
-    labels = batch['label'].long().cuda().contiguous()
-    attention_mask = batch['padding_mask'].float().cuda().contiguous()
+    tokens = batch['text'].long().to(device=get_current_device()).contiguous()
+    types = batch['types'].long().to(device=get_current_device()).contiguous()
+    labels = batch['label'].long().to(device=get_current_device()).contiguous()
+    attention_mask = batch['padding_mask'].float().to(device=get_current_device()).contiguous()
     if args.fp16:
         attention_mask = attention_mask.half()
 

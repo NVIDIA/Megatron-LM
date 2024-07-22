@@ -17,7 +17,7 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -27,7 +27,7 @@ _te_version = packaging.version.Version(version("transformer-engine"))
 
 def initialize_expert_layer(seed, glu=True, moe_grouped_gemm=False, **config_kwargs):
     torch.manual_seed(seed)
-    model_parallel_cuda_manual_seed(seed)
+    model_parallel_device_manual_seed(seed)
 
     pp_size = parallel_state.get_pipeline_model_parallel_world_size()
     num_moe_experts = 8

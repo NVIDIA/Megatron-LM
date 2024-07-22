@@ -12,12 +12,12 @@ from megatron.core.models.retro import get_retro_decoder_block_spec, RetroConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 
 
 def initialize_retro_model(seed, decoder_spec_fn, spec_type, num_layers=9, **config_kwargs):
     torch.manual_seed(seed)
-    model_parallel_cuda_manual_seed(seed)
+    model_parallel_device_manual_seed(seed)
 
     default_config_kwargs=dict(
         num_layers=num_layers,

@@ -260,7 +260,7 @@ class TransformerBlock(MegatronModule):
                 return te_checkpoint(
                     forward_func,
                     self.config.distribute_saved_activations,
-                    tensor_parallel.random.get_cuda_rng_tracker,
+                    tensor_parallel.random.get_device_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
                     hidden_states,
                     attention_mask,
@@ -369,7 +369,7 @@ class TransformerBlock(MegatronModule):
         )
 
         if self.config.sequence_parallel:
-            rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
+            rng_context = tensor_parallel.get_device_rng_tracker().fork()
         else:
             rng_context = nullcontext()
 

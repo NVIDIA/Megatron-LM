@@ -15,7 +15,7 @@ from torch import Tensor, nn
 from megatron.core import parallel_state
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers
-from megatron.core.tensor_parallel import get_cuda_rng_tracker
+from megatron.core.tensor_parallel import get_device_rng_tracker
 from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
@@ -32,7 +32,7 @@ def _init_weights(
     rescale_prenorm_residual=True,
     n_residuals_per_layer=1,  # Change to 2 if we have MLP
 ):
-    with get_cuda_rng_tracker().fork():
+    with get_device_rng_tracker().fork():
         if isinstance(module, nn.Linear):
             if not getattr(module.weight, "_no_reinit", False):
                 nn.init.normal_(module.weight, std=initializer_range)

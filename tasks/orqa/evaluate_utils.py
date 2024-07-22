@@ -1,5 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_local_device_count
 import torch
 
 from megatron.training import get_args, print_rank_0
@@ -108,7 +110,7 @@ class ORQAEvaluator(object):
                                                                     split)
         local_rank = args.local_rank
         rank = torch.distributed.get_rank()
-        device_count = torch.cuda.device_count()
+        device_count = get_local_device_count()
         num_nodes = torch.distributed.get_world_size() // device_count
         node_id = rank // device_count
 
@@ -132,14 +134,14 @@ class ORQAEvaluator(object):
             distance, topkindex = self.mips_index.search_mips_index(
                 all_query_tensor, top_k=args.faiss_topk_retrievals, 
                 reconstruct=False)
-            distance = torch.from_numpy(distance).cuda()
-            topkindex = torch.LongTensor(topkindex).cuda()
+            distance = torch.from_numpy(distance).to(device=get_current_device())
+            topkindex = torch.LongTensor(topkindex).to(device=get_current_device())
 
         if local_rank != 0:
             distance = torch.empty(device_count * len(query_tensor), \
-                args.faiss_topk_retrievals, dtype=torch.float32).cuda()
+                args.faiss_topk_retrievals, dtype=torch.float32).to(device=get_current_device())
             topkindex = torch.empty(device_count * len(query_tensor), \
-                args.faiss_topk_retrievals, dtype=torch.int64).cuda()
+                args.faiss_topk_retrievals, dtype=torch.int64).to(device=get_current_device())
 
         torch.distributed.broadcast(distance, src=device_start_rank, \
             group=group)

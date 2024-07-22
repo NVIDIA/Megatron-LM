@@ -8,6 +8,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 import math
+from megatron.core.device_utils import get_current_device
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -542,8 +543,8 @@ if __name__ == "__main__":
         y_pred = y_true + noise
         for cuda in [False, True]:
             if cuda:
-                y_pred = y_pred.cuda()
-                y_true = y_true.cuda()
+                y_pred = y_pred.to(device=get_current_device())
+                y_true = y_true.to(device=get_current_device())
 
             print('#'*20, 'Cuda : {} ; size : {}'.format(cuda, y_true.size()))
             ########### similarity metrics

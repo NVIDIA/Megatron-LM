@@ -4,6 +4,7 @@ import operator
 from functools import reduce
 from typing import Callable, List, Optional, Tuple, Union
 
+from megatron.core.device_utils import get_current_device
 import torch
 
 from megatron import core
@@ -45,19 +46,19 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
     send_next_shape_tensor = None
     if recv_prev:
         recv_prev_shape_tensor = torch.empty(
-            (3), device=torch.cuda.current_device(), dtype=torch.int64
+            (3), device=get_current_device(), dtype=torch.int64
         )
     if recv_next:
         recv_next_shape_tensor = torch.empty(
-            (3), device=torch.cuda.current_device(), dtype=torch.int64
+            (3), device=get_current_device(), dtype=torch.int64
         )
     if tensor_send_prev is not None:
         send_prev_shape_tensor = torch.tensor(
-            tensor_send_prev.size(), device=torch.cuda.current_device(), dtype=torch.int64
+            tensor_send_prev.size(), device=get_current_device(), dtype=torch.int64
         )
     if tensor_send_next is not None:
         send_next_shape_tensor = torch.tensor(
-            tensor_send_next.size(), device=torch.cuda.current_device(), dtype=torch.int64
+            tensor_send_next.size(), device=get_current_device(), dtype=torch.int64
         )
 
     if config.use_ring_exchange_p2p:
@@ -105,7 +106,8 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
 
         # To protect against race condition when using batch_isend_irecv().
         # should take this out once the bug with batch_isend_irecv is resolved.
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
     recv_prev_shape = [0, 0, 0]
     if recv_prev_shape_tensor is not None:
@@ -320,7 +322,7 @@ def _communicate(
         tensor_recv_prev = torch.empty(
             recv_prev_shape,
             requires_grad=True,
-            device=torch.cuda.current_device(),
+            device=get_current_device(),
             dtype=config.pipeline_dtype,
         )
     if recv_next:
@@ -334,7 +336,7 @@ def _communicate(
         tensor_recv_next = torch.empty(
             recv_next_shape,
             requires_grad=True,
-            device=torch.cuda.current_device(),
+            device=get_current_device(),
             dtype=config.pipeline_dtype,
         )
 
@@ -368,7 +370,8 @@ def _communicate(
     if config.batch_p2p_comm and config.batch_p2p_sync:
         # To protect against race condition when using batch_isend_irecv().
         # User should assert that we have a modern enough PyTorch to not need this
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
     return tensor_recv_prev, tensor_recv_next, reqs
 

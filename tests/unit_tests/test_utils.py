@@ -2,6 +2,7 @@ import os
 import time
 import urllib.request as req
 
+import megatron.core.device_utils
 import numpy as np
 import pytest
 import torch
@@ -20,7 +21,7 @@ def test_divide_improperly():
 def test_global_memory_buffer():
     global_memory_buffer = util.GlobalMemoryBuffer()
     obtained_tensor = global_memory_buffer.get_tensor((3,2), torch.float32, "test_tensor")
-    expected_tensor = torch.empty((3,2), dtype=torch.float32, device=torch.cuda.current_device())
+    expected_tensor = torch.empty((3,2), dtype=torch.float32, device=megatron.core.device_utils.get_current_device())
     assert obtained_tensor.shape == expected_tensor.shape
 
 def test_make_viewless_tensor():
@@ -48,7 +49,7 @@ def _init_distributed(world, rank):
     Utils.initialize_distributed()
     assert torch.distributed.is_initialized() == True
     assert torch.distributed.get_rank() == rank
-    assert torch.cuda.device_count() == world
+    assert torch.distributed.get_world_size() == world
     torch.distributed.barrier()
 
 # Deinitialization and cleanup.

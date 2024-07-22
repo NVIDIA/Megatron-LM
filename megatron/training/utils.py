@@ -5,6 +5,7 @@ import os
 import sys
 from datetime import datetime
 
+from megatron.core.device_utils import get_current_device
 import torch
 
 try:
@@ -117,6 +118,10 @@ def average_losses_across_data_parallel_group(losses):
 
 def report_memory(name):
     """Simple GPU memory report."""
+
+    if not torch.cuda.is_avalable():
+        return
+    
     mega_bytes = 1024.0 * 1024.0
     string = name + ' memory (MB)'
     string += ' | allocated: {}'.format(
@@ -341,16 +346,16 @@ def get_batch_on_this_tp_rank(data_iterator):
 
     else:
 
-       tokens=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
-       labels=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
-       loss_mask=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.float32 , device = torch.cuda.current_device())
+       tokens=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = get_current_device())
+       labels=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = get_current_device())
+       loss_mask=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.float32 , device = get_current_device())
        if args.create_attention_mask_in_dataloader:
            attention_mask=torch.empty(
-                (args.micro_batch_size,1,args.seq_length,args.seq_length), dtype = torch.bool , device = torch.cuda.current_device()
+                (args.micro_batch_size,1,args.seq_length,args.seq_length), dtype = torch.bool , device = get_current_device()
             )
        else:
            attention_mask=None
-       position_ids=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
+       position_ids=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = get_current_device())
 
        if args.pipeline_model_parallel_size == 1:
            _broadcast(tokens)

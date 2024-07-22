@@ -8,6 +8,7 @@ from dataclasses import replace
 from logging import getLogger
 from typing import Callable, Dict, List, Optional, Tuple
 
+from megatron.core.device_utils import get_current_device
 import torch
 
 HAVE_APEX_OR_TE = True
@@ -310,7 +311,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 param_range = gbuf_range["param_map"][model_param]["param"]
 
                 # fp16, bf16 params.
-                if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
+                model_param_type = model_param.type().split('.')[-1]
+                if model_param_type in ['HalfTensor', 'BFloat16Tensor']:
 
                     # Clone model -> main.
                     shard_model_param = model_param.detach().view(-1)[
@@ -333,7 +335,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     shard_fp32_from_float16_params_this_group.append(shard_main_param)
 
                 # fp32 params.
-                elif model_param.type() == 'torch.cuda.FloatTensor':
+                elif model_param_type == 'FloatTensor':
                     shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
                     model_fp32_params_this_group.append(model_param)
                     shard_fp32_params_this_group.append(shard_model_param)
@@ -346,10 +348,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 else:
                     raise TypeError(
                         'Wrapped parameters must be one of '
-                        'torch.cuda.FloatTensor,  '
-                        'torch.cuda.HalfTensor, or '
-                        'torch.cuda.BFloat16Tensor. '
-                        'Received {}'.format(model_param.type())
+                        'FloatTensor,  '
+                        'HalfTensor, or '
+                        'BFloat16Tensor. '
+                        'Received {}'.format(model_param_type)
                     )
 
             # Update optimizer's params.
@@ -637,7 +639,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # Allocate dummy tensors.
                         numel = len(param_range_map["gbuf_world"])
                         init_shard = lambda: torch.empty(
-                            (numel,), dtype=torch.float32, device=torch.cuda.current_device()
+                            (numel,), dtype=torch.float32, device=get_current_device()
                         )
 
                         state_dict_state.append(

@@ -22,12 +22,12 @@ from megatron.core.transformer.transformer_block import \
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 
 
 def initialize_t5_model(seed, encoder_spec_fn, decoder_spec_fn, num_layers=2, **config_kwargs):
     torch.manual_seed(seed)
-    model_parallel_cuda_manual_seed(seed)
+    model_parallel_device_manual_seed(seed)
 
     default_config_kwargs=dict(
         num_layers=num_layers, hidden_size=16, num_attention_heads=12, kv_channels=64, ffn_hidden_size=64,

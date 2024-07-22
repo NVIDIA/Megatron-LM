@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.core.device_utils import get_current_device
 import pytest
 import torch
 from megatron.core import parallel_state
@@ -72,12 +73,13 @@ class MoEModelTestContainer:
         )
         self.moe_layer = MoELayer(
             self.config, transformer_layer_spec.submodules.mlp.submodules
-        ).cuda()
+        ).to(device=get_current_device())
         self.moe_layer.set_layer_number(0)
     
     def __del__(self):
         torch.distributed.barrier()
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         Utils.destroy_model_parallel()
 
     def dispatcher_dropless_test(self):
@@ -85,7 +87,7 @@ class MoEModelTestContainer:
         bs = 32
         seql = 8
         hidden_states = torch.randn((bs, seql, moe_layer.config.hidden_size))
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
         hidden_states.requires_grad = True
         probs, indices = moe_layer.router(hidden_states)
         probs = torch.ones_like(probs) / moe_layer.router.topk
@@ -122,7 +124,7 @@ class MoEModelTestContainer:
     def dispacher_capacity_test(self):
         moe_layer = self.moe_layer
         hidden_states = torch.randn((256, moe_layer.config.hidden_size))
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
         hidden_states.requires_grad = True
         probs, indices = moe_layer.router(hidden_states)
         tp_size = moe_layer.config.tensor_model_parallel_size
@@ -163,7 +165,7 @@ class MoEModelTestContainer:
     def dispatcher_drop_and_pad_test(self):
         "Test if the tokens are dropped and padded correctly"
         moe_layer = self.moe_layer
-        hidden_states = torch.randn((256, moe_layer.config.hidden_size)).cuda()
+        hidden_states = torch.randn((256, moe_layer.config.hidden_size)).to(device=get_current_device())
         hidden_states.requires_grad = True
 
         # Create the answer.
@@ -171,14 +173,14 @@ class MoEModelTestContainer:
         moe_layer.token_dispatcher.drop_and_pad = False
 
         # Uncomment these lines to help bug location.
-        # hidden_states = torch.ones((8, moe_layer.config.hidden_size)).cuda()
-        # hidden_states = hidden_states * torch.range(1, 8).unsqueeze(1).cuda()
+        # hidden_states = torch.ones((8, moe_layer.config.hidden_size)).to(device=get_current_device())
+        # hidden_states = hidden_states * torch.range(1, 8).unsqueeze(1).to(device=get_current_device())
         # hidden_states.requires_grad = True
-        # indices_1 = torch.tensor([[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7]]).cuda()
+        # indices_1 = torch.tensor([[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7]]).to(device=get_current_device())
         # probs_1 = torch.ones_like(indices_1)
-        # indices_2 = torch.tensor([[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7]]).cuda()
+        # indices_2 = torch.tensor([[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7]]).to(device=get_current_device())
         # probs_2 = torch.ones_like(indices_2)
-        # num_local_tokens_per_expert = torch.tensor([2, 2, 2, 2, 2, 2, 2, 2]).cuda()
+        # num_local_tokens_per_expert = torch.tensor([2, 2, 2, 2, 2, 2, 2, 2]).to(device=get_current_device())
 
         probs_1, indices_1 = moe_layer.router(hidden_states)
         (permuted_input_1, tokens_per_expert,) = moe_layer.token_dispatcher.token_permutation(
@@ -191,7 +193,8 @@ class MoEModelTestContainer:
         torch.autograd.backward(forward_answer, forward_answer)
         backward_answer = hidden_states.grad.clone()
         hidden_states.grad = None
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         moe_layer.token_dispatcher.drop_and_pad = True
         moe_layer.config.moe_pad_expert_input_to_capacity = True
         # End
@@ -263,7 +266,7 @@ class TestAllgatherDispatcher:
         moe_layer = container.moe_layer
         # [bs, seql, hidden size]
         hidden_states = torch.randn((32, 8, moe_layer.router.config.hidden_size))
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
         hidden_states.requires_grad = True
         scores, indices = moe_layer.router(hidden_states)
         assert scores.shape == (256, moe_layer.router.topk), "Scores shape is not correct"

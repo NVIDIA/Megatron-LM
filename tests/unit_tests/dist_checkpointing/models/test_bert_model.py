@@ -17,14 +17,14 @@ from tests.unit_tests.dist_checkpointing.models.common import \
     common_test_parallel_reconfiguration_e2e, common_test_state_dict_comparison, \
     common_test_vocab_size_padding_change
 from tests.unit_tests.test_utilities import Utils
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.models.bert.bert_layer_specs import bert_layer_local_spec, bert_layer_with_transformer_engine_spec
 
 
 def initialize_bert_model(seed, layer_spec_fn=bert_layer_with_transformer_engine_spec, vocab_size=128, **config_kwargs):
     os.environ['NVTE_ALLOW_NONDETERMINISTIC_ALGO'] = '0'
     torch.manual_seed(seed)
-    model_parallel_cuda_manual_seed(seed)
+    model_parallel_device_manual_seed(seed)
 
     layer_spec = layer_spec_fn() if callable(layer_spec_fn) else layer_spec_fn
 

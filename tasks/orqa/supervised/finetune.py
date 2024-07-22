@@ -6,6 +6,7 @@ from functools import partial
 import sys
 
 import math
+from megatron.core.device_utils import get_current_device
 import torch
 import torch.nn.functional as F
 
@@ -26,7 +27,7 @@ def check_and_append_tensor_for_gather(group, rank, world_size, input_):
     # gather the size of the first dimension of the tensor from all ranks
     current_length = input_.size()[0]
     first_dim = torch.tensor([[current_length]], 
-        device=torch.cuda.current_device())
+        device=get_current_device())
     input_list = [torch.empty_like(first_dim) for _ in range(world_size)]
     input_list[rank].copy_(first_dim)
     torch.distributed.all_gather(input_list, first_dim, group=group)
@@ -149,10 +150,10 @@ def orqa(Dataset):
             for i in range(world_size):
                 j = i * local_context_size
                 labels.extend(list(range(j, j + local_batch_size)))
-            labels = torch.LongTensor(labels).cuda()
+            labels = torch.LongTensor(labels).to(device=get_current_device())
             assert len(labels) == global_batch_size
         else:
-            labels = torch.arange(global_batch_size).long().cuda()
+            labels = torch.arange(global_batch_size).long().to(device=get_current_device())
 
         # Cross-entropy loss.
         softmax_scores = F.log_softmax(retrieval_scores, dim=1)

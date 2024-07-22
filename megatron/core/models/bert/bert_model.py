@@ -3,6 +3,7 @@ import os
 from collections import OrderedDict
 from typing import Dict, Literal, Optional
 
+from megatron.core.device_utils import get_current_device
 import torch
 from torch import Tensor
 
@@ -253,7 +254,7 @@ class BertModel(LanguageModule):
             output = torch.zeros(
                 size=(embeddings.shape[0], embeddings.shape[2]),
                 dtype=torch.float32,
-                device=torch.cuda.current_device(),
+                device=get_current_device(),
             )
             for i, (embedding, mask) in enumerate(zip(embeddings, masks)):
                 output[i, :] = torch.mean(embedding[1 : mask - 1], dim=0)

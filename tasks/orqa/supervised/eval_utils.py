@@ -3,6 +3,7 @@
 """Evaluation utilities."""
 from collections import OrderedDict
 import math
+from megatron.core.device_utils import get_current_device
 import numpy as np
 import time
 import torch
@@ -50,20 +51,20 @@ def task_collate_fn(batch_data):
 
 def process_batch(batch):
     """Process batch and produce inputs for the model."""
-    query_tokens = batch['query'].long().cuda()
-    query_mask = (batch['query_mask'] < 0.5).cuda()
-    query_types = batch['query_types'].long().cuda()
-    query_pad_mask = batch['query_pad_mask'].long().cuda()
+    query_tokens = batch['query'].long().to(device=get_current_device())
+    query_mask = (batch['query_mask'] < 0.5).to(device=get_current_device())
+    query_types = batch['query_types'].long().to(device=get_current_device())
+    query_pad_mask = batch['query_pad_mask'].long().to(device=get_current_device())
 
-    context_tokens = batch['context'].long().cuda()
-    context_mask = (batch['context_mask'] < 0.5).cuda()
-    context_types = batch['context_types'].long().cuda()
-    context_pad_mask = batch['context_pad_mask'].long().cuda()
+    context_tokens = batch['context'].long().to(device=get_current_device())
+    context_mask = (batch['context_mask'] < 0.5).to(device=get_current_device())
+    context_types = batch['context_types'].long().to(device=get_current_device())
+    context_pad_mask = batch['context_pad_mask'].long().to(device=get_current_device())
 
     if 'neg_context' in batch:
-        neg_context_tokens = batch['neg_context'].long().cuda()
-        neg_context_mask = (batch['neg_context_mask'] < 0.5).cuda()
-        neg_context_types = batch['neg_context_types'].long().cuda()
+        neg_context_tokens = batch['neg_context'].long().to(device=get_current_device())
+        neg_context_mask = (batch['neg_context_mask'] < 0.5).to(device=get_current_device())
+        neg_context_types = batch['neg_context_types'].long().to(device=get_current_device())
     else:
         neg_context_tokens = None
         neg_context_mask = None
@@ -156,7 +157,7 @@ def retrieval_loss(model, dataloader):
                     math.sqrt(args.hidden_size)
 
             local_batch_size = query_logits.shape[0]
-            labels = torch.arange(local_batch_size).long().cuda()
+            labels = torch.arange(local_batch_size).long().to(device=get_current_device())
 
             softmax_scores = F.softmax(retrieval_scores, dim=1)
             sorted_vals, sorted_indices = torch.topk(softmax_scores,
@@ -164,14 +165,14 @@ def retrieval_loss(model, dataloader):
                                                      sorted=True)
 
             def topk_accuracy(k):
-                return torch.cuda.FloatTensor(
+                return torch.tensor(
                     [sum([int(labels[i] in sorted_indices[i, :k]) for i in \
-                        range(local_batch_size)])])
+                        range(local_batch_size)])], dtype=torch.float, device=get_current_device())
 
             def get_rank():
-                return torch.cuda.FloatTensor(
+                return torch.tensor(
                     [sum([torch.nonzero(labels[i] == sorted_indices[i])[0][0] \
-                        for i in range(local_batch_size)])])
+                        for i in range(local_batch_size)])], dtype=torch.float, device=get_current_device())
 
             topk_accs = [topk_accuracy(k) for k in \
                 args.retriever_report_topk_accuracies]

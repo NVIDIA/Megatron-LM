@@ -2,6 +2,7 @@
 
 
 """Inference API."""
+from megatron.core.device_utils import get_current_device
 import numpy as np
 import torch
 from megatron.core import mpu
@@ -87,8 +88,8 @@ def _tokenize_prompts_and_batch(prompts, tokens_to_generate, add_BOS):
         prompt_tokens.extend([tokenizer.eod] * padding_size)
 
     # Now we are in a structured format, we can convert to tensors.
-    prompts_tokens_tensor = torch.cuda.LongTensor(prompts_tokens)
-    prompts_length_tensor = torch.cuda.LongTensor(prompts_length)
+    prompts_tokens_tensor = torch.tensor(prompts_tokens, dtype=torch.long, device=get_current_device())
+    prompts_length_tensor = torch.tensor(prompts_length, dtype=torch.long, device=get_current_device())
 
     return prompts_tokens_tensor, prompts_length_tensor
 
