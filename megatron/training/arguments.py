@@ -550,6 +550,16 @@ def validate_args(args, defaults={}):
     if args.use_dist_ckpt and args.use_legacy_models:
         raise RuntimeError('--use-dist-ckpt is not supported in legacy models.')
 
+    # Inter-document attention independence checks
+    if args.gpt_use_thd_qkv_format:
+        args.create_attention_mask_in_dataloader = False
+        assert not args.use_legacy_models, \
+            "This option requires non-legacy Megatron Core models"
+        assert args.transformer_impl == "transformer_engine", \
+            "This option requires Transformer Engine for the model backend"
+        assert args.context_parallel_size == 1, \
+            "TransformerEngine does not support packed sequences with context parallelism"
+
     # Data blend checks
     assert args.mock_data + \
            bool(args.data_path) + \
@@ -1538,6 +1548,9 @@ def _add_data_args(parser):
     group.add_argument('--mock-data', action='store_true',
                        help='Skip data loading and validation and opt for artificial '
                        'generation of mock data when an implementation is available.')
+    group.add_argument('--gpt-use-thd-qkv-format', action='store_true',
+                       help='Pack sequences for \'thd\' qkv_format used in Transformer Engine '
+                       'DotProductAttention')
     group.add_argument('--vocab-size', type=int, default=None,
                        help='Size of vocab before EOD or padding.')
     group.add_argument('--vocab-file', type=str, default=None,

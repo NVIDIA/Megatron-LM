@@ -47,6 +47,54 @@ def normalize(weights: List[float]) -> List[float]:
     return w
 
 
+def get_cu_seqlens(token_ids: torch.Tensor, delim_bos: Optional[int], delim_eos: Optional[int]) -> torch.Tensor:
+    """Get the cumulative sequence lengths required for 'thd' attention as specified by
+    Transformer Engine DotProductAttention for a GPT-like causal auto-regressive masking scheme
+
+    Args:
+        token_ids (torch.Tensor): The token tensor in (batch, sequence) format
+
+        delim_bos (Optional[int]): The initial prefix delimiting token id, required if eos is None
+
+        delim_eos (Optional[int]): The terminal suffix delimiting token id, required if bos is None
+
+    Returns:
+        torch.Tensor: The cumulative sequence lengths for tokens according to bos/eos
+    
+    """
+    dim_b = token_ids.shape[0]
+    dim_s = token_ids.shape[0]
+
+    # We deliminate documents with the bos token
+    if delim_bos is not None:
+        start_mask = torch.zeros_like(token_ids)
+        start_mask[:, 0] = 1
+        start_mask = torch.logical_or(start_mask, token_ids == delim_bos)
+        cu_seqlens = torch.argwhere(start_mask)
+        cu_seqlens = cu_seqlens[:, 1] + (cu_seqlens[:, 0] * dim_s)
+        cu_seqlens = cu_seqlens[1:]
+        cu_seqlens = torch.concat(
+            [
+                cu_seqlens, 
+                torch.tensor([dim_b * dim_s], dtype=cu_seqlens.dtype, device=cu_seqlens.device)
+            ]
+        )
+
+    # We deliminate documents with the eos token
+    elif delim_eos is not None:
+        end_mask = torch.zeros_like(token_ids)
+        end_mask[:, -1] = 1
+        end_mask = torch.logical_or(end_mask, token_ids == delim_eos)
+        cu_seqlens = torch.argwhere(end_mask)
+        cu_seqlens = cu_seqlens[:, 1] + (cu_seqlens[:, 0] * dim_s) + 1
+
+    # We don't care about intra-sequence inter-document breaks
+    else:
+        cu_seqlens = (torch.arange(dim_b, device=token_ids.device) + 1) * dim_s
+
+    return cu_seqlens
+
+
 def get_blend_from_list(
     blend: Optional[List[str]],
 ) -> Optional[Tuple[List[str], Optional[List[float]]]]:

@@ -27,17 +27,17 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Configuration object for Megatron Core GPT datasets"""
 
     reset_position_ids: bool = None
-    """Option to reset the position IDs in the dataset at an interval"""
+    """Option to assume EOD-demarcated document independence in generating the position ids"""
 
     reset_attention_mask: bool = None
-    """Option to reset the attention mask from the dataset"""
+    """Option to assume EOD-demarcated document independence in generating the attention masks"""
 
     eod_mask_loss: bool = None
-    """Option to enable the EOD mask loss"""
+    """Option to mask the loss for EOD tokens"""
 
     create_attention_mask: bool = True
-    """Option to enable the attention masks generation. Can be disabled if attention kernel
-       generates masks by itself.
+    """Option to enable generation of the attention masks. Can be disabled if mask generation is
+       handled in the attention kernel.
     """
 
     drop_last_partial_validation_sequence: bool = True
@@ -94,7 +94,7 @@ class GPTDataset(MegatronDataset):
         self.masks_and_position_ids_are_cacheable = not any(
             [
                 self.config.reset_position_ids,
-                self.config.reset_attention_mask,
+                self.config.reset_attention_mask and self.config.create_attention_mask,
                 self.config.eod_mask_loss,
             ]
         )
@@ -215,21 +215,17 @@ class GPTDataset(MegatronDataset):
         if idx is None:
             loss_mask = torch.zeros_like(loss_mask)
 
+        ret = {
+                "tokens": tokens,
+                "labels": labels,
+                "loss_mask": loss_mask,
+                "position_ids": position_ids,
+            }
+
         if self.config.create_attention_mask:
-            return {
-                "tokens": tokens,
-                "labels": labels,
-                "attention_mask": attention_mask,
-                "loss_mask": loss_mask,
-                "position_ids": position_ids,
-            }
-        else:
-            return {
-                "tokens": tokens,
-                "labels": labels,
-                "loss_mask": loss_mask,
-                "position_ids": position_ids,
-            }
+            ret["attention_mask"] = attention_mask
+
+        return ret
 
     def _query_document_sample_shuffle_indices(
         self, idx: int

@@ -13,11 +13,12 @@ from megatron.training import get_tokenizer
 from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.utils import get_blend_from_list
+from megatron.core.datasets.utils import get_blend_from_list, get_cu_seqlens
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
 import megatron.legacy.model
 from megatron.core.models.gpt import GPTModel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.training import pretrain
 from megatron.core.utils import StragglerDetector
 from megatron.core.transformer.spec_utils import import_module
@@ -161,18 +162,45 @@ def forward_step(data_iterator, model: GPTModel):
     """
     args = get_args()
     timers = get_timers()
+    tokenizer = get_tokenizer()
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()
+
     global stimer
     with stimer(bdata=True):
-        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
-            data_iterator)
+        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator)
+        if args.gpt_use_thd_qkv_format:
+
+            # Get cu_seqlens for 'thd' transformer_engine.pytorch.attention.DotProductAttention
+            if args.reset_attention_mask:
+                cu_seqlens = get_cu_seqlens(tokens, None, tokenizer.eod)
+            else:
+                cu_seqlens = get_cu_seqlens(tokens, None, None)
+
+            # Get max_seqlen for 'thd' transformer_engine.pytorch.attention.DotProductAttention
+            # NB: the impact of the gpu to cpu transfer is unknown
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+
+            packed_seq_params = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_kv=max_seqlen
+            )
+
+            tokens = tokens.view(1, -1)
+            labels = labels.view(1, -1)
+            loss_mask = loss_mask.view(1, -1)
+            position_ids = position_ids.view(1, -1)
+        else:
+            packed_seq_params = None
+
     timers('batch-generator').stop()
 
     with stimer:
-        output_tensor = model(tokens, position_ids, attention_mask,
-                              labels=labels)
+        output_tensor = model(tokens, position_ids, attention_mask, labels=labels, packed_seq_params=packed_seq_params)
 
     return output_tensor, partial(loss_func, loss_mask)
 
