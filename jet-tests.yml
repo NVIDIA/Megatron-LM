@@ -59,6 +59,13 @@ jet-trigger:
     strategy: depend
   variables:
     JET_WORKLOADS_FILTER: '$_JET_FILTER'
+    JET_CUSTOM_CONFIG: |
+      retrier:
+        enabled: true
+        max_retries: 2
+        retry_on: ['1.2'] # Will retry `Infrastructure failure` errors
+        waiting_time: 60
+        environment: jet-auto-retrier
   inherit:
     variables: true
 
@@ -72,9 +79,6 @@ jet-results-summary:
     - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $VAULT_JWT_TOKEN
   script:
     - env
-    - export RW_API_TOKEN=${PROJECT_ACCESS_TOKEN}
-    - export GITLAB_ENDPOINT
-    - bash tests/functional_tests/shell_test_utils/restart_jet_log_jobs.sh ${CI_PIPELINE_ID}
     - python -m pip install -U --no-cache-dir prettytable
     - rc=0
     - python tests/functional_tests/python_test_utils/jet_test_pipeline.py ${CI_PIPELINE_ID} --artifact_links $CI_JOB_ID --download_scripts_dir ./scripts || rc=$?
