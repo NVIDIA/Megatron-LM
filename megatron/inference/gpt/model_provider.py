@@ -3,12 +3,9 @@
 """ModelOpt GPT model provider."""
 
 import modelopt.torch.opt as mto
-
-from megatron.training import get_args, print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core.inference.ammo_support.gpt.model_specs import get_gpt_layer_ammo_spec
-from megatron.core.inference.ammo_support.gpt.state_dict_hooks import (
-    mcore_gpt_load_classic_state_dict_pre_hook,
+from megatron.core.inference.modelopt_support.gpt.model_specs import get_gpt_layer_modelopt_spec
+from megatron.core.inference.modelopt_support.gpt.state_dict_hooks import (
+    mcore_gpt_load_legacy_state_dict_pre_hook,
     mcore_gpt_load_te_state_dict_pre_hook,
 )
 from megatron.core.models.gpt import GPTModel as MCoreGPTModel
