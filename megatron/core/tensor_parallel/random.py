@@ -129,8 +129,10 @@ def initialize_rng_tracker(use_te_rng_tracker: bool = False):
     if _DEVICE_RNG_STATE_TRACKER_INITIALIZED:
         return
 
-    if get_xla_model() and use_te_rng_tracker:
-        raise RuntimeError("XLA is not supported with use_te_rng_tracker=True")
+    if use_te_rng_tracker and get_xla_model():
+        import warnings
+        warnings.warn("XLA model fall back: use_te_rng_tracker=False")
+        use_te_rng_tracker = False
     
     if use_te_rng_tracker:
         try:

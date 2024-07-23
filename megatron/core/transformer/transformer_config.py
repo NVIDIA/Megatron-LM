@@ -4,6 +4,7 @@ import types
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
+from megatron.core.device_utils import get_xla_model
 import torch
 import torch.nn.functional as F
 
@@ -285,6 +286,26 @@ class TransformerConfig(ModelParallelConfig):
             See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more details.
         """
         super().__post_init__()
+
+        if get_xla_model() is not None:
+            import warnings
+
+            if self.masked_softmax_fusion:
+                warnings.warn("XLA model fallback: masked_softmax_fusion=False")
+                self.masked_softmax_fusion = False
+
+            if self.bias_activation_fusion:
+                warnings.warn("XLA model fallback: bias_activation_fusion=False")
+                self.bias_activation_fusion = False
+            
+            if self.apply_rope_fusion:
+                warnings.warn("XLA model fallback: apply_rope_fusion=False")
+                self.apply_rope_fusion = False
+            
+            if self.fp8:
+                warnings.warn("XLA model fallback: fp8=None")
+                self.fp8 = None
+            
         if self.fp16 and self.bf16:
             raise ValueError(
                 f'Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True.'

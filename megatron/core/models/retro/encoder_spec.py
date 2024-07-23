@@ -155,6 +155,8 @@ def get_retro_encoder_block_spec(
         Transformer block submodules for the given spec.
     """
 
+    use_transformer_engine = use_transformer_engine & HAVE_TE
+    
     # Num layers.
     num_layers = config.retro_encoder_num_layers
     retro_layer_numbers = [1]

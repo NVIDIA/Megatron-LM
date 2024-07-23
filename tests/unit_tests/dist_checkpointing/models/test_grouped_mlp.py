@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import os
 import pytest
 import torch
 
@@ -40,7 +41,7 @@ def get_pp_offsets():
     pp_size = parallel_state.get_pipeline_model_parallel_world_size()
     return ((0, pp_rank, pp_size),)
 
-
+@pytest.mark.skipif(int(os.environ.get('ACCEL_MEMORY_GB', 40)) < 32 , reason="insufficient accelerator memory")
 class TestGroupedMLPReconfiguration:
     @pytest.mark.parametrize("use_fpsl,src_tp_pp_exp,dest_tp_pp_exp,use_glu", [
         # changing PP is impossible because the number of layers must be the same

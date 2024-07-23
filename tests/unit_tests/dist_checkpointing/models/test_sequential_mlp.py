@@ -2,7 +2,7 @@
 
 import pytest
 from pkg_resources import packaging
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 import torch
 
 from megatron.core import parallel_state
@@ -22,8 +22,6 @@ from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
-
-_te_version = packaging.version.Version(version("transformer-engine"))
 
 def initialize_expert_layer(seed, glu=True, moe_grouped_gemm=False, **config_kwargs):
     torch.manual_seed(seed)
@@ -62,9 +60,17 @@ def get_pp_offsets():
     return ((0, pp_rank, pp_size),)
 
 moe_grouped_gemm_options = [False]
-if _te_version >= packaging.version.Version("1.9.0.dev0"):
-    moe_grouped_gemm_options.append(True)
+try:
+    _te_version = packaging.version.Version(version("transformer-engine"))
+    if _te_version >= packaging.version.Version("1.9.0.dev0"):
+        moe_grouped_gemm_options.append(True)
+except PackageNotFoundError:
+    _te_version = None
 
+@pytest.mark.skipif(
+    _te_version is None,
+    reason="TE is not installed.",
+)
 class TestExpertLayerReconfiguration:
     @pytest.mark.parametrize(
         "use_fpsl,src_tp_pp_exp,dest_tp_pp_exp,use_glu",
@@ -141,7 +147,8 @@ class TestExpertLayerReconfiguration:
             assert not any(map(bool, diffs)), diffs
 
     @pytest.mark.skipif(
-        _te_version < packaging.version.Version("1.9.0.dev0"),
+        _te_version is None or 
+        (_te_version < packaging.version.Version("1.9.0.dev0")),
         reason="TE Grouped MLP is only supported in TE 1.9.0.dev0 and later.",
     )
     @pytest.mark.parametrize(

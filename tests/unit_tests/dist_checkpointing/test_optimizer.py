@@ -24,7 +24,7 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import \
 from megatron.core.dist_checkpointing.utils import extract_sharded_tensors
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-from megatron.core.optimizer import DistributedOptimizer, OptimizerConfig, \
+from megatron.core.optimizer import OptimizerConfig, \
     get_megatron_optimizer
 from megatron.core.tensor_parallel import model_parallel_device_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -230,7 +230,9 @@ def setup_model_and_optimizer(seed, tp, pp, initialize_fn=initialize_gpt_model, 
 
     return unwrap_model(model), optimizer
 
+from megatron.core.optimizer.distrib_optimizer import HAVE_APEX_OR_TE
 
+@pytest.mark.skipif(not HAVE_APEX_OR_TE, reason="APEX or TE required for DistributedOptimizer")
 class TestDistributedOptimizer:
     def setup_class(cls):
         Utils.initialize_distributed()
@@ -422,7 +424,7 @@ class TestDistributedOptimizer:
                 load_checkpoint_no_arg_checks(model, optimizer, None)
 
 
-
+@pytest.mark.skipif(not HAVE_APEX_OR_TE, reason="APEX or TE required for DistributedOptimizer")
 class TestFP32Optimizer:
     def setup_class(cls):
         Utils.initialize_distributed()
@@ -472,7 +474,7 @@ class TestFP32Optimizer:
                 diffs = diff(plain_state_dict_A, plain_state_dict_B)
                 assert not any(map(bool, diffs)), diffs
 
-
+@pytest.mark.skipif(not HAVE_APEX_OR_TE, reason="APEX or TE required for DistributedOptimizer")
 class TestOptimizerResharding:
     @pytest.fixture(scope='function', autouse=True)
     def cleanup_model_parallel(self):

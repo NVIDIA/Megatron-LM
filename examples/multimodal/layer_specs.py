@@ -22,6 +22,8 @@ try:
 
     HAVE_TE = True
 except ImportError:
+    import warnings
+    warnings.warn(f'Transfomer Engine is not installed. Falling back to Megatron Local')
     HAVE_TE = False
 
 try:
@@ -70,6 +72,9 @@ def get_layer_spec(is_vit=False) -> ModuleSpec:
 
 
 def get_layer_spec_te(is_vit=False) -> ModuleSpec:
+    if not HAVE_TE:
+        return get_layer_spec(is_vit=is_vit)
+    
     attn_mask_type = AttnMaskType.no_mask if is_vit else AttnMaskType.causal
 
     mlp = get_mlp_module_spec_te()
@@ -96,6 +101,8 @@ def get_layer_spec_te(is_vit=False) -> ModuleSpec:
 
 def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
     # Dense MLP w/ or w/o TE modules.
+
+    use_te = use_te & HAVE_TE
     return ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(
@@ -106,6 +113,10 @@ def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
 
 
 def get_mlp_module_spec_te() -> ModuleSpec:
+
+    if not HAVE_TE:
+        return get_mlp_module_spec(use_te=False)
+    
     return ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(

@@ -4,12 +4,11 @@
 from contextlib import nullcontext
 import os
 import math
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import numpy as np
 import torch
 import torch.nn.functional as F
 from typing import Optional
-
 from megatron import core
 from megatron.training import get_timers, get_args
 from .module import MegatronModule
@@ -1351,7 +1350,6 @@ def _get_layer_type(model_type, default_layer_type, retro_layer_numbers,
     else:
         return default_layer_type
 
-
 class ParallelTransformer(MegatronModule):
     """Transformer class."""
 
@@ -1374,7 +1372,7 @@ class ParallelTransformer(MegatronModule):
         self.post_process = post_process
         self.input_tensor = None
         self.drop_path_rate = drop_path_rate
-        self.transformer_impl = args.transformer_impl
+        self.transformer_impl = args.transformer_impl if not get_xla_model() else "local"
         self.retro_add_retriever = args.retro_add_retriever
 
         # Store activation checkpoiting flag.
@@ -1390,6 +1388,7 @@ class ParallelTransformer(MegatronModule):
         self.transformer_engine_v_0_10 = False
         self.transformer_engine_v_0_11 = False
         self.transformer_engine_v_0_8 = False
+
         if self.transformer_impl == 'transformer_engine':
             global transformer_engine
             import transformer_engine
@@ -1408,7 +1407,7 @@ class ParallelTransformer(MegatronModule):
 
             assert not args.squared_relu, "TransformerEngine does not support squared relu activation."
 
-        self.use_fp8 = args.fp8 is not None
+        self.use_fp8 = args.fp8 is not None and get_xla_model() is None
         self.fp8_recipe = None
         self.fp8_group = None
         if self.use_fp8:

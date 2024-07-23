@@ -15,7 +15,7 @@ from megatron.core.models.T5.t5_spec import (get_t5_encoder_with_transformer_eng
                                             get_t5_encoder_with_local_block_spec,
                                             get_t5_decoder_with_local_block_spec)
 
-@pytest.mark.skipif(int(os.environ.get('ACCEL_MEMORY_GB', 16)) <= 24 , reason="insufficient accelerator memory")
+@pytest.mark.skipif(int(os.environ.get('ACCEL_MEMORY_GB', 40)) < 32 , reason="insufficient accelerator memory")
 class TestT5Model:
 
     def setup_method(self, method):

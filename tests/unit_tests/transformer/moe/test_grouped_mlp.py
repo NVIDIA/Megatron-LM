@@ -3,7 +3,7 @@
 from megatron.core.device_utils import get_current_device
 import pytest
 from pkg_resources import packaging
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 
 import torch
 import torch.nn.functional as F
@@ -22,9 +22,16 @@ DEVICE_CAPABILITY = None
 if torch.cuda.is_available():
     DEVICE_CAPABILITY = torch.cuda.get_device_capability()
 
-_te_version = packaging.version.Version(version("transformer-engine"))
 
-
+try:
+    _te_version = packaging.version.Version(version("transformer-engine"))
+except PackageNotFoundError:
+    _te_version = None
+    
+@pytest.mark.skipif(
+    _te_version is None,
+    reason="TE is not installed.",
+)
 class TestParallelGroupedMLP:
 
     def setup_method(self, method, use_cpu_initialization=False, swiglu=True):

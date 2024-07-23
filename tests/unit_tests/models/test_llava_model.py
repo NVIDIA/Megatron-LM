@@ -13,7 +13,7 @@ from megatron.core.tensor_parallel.random import model_parallel_device_manual_se
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
-@pytest.mark.skipif(int(os.environ.get('ACCEL_MEMORY_GB', 16)) <= 24 , reason="insufficient accelerator memory")
+@pytest.mark.skipif(int(os.environ.get('ACCEL_MEMORY_GB', 40)) < 32 , reason="insufficient accelerator memory")
 class TestLLaVAModel:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
