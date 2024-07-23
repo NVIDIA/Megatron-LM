@@ -25,7 +25,8 @@ RUN pip3 install --no-cache-dir \
       wrapt \
       git+https://github.com/fanshiqing/grouped_gemm@v1.1.2 \
       zarr \
-      tensorstore==0.1.45
+      tensorstore==0.1.45 \
+      wandb
 
 ##### For Mamba begin #####
 RUN pip uninstall -y triton && \

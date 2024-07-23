@@ -36,15 +36,23 @@ default:
   interruptible: true
 
 variables:
-  FUNCTIONAL_TEST: "yes"
+  FUNCTIONAL_TEST: 
+    value: "yes"
+    options:
+      - "yes"
+      - "no"
+    description: To run the funtional test suite
+  CONVERGENCE_TEST:
+    value: "no"
+    options:
+      - "yes"
+      - "no"
   SCOPE:
     value: "mr"
     options:
       - "mr"
-      - "nightly"
       - "mr-and-nightly"
       - "weekly"
-      - "release"
     description: "Testsuite to run"
   SLURM_CLUSTER:
     value: "dgxa100_dracooci"
@@ -61,7 +69,7 @@ metadata:
   image: python:3.10
   stage: .pre
   tags:
-    - os/linux
+    - mcore-docker-node-small
   script:
     - set -x
     - env
@@ -90,6 +98,11 @@ metadata:
       if [[ "$JET_CUSTOM_FILTER" == "type == 'basic'" ]]; then
         JET_CUSTOM_FILTER="False"
       fi
+    - | 
+      if [[ $CONVERGENCE_TEST == yes && $CI_COMMIT_BRANCH != core_r* ]]; then
+        echo "Please run convergence-tests only on release branches. Current branch: $CI_COMMIT_BRANCH".
+        exit 1
+      fi
     - echo "JET_CI_BRANCH=$JET_CI_BRANCH" | tee -a build.env
     - echo "JET_CUSTOM_FILTER=$JET_CUSTOM_FILTER" | tee -a build.env
   artifacts:
@@ -99,8 +112,9 @@ metadata:
     - if: '$FUNCTIONAL_TEST == "yes"'
 
 ppp_capacity_statistics:
-  tags: [mcore-ssh-agent]
+  tags: [mcore-ssh-node]
   stage: .pre
+  image: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_ci:buildcache
   script:
     - |
       set -x
@@ -327,7 +341,7 @@ docs_build_test:
   image: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/python-format:0.0.1
   stage: unit_tests
   tags:
-    - os/linux
+    - mcore-docker-node-small
   script:
     - cd ..
     - rm -rf documentation && git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/nemo-megatron-core-tme/documentation.git
@@ -342,7 +356,7 @@ docs_build_test:
 formatting:
   image: ${LINTING_IMAGE}:${CI_PIPELINE_ID}
   tags:
-    - os/linux
+    - mcore-docker-node-small
   stage: unit_tests
   before_script:
     - git fetch origin main
@@ -357,3 +371,59 @@ formatting:
 
 include:
   - jet-tests.yml
+
+convergence-test:
+  stage: unit_tests
+  needs: [build_image]
+  tags:
+    - ${TAG}
+  timeout: 7d
+  rules:
+    - if: '$CONVERGENCE_TEST == "yes" && $CI_COMMIT_BRANCH =~ /^core_r/'
+    - when: never
+  parallel:
+    matrix:
+      - SETTINGS: RELEASE_BERT
+        TAG: mcore-ssh-node-A
+      - SETTINGS: RELEASE_GPT  
+        TAG: mcore-ssh-node-B
+      - SETTINGS: RELEASE_MOE
+        TAG: mcore-ssh-node-B
+  before_script: |
+    python -m venv local/venv 
+    source local/venv/bin/activate
+    pip install jet-api --upgrade $JET_INDEX_URLS
+  script:
+    - |
+      if [[ -z "${!SETTINGS}" ]]; then
+        echo Unknown model $SETTINGS
+        exit 1
+      fi
+      set -x
+
+      export MCORE_RELEASE_NUM=${CI_COMMIT_BRANCH#core_r}
+      export IMAGE_TAG=v${MCORE_RELEASE_NUM}-${CI_PIPELINE_ID} 
+      export WANDB_API_KEY=${WANDB_API_KEY}
+      export GITLAB_TOKEN=${PAT}
+      
+      echo "${!SETTINGS}" > vars.sh
+      source vars.sh
+
+      # Fill in data blend
+      DATA_BLEND_ID=$(curl \
+                        --request GET "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/snippets" \
+                        --header "PRIVATE-TOKEN: $PROJECT_ACCESS_TOKEN_MCORE" \
+                      | jq --arg TITLE "$SETTINGS" '
+                              .[] 
+                              | select(.title == "GPT") 
+                              | .id
+                        ' \
+                      | tr -d '"')
+      export DATA_BLEND=$(curl \
+                    --request GET "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/snippets/${DATA_BLEND_ID}/raw" \
+                    --header "PRIVATE-TOKEN: $PROJECT_ACCESS_TOKEN_MCORE"
+                  )
+      yq '.MODEL_ARGS."--data-path" = env(DATA_BLEND)' -i $TRAINING_PARAMS_PATH
+
+      env
+      bash tests/functional_tests/shell_test_utils/run_ci_test_locally.sh

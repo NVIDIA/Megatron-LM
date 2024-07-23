@@ -22,7 +22,7 @@ jet-configure:
     entrypoint: [""]
   extends: [.jet_common, .jet-configure]
   tags:
-    - os/linux
+    - mcore-docker-node-small
   script:
     - set -x
     - JET_FILTER=${JET_CUSTOM_FILTER:-False}
@@ -67,7 +67,7 @@ jet-results-summary:
   image: ${GITLAB_ENDPOINT}:5005/dl/jet/api:latest
   needs: [jet-trigger]
   tags:
-    - os/linux
+    - mcore-docker-node-small
   before_script:
     - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $VAULT_JWT_TOKEN
   script:
@@ -94,7 +94,7 @@ jet-results-notify:
   image: ${GITLAB_ENDPOINT}:5005/dl/jet/api:latest
   needs: [jet-trigger]
   tags:
-    - os/linux
+    - mcore-docker-node-small
   before_script:
     - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $VAULT_JWT_TOKEN
   script:

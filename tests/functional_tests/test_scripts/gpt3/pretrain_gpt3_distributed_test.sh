@@ -183,8 +183,9 @@ echo "$command" > $SCRIPTS_DIR/pretrain_gpt3_distributed_command.sh
 eval $command
 
 echo "Saving test results to $TENSORBOARD_DIR"
-PYTHONPATH=$PWD python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $TENSORBOARD_DIR "$JOB_NAME" | \
-    tee ${TENSORBOARD_DIR}/results.json
+PYTHONPATH=$PWD python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
+  --logs-dir $TENSORBOARD_DIR \
+  --output-path ${TENSORBOARD_DIR}/results.json
 
 if [[ $SKIP_PYTEST != 1 ]]; then
     echo "-----------------------------------------------------------------------------"
