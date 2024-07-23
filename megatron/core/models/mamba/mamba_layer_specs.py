@@ -89,7 +89,7 @@ else:
             mamba_layer=ModuleSpec(
                 module=MambaLayer,
                 submodules=MambaLayerSubmodules(
-                    input_layernorm=WrappedTorchLayerNorm,
+                    norm=WrappedTorchLayerNorm,
                     mixer=ModuleSpec(
                         module=MambaMixer,
                         submodules=MambaMixerSubmodules(
