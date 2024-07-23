@@ -5,6 +5,7 @@ import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir)))
+from megatron.core.device_utils import get_current_device
 from megatron.training import get_args
 from megatron.training import print_rank_0
 from megatron.core import mpu
@@ -107,7 +108,7 @@ if __name__ == "__main__":
         server.run("0.0.0.0",port=args.port)
 
     while True:
-        choice = torch.tensor(1, dtype=torch.long, device='cuda')
+        choice = torch.tensor(1, dtype=torch.long, device=get_current_device())
         torch.distributed.broadcast(choice, 0)
         if choice.item() == 0:
             try:

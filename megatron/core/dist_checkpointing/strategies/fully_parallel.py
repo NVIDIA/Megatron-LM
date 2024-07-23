@@ -488,7 +488,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                 for rank, shard_id in enumerate(round_shard_ids):
                     if shard_id is None:
                         # if no more useful data, the given rank will exchange empty tensor
-                        local_ten = torch.empty(0, dtype=dtype, device='cuda')
+                        local_ten = torch.empty(0, dtype=dtype, device=get_current_device())
                         orig_device = None
                     else:
                         assert isinstance(shard_id, tuple), type(shard_id)
@@ -620,19 +620,19 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             orig_device = None  # this tensor will be discarded anyway
             sh_ten = unneeded_shards[shard_id]
             if sh_ten.data is None:
-                sh_ten.init_data('cuda')
+                sh_ten.init_data(device=get_current_device())
                 tensor = sh_ten.data
                 sh_ten.data = None  # won't be used. free memory
             else:
                 tensor = sh_ten.data
                 if tensor.device.type == 'cpu':
-                    tensor = torch.empty_like(tensor, device='cuda')
+                    tensor = torch.empty_like(tensor, device=get_current_device())
         else:
-            local_unloaded_sh_ten.init_data('cuda')
+            local_unloaded_sh_ten.init_data(device=get_current_device())
             orig_device = local_unloaded_sh_ten.data.device
             tensor = local_unloaded_sh_ten.data
             if tensor.device.type == 'cpu':
-                tensor = torch.empty_like(tensor, device='cuda')
+                tensor = torch.empty_like(tensor, device=get_current_device())
             loaded_tensors[shard_id] = tensor
         return tensor, orig_device
 

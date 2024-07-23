@@ -36,6 +36,8 @@ from torch.distributed.checkpoint.default_planner import create_default_local_sa
 from torch.distributed.checkpoint.metadata import Metadata
 from torch.distributed.checkpoint.planner_helpers import _create_write_items
 
+from megatron.core.device_utils import get_current_device_type
+
 from ..core import CheckpointingException
 from ..dict_utils import extract_matching_values, nested_values
 from ..mapping import (
@@ -215,7 +217,7 @@ def sharded_tensor_to_torch_sharded_tensor(
         offset = tuple(map(lambda x: x[0] * x[1], zip(fragment_offsets, offsets_shape)))
         if offset in local_global_offsets:
             # local shard
-            placement = f"rank:{rank}/cuda"
+            placement = f"rank:{rank}/{get_current_device_type()}"
             for sh_ten in local_global_offsets[offset]:
                 if is_flattened_range_1d:
                     offset = (sh_ten.global_offset[0] + sh_ten.flattened_range.start,)
@@ -238,7 +240,7 @@ def sharded_tensor_to_torch_sharded_tensor(
                 size = (1,) * len(offsets_shape) + global_shape[-1:]
             else:
                 size = offsets_shape
-            shard_metadata.append(ShardMetadata(offset, size, "cuda"))
+            shard_metadata.append(ShardMetadata(offset, size, get_current_device_type()))
 
     tensor = some_sh_ten.data
     sharded_tensor_metadata = ShardedTensorMetadata(

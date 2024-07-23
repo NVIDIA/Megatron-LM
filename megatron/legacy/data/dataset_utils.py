@@ -26,6 +26,7 @@ import collections
 import numpy as np
 import torch
 
+from megatron.core.device_utils import get_current_device
 from megatron.training import (
     get_args,
     print_rank_0
@@ -706,7 +707,7 @@ def get_samples_mapping(indexed_dataset,
     # This should be a barrier but nccl barrier assumes
     # device_index=rank which is not the case for model
     # parallel case
-    counts = torch.tensor([1], dtype=torch.long, device='cuda')
+    counts = torch.tensor([1], dtype=torch.long, device=get_current_device())
     torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
     torch.distributed.all_reduce(counts, group=mpu.get_pipeline_model_parallel_group())
     assert counts[0].item() == (

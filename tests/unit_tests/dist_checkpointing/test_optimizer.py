@@ -12,6 +12,7 @@ import torch
 from torch.optim import Adam
 
 from megatron.core import parallel_state, DistributedDataParallel as DDP
+from megatron.core.device_utils import get_current_device
 from megatron.core.dist_checkpointing import ShardedTensor, save, load, \
     load_tensors_metadata, load_plain_tensors
 from megatron.core.dist_checkpointing.dict_utils import nested_values, diff
@@ -415,7 +416,7 @@ class TestDistributedOptimizer:
                     if key in key_list:
                         flag = 1
 
-                tensor = torch.tensor([flag], dtype=torch.long, device='cuda')
+                tensor = torch.tensor([flag], dtype=torch.long, device=get_current_device())
                 torch.distributed.broadcast(tensor, 0)
                 flag = tensor[0].item()
                 assert flag == 1, key_list

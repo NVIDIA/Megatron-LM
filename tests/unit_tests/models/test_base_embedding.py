@@ -46,6 +46,7 @@ class TestBaseEmbedding:
         assert embeddings.shape[1] == input_ids.shape[0]
         assert embeddings.shape[2] == self.base_embedding.config.hidden_size
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_gpu_forward(self):
         self.base_embedding.to(device=get_current_device())
         input_ids = torch.tensor(

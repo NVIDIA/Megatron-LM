@@ -2,7 +2,7 @@
 
 from commons import print_separator
 from commons import initialize_distributed
-from megatron.core.device_utils import set_manual_seed
+from megatron.core.device_utils import get_current_device, set_manual_seed
 import mpu
 import torch
 import sys
@@ -21,7 +21,7 @@ def test_set_cuda_rng_state(tensor_model_parallel_size):
     size = 123
     seed = 1234
     set_manual_seed(1234)
-    tensor = torch.tensor(size, dtype=torch.float, device='cuda')
+    tensor = torch.tensor(size, dtype=torch.float, device=get_current_device())
 
     # Get the state
     rng_state = torch.cuda.get_rng_state()
@@ -83,7 +83,7 @@ def test_cuda_rng_tracker(tensor_model_parallel_size):
     seed_1 = 1234
     seed_2 = 4321
     size = [12, 21]
-    tensor = torch.tensor(size, dtype=torch.float, device='cuda')
+    tensor = torch.tensor(size, dtype=torch.float, device=get_current_device())
 
     # Set to seed_1 and generate two tensors.
     set_manual_seed(seed_1)

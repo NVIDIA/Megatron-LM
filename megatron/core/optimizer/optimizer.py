@@ -11,6 +11,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from megatron.core.device_utils import get_current_device
+
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_scale
 except ImportError:
@@ -314,7 +316,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         # Note that we keep this for the cases that grad scaler is none.
         # We still record nan/inf if we have a bfloat16 with a grad scaler.
         if self.grad_scaler:
-            self.found_inf = torch.tensor([0.0], dtype=torch.float, device='cuda')
+            self.found_inf = torch.tensor([0.0], dtype=torch.float, device=get_current_device())
 
         # Dummy tensor needed for apex multi-apply tensor.
         # For bfloat, we don't have multi-tensor apply and for now
@@ -322,11 +324,11 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if self.config.bf16:
             self._dummy_overflow_buf = None
         else:
-            self._dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+            self._dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device=get_current_device())
 
         # In case grad scaler is not passed, define the unity scale.
         if self.grad_scaler is None:
-            self._scale_one = torch.tensor([1.0], dtype=torch.float, device='cuda')
+            self._scale_one = torch.tensor([1.0], dtype=torch.float, device=get_current_device())
 
     def get_loss_scale(self):
         if self.grad_scaler is None:
@@ -723,7 +725,7 @@ class FP32Optimizer(MegatronOptimizer):
             init_state_fn,
         )
 
-        self._scale = torch.tensor([1.0], dtype=torch.float, device='cuda')
+        self._scale = torch.tensor([1.0], dtype=torch.float, device=get_current_device())
 
     def zero_grad(self, set_to_none=True):
         """Copied from torch.optim.optimizer"""

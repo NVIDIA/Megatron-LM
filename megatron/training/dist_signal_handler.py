@@ -2,6 +2,11 @@ import signal
 
 import torch
 
+try:
+    import torch_xla.core.xla_model as xm
+except ImportError:
+    xm = None
+
 
 def get_world_size():
     if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -12,6 +17,10 @@ def get_world_size():
 
 
 def get_device(local_rank=None):
+
+    if xm:
+        return xm.xla_device()
+    
     backend = torch.distributed.get_backend()
     if backend == 'nccl':
         if local_rank is None:

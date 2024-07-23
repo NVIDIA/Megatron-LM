@@ -12,6 +12,7 @@ from time import time
 import torch
 
 from megatron.core import mpu, tensor_parallel, dist_checkpointing
+from megatron.core.device_utils import get_current_device
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.dist_checkpointing.serialization import get_default_load_sharded_strategy
 from megatron.core.dist_checkpointing.strategies.fully_parallel import \
@@ -230,7 +231,7 @@ def read_metadata(tracker_filename):
 
     # Get the max iteration retrieved across the ranks.
     if torch.distributed.is_initialized():
-        iters_cuda = torch.tensor([iteration], dtype=torch.long, device='cuda')
+        iters_cuda = torch.tensor([iteration], dtype=torch.long, device=get_current_device())
         torch.distributed.all_reduce(iters_cuda, op=torch.distributed.ReduceOp.MAX)
         max_iter = iters_cuda[0].item()
 

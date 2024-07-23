@@ -5,6 +5,7 @@ import json
 import threading
 from flask import Flask, request, jsonify, current_app
 from flask_restful import Resource, Api
+from megatron.core.device_utils import get_current_device
 from megatron.training import get_args
 from megatron.inference.text_generation import generate_and_post_process
 from megatron.inference.text_generation import beam_search_and_post_process
@@ -20,12 +21,12 @@ class MegatronGenerate(Resource):
 
     @staticmethod
     def send_do_generate():
-        choice = torch.tensor([GENERATE_NUM], dtype=torch.long, device='cuda')
+        choice = torch.tensor([GENERATE_NUM], dtype=torch.long, device=get_current_device())
         torch.distributed.broadcast(choice, 0)
      
     @staticmethod
     def send_do_beam_search():
-        choice = torch.tensor([BEAM_NUM], dtype=torch.long, device='cuda')
+        choice = torch.tensor([BEAM_NUM], dtype=torch.long, device=get_current_device())
         torch.distributed.broadcast(choice, 0)
     
     def put(self):

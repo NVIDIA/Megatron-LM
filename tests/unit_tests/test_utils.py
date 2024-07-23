@@ -9,7 +9,7 @@ import torch
 
 import megatron.core.utils as util
 from tests.unit_tests.test_utilities import Utils
-
+from megatron.core.device_utils import get_current_device
 
 def test_divide_properly():
     assert util.divide(4,2) == 2
@@ -21,7 +21,7 @@ def test_divide_improperly():
 def test_global_memory_buffer():
     global_memory_buffer = util.GlobalMemoryBuffer()
     obtained_tensor = global_memory_buffer.get_tensor((3,2), torch.float32, "test_tensor")
-    expected_tensor = torch.empty((3,2), dtype=torch.float32, device=megatron.core.device_utils.get_current_device())
+    expected_tensor = torch.empty((3,2), dtype=torch.float32, device=get_current_device())
     assert obtained_tensor.shape == expected_tensor.shape
 
 def test_make_viewless_tensor():
@@ -110,8 +110,8 @@ def test_straggler_detector():
         M = 20
         K = 30
         N = 40
-        mat1 = torch.randn(M, K, device='cuda')
-        mat2 = torch.randn(K, N, device='cuda')
+        mat1 = torch.randn(M, K, device=get_current_device())
+        mat2 = torch.randn(K, N, device=get_current_device())
         # batch_data.
         with stimer(bdata=True):
             time.sleep(s)
@@ -143,8 +143,8 @@ def test_straggler_detector():
         N = 20
         P = 30
         M = 40
-        mat1 = torch.randn(N, P, device='cuda')
-        mat2 = torch.randn(P, M, device='cuda')
+        mat1 = torch.randn(N, P, device=get_current_device())
+        mat2 = torch.randn(P, M, device=get_current_device())
         tfp = (N * M) * (2 * P - 1)  # Theoretical.
         iter = 10  # Mock.
         # batch_data.

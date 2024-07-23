@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import SGD, Adam
 
+from megatron.core.device_utils import get_current_device
 from megatron.core.optimizer import ChainedOptimizer
 
 
@@ -51,16 +52,16 @@ def test_chained_optimizer():
     assert not list(optimizer_1.state.values())[0]["exp_avg"].is_cuda
     assert not list(optimizer_2.state.values())[0]["momentum_buffer"].is_cuda
 
-    def to_cuda(d):
+    def to_device(d):
         for k, v in d.items():
             if isinstance(v, torch.Tensor):
-                d[k] = v.to("cuda")
+                d[k] = v.to(device=get_current_device())
             elif isinstance(v, dict):
-                to_cuda(v)
+                to_device(v)
         return d
 
     for k, v in chained_optimizer.state.items():
-        chained_optimizer.state[k] = to_cuda(v)
+        chained_optimizer.state[k] = to_device(v)
 
     assert list(optimizer_1.state.values())[0]["exp_avg"].is_cuda
     assert list(optimizer_2.state.values())[0]["momentum_buffer"].is_cuda

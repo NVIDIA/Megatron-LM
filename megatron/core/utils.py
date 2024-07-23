@@ -469,7 +469,7 @@ def local_multi_tensor_applier(op, noop_flag_buffer, tensor_lists, *args):
 def local_multi_tensor_l2_norm(chunk_size, noop_flag, tensor_lists, per_tensor, *args):
     l2 = [[(torch.norm(tensor)) for tensor in tensor_list] for tensor_list in tensor_lists]
     l2_reduced = torch.norm(torch.tensor(l2))
-    l2_cuda = torch.tensor([float(l2_reduced)], dtype=torch.float, device='cuda')
+    l2_cuda = torch.tensor([float(l2_reduced)], dtype=torch.float, device=get_current_device())
     return l2_cuda, None
 
 

@@ -4,6 +4,7 @@ import pytest
 
 import torch
 
+from megatron.core.device_utils import get_current_device
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.core import CheckpointingException
 from megatron.core.dist_checkpointing.mapping import is_main_replica, \
@@ -21,7 +22,7 @@ class TestShardedTensor:
     # def teardown_method(self, method):
     #     Utils.destroy_model_parallel()
     
-    def test_from_rank_offsets_constructor(self, dtype=torch.float, device='cuda'):
+    def test_from_rank_offsets_constructor(self, dtype=torch.float, device=get_current_device()):
         data = torch.ones((1, 3, 7, 9), dtype=dtype, device=device)
         shape = data.shape
         rank_offsets = [
@@ -37,7 +38,7 @@ class TestShardedTensor:
         assert sh_ten.global_offset == (0, 0, shape[2] * 3, 0)
         assert sh_ten.axis_fragmentations == (10, 1, 6, 1)
 
-    def test_from_rank_offsets_flat_constructor(self, dtype=torch.float, device='cuda'):
+    def test_from_rank_offsets_flat_constructor(self, dtype=torch.float, device=get_current_device()):
         data = torch.arange(28, dtype=dtype, device=device).reshape((1, 4, 7))
         shape = data.shape
         rank_offsets = [

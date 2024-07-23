@@ -80,7 +80,7 @@ def calc_params_l2_norm(model):
                     params_data.append(param.data.float() if args.bf16 else param.data)
 
     # Calculate norm
-    dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+    dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device=get_current_device())
     norm, _ = multi_tensor_applier(
         multi_tensor_l2norm,
         dummy_overflow_buf,

@@ -182,6 +182,7 @@ class TestFullyParallelSaveAndLoad:
 
         assert loaded_state_dict.keys() == state_dict.keys()
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize('state_dict_device', ['cpu', 'cuda'])
     def test_memory_usage(self, state_dict_device):
         Utils.initialize_model_parallel(2, 1)

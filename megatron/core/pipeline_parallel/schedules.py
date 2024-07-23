@@ -3,7 +3,7 @@
 import contextlib
 from typing import Callable, Iterator, List, Optional, Union
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_current_device_type
 import torch
 from torch.autograd.variable import Variable
 
@@ -212,7 +212,7 @@ def forward_step(
     set_input_tensor(input_tensor)
 
     if config.enable_autocast:
-        context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
+        context_manager = torch.autocast(get_current_device_type(), dtype=config.autocast_dtype)
     else:
         context_manager = contextlib.nullcontext()
     with context_manager:

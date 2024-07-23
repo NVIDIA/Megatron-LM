@@ -17,13 +17,13 @@ def test_local_multi_tensor_l2_norm_and_scale():
     tensor_list = [torch.rand(5,5).to(device=get_current_device()) for _ in range(10)]
     tensor_list_copy = copy.deepcopy(tensor_list)
 
-    norm_apex, _ = multi_tensor_apply.multi_tensor_applier(amp_C.multi_tensor_l2norm, torch.tensor([0], dtype=torch.int, device='cuda'), [tensor_list], False)
-    norm_local, _ = multi_tensor_apply.multi_tensor_applier(local_multi_tensor_l2_norm, torch.tensor([0], dtype=torch.int, device='cuda'), [tensor_list_copy], False)
+    norm_apex, _ = multi_tensor_apply.multi_tensor_applier(amp_C.multi_tensor_l2norm, torch.tensor([0], dtype=torch.int, device=get_current_device()), [tensor_list], False)
+    norm_local, _ = multi_tensor_apply.multi_tensor_applier(local_multi_tensor_l2_norm, torch.tensor([0], dtype=torch.int, device=get_current_device()), [tensor_list_copy], False)
     torch.testing.assert_close(norm_apex, norm_local)
 
     clip_coeff = 0.05
-    multi_tensor_apply.multi_tensor_applier(amp_C.multi_tensor_scale, torch.tensor([0], dtype=torch.int, device='cuda'), [tensor_list, tensor_list], clip_coeff)
-    multi_tensor_apply.multi_tensor_applier(local_multi_tensor_scale, torch.tensor([0], dtype=torch.int, device='cuda'), [tensor_list_copy, tensor_list_copy], clip_coeff)
+    multi_tensor_apply.multi_tensor_applier(amp_C.multi_tensor_scale, torch.tensor([0], dtype=torch.int, device=get_current_device()), [tensor_list, tensor_list], clip_coeff)
+    multi_tensor_apply.multi_tensor_applier(local_multi_tensor_scale, torch.tensor([0], dtype=torch.int, device=get_current_device()), [tensor_list_copy, tensor_list_copy], clip_coeff)
     torch.testing.assert_close(tensor_list, tensor_list_copy)
 
 def test_local_multi_tensor_apply():
@@ -32,6 +32,6 @@ def test_local_multi_tensor_apply():
 
     tensor_list = [torch.rand(5,5).to(device=get_current_device()) for _ in range(10)]
 
-    norm_apex, _ = multi_tensor_apply.multi_tensor_applier(amp_C.multi_tensor_l2norm, torch.tensor([0], dtype=torch.int, device='cuda'), [tensor_list], False)
-    norm_local, _ = local_multi_tensor_applier(amp_C.multi_tensor_l2norm, torch.tensor([0], dtype=torch.int, device='cuda'), [tensor_list], False)
+    norm_apex, _ = multi_tensor_apply.multi_tensor_applier(amp_C.multi_tensor_l2norm, torch.tensor([0], dtype=torch.int, device=get_current_device()), [tensor_list], False)
+    norm_local, _ = local_multi_tensor_applier(amp_C.multi_tensor_l2norm, torch.tensor([0], dtype=torch.int, device=get_current_device()), [tensor_list], False)
     torch.testing.assert_close(norm_apex, norm_local)

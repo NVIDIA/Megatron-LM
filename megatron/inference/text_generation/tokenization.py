@@ -6,6 +6,7 @@
 import torch
 
 
+from megatron.core.device_utils import get_current_device
 from megatron.training import get_args, get_tokenizer
 from .communication import broadcast_int_list, broadcast_tensor
 
@@ -129,7 +130,7 @@ def _tokenize_prompts_and_batch(prompts, tokens_to_generate, add_BOS):
         prompt_tokens.extend([eod_token] * padding_size)
 
     # Now we are in a structured format, we can convert to tensors.
-    prompts_tokens_tensor = torch.tensor(prompts_tokens, dtype=torch.long, device='cuda')
-    prompts_length_tensor = torch.tensor(prompts_length, dtype=torch.long, device='cuda')
+    prompts_tokens_tensor = torch.tensor(prompts_tokens, dtype=torch.long, device=get_current_device())
+    prompts_length_tensor = torch.tensor(prompts_length, dtype=torch.long, device=get_current_device())
 
     return prompts_tokens_tensor, prompts_length_tensor
