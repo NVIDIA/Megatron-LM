@@ -101,6 +101,7 @@ OPTIONS=" \
     --save-interval 1000 \
     --save ${FINETUNE_DIR} \
     --load ${FINETUNE_DIR} \
+    --dataloader-save ${FINETUNE_DIR}/dataloader \
     --pretrained-checkpoint ${CHECKPOINT_DIR} \
     --split 100,0,0 \
     --clip-grad 1.0 \

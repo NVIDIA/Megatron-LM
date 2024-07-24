@@ -1,5 +1,7 @@
 import math
 
+import pytest
+
 from megatron.core.device_utils import get_current_device
 import torch
 from torch.nn import LayerNorm
@@ -10,6 +12,7 @@ from megatron.legacy.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.legacy.model.utils import attention_mask_func
 from megatron.legacy.fused_kernels import load
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_load_fused_kernels():
     try:
         import fused_layer_norm_cuda
@@ -22,6 +25,7 @@ def test_load_fused_kernels():
         print("[Fail] load_fused_kernels")
         raise e
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_fused_softmax():
     bert = BertModel.from_pretrained("bert-base-cased").to(device=get_current_device()).half()
     tokenizer = BertTokenizer.from_pretrained("bert-base-cased")
@@ -119,7 +123,7 @@ def test_fused_softmax():
             f"\n > torch_values={torch_softmax_output[-1][-1][-1][:5].tolist()}"
         )
 
-
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_fused_upper_triangle_mask_softmax():
     gpt = GPT2Model.from_pretrained("gpt2").to(device=get_current_device()).half()
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
@@ -219,7 +223,7 @@ def test_fused_upper_triangle_mask_softmax():
             f"\n > torch_values={torch_softmax_output[-1][-1][-1][:5].tolist()}"
         )
 
-
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_layer_norm():
     bert = BertModel.from_pretrained("bert-base-cased").to(device=get_current_device()).half()
     tokenizer = BertTokenizer.from_pretrained("bert-base-cased")
@@ -290,7 +294,7 @@ def forward_torch_softmax(input, mask, scale):
     probs = torch.nn.Softmax(dim=-1)(mask_output)
     return probs
 
-
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_masked_softmax_forward():
     import scaled_masked_softmax_cuda
 
@@ -306,6 +310,7 @@ def test_masked_softmax_forward():
             error = (softmax_results_torch - softmax_results).abs().max()
             assert error < 1e-3
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_masked_softmax_backward():
     import scaled_masked_softmax_cuda
 
@@ -326,7 +331,7 @@ def test_masked_softmax_backward():
             error = (back_grad - inputs.grad).abs().max()
             assert error < 1e-3
 
-
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_allmasked_softmax_forward():
     import scaled_masked_softmax_cuda
 
@@ -342,7 +347,7 @@ def test_allmasked_softmax_forward():
             error = (softmax_results_torch - softmax_results).abs().max()
             assert error == 0.0
 
-
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_allmasked_softmax_backward():
     import scaled_masked_softmax_cuda
 

@@ -82,12 +82,12 @@ def get_grad_norm_fp32(
     # Calculate norm.
     if norm_type == inf:
         total_norm = max(grad.abs().max() for grad in grads_for_norm)
-        total_norm_cuda = torch.tensor([float(total_norm)], dtype=torch.float, device=get_current_device())
+        total_norm_device = torch.tensor([float(total_norm)], dtype=torch.float, device=get_current_device())
         # Take max across all model-parallel GPUs.
         torch.distributed.all_reduce(
-            total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=model_parallel_group
+            total_norm_device, op=torch.distributed.ReduceOp.MAX, group=model_parallel_group
         )
-        total_norm = total_norm_cuda[0].item()
+        total_norm = total_norm_device[0].item()
 
     else:
         if norm_type == 2.0:

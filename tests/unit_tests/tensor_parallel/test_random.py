@@ -7,7 +7,7 @@ from tests.unit_tests.test_utilities import Utils
 import pytest
 import torch
 
-def test_cuda_rng_states_tracker():
+def test_device_rng_states_tracker():
     rng_tracker = DeviceRNGStatesTracker()
     rng_tracker.set_states({"state1":1234})
     assert(rng_tracker.get_states()["state1"] == 1234)

@@ -26,12 +26,11 @@ from megatron.legacy.model.fused_bias_gelu import bias_gelu
 
 logger = logging.getLogger(__name__)
 
-
 def initialize_megatron(
     extra_args_provider=None,
     args_defaults={},
     ignore_unknown_args=False,
-    allow_no_cuda=False,
+    allow_no_cuda=not torch.cuda.is_available(),
     skip_mpu_initialization=False,
     get_embedding_ranks=None,
     get_position_embedding_ranks=None

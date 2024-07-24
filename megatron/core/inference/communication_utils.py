@@ -4,8 +4,8 @@ import torch
 from megatron.core import parallel_state
 
 
-def _is_cuda_or_xla(tensor):
-    """Check if a tensor is not none and is cuda or xla."""
+def _is_device(tensor):
+    """Check if a tensor is not none and is on a device."""
     assert tensor is not None
     assert tensor.is_cuda or tensor.is_xla
 
@@ -14,7 +14,7 @@ def broadcast_from_last_pipeline_stage(size, dtype, tensor=None):
     """Broadcast a tensor from last pipeline stage to all ranks."""
 
     if parallel_state.is_pipeline_last_stage():
-        _is_cuda_or_xla(tensor)
+        _is_device(tensor)
         assert tensor.is_contiguous()
     else:
         tensor = torch.empty(size, dtype=dtype, device=get_current_device())

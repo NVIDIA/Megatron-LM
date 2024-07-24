@@ -86,17 +86,21 @@ All being well you should observe training and valiation loss curves similar to 
 
 These curves were obtained with global batch size of 256. Changing this value will likely change the curves. For pretraining and instruction tuning llava models we have found that loss curves are an unreliable predictor of downstream task performance. Therefore it is necessary to run test generation and evaluation on a range of metrics to understand model quality. We intend to add training time zero-shot evaluation in a future update.
 
+You can execute the pretraining script multiple times to resume training. On resuming, the latest model, optimizer, and dataloader state are loaded.
+
 ### SFT
 
 1. Prepare an instruction tuning dataset such in [megatron-energon format](https://nvidia.github.io/Megatron-Energon/data_prep.html#). NOTE: we do not provide instructions for this.
 
-5. Update `sft_dataset.yaml` so that both `path` variables point to the train and val splits of your instruction tuning dataset.
+2. Update `sft_dataset.yaml` so that both `path` variables point to the train and val splits of your instruction tuning dataset.
 
 Run the following script to instruction tune the pre-trained llava model:
 
     ```
     examples/multimodal/sft_mistral_clip.sh
     ```
+
+You can execute the SFT script multiple times to resume training. On resuming, the latest model, optimizer, and dataloader state are loaded.
 
 ## Evaluation
 

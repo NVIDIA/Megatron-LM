@@ -385,7 +385,19 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
         grad_output_buffer
     ), "Length of activation and gradient buffers need to be equal!"
 
-    import fused_weight_gradient_mlp_cuda
+    try:
+        import fused_weight_gradient_mlp_cuda
+    except ImportError:
+        if config.gradient_accumulation_fusion:
+            raise RuntimeError(
+                "Gradient_accumulation_fusion set "
+                "to True but the custom CUDA extension fused_weight_gradient_mlp_cuda "
+                "module is not found. To use gradient_accumulation_fusion you must "
+                "install APEX with --cpp_ext and --cuda_ext. For example: "
+                "pip install --global-option=\"--cpp_ext\" --global-option=\"--cuda_ext .\" "
+                "Note that the extension requires CUDA>=11. Otherwise, you must turn off "
+                "gradient accumulation fusion."
+            )
 
     from megatron.core.parallel_state import (
         get_global_memory_buffer,

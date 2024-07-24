@@ -116,23 +116,23 @@ def retro_generate_tokens_probs_and_return_on_first_stage(
         for context_length in range(min_prompt_length, max_sequence_length):
             prev_context_length = 0
             sizes_list = None
-            neighbor_tokens_cuda_long_tensor = None
+            neighbor_tokens_device_long_tensor = None
 
             # get the chunks for retrieval
             if torch.distributed.get_rank() == 0:
                 neighbor_tokens = neighbours_array
-                neighbor_tokens_cuda_long_tensor = torch.tensor(
+                neighbor_tokens_device_long_tensor = torch.tensor(
                     neighbor_tokens.reshape((-1, retro_args.retro_gpt_retrieved_length)),
                     dtype=torch.long, device=get_current_device())
-                sizes_list = [neighbor_tokens_cuda_long_tensor.size(0),  # Batch size
-                              neighbor_tokens_cuda_long_tensor.size(1)]  # Sequence lenght
+                sizes_list = [neighbor_tokens_device_long_tensor.size(0),  # Batch size
+                              neighbor_tokens_device_long_tensor.size(1)]  # Sequence lenght
             sizes_tensor = broadcast_int_list(2, int_list=sizes_list)
             sizes = sizes_tensor.tolist()
-            neighbor_tokens_cuda_long_tensor = broadcast_tensor(
-                sizes, torch.int64, tensor=neighbor_tokens_cuda_long_tensor)
+            neighbor_tokens_device_long_tensor = broadcast_tensor(
+                sizes, torch.int64, tensor=neighbor_tokens_device_long_tensor)
 
             _, _, neighbor_position_ids = get_ltor_masks_and_position_ids(
-                neighbor_tokens_cuda_long_tensor,
+                neighbor_tokens_device_long_tensor,
                 tokenizer.eod,
                 args.reset_position_ids,
                 args.reset_attention_mask,
@@ -146,7 +146,7 @@ def retro_generate_tokens_probs_and_return_on_first_stage(
                                  ..., prev_context_length:4096, :4096]
 
             logits = model(tokens2use, positions2use, attention_mask2use,
-                           retriever_input_ids=neighbor_tokens_cuda_long_tensor,
+                           retriever_input_ids=neighbor_tokens_device_long_tensor,
                            retriever_position_ids=neighbor_position_ids, retriever_attn_mask=neighbor_attention_mask,
                            )
 

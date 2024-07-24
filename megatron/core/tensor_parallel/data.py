@@ -37,13 +37,13 @@ def _build_key_size_numel_dictionaries(keys, data):
             offset += max_dim
 
     # Move to GPU and broadcast.
-    sizes_cuda = torch.tensor(sizes, dtype=torch.long, device=get_current_device())
+    sizes_device = torch.tensor(sizes, dtype=torch.long, device=get_current_device())
     torch.distributed.broadcast(
-        sizes_cuda, get_tensor_model_parallel_src_rank(), group=get_tensor_model_parallel_group()
+        sizes_device, get_tensor_model_parallel_src_rank(), group=get_tensor_model_parallel_group()
     )
 
     # Move back to cpu and unpack.
-    sizes_cpu = sizes_cuda.cpu()
+    sizes_cpu = sizes_device.cpu()
     key_size = {}
     key_numel = {}
     total_numel = 0
