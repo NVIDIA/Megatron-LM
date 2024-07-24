@@ -45,16 +45,16 @@ def send_to_next_pipeline_rank(tensor=None):
 
 
 
-def _is_cuda(tensor):
-    """Check if a tensor is not none and is cuda."""
+def _is_cuda_or_xla(tensor):
+    """Check if a tensor is not none and is cuda or xla"""
     assert tensor is not None
-    assert tensor.is_cuda
+    assert tensor.is_cuda or tensor.is_xla
 
 
 
-def _is_cuda_contiguous(tensor):
-    """Check if a tensor is not none, is cuda, and is contiguous."""
-    _is_cuda(tensor)
+def _is_cuda_or_xla_contiguous(tensor):
+    """Check if a tensor is not none, is cuda or xla, and is contiguous."""
+    _is_cuda_or_xla(tensor)
     assert tensor.is_contiguous()
 
 
@@ -69,7 +69,7 @@ def broadcast_from_last_pipeline_stage(size, dtype, tensor=None):
         return tensor
 
     if is_last_stage:
-        _is_cuda_contiguous(tensor)
+        _is_cuda_or_xla_contiguous(tensor)
     else:
         tensor = torch.empty(size,
                              dtype=dtype,
@@ -95,7 +95,7 @@ def broadcast_from_last_to_first_pipeline_stage(size, dtype, tensor=None):
     # Only first and last stage pipeline stages need to be involved.
     if is_last_stage or is_first_stage:
         if is_last_stage:
-            _is_cuda_contiguous(tensor)
+            _is_cuda_or_xla_contiguous(tensor)
         else:
             tensor = torch.empty(size,
                                  dtype=dtype,
@@ -123,7 +123,7 @@ def copy_from_last_to_first_pipeline_stage(size, dtype, tensor=None):
         return
     # Only first and last stage pipeline stages need to be involved.
     if is_last_stage or is_first_stage:
-        _is_cuda(tensor)
+        _is_cuda_or_xla(tensor)
         is_contiguous = tensor.is_contiguous()
         src = mpu.get_pipeline_model_parallel_last_rank()
         group = mpu.get_embedding_group()
@@ -150,7 +150,7 @@ def broadcast_tensor(size, dtype, tensor=None, rank=0):
     """
 
     if torch.distributed.get_rank() == rank:
-        _is_cuda_contiguous(tensor)
+        _is_cuda_or_xla_contiguous(tensor)
     else:
         tensor = torch.empty(size,
                              dtype=dtype,

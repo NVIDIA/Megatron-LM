@@ -49,8 +49,10 @@ def test_chained_optimizer():
     assert len(chained_optimizer.state) != 0
 
     # 2. check the state is a reference
-    assert not list(optimizer_1.state.values())[0]["exp_avg"].is_cuda
-    assert not list(optimizer_2.state.values())[0]["momentum_buffer"].is_cuda
+    exp_avg = list(optimizer_1.state.values())[0]["exp_avg"]
+    momentum_buffer = list(optimizer_2.state.values())[0]["momentum_buffer"]
+    assert not exp_avg.is_cuda and not exp_avg.is_xla
+    assert not momentum_buffer.is_cuda and not momentum_buffer.is_xla
 
     def to_device(d):
         for k, v in d.items():
@@ -63,5 +65,7 @@ def test_chained_optimizer():
     for k, v in chained_optimizer.state.items():
         chained_optimizer.state[k] = to_device(v)
 
-    assert list(optimizer_1.state.values())[0]["exp_avg"].is_cuda
-    assert list(optimizer_2.state.values())[0]["momentum_buffer"].is_cuda
+    exp_avg = list(optimizer_1.state.values())[0]["exp_avg"]
+    momentum_buffer = list(optimizer_2.state.values())[0]["momentum_buffer"]
+    assert exp_avg.is_cuda or exp_avg.is_xla
+    assert momentum_buffer.is_cuda or momentum_buffer.is_xla
