@@ -421,7 +421,7 @@ class MCoreSavePlanner(DefaultSavePlanner):
         **kwargs,
     ) -> None:
         # `dedup_replicated_tensors` was deprecated in 2.3 - this avoids tons of warnings during saving
-        if packaging.version.Version(torch.__version__) < packaging.version.Version("2.3.0"):
+        if packaging.version.Version(torch.__version__) <= packaging.version.Version("2.2"):
             kwargs['dedup_replicated_tensors'] = dedup_replicated_tensors
         super().__init__(*args, **kwargs)
         self.nd_flattened_global_shapes = nd_flattened_global_shapes or {}
