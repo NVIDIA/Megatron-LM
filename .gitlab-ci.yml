@@ -293,6 +293,22 @@ formatting:
     - when: always
   interruptible: true
 
+copyright:
+  image: ${LINTING_IMAGE}:${CI_PIPELINE_ID}
+  tags:
+    - mcore-docker-node-small
+  stage: unit_tests
+  before_script:
+    - git fetch origin main
+  script:
+    - bash tools/copyright.sh
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/)'
+      allow_failure: true
+    - when: always
+  interruptible: true
+
 include:
   - jet-tests.yml
 

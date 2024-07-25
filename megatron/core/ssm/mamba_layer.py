@@ -1,3 +1,4 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 

@@ -1,3 +1,4 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import json
 from abc import ABC, abstractmethod
 from collections import OrderedDict
@@ -59,22 +60,19 @@ class MegatronTokenizer(ABC):
     @property
     @abstractmethod
     def vocab(self):
-        """Dictionary from vocab text token to id token
-        """
+        """Dictionary from vocab text token to id token"""
         pass
 
     @property
     @abstractmethod
     def inv_vocab(self):
-        """Dictionary from vocab id token to text token
-        """
+        """Dictionary from vocab id token to text token"""
         pass
 
     @property
     @abstractmethod
     def vocab_size(self):
-        """The vocabulary size
-        """
+        """The vocabulary size"""
         pass
 
     @property

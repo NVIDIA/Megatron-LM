@@ -1,3 +1,4 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 """Integrations with NVIDIA TensorRT Model Optimizer (referred as ModelOpt).
 
 ModelOpt is a library comprising state-of-the-art model optimization techniques including quantization and sparsity to
