@@ -592,11 +592,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.param_buffers.append(current_param_buffers)
 
         self.bucket_map_param_to_buffer = {} # for each bucket, it map to a list which contains (param_buffer, model_param)
+        self.bucket_map_param_to_buffer_list = {} # for each bucket, it map to a list which contains (param_buffer_list, model_param_list)\
+                                                    # This is for pytorch fused for-each operation
         for gbuf_index, grad_buffer in enumerate(self.grad_buffers):
             param_map = grad_buffer.param_index_map
             param_buf_list = []
             for param, (buf_start, buf_end, bucket_index_in_param_map) in param_map.items():
                 param_buf_list = self.bucket_map_param_to_buffer.get(bucket_index_in_param_map, [])
+                param_buf_list_list = self.bucket_map_param_to_buffer_list.get(bucket_index_in_param_map, ([], []))
 
                 bucket_offset = grad_buffer.buckets[bucket_index_in_param_map].offset
                 param_buf = self.param_buffers[gbuf_index][bucket_index_in_param_map]
@@ -605,6 +608,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 
                 param_buf_list.append((param_buf_shard.detach(), param.view(-1).detach()))
                 self.bucket_map_param_to_buffer[bucket_index_in_param_map] = param_buf_list
+
+                param_buf_list_list[0].append(param_buf_shard.detach())
+                param_buf_list_list[1].append(param.view(-1).detach())
+                self.bucket_map_param_to_buffer_list[bucket_index_in_param_map] = param_buf_list_list
 
         # Now construct data structures to manage all-gather handles.
         self.all_gather_handles = []
@@ -1186,9 +1193,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(stream):
 
-                    param_buf_list = self.bucket_map_param_to_buffer.get(bucket_index, [])
-                    for param_buf_shard, param_model in param_buf_list:
-                        param_buf_shard.sub_(param_model)
+                    param_buf_shard_list, param_list = self.bucket_map_param_to_buffer_list[bucket_index]
+                    torch._foreach_sub_(param_buf_shard_list, param_list)
+
+                    # param_buf_list = self.bucket_map_param_to_buffer.get(bucket_index, [])
+                    # for param_buf_shard, param_model in param_buf_list:
+                    #     param_buf_shard.sub_(param_model)
 
                     if not hasattr(self, 'pbuf_quantize_buffer') or self.pbuf_quantize_buffer is None:
                         self.post_init_quantized_buffer()
@@ -1228,8 +1238,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             rel_diff = abs_diff / torch.norm(quant_copy, p=2)
                             print(f"DEBUG after allgather param... dp rank: {data_parallel_rank},  bucket_index: {bucket_index}, abs_diff: {abs_diff}, rel_diff: {rel_diff}, param norm: {torch.norm(quant_copy, p=2)}", flush=True)
                     
-                    for param_buf_shard, param_model in param_buf_list:
-                        param_buf_shard.add_(param_model)
+                    # for param_buf_shard, param_model in param_buf_list:
+                    #     param_buf_shard.add_(param_model)
+                    torch._foreach_add_(param_buf_shard_list, param_list)
 
                     event.record()
 
