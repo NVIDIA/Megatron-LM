@@ -118,3 +118,8 @@ docker run \
     $PYTORCH_IMAGE \
     bash examples/mixtral/train_mixtral_8x7b_distributed.sh $CHECKPOINT_PATH $TOKENIZER_MODEL $DATA_PATH
 ```
+
+## Acknowledgements
+Contributors outside NVIDIA for the huggingface converter and example of Mixtral models in Megatron-Core:
+- Peng Li <jerry.lp@alibaba-inc.com>
+- Jun Huang <huangjun.hj@alibaba-inc.com>
