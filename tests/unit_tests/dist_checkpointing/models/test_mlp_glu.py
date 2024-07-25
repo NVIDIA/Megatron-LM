@@ -1,22 +1,22 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import pytest
-
 import torch
 from torch.optim import Adam
 
 from megatron.core import parallel_state
+from megatron.core.dist_checkpointing import ShardedTensor, load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff, nested_values
-from megatron.core.dist_checkpointing.optimizer import \
-    get_param_id_to_sharded_param_map, optim_state_to_sharding_state
+from megatron.core.dist_checkpointing.optimizer import (
+    get_param_id_to_sharded_param_map,
+    optim_state_to_sharding_state,
+)
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLP
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
-from megatron.core.dist_checkpointing import save, load, load_plain_tensors, \
-    ShardedTensor
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 
 
 def initialize_mlp(glu=True):
@@ -34,6 +34,12 @@ def get_pp_offsets():
 
 
 class TestParallelMLPWithGLU:
+    def setup_method(self, method):
+        pass
+    
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+        
     @pytest.mark.parametrize("src_tp_pp,dest_tp_pp", [
         # changing PP is impossible because the number of layers must be the same
         ((2, 2), (4, 2)),
@@ -43,10 +49,11 @@ class TestParallelMLPWithGLU:
     ])
     def test_parallel_reconfiguration_e2e(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp):
         """ Test module saving and loading with different TP/PP """
+        Utils.initialize_model_parallel(*src_tp_pp)
+        
         with TempNamedDir(tmp_path_dist_ckpt / 'test_mlp_glu_reconfiguration_model_A') as ckpt_dir_A, \
              TempNamedDir(tmp_path_dist_ckpt / 'test_mlp_glu_reconfiguration_model_B') as ckpt_dir_B:
             # Save checkpoint A
-            Utils.initialize_model_parallel(*src_tp_pp)
             mlp_A = initialize_mlp()
             save(mlp_A.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_A)
             Utils.destroy_model_parallel()

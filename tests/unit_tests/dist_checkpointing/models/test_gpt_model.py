@@ -1,18 +1,22 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 import pytest
-
 import torch
 
 from megatron.core import parallel_state as ps
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec as gpt_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec as gpt_te_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
-from tests.unit_tests.dist_checkpointing.models.common import \
-    common_test_simple_sharded_state_dict_save_load, \
-    common_test_parallel_reconfiguration_e2e, \
-    common_test_state_dict_comparison, common_test_vocab_size_padding_change
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.models.gpt.gpt_layer_specs import \
-    get_gpt_layer_with_transformer_engine_spec as gpt_te_spec, get_gpt_layer_local_spec as gpt_local_spec
+from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.dist_checkpointing.models.common import (
+    common_test_parallel_reconfiguration_e2e,
+    common_test_simple_sharded_state_dict_save_load,
+    common_test_state_dict_comparison,
+    common_test_vocab_size_padding_change,
+)
+from tests.unit_tests.test_utilities import Utils
 
 
 def initialize_gpt_model(seed, layer_spec_fn=gpt_te_spec, vocab_size=128, **config_kwargs):
@@ -43,6 +47,12 @@ class TestGPTModel:
 
 
 class TestGPTModelReconfiguration:
+    def setup_method(self, method):
+        pass
+    
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
     @pytest.mark.parametrize(
         ('use_fpsl', 'load_order', 'store_order', 'src_tp_pp', 'dest_tp_pp', 'src_layer_spec_fn', 'dst_layer_spec_fn'),
         [
@@ -60,6 +70,7 @@ class TestGPTModelReconfiguration:
     def test_parallel_reconfiguration_e2e(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp,
                                           src_layer_spec_fn, dst_layer_spec_fn, use_fpsl, load_order, store_order):
         """ Test model saving and loading with different TP/PP """
+        Utils.initialize_model_parallel(src_tp_pp[0], src_tp_pp[1])
         common_test_parallel_reconfiguration_e2e(initialize_gpt_model, tmp_path_dist_ckpt, src_tp_pp,
                                                  dest_tp_pp, src_layer_spec_fn, dst_layer_spec_fn, use_fpsl, load_order, store_order)
 
@@ -76,5 +87,6 @@ class TestGPTModelReconfiguration:
     ])
     def test_vocab_size_padding_change(self, tmp_path_dist_ckpt, vocab_size_base, src_tp_pp, dest_tp_pp):
         """ Test model loading with different vocab size (caused by TP padding). """
+        Utils.initialize_model_parallel(src_tp_pp[0], src_tp_pp[1])
         common_test_vocab_size_padding_change(initialize_gpt_model, tmp_path_dist_ckpt, vocab_size_base,
                                               src_tp_pp, dest_tp_pp)
