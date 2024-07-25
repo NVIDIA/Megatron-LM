@@ -299,14 +299,29 @@ std::vector<at::Tensor> stochastic_quantize(at::Tensor& input_vals,
 
 }
 
+/*
+    dp_param_offset:
+        suppose the full_param_buffer contains [param1, param2, param3...], dp size = 4
+        full_param_buffer size equals to ceil(param1.size + param2.size + ....)
+        dp0: param_buffer := full_param_buffer; 
+                dp_param_offset := 0
+        dp1: param_buffer := full_param_buffer + 1 * (full_param_buffer.size / 4);
+                dp_param_offset := 1 * (full_param_buffer.size / 4)
+        dp2: param_buffer := full_param_buffer + 2 * (full_param_buffer.size / 4);
+                dp_param_offset := 2 * (full_param_buffer.size / 4)
+        dp3: param_buffer := full_param_buffer + 3 * (full_param_buffer.size / 4);
+                dp_param_offset := 3 * (full_param_buffer.size / 4)
+
+*/
 std::vector<at::Tensor> sub_quantize(
     at::Tensor& param_buffer,
     std::vector<at::Tensor> params,
+    size_t dp_param_offset,
     int groups,
     int numBits,
     quantize::Type quantType){
     
-    return sub_quantize_cuda(param_buffer, params, groups, numBits, quantType);
+    return sub_quantize_cuda(param_buffer, params, dp_param_offset, groups, numBits, quantType);
 }
 
 std::vector<at::Tensor> stochastic_quantize_ht(at::Tensor& input_vals,

@@ -37,6 +37,7 @@ void launch_dequantize_kernel(T* dequant_data,
 std::vector<at::Tensor> sub_quantize_cuda(
     at::Tensor& input_vals,
     std::vector<at::Tensor> params_list,
+    size_t dp_param_offset,
     int groups,
     int numBits,
     quantize::Type quantType);

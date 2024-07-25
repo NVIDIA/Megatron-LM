@@ -53,6 +53,7 @@ __device__ __inline__ size_t load_to_local(
     for (int j = 0; j < vec_size; ) {
         if (idx + j >= total_length) {
             local_buffer[j] = 0; // Handle out-of-bounds by setting to zero or another appropriate value
+            j++;
             continue;
         }
 
@@ -139,6 +140,7 @@ __global__ void cached_quantization(
     float* __restrict__ params,
     const __nv_bfloat16* __restrict__ param_buffer, // Updated to bfloat16
     __nv_bfloat16** model_params, // model params are real params for forward computation
+    const size_t dp_param_offset,
     const size_t* model_param_size, // model param size are used to store size for all params
     const size_t num_params,
     const size_t total_size,
@@ -185,7 +187,7 @@ __global__ void cached_quantization(
                 iteration_buffer + j * quantize::bf2_per_load,
                 input_base + iteration * stride,
                 elem_offset + iteration * stride < elems_per_group);
-            param_offset = load_to_local<__nv_bfloat16, quantize::bf_per_load>(temp_param_model, model_params, shared_model_param_size, num_params, total_size, (size_t)(base_offset + iteration * stride), param_offset);
+            param_offset = load_to_local<__nv_bfloat16, quantize::bf_per_load>(temp_param_model, model_params, shared_model_param_size, num_params, total_size, base_offset + iteration * stride + dp_param_offset, param_offset);
 #pragma unroll
             for (int k = 0; k < quantize::bf_per_load; k++) {
                 data_cast[k] = (elem_offset + iteration * stride + k < elems_per_group) ? __hsub(data_cast[k], temp_param_model[k]) : __float2bfloat16(0.0f);
@@ -207,7 +209,7 @@ __global__ void cached_quantization(
                         internal_unroll_l,           \
                         threads_per_group,           \
                         max_threads>                 \
-        <<<grid, block, shared_mem_size, stream>>>(output_data, d_params, d_param_buffer, d_model_params, d_model_param_size, num_params, total_size, groups, elems_per_group);
+        <<<grid, block, shared_mem_size, stream>>>(output_data, d_params, d_param_buffer, d_model_params, dp_param_offset, d_model_param_size, num_params, total_size, groups, elems_per_group);
 
 #define LAUNCH_CACHED_QUANT(                                                        \
     q_bits, quant_type, unroll_factor_in, internal_unroll_in, threads_per_group_in) \
@@ -233,7 +235,9 @@ void launch_sub_quant(
     int8_t* output_data,
     float* d_params,
     const __nv_bfloat16* d_param_buffer,  // param buffer are contiguous buffer place for all gather params
+    const size_t param_buffer_size,
     std::vector<at::Tensor> param_list,
+    const size_t dp_param_offset,
     const int groups,
     const int elems_per_group,
     const int num_bits,
@@ -264,6 +268,8 @@ void launch_sub_quant(
         total_size += param_list[i].size(0);
         model_param_size[i] = total_size;
     }
+    // printf("total size: %ld, param buffer size: %ld, dp_param_offset: %ld\n", total_size, param_buffer_size, dp_param_offset);
+    total_size = min(total_size, param_buffer_size+dp_param_offset);
 
     // Copy params ptr
     std::vector<void*> model_params(num_params);
@@ -311,6 +317,7 @@ void launch_sub_quant(
 std::vector<at::Tensor> sub_quantize_cuda(
     at::Tensor& input_vals,
     std::vector<at::Tensor> param_list,
+    size_t dp_param_offset,
     int groups,
     int numBits,
     quantize::Type quantType) {
@@ -365,7 +372,9 @@ std::vector<at::Tensor> sub_quantize_cuda(
             (int8_t*)output.data_ptr(),
             (float*)params.data_ptr(),
             (__nv_bfloat16*)input_vals.data_ptr(),
+            at::numel(input_vals),
             param_list,
+            dp_param_offset,
             groups,
             elems_per_group,
             numBits,
