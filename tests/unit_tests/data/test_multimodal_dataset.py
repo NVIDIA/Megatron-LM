@@ -4,33 +4,28 @@
 # Compile megatron.core.datasets.helpers dependencies before BlendedDataset import
 ##
 
-import torch
-
-from megatron.core.datasets.utils import compile_helpers
-from tests.unit_tests.test_utilities import Utils
-
-if torch.distributed.is_available():
-    Utils.initialize_distributed()
-    if torch.distributed.get_rank() == 0:
-        compile_helpers()
-    torch.distributed.barrier()
-else:
-    compile_helpers()
-
-##
-# Done
-##
-
 from types import SimpleNamespace
+
+import torch
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.multimodal_dataset import MockMultimodalDataset, MultimodalDatasetConfig
+from megatron.core.datasets.utils import compile_helpers
 from megatron.training.tokenizer.tokenizer import _NullTokenizer
+from tests.unit_tests.test_utilities import Utils
 
 _MOCK_VOCAB_SIZE = 8192
 
 
 def test_mock_multimodal_dataset():
+    if torch.distributed.is_available():
+        Utils.initialize_distributed()
+        if torch.distributed.get_rank() == 0:
+            compile_helpers()
+        torch.distributed.barrier()
+    else:
+        compile_helpers()
+        
     config = MultimodalDatasetConfig(
         random_seed=1234,
         sequence_length=1024,

@@ -1,24 +1,25 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core.models.bert.bert_model import BertModel
-import pytest
-
 import os
-import torch
-from torch.distributed._tensor import DeviceMesh
 
-from megatron.core.dist_checkpointing import save, load, load_plain_tensors
+import pytest
+import torch
+
 from megatron.core import parallel_state as ps
-from megatron.core.dist_checkpointing.dict_utils import diff
-from megatron.core.transformer.transformer_config import TransformerConfig
-from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.dist_checkpointing.models.common import \
-    common_test_simple_sharded_state_dict_save_load, \
-    common_test_parallel_reconfiguration_e2e, common_test_state_dict_comparison, \
-    common_test_vocab_size_padding_change
-from tests.unit_tests.test_utilities import Utils
+from megatron.core.models.bert.bert_layer_specs import (
+    bert_layer_local_spec,
+    bert_layer_with_transformer_engine_spec,
+)
+from megatron.core.models.bert.bert_model import BertModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.models.bert.bert_layer_specs import bert_layer_local_spec, bert_layer_with_transformer_engine_spec
+from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.dist_checkpointing.models.common import (
+    common_test_parallel_reconfiguration_e2e,
+    common_test_simple_sharded_state_dict_save_load,
+    common_test_state_dict_comparison,
+    common_test_vocab_size_padding_change,
+)
+from tests.unit_tests.test_utilities import Utils
 
 
 def initialize_bert_model(seed, layer_spec_fn=bert_layer_with_transformer_engine_spec, vocab_size=128, **config_kwargs):
@@ -52,6 +53,12 @@ class TestBertModel:
 
 
 class TestBERTModelReconfiguration:
+    def setup_method(self, method):
+        pass
+    
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+        
     @pytest.mark.parametrize(
         ('use_fpsl', 'src_tp_pp', 'dest_tp_pp', 'src_layer_spec', 'dst_layer_spec'),
         [
@@ -67,6 +74,8 @@ class TestBERTModelReconfiguration:
     def test_parallel_reconfiguration_e2e(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp,
                                           src_layer_spec, dst_layer_spec, use_fpsl):
         """ Test model saving and loading with different TP/PP """
+        Utils.initialize_model_parallel(src_tp_pp[0], src_tp_pp[1])
+                                        
         common_test_parallel_reconfiguration_e2e(initialize_bert_model, tmp_path_dist_ckpt, src_tp_pp,
                                                  dest_tp_pp, src_layer_spec, dst_layer_spec, use_fpsl)
 
@@ -82,5 +91,6 @@ class TestBERTModelReconfiguration:
     ])
     def test_vocab_size_padding_change(self, tmp_path_dist_ckpt, vocab_size_base, src_tp_pp, dest_tp_pp):
         """ Test model loading with different vocab size (caused by TP padding). """
+        Utils.initialize_model_parallel(src_tp_pp[0], src_tp_pp[1])
         common_test_vocab_size_padding_change(initialize_bert_model, tmp_path_dist_ckpt, vocab_size_base,
                                               src_tp_pp, dest_tp_pp)
