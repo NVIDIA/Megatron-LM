@@ -246,6 +246,13 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                             if hasattr(self.config, "tp_comm_overlap_rs_dgrad")
                             else False
                         )
+                    if tp_comm_buffer_name == 'qkv' and self.config.tp_comm_overlap_disable_qkv:
+                        extra_kwargs["ub_overlap_ag"] = False
+                        extra_kwargs["ub_overlap_rs_dgrad"] = False
+
+                    if tp_comm_buffer_name == 'fc1' and self.config.tp_comm_overlap_disable_fc1:
+                        extra_kwargs["ub_overlap_ag"] = False
+                        extra_kwargs["ub_overlap_rs_dgrad"] = False
                 else:
                     extra_kwargs["ub_atomic_gemm_ag"] = self.config.tp_comm_atomic_ag
                     extra_kwargs["ub_split_ag"] = self.config.tp_comm_split_ag
