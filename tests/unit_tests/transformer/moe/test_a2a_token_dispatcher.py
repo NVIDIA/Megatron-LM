@@ -28,7 +28,7 @@ class TestAlltoAllDispatcher:
             ep_size=ep_size,
             pp_size=1,
             num_moe_experts=8,
-            moe_router_topk=1,
+            moe_router_topk=2,
             moe_router_load_balancing_type="aux_loss",
             moe_token_dispatcher_type="alltoall",
         )

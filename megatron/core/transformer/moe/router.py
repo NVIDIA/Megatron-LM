@@ -46,9 +46,10 @@ class Router(ABC, MegatronModule):
         self.weight = torch.nn.Parameter(
             torch.empty((self.config.num_moe_experts, self.config.hidden_size))
         )
-        if get_cuda_rng_tracker().is_initialized():
-            with get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
-                config.init_method(self.weight)
+        if config.perform_initialization:
+            if get_cuda_rng_tracker().is_initialized():
+                with get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
+                    config.init_method(self.weight)
         else:
             config.init_method(self.weight)
         setattr(self.weight, 'sequence_parallel', config.sequence_parallel)
@@ -156,6 +157,7 @@ class TopKRouter(Router):
             capacity_factor=self.config.moe_expert_capacity_factor,
             pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             drop_policy=self.config.moe_token_drop_policy,
+            use_pre_softmax=self.config.moe_router_pre_softmax,
         )
 
         if self.training:
@@ -285,6 +287,7 @@ class TopKRouter(Router):
                 capacity_factor=self.config.moe_expert_capacity_factor,
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
                 drop_policy=self.config.moe_token_drop_policy,
+                use_pre_softmax=self.config.moe_router_pre_softmax,
             )
         else:
             raise ValueError(f"Unsupported MoE routing type: {self.routing_type}")
