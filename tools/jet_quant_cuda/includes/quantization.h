@@ -7,6 +7,9 @@
 
 #include <cuda_fp16.h>
 #include "ds_kernel_utils.h"
+#include <vector>
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
 
 namespace quantize {
 
@@ -30,7 +33,14 @@ void launch_dequantize_kernel(T* dequant_data,
                               int elems_per_group,
                               int64_t total_elems,
                               cudaStream_t stream);
-                              
+
+std::vector<at::Tensor> sub_quantize_cuda(
+    at::Tensor& input_vals,
+    std::vector<at::Tensor> params_list,
+    int groups,
+    int numBits,
+    quantize::Type quantType);
+
 void launch_quant(int8_t* output_data,
                   float* params,
                   const __half* input_data,
