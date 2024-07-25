@@ -46,9 +46,14 @@ class TestTop2Router:
         assert num_weights == 12 * 4, num_weights
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_router_forward(self):
+    @pytest.mark.parametrize("moe_router_pre_softmax", [
+        (True),
+        (False),
+    ])
+    def test_router_forward(self, moe_router_pre_softmax):
         with torch.no_grad():
             self.router = self.router.cuda()
+            self.router.config.moe_router_pre_softmax = moe_router_pre_softmax
             # [num tokens, hidden size]
             hidden_states = torch.randn((32, 2, self.router.config.hidden_size))
             hidden_states = hidden_states.cuda()

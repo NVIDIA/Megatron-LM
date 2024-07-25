@@ -1757,6 +1757,8 @@ def _add_moe_args(parser):
                        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
     group.add_argument('--moe-router-topk', type=int, default=2,
                        help='Number of experts to route to for each token. The default is 2.')
+    group.add_argument('--moe-router-pre-softmax', action='store_true',
+                       help='Enable pre-softmax routing for MoE, which means the top-k selection is before the softmax. By default, top-k is done after the softmax.')
     group.add_argument('--moe-grouped-gemm', action='store_true',
                        help='When there are multiple experts per rank, compress multiple local (potentially small) gemms in a single kernel launch to improve the utilization and performance by leveraging the Grouped GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).')
     group.add_argument('--moe-aux-loss-coeff', type=float, default=0.0,
