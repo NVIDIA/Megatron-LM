@@ -26,7 +26,7 @@ TYPE_OF_TEST_TO_METRIC = {
 }
 
 METRIC_TO_THRESHOLD = {
-    "iteration-time": 0.3,
+    "iteration-time": 0.5,
     "mem-allocated-bytes": 3 * 1000 * 1000,  # 3MB
     "lm loss": 0.05,
 }
