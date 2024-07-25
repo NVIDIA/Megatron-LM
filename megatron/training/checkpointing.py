@@ -16,7 +16,7 @@ from time import time
 import torch
 
 from megatron.core import mpu, tensor_parallel, dist_checkpointing
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_current_rng_state
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.dist_checkpointing.serialization import get_default_load_sharded_strategy
 from megatron.core.dist_checkpointing.strategies.fully_parallel import \
@@ -265,7 +265,7 @@ def get_rng_state(use_dist_ckpt: bool = False):
         'random_rng_state': random.getstate(),
         'np_rng_state': np.random.get_state(),
         'torch_rng_state': torch.get_rng_state(),
-        'cuda_rng_state': torch.cuda.get_rng_state(),
+        'cuda_rng_state': get_current_rng_state(),
         'rng_tracker_states': tensor_parallel.get_device_rng_tracker().get_states()}
 
     rng_state_list = None

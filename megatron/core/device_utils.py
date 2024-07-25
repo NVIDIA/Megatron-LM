@@ -59,6 +59,8 @@ def get_local_device_count() -> int:
         device_count = xr.local_device_count()
     elif torch.cuda.is_available():
         device_count = torch.cuda.device_count()
+    else:
+        device_count = int(os.getenv("NUM_DEVICES", 8))
 
     return device_count
 
@@ -77,7 +79,7 @@ def get_distributed_backend(backend=None) -> str:
 def get_distributed_init_method() -> str:
     if xm is not None:
         init_method = 'xla://'
-    elif torch.cuda.is_available():
+    else:
         init_method =  "env://"
 
     return init_method

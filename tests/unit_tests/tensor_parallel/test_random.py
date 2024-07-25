@@ -1,4 +1,4 @@
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_current_rng_state
 from megatron.core.tensor_parallel.random import DeviceRNGStatesTracker
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed,get_device_rng_tracker
 from megatron.core.tensor_parallel.random import checkpoint
@@ -25,7 +25,7 @@ def test_device_rng_states_tracker():
     
     rng_tracker.fork("state2")
     set_manual_seed(seed)
-    rng_state = torch.cuda.get_rng_state()
+    rng_state = get_current_rng_state()
     assert torch.equal(rng_tracker.get_states()['state2'], rng_state)
 
 def test_model_parallel_device_manual_seed():

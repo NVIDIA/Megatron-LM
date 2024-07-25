@@ -6,6 +6,7 @@ import pytest
 from types import SimpleNamespace
 from unittest import mock
 
+from megatron.core.optimizer.distrib_optimizer import HAVE_APEX_OR_TE
 from megatron.training.checkpointing import (
     _NON_PERSISTENT_CKPT_SUBDIR,
     load_checkpoint,
@@ -19,6 +20,7 @@ from tests.unit_tests.dist_checkpointing import (
 )
 from tests.unit_tests.test_utilities import Utils
 
+@pytest.mark.skipif(not HAVE_APEX_OR_TE, reason="APEX or TE required for DistributedOptimizer")
 class TestNonPersistentSaveAndLoad:
     @pytest.mark.parametrize(
         ('tp,pp'),
@@ -111,7 +113,7 @@ class TestNonPersistentSaveAndLoad:
                             ), [filename, ckpt_a, ckpt_b]
         Utils.destroy_model_parallel()
 
-
+@pytest.mark.skipif(not HAVE_APEX_OR_TE, reason="APEX or TE required for DistributedOptimizer")
 class TestLegacySaveAndLoad:
     @pytest.mark.parametrize(
         ('tp,pp'),
