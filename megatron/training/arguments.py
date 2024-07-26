@@ -562,11 +562,15 @@ def validate_args(args, defaults={}):
 
     # Deterministic mode
     if args.deterministic_mode:
-        assert not args.use_flash_attn, 'Flash attention can not be used in deterministic mode.'
+        assert not args.use_flash_attn, "Flash attention can not be used in deterministic mode."
+        assert args.num_experts is None, "MoEs are currently not deterministic."
+        assert not args.cross_entropy_loss_fusion, "Cross Entropy Fusion is currently not deterministic."
 
         all_reduce_choices = ["Tree", "Ring", "CollnetDirect", "CollnetChain", "^NVLS"]
         assert os.getenv("NCCL_ALGO", -1) != -1 and os.getenv("NCCL_ALGO") in all_reduce_choices, \
             f"NCCL_ALGO must be one of {all_reduce_choices}."
+
+        torch.use_deterministic_algorithms(True)
 
     # Update the printed args to reflect that `apply_query_key_layer_scaling` also controls `attention_softmax_in_fp32`
     if args.apply_query_key_layer_scaling:
@@ -1435,7 +1439,7 @@ def _add_distributed_args(parser):
     group.add_argument('--overlap-grad-reduce', action='store_true',
                        default=False, help='If set, overlap DDP grad reduce.')
     group.add_argument('--defer-embedding-wgrad-compute', action='store_true',
-                       default=False, help='If set, defers the vocabulary projection linear layer weight' 
+                       default=False, help='If set, defers the vocabulary projection linear layer weight'
                        'gradient compute to pipeline flush.', dest='defer_embedding_wgrad_compute')
     group.add_argument('--wgrad-deferral-limit', type=int, default=0, help='Number of micro-batches for which'
                        'weight gradient computation of vocabulary projection is deferred, defaults to 0 which'
