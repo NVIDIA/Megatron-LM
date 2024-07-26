@@ -887,14 +887,14 @@ def get_amax_reduction_group(with_context_parallel=False):
     """Get the FP8 amax reduction group the caller rank belongs to."""
     if with_context_parallel:
         assert (
-            _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP is not None
+            _TENSOR_AND_CONTEXT_PARALLEL_GROUP is not None
         ), 'FP8 amax reduction group is not initialized'
-        return _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
+        return _TENSOR_AND_CONTEXT_PARALLEL_GROUP
     else:
         assert (
-            _TENSOR_AND_DATA_PARALLEL_GROUP is not None
+            _TENSOR_MODEL_PARALLEL_GROUP is not None
         ), 'FP8 amax reduction group is not initialized'
-        return _TENSOR_AND_DATA_PARALLEL_GROUP
+        return _TENSOR_MODEL_PARALLEL_GROUP
 
 
 def get_tensor_and_data_parallel_group(with_context_parallel=False):
