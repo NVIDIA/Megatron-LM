@@ -10,7 +10,7 @@ spec:
          {'_'+args_meta if args_meta else ''}"
   model: gpt3
   variant: 345m
-  build: mcore-pyt 
+  build: mcore-pyt
   scope: nightly
   nodes: 1
   gpus: 8
@@ -27,6 +27,7 @@ spec:
   artifacts: {/workspace/data/gpt3_data: text/the_pile/shard00}
   ckpt_format: torch
   ckpt_resume: 0
+  n_runs: 1
   script: |-
     ls
     cd /workspace/megatron-lm
@@ -42,6 +43,7 @@ spec:
         TP_SIZE={tp_size} \
         PP_SIZE={pp_size} \
         NUM_NODES={nodes} \
+        NUM_RUNS={n_runs} \
         MAX_STEPS={100 if ckpt_resume else 50} \
         USE_CORE={"1" if use_mcore else "0"} \
         VP_SIZE={vp_size if vp_size is not None else '""'} \
@@ -53,14 +55,14 @@ spec:
         JOB_NAME={name} \
         ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'}
 products:
-  - {use_mcore: [True],  tp_size: [4], pp_size: [1], ckpt_resume: [0, 1], ckpt_format: [torch_dist]}
+  - {use_mcore: [True],  tp_size: [4], pp_size: [1], ckpt_resume: [0, 1], ckpt_format: [torch_dist], n_runs: [10], time_limit: [12000]}
   - {use_mcore: [False], tp_size: [4], pp_size: [1], ckpt_resume: [0, 1]}
   - {use_mcore: [True], tp_size: [4], pp_size: [1], ckpt_resume: [1]}
-  - {use_mcore: [True],  tp_size: [1], pp_size: [2,4], ckpt_resume: [0, 1], ckpt_format: [torch_dist]}
+  - {use_mcore: [True],  tp_size: [1], pp_size: [2,4], ckpt_resume: [0, 1], ckpt_format: [torch_dist], n_runs: [10], time_limit: [12000]}
   - {use_mcore: [False], tp_size: [1], pp_size: [2,4], ckpt_resume: [0, 1]}
   - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], ckpt_format: [torch_dist], extra_args: ['"--num-experts 2 --sequence-parallel --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"'], args_meta: ["te_2experts"]}
   - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], ckpt_format: [torch_dist], extra_args: ['"--sequence-parallel --num-experts 4 --expert-model-parallel-size 2 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"'], args_meta: ["te_4experts2parallel"]}
-  - {tp_size: [1], pp_size: [1], ckpt_resume: [0, 1], ckpt_format: [torch_dist], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather"'], args_meta: ["dist_optimizer_overlap_grad_reduce_param_gather"]}
+  - {tp_size: [1], pp_size: [1], ckpt_resume: [0, 1], ckpt_format: [torch_dist], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather"'], args_meta: ["dist_optimizer_overlap_grad_reduce_param_gather"], n_runs: [10], time_limit: [12000]}
 # Non-MCore
   - {use_mcore: [False], tp_size: [1,4], pp_size: [1], extra_args: ["--overlap-grad-reduce"], args_meta: ["overlap_grad_reduce"]}
   - {use_mcore: [False], tp_size: [1], pp_size: [1], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce"'], args_meta: ["dist_optimizer_overlap_grad_reduce"]}

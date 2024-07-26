@@ -33,7 +33,7 @@ TRANSFORMER_IMPL=local
 if [[ $ALLOW_NONDETERMINISTIC -eq 1 ]]; then
    command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1;"
 else
-   command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0; export NCCL_ALGO=Tree;"
+   command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0; export NCCL_ALGO=Tree; export CUBLAS_WORKSPACE_CONFIG=:4096:8;"
    ADDITIONAL_PARAMS+=" --deterministic-mode"
 fi
 

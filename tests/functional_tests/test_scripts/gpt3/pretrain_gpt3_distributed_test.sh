@@ -19,6 +19,7 @@ if [[ -z $MOE_GROUPED_GEMM ]]; then MOE_GROUPED_GEMM=0; fi
 if [[ -z $ALLOW_NONDETERMINISTIC ]]; then ALLOW_NONDETERMINISTIC=0; fi
 if [[ -z $VOCAB_FILE ]]; then VOCAB_FILE="/workspace/data/gpt3_data/vocab.json" ; fi
 if [[ -z $MERGE_FILE ]]; then MERGE_FILE="/workspace/data/gpt3_data/merges.txt" ; fi
+if [[ -z $NUM_RUNS ]]; then NUM_RUNS=1 ; fi
 
 GPUS_PER_NODE=8
 # Change for multinode config
@@ -35,7 +36,7 @@ TRANSFORMER_IMPL=local
 if [[ $ALLOW_NONDETERMINISTIC -eq 1 ]]; then
    command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1;"
 else
-   command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0; export NCCL_ALGO=Tree;"
+   command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0; export NCCL_ALGO=Tree; export CUBLAS_WORKSPACE_CONFIG=:4096:8;"
    ADDITIONAL_PARAMS+=" --deterministic-mode"
 fi
 
@@ -180,28 +181,33 @@ echo "$command"
 echo "-----------------------------------------------------------------------------"
 
 echo "$command" > $SCRIPTS_DIR/pretrain_gpt3_distributed_command.sh
-eval $command
 
-echo "Saving test results to $TENSORBOARD_DIR"
-PYTHONPATH=$PWD python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
-  --logs-dir $TENSORBOARD_DIR \
-  --output-path ${TENSORBOARD_DIR}/results.json
+for i in {1..$NUM_RUNS}; do
+  echo "Run ${i}"
+  rm -rf $CHECKPOINT_PATH
+  eval $command
 
-if [[ $SKIP_PYTEST != 1 ]]; then
-    echo "-----------------------------------------------------------------------------"
-    if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
-        echo "Running pytest 1st vs 2nd run comparison"
-        export LOGS_DIR=$TENSORBOARD_DIR
-        pytest ./tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py
-    else
-        echo "Running pytest checks against golden values"
-        export LOGS_DIR=$TENSORBOARD_DIR
-        if [[ $USE_FP8 -eq 1 ]]; then
-          export EXPECTED_METRICS_FILE="./tests/functional_tests/test_results/jet/gpt3-345m-weekly-dgx-h100-1n8g-mcore-tp1-pp1-bf16-baseline.json"
-          pytest ./tests/functional_tests/python_test_utils/test_fp8_ci_pipeline.py
-        else
-          export EXPECTED_METRICS_FILE="./tests/functional_tests/test_results/jet/${JOB_NAME}.json"
-          pytest ./tests/functional_tests/python_test_utils/test_ci_pipeline.py
-        fi
-    fi
-fi
+  echo "Saving test results to $TENSORBOARD_DIR"
+  PYTHONPATH=$PWD python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
+    --logs-dir $TENSORBOARD_DIR \
+    --output-path ${TENSORBOARD_DIR}/results.json
+
+  if [[ $SKIP_PYTEST != 1 ]]; then
+      echo "-----------------------------------------------------------------------------"
+      if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
+          echo "Running pytest 1st vs 2nd run comparison"
+          export LOGS_DIR=$TENSORBOARD_DIR
+          pytest ./tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py
+      else
+          echo "Running pytest checks against golden values"
+          export LOGS_DIR=$TENSORBOARD_DIR
+          if [[ $USE_FP8 -eq 1 ]]; then
+            export EXPECTED_METRICS_FILE="./tests/functional_tests/test_results/jet/gpt3-345m-weekly-dgx-h100-1n8g-mcore-tp1-pp1-bf16-baseline.json"
+            pytest ./tests/functional_tests/python_test_utils/test_fp8_ci_pipeline.py
+          else
+            export EXPECTED_METRICS_FILE="./tests/functional_tests/test_results/jet/${JOB_NAME}.json"
+            pytest ./tests/functional_tests/python_test_utils/test_ci_pipeline.py
+          fi
+      fi
+  fi
+done
