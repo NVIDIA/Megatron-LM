@@ -324,6 +324,31 @@ std::vector<at::Tensor> sub_quantize(
     return sub_quantize_cuda(param_buffer, params, dp_param_offset, groups, numBits, quantType);
 }
 
+template <typename T>
+at::Tensor fused_dequantize_add(
+    at::Tensor& quantized_data,
+    at::Tensor& params,
+    at::Tensor& output_buffer,
+    std::vector<at::Tensor> param_list,
+    size_t dp_param_offset,
+    int groups,
+    int num_bits,
+    quantize::Type quant_type)
+{
+
+    return fused_dequantize_add_cuda<T>(
+        quantized_data,
+        params,
+        output_buffer,
+        param_list,
+        dp_param_offset,
+        groups,
+        num_bits,
+        quant_type
+    );
+
+}
+
 std::vector<at::Tensor> stochastic_quantize_ht(at::Tensor& input_vals,
                                             int groups,
                                             int numBits,
@@ -449,6 +474,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dequantize_reduce_ht32", &dequantize_reduce_ht);
     m.def("stochastic_quantize", &stochastic_quantize);
     m.def("sub_quantize", &sub_quantize);
+    m.def("dequantize_add_bf16", &fused_dequantize_add<__nv_bfloat16>);
     m.def("stochastic_quantize_ht32", &stochastic_quantize_ht);
     m.def("dequantize_half", &dequantize<__half>);
     m.def("dequantize_fp32", &dequantize<float>);

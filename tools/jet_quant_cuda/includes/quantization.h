@@ -34,6 +34,17 @@ void launch_dequantize_kernel(T* dequant_data,
                               int64_t total_elems,
                               cudaStream_t stream);
 
+template <typename T>
+at::Tensor fused_dequantize_add_cuda(
+    at::Tensor& quantized_data,
+    at::Tensor& params,
+    at::Tensor& output_buffer,
+    std::vector<at::Tensor> param_list,
+    size_t dp_param_offset,
+    int groups,
+    int num_bits,
+    quantize::Type quant_type);
+
 std::vector<at::Tensor> sub_quantize_cuda(
     at::Tensor& input_vals,
     std::vector<at::Tensor> params_list,
