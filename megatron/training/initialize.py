@@ -4,6 +4,8 @@
 import logging
 import random
 import os
+import packaging
+import packaging.version
 import time
 
 import numpy as np
@@ -233,21 +235,22 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
             print("> initializing torch distributed ...", flush=True)
         # Manually set the device ids.
         if device_count > 0:
-            device = args.rank % device_count
-            if args.local_rank is not None:
-                assert (
-                    args.local_rank == device
-                ), "expected local-rank to be the same as rank % device-count."
-            else:
-                args.local_rank = device
-            torch.cuda.set_device(device)
+            torch.cuda.set_device(args.local_rank)
+            device_id = torch.device(f'cuda:{args.local_rank}')
+        else:
+            device_id = None
+
         # Call the init process
-        torch.distributed.init_process_group(
-            backend=args.distributed_backend,
-            world_size=args.world_size,
-            rank=args.rank,
-            timeout=timedelta(minutes=args.distributed_timeout_minutes),
-        )
+        init_process_group_kwargs = {
+            'backend' : args.distributed_backend,
+            'world_size': args.world_size,
+            'rank': args.rank,
+            'timeout': timedelta(minutes=args.distributed_timeout_minutes),
+        }
+        if packaging.version.Version(torch.__version__) >= packaging.version.Version("2.3.0"):
+            init_process_group_kwargs['device_id'] = device_id
+
+        torch.distributed.init_process_group(**init_process_group_kwargs)
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
