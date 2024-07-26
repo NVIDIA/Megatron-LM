@@ -139,7 +139,7 @@ class QuantizationHelper:
         quant_tensor, quant_scales = quant_module.sub_quantize(weight_tensor, param_list, data_parallel_rank * weight_tensor.numel(), groups, self.weight_quantization_bits, quant_module.Symmetric)
         return quant_tensor, quant_scales
 
-    def dequantize_gather_weights(self, quantized_weight_tensor, scales, dequant_type, received_buffer):
+    def dequantize_gather_weights(self, quantized_weight_tensor, scales, dequant_type, received_buffer,  param_list, data_parallel_rank):
         """
         Dequantize the given tensor using CUDAQuantizer.
 
@@ -150,14 +150,26 @@ class QuantizationHelper:
         Returns:
             torch.Tensor: The dequantized tensor.
         """
-        groups =  quantized_weight_tensor.nelement() * (8 // self.weight_quantization_bits) // self.wq_group_size
+        dequant_elements_num = quantized_weight_tensor.nelement() * (8 // self.weight_quantization_bits)
+        groups =  dequant_elements_num // self.wq_group_size
         quant_module = self.quant_module
         if dequant_type is torch.bfloat16:
-            quant_module.dequantize_bf16(quantized_weight_tensor, scales, received_buffer, groups, self.weight_quantization_bits, quant_module.Symmetric)
+            received_buffer = received_buffer.view(torch.bfloat16)
+            assert(received_buffer.numel() == dequant_elements_num), "received_buffer size is not equal to dequant_elements size"
+            quant_module.dequantize_add_bf16(
+                quantized_weight_tensor, 
+                scales, 
+                received_buffer, 
+                param_list, 
+                0, 
+                groups, 
+                self.weight_quantization_bits, 
+                quant_module.Symmetric)
+
         elif dequant_type is torch.float32:
-            quant_module.dequantize_fp32(quantized_weight_tensor, scales, received_buffer, groups, self.weight_quantization_bits, quant_module.Symmetric)
+            assert(False), "dequant_type is not supported"
         elif dequant_type is torch.float16:
-            quant_module.dequantize_half(quantized_weight_tensor, scales, received_buffer, groups, self.weight_quantization_bits, quant_module.Symmetric)
+            assert(False), "dequant_type is not supported"
         else:
             assert(False), "dequant_type is not supported"
 

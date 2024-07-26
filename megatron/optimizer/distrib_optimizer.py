@@ -1231,7 +1231,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             group = data_parallel_group,
                         )
                         # PDEF after allgather: allgather -> (use_2int4_represent_1int8) -> dequant
-                        self.quantize_helper.dequantize_gather_weights(param2recv, scale2recv, weight_dtype, pbuf.detach())
+                        self.quantize_helper.dequantize_gather_weights(param2recv, scale2recv, weight_dtype, pbuf.detach(), param_list, data_parallel_rank)
 
                         if _COMM_QUANT_REC_ERROR == 1:
                             abs_diff = torch.norm(quant_copy - pbuf_views[data_parallel_rank], p=2)
@@ -1240,7 +1240,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     
                     # for param_buf_shard, param_model in param_buf_list:
                     #     param_buf_shard.add_(param_model)
-                    torch._foreach_add_(param_buf_shard_list, param_list)
+                    # torch._foreach_add_(param_buf_shard_list, param_list)
 
                     event.record()
 
