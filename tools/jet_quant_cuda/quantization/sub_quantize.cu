@@ -39,10 +39,10 @@ __device__ __inline__ size_t load_to_local(
         }
     }
 
-    if (param_idx == num_params) {
+    if (param_idx >= num_params) {
 
 #pragma unroll
-        for (int j = 0; j < vec_size; ) {
+        for (int j = 0; j < vec_size; j++) {
             local_buffer[j] = 0;
         }
 
@@ -59,6 +59,7 @@ __device__ __inline__ size_t load_to_local(
 
         size_t start_idx = param_idx==0 ? 0 : param_sizes[param_idx-1];
         size_t end_idx = param_sizes[param_idx];
+        assert(("load_to_local failed, idx + j < start_idx", start_idx <= idx + j));
         for (; param_idx < num_params; ) {
 
             if (idx + j < end_idx) {
@@ -89,6 +90,8 @@ __device__ __inline__ size_t load_to_local(
                             model_params[param_idx]+idx + j - start_idx);
                         j += 1;
                         break;
+                    } else {
+                        assert(("load_to_local failed, vec_size - j < 1", false));
                     }
                 } else {
                     // IF [idx+j, idx+vec_size) is not contiguous, only load [idx+j, end_idx)
@@ -116,6 +119,8 @@ __device__ __inline__ size_t load_to_local(
                             model_params[param_idx]+idx + j - start_idx);
                         j += 1;
                         break;
+                    } else {
+                        assert(("load_to_local failed, end_idx - idx - j < 1", false));
                     }
                 }
             }
@@ -123,6 +128,7 @@ __device__ __inline__ size_t load_to_local(
             ++param_idx;
             end_idx = param_sizes[param_idx];
         }
+        assert(("load_to_local failed, for loop search parameters finished without finding", param_idx<num_params));
     }
     return param_idx;
 }

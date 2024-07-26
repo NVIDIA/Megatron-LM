@@ -121,7 +121,7 @@ class QuantizationHelper:
     
         self.all2all_process_group = all_to_all_group
 
-    def quantize_gather_weights(self, weight_tensor :torch.Tensor):
+    def quantize_gather_weights(self, weight_tensor :torch.Tensor, param_list, data_parallel_rank):
         """
         Quantize the given tensor using CUDAQuantizer.
 
@@ -136,7 +136,7 @@ class QuantizationHelper:
         assert weight_tensor.nelement() % self.wq_group_size == 0
         groups =  weight_tensor.nelement() // self.wq_group_size
         quant_module = self.quant_module
-        quant_tensor, quant_scales = quant_module.stochastic_quantize(weight_tensor, groups, self.weight_quantization_bits, quant_module.Symmetric)
+        quant_tensor, quant_scales = quant_module.sub_quantize(weight_tensor, param_list, data_parallel_rank * weight_tensor.numel(), groups, self.weight_quantization_bits, quant_module.Symmetric)
         return quant_tensor, quant_scales
 
     def dequantize_gather_weights(self, quantized_weight_tensor, scales, dequant_type, received_buffer):

@@ -1194,7 +1194,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 with torch.cuda.stream(stream):
 
                     param_buf_shard_list, param_list = self.bucket_map_param_to_buffer_list[bucket_index]
-                    torch._foreach_sub_(param_buf_shard_list, param_list)
+                    # torch._foreach_sub_(param_buf_shard_list, param_list)
 
                     # param_buf_list = self.bucket_map_param_to_buffer.get(bucket_index, [])
                     # for param_buf_shard, param_model in param_buf_list:
@@ -1217,7 +1217,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             quant_copy = pbuf_views[data_parallel_rank].detach().clone()
                         
                         assert self.quantize_helper is not None, "Quantization helper for weight not initialized"
-                        param2send, scale2send = self.quantize_helper.quantize_gather_weights(pbuf_views[data_parallel_rank].detach())
+                        param2send, scale2send = self.quantize_helper.quantize_gather_weights(pbuf_views[data_parallel_rank].detach(), param_list, data_parallel_rank)
 
                         # we donot async allgather
                         torch.distributed._all_gather_base(
