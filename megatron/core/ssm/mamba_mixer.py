@@ -14,10 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from megatron.core.parallel_state import get_tensor_model_parallel_world_size
-from megatron.core.tensor_parallel import (
-    get_cuda_rng_tracker,
-    reduce_from_tensor_model_parallel_region,
-)
+from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -227,8 +224,8 @@ class MambaMixer(MegatronModule):
             conv_state, ssm_state = self._get_states_from_cache(inference_params, batch)
             if inference_params.seqlen_offset > 0:
                 # The states are updated inplace
-                out, _, _ = self.step(hidden_states, conv_state, ssm_state)
-                return out
+                out, out_bias, _, _ = self.step(hidden_states, conv_state, ssm_state)
+                return out, out_bias
 
         # (nheads_local)
         A = -torch.exp(self.A_log.float())
@@ -360,7 +357,7 @@ class MambaMixer(MegatronModule):
         hidden_states = hidden_states.squeeze(0)
 
         #  b d_model --> b p(2d)
-        xz = hidden_states @ self.in_proj.weight.t()
+        xz, _ = self.in_proj(hidden_states)
 
         z, xBC, dt = torch.split(
             xz,
@@ -472,9 +469,8 @@ class MambaMixer(MegatronModule):
             y = self.norm(y, z)
 
         # b pd --> b d
-        out = y @ self.out_proj.weight.t()
-        out = reduce_from_tensor_model_parallel_region(out)
-        return out.unsqueeze(0), conv_state, ssm_state
+        out, out_bias = self.out_proj(y)
+        return out.unsqueeze(0), out_bias, conv_state, ssm_state
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
         device = self.out_proj.weight.device
