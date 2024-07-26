@@ -285,9 +285,6 @@ timing_log_option: minmax
 tensorboard_log_interval: 1
 tensorboard_queue_size: 1000
 log_timers_to_tensorboard: False
-log_batch_size_to_tensorboard: False
-log_learning_rate_to_tensorboard: True
-log_learning_rate_to_tensorboard: True
 log_validation_ppl_to_tensorboard: False
 log_memory_to_tensorboard: False
 log_world_size_to_tensorboard: False
