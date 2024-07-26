@@ -442,14 +442,15 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
 
         grad_output = grad_output_buffer.pop(0)
         wgrad_compute(all_gathered_input[i % 2], grad_output, weight)
+        drain_idx = (i + 1) % 2
         input, all_gathered_input[i % 2], grad_output = None, None, None
 
         if config.sequence_parallel:
             handle.wait()
 
     grad_output = grad_output_buffer.pop(0)
-    wgrad_compute(all_gathered_input[1], grad_output, weight)
-    input, all_gathered_input[1], grad_output = None, None, None
+    wgrad_compute(all_gathered_input[drain_idx], grad_output, weight)
+    input, all_gathered_input[drain_idx], grad_output = None, None, None
 
 
 def local_multi_tensor_applier(op, noop_flag_buffer, tensor_lists, *args):
