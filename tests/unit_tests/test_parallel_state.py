@@ -218,7 +218,7 @@ def test_different_initialize_order_unconsistency(src_tp_pp, ep_size):
     assert dp_g != torch.distributed.get_process_group_ranks(ps.get_data_parallel_group(False))
     assert pp_g != torch.distributed.get_process_group_ranks(ps.get_pipeline_model_parallel_group())
     assert cp_g == torch.distributed.get_process_group_ranks(ps.get_context_parallel_group())
-    assert amax_g != torch.distributed.get_process_group_ranks(ps.get_amax_reduction_group(False))
+    assert amax_g == torch.distributed.get_process_group_ranks(ps.get_amax_reduction_group(False))
     assert mp_g != torch.distributed.get_process_group_ranks(ps.get_model_parallel_group())
 
     Utils.destroy_model_parallel()
