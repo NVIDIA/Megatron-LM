@@ -327,6 +327,7 @@ def validate_args(args, defaults={}):
 
     # Consumed tokens.
     args.consumed_train_samples = 0
+    args.skipped_train_samples = 0
     args.consumed_valid_samples = 0
 
     # Support for variable sequence lengths across batches/microbatches.
@@ -922,12 +923,6 @@ def _add_logging_args(parser):
                        'flush to disk.')
     group.add_argument('--log-timers-to-tensorboard', action='store_true',
                        help='If set, write timers to tensorboard.')
-    group.add_argument('--log-batch-size-to-tensorboard', action='store_true',
-                       help='If set, write batch-size to tensorboard.')
-    group.add_argument('--no-log-learnig-rate-to-tensorboard',
-                       action='store_false',
-                       help='Disable learning rate logging to tensorboard.',
-                       dest='log_learning_rate_to_tensorboard')
     group.add_argument('--no-log-loss-scale-to-tensorboard',
                        action='store_false',
                        help='Disable loss-scale logging to tensorboard.',
@@ -1014,6 +1009,13 @@ def _add_training_args(parser):
                        ' (1024 - 16) / 8 = 126 intervals will increase'
                        'the batch size linearly to 1024. In each interval'
                        'we will use approximately 300000 / 126 = 2380 samples.')
+    group.add_argument('--decrease-batch-size-if-needed', action='store_true', default=False,
+                       help='If set, decrease batch size if microbatch_size * dp_size'
+                       'does not divide batch_size. Useful for KSO (Keep Soldiering On)'
+                       'to continue making progress if number of healthy GPUs (and'
+                       'corresponding dp_size) does not support current batch_size.'
+                       'Old batch_size will be restored if training is re-started with'
+                       'dp_size that divides batch_size // microbatch_size.')
     group.add_argument('--recompute-activations', action='store_true',
                        help='recompute activation to allow for training '
                        'with larger models, sequences, and batch sizes.')
