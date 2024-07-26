@@ -13,12 +13,12 @@ workflow:
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run tests and nightly/
       variables:
         FUNCTIONAL_TEST: "yes"
-        SLURM_CLUSTER: dgxa100_dracooci
+        SLURM_CLUSTER: dgxa100_dracooci-ord
         SCOPE: mr-and-nightly
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run tests/
       variables:
         FUNCTIONAL_TEST: "yes"
-        SLURM_CLUSTER: dgxa100_dracooci
+        SLURM_CLUSTER: dgxa100_dracooci-ord
         SCOPE: mr
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       variables:
@@ -58,6 +58,7 @@ variables:
     value: "dgxa100_dracooci"
     options:
       - "dgxa100_dracooci"
+      - "dgxa100_dracooci-ord"
       - "dgxh100_eos"
     description: '"dgxa100_dracooci" for OCI-IAD, "dgxh100_eos" for EOS'
   # CI wide variables
@@ -80,6 +81,9 @@ metadata:
         JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and 'dgx_h100' in spec.platforms"
       elif [[ $SLURM_CLUSTER == dgxa100_dracooci ]]; then
         JET_CI_BRANCH=mcore/draco-oci
+        JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and 'dgx_a100' in spec.platforms"
+      elif [[ $SLURM_CLUSTER == dgxa100_dracooci-ord ]]; then
+        JET_CI_BRANCH=mcore/draco-oci-ord
         JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and 'dgx_a100' in spec.platforms"
       fi
     - |
