@@ -9,7 +9,9 @@ from typing import List, Optional, Union
 logger = logging.getLogger(__name__)
 
 # TODO: global_var merge into mcore?
-_GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
+_GLOBAL_NUM_MICROBATCHES_CALCULATOR: Union[
+    'ConstantNumMicroBatchesCalculator', 'RampupBatchsizeNumMicroBatchesCalculator'
+] = None
 
 
 def get_num_microbatches() -> int:
@@ -20,6 +22,11 @@ def get_num_microbatches() -> int:
 def get_current_global_batch_size() -> int:
     """Get current global batch size."""
     return _GLOBAL_NUM_MICROBATCHES_CALCULATOR.get_current_global_batch_size()
+
+
+def get_micro_batch_size() -> int:
+    """Get micro batch size."""
+    return _GLOBAL_NUM_MICROBATCHES_CALCULATOR.get_micro_batch_size()
 
 
 def update_num_microbatches(
@@ -54,6 +61,29 @@ def init_num_microbatches_calculator(
     assert (
         _GLOBAL_NUM_MICROBATCHES_CALCULATOR is None
     ), 'num microbatches calculator is already initialized.'
+
+    _GLOBAL_NUM_MICROBATCHES_CALCULATOR = build_num_microbatches_calculator(
+        rank, rampup_batch_size, global_batch_size, micro_batch_size, data_parallel_size
+    )
+
+
+def reconfigure_num_microbatches_calculator(
+    rank: int,
+    rampup_batch_size: Optional[List[int]],
+    global_batch_size: int,
+    micro_batch_size: int,
+    data_parallel_size: int,
+) -> None:
+    """Reconfigure number of micro-batches calculator.
+
+    Args:
+        rank (int): Rank of the GPU, only rank 0 will log the information.
+        rampup_batch_size (Optional[List[int]]): Rampup batch size, should be in format of [start_global_batch_size, batch_size_increment, ramup_samples].
+        global_batch_size (int): Global batch size for the model.
+        micro_batch_size (int): Micro batch size at initialization.
+        data_parallel_size (int): Data parallel size.
+    """
+    global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
 
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = build_num_microbatches_calculator(
         rank, rampup_batch_size, global_batch_size, micro_batch_size, data_parallel_size
@@ -118,6 +148,7 @@ class NumMicroBatchesCalculator(ABC):
     def __init__(self) -> None:
         self.num_micro_batches = None
         self.current_global_batch_size = None
+        self.micro_batch_size = None
 
     def get(self) -> int:
         """Get number of micro-batches."""
@@ -126,6 +157,10 @@ class NumMicroBatchesCalculator(ABC):
     def get_current_global_batch_size(self) -> int:
         """Get current global batch size."""
         return self.current_global_batch_size
+
+    def get_micro_batch_size(self) -> int:
+        """Get current global batch size."""
+        return self.micro_batch_size
 
     @abstractmethod
     def update(self, consumed_samples, consistency_check) -> None:
