@@ -252,6 +252,7 @@ class T5Model(LanguageModule):
 
         ## Encoder forward
         if encoder_hidden_states is None:
+
             # Encoder position ids
             encoder_position_ids = t5_position_ids(encoder_input_ids)
 
@@ -272,16 +273,16 @@ class T5Model(LanguageModule):
                 )
                 rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
-        # Run encoder.
-        if self.add_encoder:
-            encoder_hidden_states = self.encoder(
-                hidden_states=encoder_input,
-                attention_mask=encoder_attn_mask,
-                inference_params=inference_params,
-                rotary_pos_emb=rotary_pos_emb,
-            )
-        else:
-            encoder_hidden_states = self.encoder_hidden_state
+            # Run encoder.
+            if self.add_encoder:
+                encoder_hidden_states = self.encoder(
+                    hidden_states=encoder_input,
+                    attention_mask=encoder_attn_mask,
+                    inference_params=inference_params,
+                    rotary_pos_emb=rotary_pos_emb,
+                )
+            else:
+                encoder_hidden_states = self.encoder_hidden_state
 
         if not self.add_decoder or output_encoder_hidden_only:
             return encoder_hidden_states
