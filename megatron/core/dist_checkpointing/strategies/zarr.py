@@ -52,6 +52,13 @@ logger = getLogger(__name__)
 
 
 class ZarrSaveShardedStrategy(SaveShardedStrategy):
+    def __init__(self, backend: str, version: int):
+        super().__init__(backend, version)
+        logger.warning(
+            f'`zarr` distributed checkpoint backend is deprecated.'
+            ' Please switch to PyTorch Distributed format (`torch_dist`).'
+        )
+
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         sharded_tensors = list(nested_values(sharded_state_dict))
         arrays = _create_or_open_zarr_arrays(sharded_tensors, checkpoint_dir)
@@ -63,7 +70,7 @@ class ZarrSaveShardedStrategy(SaveShardedStrategy):
 def _create_or_open_zarr_arrays(
     sharded_tensors: List[ShardedTensor], checkpoint_dir: Path
 ) -> List[Optional[zarr.Array]]:
-    """ Returns list of zarr arrays corresponding to given tensors.
+    """Returns list of zarr arrays corresponding to given tensors.
 
     For a sharded tensors that:
     a) is main replica and represents the first chunk (all offsets 0), creates the Zarr array
