@@ -320,7 +320,7 @@ def topk_softmax_with_capacity(
 
     if capacity_factor is None:
         # TopK without capacity
-        tokens_per_expert = torch.histc(top_indices, bins=num_experts, min=0, max=num_experts)
+        tokens_per_expert = torch.bincount(top_indices.view(-1), minlength=num_experts)
         return probs, top_indices, tokens_per_expert
     else:
         # TopK with capacity

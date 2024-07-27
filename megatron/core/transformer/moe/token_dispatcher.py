@@ -162,12 +162,14 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         with torch.no_grad():
             # The indices of local_indices that give its sorted order along dim 0.
             self.indices = torch.argsort(local_indices, dim=0)
-            tokens_per_expert = torch.histc(
-                local_indices,
-                bins=self.num_local_experts,
-                min=self.local_expert_indices[0],
-                max=self.local_expert_indices[-1],
+            tokens_per_expert = torch.bincount(
+                local_indices.view(-1),
+                minlength=self.config.num_moe_experts,
             )
+            if self.num_local_experts < self.config.num_moe_experts:
+                tokens_per_expert = tokens_per_expert[
+                    self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
+                ]
             tokens_per_expert = tokens_per_expert.cpu().to(torch.long)
 
         # Stage2: permute the tokens locally so that they are grouped by their expert assignment
@@ -365,9 +367,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             torch.Tensor: Tensor containing the number of tokens assigned to local expert.
         """
-        num_local_tokens_per_expert = torch.histc(
-            indices, bins=self.num_experts, min=0, max=self.num_experts
-        )
+        num_local_tokens_per_expert = torch.bincount(indices.view(-1), minlength=self.num_experts)
         # num_local_tokens_per_expert: [num_experts]
 
         ep_size = self.config.expert_model_parallel_size
