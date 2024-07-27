@@ -16,6 +16,7 @@ import numpy as np
 import torch
 from pkg_resources import packaging
 from torch.distributed import checkpoint
+from torch.distributed._shard._utils import narrow_tensor_by_index
 from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed._shard.sharded_tensor import Shard, ShardedTensorMetadata, TensorProperties
 from torch.distributed._sharded_tensor import ShardedTensor as TorchShardedTensor
@@ -25,7 +26,9 @@ from torch.distributed.checkpoint import (
     DefaultSavePlanner,
     FileSystemReader,
     LoadPlan,
+    LoadPlanner,
     Metadata,
+    ReadItem,
     SavePlan,
     TensorStorageMetadata,
     WriteItem,
@@ -34,7 +37,9 @@ from torch.distributed.checkpoint._nested_dict import FLATTEN_MAPPING, unflatten
 from torch.distributed.checkpoint._traverse import OBJ_PATH, traverse_state_dict
 from torch.distributed.checkpoint.default_planner import create_default_local_save_plan
 from torch.distributed.checkpoint.metadata import Metadata
+from torch.distributed.checkpoint.planner import LoadItemType
 from torch.distributed.checkpoint.planner_helpers import _create_write_items
+from torch.futures import Future
 
 from ..core import CheckpointingException
 from ..dict_utils import extract_matching_values, nested_values
@@ -60,6 +65,13 @@ from .resharding import (
     restore_nd_flattened_tensors_formulation,
 )
 from .state_dict_saver import save_state_dict_async_finalize, save_state_dict_async_plan
+
+try:
+    from transformer_engine.pytorch.float8_tensor import Float8Tensor
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 _import_trigger = None
 
@@ -473,6 +485,7 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
     ) -> None:
         super().__init__(*args, **kwargs)
         self.shapes_validation_sharded_tensors = shapes_validation_sharded_tensors
+        self._intermediate_read_item_and_target: Optional[Tuple[ReadItem, torch.Tensor]] = None
 
     def _validate_global_shapes(self, metadata, sharded_tensors):
         for sh_ten in sharded_tensors:
@@ -492,6 +505,41 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
     def create_local_plan(self) -> LoadPlan:
         self._validate_global_shapes(self.metadata, self.shapes_validation_sharded_tensors)
         return super().create_local_plan()
+
+    def resolve_tensor(self, read_item: ReadItem):
+        """Override to add FP8 support.
+
+        Narrowing the Float8Tensor can create incontiguous tensors and there are
+        no `copy` kernels for such cases. This method creates a contiguous FP8
+        tensors so that the subsequent `copy_` in FileSystemReader succeeds.
+        Note that this requires tracking the original tensor
+        (as `self._intermediate_read_item_and_target` attribute)
+        and restoring it in `commit_tensor` method.
+        """
+        target_tensor = super().resolve_tensor(read_item)
+        if (
+            not target_tensor.is_contiguous()
+            and HAVE_TE
+            and isinstance(target_tensor, Float8Tensor)
+        ):
+            self._intermediate_read_item_and_target = (read_item, target_tensor)
+            target_tensor = Float8Tensor.make_like(
+                target_tensor,
+                data=target_tensor._data.contiguous(),
+            )
+        return target_tensor
+
+    def commit_tensor(self, read_item: ReadItem, tensor: torch.Tensor) -> None:
+        """Restores the original FP8 tensor saved in `resolve_tensor`."""
+        if self._intermediate_read_item_and_target is not None:
+            interm_read_item, target_tensor = self._intermediate_read_item_and_target
+            assert (
+                interm_read_item is read_item
+            ), '`commit_tensor` method should be called right after `resolve_tensor`'
+            target_tensor.copy_(tensor)
+            tensor = target_tensor
+            self._intermediate_read_item_and_target = None
+        return super().commit_tensor(read_item, tensor)
 
 
 class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
