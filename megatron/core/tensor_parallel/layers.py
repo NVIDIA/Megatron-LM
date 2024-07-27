@@ -802,7 +802,9 @@ class ColumnParallelLinear(torch.nn.Module):
             )
             self.sequence_parallel = False
 
-        self.allreduce_dgrad = world_size > 1 and not self.sequence_parallel
+        self.allreduce_dgrad = (
+            world_size > 1 and not self.sequence_parallel and not self.disable_grad_reduce
+        )
 
         if config.gradient_accumulation_fusion and not _grad_accum_fusion_available:
             raise RuntimeError(
