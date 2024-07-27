@@ -236,8 +236,6 @@ unit_tests:
   needs: [build_image]
   tags:
     - 8xL40S
-  variables:
-    MOE_GROUPED_GEMM: 0 # Set to 1 to enable grouped gemm for MoE
   rules:
     - if: '$FUNCTIONAL_TEST == "no" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/)'
       allow_failure: true
