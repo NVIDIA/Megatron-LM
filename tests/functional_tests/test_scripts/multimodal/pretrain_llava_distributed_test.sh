@@ -48,6 +48,7 @@ fi
 if [[ $MOE_GROUPED_GEMM -eq 1 ]]; then
        echo "Running MoE with Grouped GEMM"
        TRAINING_DTYPE=bf16  # Currently GroupedGEMM for MoE only supports bf16 dtype
+       ADDITIONAL_PARAMS+=" --moe-grouped-gemm --disable-bias-linear"
 fi
 
 if [[ $USE_TE -eq 1 ]]; then

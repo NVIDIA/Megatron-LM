@@ -6,6 +6,7 @@ spec:
   name: "{model}_{variant}_{scope}_{platforms}_{nodes}N{gpus}G_\
          {'mcore_' if use_mcore else ''}{'te_' if use_te else ''}\
          tp{tp_size}_pp{pp_size}{'_vp'+str(vp_size) if vp_size else ''}\
+         {'_ep'+str(ep_size) if ep_size else ''}\
          {'_resume_'+str(ckpt_format) if ckpt_resume else ''}\
          {'_'+args_meta if args_meta else ''}"
   model: gpt3
@@ -18,6 +19,7 @@ spec:
   use_te: False
   use_mcore: True
   vp_size: null
+  ep_size: null
   extra_args: null
   args_meta: null
   micro_batch_size: 4 # MBS
@@ -47,6 +49,7 @@ spec:
         MAX_STEPS={100 if ckpt_resume else 50} \
         USE_CORE={"1" if use_mcore else "0"} \
         VP_SIZE={vp_size if vp_size is not None else '""'} \
+        EP_SIZE={ep_size if ep_size is not None else '""'} \
         MBS={micro_batch_size} \
         GBS={batch_size} \
         MOE_GROUPED_GEMM={moe_grouped_gemm} \
@@ -61,7 +64,7 @@ products:
   - {use_mcore: [True],  tp_size: [1], pp_size: [2,4], ckpt_resume: [0, 1], ckpt_format: [torch_dist], n_runs: [10], time_limit: [12000]}
   - {use_mcore: [False], tp_size: [1], pp_size: [2,4], ckpt_resume: [0, 1]}
   - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], ckpt_format: [torch_dist], extra_args: ['"--num-experts 2 --sequence-parallel --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"'], args_meta: ["te_2experts"]}
-  - {tp_size: [2], pp_size: [2], ckpt_resume: [0, 1], ckpt_format: [torch_dist], extra_args: ['"--sequence-parallel --num-experts 4 --expert-model-parallel-size 2 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"'], args_meta: ["te_4experts2parallel"]}
+  - {tp_size: [2], pp_size: [2], ep_size: [2], ckpt_resume: [0, 1], ckpt_format: [torch_dist], extra_args: ['"--sequence-parallel --num-experts 4 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"'], args_meta: ["te_4experts2parallel"]}
   - {tp_size: [1], pp_size: [1], ckpt_resume: [0, 1], ckpt_format: [torch_dist], extra_args: ['"--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather"'], args_meta: ["dist_optimizer_overlap_grad_reduce_param_gather"], n_runs: [10], time_limit: [12000]}
 # Non-MCore
   - {use_mcore: [False], tp_size: [1,4], pp_size: [1], extra_args: ["--overlap-grad-reduce"], args_meta: ["overlap_grad_reduce"]}
