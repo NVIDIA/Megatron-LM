@@ -35,6 +35,8 @@ def detokenize_generations(tokens_gpu_tensor,
                                            'HuggingFaceTokenizer',
                                            'Llama2Tokenizer']:
                     word = tokenizer.decoder[token]
+                elif args.tokenizer_type == 'TikTokenizer':
+                    word = tokenizer.detokenize([token])
                 elif args.tokenizer_type in ['Llama3Tokenizer', 'MistralTokenizer']:
                     word = tokenizer.decode([token])
                 elif args.tokenizer_type == 'NullTokenizer':
