@@ -17,3 +17,5 @@ parser.add_argument("--skip_plot", action='store_true', help="Skip generation of
 parser.add_argument("--skip_csv", action='store_true', help="Skip generation of csv files")
 parser.add_argument("--use_sns", action='store_true', help="Use the SNS library to format plot")
 parser.add_argument("--csv_name", required=False, default="", type=str, help="Unique name for CSV files")
+parser.add_argument("--plot_only", action='store_true', help="Plot only using csv files")
+parser.add_argument("--csv_dir", required=False, type=str, help="Directory for csv files")

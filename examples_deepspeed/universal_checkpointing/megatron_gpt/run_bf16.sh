@@ -3,7 +3,7 @@
 
 DIR=`pwd`
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
-BASE_DATA_PATH=datasets
+BASE_DATA_PATH=dataset
 DATASET=${BASE_DATA_PATH}/my-gpt2_text_document
 VOCAB_PATH=${BASE_DATA_PATH}/gpt2-vocab.json
 MERGE_PATH=${BASE_DATA_PATH}/gpt2-merges.txt
