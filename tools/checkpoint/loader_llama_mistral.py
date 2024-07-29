@@ -561,7 +561,7 @@ def _load_checkpoint(queue, args):
         except ImportError:
             raise AssertionError("Module 'llama' is required but not installed.")
         tokenizer = Llama3Tokenizer(margs.tokenizer_model)
-        md.true_vocab_size = tokenizer.vocab_size
+        md.true_vocab_size = tokenizer.n_words
     else:
         md.true_vocab_size = None
 
