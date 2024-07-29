@@ -54,7 +54,7 @@ def init_num_microbatches_calculator(
     global_batch_size: int,
     micro_batch_size: int,
     data_parallel_size: int,
-    decrease_batch_size_if_needed: bool,
+    decrease_batch_size_if_needed: bool = False,
 ) -> None:
     """Initialize number of micro-batches calculator.
 
@@ -64,14 +64,14 @@ def init_num_microbatches_calculator(
         global_batch_size (int): Global batch size for the model.
         micro_batch_size (int): Micro batch size at initialization.
         data_parallel_size (int): Data parallel size.
-        decrease_batch_size_if_needed (bool): If true, scale down batch size to ensure divisibility by DP size * microbatch size.
+        decrease_batch_size_if_needed (bool): If true, scale down batch size to ensure divisibility by DP size * microbatch size. Default false.
     """
     global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
     assert (
         _GLOBAL_NUM_MICROBATCHES_CALCULATOR is None
     ), 'num microbatches calculator is already initialized.'
 
-    _GLOBAL_NUM_MICROBATCHES_CALCULATOR = build_num_microbatches_calculator(
+    _GLOBAL_NUM_MICROBATCHES_CALCULATOR = _build_num_microbatches_calculator(
         rank,
         rampup_batch_size,
         global_batch_size,
@@ -101,7 +101,7 @@ def reconfigure_num_microbatches_calculator(
     """
     global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
 
-    _GLOBAL_NUM_MICROBATCHES_CALCULATOR = build_num_microbatches_calculator(
+    _GLOBAL_NUM_MICROBATCHES_CALCULATOR = _build_num_microbatches_calculator(
         rank,
         rampup_batch_size,
         global_batch_size,
@@ -111,7 +111,7 @@ def reconfigure_num_microbatches_calculator(
     )
 
 
-def build_num_microbatches_calculator(
+def _build_num_microbatches_calculator(
     rank: int,
     rampup_batch_size: Optional[List[int]],
     global_batch_size: int,
