@@ -80,12 +80,12 @@ def test_update_num_microbatches():
 
 
 def test_build_num_microbatches_calculator():
-    temp_calculator = mb_calculator.build_num_microbatches_calculator(0, None, 32, 8, 2, False)
+    temp_calculator = mb_calculator._build_num_microbatches_calculator(0, None, 32, 8, 2, False)
     assert temp_calculator.get() == 2
     assert temp_calculator.get_current_global_batch_size() == 32
     assert type(temp_calculator) is mb_calculator.ConstantNumMicroBatchesCalculator
 
-    temp_calculator = mb_calculator.build_num_microbatches_calculator(0, [16, 16, 48], 32, 8, 2, False)
+    temp_calculator = mb_calculator._build_num_microbatches_calculator(0, [16, 16, 48], 32, 8, 2, False)
     assert temp_calculator.get() == 1
     assert temp_calculator.get_current_global_batch_size() == 16
     assert type(temp_calculator) is mb_calculator.RampupBatchsizeNumMicroBatchesCalculator
