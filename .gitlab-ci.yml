@@ -13,12 +13,12 @@ workflow:
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run tests and nightly/
       variables:
         FUNCTIONAL_TEST: "yes"
-        SLURM_CLUSTER: dgxa100_dracooci-ord
+        SLURM_CLUSTER: $DEFAULT_A100_CLUSTER
         SCOPE: mr-and-nightly
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run tests/
       variables:
         FUNCTIONAL_TEST: "yes"
-        SLURM_CLUSTER: dgxa100_dracooci-ord
+        SLURM_CLUSTER: $DEFAULT_A100_CLUSTER
         SCOPE: mr
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       variables:
