@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:experimental
 
 ARG FROM_IMAGE_NAME
-FROM $FROM_IMAGE_NAME
+FROM $FROM_IMAGE_NAME as main
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN sed -i -e 's/^APT/# APT/' -e 's/^DPkg/# DPkg/' \
@@ -15,3 +15,5 @@ RUN pip3 install --no-cache-dir \
 COPY . /opt/megatron-lm
 
 WORKDIR /opt/megatron-lm
+
+FROM main as jet

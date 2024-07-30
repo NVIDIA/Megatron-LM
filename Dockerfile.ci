@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:experimental
 
 ARG FROM_IMAGE_NAME
-FROM $FROM_IMAGE_NAME
+FROM $FROM_IMAGE_NAME as main
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN sed -i -e 's/^APT/# APT/' -e 's/^DPkg/# DPkg/' \
@@ -63,7 +63,22 @@ RUN cd /tmp && \
     rm -rf mamba
 ##### For Mamba end #####
 
-COPY . /workspace/megatron-lm
+##### For JET-API start #####
+RUN apt-get install -y python3-venv && \
+    apt-get clean -y && \
+    python -m venv /opt/jet
+##### For JET-API end #####
 
+COPY . /workspace/megatron-lm
 RUN cp -r /workspace/megatron-lm /opt && \
-    pip install /opt/megatron-lm
+    pip install /opt/megatron-lm  
+
+
+##### For NVIDIANS only #####
+FROM main as jet
+ARG CACHEBUST=0
+RUN --mount=type=secret,id=JET_INDEX_URLS \
+    JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS) && \
+    /opt/jet/bin/pip install jet-api --upgrade $JET_INDEX_URLS 
+ENV PATH="$PATH:/opt/jet/bin"
+###
