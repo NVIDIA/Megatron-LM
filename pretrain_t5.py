@@ -111,7 +111,7 @@ def model_provider(
         encoder_config = deepcopy(config)
         encoder_config.num_layers = args.encoder_num_layers
         if args.pipeline_model_parallel_size > 1:
-            assert args.encoder_pipeline_model_parallel_size is not None, "Need to know how to shard the encoder & decoder."
+            assert args.encoder_pipeline_model_parallel_size > 0, "Need to know how to shard the encoder & decoder."
             encoder_config.pipeline_model_parallel_size = args.encoder_pipeline_model_parallel_size
 
         print_rank_0('building T5 model ...')
