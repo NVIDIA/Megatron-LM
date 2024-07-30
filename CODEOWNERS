@@ -7,3 +7,6 @@ tests/ @shanmugamr @terryk @okoenig
 [MODELOPT]
 megatron/core/inference/modelopt_support @chenhany @kmorabia
 examples/inference/quantization @chenhany @kmorabia
+
+[DATASETS]
+megatron/core/datasets @jkamalu @jcasper @eharper
