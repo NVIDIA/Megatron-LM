@@ -63,9 +63,7 @@ jet-trigger:
       retrier:
         enabled: true
         max_retries: 2
-        retry_on: 
-          - '1.2'  # `Infrastructure failure`
-          - '1.2.1.2'  # `SLURM Deadline` errors
+        retry_on: ['1.2', '1.2.*'] # All infra related issues
         waiting_time: 60
         environment: jet-auto-retrier
   inherit:
