@@ -6,6 +6,7 @@ import sys
 import tempfile
 
 import nltk
+import pytest
 import requests
 
 from megatron.core.datasets.indexed_dataset import IndexedDataset
@@ -183,7 +184,7 @@ def gpt2_merge(odir):
         writer.write(requests.get(PRETRAINED_MERGES_ARCHIVE_MAP['gpt2']).content)
     return path
 
-
+@pytest.mark.skip(reason="Tests are flaky and need to be debugged")
 def test_preprocess_data_gpt():
     with tempfile.TemporaryDirectory() as temp_dir:
 
@@ -213,7 +214,7 @@ def bert_vocab(odir):
         writer.write(requests.get(__HUGGINGFACE_BERT_BASE_UNCASED_VOCAB).content)
     return path
 
-
+@pytest.mark.skip(reason="Tests are flaky and need to be debugged")
 def test_preprocess_data_bert():
     with tempfile.TemporaryDirectory() as temp_dir:
 

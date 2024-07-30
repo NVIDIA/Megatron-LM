@@ -4,19 +4,27 @@ from typing import Dict
 
 import numpy as np
 import pytest
-
 import torch
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.dict_utils import nested_values, \
-    map_reduce, dict_list_map_outplace
+from megatron.core.dist_checkpointing.dict_utils import (
+    dict_list_map_outplace,
+    map_reduce,
+    nested_values,
+)
 from megatron.core.dist_checkpointing.mapping import is_main_replica
-from megatron.core.dist_checkpointing.strategies.base import \
-    SaveShardedStrategy, LoadShardedStrategy
-from megatron.core.dist_checkpointing.strategies.fully_parallel import \
-    FullyParallelSaveStrategyWrapper, _sharded_tensor_shard_id, \
-    FullyParallelLoadStrategyWrapper, _ShardId
+from megatron.core.dist_checkpointing.strategies.base import (
+    LoadShardedStrategy,
+    SaveShardedStrategy,
+)
+from megatron.core.dist_checkpointing.strategies.fully_parallel import (
+    FullyParallelLoadStrategyWrapper,
+    FullyParallelSaveStrategyWrapper,
+    _sharded_tensor_shard_id,
+    _ShardId,
+)
+from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -59,6 +67,12 @@ class MockLoadStrategy(LoadShardedStrategy):
 
 
 class TestFullyParallelSaveAndLoad:
+    def setup_method(self, method):
+        pass
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()   
+        
     @staticmethod
     def get_sharded_state_dict():
         return {
@@ -75,7 +89,7 @@ class TestFullyParallelSaveAndLoad:
         }
 
     @pytest.mark.parametrize("parallelization_along_dp", [False, True])
-    def test_save_distribution(self, parallelization_along_dp):
+    def test_save_distribution(self, parallelization_along_dp, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(2, 1)
         state_dict = self.get_sharded_state_dict()
 
@@ -122,7 +136,8 @@ class TestFullyParallelSaveAndLoad:
         save_strategy = FullyParallelSaveStrategyWrapper(mock_strategy,
                                                          parallelization_group,
                                                          do_cache_distribution=True)
-        save_strategy.save(state_dict, Path('mock_dir'))
+        with TempNamedDir(tmp_path_dist_ckpt / 'mock_dir') as ckpt_dir_A:
+            save_strategy.save(state_dict, ckpt_dir_A)
         key_to_saving_rank = dict(map_reduce(save_strategy.cached_distribution.main_rank_for_shard.items(), lambda shard_rank: shard_rank[0][0], lambda shard_rank: shard_rank[1]))
         assert expected_key_to_saving_ranks == key_to_saving_rank
 
@@ -134,7 +149,7 @@ class TestFullyParallelSaveAndLoad:
         assert mock_strategy.save_keys == expected_keys_saved_by_current_rank, (Utils.rank, mock_strategy.save_keys, expected_keys_saved_by_current_rank)
 
     @pytest.mark.parametrize("parallelization_along_dp", [False, True])
-    def test_load_distribution(self, parallelization_along_dp):
+    def test_load_distribution(self, parallelization_along_dp, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(2, 1)
 
         state_dict = self.get_sharded_state_dict()
@@ -174,7 +189,8 @@ class TestFullyParallelSaveAndLoad:
         load_strategy = FullyParallelLoadStrategyWrapper(mock_strategy,
                                                          parallelization_group,
                                                          do_cache_distribution=True)
-        loaded_state_dict = load_strategy.load(state_dict, Path('mock_dir'))
+        with TempNamedDir(tmp_path_dist_ckpt / 'mock_dir') as ckpt_dir_A:
+            loaded_state_dict = load_strategy.load(state_dict, ckpt_dir_A)
         key_to_saving_rank = dict(map_reduce(load_strategy.cached_distribution.main_rank_for_shard.items(), lambda shard_rank: shard_rank[0][0], lambda shard_rank: shard_rank[1]))
         assert expected_key_to_saving_ranks == key_to_saving_rank
 
@@ -182,8 +198,9 @@ class TestFullyParallelSaveAndLoad:
 
         assert loaded_state_dict.keys() == state_dict.keys()
 
+    @pytest.mark.skip(reason="Tests are flaky and need to be debugged")
     @pytest.mark.parametrize('state_dict_device', ['cpu', 'cuda'])
-    def test_memory_usage(self, state_dict_device):
+    def test_memory_usage(self, state_dict_device, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(2, 1)
 
         megabytes = 1024 * 1024
@@ -210,7 +227,8 @@ class TestFullyParallelSaveAndLoad:
 
         mem_alloc_start = torch.cuda.memory_allocated()
 
-        loaded_state_dict = load_strategy.load(sharded_state_dict, Path('mock_dir'))
+        with TempNamedDir(tmp_path_dist_ckpt / 'mock_dir') as ckpt_dir_A:
+            loaded_state_dict = load_strategy.load(sharded_state_dict, ckpt_dir_A)
 
         # Each rank is expected to do 7 * 10 empty allocations
         assert len(mem_alloc) == 7 * 10

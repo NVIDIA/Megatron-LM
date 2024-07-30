@@ -178,6 +178,6 @@ def test_straggler_detector():
     straggler_detector_report()
     # Check that exception is not suppressed.
     straggler_detector_exception_propagate()
-
+    util.StragglerDetector._configured = False
     # Teardown.
     _deinit_distributed()

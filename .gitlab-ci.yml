@@ -3,6 +3,8 @@ workflow:
     - if: $CI_PIPELINE_SOURCE == "schedule"
       variables:
         FUNCTIONAL_TEST: "yes"
+        UNIT_TEST_TIMEOUT: 180
+        UNIT_TEST_REPEAT: 10
     - if: $CI_PIPELINE_SOURCE == "web"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       variables:
@@ -65,6 +67,8 @@ variables:
   CI_MCORE_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_ci
   CI_NEMO_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/nemo_ci
   LINTING_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_linting
+  UNIT_TEST_TIMEOUT: 15
+  UNIT_TEST_REPEAT: 1
   
 metadata:
   image: python:3.10
@@ -242,27 +246,20 @@ unit_tests:
   image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
   stage: unit_tests
   needs: [build_image]
+  timeout: 180m
   tags:
     - 8xL40S
   rules:
     - if: '$FUNCTIONAL_TEST == "no" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/)'
       allow_failure: true
     - when: always
-  parallel:
-    matrix:
-      - DIR: 
-        - data
-        - dist_checkpointing
-        - distributed
-        - fusions
-        - inference
-        - models
-        - pipeline_parallel
-        - tensor_parallel
-        - transformer
-        - '*.py'
   script:
-    - torchrun --nproc_per_node=8 -m pytest -x -v -s --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail tests/unit_tests/$DIR
+    - |
+      for i in $(seq $UNIT_TEST_REPEAT); do
+        SEED=$((RANDOM % 9000 + 1000));
+        timeout ${UNIT_TEST_TIMEOUT}m torchrun --nproc_per_node=8 -m pytest --random-order --random-order-seed ${SEED} -xvs --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail tests/unit_tests
+      done
+      
   artifacts:
     paths:
       - coverage

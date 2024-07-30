@@ -37,7 +37,9 @@ class TestGPTInferenceWrapper:
         )
 
         self.inference_wrapped_model = GPTInferenceWrapper(gpt_model, inference_wrapper_config)
-     
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+        
     # This will call the inference_wrapped_model.forward_pass_with_pipeline_parallel_small_input_batch()    
     def test_inference_pipeline_parallel_small_size(self):
         self.setup_model(tensor_parallel_size=2, pipeline_parallel_size=2)
