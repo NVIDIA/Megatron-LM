@@ -50,9 +50,15 @@ jet-configure:
     max: 2
     when: job_execution_timeout
 
+  
+jet-build:
+  extends: [build_image, .jet_common]
+  variables:
+    STAGE: jet
+
 jet-trigger:
   extends: [.jet_common, .jet-trigger]
-  needs: [metadata, jet-configure]
+  needs: [metadata, jet-configure, jet-build]
   trigger:
     project: dl/jet/ci
     branch: $JET_CI_BRANCH
@@ -66,6 +72,9 @@ jet-trigger:
         retry_on: ['1.2', '1.2.*'] # All infra related issues
         waiting_time: 60
         environment: jet-auto-retrier
+      builds: 
+        jet_flavour: # An empty mapping will disable building the JET flavor 
+        
   inherit:
     variables: true
 

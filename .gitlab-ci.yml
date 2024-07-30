@@ -175,7 +175,6 @@ build_image:
   tags:
     - 8xL40S-builder
   image: docker:26.1.4-dind
-  needs: []  # May start ASAP
   stage: build
   timeout: 45m
   parallel:
@@ -192,6 +191,8 @@ build_image:
   before_script:
     - echo "$NGC_API_KEY" | docker login nvcr.io -u '$oauthtoken' --password-stdin
     - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
+  variables:
+    STAGE: main
   script:
     - |
       set -x
@@ -213,8 +214,11 @@ build_image:
       fi
 
       docker build \
+        --secret id=JET_INDEX_URLS \
+        --target $STAGE \
         -f $FILE \
         -t ${IMAGE}:${CI_PIPELINE_ID} \
+        --build-arg CACHEBUST=$(cat /proc/sys/kernel/random/uuid) \
         --cache-to type=inline \
         --cache-from type=registry,ref=${IMAGE}:buildcache \
         --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
