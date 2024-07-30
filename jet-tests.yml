@@ -33,14 +33,14 @@ jet-configure:
           select(.spec.name == "mcore-pyt")
           | .spec.source.image = env(IMAGE)
         )
-      ' -i tests/functional_tests/jet_recipes/build-pyt.yaml
+      ' -i tests/functional_tests/jet_recipes/_build-pyt.yaml
 
       IMAGE=${CI_NEMO_IMAGE}:${CI_PIPELINE_ID} yq '. |=
         (
           select(.spec.name == "mcore-nemo")
           | .spec.source.image = env(IMAGE)
         )
-      ' -i tests/functional_tests/jet_recipes/build-pyt.yaml
+      ' -i tests/functional_tests/jet_recipes/_build-pyt.yaml
   artifacts:
     reports:
       dotenv: jet.env
@@ -89,8 +89,10 @@ jet-results-summary:
     when: always
     paths:
       - scripts
-  allow_failure: true
   rules:
+    - if: '$FUNCTIONAL_TEST == "yes" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/ )'
+      allow_failure: true
+      when: always
     - if: '$FUNCTIONAL_TEST == "yes"'
       when: always
     - when: never
@@ -115,7 +117,6 @@ jet-results-notify:
     when: always
     paths:
       - scripts
-  allow_failure: true
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
       when: always
