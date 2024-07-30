@@ -91,6 +91,7 @@ class MambaModel(LanguageModule):
                 rotary_percent=rotary_percent,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
+                use_cpu_initialization=self.config.use_cpu_initialization,
             )
 
         self.decoder = build_module(
