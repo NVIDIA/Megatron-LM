@@ -26,14 +26,11 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestSerialization:
-    def setup_class(cls):
-        Utils.initialize_distributed()
+    def setup_method(self, method):
+        pass
 
-    @pytest.fixture(scope='function', autouse=True)
-    def cleanup_model_parallel(self):
-        # pass for initialize
-        yield
-        Utils.destroy_model_parallel()
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()  
 
     def test_single_process_save_load(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(1,1)
@@ -462,7 +459,7 @@ class TestNonStrictLoad:
 
             with caplog.at_level(logging.WARNING):
                 loaded_state_dict = load_with_flag(StrictHandling.LOG_UNEXPECTED)
-            assert caplog.text == ''
+            assert caplog.text == '' or '`zarr` distributed checkpoint backend is deprecated' in caplog.text
             assert 'TenB' in loaded_state_dict
 
             loaded_state_dict, missing_keys, unexpected_keys = load_with_flag(StrictHandling.RETURN_UNEXPECTED)
@@ -512,7 +509,7 @@ class TestNonStrictLoad:
             ):
                 with caplog.at_level(logging.WARNING):
                     loaded_state_dict = load_with_flag(strict)
-                assert caplog.text == ''
+                assert caplog.text == '' or '`zarr` distributed checkpoint backend is deprecated' in caplog.text
                 assert 'TenB' in loaded_state_dict
                 assert 'ObjB' in loaded_state_dict
 
@@ -522,7 +519,7 @@ class TestNonStrictLoad:
             ):
                 with caplog.at_level(logging.WARNING):
                     loaded_state_dict, missing_keys, unexpected_keys = load_with_flag(strict)
-                assert caplog.text == ''
+                assert caplog.text == '' or '`zarr` distributed checkpoint backend is deprecated' in caplog.text
                 assert 'TenB' in loaded_state_dict
                 assert 'ObjB' in loaded_state_dict
                 assert missing_keys == set()

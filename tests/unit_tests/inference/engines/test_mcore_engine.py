@@ -46,6 +46,9 @@ class TestMCoreEngine:
         text_generation_controller = SimpleTextGenerationController(inference_wrapped_model=inference_wrapped_model, tokenizer=self.mock_tokenizer)       
 
         self.mcore_engine = MCoreEngine(text_generation_controller=text_generation_controller, max_batch_size=4)
+        
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
 
     def test_generate(self):
         self.mock_tokenizer.vocab_size = self.vocab_size

@@ -23,6 +23,12 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestFlattenedResharding:
+    def setup_method(self, method):
+        pass
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()   
+        
     @pytest.mark.parametrize(
         ('src_tp_pp', 'dest_tp_pp',),
         [

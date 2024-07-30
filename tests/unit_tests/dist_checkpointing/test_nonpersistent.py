@@ -20,6 +20,12 @@ from tests.unit_tests.dist_checkpointing import (
 from tests.unit_tests.test_utilities import Utils
 
 class TestNonPersistentSaveAndLoad:
+    def setup_method(self, method):
+        pass
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()   
+        
     @pytest.mark.parametrize(
         ('tp,pp'),
         [
