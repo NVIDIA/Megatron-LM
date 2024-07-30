@@ -1,0 +1,50 @@
+type: basic
+format_version: 1
+maintainers: [maanug]
+loggers: [stdout]
+spec:
+  name: "{testscript}"
+  model: bert
+  build: mcore-pyt
+  nodes: 1
+  gpus: 8
+  platforms: dgx_a100
+  time_limit: 1200
+  scope: null
+  artifacts: 
+    /workspace/data/bert_data: text/the_pile/bert_shard00
+  script: |-
+    ls
+    cd /workspace/megatron-lm
+
+    ARGUMENTS=(
+        "DATA_PATH=/workspace/data/bert_data"
+        "DATA_CACHE_PATH=/workspace/data/cache" 
+        "OUTPUT_PATH={assets_dir}"
+        "TENSORBOARD_PATH={assets_dir}/tensorboard"
+        "CHECKPOINT_PATH=/workspace/checkpoints"
+        "TRAINING_SCRIPT_PATH=pretrain_bert.py"
+        "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{testscript}/model_config.yaml"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{testscript}/golden_values.json"
+    )
+
+    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
+
+products:
+  - scope: [mr]
+    testscript: 
+    - bert_mr_mcore_tp2_pp2_dgx_a100_1N8G
+    - bert_mr_mcore_tp2_pp2_local_spec_dgx_a100_1N8G
+    - bert_mr_mcore_tp2_pp2_resume_torch_dist_dgx_a100_1N8G
+    - bert_mr_mcore_tp2_pp2_resume_torch_dist_local_spec_dgx_a100_1N8G
+    - bert_mr_tp1_pp4_vp2_dgx_a100_1N8G
+    - bert_mr_tp1_pp4_vp2_resume_torch_dgx_a100_1N8G
+    - bert_mr_tp2_pp2_dgx_a100_1N8G
+    - bert_mr_tp2_pp2_resume_torch_dgx_a100_1N8G
+  - scope: [nightly]
+    testscript:
+    - bert_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp2
+    - bert_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp4_vp2
+    - bert_345m_nightly_dgx_a100_1N8G_mcore_tp4_pp1
+    - bert_345m_nightly_dgx_a100_1N8G_tp1_pp2
+    - bert_345m_nightly_dgx_a100_1N8G_tp4_pp1
