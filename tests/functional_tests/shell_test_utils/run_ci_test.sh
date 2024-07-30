@@ -35,8 +35,12 @@ done
 bash tests/functional_tests/shell_test_utils/_run_training.sh
 
 # Extract settings from params file
-TEST_TYPE=$(cat $TRAINING_PARAMS_PATH | yq '.TEST_TYPE')
-NVTE_ALLOW_NONDETERMINISTIC_ALGO=$(cat $TRAINING_PARAMS_PATH | yq '.ENV_VARS.NVTE_ALLOW_NONDETERMINISTIC_ALGO')
+TEST_TYPE=$(cat $TRAINING_PARAMS_PATH \
+            | yq '.TEST_TYPE')
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=$(cat $TRAINING_PARAMS_PATH \
+                                   | yq '.ENV_VARS.NVTE_ALLOW_NONDETERMINISTIC_ALGO')
+SKIP_PYTEST=$(cat $TRAINING_PARAMS_PATH \
+              | yq '.ENV_VARS.SKIP_PYTEST')
 
 # Maybe checkpoint resume training
 if [[ "$TEST_TYPE" == "ckpt-resume" ]]; then 

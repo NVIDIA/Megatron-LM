@@ -43,6 +43,12 @@ mv $TRAINING_PARAMS_PATH.tmp $TRAINING_PARAMS_PATH
 # Exit earlier to leave time for properly saving checkpoint
 PARAMS="--exit-duration-in-mins $((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60 - 15))"
 
+# Run before script
+SCRIPT=$(cat $TRAINING_PARAMS_PATH | yq .'BEFORE_SCRIPT')
+if [[ "$SCRIPT" != null ]]; then
+    eval "$SCRIPT"
+fi;
+
 # Extract training params
 TRAINING_PARAMS_FROM_CONFIG=$(yq '... comments="" | .MODEL_ARGS | to_entries | .[] | with(select(.value == "true"); .value = "") | [.key + " " + .value] | join("")' $TRAINING_PARAMS_PATH | tr '\n' ' ')
 PARAMS="$PARAMS $TRAINING_PARAMS_FROM_CONFIG"
