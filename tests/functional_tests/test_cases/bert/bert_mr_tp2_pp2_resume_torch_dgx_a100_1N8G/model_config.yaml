@@ -1,0 +1,47 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  NCCL_ALGO: Tree
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+MODEL_ARGS:
+  --num-layers: 24
+  --hidden-size: 1024
+  --num-attention-heads: 16
+  --log-params-norm: true
+  --log-num-zeros-in-grad: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --micro-batch-size: 4
+  --global-batch-size: 128
+  --seq-length: 512
+  --max-position-embeddings: 512
+  --train-iters: 100
+  --timing-log-level: 2
+  --lr-decay-iters: 990000
+  --save: ${CHECKPOINT_PATH}
+  --load: ${CHECKPOINT_PATH}
+  --data-path: ${DATA_PATH}/my-bert_00_text_sentence
+  --vocab-file: ${DATA_PATH}/vocab.txt
+  --split: 949,50,1
+  --distributed-backend: nccl
+  --lr: 0.0001
+  --min-lr: 0.00001
+  --lr-warmup-fraction: 0.01
+  --log-interval: 1
+  --save-interval: 50
+  --eval-interval: 1000
+  --eval-iters: 10
+  --tensor-model-parallel-size: 2
+  --pipeline-model-parallel-size: 2
+  --use-legacy-models: true
+  --transformer-impl: local  
+  --deterministic-mode: true  
+  --use-checkpoint-args: true  
+  --use-checkpoint-opt_param-scheduler: true
+  --no-gradient-accumulation-fusion: true
+  --data-cache-path: ${DATA_CACHE_PATH}
+  --fp16: true
+  --apply-query-key-layer-scaling: true
+TEST_TYPE: ckpt-resume
