@@ -176,13 +176,13 @@ def validate_args(args, defaults={}):
     )
 
     # Checks.
-    model_parallel_size = args.pipeline_model_parallel_size * \
+    model_parallel_size = (args.encoder_pipeline_model_parallel_size + args.pipeline_model_parallel_size) * \
                           args.tensor_model_parallel_size
     assert args.world_size % (model_parallel_size * args.context_parallel_size) == 0, \
         'world size ({}) is not divisible by tensor parallel size ({}) times ' \
-        'pipeline parallel size ({}) times context parallel size ({})'.format(
+        'pipeline parallel size (encoder+decoder) ({}+{}) times context parallel size ({})'.format(
         args.world_size, args.tensor_model_parallel_size,
-        args.pipeline_model_parallel_size, args.context_parallel_size)
+        args.encoder_pipeline_model_parallel_size, args.pipeline_model_parallel_size, args.context_parallel_size)
     args.data_parallel_size = args.world_size // (model_parallel_size * args.context_parallel_size)
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
@@ -194,15 +194,11 @@ def validate_args(args, defaults={}):
                   args.tensor_model_parallel_size,
                   args.pipeline_model_parallel_size), flush=True)
 
+    # backwards compatibility.
     if args.pipeline_model_parallel_split_rank is not None:
         args.encoder_pipeline_model_parallel_size = args.pipeline_model_parallel_split_rank
-
-    if args.pipeline_model_parallel_size > 1:
-        if args.encoder_pipeline_model_parallel_size is not None:
-            assert args.encoder_pipeline_model_parallel_size < \
-                    args.pipeline_model_parallel_size, 'encoder pipeline size needs '\
-                    ' to be less than pipeline model parallel size ({})'.format(
-                            args.pipeline_model_parallel_size)
+        args.pipeline_model_parallel_size -= args.encoder_pipeline_model_parallel_size
+        assert args.pipeline_model_parallel_size > 0
 
     if args.tp_comm_overlap:
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
@@ -1419,8 +1415,9 @@ def _add_distributed_args(parser):
                        help='Degree of tensor model parallelism.')
     group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
                        help='Degree of pipeline model parallelism.')
-    group.add_argument('--encoder-pipeline-model-parallel-size', type=int, default=None,
-                       help='Degree of pipeline model parallelism in the encoder.')
+    group.add_argument('--encoder-pipeline-model-parallel-size', type=int, default=0,
+                       help=('Degree of pipeline model parallelism in the encoder. This is '
+                             'independent of the amount of pipeline in the decoder.'))
     group.add_argument('--pipeline-model-parallel-split-rank',
                        type=int, default=None,
                        help=('Rank where encoder and decoder should be split. '

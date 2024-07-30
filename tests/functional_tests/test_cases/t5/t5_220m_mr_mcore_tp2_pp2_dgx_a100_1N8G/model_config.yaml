@@ -14,7 +14,7 @@ MODEL_ARGS:
   --decoder-seq-length: 128
   --max-position-embeddings: 512
   --tensor-model-parallel-size: 2
-  --pipeline-model-parallel-size: 4
+  --pipeline-model-parallel-size: 2
   --micro-batch-size: 4
   --global-batch-size: 32
   --lr: 0.0001
@@ -43,11 +43,11 @@ MODEL_ARGS:
   --log-timers-to-tensorboard: true
   --timing-log-level: 2
   --log-interval: 1
-  --save-interval: 50
+  --save-interval: 10000
   --eval-interval: 1000
   --eval-iters: 10
   --distributed-backend: nccl
   --data-cache-path: ${DATA_CACHE_PATH}
   --encoder-pipeline-model-parallel-size: 2
   --deterministic-mode: true
-TEST_TYPE: ckpt-resume
+TEST_TYPE: regular

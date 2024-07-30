@@ -342,7 +342,7 @@ def initialize_model_parallel(
     nccl_communicator_config_path: Optional[str] = None,
     distributed_timeout_minutes: int = 30,
     order: str = "tp-cp-ep-dp-pp",
-    encoder_pipeline_model_parallel_size: Optional[int] = None,
+    encoder_pipeline_model_parallel_size: Optional[int] = 0,
     get_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
     get_position_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
 ) -> None:
@@ -433,11 +433,11 @@ def initialize_model_parallel(
             The rank initialization order of parallelism. Now we support
             tp-dp-pp and tp-pp-dp orders.
 
-        encoder_pipeline_model_parallel_size (int, optional):
-            The number of tensor parallel GPU groups to allocate to the encoder. Must be
-            smaller than pipeline_model_parallel_size. As an example, if pipeline_model_parallel_size is 4
-            and encoder_pipeline_model_parallel_size is 2, then the encoder will use the first two pipeline
-            stages for its layers.
+        encoder_pipeline_model_parallel_size (int, default = 0):
+            The number of tensor parallel GPU groups to allocate to the encoder. As an example,
+            if pipeline_model_parallel_size is 4 and encoder_pipeline_model_parallel_size is 2,
+            then the encoder will use the first two pipeline stages for its layers, and the total
+            amount of pipelineing is 6.
 
         get_embedding_ranks (Callable[[List[int], Optional[int]], List[int]], optional, default=None):
             A function that takes in a list of ranks for a pipeline group and returns
@@ -464,6 +464,9 @@ def initialize_model_parallel(
     ranks 8 to 15 belong to the second box.
 
     """
+    if encoder_pipeline_model_parallel_size is None:
+        encoder_pipeline_model_parallel_size = 0
+
     if get_embedding_ranks is None:
         get_embedding_ranks = partial(
             default_embedding_ranks, split_rank=pipeline_model_parallel_split_rank
@@ -474,7 +477,7 @@ def initialize_model_parallel(
             default_position_embedding_ranks, split_rank=pipeline_model_parallel_split_rank
         )
 
-    if encoder_pipeline_model_parallel_size is not None:
+    if encoder_pipeline_model_parallel_size > 0:
         global _PIPELINE_MODEL_PARALLEL_DECODER_START
         _PIPELINE_MODEL_PARALLEL_DECODER_START = encoder_pipeline_model_parallel_size
 
@@ -482,19 +485,17 @@ def initialize_model_parallel(
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
 
-    if (
-        world_size
-        % (tensor_model_parallel_size * pipeline_model_parallel_size * context_parallel_size)
-        != 0
-    ):
+    total_pipelining = encoder_pipeline_model_parallel_size + pipeline_model_parallel_size
+
+    if world_size % (tensor_model_parallel_size * total_pipelining * context_parallel_size) != 0:
         raise RuntimeError(
             f"world_size ({world_size}) is not divisible by tensor_model_parallel_size "
-            f"({tensor_model_parallel_size}) x pipeline_model_parallel_size ({pipeline_model_parallel_size}) "
+            f"({tensor_model_parallel_size}) x total_pipelining ({encoder_pipeline_model_parallel_size=} + {pipeline_model_parallel_size=}) "
             f"x context_parallel_size ({context_parallel_size})"
         )
 
     data_parallel_size: int = world_size // (
-        tensor_model_parallel_size * pipeline_model_parallel_size * context_parallel_size
+        tensor_model_parallel_size * total_pipelining * context_parallel_size
     )
 
     if data_parallel_size % expert_model_parallel_size != 0:
@@ -535,7 +536,7 @@ def initialize_model_parallel(
         tp=tensor_model_parallel_size,
         ep=expert_model_parallel_size,
         dp=data_parallel_size,
-        pp=pipeline_model_parallel_size,
+        pp=total_pipelining,
         cp=context_parallel_size,
         order=order,
     )
