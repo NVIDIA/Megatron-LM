@@ -9,11 +9,10 @@ import os
 import warnings
 from typing import Any, Callable, List, Optional, Tuple
 
-from ..device_utils import get_current_device
+from ..device_utils import get_current_device, get_current_device_type
 import torch
 import torch.nn.functional as F
 import torch.nn.init as init
-from torch.cuda.amp import custom_bwd, custom_fwd
 from torch.nn.parameter import Parameter
 
 from megatron.core.model_parallel_config import ModelParallelConfig
@@ -276,7 +275,6 @@ class LinearWithFrozenWeight(torch.autograd.Function):
     mathematically."""
 
     @staticmethod
-    @custom_fwd
     def forward(
         ctx,
         input,
@@ -292,7 +290,6 @@ class LinearWithFrozenWeight(torch.autograd.Function):
         return output
 
     @staticmethod
-    @custom_bwd
     def backward(ctx, grad_output):
         (weight,) = ctx.saved_tensors
         grad_input = grad_output.matmul(weight)
@@ -387,7 +384,6 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     """See linear_with_grad_accumulation_and_async_allreduce"""
 
     @staticmethod
-    @custom_fwd
     def forward(
         ctx,
         input,
@@ -426,7 +422,6 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         return output
 
     @staticmethod
-    @custom_bwd
     def backward(ctx, grad_output):
         input, weight = ctx.saved_tensors
         use_bias = ctx.use_bias

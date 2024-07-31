@@ -6,7 +6,7 @@ import os
 from enum import Enum
 from typing import Dict, List, Optional
 
-from ..device_utils import get_current_device
+from ..device_utils import get_current_device, get_xla_model
 import torch
 
 from ..utils import log_on_each_pipeline_stage
@@ -356,12 +356,13 @@ class ParamAndGradBuffer:
             assert self.numel == self.numel_unpadded
 
         self.param_data = None
+        xm = get_xla_model()
         # Only re-map param tensors if using distributed optimizer.
         if self.ddp_config.use_distributed_optimizer:
             self.param_data = torch.zeros(
                 self.numel,
                 dtype=self.param_dtype,
-                device=get_current_device(),
+                device=get_current_device() if not xm else torch.device("cpu"),
                 requires_grad=False,
             )
         self.grad_data = torch.zeros(

@@ -18,7 +18,7 @@ from pkg_resources import packaging
 from torch.distributed import checkpoint
 from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed._shard.sharded_tensor import Shard, ShardedTensorMetadata, TensorProperties
-from torch.distributed._sharded_tensor import ShardedTensor as TorchShardedTensor
+from torch.distributed._shard.sharded_tensor import ShardedTensor as TorchShardedTensor
 from torch.distributed.checkpoint import (
     BytesStorageMetadata,
     DefaultLoadPlanner,
