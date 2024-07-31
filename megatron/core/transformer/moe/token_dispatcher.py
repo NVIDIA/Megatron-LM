@@ -474,7 +474,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             hidden_states = tensor_parallel.all_to_all_sp2hp(hidden_states)
 
         # Permutation 1: input to AlltoAll input
-        self.hiddden_shape_before_permute = hidden_states.shape
+        self.hidden_shape_before_permute = hidden_states.shape
         if self.cuda_sync_point == "before_permutation_1":
             torch.cuda.current_stream().synchronize()
         permutated_local_input_tokens, self.reversed_local_input_permutation_mapping = permute(
@@ -579,7 +579,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.reversed_local_input_permutation_mapping,
             probs=self.probs,
             padded_mode=self.drop_and_pad,
-            restore_shape=self.hiddden_shape_before_permute,
+            restore_shape=self.hidden_shape_before_permute,
         )
 
         # Perform tensor parallel AlltoAll communication
