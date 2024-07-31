@@ -15,7 +15,7 @@ import torch
 def extract_matching_values(
     x: Union[dict, list], predicate: Callable[[Any], bool], return_lists_as_dicts: bool = False
 ) -> Tuple[Union[dict, list], Union[dict, list]]:
-    """ Return matching and nonmatching values. Keeps hierarchy.
+    """Return matching and nonmatching values. Keeps hierarchy.
 
     Args:
         x (Union[dict, list]) : state dict to process. Top-level argument must be a dict or list
@@ -64,7 +64,7 @@ def extract_matching_values(
 
 
 def diff(x1: Any, x2: Any, prefix: Tuple = ()) -> Tuple[list, list, list]:
-    """ Recursive diff of dicts.
+    """Recursive diff of dicts.
 
     Args:
         x1 (object): left dict
@@ -114,7 +114,7 @@ def diff(x1: Any, x2: Any, prefix: Tuple = ()) -> Tuple[list, list, list]:
 
 
 def inspect_types(x: Any, prefix: Tuple = (), indent: int = 4):
-    """ Helper to print types of (nested) dict values. """
+    """Helper to print types of (nested) dict values."""
     print_indent = lambda: print(' ' * indent * len(prefix), end='')
     if isinstance(x, dict):
         print()
@@ -134,7 +134,7 @@ def inspect_types(x: Any, prefix: Tuple = (), indent: int = 4):
         else:
             try:
                 x_str = str(x)
-            except:
+            except Exception:
                 x_str = '<no string repr>'
             if len(x_str) > 30:
                 x_str = x_str[:30] + '... (truncated)'
@@ -142,7 +142,7 @@ def inspect_types(x: Any, prefix: Tuple = (), indent: int = 4):
 
 
 def nested_values(x: Union[dict, list]):
-    """ Returns iterator over (nested) values of a given dict or list. """
+    """Returns iterator over (nested) values of a given dict or list."""
     x_iter = x.values() if isinstance(x, dict) else x
     for v in x_iter:
         if isinstance(v, (dict, list)):
@@ -152,7 +152,7 @@ def nested_values(x: Union[dict, list]):
 
 
 def nested_items_iter(x: Union[dict, list]):
-    """ Returns iterator over (nested) tuples (container, key, value) of a given dict or list. """
+    """Returns iterator over (nested) tuples (container, key, value) of a given dict or list."""
     x_iter = x.items() if isinstance(x, dict) else enumerate(x)
     for k, v in x_iter:
         if isinstance(v, (dict, list)):
@@ -162,19 +162,19 @@ def nested_items_iter(x: Union[dict, list]):
 
 
 def dict_map(f: Callable, d: dict):
-    """ `map` equivalent for dicts. """
+    """`map` equivalent for dicts."""
     for sub_d, k, v in nested_items_iter(d):
         sub_d[k] = f(v)
 
 
 def dict_map_with_key(f: Callable, d: dict):
-    """ `map` equivalent for dicts with a function that accepts tuple (key, value). """
+    """`map` equivalent for dicts with a function that accepts tuple (key, value)."""
     for sub_d, k, v in nested_items_iter(d):
         sub_d[k] = f(k, v)
 
 
 def dict_list_map_inplace(f: Callable, x: Union[dict, list]):
-    """ Maps dicts and lists *in-place* with a given function. """
+    """Maps dicts and lists *in-place* with a given function."""
     if isinstance(x, dict):
         for k, v in x.items():
             x[k] = dict_list_map_inplace(f, v)
@@ -186,7 +186,7 @@ def dict_list_map_inplace(f: Callable, x: Union[dict, list]):
 
 
 def dict_list_map_outplace(f: Callable, x: Union[dict, list]):
-    """ Maps dicts and lists *out-of-place* with a given function. """
+    """Maps dicts and lists *out-of-place* with a given function."""
     if isinstance(x, dict):
         return {k: dict_list_map_outplace(f, v) for k, v in x.items()}
     elif isinstance(x, list):
@@ -196,7 +196,7 @@ def dict_list_map_outplace(f: Callable, x: Union[dict, list]):
 
 
 def merge(x1: dict, x2: dict, key: Tuple[str, ...] = ()):
-    """ Merges dicts and lists recursively. """
+    """Merges dicts and lists recursively."""
     if isinstance(x1, dict) and isinstance(x2, dict):
         for k, v2 in x2.items():
             if k not in x1:
@@ -223,7 +223,7 @@ def map_reduce(
     value_fn: Callable = lambda x: x,
     reduce_fn: Callable = lambda x: x,
 ) -> dict:
-    """ Simple map-reduce implementation following `more_itertools.map_reduce` interface. """
+    """Simple map-reduce implementation following `more_itertools.map_reduce` interface."""
     res = defaultdict(list)
     for x in xs:
         res[key_fn(x)].append(value_fn(x))

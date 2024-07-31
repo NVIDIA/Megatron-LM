@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 try:
     jit_fuser = torch.compile
-except:
+except AttributeError:
     jit_fuser = torch.jit.script
 
 

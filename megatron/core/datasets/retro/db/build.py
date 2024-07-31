@@ -95,13 +95,23 @@ def build_partial_db(
     if proc_id in progress_proc_ids:
         log_retro_rank_0(
             " > building partial chunk db, proc %d / %d, docs %d:%d / %d."
-            % (proc_id, n_procs, doc_start_id, doc_end_id, n_docs,)
+            % (
+                proc_id,
+                n_procs,
+                doc_start_id,
+                doc_end_id,
+                n_docs,
+            )
         )
 
     # Progress bars (snapshot of overall progress).
     doc_id_iter = range(doc_start_id, doc_end_id)
     pbar = (
-        tqdm(doc_id_iter, "parse doc chunks", miniters=len(doc_id_iter) // 20,)
+        tqdm(
+            doc_id_iter,
+            "parse doc chunks",
+            miniters=len(doc_id_iter) // 20,
+        )
         if proc_id in progress_proc_ids
         else doc_id_iter
     )
@@ -126,7 +136,7 @@ def build_partial_db(
                     n_procs,
                 )
             )
-        except:
+        except Exception:
             pass
 
         # Remove EOD token.
@@ -146,7 +156,9 @@ def build_partial_db(
             # Re-tokenize.
             chunk_end_idx = chunk_end_idxs[i]
             gpt_token_ids = indexed_dataset.get(
-                idx=doc_id, offset=chunk_start_idx, length=chunk_end_idx - chunk_start_idx,
+                idx=doc_id,
+                offset=chunk_start_idx,
+                length=chunk_end_idx - chunk_start_idx,
             )
             text = config.gpt_detokenize(gpt_token_ids.tolist())
             bert_token_ids = config.bert_tokenize(text)
@@ -157,7 +169,14 @@ def build_partial_db(
             else:
                 _chunk_db = chunk_db_valid
                 doc_size_map[doc_id] += 1
-            _chunk_db.append((doc_id, chunk_start_idx, chunk_end_idx, len(bert_token_ids),))
+            _chunk_db.append(
+                (
+                    doc_id,
+                    chunk_start_idx,
+                    chunk_end_idx,
+                    len(bert_token_ids),
+                )
+            )
 
     return proc_id, chunk_db_valid, chunk_db_invalid, doc_size_map
 
@@ -250,7 +269,10 @@ def build_block_db(
 
 
 def save_block_db(
-    block: dict, chunk_db_valid: np.ndarray, chunk_db_invalid: np.ndarray, doc_offsets: np.ndarray,
+    block: dict,
+    chunk_db_valid: np.ndarray,
+    chunk_db_invalid: np.ndarray,
+    doc_offsets: np.ndarray,
 ) -> None:
     """Save block of chunked tokens to disk. These blocks are later used for
     training and adding to the vector index.
@@ -269,7 +291,10 @@ def save_block_db(
 
 
 def build_individual_db(
-    config: RetroPreprocessingConfig, dataset_idx: int, n_datasets: int, dataset_info: dict,
+    config: RetroPreprocessingConfig,
+    dataset_idx: int,
+    n_datasets: int,
+    dataset_info: dict,
 ) -> None:
     """Process a single indexed dataset & extract chunks.
 
@@ -370,7 +395,8 @@ def build_individual_db(
 
 
 def build_individual_dbs(
-    config: RetroPreprocessingConfig, indexed_dataset_infos: List[Dict],
+    config: RetroPreprocessingConfig,
+    indexed_dataset_infos: List[Dict],
 ) -> None:
     """Iterate each indexed dataset & process its chunks.
 
@@ -386,7 +412,11 @@ def build_individual_dbs(
         # Progress.
         log_retro_rank_0(
             " > building individual db, dataset %d / %d ... '%s'."
-            % (ds_idx, len(indexed_dataset_infos), ds_info["prefix"],)
+            % (
+                ds_idx,
+                len(indexed_dataset_infos),
+                ds_info["prefix"],
+            )
         )
 
         # Process single dataset.
@@ -444,9 +474,11 @@ def update_chunk_counts(
             ds_info["n_chunks_train"],
             ds_info["n_chunks"],
         )
-        assert ds_info["n_chunks_sampled"] <= ds_info["n_chunks_train"], (
-            "n_sampled (%d) > n_train (%d)."
-            % (ds_info["n_chunks_sampled"], ds_info["n_chunks_train"])
+        assert (
+            ds_info["n_chunks_sampled"] <= ds_info["n_chunks_train"]
+        ), "n_sampled (%d) > n_train (%d)." % (
+            ds_info["n_chunks_sampled"],
+            ds_info["n_chunks_train"],
         )
 
 
@@ -562,9 +594,9 @@ def merge_dbs(project_dir: str, indexed_dataset_infos: List[Dict], db_type: str)
                     else np.copy(individual_doc_offsets[: ds_info[n_docs_key]])
                 )
 
-            merged_chunk_db[
-                chunk_start_index : chunk_start_index + len(individual_chunk_db)
-            ] = individual_chunk_db
+            merged_chunk_db[chunk_start_index : chunk_start_index + len(individual_chunk_db)] = (
+                individual_chunk_db
+            )
             chunk_start_index += len(individual_chunk_db)
             n_written[0] = chunk_start_index
             if n_docs_key is not None:

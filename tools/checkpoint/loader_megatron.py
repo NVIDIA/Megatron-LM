@@ -366,6 +366,6 @@ def _load_checkpoint(queue, args):
 def load_checkpoint(queue, args):
     try:
         _load_checkpoint(queue, args)
-    except:
+    except Exception:
         queue.put("exit")
         raise

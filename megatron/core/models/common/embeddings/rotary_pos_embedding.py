@@ -24,7 +24,7 @@ try:
     )
 
     HAVE_APPLY_ROPE_FUSION = True
-except:
+except ImportError:
     HAVE_APPLY_ROPE_FUSION = False
 
 

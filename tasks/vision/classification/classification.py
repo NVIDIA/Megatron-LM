@@ -58,7 +58,7 @@ def classification():
         timers("batch generator", log_level=2).start()
         try:
             batch_ = next(batch)
-        except BaseException:
+        except Exception:
             batch_ = batch
         images, labels = process_batch(batch_)
         timers("batch generator").stop()

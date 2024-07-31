@@ -181,7 +181,7 @@ def _set_one_logger(args):
             }
             one_logger = OneLogger(config=config)
             _GLOBAL_ONE_LOGGER = one_logger
-        except BaseException:
+        except Exception:
             print('WARNING: one_logger package is required to enable e2e metrics '
                   'tracking. please go to '
                   'https://confluence.nvidia.com/display/MLWFO/Package+Repositories'
@@ -198,7 +198,7 @@ def _set_adlr_autoresume(args):
         sys.path.append(os.environ.get('SUBMIT_SCRIPTS', '.'))
         try:
             from userlib.auto_resume import AutoResume
-        except BaseException:
+        except ImportError:
             print('ADLR autoresume is not available, exiting ...')
             sys.exit()
 

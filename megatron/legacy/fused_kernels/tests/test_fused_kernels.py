@@ -374,7 +374,7 @@ if __name__ == "__main__":
             transformers.logging.FATAL,
         )
 
-    except:
+    except ImportError:
         print("\n[Fail] Please install `transformers` package to test fused kernels\n")
         exit(-1)
 

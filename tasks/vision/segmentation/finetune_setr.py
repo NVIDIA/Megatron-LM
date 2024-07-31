@@ -122,7 +122,7 @@ def segmentation():
             args = get_args()
             try:
                 batch_ = next(batch)
-            except BaseException:
+            except Exception:
                 batch_ = batch
             images, labels = process_batch(batch_)
 
