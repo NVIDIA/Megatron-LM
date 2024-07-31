@@ -105,7 +105,7 @@ class GPTDataset(MegatronDataset):
 
         try:
             self._pad_token_id = self.config.tokenizer.pad
-        except:
+        except Exception:
             self._pad_token_id = _PAD_TOKEN_ID
 
         (

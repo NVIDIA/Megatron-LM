@@ -294,7 +294,7 @@ def main(args):
             try:
                 layer_num = int(re.findall(r'\d+', key)[0])
                 new_key = key.replace(str(layer_num), str(layer_num + pp*num_layers_per_pipeline_rank), 1)
-            except:
+            except Exception:
                 new_key = key
             full_model[new_key] = original_tensor
     # print("Combined model: {}".format(full_model.keys()))
@@ -319,7 +319,7 @@ def main(args):
                 if layer_num >= num_layers_per_pipeline_rank * (pp+1):
                     break
                 new_key = key.replace(str(layer_num), str(layer_num - (pp * num_layers_per_pipeline_rank)), 1)
-            except:
+            except Exception:
                 new_key = key
 
             if ii < pp_offset:

@@ -800,7 +800,7 @@ def _load_base_checkpoint(
         sys.modules.pop('fp16.loss_scaler', None)
         sys.modules.pop('megatron.fp16.loss_scaler', None)
         sys.modules.pop('megatron.model', None)
-    except BaseException as e:
+    except Exception as e:
         print('could not load the checkpoint')
         print(e)
         sys.exit()

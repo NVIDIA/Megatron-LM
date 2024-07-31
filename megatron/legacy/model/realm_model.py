@@ -132,7 +132,7 @@ class ICTBertModel(MegatronModule):
 
         try:
             state_dict = torch.load(checkpoint_name, map_location='cpu')
-        except BaseException:
+        except Exception:
             raise ValueError("Could not load checkpoint")
 
         # load the LM state dict into each model

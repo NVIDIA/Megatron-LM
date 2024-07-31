@@ -57,7 +57,7 @@ def _cross_entropy_forward_step(batch, model):
     timers('batch-generator', log_level=2).start()
     try:
         batch_ = next(batch)
-    except BaseException:
+    except Exception:
         batch_ = batch
     tokens, types, labels, attention_mask = process_batch(batch_)
     timers('batch-generator').stop()

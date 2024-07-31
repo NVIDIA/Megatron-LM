@@ -186,7 +186,7 @@ class retro:
                 "chunk_tokens": chunk_token_ids,
                 "neighbor_tokens": neighbor_token_ids,
             }
-        except:
+        except Exception:
             return None
 
     @classmethod
@@ -199,7 +199,7 @@ class retro:
             print("NEIGHBOR_CHUNKS:")
             for token_ids in tokens["neighbor_tokens"]:
                 print("  - %s" % shorten_str(cls.gpt_to_text(token_ids), 150))
-        except:
+        except Exception:
             print("<no neighbors for sample %d>" % sample_id)
 
     ##############################################

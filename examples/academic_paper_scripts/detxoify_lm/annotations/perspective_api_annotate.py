@@ -107,7 +107,7 @@ def get_score(line):
             except UnicodeDecodeError:
                 try:
                     decoded_text = encoded_text[:20476].decode('utf8')
-                except:
+                except Exception:
                     print("Error occurred")
                     data['score'] = None
                     return json.dumps(data)
@@ -138,7 +138,7 @@ def get_scores(lines):
                 except UnicodeDecodeError:
                     try:
                         decoded_text = encoded_text[:20476].decode('utf8')
-                    except:
+                    except Exception:
                         print("Error occurred")
                         data['score'] = None
                         all_data.append(json.dumps(data))

@@ -110,7 +110,10 @@ class GPTToTextDataset(torch.utils.data.Dataset):
 
 
 def get_blocks(
-    dirname: str, n_samples: int, block_size: int, validate: Callable = None,
+    dirname: str,
+    n_samples: int,
+    block_size: int,
+    validate: Callable = None,
 ) -> SimpleNamespace:
     """Divide range [0, num_samples) to sequence of block ranges.
 
@@ -144,7 +147,8 @@ def get_blocks(
         {
             "range": r,
             "path": os.path.join(
-                dirname, "%s-%s.hdf5" % tuple([str(i).zfill(n_digits) for i in r]),
+                dirname,
+                "%s-%s.hdf5" % tuple([str(i).zfill(n_digits) for i in r]),
             ),
         }
         for r in block_ranges
@@ -165,13 +169,13 @@ def get_blocks(
 
             try:
                 f = h5py.File(path, "r")
-            except:
+            except Exception:
                 os.remove(path)
                 continue
 
             try:
                 validate(f)
-            except:
+            except Exception:
                 os.remove(path)
             finally:
                 f.close()

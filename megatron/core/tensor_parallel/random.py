@@ -171,7 +171,7 @@ def initialize_rng_tracker(use_te_rng_tracker: bool = False):
             _te_version = packaging.version.Version(version("transformer-engine"))
             if _te_version < packaging.version.Version("1.5.0"):
                 raise RuntimeError("use_te_rng_tracker requires TransformerEngine version >= 1.5")
-        except:
+        except ImportError:
             raise RuntimeError("use_te_rng_tracker requires TransformerEngine, but not installed")
     if use_te_rng_tracker:
         _CUDA_RNG_STATE_TRACKER = te.distributed.CudaRNGStatesTracker()
@@ -219,7 +219,7 @@ def model_parallel_cuda_manual_seed(seed):
 
 
 class CheckpointFunction(torch.autograd.Function):
-    """Checkpoint Function 
+    """Checkpoint Function
 
     This function is adapted from torch.utils.checkpoint with two main changes:
     1) torch.cuda.set_rng_state is replaced with `_set_cuda_rng_state`

@@ -79,7 +79,7 @@ def calculate_correct_answers(model, dataloader, epoch):
     def correct_answers_forward_step(batch, model):
         try:
             batch_ = next(batch)
-        except BaseException:
+        except Exception:
             batch_ = batch
         images, labels = process_batch(batch_)
 
