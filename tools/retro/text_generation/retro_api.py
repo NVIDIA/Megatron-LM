@@ -2,7 +2,7 @@
 
 
 """Inference API."""
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, set_manual_seed
 import numpy as np
 import torch
 from megatron.core import mpu
@@ -183,7 +183,7 @@ def retro_generate(model,
     random_seed = int(values_float_tensor[9].item())
 
     if random_seed != -1:
-        torch.random.manual_seed(random_seed)
+        set_manual_seed(random_seed)
 
     # Tokenize prompts and get the batch.
     # Note that these tensors are broadcaseted to all ranks.

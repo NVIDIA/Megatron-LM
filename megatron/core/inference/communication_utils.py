@@ -1,7 +1,8 @@
-from megatron.core.device_utils import get_current_device
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_current_device
 
 
 def _is_device(tensor):

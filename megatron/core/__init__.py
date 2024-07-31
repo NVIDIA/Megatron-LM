@@ -1,3 +1,4 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import megatron.core.tensor_parallel
 import megatron.core.utils
 from megatron.core import parallel_state

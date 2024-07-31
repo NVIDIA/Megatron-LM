@@ -3,7 +3,7 @@
 """Inference API."""
 
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, set_manual_seed
 import torch
 
 from megatron.core import mpu
@@ -126,9 +126,9 @@ def generate(model,
     random_seed = int(values_float_tensor[12].item())
 
     if random_seed != -1:
-        torch.random.manual_seed(random_seed)
+        set_manual_seed(random_seed)
 
-    # Tokenize prompts and get the batch.
+    # Tokenize prsompts and get the batch.
     # Note that these tensors are broadcaseted to all ranks.
     if torch.distributed.get_rank() == 0:
         assert prompts is not None

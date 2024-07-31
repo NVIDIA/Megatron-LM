@@ -1,10 +1,11 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
 """ Storage writer for PyT Distributed format allowing asynchronous save. """
-
+import gc
 import logging
 import os
 import queue
+from contextlib import contextmanager
 from itertools import chain
 from pathlib import Path
 from time import time
@@ -30,8 +31,21 @@ def _get_write_results_queue():
     global _results_queue
     if _results_queue is None:
         ctx = mp.get_context('spawn')
-        _results_queue = ctx.Queue()
+        _results_queue = ctx.Manager().Queue()
     return _results_queue
+
+
+@contextmanager
+def _disable_gc():
+    """Temporarily disables GC."""
+    gc_enabled = gc.isenabled()
+    try:
+        if gc_enabled:
+            gc.disable()
+        yield
+    finally:
+        if gc_enabled:
+            gc.enable()
 
 
 class FileSystemWriterAsync(FileSystemWriter):
@@ -138,32 +152,44 @@ class FileSystemWriterAsync(FileSystemWriter):
         return (self.write_preloaded_data_multiproc, (self.write_buckets, self.results_queue))
 
     @staticmethod
+    @_disable_gc()
     def write_preloaded_data_multiproc(
-        write_buckets: List[WriteBucket],
-        global_results_queue: mp.Queue,
-        worker_timeout: int = 600,
+        write_buckets: List[WriteBucket], global_results_queue: mp.Queue
     ) -> None:
         """
         Performs saving data to storage with multiple processes.
+
+        Starts predefined number of processes and uses 2 queues to make sure the results
+        are complete:
+        - local_results_queue - to send the actual results
+        - count_queue - small queue to mark worker as completed
+
+        Using just one queue disallowed proper exception handling.
+
+        This method is meant to be run in a forked subprocess.
+        Triggering GC during execution leads to CUDA errors
+        (cleaning up tensors owned by the parent process).
+        To prevent this, we disable the GC explicitly for this function with _disable_gc.
 
         Args:
             write_buckets (List[WriteBucket]): write plan
             global_results_queue (mp.Queue): mp.Queue to collect Dict[List[WriteResults]] (or an Exception)
                 from parallel write processes to the main training process
-            worker_timeout (int): time to wait for the worker completion
         Returns: None
         """
         w_start = time()
         write_results_or_exc: Union[dict, Exception] = dict()
         ctx = mp.get_context('fork')
         local_results_queue = ctx.Queue()
+        count_queue = ctx.JoinableQueue()
         p_list = []
         for i, write_bucket in enumerate(write_buckets):
             try:
+                count_queue.put(i)
                 p_list.append(
                     ctx.Process(
                         target=FileSystemWriterAsync.write_preloaded_data,
-                        args=(i, write_bucket, local_results_queue, True),
+                        args=(i, write_bucket, local_results_queue, count_queue, True),
                     )
                 )
             except Exception as e:
@@ -175,15 +201,17 @@ class FileSystemWriterAsync(FileSystemWriter):
             for p in p_list:
                 p.start()
 
-            # We expect exactly `len(write_buckets)` items
-            for completed_proc_num in range(len(write_buckets)):
+            logger.debug('FileSystemWriterAsync: collecting worker results...')
+
+            # To make sure all nodes are completed
+            count_queue.join()
+            # At this point, all workers completed, so the queue should have exactly `len(write_buckets)` items
+            for proc_idx in range(len(write_buckets)):
                 try:
-                    local_proc_idx, local_results_or_exc = local_results_queue.get(
-                        timeout=worker_timeout
-                    )
+                    local_proc_idx, local_results_or_exc = local_results_queue.get()
                 except queue.Empty:
                     write_results_or_exc = RuntimeError(
-                        f'Unexpected empty `local_results_queue` (got only {completed_proc_num}/{len(write_buckets)} items)'
+                        f'Unexpected empty `local_results_queue` (got only {proc_idx}/{len(write_buckets)} items)'
                     )
                     break
                 else:
@@ -197,6 +225,8 @@ class FileSystemWriterAsync(FileSystemWriter):
                         write_results_or_exc[local_proc_idx] = local_results_or_exc
                         p_list[local_proc_idx].join()
 
+            logger.debug('FileSystemWriterAsync: collected worker results successfully')
+
         global_results_queue.put(write_results_or_exc)
 
         w_end = time()
@@ -205,10 +235,12 @@ class FileSystemWriterAsync(FileSystemWriter):
         )
 
     @staticmethod
+    @_disable_gc()
     def write_preloaded_data(
         local_proc_idx: int,
         write_bucket: WriteBucket,
-        results_queue: mp.Queue,
+        results_queue: mp.SimpleQueue,
+        count_queue: mp.JoinableQueue,
         use_fsync: bool,
     ) -> None:
         """
@@ -218,6 +250,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             local_proc_idx (int): index of a local process that performs writing
             write_bucket (WriteBucket): data to write to storage
             results_queue (mp.Queue): queue to return the write results to the proxy checkpoint process.
+            count_queue (mp.JoinableQueue): queue to marks worker task as completed
             use_fsync (bool): if True, calls os.fsync at the end of saving
 
         Returns: None, the write result are put into the `queue`
@@ -242,6 +275,9 @@ class FileSystemWriterAsync(FileSystemWriter):
             local_output = (local_proc_idx, e)
 
         results_queue.put(local_output)
+        # Signal this process is done.
+        count_queue.get()
+        count_queue.task_done()
 
         mem_after = _process_memory()
         logger.debug(

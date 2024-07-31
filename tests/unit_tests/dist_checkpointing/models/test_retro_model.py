@@ -2,14 +2,12 @@
 import types
 
 import pytest
-
 import torch
 
-from megatron.core.dist_checkpointing import save, load, load_plain_tensors
 from megatron.core import parallel_state as ps
+from megatron.core.dist_checkpointing import load, save
 from megatron.core.dist_checkpointing.validation import StrictHandling
-from megatron.core.models.retro import get_retro_decoder_block_spec, RetroConfig, RetroModel
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.models.retro import RetroConfig, RetroModel, get_retro_decoder_block_spec
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
@@ -49,6 +47,12 @@ def initialize_retro_model(seed, decoder_spec_fn, spec_type, num_layers=9, **con
 
 
 class TestRetroModel:
+    def setup_method(self, method):
+        pass
+    
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+        
     @pytest.mark.parametrize('src_spec_type', ['te', 'local'])
     @pytest.mark.parametrize('dst_spec_type', ['te', 'local'])
     @pytest.mark.parametrize('model_type', ['retro'])

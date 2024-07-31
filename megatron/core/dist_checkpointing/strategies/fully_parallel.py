@@ -1,3 +1,4 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import logging
 from collections import defaultdict
 from functools import reduce

@@ -1,3 +1,4 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from typing import List, OrderedDict, Tuple
 
 from megatron.core.device_utils import get_current_device

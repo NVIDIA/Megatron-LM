@@ -1,7 +1,9 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from typing import Dict, List
 
 import torch
 
+from megatron.core.device_utils import set_manual_seed
 from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.inference_request import InferenceRequest
@@ -46,7 +48,7 @@ class MCoreEngine(AbstractEngine):
         """
         # TODO :M core- get rng state tracker
         if self.random_seed:
-            torch.random.manual_seed(self.random_seed)
+            set_manual_seed(self.random_seed)
 
         for prompt in prompts:
             prompt_tokens = self.text_generation_controller.tokenize_prompt(prompt)

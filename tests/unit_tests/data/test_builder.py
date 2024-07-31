@@ -2,35 +2,20 @@
 # Compile megatron.core.datasets.helpers dependencies before BlendedDataset import
 ##
 
-import torch
-
-from megatron.core.datasets.utils import compile_helpers
-from tests.unit_tests.test_utilities import Utils
-
-if torch.distributed.is_available():
-    Utils.initialize_distributed()
-    if torch.distributed.get_rank() == 0:
-        compile_helpers()
-    torch.distributed.barrier()
-else:
-    compile_helpers()
-
-##
-# Done
-##
-
 import os
 import tempfile
 from collections import defaultdict
 from typing import Dict, Optional
 
 import numpy
+import pytest
 import torch
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
-from megatron.core.datasets.utils import Split, get_blend_from_list
+from megatron.core.datasets.utils import Split, compile_helpers, get_blend_from_list
+from tests.unit_tests.test_utilities import Utils
 
 _NUM_DATASETS = 10
 
@@ -62,6 +47,13 @@ def do_setup(odir):
 
 
 def test_builder():
+    if torch.distributed.is_available():
+        Utils.initialize_distributed()
+        if torch.distributed.get_rank() == 0:
+            compile_helpers()
+        torch.distributed.barrier()
+    else:
+        compile_helpers()
 
     # Define the class here to avoid pytest warnings
 

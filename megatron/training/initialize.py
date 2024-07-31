@@ -4,6 +4,8 @@
 import logging
 import random
 import os
+import packaging
+import packaging.version
 import time
 
 from megatron.core.device_utils import get_current_device, get_distributed_backend, get_local_device_count
@@ -231,14 +233,24 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
     else:
         if args.rank == 0:
             print("> initializing torch distributed ...", flush=True)
+        # Manually set the device ids.
+        if device_count > 0:
+            device_id = get_current_device()
+        else:
+            device_id = None
+
         # Call the init process
-        torch.distributed.init_process_group(
-            backend=get_distributed_backend(backend=args.distributed_backend),
-            init_method=get_distributed_init_method(),
-            world_size=args.world_size,
-            rank=args.rank,
-            timeout=timedelta(minutes=args.distributed_timeout_minutes),
-        )
+        init_process_group_kwargs = {
+            'backend' : get_distributed_backend(backend=args.distributed_backend),
+            'init_method': get_distributed_init_method(),
+            'world_size': args.world_size,
+            'rank': args.rank,
+            'timeout': timedelta(minutes=args.distributed_timeout_minutes),
+        }
+        if packaging.version.Version(torch.__version__) >= packaging.version.Version("2.3.0"):
+            init_process_group_kwargs['device_id'] = device_id
+
+        torch.distributed.init_process_group(**init_process_group_kwargs)
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.

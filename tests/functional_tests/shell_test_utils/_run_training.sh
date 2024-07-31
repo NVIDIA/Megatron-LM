@@ -25,6 +25,8 @@ MANDATORY_VARS=(
     "TRAINING_SCRIPT_PATH"
     "TRAINING_PARAMS_PATH"
     "OUTPUT_PATH"
+    "TENSORBOARD_PATH"
+    "CHECKPOINT_PATH"
     "DATA_PATH"
 )
 for mandatory_var in "${MANDATORY_VARS[@]}"; do
@@ -38,15 +40,11 @@ done
 cat $TRAINING_PARAMS_PATH | envsubst >$TRAINING_PARAMS_PATH.tmp
 mv $TRAINING_PARAMS_PATH.tmp $TRAINING_PARAMS_PATH
 
-# Copy test_config into baseline
-mkdir -p ${OUTPUT_PATH}
-cp $TRAINING_PARAMS_PATH ${OUTPUT_PATH}/model_config.yaml || true
-
 # Exit earlier to leave time for properly saving checkpoint
 PARAMS="--exit-duration-in-mins $((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60 - 15))"
 
 # Extract training params
-TRAINING_PARAMS_FROM_CONFIG=$(yq '... comments="" | to_entries | .[] | select(.key != "ENV_VARS") | with(select(.value == "true"); .value = "") | [.key + " " + .value] | join("")' $TRAINING_PARAMS_PATH | tr '\n' ' ')
+TRAINING_PARAMS_FROM_CONFIG=$(yq '... comments="" | .MODEL_ARGS | to_entries | .[] | with(select(.value == "true"); .value = "") | [.key + " " + .value] | join("")' $TRAINING_PARAMS_PATH | tr '\n' ' ')
 PARAMS="$PARAMS $TRAINING_PARAMS_FROM_CONFIG"
 
 # Pull env vars to export
@@ -63,7 +61,7 @@ done
 
 # Set PYTHONPATH
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
-export WAND_API_KEY="${WAND_API_KEY:-}"
+export WANDB_API_KEY="${WANDB_API_KEY:-}"
 
 ######## Distributed training settings. ########
 echo "------ARGUMENTS for SLURM ---"

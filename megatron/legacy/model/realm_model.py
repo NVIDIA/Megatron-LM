@@ -1,3 +1,4 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import os
 from megatron.core.device_utils import get_current_device
 import torch

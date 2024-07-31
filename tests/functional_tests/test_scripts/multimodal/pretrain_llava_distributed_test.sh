@@ -33,7 +33,7 @@ TRANSFORMER_IMPL=local
 if [[ $ALLOW_NONDETERMINISTIC -eq 1 ]]; then
    command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1;"
 else
-   command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0; export NCCL_ALGO=Tree;"
+   command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0; export NCCL_ALGO=Tree; export CUBLAS_WORKSPACE_CONFIG=:4096:8;"
    ADDITIONAL_PARAMS+=" --deterministic-mode"
 fi
 
@@ -48,6 +48,7 @@ fi
 if [[ $MOE_GROUPED_GEMM -eq 1 ]]; then
        echo "Running MoE with Grouped GEMM"
        TRAINING_DTYPE=bf16  # Currently GroupedGEMM for MoE only supports bf16 dtype
+       ADDITIONAL_PARAMS+=" --moe-grouped-gemm --disable-bias-linear"
 fi
 
 if [[ $USE_TE -eq 1 ]]; then
@@ -176,8 +177,9 @@ echo "$command" > $SCRIPTS_DIR/pretrain_llava_distributed_command.sh
 eval $command
 
 echo "Saving test results to $TENSORBOARD_DIR"
-PYTHONPATH=$PWD python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $TENSORBOARD_DIR "$JOB_NAME" | \
-    tee ${TENSORBOARD_DIR}/results.json
+PYTHONPATH=$PWD python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
+  --logs-dir $TENSORBOARD_DIR \
+  --output-path ${TENSORBOARD_DIR}/results.json
 
 if [[ $SKIP_PYTEST != 1 ]]; then
     echo "-----------------------------------------------------------------------------"

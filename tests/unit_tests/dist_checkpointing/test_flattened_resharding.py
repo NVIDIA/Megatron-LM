@@ -8,18 +8,16 @@ import torch
 from torch.distributed.checkpoint import CheckpointException
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing import ShardedTensor, save, load
-from megatron.core.dist_checkpointing.core import CheckpointingException, \
-    maybe_load_config
+from megatron.core.dist_checkpointing import ShardedTensor, load, save
+from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_load_config
 from megatron.core.dist_checkpointing.dict_utils import diff
-from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory, \
-    ShardedObject
+from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensorFactory
 from megatron.core.dist_checkpointing.serialization import load_tensors_metadata
-from megatron.core.dist_checkpointing.strategies.resharding import \
-    apply_nd_flattened_tensors_reformulation, restore_nd_flattened_tensors_formulation
-from megatron.core.dist_checkpointing.strategies.torch import \
-    get_reformulation_metadata
-
+from megatron.core.dist_checkpointing.strategies.resharding import (
+    apply_nd_flattened_tensors_reformulation,
+    restore_nd_flattened_tensors_formulation,
+)
+from megatron.core.dist_checkpointing.strategies.torch import get_reformulation_metadata
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -35,8 +33,9 @@ class TestFlattenedResharding:
         ]
     )
     def test_partition_change_save_load(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp):
+        Utils.initialize_model_parallel(*src_tp_pp)
         with TempNamedDir(tmp_path_dist_ckpt / 'test_flattened_partition_change_save_load') as ckpt_dir:
-            Utils.initialize_model_parallel(*src_tp_pp)
+            
             state_dict = self._build_state_dict()
 
             save(state_dict, ckpt_dir)
@@ -73,8 +72,9 @@ class TestFlattenedResharding:
         ]
     )
     def test_reformulate_nd_flattened_tensors(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, expected_ckpt_offsets_by_rank):
+        Utils.initialize_model_parallel(*src_tp_pp, order='tp-dp-pp')
         with TempNamedDir(tmp_path_dist_ckpt / 'test_reformulate_nd_flattened_tensors') as ckpt_dir:
-            Utils.initialize_model_parallel(*src_tp_pp, order='tp-dp-pp')
+            
             state_dict = self._build_state_dict()
 
             ckpt_local_shape = state_dict['sd_key_flat'].local_shape
@@ -114,8 +114,9 @@ class TestFlattenedResharding:
         ]
     )
     def test_load_tensor_metadata(self, tmp_path_dist_ckpt, src_tp_pp):
+        Utils.initialize_model_parallel(*src_tp_pp, order='tp-dp-pp')
         with TempNamedDir(tmp_path_dist_ckpt / 'test_reformulate_nd_flattened_tensors') as ckpt_dir:
-            Utils.initialize_model_parallel(*src_tp_pp, order='tp-dp-pp')
+            
             state_dict = self._build_state_dict()
 
             save(state_dict, ckpt_dir)

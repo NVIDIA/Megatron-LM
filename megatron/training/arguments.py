@@ -327,6 +327,7 @@ def validate_args(args, defaults={}):
 
     # Consumed tokens.
     args.consumed_train_samples = 0
+    args.skipped_train_samples = 0
     args.consumed_valid_samples = 0
 
     # Support for variable sequence lengths across batches/microbatches.
@@ -562,11 +563,15 @@ def validate_args(args, defaults={}):
 
     # Deterministic mode
     if args.deterministic_mode:
-        assert not args.use_flash_attn, 'Flash attention can not be used in deterministic mode.'
+        assert not args.use_flash_attn, "Flash attention can not be used in deterministic mode."
+        assert args.num_experts is None, "MoEs are currently not deterministic."
+        assert not args.cross_entropy_loss_fusion, "Cross Entropy Fusion is currently not deterministic."
 
         all_reduce_choices = ["Tree", "Ring", "CollnetDirect", "CollnetChain", "^NVLS"]
         assert os.getenv("NCCL_ALGO", -1) != -1 and os.getenv("NCCL_ALGO") in all_reduce_choices, \
             f"NCCL_ALGO must be one of {all_reduce_choices}."
+
+        torch.use_deterministic_algorithms(True)
 
     # Update the printed args to reflect that `apply_query_key_layer_scaling` also controls `attention_softmax_in_fp32`
     if args.apply_query_key_layer_scaling:
@@ -918,12 +923,6 @@ def _add_logging_args(parser):
                        'flush to disk.')
     group.add_argument('--log-timers-to-tensorboard', action='store_true',
                        help='If set, write timers to tensorboard.')
-    group.add_argument('--log-batch-size-to-tensorboard', action='store_true',
-                       help='If set, write batch-size to tensorboard.')
-    group.add_argument('--no-log-learnig-rate-to-tensorboard',
-                       action='store_false',
-                       help='Disable learning rate logging to tensorboard.',
-                       dest='log_learning_rate_to_tensorboard')
     group.add_argument('--no-log-loss-scale-to-tensorboard',
                        action='store_false',
                        help='Disable loss-scale logging to tensorboard.',
@@ -1010,6 +1009,13 @@ def _add_training_args(parser):
                        ' (1024 - 16) / 8 = 126 intervals will increase'
                        'the batch size linearly to 1024. In each interval'
                        'we will use approximately 300000 / 126 = 2380 samples.')
+    group.add_argument('--decrease-batch-size-if-needed', action='store_true', default=False,
+                       help='If set, decrease batch size if microbatch_size * dp_size'
+                       'does not divide batch_size. Useful for KSO (Keep Soldiering On)'
+                       'to continue making progress if number of healthy GPUs (and'
+                       'corresponding dp_size) does not support current batch_size.'
+                       'Old batch_size will be restored if training is re-started with'
+                       'dp_size that divides batch_size // microbatch_size.')
     group.add_argument('--recompute-activations', action='store_true',
                        help='recompute activation to allow for training '
                        'with larger models, sequences, and batch sizes.')
@@ -1435,7 +1441,7 @@ def _add_distributed_args(parser):
     group.add_argument('--overlap-grad-reduce', action='store_true',
                        default=False, help='If set, overlap DDP grad reduce.')
     group.add_argument('--defer-embedding-wgrad-compute', action='store_true',
-                       default=False, help='If set, defers the vocabulary projection linear layer weight' 
+                       default=False, help='If set, defers the vocabulary projection linear layer weight'
                        'gradient compute to pipeline flush.', dest='defer_embedding_wgrad_compute')
     group.add_argument('--wgrad-deferral-limit', type=int, default=0, help='Number of micro-batches for which'
                        'weight gradient computation of vocabulary projection is deferred, defaults to 0 which'
@@ -1459,7 +1465,7 @@ def _add_distributed_args(parser):
                        default=False, help='If set, use custom-built ring exchange '
                        'for p2p communications. Note that this option will require '
                        'a custom built image that support ring-exchange p2p.')
-    group.add_argument('--local_rank', type=int, default=None,
+    group.add_argument('--local-rank', type=int, default=int(os.getenv('LOCAL_RANK', '0')),
                        help='local rank passed from distributed launcher.')
     group.add_argument('--lazy-mpu-init', type=bool, required=False,
                        help='If set to True, initialize_megatron() '
@@ -1757,6 +1763,8 @@ def _add_moe_args(parser):
                        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
     group.add_argument('--moe-router-topk', type=int, default=2,
                        help='Number of experts to route to for each token. The default is 2.')
+    group.add_argument('--moe-router-pre-softmax', action='store_true',
+                       help='Enable pre-softmax routing for MoE, which means the top-k selection is before the softmax. By default, top-k is done after the softmax.')
     group.add_argument('--moe-grouped-gemm', action='store_true',
                        help='When there are multiple experts per rank, compress multiple local (potentially small) gemms in a single kernel launch to improve the utilization and performance by leveraging the Grouped GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).')
     group.add_argument('--moe-aux-loss-coeff', type=float, default=0.0,

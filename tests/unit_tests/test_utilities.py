@@ -2,6 +2,7 @@ import os
 from megatron.core.device_utils import get_distributed_backend, get_local_device_count
 from megatron.core.device_utils import get_distributed_init_method
 import torch
+
 import megatron.core.parallel_state as ps
 
 
@@ -54,8 +55,8 @@ class Utils:
     def destroy_model_parallel():
         if not Utils.inited:
             return
-        ps.destroy_model_parallel()
         torch.distributed.barrier()
+        ps.destroy_model_parallel()
         Utils.inited = False
 
     @staticmethod
