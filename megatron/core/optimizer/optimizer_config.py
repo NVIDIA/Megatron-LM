@@ -55,7 +55,7 @@ class OptimizerConfig:
        dynamic loss scaling is used.
     """
 
-    initial_loss_scale: float = 2 ** 32
+    initial_loss_scale: float = 2**32
     """Initial loss-scale for dynamic loss scaling."""
 
     min_loss_scale: float = 1.0
@@ -114,3 +114,6 @@ class OptimizerConfig:
 
     timers: Callable = None
     """Function to get timers."""
+
+    config_logger_dir: str = ""
+    """When non-empty, dumps entry-point configs to config_logger_dir"""

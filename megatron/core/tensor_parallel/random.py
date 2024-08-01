@@ -4,6 +4,7 @@
 # repo: https://github.com/pytorch/pytorch
 
 import contextlib
+import logging
 from importlib.metadata import version
 
 import torch
@@ -144,10 +145,15 @@ class CudaRNGStatesTracker:
         orig_cuda_rng_state = torch.cuda.get_rng_state()
         # Set rng state to the desired one
         _set_cuda_rng_state(self.states_[name])
+        # Record cpu RNG state
+        cpu_rng_state = torch.get_rng_state()
         # Do the stuff we wanted to do.
         try:
             yield
         finally:
+            # Throw a warning if cpu RNG state changed
+            if not torch.all(cpu_rng_state == torch.get_rng_state()).item():
+                logging.getLogger(__name__).warning('CPU RNG state changed within GPU RNG context')
             # Update the current rng state for later use.
             self.states_[name] = torch.cuda.get_rng_state()
             # And set the state to the original state we started with.

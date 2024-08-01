@@ -32,6 +32,7 @@ except ImportError:
         multi_tensor_scale_impl = local_multi_tensor_scale
 
 from .. import parallel_state, tensor_parallel
+from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..dist_checkpointing.optimizer import (
     get_param_id_to_sharded_param_map,
@@ -297,6 +298,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         grad_scaler: Optional[MegatronGradScaler],
         init_state_fn: Callable,
     ):
+        if has_config_logger_enabled(config):
+            log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
         super().__init__(
             optimizer,
@@ -715,6 +718,8 @@ class FP32Optimizer(MegatronOptimizer):
         config: OptimizerConfig,
         init_state_fn: Callable,
     ):
+        if has_config_logger_enabled(config):
+            log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
         super(FP32Optimizer, self).__init__(
             optimizer,

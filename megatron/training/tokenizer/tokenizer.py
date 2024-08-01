@@ -2,6 +2,7 @@
 
 """Megatron tokenizers."""
 
+import math
 from abc import ABC, abstractmethod
 import base64
 import json
@@ -83,16 +84,15 @@ def build_tokenizer(args):
     return tokenizer
 
 
-def _vocab_size_with_padding(orig_vocab_size, args):
+def _vocab_size_with_padding(orig_vocab_size, args, logging_enabled=True):
     """Pad vocab size so it is divisible by model parallel size and
     still having GPU friendly size."""
 
     after = orig_vocab_size
     multiple = args.make_vocab_size_divisible_by * \
         args.tensor_model_parallel_size
-    while (after % multiple) != 0:
-        after += 1
-    if args.rank == 0:
+    after = int(math.ceil(after / multiple) * multiple)
+    if args.rank == 0 and logging_enabled:
         print(' > padded vocab (size: {}) with {} dummy tokens '
               '(new size: {})'.format(
                   orig_vocab_size, after - orig_vocab_size, after), flush=True)
