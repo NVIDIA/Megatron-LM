@@ -1,12 +1,15 @@
 import contextlib
 import math
+import os
 import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_xla_model
 from megatron.core.distributed import DistributedDataParallelConfig, ParamAndGradBuffer
 from tests.unit_tests.test_utilities import Utils, TestModel
 
+xm = get_xla_model()
 
 def get_model_and_buffers(
     input_dim: int,
@@ -121,7 +124,6 @@ def test_bucket_sizes(bucket_size: int, use_distributed_optimizer: bool, bias: b
 
     Utils.destroy_model_parallel()
 
-
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("overlap_grad_reduce", [False, True])
 def test_grad_sync(use_distributed_optimizer: bool, overlap_grad_reduce: bool):
@@ -162,6 +164,9 @@ def test_grad_sync(use_distributed_optimizer: bool, overlap_grad_reduce: bool):
             # params in the model have registered their grad above.
             # When overlap_grad_reduce is False, the collective is forced through.
             param_and_grad_buffer.finish_grad_sync()
+
+        if xm:
+            xm.mark_step()
 
         expected_grad_data_value = expected_grad_data_value_after_collective
         if overlap_grad_reduce and i < (len(params) - 1):

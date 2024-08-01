@@ -7,6 +7,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.device_utils import get_xla_model
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import AttnMaskType
@@ -15,6 +16,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import attention_mask_func
 from megatron.core.utils import divide
 
+xm = get_xla_model()
 
 class DotProductAttention(MegatronModule):
     """
@@ -202,4 +204,7 @@ class DotProductAttention(MegatronModule):
         new_context_shape = context.size()[:-2] + (self.hidden_size_per_partition,)
         context = context.view(*new_context_shape)
 
+        if xm:
+            xm.mark_step()
+            
         return context

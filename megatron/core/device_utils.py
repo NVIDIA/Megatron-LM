@@ -58,12 +58,10 @@ def get_local_device_count() -> int:
     device_count = 1
 
     if xr is not None:
-        device_count = xr.local_device_count()
+        device_count = xr.global_device_count()
     elif torch.cuda.is_available():
         device_count = torch.cuda.device_count()
-    else:
-        device_count = int(os.getenv("NUM_DEVICES", 8))
-
+    
     return device_count
 
 

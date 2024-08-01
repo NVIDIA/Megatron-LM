@@ -4,7 +4,7 @@ from copy import deepcopy
 from functools import partial
 from typing import Optional, Tuple
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
@@ -33,6 +33,8 @@ from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import make_sharded_object_for_checkpoint
 
+
+xm = get_xla_model()
 
 class GroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using CUTLASS GroupedGEMM.
@@ -190,6 +192,9 @@ class GroupedMLP(MegatronModule):
 
             fc2_output = h
 
+        if xm:
+            xm.mark_step()
+            
         return fc2_output, None
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):

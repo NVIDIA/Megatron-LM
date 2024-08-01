@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from importlib.metadata import version
 from typing import Union
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 from pkg_resources import packaging
 
@@ -39,6 +39,9 @@ if HAVE_TE:
     from megatron.core.transformer.custom_layers.transformer_engine import SplitAlongDim
 else:
     SplitAlongDim = None
+
+
+xm = get_xla_model()
 
 
 @dataclass
@@ -352,6 +355,9 @@ class Attention(MegatronModule, ABC):
 
         output, bias = self.linear_proj(core_attn_out)
 
+        if xm:
+            xm.mark_step()
+            
         return output, bias
 
 
