@@ -33,11 +33,15 @@ workflow:
 
 stages:
   - build
-  - unit_tests
+  - test 
   - functional_tests
 
 default:
   interruptible: true
+
+include:
+  - jet-tests.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
 
 variables:
   FUNCTIONAL_TEST: 
@@ -246,7 +250,7 @@ build_image:
 
 unit_tests:
   image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
-  stage: unit_tests
+  stage: test
   needs: [build_image]
   timeout: 180m
   tags:
@@ -268,7 +272,7 @@ unit_tests:
 
 docs_build_test:
   image: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/python-format:0.0.1
-  stage: unit_tests
+  stage: test
   tags:
     - mcore-docker-node-small
   script:
@@ -286,7 +290,7 @@ formatting:
   image: ${LINTING_IMAGE}:${CI_PIPELINE_ID}
   tags:
     - mcore-docker-node-small
-  stage: unit_tests
+  stage: test
   before_script:
     - git fetch origin main
   script:
@@ -302,7 +306,7 @@ copyright:
   image: ${LINTING_IMAGE}:${CI_PIPELINE_ID}
   tags:
     - mcore-docker-node-small
-  stage: unit_tests
+  stage: test
   before_script:
     - git fetch origin main
   script:
@@ -314,11 +318,31 @@ copyright:
     - when: always
   interruptible: true
 
-include:
-  - jet-tests.yml
+secret_detection_check:
+  extends: secret_detection # Is from the template - Secret-Detection.gitlab-ci.yml
+  stage: test
+  tags:
+    - mcore-docker-node-small
+  rules:  # This is required because the template sets rules do not work for us.
+    - when: always
+  before_script:  # JQ to parse the parse JSON report generated 
+    - apk add jq
+  allow_failure: false
+  script:
+    - !reference [secret_detection, script]  # Source the script from the template
+    - echo "Secret detection Report can be downloaded from the Merge Request"
+    - echo -e "\n\n\n\n\n############# Printing Secret Detection Report#####################################################"
+    - echo -e "#############Looks for the vulnerabilities JSON section##################################################### \n\n\n\n\n"
+    - cat gl-secret-detection-report.json | jq '.'
+    # Parse to find vulnerabilities JSON key
+    - |
+      if [[ $(cat gl-secret-detection-report.json | jq '.vulnerabilities | length > 0') == true ]]; then 
+        echo "Atleast one vulnerability has been found"
+        exit 1
+      fi
 
 convergence-test:
-  stage: unit_tests
+  stage: test
   needs: [build_image]
   tags:
     - ${TAG}
@@ -372,3 +396,4 @@ convergence-test:
 
       env
       bash tests/functional_tests/shell_test_utils/run_ci_test_locally.sh
+  
