@@ -189,7 +189,6 @@ class Attention(MegatronModule, ABC):
         # =================================================
         # Pre-allocate memory for key-values for inference.
         # =================================================
-        is_first_step = False
         if self.layer_number not in inference_params.key_value_memory_dict:
             inf_max_seq_length = inference_params.max_sequence_length
             inf_max_batch_size = inference_params.max_batch_size
@@ -203,12 +202,15 @@ class Attention(MegatronModule, ABC):
                 inference_key_memory,
                 inference_value_memory,
             )
-            is_first_step = True
         else:
             # Get the pre-allocated buffers for this layer
             inference_key_memory, inference_value_memory = inference_params.key_value_memory_dict[
                 self.layer_number
             ]
+
+        if inference_params.sequence_len_offset > 0:
+            # This should mean that we are past the prompt forward_step
+            # and so we need to turn off masking
             attn_mask_type = AttnMaskType.no_mask
 
         batch_start = inference_params.batch_size_offset
@@ -224,24 +226,13 @@ class Attention(MegatronModule, ABC):
         value = inference_value_memory[:sequence_end, batch_start:batch_end, ...]
 
         # adjust the key rotary positional embedding
-        if rotary_pos_emb is not None:
-            q_pos_emb, k_pos_emb = rotary_pos_emb
-            # need to cross check this condition during inference
-            # if not set_inference_key_value_memory:
-            if not is_first_step:
-                # In inference, we compute one token at a time.
-                # Select the correct positional embedding
-                # (only the last token in the sequence)
-                q_pos_emb = q_pos_emb[sequence_end - 1 : sequence_end]
-            else:
-                # In the first forward pass of inference,
-                # we use the entire provided prefix.
-                # q_pos_emb here has the rope embeddings of the entire
-                # prefix + to-be-generated output so
-                # we slice to just the prefix.
-                q_pos_emb = q_pos_emb[:sequence_end, :, :, :]
-            k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
-            rotary_pos_emb = (q_pos_emb, k_pos_emb)
+        if rotary_pos_emb is None:
+            return key, value, rotary_pos_emb, attn_mask_type
+
+        q_pos_emb, k_pos_emb = rotary_pos_emb
+        q_pos_emb = q_pos_emb[sequence_start:sequence_end, :, :, :]
+        k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
+        rotary_pos_emb = (q_pos_emb, k_pos_emb)
 
         return key, value, rotary_pos_emb, attn_mask_type
 
