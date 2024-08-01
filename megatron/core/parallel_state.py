@@ -552,8 +552,9 @@ def initialize_model_parallel(
     assert _DATA_PARALLEL_GROUP is None, 'data parallel group is already initialized'
 
     for ranks in rank_generator.get_ranks('dp'):
+        pg_options = get_nccl_options('dp', nccl_comm_cfgs) if torch.cuda.is_available() else None
         group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('dp', nccl_comm_cfgs)
+            ranks, timeout=timeout, pg_options=pg_options
         )
         group_gloo = torch.distributed.new_group(ranks, timeout=timeout, backend="gloo")
         if rank in ranks:
@@ -561,8 +562,9 @@ def initialize_model_parallel(
             _DATA_PARALLEL_GROUP_GLOO = group_gloo
             _DATA_PARALLEL_GLOBAL_RANKS = ranks
     for ranks_with_cp in rank_generator.get_ranks('dp-cp'):
+        pg_options = get_nccl_options('dp_cp', nccl_comm_cfgs) if torch.cuda.is_available() else None
         group_with_cp = torch.distributed.new_group(
-            ranks_with_cp, timeout=timeout, pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs)
+            ranks_with_cp, timeout=timeout, pg_options=pg_options
         )
         group_with_cp_gloo = torch.distributed.new_group(
             ranks_with_cp, timeout=timeout, backend="gloo"
@@ -597,8 +599,9 @@ def initialize_model_parallel(
     global _CONTEXT_PARALLEL_GLOBAL_RANKS
     assert _CONTEXT_PARALLEL_GROUP is None, 'context parallel group is already initialized'
     for ranks in rank_generator.get_ranks('cp'):
+        pg_options = get_nccl_options('cp', nccl_comm_cfgs) if torch.cuda.is_available() else None
         group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('cp', nccl_comm_cfgs)
+            ranks, timeout=timeout, pg_options=pg_options
         )
         if rank in ranks:
             _CONTEXT_PARALLEL_GROUP = group
@@ -608,8 +611,9 @@ def initialize_model_parallel(
     global _MODEL_PARALLEL_GROUP
     assert _MODEL_PARALLEL_GROUP is None, 'model parallel group is already initialized'
     for ranks in rank_generator.get_ranks('tp-pp'):
+        pg_options = get_nccl_options('mp', nccl_comm_cfgs) if torch.cuda.is_available() else None
         group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('mp', nccl_comm_cfgs)
+            ranks, timeout=timeout, pg_options=pg_options
         )
         if rank in ranks:
             _MODEL_PARALLEL_GROUP = group
@@ -620,8 +624,9 @@ def initialize_model_parallel(
         _MODEL_AND_EXPERT_PARALLEL_GROUP is None
     ), 'model and expert parallel group is already initialized'
     for ranks in rank_generator.get_ranks('tp-ep-pp', independent_ep=True):
+        pg_options=get_nccl_options('mp_exp', nccl_comm_cfgs) if torch.cuda.is_available() else None
         group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('mp_exp', nccl_comm_cfgs)
+            ranks, timeout=timeout, pg_options=pg_options
         )
         if rank in ranks:
             _MODEL_AND_EXPERT_PARALLEL_GROUP = group
@@ -633,8 +638,9 @@ def initialize_model_parallel(
         _TENSOR_MODEL_PARALLEL_GROUP is None
     ), 'tensor model parallel group is already initialized'
     for ranks in rank_generator.get_ranks('tp'):
+        pg_options = get_nccl_options('tp', nccl_comm_cfgs) if torch.cuda.is_available() else None
         group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('tp', nccl_comm_cfgs)
+            ranks, timeout=timeout, pg_options=pg_options
         )
         if rank in ranks:
             _TENSOR_MODEL_PARALLEL_GROUP = group
@@ -654,28 +660,31 @@ def initialize_model_parallel(
     global _POSITION_EMBEDDING_GLOBAL_RANKS
     assert _POSITION_EMBEDDING_GROUP is None, 'position embedding group is already initialized'
     for ranks in rank_generator.get_ranks('pp'):
+        pg_options = get_nccl_options('pp', nccl_comm_cfgs) if torch.cuda.is_available() else None
         group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('pp', nccl_comm_cfgs)
+            ranks, timeout=timeout, pg_options=pg_options
         )
         if rank in ranks:
             _PIPELINE_MODEL_PARALLEL_GROUP = group
             _PIPELINE_GLOBAL_RANKS = ranks
 
         embedding_ranks = get_embedding_ranks(ranks)
+        pg_options = get_nccl_options('embd', nccl_comm_cfgs) if torch.cuda.is_available() else None
         group = torch.distributed.new_group(
             embedding_ranks,
             timeout=timeout,
-            pg_options=get_nccl_options('embd', nccl_comm_cfgs),
+            pg_options=pg_options,
         )
         if rank in embedding_ranks:
             _EMBEDDING_GROUP = group
             _EMBEDDING_GLOBAL_RANKS = embedding_ranks
 
         position_embedding_ranks = get_position_embedding_ranks(ranks)
+        pg_options=get_nccl_options('embd', nccl_comm_cfgs) if torch.cuda.is_available() else None
         group = torch.distributed.new_group(
             position_embedding_ranks,
             timeout=timeout,
-            pg_options=get_nccl_options('embd', nccl_comm_cfgs),
+            pg_options=pg_options,
         )
         if rank in position_embedding_ranks:
             _POSITION_EMBEDDING_GROUP = group
@@ -688,14 +697,16 @@ def initialize_model_parallel(
         _TENSOR_AND_DATA_PARALLEL_GROUP is None
     ), 'Tensor + data parallel group is already initialized'
     for ranks in rank_generator.get_ranks('tp-dp-cp'):
+        pg_options=get_nccl_options('tp_dp_cp', nccl_comm_cfgs) if torch.cuda.is_available() else None
         group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('tp_dp_cp', nccl_comm_cfgs)
+            ranks, timeout=timeout, pg_options=pg_options
         )
         if rank in ranks:
             _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = group
     for ranks in rank_generator.get_ranks('tp-dp'):
+        pg_options=get_nccl_options('tp_dp', nccl_comm_cfgs) if torch.cuda.is_available() else None
         group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('tp_dp', nccl_comm_cfgs)
+            ranks, timeout=timeout, pg_options=pg_options
         )
         if rank in ranks:
             _TENSOR_AND_DATA_PARALLEL_GROUP = group
@@ -705,8 +716,9 @@ def initialize_model_parallel(
         _TENSOR_AND_CONTEXT_PARALLEL_GROUP is None
     ), 'Tensor + context parallel group is already initialized'
     for ranks in rank_generator.get_ranks('tp-cp'):
+        pg_options=get_nccl_options('tp_cp', nccl_comm_cfgs) if torch.cuda.is_available() else None
         group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('tp_cp', nccl_comm_cfgs)
+            ranks, timeout=timeout, pg_options=pg_options
         )
         if rank in ranks:
             _TENSOR_AND_CONTEXT_PARALLEL_GROUP = group
@@ -730,22 +742,25 @@ def initialize_model_parallel(
     global _DATA_MODULO_EXPERT_PARALLEL_GROUP_WITH_CP_GLOO
 
     for ranks in rank_generator.get_ranks('tp-ep', independent_ep=True):
+        pg_options=get_nccl_options('tp_exp', nccl_comm_cfgs) if torch.cuda.is_available() else None
         group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('tp_exp', nccl_comm_cfgs)
+            ranks, timeout=timeout, pg_options=pg_options
         )
         if rank in ranks:
             _TENSOR_AND_EXPERT_PARALLEL_GROUP = group
 
     for ranks in rank_generator.get_ranks('ep', independent_ep=True):
+        pg_options=get_nccl_options('exp', nccl_comm_cfgs) if torch.cuda.is_available() else None
         group = torch.distributed.new_group(
-            ranks, pg_options=get_nccl_options('exp', nccl_comm_cfgs)
+            ranks, pg_options=pg_options
         )
         if rank in ranks:
             _EXPERT_MODEL_PARALLEL_GROUP = group
 
     for ranks in rank_generator.get_ranks('dp', independent_ep=True):
+        pg_options=get_nccl_options('dp_modulo_exp', nccl_comm_cfgs) if torch.cuda.is_available() else None
         group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('dp_modulo_exp', nccl_comm_cfgs)
+            ranks, timeout=timeout, pg_options=pg_options
         )
         group_gloo = torch.distributed.new_group(ranks, backend="gloo")
         if rank in ranks:
@@ -755,10 +770,11 @@ def initialize_model_parallel(
     for ranks in rank_generator.get_ranks('dp-cp', independent_ep=True):
         # Lazy initialization of the group
         if get_context_parallel_world_size() > 1:
+            pg_options=get_nccl_options('dp_modulo_exp_cp', nccl_comm_cfgs) if torch.cuda.is_available() else None
             group = torch.distributed.new_group(
                 ranks,
                 timeout=timeout,
-                pg_options=get_nccl_options('dp_modulo_exp_cp', nccl_comm_cfgs),
+                pg_options=pg_options,
             )
             group_gloo = torch.distributed.new_group(ranks, backend="gloo")
         else:
