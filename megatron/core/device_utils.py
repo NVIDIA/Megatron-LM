@@ -4,10 +4,11 @@ import torch
 try:
     import torch_xla.core.xla_model as xm
     import torch_xla.runtime as xr
-    import torch_xla.distributed.xla_backend
+    import torch_xla.distributed.xla_backend as xb
 except ImportError:
     xm = None
     xr = None
+    xb = None
 
 
 def get_xla_model():
@@ -117,3 +118,12 @@ def set_current_rng_state(new_state):
         new_state = new_state.type(torch.ByteTensor)
         torch.set_rng_state(new_state)
 
+if xb:
+    def make_send_channel_id_impl(self, dst_rank, tag):
+        return int(dst_rank)*2
+
+    def make_recv_channel_id_impl(self, src_rank, tag):
+        return int(src_rank)*3
+    
+    xb.ProcessGroupXla.make_send_channel_id = make_send_channel_id_impl
+    xb.ProcessGroupXla.make_recv_channel_id = make_recv_channel_id_impl
