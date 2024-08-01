@@ -7,6 +7,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.models.bert.bert_lm_head import BertLMHead
 from megatron.core.models.bert.pooler import Pooler
@@ -59,6 +60,9 @@ class BertModel(LanguageModule):
         return_embeddings=False,
     ):
         super(BertModel, self).__init__(config=config)
+
+        if has_config_logger_enabled(config):
+            log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
         if return_embeddings:
             assert self.post_process and self.add_binary_head

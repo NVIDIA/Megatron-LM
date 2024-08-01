@@ -22,6 +22,7 @@ except ImportError:
         HAVE_APEX_OR_TE = False
 
 from .. import parallel_state, tensor_parallel
+from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing import ShardedTensor
 from ..dist_checkpointing.dict_utils import nested_values
 from ..dist_checkpointing.mapping import (
@@ -408,6 +409,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             data_parallel_group_idx (int): index in data-parallel group (used by
                 distributed checkpointing logic).
         """
+
+        if has_config_logger_enabled(config):
+            log_config_to_disk(config, locals(), prefix=type(self).__name__)
+
+        assert (
+            HAVE_APEX_OR_TE
+        ), f'Please install Apex or Transformer Engine to use DistributedOptimizer.'
 
         super().__init__(
             optimizer,

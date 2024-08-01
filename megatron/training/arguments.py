@@ -48,6 +48,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_retro_args(parser)
     parser = _add_experimental_args(parser)
     parser = _add_one_logger_args(parser)
+    parser = _add_config_logger_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -646,6 +647,7 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['num_query_groups'] = args.num_query_groups
     else:
         kw_args['num_query_groups'] = None
+    kw_args['config_logger_dir'] = args.config_logger_dir
 
     # Return config.
     return config_class(**kw_args)
@@ -870,6 +872,13 @@ def _add_one_logger_args(parser):
                        'part of. It will be used to track the changes in the '
                        'application side which might change the performance '
                        'baseline')
+    return parser
+
+def _add_config_logger_args(parser):
+    group = parser.add_argument_group(title='config logger')
+    group.add_argument('--config-logger-dir', type=str, default='',
+                       help='If set, will dump all configs to --config-logger-dir',
+                       dest='config_logger_dir')
     return parser
 
 def _add_logging_args(parser):

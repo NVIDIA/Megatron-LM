@@ -49,6 +49,8 @@ _PIPELINE_MODEL_PARALLEL_DECODER_START = None
 _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = None
 _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = None
 _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE = None
+_MPU_DATA_PARALLEL_WORLD_SIZE = None
+_MPU_DATA_PARALLEL_RANK = None
 _MPU_TENSOR_MODEL_PARALLEL_RANK = None
 _MPU_PIPELINE_MODEL_PARALLEL_RANK = None
 _MPU_EXPERT_MODEL_PARALLEL_RANK = None
@@ -1237,6 +1239,9 @@ def get_pipeline_model_parallel_prev_rank():
 
 def get_data_parallel_world_size(with_context_parallel=False):
     """Return world size for the data parallel group."""
+    global _MPU_DATA_PARALLEL_WORLD_SIZE
+    if _MPU_DATA_PARALLEL_WORLD_SIZE is not None:
+        return _MPU_DATA_PARALLEL_WORLD_SIZE
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_world_size(
             group=get_data_parallel_group(with_context_parallel=with_context_parallel)
@@ -1245,8 +1250,17 @@ def get_data_parallel_world_size(with_context_parallel=False):
         return 0
 
 
+def set_data_parallel_rank(rank):
+    """Return world size for the data parallel group."""
+    global _MPU_DATA_PARALLEL_RANK
+    _MPU_DATA_PARALLEL_RANK = rank
+
+
 def get_data_parallel_rank(with_context_parallel=False):
     """Return my rank for the data parallel group."""
+    global _MPU_DATA_PARALLEL_RANK
+    if _MPU_DATA_PARALLEL_RANK is not None:
+        return _MPU_DATA_PARALLEL_RANK
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_rank(
             group=get_data_parallel_group(with_context_parallel=with_context_parallel)
@@ -1361,6 +1375,17 @@ def destroy_global_memory_buffer():
     """Sets the global memory buffer to None"""
     global _GLOBAL_MEMORY_BUFFER
     _GLOBAL_MEMORY_BUFFER = None
+
+
+def get_all_ranks():
+    ranks = [
+        get_tensor_model_parallel_rank(),
+        get_data_parallel_rank(),
+        get_context_parallel_rank(),
+        get_pipeline_model_parallel_rank(),
+        get_expert_model_parallel_rank(),
+    ]
+    return '_'.join(map(lambda x: str(x or 0), ranks))
 
 
 def get_moe_layer_wise_logging_tracker():

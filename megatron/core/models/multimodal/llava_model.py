@@ -7,6 +7,7 @@ from typing import List
 import torch
 
 from megatron.core import InferenceParams, parallel_state
+from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
@@ -74,6 +75,9 @@ class LLaVAModel(MegatronModule):
         img_embedding_idx: int = 0,
     ) -> None:
         super().__init__(config=language_transformer_config)
+
+        if has_config_logger_enabled(language_transformer_config):
+            log_config_to_disk(language_transformer_config, locals(), prefix=type(self).__name__)
 
         logging.getLogger(__name__).warning(
             "LLaVA model is under development and may be missing features."

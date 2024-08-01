@@ -345,6 +345,9 @@ def pretrain(
                                    iteration, process_non_loss_data_func, config,
                                    verbose=True, write_to_tensorboard=not args.skip_train)
 
+    wandb_writer = get_wandb_writer()
+    if wandb_writer:
+        wandb_writer.finish()
     maybe_finalize_async_save(blocking=True)
 
     one_logger and one_logger.log_metrics({
@@ -1277,9 +1280,6 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     writer = get_tensorboard_writer()
     if writer:
         writer.flush()
-    wandb_writer = get_wandb_writer()
-    if wandb_writer:
-        wandb_writer.finish()
 
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if args.use_distributed_optimizer and args.overlap_param_gather:
@@ -1289,6 +1289,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if exit:
+        wandb_writer = get_wandb_writer()
+        if wandb_writer:
+            wandb_writer.finish()
         sys.exit()
 
     return iteration, num_floating_point_operations_so_far
