@@ -1,5 +1,7 @@
 workflow:
   rules:
+    - if: $CI_PROJECT_NAMESPACE != "ADLR"
+      when: never
     - if: $CI_PIPELINE_SOURCE == "schedule"
       variables:
         FUNCTIONAL_TEST: "yes"
