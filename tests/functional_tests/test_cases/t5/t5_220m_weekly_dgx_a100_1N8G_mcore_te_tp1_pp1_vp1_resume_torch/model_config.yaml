@@ -50,4 +50,5 @@ MODEL_ARGS:
   --data-cache-path: ${DATA_CACHE_PATH}
   --deterministic-mode: true
   --attention-softmax-in-fp32: true
+  --ckpt-format: torch
 TEST_TYPE: ckpt-resume

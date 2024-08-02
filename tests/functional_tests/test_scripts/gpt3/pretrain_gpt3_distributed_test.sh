@@ -86,10 +86,11 @@ else
        __SAVE_INTERVAL=${SAVE_INTERVAL:-10000}  # inf
 fi
 if [[ -n "$CKPT_FORMAT" ]] && [[ "$CKPT_FORMAT" != 'torch' ]]; then
-       echo "Using distributed checkpoint format $CKPT_FORMAT..."
-       [[ "$CKPT_FORMAT" == 'zarr' ]] && command="$command pip install zarr tensorstore==0.1.45;"
-       ADDITIONAL_PARAMS+=" --use-dist-ckpt --dist-ckpt-format $CKPT_FORMAT --use-mcore-models"
+       echo "Using mcore model for distributed checkpoint format $CKPT_FORMAT..."
+       ADDITIONAL_PARAMS+=" --use-mcore-models"
 fi
+[[ "$CKPT_FORMAT" == 'zarr' ]] && command="$command pip install zarr tensorstore==0.1.45;"
+ADDITIONAL_PARAMS+=" --ckpt-format $CKPT_FORMAT"
 set +x
 # Runs the "345M" parameter model
 

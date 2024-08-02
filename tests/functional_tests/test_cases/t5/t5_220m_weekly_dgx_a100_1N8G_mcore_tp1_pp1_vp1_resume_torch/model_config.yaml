@@ -49,4 +49,5 @@ MODEL_ARGS:
   --distributed-backend: nccl
   --data-cache-path: ${DATA_CACHE_PATH}
   --deterministic-mode: true
+  --ckpt-format: torch
 TEST_TYPE: ckpt-resume

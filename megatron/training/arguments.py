@@ -19,6 +19,7 @@ from megatron.core.models.retro.utils import (
 )
 from megatron.core.transformer import TransformerConfig
 from megatron.training.activations import squared_relu
+from megatron.training.utils import update_use_dist_ckpt
 
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
@@ -508,6 +509,9 @@ def validate_args(args, defaults={}):
         assert args.pipeline_model_parallel_size == 1, \
             "retro currently does not support pipeline parallelism."
 
+    # Set args.use_dist_ckpt from args.ckpt_format.
+    update_use_dist_ckpt(args)
+
     if args.decoupled_lr is not None or args.decoupled_min_lr is not None:
         assert not args.use_legacy_models, \
             '--decoupled-lr and --decoupled-min-lr is not supported in legacy models.'
@@ -586,6 +590,12 @@ def validate_args(args, defaults={}):
         print('Warning: With non-parallel ckpt save and DistributedOptimizer,'
               ' it will be impossible to resume training with different parallelism.'
               ' Consider removing flag --no-ckpt-fully-parallel-save.')
+    if args.use_dist_ckpt_deprecated and args.rank == 0:
+        print('--use-dist-ckpt is deprecated and has no effect.'
+              ' Use --ckpt-format to select the checkpoint format.')
+    if args.dist_ckpt_format_deprecated and args.rank == 0:
+        print('--dist-ckpt-format is deprecated and has no effect.'
+              ' Use --ckpt-format to select the checkpoint format.')
 
     # Print arguments.
     _print_args("arguments", args)
@@ -1344,14 +1354,28 @@ def _add_checkpointing_args(parser):
                        "(e.g., path typo), then exit instead of random "
                        "initialization.")
     group.add_argument('--use-dist-ckpt', action='store_true',
-                       help='Use distributed checkpoint format.')
+                       dest='use_dist_ckpt_deprecated',
+                       help='Deprecated: see --ckpt-format.')
     group.add_argument('--auto-detect-ckpt-format', action='store_true',
                        help='Determine if the checkpoint format is in legacy or distributed format.'
-                            ' If False, expects distributed checkpoint iff args.use_dist_ckpt.'
+                            ' If False, expects distributed checkpoint iff args.ckpt_format != "torch".'
                             ' Might slow down loading a bit (double rank0 ckpt load).')
-    group.add_argument('--dist-ckpt-format', type=str, default='torch_dist',
-                       choices=['zarr', 'torch_dist'],
-                       help='Distributed checkpoint format to use.')
+    group.add_argument('--dist-ckpt-format',
+                       dest='dist_ckpt_format_deprecated',
+                       help='Deprecated: see --ckpt-format.')
+    group.add_argument('--ckpt-format', default='torch_dist',
+                       choices=['torch', 'torch_dist', 'zarr'],
+                       help='Checkpoint format to use.')
+    group.add_argument('--ckpt-convert-format', default=None,
+                       choices=['torch', 'torch_dist', 'zarr'],
+                       help='Checkpoint format for conversion.')
+    group.add_argument('--ckpt-convert-save', default=None,
+                       help='Save directory for converted checkpoint.')
+    group.add_argument('--ckpt-convert-update-legacy-dist-opt-format', action='store_true',
+                       help='When loading a checkpoint, update the legacy format '
+                       'for the distributed optimizer, which previously used a '
+                       'merged param/grad buffer and a different bucket mapping. '
+                       'The legacy format was deprecated on Feb 13, 2024.')
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
                        dest='ckpt_fully_parallel_save_deprecated',
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')

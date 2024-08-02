@@ -44,4 +44,5 @@ MODEL_ARGS:
   --data-cache-path: ${DATA_CACHE_PATH}
   --fp16: true
   --apply-query-key-layer-scaling: true
+  --ckpt-format: torch
 TEST_TYPE: ckpt-resume

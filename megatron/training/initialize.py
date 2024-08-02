@@ -51,8 +51,14 @@ def initialize_megatron(
     # Parse arguments
     args = parse_args(extra_args_provider, ignore_unknown_args)
 
+    # Prep for checkpoint conversion.
+    if args.ckpt_convert_format is not None:
+        assert args.ckpt_convert_save is not None
+        assert args.load is not None
+        args.exit_on_missing_checkpoint = True
+
     if args.use_checkpoint_args or args_defaults.get("use_checkpoint_args", False):
-        assert args.load is not None, "--use-checkpoints-args requires --load argument"
+        assert args.load is not None, "--use-checkpoint-args requires --load argument"
         load_args_from_checkpoint(args)
 
     if args.yaml_cfg is not None:

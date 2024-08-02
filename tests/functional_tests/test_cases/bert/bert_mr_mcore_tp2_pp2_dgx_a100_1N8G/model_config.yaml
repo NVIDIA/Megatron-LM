@@ -39,4 +39,5 @@ MODEL_ARGS:
   --no-gradient-accumulation-fusion: true
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
+  --ckpt-format: torch
 TEST_TYPE: regular
