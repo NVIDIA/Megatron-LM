@@ -230,7 +230,7 @@ class TransformerConfig(ModelParallelConfig):
     """Number of experts to route to for each token."""
 
     moe_router_pre_softmax: bool = False
-    """Enable pre-softmax routing for MoE, which means the top-k selection is before the softmax. By default, top-k is done after the softmax."""
+    """Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. By default, softmax is done after top-k."""
 
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms

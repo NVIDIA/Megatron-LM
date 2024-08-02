@@ -1769,9 +1769,9 @@ def _add_moe_args(parser):
     group.add_argument('--moe-router-topk', type=int, default=2,
                        help='Number of experts to route to for each token. The default is 2.')
     group.add_argument('--moe-router-pre-softmax', action='store_true',
-                       help='Enable pre-softmax routing for MoE, which means the top-k selection is before the softmax. By default, top-k is done after the softmax.')
+                       help='Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. By default, softmax is done after top-k.')
     group.add_argument('--moe-grouped-gemm', action='store_true',
-                       help='When there are multiple experts per rank, compress multiple local (potentially small) gemms in a single kernel launch to improve the utilization and performance by leveraging the Grouped GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).')
+                       help='When there are multiple experts per rank, launch multiple local GEMM kernels in multiple streams to improve the utilization and performance with GroupedLinear in TransformerEngine.')
     group.add_argument('--moe-aux-loss-coeff', type=float, default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
     group.add_argument('--moe-z-loss-coeff', type=float, default=None,

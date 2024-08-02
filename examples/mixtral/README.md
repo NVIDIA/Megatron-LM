@@ -15,15 +15,19 @@ snapshot_download(repo_id="mistralai/Mixtral-8x7B-v0.1", ignore_patterns=["*.pt"
 The HF checkpoints can be converted to Megatron format by using the provided checkpoint converter for HF format.
 The target model parallel size(e.g. TP,PP,EP) should be specified.
 
+Currently the converter doesn't support distributed checkpointing yet, so each different parallel config requires a specific checkpoint.
+- For training, the recommended model parallel config is TP1EP8PP4
+- For inference, the recommended model parallel config is TP1EP1PP2
+
 ```
 TOKENIZER_MODEL=/workspace/checkpoints/mixtral-hf/tokenizer.model
 MEGATRON_PATH="/workspace/megatron-lm"
 export PYTHONPATH=$MEGATRON_PATH:$PYTHONPATH
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-TARGET_TP_SIZE=1
-TARGET_PP_SIZE=4
-TARGET_EP_SIZE=8
+TARGET_TP_SIZE=""
+TARGET_EP_SIZE=""
+TARGET_PP_SIZE=""
 
 HF_FORMAT_DIR=/workspace/checkpoints/mixtral-hf
 MEGATRON_FORMAT_DIR=/workspace/checkpoints/mixtral-mcore-TP${TARGET_TP_SIZE}PP${TARGET_PP_SIZE}EP${TARGET_EP_SIZE}
@@ -88,6 +92,7 @@ torchrun $DISTRIBUTED_ARGS tools/run_text_generation_server.py   \
        --num-experts 8 \
        --moe-router-topk 2 \
        --moe-token-dispatcher-type alltoall \
+       --moe-grouped-gemm \
        --mock-data \
        --rotary-base 1000000
 ```
@@ -118,6 +123,8 @@ docker run \
     $PYTORCH_IMAGE \
     bash examples/mixtral/train_mixtral_8x7b_distributed.sh $CHECKPOINT_PATH $TOKENIZER_MODEL $DATA_PATH
 ```
+
+The above functionality also applys to Mixtral 8x22B actually, you should set the model config (including hidden_size/head_num/num_layers/ffn_hidden_size) properly according to the original [config](https://huggingface.co/mistralai/Mixtral-8x22B-v0.1/blob/main/config.json).
 
 ## Acknowledgements
 Contributors outside NVIDIA for the huggingface converter and example of Mixtral models in Megatron-Core:
