@@ -51,4 +51,5 @@ MODEL_ARGS:
   --sequence-parallel: true
   --deterministic-mode: true
   --attention-softmax-in-fp32: true
+  --ckpt-format: torch
 TEST_TYPE: regular

@@ -67,10 +67,11 @@ def _load_checkpoint(queue, args):
                 '--mock-data', # To pass the "blend data checks" in arguments.py
                 '--load', args.load_dir,
                 '--position-embedding-type', args.position_embedding_type,
+                '--exit-on-missing-checkpoint',
                 ]
 
     margs = parse_args()
-    margs, checkpoint_args = load_args_from_checkpoint(margs, exit_on_missing_checkpoint=True)
+    margs, checkpoint_args = load_args_from_checkpoint(margs)
 
     # Arguments do sanity checks on the world size, but we don't care,
     # so trick it into thinking we are plenty of processes

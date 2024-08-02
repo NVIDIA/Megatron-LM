@@ -384,3 +384,7 @@ def get_batch_on_this_tp_rank(data_iterator):
        }
 
     return batch
+
+
+def update_use_dist_ckpt(args):
+    args.use_dist_ckpt = args.ckpt_format != "torch"

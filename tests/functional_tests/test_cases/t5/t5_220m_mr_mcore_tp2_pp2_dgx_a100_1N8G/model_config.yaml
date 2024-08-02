@@ -50,4 +50,5 @@ MODEL_ARGS:
   --data-cache-path: ${DATA_CACHE_PATH}
   --encoder-pipeline-model-parallel-size: 2
   --deterministic-mode: true
+  --ckpt-format: torch
 TEST_TYPE: regular
