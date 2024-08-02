@@ -6,7 +6,8 @@ import os
 import sys
 import torch
 
-from megatron.core import Timers, init_num_microbatches_calculator
+from megatron.core import Timers
+from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator
 from megatron.training import dist_signal_handler
 from megatron.training.tokenizer import build_tokenizer
 
