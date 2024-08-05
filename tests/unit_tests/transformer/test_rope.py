@@ -22,6 +22,8 @@ class TestRotaryEmbedding:
         )
 
     def teardown_method(self, method):
+        del self.rope_gpu_init
+        del self.rope_cpu_init
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
