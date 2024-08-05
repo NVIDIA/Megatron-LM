@@ -229,6 +229,9 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_topk: int = 2
     """Number of experts to route to for each token."""
 
+    moe_router_pre_softmax: bool = False
+    """Enable pre-softmax routing for MoE, which means the top-k selection is before the softmax. By default, top-k is done after the softmax."""
+
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
     in a single kernel launch to improve the utilization and performance by leveraging the Grouped
@@ -281,8 +284,8 @@ class TransformerConfig(ModelParallelConfig):
     """When set to true, TransformerLayer blocks are wrapped with CUDA graph."""
 
     def __post_init__(self):
-        """ Python dataclass method that is used to modify attributes after initialization.
-            See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more details.
+        """Python dataclass method that is used to modify attributes after initialization.
+        See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more details.
         """
         super().__post_init__()
         if self.fp16 and self.bf16:
