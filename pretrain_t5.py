@@ -85,6 +85,11 @@ def model_provider(
 
     args = get_args()
 
+    assert (
+        args.encoder_tensor_model_parallel_size == 0 or
+        args.encoder_tensor_model_parallel_size == args.tensor_model_parallel_size
+    ), f"Because word embeddings are shared between the encoder & decoder, these have to have the same tensor parallel size."
+
     config = core_transformer_config_from_args(args)
     if args.use_legacy_models:
         model = LegacyT5Model(

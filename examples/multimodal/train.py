@@ -71,9 +71,6 @@ def model_provider(
 
     vision_config = deepcopy(base_config)
     vision_config = get_vision_model_config(vision_config, apply_query_key_layer_scaling=args.apply_query_key_layer_scaling)
-    if args.pipeline_model_parallel_size > 1:
-        assert args.encoder_pipeline_model_parallel_size == 1, "ViT can only live on 1 pipeline stage."
-        vision_config.pipeline_model_parallel_size = args.encoder_pipeline_model_parallel_size
 
     if use_te:
         vision_transformer_layer_spec = get_layer_spec_te(is_vit=True)
@@ -82,6 +79,15 @@ def model_provider(
 
     vision_projection_config = deepcopy(base_config)
     vision_projection_config = get_vision_projection_config(vision_projection_config, language_config.hidden_size)
+
+    if args.encoder_pipeline_model_parallel_size > 0:
+        assert args.encoder_pipeline_model_parallel_size == 1, "ViT can only live on 1 pipeline stage."
+        vision_config.pipeline_model_parallel_size = args.encoder_pipeline_model_parallel_size
+        vision_projection_config.pipeline_model_parallel_size = args.encoder_pipeline_model_parallel_size
+        if args.encoder_tensor_model_parallel_size > 0:
+            vision_transformer_config.tensor_model_parallel_size = args.encoder_tensor_model_parallel_size
+            vision_projection_config.tensor_model_parallel_size = args.encoder_tensor_model_parallel_size
+
     vision_projection_layer_spec = get_mlp_module_spec(use_te=use_te).submodules
 
     model = LLaVAModel(

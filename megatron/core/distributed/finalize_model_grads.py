@@ -135,13 +135,29 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
     # if we are using by the number of tokens, then we use that as a divisor. this number
     # will be the total number of non-padded tokens in the global batch.
     if num_tokens is not None:
+
         # the number of tokens is only present on the last stage, so broadcast it
         # to the other ranks in the pipeline parallel group.
-        torch.distributed.broadcast(
-            num_tokens,
-            src=parallel_state.get_pipeline_model_parallel_last_rank(),
-            group=parallel_state.get_pipeline_model_parallel_group(),
-        )
+        last_rank = parallel_state.get_pipeline_model_parallel_last_rank()
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+
+        if not isinstance(last_rank, list):
+            assert not isinstance(last_rank, list)
+            last_rank = [last_rank]
+            assert not isinstance(pp_group, list)
+            pp_group = [pp_group]
+
+        # need to do a broadcast for every pp group, even though num_tokens should be the same.
+        num_tokens_list = []
+        for lr, group in zip(last_rank, pp_group):
+            torch.distributed.broadcast(
+                num_tokens,
+                src=lr,
+                group=group,
+            )
+            num_tokens_list.append(torch.clone(num_tokens))
+        assert all(x.item() == num_tokens_list[0] for x in num_tokens_list)
+
         # all-reduce across DP ranks.
         torch.distributed.all_reduce(num_tokens, group=parallel_state.get_data_parallel_group())
         for model_chunk in model:

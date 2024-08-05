@@ -39,6 +39,7 @@ spec:
         USE_TE={"1" if use_te else "0"} \
         TP_SIZE={tp_size} \
         PP_SIZE={pp_size} \
+        GPUS={gpus} \
         NUM_NODES={nodes} \
         MAX_STEPS={100 if ckpt_resume else 50} \
         USE_CORE={"1" if use_mcore else "0"} \
@@ -53,4 +54,5 @@ spec:
         ADDITIONAL_PARAMS={extra_args if extra_args is not None else '""'}
 products:
   - {use_te: [True], tp_size: [1],  pp_size: [1]}
-  - {use_te: [True], tp_size: [2],  pp_size: [3], ckpt_resume: [0, 1], extra_args: ['"--encoder-pipeline-model-parallel-size 1"']}
+  - {use_te: [True], tp_size: [2],  pp_size: [3], ckpt_resume: [0], extra_args: ['"--encoder-pipeline-model-parallel-size 1"']}
+  - {use_te: [True], tp_size: [4],  pp_size: [1], gpus: [7], ckpt_resume: [0, 1], extra_args: ['"--encoder-pipeline-model-parallel-size 1 --encoder-tensor-model-parallel-size 3"'], args_meta: ["etp3"]}

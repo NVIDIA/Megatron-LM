@@ -12,8 +12,8 @@ from megatron.core.datasets.gpt_dataset import MockGPTLowLevelDataset
 from megatron.core.datasets.multimodal_dataset import MockMultimodalDataset, MultimodalDatasetConfig
 from megatron.core.enums import ModelType
 from megatron.core.models.multimodal.llava_model import LLaVAModel
-from megatron.core.models.multimodal.llava_spec import decoder_model_with_transformer_engine_default_spec
-from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
+from megatron.core.models.multimodal.llava_spec import decoder_model_with_transformer_engine_default_spec, decoder_model_with_local_default_spec
+from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec, get_vit_layer_with_local_spec
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
@@ -62,23 +62,34 @@ def model_provider(
 
     if args.spec is not None:
         language_transformer_layer_spec = import_module(args.spec)
-    else:
+    elif args.transformer_impl == "transformer_engine":
         language_transformer_layer_spec = decoder_model_with_transformer_engine_default_spec(
             args.num_experts, args.moe_grouped_gemm
         )
+    else:  # transformer_impl == "local"
+        language_transformer_layer_spec = decoder_model_with_local_default_spec(
+            args.num_experts, args.moe_grouped_gemm
+        )
 
-    vision_transformer_layer_spec = get_vit_layer_with_transformer_engine_spec()
+    if args.transformer_impl == "transformer_engine":
+        vision_transformer_layer_spec = get_vit_layer_with_transformer_engine_spec()
+    else:  # transformer_impl == "local"
+        vision_transformer_layer_spec = get_vit_layer_with_local_spec()
 
     # TODO: Make these configurable via input .yaml config.
     vision_transformer_config = deepcopy(language_transformer_config)
     vision_transformer_config.num_layers = args.encoder_num_layers
 
-    if args.pipeline_model_parallel_size > 1:
-        assert args.encoder_pipeline_model_parallel_size == 1, "ViT can only live on 1 pipeline stage."
-        vision_transformer_config.pipeline_model_parallel_size = args.encoder_pipeline_model_parallel_size
-
     vision_projection_type = "mlp"
     vision_projection_config = deepcopy(language_transformer_config)
+
+    if args.encoder_pipeline_model_parallel_size > 0:
+        assert args.encoder_pipeline_model_parallel_size == 1, "ViT can only live on 1 pipeline stage."
+        vision_transformer_config.pipeline_model_parallel_size = args.encoder_pipeline_model_parallel_size
+        vision_projection_config.pipeline_model_parallel_size = args.encoder_pipeline_model_parallel_size
+        if args.encoder_tensor_model_parallel_size > 0:
+            vision_transformer_config.tensor_model_parallel_size = args.encoder_tensor_model_parallel_size
+            vision_projection_config.tensor_model_parallel_size = args.encoder_tensor_model_parallel_size
 
     vision_projection_modules = deepcopy(language_transformer_layer_spec.submodules.mlp.submodules)
 
