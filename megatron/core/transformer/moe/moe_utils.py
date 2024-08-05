@@ -287,6 +287,7 @@ def topk_softmax_with_capacity(
     capacity_factor: float = None,
     pad_to_capacity: bool = False,
     drop_policy: str = "probs",
+    use_pre_softmax: bool = False,
 ):
     """Apply capacity and padding to the top-k selection.
     Args:
@@ -302,13 +303,20 @@ def topk_softmax_with_capacity(
         (1) If there's no token padding, the shape of probs and indices is [tokens, top_k], indicating the selected experts for each token.
         (2) If there's token padding, the shape of probs and indices is [num_expert, capacity], indicating the tokens selected for each expert.
     """
-    # TODO: Add Pre softmax.
     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
     num_tokens = logits.shape[0]
     num_experts = logits.shape[1]
-
-    scores, top_indices = torch.topk(logits, k=topk, dim=1)
-    probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
+    if use_pre_softmax:
+        # Pre softmax
+        scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+        probs, top_indices = torch.topk(scores, k=topk, dim=1)
+    else:
+        # Post softmax
+        if topk == 1:
+            # Requires applying softmax before selecting the top-k when k is 1, since softmax on a [num_tokens, 1] would yield a zero gradient.
+            raise ValueError("Please use --moe-router-pre-softmax when topk is 1.")
+        scores, top_indices = torch.topk(logits, k=topk, dim=1)
+        probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
 
     if capacity_factor is None:
         # TopK without capacity
