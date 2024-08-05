@@ -8,11 +8,27 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
     TELayerNormColumnParallelLinear,
     TERowParallelLinear,
 )
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+
+try:
+    import apex
+
+    from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+
+    HAVE_APEX = True
+    LNImpl = FusedLayerNorm
+except ImportError:
+    import warnings
+
+    from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
+
+    warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
+    LNImpl = WrappedTorchLayerNorm
 
 
 # Use this spec to use lower level Transformer Engine modules (required for fp8 training)
@@ -40,8 +56,33 @@ def get_vit_layer_with_transformer_engine_spec() -> ModuleSpec:
     )
 
 
+def get_vit_layer_with_local_spec() -> ModuleSpec:
+    mlp = _get_mlp_module_spec(use_te=False)
+    return ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            input_layernorm=LNImpl,
+            self_attention=ModuleSpec(
+                module=SelfAttention,
+                params={"attn_mask_type": AttnMaskType.causal},
+                submodules=SelfAttentionSubmodules(
+                    linear_qkv=ColumnParallelLinear,
+                    core_attention=DotProductAttention,
+                    linear_proj=RowParallelLinear,
+                ),
+            ),
+            self_attn_bda=get_bias_dropout_add,
+            pre_mlp_layernorm=LNImpl,
+            mlp=mlp,
+            mlp_bda=get_bias_dropout_add,
+        ),
+    )
+
+
 # Helper function to get module spec for MLP/MoE
-def _get_mlp_module_spec(use_te: bool = True,) -> ModuleSpec:
+def _get_mlp_module_spec(
+    use_te: bool = True,
+) -> ModuleSpec:
     # Dense MLP w/ or w/o TE modules.
     return ModuleSpec(
         module=MLP,

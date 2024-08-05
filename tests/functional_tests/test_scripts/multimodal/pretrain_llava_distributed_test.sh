@@ -17,8 +17,9 @@ if [[ -z $MBS ]]; then MBS=4; fi
 if [[ -z $GBS ]]; then GBS=32; fi
 if [[ -z $MOE_GROUPED_GEMM ]]; then MOE_GROUPED_GEMM=0; fi
 if [[ -z $ALLOW_NONDETERMINISTIC ]]; then ALLOW_NONDETERMINISTIC=0; fi
+if [[ -z $GPUS ]]; then GPUS=8; fi
 
-GPUS_PER_NODE=8
+GPUS_PER_NODE=$GPUS
 # Change for multinode config
 MASTER_ADDR=localhost
 MASTER_PORT=6000
@@ -84,10 +85,10 @@ build_torch_run_cmd() {
   torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     pretrain_vlm.py \
       --num-layers 12 \
-      --hidden-size 512 \
+      --hidden-size 624 \
       --attention-dropout 0.0 \
       --hidden-dropout 0.0 \
-      --num-attention-heads 8 \
+      --num-attention-heads 12 \
       --log-params-norm \
       --log-num-zeros-in-grad \
       --log-validation-ppl-to-tensorboard \

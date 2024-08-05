@@ -160,47 +160,53 @@ def validate_args(args, defaults={}):
     # Load saved args from Retro (if applicable).
     load_retro_args(args)
 
-    # Tensor model parallel size.
-    args.tensor_model_parallel_size = min(
-        args.tensor_model_parallel_size, args.world_size)
-    assert args.world_size % args.tensor_model_parallel_size == 0, 'world size'\
-        ' ({}) is not divisible by tensor model parallel size ({})'.format(
-            args.world_size, args.tensor_model_parallel_size)
+    if args.encoder_tensor_model_parallel_size > 0:
+        assert args.encoder_pipeline_model_parallel_size > 0, "encoder_pipeline_model_parallel_size must be defined."
+        assert args.num_attention_heads % args.encoder_tensor_model_parallel_size == 0
+        assert args.encoder_tensor_model_parallel_size <= args.tensor_model_parallel_size, "We do not support encoders with more TP than the decoder."
+
+    if args.encoder_pipeline_model_parallel_size > 0 and args.encoder_tensor_model_parallel_size == 0:
+        args.encoder_tensor_model_parallel_size = args.tensor_model_parallel_size
+
+    encoder_model_size = args.encoder_tensor_model_parallel_size * args.encoder_pipeline_model_parallel_size * args.context_parallel_size
+    decoder_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
+    total_model_size = encoder_model_size + decoder_model_size
+
+    # Total model size.
+    assert args.world_size % total_model_size == 0, (
+        f"world size ({args.world_size}) is not divisible by total_model_size ({encoder_model_size=} + {decoder_model_size=})"
+    )
 
     # Pipeline model parallel size.
-    args.pipeline_model_parallel_size = min(
-        args.pipeline_model_parallel_size,
-        (args.world_size // args.tensor_model_parallel_size))
     args.transformer_pipeline_model_parallel_size = (
         args.pipeline_model_parallel_size - 1
         if args.standalone_embedding_stage else
         args.pipeline_model_parallel_size
     )
 
+    args.data_parallel_size = args.world_size // total_model_size
+
     # Checks.
-    model_parallel_size = (args.encoder_pipeline_model_parallel_size + args.pipeline_model_parallel_size) * \
-                          args.tensor_model_parallel_size
-    assert args.world_size % (model_parallel_size * args.context_parallel_size) == 0, \
-        'world size ({}) is not divisible by tensor parallel size ({}) times ' \
-        'pipeline parallel size (encoder+decoder) ({}+{}) times context parallel size ({})'.format(
-        args.world_size, args.tensor_model_parallel_size,
-        args.encoder_pipeline_model_parallel_size, args.pipeline_model_parallel_size, args.context_parallel_size)
-    args.data_parallel_size = args.world_size // (model_parallel_size * args.context_parallel_size)
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
               'context-parallel size: {} '
               'tensor-model-parallel size: {}, '
-              'pipeline-model-parallel size: {} '.format(
+              'encoder-tensor-model-parallel size: {}'
+              'pipeline-model-parallel size: {} '
+              'encoder-pipeline-model-parallel size: {}'.format(
                   args.world_size, args.data_parallel_size,
                   args.context_parallel_size,
                   args.tensor_model_parallel_size,
-                  args.pipeline_model_parallel_size), flush=True)
+                  args.encoder_tensor_model_parallel_size,
+                  args.pipeline_model_parallel_size,
+                  args.encoder_pipeline_model_parallel_size), flush=True)
 
     # backwards compatibility.
     if args.pipeline_model_parallel_split_rank is not None:
         args.encoder_pipeline_model_parallel_size = args.pipeline_model_parallel_split_rank
         args.pipeline_model_parallel_size -= args.encoder_pipeline_model_parallel_size
         assert args.pipeline_model_parallel_size > 0
+
 
     if args.tp_comm_overlap:
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
@@ -1445,6 +1451,8 @@ def _add_distributed_args(parser):
 
     group.add_argument('--tensor-model-parallel-size', type=int, default=1,
                        help='Degree of tensor model parallelism.')
+    group.add_argument('--encoder-tensor-model-parallel-size', type=int, default=0,
+                       help='Degree of tensor model parallelism for the encoder.')
     group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
                        help='Degree of pipeline model parallelism.')
     group.add_argument('--encoder-pipeline-model-parallel-size', type=int, default=0,
@@ -1846,5 +1854,4 @@ def _add_experimental_args(parser):
                        'pattern')
     group.add_argument('--yaml-cfg', type=str, default=None,
                        help = 'Config file to add additional arguments')
-
     return parser
