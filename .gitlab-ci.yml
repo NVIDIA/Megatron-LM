@@ -128,6 +128,7 @@ metadata:
 mirror_to_github:
   tags: [mcore-docker-node-small]
   stage: .pre
+  image: python:3.10
   script:
     - git remote add github https://ko3n1g:$GH_TOKEN@github.com/NVIDIA/Megatron-LM.git
     - git branch -u github/main
