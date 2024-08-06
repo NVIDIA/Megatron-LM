@@ -131,6 +131,7 @@ mirror_to_github:
   image: python:3.10
   script:
     - git remote add github https://ko3n1g:$GH_TOKEN@github.com/NVIDIA/Megatron-LM.git
+    - git checkout main
     - git branch -u github/main
     - git push
   rules:
