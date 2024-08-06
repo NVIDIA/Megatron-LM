@@ -134,6 +134,7 @@ mirror_to_github:
   script:
     - git remote add github https://ko3n1g:$GH_TOKEN@github.com/NVIDIA/Megatron-LM.git || true
     - git fetch github
+    - git checkout github/main
     - git checkout origin/main
     - git push -u github/main origin/main
   rules:
