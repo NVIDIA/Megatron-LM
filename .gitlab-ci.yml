@@ -130,7 +130,7 @@ mirror_to_github:
   stage: .pre
   image: python:3.10
   script:
-    - git remote add github https://ko3n1g:$GH_TOKEN@github.com/NVIDIA/Megatron-LM.git
+    - git remote add github https://ko3n1g:$GH_TOKEN@github.com/NVIDIA/Megatron-LM.git || exit 0
     - git fetch github
     - git checkout main
     - git branch -u github/main
