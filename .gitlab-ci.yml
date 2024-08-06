@@ -136,7 +136,7 @@ mirror_to_github:
     - git fetch github
     - git checkout github/main
     - git checkout origin/main
-    - git push -u github/main origin/main
+    - git push -u github origin/main
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
 
