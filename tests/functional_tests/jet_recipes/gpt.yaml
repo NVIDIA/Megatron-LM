@@ -1,0 +1,149 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: "{test_case}"
+  model: gpt
+  build: mcore-pyt
+  nodes: 1
+  gpus: 8
+  platforms: dgx_a100
+  time_limit: 1200
+  scope: null
+  artifacts:
+    /workspace/data/gpt3_data: text/the_pile/shard00
+  script: |-
+    ls
+    cd /workspace/megatron-lm
+
+    ARGUMENTS=(
+        "DATA_PATH=/workspace/data/gpt3_data"
+        "DATA_CACHE_PATH=/workspace/data/cache"
+        "OUTPUT_PATH={assets_dir}"
+        "TENSORBOARD_PATH={assets_dir}/tensorboard"
+        "CHECKPOINT_PATH=/workspace/checkpoints"
+        "TRAINING_SCRIPT_PATH=pretrain_gpt.py"
+        "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values.json"
+    )
+
+    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
+
+products:
+  - scope: [mr]
+    test_case:
+    - gpt3_mr_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer_no_mmap_bin_files_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp1_resume_torch_dist_uniform_full_recompute_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp1_uniform_full_recompute_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_reshard_2x1x4_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings_interleaved_no_fusion_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp2_rope_embeddings_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp2_rope_embeddings_interleaved_no_fusion_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp4_disable_bias_linear_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_disable_bias_linear_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_sequence_parallel_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_swiglu_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_untie_embeddings_and_outputs_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp4_sequence_parallel_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp4_swiglu_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp4_untie_embeddings_and_outputs_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp4_vp1_calculate_per_token_loss_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp4_vp1_decoupled_lr_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp4_vp1_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_untied_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_decoupled_lr_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_calculate_per_token_loss_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_untied_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp1_cp2_nondeterministic_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_groupedGEMM_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_top2router_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_groupedGEMM_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_top2router_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp2_cp2_nondeterministic_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp2_cross_entropy_loss_fusion_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp2_ddp_average_in_collective_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp2_defer_embedding_wgrad_compute_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp2_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp2_no_create_attention_mask_in_dataloader_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp2_no_mmap_bin_files_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_cross_entropy_loss_fusion_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_ddp_average_in_collective_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_defer_embedding_wgrad_compute_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_no_create_attention_mask_in_dataloader_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_no_mmap_bin_files_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_reshard_1x4xNone_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp4_pp1_qk_layernorm_test_mode_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp4_pp1_resume_torch_dist_qk_layernorm_test_mode_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp4_pp2_resume_torch_dist_reshard_8x1xNone_dgx_a100_1N8G
+    - gpt3_mr_mcore_tp2_pp2_resume_torch_dist_uninstall_te_dgx_a100_1N8G
+    - gpt3_mr_mcore_tp2_pp2_uninstall_te_dgx_a100_1N8G
+    - gpt3_mr_te_tp2_pp2_dgx_a100_1N8G
+    - gpt3_mr_te_tp2_pp2_resume_torch_dgx_a100_1N8G
+    - gpt3_mr_tp1_pp4_vp1_dgx_a100_1N8G
+    - gpt3_mr_tp1_pp4_vp1_resume_torch_dgx_a100_1N8G
+    - gpt3_mr_tp2_pp2_dgx_a100_1N8G
+  - scope: [nightly]
+    test_case:
+    - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_dist_optimizer_overlap_grad_reduce_param_gather
+    - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather
+    - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp2
+    - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp2_resume_torch_dist
+    - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp4
+    - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp4_resume_torch_dist
+    - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_resume_torch_dist_te_4experts2parallel
+    - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_te_4experts2parallel
+    - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_resume_torch_dist_te_2experts
+    - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_te_2experts
+    - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp4_pp1
+    - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp4_pp1_resume_torch
+    - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp4_pp1_resume_torch_dist
+    - gpt3_345m_nightly_dgx_a100_1N8G_tp1_pp1_dist_optimizer_overlap_grad_reduce
+    - gpt3_345m_nightly_dgx_a100_1N8G_tp1_pp1_overlap_grad_reduce
+    - gpt3_345m_nightly_dgx_a100_1N8G_tp1_pp2
+    - gpt3_345m_nightly_dgx_a100_1N8G_tp1_pp2_resume_torch
+    - gpt3_345m_nightly_dgx_a100_1N8G_tp1_pp4
+    - gpt3_345m_nightly_dgx_a100_1N8G_tp1_pp4_overlap_grad_reduce
+    - gpt3_345m_nightly_dgx_a100_1N8G_tp1_pp4_resume_torch
+    - gpt3_345m_nightly_dgx_a100_1N8G_tp1_pp4_vp1_overlap_grad_reduce
+    - gpt3_345m_nightly_dgx_a100_1N8G_tp2_pp2_4experts
+    - gpt3_345m_nightly_dgx_a100_1N8G_tp2_pp2_overlap_grad_reduce
+    - gpt3_345m_nightly_dgx_a100_1N8G_tp2_pp2_resume_torch_4experts
+    - gpt3_345m_nightly_dgx_a100_1N8G_tp2_pp2_resume_torch_overlap_grad_reduce
+    - gpt3_345m_nightly_dgx_a100_1N8G_tp4_pp1
+    - gpt3_345m_nightly_dgx_a100_1N8G_tp4_pp1_overlap_grad_reduce
+    - gpt3_345m_nightly_dgx_a100_1N8G_tp4_pp1_resume_torch
+  - scope: [weekly]
+    test_case:
+    - gpt3_345m_weekly_dgx_h100_1N8G_mcore_nondet_tp1_pp1_fp8_no_model_parallel
+    - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp1_pp1_bf16_baseline
+    - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp1_pp1_fp8_no_model_parallel
+    - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp1_pp2_fp8_pp
+    - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp2_pp2_fp8_tp_pp
+    - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp2_pp2_fp8_tp_pp_sp
+    - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp4_pp2_fp8_tp_pp
+
+    
+
+    

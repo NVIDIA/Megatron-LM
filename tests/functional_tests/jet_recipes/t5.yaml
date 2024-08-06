@@ -1,9 +1,9 @@
 type: basic
 format_version: 1
-maintainers: [maanug]
+maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: "{testscript}"
+  name: "{test_case}"
   model: t5
   build: mcore-pyt
   nodes: 1
@@ -24,19 +24,19 @@ spec:
         "TENSORBOARD_PATH={assets_dir}/tensorboard"
         "CHECKPOINT_PATH=/workspace/checkpoints"
         "TRAINING_SCRIPT_PATH=pretrain_t5.py"
-        "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{testscript}/model_config.yaml"
-        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{testscript}/golden_values.json"
+        "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values.json"
     )
 
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
   - scope: [mr]
-    testscript:
+    test_case:
     - t5_220m_mr_mcore_tp2_pp2_dgx_a100_1N8G
     - t5_220m_mr_mcore_tp2_pp2_resume_torch_dgx_a100_1N8G
   - scope: [weekly]
-    testscript:
+    test_case:
     - t5_220m_weekly_dgx_a100_1N8G_mcore_te_tp1_pp1_vp1_resume_torch
     - t5_220m_weekly_dgx_a100_1N8G_mcore_te_tp2_pp1_vp1
     - t5_220m_weekly_dgx_a100_1N8G_mcore_te_tp2_pp1_vp1_sequence_parallel
