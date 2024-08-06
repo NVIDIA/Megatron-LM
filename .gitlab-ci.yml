@@ -125,6 +125,16 @@ metadata:
   rules:
     - if: '$FUNCTIONAL_TEST == "yes"'
 
+mirror_to_github:
+  tags: [mcore-docker-node-small]
+  stage: .pre
+  script:
+    - git remote add github https://ko3n1g:$GH_TOKEN@github.com/NVIDIA/Megatron-LM.git
+    - git branch -u github/main
+    - git push
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
 ppp_capacity_statistics:
   tags: [mcore-ssh-node-A]
   stage: .pre
