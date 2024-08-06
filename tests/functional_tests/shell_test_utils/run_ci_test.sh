@@ -31,8 +31,11 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
     fi
 done
 
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+ROOT_DIR=$(realpath $SCRIPT_DIR/../../../)
+
 # Training
-bash tests/functional_tests/shell_test_utils/_run_training.sh
+bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
 
 # Extract settings from params file
 TEST_TYPE=$(cat $TRAINING_PARAMS_PATH \
@@ -46,12 +49,12 @@ SKIP_PYTEST=$(cat $TRAINING_PARAMS_PATH \
 if [[ "$TEST_TYPE" == "ckpt-resume" ]]; then 
     rm -rf $CHECKPOINT_PATH/iter_0000100; 
     echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt;
-    bash tests/functional_tests/shell_test_utils/_run_training.sh
+    bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
 fi
 
 # Save run results
-export PYTHONPATH=$(pwd)
-python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
+export PYTHONPATH=$ROOT_DIR
+python3 $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
     --logs-dir $TENSORBOARD_PATH \
     --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH)
 
@@ -62,12 +65,12 @@ if [[ ${SKIP_PYTEST:-0} != 1 ]]; then
     
     if [[ "$TEST_TYPE" == "ckpt-resume" ]]; then
         echo "Running pytest 1st vs 2nd run comparison"
-        pytest -s ./tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py
+        pytest -s $ROOT_DIR/tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py
 
     elif [[ "$TEST_TYPE" == "regular" ]]; then
         echo "Running pytest checks against golden values"
         export EXPECTED_METRICS_FILE=$GOLDEN_VALUES_PATH 
-        pytest -s ./tests/functional_tests/python_test_utils/test_ci_pipeline.py
+        pytest -s $ROOT_DIR/tests/functional_tests/python_test_utils/test_ci_pipeline.py
 
     else
         echo "Test type $TEST_TYPE not yet implemented."
