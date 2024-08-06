@@ -40,17 +40,23 @@ done
 cat $TRAINING_PARAMS_PATH | envsubst >$TRAINING_PARAMS_PATH.tmp
 mv $TRAINING_PARAMS_PATH.tmp $TRAINING_PARAMS_PATH
 
-# Exit earlier to leave time for properly saving checkpoint
-PARAMS="--exit-duration-in-mins $((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60 - 15))"
-
 # Run before script
 SCRIPT=$(cat $TRAINING_PARAMS_PATH | yq '.BEFORE_SCRIPT')
 if [[ "$SCRIPT" != null ]]; then
     eval "$SCRIPT"
 fi;
 
+# Exit earlier to leave time for properly saving checkpoint
+if [[ $(echo "$TRAINING_SCRIPT_PATH" | tr '[:upper:]' '[:lower:]') == *nemo* ]]; then
+    PARAMS=""
+    TRAINING_PARAMS_FROM_CONFIG=$(yq '... comments="" | .MODEL_ARGS | to_entries | .[] | with(select(.value == "true"); .value = "") | [.key + "=" + .value] | join("")' $TRAINING_PARAMS_PATH | tr '\n' ' ')
+
+else
+    TRAINING_PARAMS_FROM_CONFIG=$(yq '... comments="" | .MODEL_ARGS | to_entries | .[] | with(select(.value == "true"); .value = "") | [.key + " " + .value] | join("")' $TRAINING_PARAMS_PATH | tr '\n' ' ')
+    PARAMS="--exit-duration-in-mins $((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60 - 15))"
+fi
+
 # Extract training params
-TRAINING_PARAMS_FROM_CONFIG=$(yq '... comments="" | .MODEL_ARGS | to_entries | .[] | with(select(.value == "true"); .value = "") | [.key + " " + .value] | join("")' $TRAINING_PARAMS_PATH | tr '\n' ' ')
 PARAMS="$PARAMS $TRAINING_PARAMS_FROM_CONFIG"
 
 # Pull env vars to export
