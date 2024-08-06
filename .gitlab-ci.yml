@@ -142,6 +142,7 @@ ppp_capacity_statistics:
   tags: [mcore-ssh-node-A]
   stage: .pre
   image: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_ci:buildcache
+  allow_failure: true
   script:
     - |
       set -x
