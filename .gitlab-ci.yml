@@ -133,10 +133,7 @@ mirror_to_github:
     GIT_STRATEGY: "clone"
   script:
     - git remote add github https://ko3n1g:$GH_TOKEN@github.com/NVIDIA/Megatron-LM.git || true
-    - git fetch github
-    - git checkout github/main
-    - git checkout origin/main
-    - git push -u github origin/main
+    - git push -u github main
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
 
