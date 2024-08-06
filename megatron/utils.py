@@ -211,3 +211,9 @@ def print_rank_last(message):
             print(message, flush=True)
     else:
         print(message, flush=True)
+
+def is_pipeline_stage_containing_loss():
+    if get_args().enable_bitpipe_schedule:
+        return mpu.is_pipeline_first_stage(ignore_virtual=True) or mpu.is_pipeline_last_stage(ignore_virtual=True)
+    else:
+        return mpu.is_pipeline_last_stage(ignore_virtual=True)

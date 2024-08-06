@@ -19,7 +19,7 @@ from megatron.model.module import param_is_not_shared
 from megatron.utils import unwrap_model
 
 from .clip_grads import clip_grad_norm_fp32, count_zeros_fp32
-
+from megatron import get_args
 
 def _zero_grad_group_helper(group, set_to_none):
     """Zero out the gradient for a group of parameters.
@@ -207,25 +207,43 @@ class MegatronOptimizer(ABC):
         parameters stay in sync. This should only run for models that support
         pipelined model parallelism (BERT and GPT-2).
         """
-
-        if mpu.is_rank_in_embedding_group(ignore_virtual=True) and \
+        ignore_virtual =True
+        if mpu.is_rank_in_embedding_group(ignore_virtual=ignore_virtual) and \
                 mpu.get_pipeline_model_parallel_world_size() > 1:
-            if mpu.is_pipeline_first_stage(ignore_virtual=True):
-                unwrapped_model = self.models[0]
-            elif mpu.is_pipeline_last_stage(ignore_virtual=True):
-                unwrapped_model = self.models[-1]
-            else:  # We do not support the interleaved schedule for T5 yet.
-                unwrapped_model = self.models[0]
-            unwrapped_model = unwrap_model(
+            if get_args().enable_bitpipe_schedule:
+                if mpu.is_pipeline_first_stage(ignore_virtual=ignore_virtual):
+                    unwrapped_model = self.models[0]
+                    unwrapped_model1 = self.models[-2]
+                elif mpu.is_pipeline_last_stage(ignore_virtual=ignore_virtual):
+                    unwrapped_model = self.models[1]
+                    unwrapped_model1 = self.models[-1]
+                unwrapped_model = unwrap_model(
                 unwrapped_model, (torchDDP, LocalDDP, Float16Module))
+                unwrapped_model1 = unwrap_model(
+                unwrapped_model1, (torchDDP, LocalDDP, Float16Module))
+                if unwrapped_model.share_embeddings_and_output_weights:
+                    weight = unwrapped_model.shared_embedding_or_output_weight()
+                if unwrapped_model1.share_embeddings_and_output_weights:
+                    weight1 = unwrapped_model1.shared_embedding_or_output_weight()
+                weight.main_grad += weight1.main_grad
+                weight1.main_grad  = weight.main_grad    
+            else:
+                if mpu.is_pipeline_first_stage(ignore_virtual=ignore_virtual):
+                    unwrapped_model = self.models[0]
+                elif mpu.is_pipeline_last_stage(ignore_virtual=ignore_virtual):
+                    unwrapped_model = self.models[-1]
+                else:  # We do not support the interleaved schedule for T5 yet.
+                    unwrapped_model = self.models[0]
+                unwrapped_model = unwrap_model(
+                    unwrapped_model, (torchDDP, LocalDDP, Float16Module))
 
-            if unwrapped_model.share_embeddings_and_output_weights:
-                weight = unwrapped_model.shared_embedding_or_output_weight()
-                if args.DDP_impl == 'local':
-                    grad = weight.main_grad
-                else:
-                    grad = weight.grad
-                torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
+                if unwrapped_model.share_embeddings_and_output_weights:
+                    weight = unwrapped_model.shared_embedding_or_output_weight()
+                    if args.DDP_impl == 'local':
+                        grad = weight.main_grad
+                    else:
+                        grad = weight.grad
+                    torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
 
 
     def allreduce_position_embedding_grads(self, args):

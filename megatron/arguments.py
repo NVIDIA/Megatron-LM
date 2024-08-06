@@ -151,6 +151,25 @@ def validate_args(args, defaults={}):
     else:
         args.virtual_pipeline_model_parallel_size = None
 
+    if args.enable_bitpipe_schedule:
+        assert (
+            args.num_layers % args.transformer_pipeline_model_parallel_size == 0
+        ), "number of layers should be divisible by the pipeline parallel size"
+        num_layers_per_pipeline_stage = (
+            args.num_layers // args.transformer_pipeline_model_parallel_size
+        )
+        assert (
+            num_layers_per_pipeline_stage % 2 == 0
+        ), "hybrid schedule requires number of layers per pipeline stage to be even"
+        assert (
+            args.num_layers_per_virtual_pipeline_stage is None
+        ), "num_layers_per_virtual_pipeline_stage should not be set with bidirectional schedule"
+        args.virtual_pipeline_model_parallel_size = 4
+        args.num_layers_per_virtual_pipeline_stage = num_layers_per_pipeline_stage//2
+        assert args.virtual_pipeline_model_parallel_size == 4
+
+    # TODO: validate more
+
     # Parameters dtype.
     args.params_dtype = torch.float
     if args.fp16:
@@ -1034,7 +1053,7 @@ def _add_distributed_args(parser):
                        default=False, help='If set, use custom-built ring exchange '
                        'for p2p communications. Note that this option will require '
                        'a custom built image that support ring-exchange p2p.')
-    group.add_argument('--local_rank', type=int, default=None,
+    group.add_argument('--local-rank', type=int, default=None,
                        help='local rank passed from distributed launcher.')
     group.add_argument('--lazy-mpu-init', type=bool, required=False,
                        help='If set to True, initialize_megatron() '
@@ -1057,6 +1076,9 @@ def _add_distributed_args(parser):
                        'affects the encoder embedding.)')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
+    group.add_argument('--enable-bitpipe-schedule', action='store_true',
+                       help='Use bitpipe pipeline.',
+                       dest='enable_bitpipe_schedule')
 
     return parser
 

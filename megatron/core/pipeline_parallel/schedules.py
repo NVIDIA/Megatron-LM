@@ -8,6 +8,7 @@ from torch.autograd.variable import Variable
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
 from megatron import core
+from megatron import get_args
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import p2p_communication
@@ -91,6 +92,12 @@ def get_forward_backward_func():
     collect_non_loss_data (optional, bool, default=False): TODO
 
     """
+    if get_args().enable_bitpipe_schedule:
+        from megatron.core.pipeline_parallel.bitpipe_schedule import (
+            forward_backward_pipelining_with_BitPipe,
+        )
+        return forward_backward_pipelining_with_BitPipe
+
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     if pipeline_model_parallel_size > 1:
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:

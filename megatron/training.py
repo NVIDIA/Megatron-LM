@@ -36,6 +36,7 @@ from megatron.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import unwrap_model
+from megatron.utils import is_pipeline_stage_containing_loss
 from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import get_forward_backward_func
@@ -316,6 +317,41 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             raise NotImplementedError('Unknown DDP implementation specified: '
                                       '{}. Exiting.'.format(args.DDP_impl))
 
+    if args.enable_bitpipe_schedule:
+        if mpu.get_pipeline_model_parallel_rank() < mpu.get_pipeline_model_parallel_world_size() // 2: 
+            for model_module in model[0:2]:
+                for param in model_module.module.parameters():
+                    torch.distributed.broadcast(
+                        param.data,
+                        src=mpu.get_bd_parallel_src_rank(),
+                        group=mpu.get_bd_parallel_group(),
+                    )
+        else:
+            for model_module in model[1::-1]:
+                for param in model_module.module.parameters():
+                    torch.distributed.broadcast(
+                        param.data,
+                        src=mpu.get_bd_parallel_src_rank(),
+                        group=mpu.get_bd_parallel_group()
+                    )
+                  
+        if mpu.get_pipeline_model_parallel_rank() < mpu.get_pipeline_model_parallel_world_size() // 2: 
+            for model_module in model[2:]:
+                for param in model_module.module.parameters():
+                    torch.distributed.broadcast(
+                        param.data,
+                        src=mpu.get_bd_parallel_src_rank(),
+                        group=mpu.get_bd_parallel_group(),
+                    )
+        else:
+            for model_module in model[-1:1:-1]:
+                for param in model_module.module.parameters():
+                    torch.distributed.broadcast(
+                        param.data,
+                        src=mpu.get_bd_parallel_src_rank(),
+                        group=mpu.get_bd_parallel_group()
+                    )
+
     return model
 
 
@@ -488,7 +524,8 @@ def train_step(forward_step_func, data_iterator,
     if args.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
 
-    if mpu.is_pipeline_last_stage(ignore_virtual=True):
+    if is_pipeline_stage_containing_loss():
+    # if mpu.is_pipeline_last_stage(ignore_virtual=True):
         # Average loss across microbatches.
         loss_reduced = {}
         for key in losses_reduced[0]:
@@ -664,7 +701,11 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
-        print_rank_last(log_string)
+        # print_rank_last(log_string)
+        if get_args().enable_bitpipe_schedule:
+            print_rank_0(log_string)
+        else:
+            print_rank_last(log_string)
         if report_memory_flag and learning_rate > 0.:
             # Report memory after optimizer state has been initialized.
             report_memory('(after {} iterations)'.format(iteration))
@@ -884,6 +925,8 @@ def evaluate(forward_step_func,
 
     for key in total_loss_dict:
         total_loss_dict[key] /= args.eval_iters * eval_num_microbatches
+        if get_args().enable_bitpipe_schedule:
+            total_loss_dict[key] *=2
 
     return total_loss_dict, collected_non_loss_data
 
@@ -923,9 +966,14 @@ def evaluate_and_print_results(prefix, forward_step_func,
         process_non_loss_data_func(collected_non_loss_data, iteration, writer)
 
     length = len(string) + 1
-    print_rank_last('-' * length)
-    print_rank_last(string)
-    print_rank_last('-' * length)
+    if get_args().enable_bitpipe_schedule:
+        print_rank_0('-' * length)
+        print_rank_0(string)
+        print_rank_0('-' * length)
+    else:
+        print_rank_last('-' * length)
+        print_rank_last(string)
+        print_rank_last('-' * length)
 
 
 def cyclic_iter(iter):

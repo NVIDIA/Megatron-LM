@@ -1261,6 +1261,9 @@ def _get_num_layers(args, model_type, is_decoder=False):
                 and mpu.get_pipeline_model_parallel_rank() == 0 else
                 args.num_layers // args.transformer_pipeline_model_parallel_size
             )
+            # If existing bd，double it
+            if args.enable_bitpipe_schedule:
+                num_layers = (num_layers * 2)
     else:
         if not is_decoder:
             num_layers = args.encoder_num_layers
@@ -1457,6 +1460,35 @@ class ParallelTransformer(MegatronModule):
             offset = mpu.get_virtual_pipeline_model_parallel_rank() * (
                 config.num_layers // config.virtual_pipeline_model_parallel_size) + \
                 (mpu.get_pipeline_model_parallel_rank() * self.num_layers)
+            # BitPipe layers 
+            if args.enable_bitpipe_schedule:
+                assert config.virtual_pipeline_model_parallel_size == 4
+                # =4; With 16 layers, 4 devices, and 2 bidirectional stages, we want an assignment of
+                # layers to stages like (each list is a model chunk): orininal looping way
+                # device 0: [0, 1] [6, 7] [8, 9] [14, 15]
+                # device 1: [2, 3] [4, 5] [10, 11] [12, 13]
+                # device 2: [4, 5] [2, 3] [12, 13] [10, 11]
+                # device 3: [6, 7] [0, 1] [14, 15] [8, 9]
+                # V_shaped way
+                # device 0: [0, 1] [6, 7] [14, 15] [8, 9] 
+                # device 1: [2, 3] [4, 5] [12, 13] [10, 11] 
+                # device 2: [4, 5] [2, 3] [10, 11] [12, 13] 
+                # device 3: [6, 7] [0, 1] [8, 9]   [14, 15] 
+                # vp_idx =mpu.get_virtual_pipeline_model_parallel_rank()%2
+                vp_idx =mpu.get_virtual_pipeline_model_parallel_rank() if mpu.get_virtual_pipeline_model_parallel_rank()<2 else (mpu.get_virtual_pipeline_model_parallel_rank()-1)%2
+                offset = (
+                    mpu.get_pipeline_model_parallel_rank()
+                        * self.num_layers
+                    + vp_idx
+                    * (
+                        mpu.get_pipeline_model_parallel_world_size()
+                        - 1
+                        - 2 * mpu.get_pipeline_model_parallel_rank()
+                    )
+                    * self.num_layers
+                    + (mpu.get_virtual_pipeline_model_parallel_rank()//2)
+                    * (config.num_layers // 2)
+                )
         else:
             # Each stage gets a contiguous set of layers.
             if args.model_type == ModelType.encoder_and_decoder and \
