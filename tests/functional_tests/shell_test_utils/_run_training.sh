@@ -44,7 +44,7 @@ mv $TRAINING_PARAMS_PATH.tmp $TRAINING_PARAMS_PATH
 PARAMS="--exit-duration-in-mins $((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60 - 15))"
 
 # Run before script
-SCRIPT=$(cat $TRAINING_PARAMS_PATH | yq .'BEFORE_SCRIPT')
+SCRIPT=$(cat $TRAINING_PARAMS_PATH | yq '.BEFORE_SCRIPT')
 if [[ "$SCRIPT" != null ]]; then
     eval "$SCRIPT"
 fi;
