@@ -336,7 +336,7 @@ def add_multimodal_extra_args(parser):
                        help='Llava specific parameter. Defines at which index'
                        'in the language_embedding tensor the image_embeddings'
                        'should be inserted')
-    group.add_argument("--dataloader-save", type=str, help="Energon dataloader state save path")
+    group.add_argument("--dataloader-save", type=str, default=None, help="Energon dataloader state save path")
     return parser
 
 

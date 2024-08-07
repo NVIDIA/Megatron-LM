@@ -83,7 +83,7 @@ def train_valid_test_dataloaders_provider(train_val_test_num_samples):
 
     train_dataloader = get_savable_loader(train_ds, worker_config=worker_config)
     if args.load is not None:
-        if hasattr(args, "dataloader_save"):
+        if getattr(args, "dataloader_save", None):
             dp_rank = mpu.get_data_parallel_rank()
             data_save_name = get_checkpoint_name(
                 args.dataloader_save,
