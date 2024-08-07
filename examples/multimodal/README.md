@@ -21,7 +21,7 @@ Follow the instructions in `megatron-lm/docs/llama_mistral.md` to download weigh
 This example uses the OpenAI CLIP `ViT-L/14@336px` Vision model. To download the weights from OpenAI and convert them to a format that can be loaded in megatron, please run the following:
 
 ```
-python examples/multimodal/clip_converter.py --download-root /some/download/folder --output /some/output/folder --tensor-parallel-size 4
+python examples/multimodal/clip_converter.py --download-root /some/download/folder --output /some/output/folder --tensor-parallel-size 4 --use-te-layernorm-linear
 ```
 
 ### Combined model checkpoint
