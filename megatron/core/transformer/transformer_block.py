@@ -397,7 +397,7 @@ class TransformerBlock(MegatronModule):
         else:
             fp8_context = nullcontext()
 
-        with rng_context and fp8_context:
+        with rng_context, fp8_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = self._checkpointed_forward(
