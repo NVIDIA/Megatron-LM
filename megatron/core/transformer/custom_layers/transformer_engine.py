@@ -905,7 +905,23 @@ except ImportError:
 
 try:
 
-    from transformer_engine.pytorch.cpu_offload import get_cpu_offload_context
+    from transformer_engine.pytorch.cpu_offload import (
+        get_cpu_offload_context as _get_cpu_offload_context,
+    )
+
+    def get_cpu_offload_context(
+        enabled, num_layers, model_layers, activation_offloading, weight_offloading
+    ):
+        if _te_version > packaging.version.Version("1.8.0"):
+            context, sync_func = _get_cpu_offload_context(
+                enabled, num_layers, model_layers, activation_offloading, weight_offloading
+            )
+        else:
+            context, sync_func = _get_cpu_offload_context(
+                enabled, num_layers, activation_offloading, weight_offloading
+            )
+
+        return context, sync_func
 
 except ImportError:
 
