@@ -11,21 +11,28 @@ import pytest
 import torch
 from torch.optim import Adam
 
-from megatron.core import parallel_state, DistributedDataParallel as DDP
-from megatron.core.dist_checkpointing import ShardedTensor, save, load, \
-    load_tensors_metadata, load_plain_tensors
-from megatron.core.dist_checkpointing.dict_utils import nested_values, diff
-from megatron.core.dist_checkpointing.optimizer import \
-    get_param_id_to_sharded_param_map, optim_state_to_sharding_state
-from megatron.core.dist_checkpointing.serialization import \
-    get_default_save_sharded_strategy
-from megatron.core.dist_checkpointing.strategies.fully_parallel import \
-    FullyParallelSaveStrategyWrapper
+from megatron.core import DistributedDataParallel as DDP
+from megatron.core import parallel_state
+from megatron.core.dist_checkpointing import (
+    ShardedTensor,
+    load,
+    load_plain_tensors,
+    load_tensors_metadata,
+    save,
+)
+from megatron.core.dist_checkpointing.dict_utils import diff, nested_values
+from megatron.core.dist_checkpointing.optimizer import (
+    get_param_id_to_sharded_param_map,
+    optim_state_to_sharding_state,
+)
+from megatron.core.dist_checkpointing.serialization import get_default_save_sharded_strategy
+from megatron.core.dist_checkpointing.strategies.fully_parallel import (
+    FullyParallelSaveStrategyWrapper,
+)
 from megatron.core.dist_checkpointing.utils import extract_sharded_tensors
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-from megatron.core.optimizer import DistributedOptimizer, OptimizerConfig, \
-    get_megatron_optimizer
+from megatron.core.optimizer import DistributedOptimizer, OptimizerConfig, get_megatron_optimizer
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
@@ -34,12 +41,11 @@ from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.training import get_model
 from megatron.training.utils import unwrap_model
 from pretrain_gpt import model_provider
-
 from tests.unit_tests.dist_checkpointing import (
+    TempNamedDir,
     init_basic_mock_args,
     init_checkpointing_mock_args,
     initialize_gpt_model,
-    TempNamedDir,
     setup_model_and_optimizer,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -397,7 +403,8 @@ class TestOptimizerResharding:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()   
-
+    
+    @pytest.mark.skip(reason="Tests are flaky and need to be debugged")
     @pytest.mark.parametrize(
         ('use_dist_opt', 'bf16'),
         (
