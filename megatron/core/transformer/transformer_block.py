@@ -152,6 +152,7 @@ class TransformerBlock(MegatronModule):
             ) = get_cpu_offload_context(
                 self.config.cpu_offloading,
                 self.config.cpu_offloading_num_layers,
+                self.config.num_layers,
                 self.config.cpu_offloading_activations,
                 self.config.cpu_offloading_weights,
             )
