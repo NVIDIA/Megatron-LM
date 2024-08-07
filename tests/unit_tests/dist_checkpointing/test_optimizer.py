@@ -404,7 +404,6 @@ class TestOptimizerResharding:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()   
     
-    @pytest.mark.skip(reason="Tests are flaky and need to be debugged")
     @pytest.mark.parametrize(
         ('use_dist_opt', 'bf16'),
         (
@@ -422,6 +421,7 @@ class TestOptimizerResharding:
             ((8, 1), (1, 2)),
         ]
     )
+    @pytest.mark.skip(reason="Tests are flaky and need to be debugged")
     def test_optimizer_resharding(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_dist_opt, bf16):
         Utils.initialize_model_parallel(*src_tp_pp)
         with TempNamedDir(tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=False) as ckpt_dir_A:
