@@ -817,12 +817,14 @@ class ParallelAttention(MegatronModule):
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
 
         if self.enable_ds_sequence_parallel:
+            batch_dim_idx = 1
             if self.use_flash_attn:
                 if not self.use_flash_attn_triton:
                     query_layer, key_layer, value_layer = [rearrange(x, 's b ... -> b s ...').contiguous()
                             for x in (query_layer, key_layer, value_layer)]
+                    batch_dim_idx = 0
 
-                context_layer = self.dist_attn(query_layer, key_layer, value_layer)
+                context_layer = self.dist_attn(query_layer, key_layer, value_layer, batch_dim_idx)
 
                 if not self.use_flash_attn_triton:
                     context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
