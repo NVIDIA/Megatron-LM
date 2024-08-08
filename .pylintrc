@@ -1,7 +1,9 @@
-[MASTER]
-ignore=tests
+[MAIN]
+ignore-paths=tests
 
 [MESSAGES CONTROL]
 disable=all
 
-enable=C0115,C0116
+enable=C0115,C0116 
+# C0115: missing-class-docstring
+# C0116: missing-function-docstring
