@@ -1516,6 +1516,11 @@ def _add_data_args(parser):
                        '(3) a list of prefixes e.g. prefix1 prefix2. '
                        'For (3), weights are inferred from the lengths of the contributing datasets. '
                        'This argument is exclusive to the other independent --*-data-path arguments.')
+    group.add_argument('--renormalize-blend-weights', action='store_true',
+                       help='Renormalize the blend weights to account for the mid-level dataset '
+                       'oversampling done to ensure fulfillment of the requested number of '
+                       'samples. Use this option if prompted. Defaults to False for backward '
+                       'comparability in the data sample order.')
     group.add_argument('--split', type=str, default=None,
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '

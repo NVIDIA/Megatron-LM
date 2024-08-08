@@ -118,7 +118,11 @@ def test_builder():
         config = BlendedMegatronDatasetConfig(
             random_seed=1234,
             sequence_length=_SEQUENCE_LENGTH,
-            blend_per_split=[blends[Split.train], None, None,],
+            blend_per_split=[
+                blends[Split.train],
+                None,
+                None,
+            ],
         )
         try:
             datasets = BlendedMegatronDatasetBuilder(
@@ -131,7 +135,11 @@ def test_builder():
         config = BlendedMegatronDatasetConfig(
             random_seed=1234,
             sequence_length=_SEQUENCE_LENGTH,
-            blend_per_split=[get_blend_from_list([paths[Split.train][0]]), None, None,],
+            blend_per_split=[
+                get_blend_from_list([paths[Split.train][0]]),
+                None,
+                None,
+            ],
         )
         datasets = BlendedMegatronDatasetBuilder(
             TestDataset, [1000, None, None], lambda: True, config
@@ -187,7 +195,11 @@ def test_builder():
         config = BlendedMegatronDatasetConfig(
             random_seed=1234,
             sequence_length=_SEQUENCE_LENGTH,
-            blend_per_split=[blends_unweighted[Split.train], None, None,],
+            blend_per_split=[
+                blends_unweighted[Split.train],
+                None,
+                None,
+            ],
         )
         datasets = BlendedMegatronDatasetBuilder(
             TestDataset, [1000, None, None], lambda: True, config
@@ -227,7 +239,25 @@ def test_builder():
             config = BlendedMegatronDatasetConfig(
                 random_seed=1234,
                 sequence_length=_SEQUENCE_LENGTH,
-                blend_per_split=[blends[Split.train], blends[Split.valid], blends[Split.test],],
+                blend_per_split=[blends[Split.train], None, None],
+                renormalize_blend_weights=True,
+            )
+            datasets = BlendedMegatronDatasetBuilder(
+                TestDataset, [1000, None, None], lambda: True, config
+            ).build()
+            assert (
+                len(datasets[0]) >= 1000
+                and len(datasets[0]) <= 1000 * (1 + _MARGIN) + _NUM_DATASETS
+            )
+
+            config = BlendedMegatronDatasetConfig(
+                random_seed=1234,
+                sequence_length=_SEQUENCE_LENGTH,
+                blend_per_split=[
+                    blends[Split.train],
+                    blends[Split.valid],
+                    blends[Split.test],
+                ],
             )
             datasets = BlendedMegatronDatasetBuilder(
                 TestDataset, [100, 100, 100], lambda: True, config
@@ -344,6 +374,26 @@ def test_builder():
             # W = S / sum(S)
             #
             ##
+            config = BlendedMegatronDatasetConfig(
+                random_seed=1234,
+                sequence_length=_SEQUENCE_LENGTH,
+                blend=blends[Split.train],
+                split="990,9,1",
+                renormalize_blend_weights=True,
+            )
+            datasets = BlendedMegatronDatasetBuilder(
+                TestDataset, [100000, 1000, 1], lambda: True, config
+            ).build()
+            assert (
+                len(datasets[0]) >= 100000
+                and len(datasets[0]) <= 100000 * (1 + _MARGIN) + _NUM_DATASETS
+            )
+            assert (
+                len(datasets[1]) >= 1000
+                and len(datasets[1]) <= 1000 * (1 + _MARGIN) + _NUM_DATASETS
+            )
+            assert len(datasets[2]) >= 1 and len(datasets[2]) <= 1 * (1 + _MARGIN) + _NUM_DATASETS
+
             config = BlendedMegatronDatasetConfig(
                 random_seed=1234,
                 sequence_length=_SEQUENCE_LENGTH,

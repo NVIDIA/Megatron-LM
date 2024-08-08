@@ -110,6 +110,7 @@ def get_gpt_chunk_datasets(config):
             get_blend_from_list(args.valid_data_path),
             get_blend_from_list(args.test_data_path)
         ],
+        renormalize_blend_weights=args.renormalize_blend_weights,
         split=config.retro_gpt_split,
         split_preprocessing=config.retro_gpt_split,
         path_to_cache=config.retro_gpt_data_cache_path,
