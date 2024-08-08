@@ -300,6 +300,7 @@ class SwitchMLP(MegatronModule):
 class CoreAttention(MegatronModule):
 
     def __init__(self, layer_number, config,
+                 softmax_scale=None,
                  attn_mask_type=AttnMaskType.padding):
         super(CoreAttention, self).__init__()
         self.fp16 = config.fp16
@@ -324,11 +325,15 @@ class CoreAttention(MegatronModule):
         self.num_attention_heads_per_partition = core.utils.divide(
             config.num_attention_heads, world_size)
 
-        coeff = None
-        self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
-        if self.apply_query_key_layer_scaling:
-            coeff = self.layer_number
-            self.norm_factor *= coeff
+        if softmax_scale is None:
+            self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
+        elif softmax_scale == 1:
+            self.norm_factor = None
+        else:
+            self.norm_factor = softmax_scale
+
+        if self.config.apply_query_key_layer_scaling:
+            self.norm_factor *= self.layer_number
 
         self.scale_mask_softmax = FusedScaleMaskSoftmax(
             self.fp16, self.bf16,
@@ -336,7 +341,7 @@ class CoreAttention(MegatronModule):
             config.masked_softmax_fusion,
             attention_mask_func,
             self.attention_softmax_in_fp32,
-            coeff)
+            self.norm_factor)
 
         # Dropout. Note that for a single iteration, this layer will generate
         # different outputs on different number of parallel partitions but
