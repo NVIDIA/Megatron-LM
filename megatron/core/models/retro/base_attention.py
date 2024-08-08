@@ -9,7 +9,6 @@ from megatron.core.transformer.module import MegatronModule
 
 
 class BaseRetroCrossAttention(MegatronModule):
-
     """Base class for Retro cross attention, for both encoder & decoder layers.
 
     This class collects the retro arguments below (i.e., num neighbors, chunk

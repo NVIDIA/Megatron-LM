@@ -97,9 +97,7 @@ class DistributedDataParallel(MegatronModule):
                 expert_parallel_params.append(param)
 
         def allocate_buffers_for_parameters(
-            input_params,
-            data_parallel_group,
-            gradient_scaling_factor,
+            input_params, data_parallel_group, gradient_scaling_factor
         ):
             param_and_grad_dtype_to_params = {}
 

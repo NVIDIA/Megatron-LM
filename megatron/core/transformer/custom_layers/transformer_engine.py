@@ -39,9 +39,7 @@ _te_version = get_te_version()
 
 
 def _get_extra_te_kwargs(config: TransformerConfig):
-    extra_transformer_engine_kwargs = {
-        "params_dtype": config.params_dtype,
-    }
+    extra_transformer_engine_kwargs = {"params_dtype": config.params_dtype}
 
     if _te_version >= packaging.version.Version("0.12.0"):
         if config.use_cpu_initialization:
@@ -62,12 +60,7 @@ class TENorm:
     """
 
     # TODO should we ditch normalization config and just use spec to choose LayerNorm vs RMSNorm?
-    def __new__(
-        cls,
-        config: TransformerConfig,
-        hidden_size: int,
-        eps: float = 1e-5,
-    ):
+    def __new__(cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5):
         if config.normalization == "LayerNorm":
             instance = te.pytorch.LayerNorm(
                 hidden_size=hidden_size,
@@ -559,13 +552,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 **packed_seq_kwargs,
             )
         else:
-            core_attn_out = super().forward(
-                query,
-                key,
-                value,
-                attention_mask,
-                **packed_seq_kwargs,
-            )
+            core_attn_out = super().forward(query, key, value, attention_mask, **packed_seq_kwargs)
 
         if self.config.apply_rope_fusion and qkv_format == 'bshd':
             return core_attn_out.transpose(0, 1)
@@ -767,12 +754,7 @@ if _te_version >= packaging.version.Version("1.9.0.dev0"):
             """
             tp_axis_map = {}
             for gemm_idx in range(self.num_gemms):
-                tp_axis_map.update(
-                    {
-                        f'{gemm_idx}.weight': 0,
-                        f'{gemm_idx}.bias': 0,
-                    }
-                )
+                tp_axis_map.update({f'{gemm_idx}.weight': 0, f'{gemm_idx}.bias': 0})
             return super()._sharded_state_dict_grouped(
                 tp_axis_map, prefix, sharded_offsets, metadata
             )

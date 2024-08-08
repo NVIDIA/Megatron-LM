@@ -270,9 +270,7 @@ def unpermute_with_padded_tokens(
 
     # Prepare a tensor of zeros with the desired output shape
     empty_tokens = torch.zeros(
-        restore_shape,
-        dtype=combined_output.dtype,
-        device=combined_output.device,
+        restore_shape, dtype=combined_output.dtype, device=combined_output.device
     )
 
     # Scatter the combined tokens back to their original positions
@@ -325,9 +323,7 @@ def topk_softmax_with_capacity(
     else:
         # TopK with capacity
         expert_capacity = get_capacity(
-            num_tokens=num_tokens * topk,
-            num_experts=num_experts,
-            capacity_factor=capacity_factor,
+            num_tokens=num_tokens * topk, num_experts=num_experts, capacity_factor=capacity_factor
         )
         # TopK selection, Maskout unused experts
         topk_masked_gates = torch.zeros_like(logits).scatter(1, top_indices, probs)
@@ -418,9 +414,7 @@ def reduce_aux_losses_tracker_across_ranks():
             torch.distributed.all_reduce(values, group=tracker[name].get('reduce_group'))
         if tracker[name].get('avg_group') is not None:
             torch.distributed.all_reduce(
-                values,
-                group=tracker[name]['avg_group'],
-                op=torch.distributed.ReduceOp.AVG,
+                values, group=tracker[name]['avg_group'], op=torch.distributed.ReduceOp.AVG
             )
 
 

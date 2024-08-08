@@ -385,12 +385,7 @@ class _MMapBinReader(_BinReader):
         Returns:
             numpy.ndarray: An array with `count` items and data-type `dtype` constructed from reading bytes from the data file starting at `offset`.
         """
-        return numpy.frombuffer(
-            self._bin_buffer,
-            dtype=dtype,
-            count=count,
-            offset=offset,
-        )
+        return numpy.frombuffer(self._bin_buffer, dtype=dtype, count=count, offset=offset)
 
     def __del__(self) -> None:
         """Clean up the object."""
@@ -633,9 +628,7 @@ class IndexedDataset(torch.utils.data.Dataset):
         if isinstance(idx, (int, numpy.integer)):
             sequence_pointer, sequence_length, sequence_mode = self.index[idx]
             sequence = self.bin_reader.read(
-                dtype=self.index.dtype,
-                count=sequence_length,
-                offset=sequence_pointer,
+                dtype=self.index.dtype, count=sequence_length, offset=sequence_pointer
             )
             return (sequence, sequence_mode) if sequence_mode is not None else sequence
         elif isinstance(idx, slice):

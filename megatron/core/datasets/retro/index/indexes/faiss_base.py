@@ -52,7 +52,7 @@ class FaissBaseIndex(Index):
 
         # Load data.
         merged_path = get_training_data_merged_path(config)
-        inp = np.memmap(merged_path, dtype="f4", mode="r",).reshape((-1, config.hidden_size))
+        inp = np.memmap(merged_path, dtype="f4", mode="r").reshape((-1, config.hidden_size))
 
         # Init index.
         index = faiss.index_factory(config.hidden_size, config.retro_index_str)

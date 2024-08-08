@@ -150,11 +150,7 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
         # need to do a broadcast for every pp group, even though num_tokens should be the same.
         num_tokens_list = []
         for lr, group in zip(last_rank, pp_group):
-            torch.distributed.broadcast(
-                num_tokens,
-                src=lr,
-                group=group,
-            )
+            torch.distributed.broadcast(num_tokens, src=lr, group=group)
             num_tokens_list.append(torch.clone(num_tokens))
         assert all(x.item() == num_tokens_list[0] for x in num_tokens_list)
 

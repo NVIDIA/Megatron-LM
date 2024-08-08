@@ -110,11 +110,7 @@ def test_builder():
         config = BlendedMegatronDatasetConfig(
             random_seed=1234,
             sequence_length=_SEQUENCE_LENGTH,
-            blend_per_split=[
-                blends[Split.train],
-                None,
-                None,
-            ],
+            blend_per_split=[blends[Split.train], None, None],
         )
         try:
             datasets = BlendedMegatronDatasetBuilder(
@@ -127,11 +123,7 @@ def test_builder():
         config = BlendedMegatronDatasetConfig(
             random_seed=1234,
             sequence_length=_SEQUENCE_LENGTH,
-            blend_per_split=[
-                get_blend_from_list([paths[Split.train][0]]),
-                None,
-                None,
-            ],
+            blend_per_split=[get_blend_from_list([paths[Split.train][0]]), None, None],
         )
         datasets = BlendedMegatronDatasetBuilder(
             TestDataset, [1000, None, None], lambda: True, config
@@ -187,11 +179,7 @@ def test_builder():
         config = BlendedMegatronDatasetConfig(
             random_seed=1234,
             sequence_length=_SEQUENCE_LENGTH,
-            blend_per_split=[
-                blends_unweighted[Split.train],
-                None,
-                None,
-            ],
+            blend_per_split=[blends_unweighted[Split.train], None, None],
         )
         datasets = BlendedMegatronDatasetBuilder(
             TestDataset, [1000, None, None], lambda: True, config
@@ -245,11 +233,7 @@ def test_builder():
             config = BlendedMegatronDatasetConfig(
                 random_seed=1234,
                 sequence_length=_SEQUENCE_LENGTH,
-                blend_per_split=[
-                    blends[Split.train],
-                    blends[Split.valid],
-                    blends[Split.test],
-                ],
+                blend_per_split=[blends[Split.train], blends[Split.valid], blends[Split.test]],
             )
             datasets = BlendedMegatronDatasetBuilder(
                 TestDataset, [100, 100, 100], lambda: True, config

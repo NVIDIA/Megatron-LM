@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
@@ -16,7 +17,9 @@ HIDDEN_SIZE = 16
 NUM_ATTENTION_HEADS = 8
 
 
-def initialize_gpt_model(pre_process=True, post_process=True, seed=0, use_glu=True, **config_kwargs):
+def initialize_gpt_model(
+    pre_process=True, post_process=True, seed=0, use_glu=True, **config_kwargs
+):
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
 
@@ -59,6 +62,7 @@ def init_basic_mock_args(args, tp, pp, bf16=True):
     args.pipeline_model_parallel_size = pp
     return args
 
+
 def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.non_persistent_global_ckpt_dir = None
     args.non_persistent_ckpt_type = None
@@ -90,15 +94,28 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.hidden_size = HIDDEN_SIZE
     args.num_attention_heads = NUM_ATTENTION_HEADS
 
-def setup_model_and_optimizer(seed, tp, pp, initialize_fn=initialize_gpt_model, bf16=True, dist_opt=True):
+
+def setup_model_and_optimizer(
+    seed, tp, pp, initialize_fn=initialize_gpt_model, bf16=True, dist_opt=True
+):
     mock_args = SimpleNamespace()
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
-        model = get_model(partial(
-            initialize_fn, seed=seed, tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp, pipeline_dtype=torch.bfloat16
-        ))
+        model = get_model(
+            partial(
+                initialize_fn,
+                seed=seed,
+                tensor_model_parallel_size=tp,
+                pipeline_model_parallel_size=pp,
+                pipeline_dtype=torch.bfloat16,
+            )
+        )
 
-    config = OptimizerConfig(bf16=bf16, params_dtype=torch.bfloat16 if bf16 else torch.float, use_distributed_optimizer=dist_opt)
+    config = OptimizerConfig(
+        bf16=bf16,
+        params_dtype=torch.bfloat16 if bf16 else torch.float,
+        use_distributed_optimizer=dist_opt,
+    )
     optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)

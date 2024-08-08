@@ -19,10 +19,10 @@ class TestTorchSoftmax:
             softmax_in_fp32=True,
             scale=None,
         )
-    
+
     def teardown_method(self):
-        get_default_causal_mask.cache_clear() 
-    
+        get_default_causal_mask.cache_clear()
+
     def test_output_shape(self):
         x = torch.randn(8, 2, 4, 4, device="cuda")
         y = self.softmax(x, None)

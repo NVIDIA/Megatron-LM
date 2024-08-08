@@ -34,9 +34,14 @@ def initialize_t5_model(seed, encoder_spec_fn, decoder_spec_fn, num_layers=2, **
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
 
-    default_config_kwargs=dict(
-        num_layers=num_layers, hidden_size=16, num_attention_heads=12, kv_channels=64, ffn_hidden_size=64,
-        use_cpu_initialization=True, pipeline_dtype=torch.bfloat16
+    default_config_kwargs = dict(
+        num_layers=num_layers,
+        hidden_size=16,
+        num_attention_heads=12,
+        kv_channels=64,
+        ffn_hidden_size=64,
+        use_cpu_initialization=True,
+        pipeline_dtype=torch.bfloat16,
     )
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs)
@@ -45,10 +50,16 @@ def initialize_t5_model(seed, encoder_spec_fn, decoder_spec_fn, num_layers=2, **
 
     en_block_spec = TransformerBlockSubmodules([encoder_spec_fn()] * num_layers)
     de_block_spec = TransformerBlockSubmodules([decoder_spec_fn()] * num_layers)
-    model = T5Model(encoder_config=transformer_config, config=transformer_config,
-                    transformer_encoder_layer_spec=en_block_spec, transformer_decoder_layer_spec=de_block_spec,
-                    pre_process=False, post_process=False,
-                    vocab_size=29184, max_sequence_length=4)
+    model = T5Model(
+        encoder_config=transformer_config,
+        config=transformer_config,
+        transformer_encoder_layer_spec=en_block_spec,
+        transformer_decoder_layer_spec=de_block_spec,
+        pre_process=False,
+        post_process=False,
+        vocab_size=29184,
+        max_sequence_length=4,
+    )
 
     with torch.no_grad():
         for p in model.parameters():
@@ -59,14 +70,16 @@ def initialize_t5_model(seed, encoder_spec_fn, decoder_spec_fn, num_layers=2, **
 class TestT5Model:
     def setup_method(self, method):
         pass
-    
+
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
-        
+
     @pytest.mark.parametrize('src_spec_type', ['te', 'local'])
     @pytest.mark.parametrize('dst_spec_type', ['te', 'local'])
     @pytest.mark.parametrize('model_type', ['t5'])
-    def test_sharded_state_dict_save_load(self, tmp_path_dist_ckpt, src_spec_type, dst_spec_type, model_type):
+    def test_sharded_state_dict_save_load(
+        self, tmp_path_dist_ckpt, src_spec_type, dst_spec_type, model_type
+    ):
         enc_dec_spec_fn = {
             'te': {
                 't5': (t5_encoder_te_spec, t5_decoder_te_spec),
@@ -75,7 +88,7 @@ class TestT5Model:
             'local': {
                 't5': (t5_encoder_local_spec, t5_decoder_local_spec),
                 'retro': (get_retro_encoder_layer_local_spec, get_retro_decoder_layer_local_spec),
-            }
+            },
         }
         src_encoder_spec_fn, src_decoder_spec_fn = enc_dec_spec_fn[src_spec_type][model_type]
         dst_encoder_spec_fn, dst_decoder_spec_fn = enc_dec_spec_fn[dst_spec_type][model_type]
@@ -91,7 +104,9 @@ class TestT5Model:
             gpt_model = initialize_t5_model(2, dst_encoder_spec_fn, dst_decoder_spec_fn)
             sharded_state_dict = gpt_model.sharded_state_dict()
 
-            state_dict, missing_keys, unexpected_keys = load(sharded_state_dict, ckpt_dir, strict=StrictHandling.RETURN_ALL)
+            state_dict, missing_keys, unexpected_keys = load(
+                sharded_state_dict, ckpt_dir, strict=StrictHandling.RETURN_ALL
+            )
             # Potential mismatch is because of extra states which is ok
             assert all('_extra_state' in k for k in missing_keys)
             assert all('_extra_state' in k for k in unexpected_keys)

@@ -82,14 +82,12 @@ def do_test_preprocess_data(temp_dir, extra_args=[]):
     dummy_jsonl(path_to_raws)
 
     # build the datasets
-    build_datasets(
-        path_to_raws, path_to_data, extra_args=extra_args,
-    )
+    build_datasets(path_to_raws, path_to_data, extra_args=extra_args)
 
     # merge the datasets
     merge_datasets(path_to_data)
 
-    sys.argv = [sys.argv[0], "--input", None, "--output-prefix", None,] + extra_args
+    sys.argv = [sys.argv[0], "--input", None, "--output-prefix", None] + extra_args
     encoder = Encoder(build_args())
     encoder.initializer()
 
@@ -184,6 +182,7 @@ def gpt2_merge(odir):
         writer.write(requests.get(PRETRAINED_MERGES_ARCHIVE_MAP['gpt2']).content)
     return path
 
+
 @pytest.mark.skip(reason="Tests are flaky and need to be debugged")
 def test_preprocess_data_gpt():
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -213,6 +212,7 @@ def bert_vocab(odir):
     with open(path, "wb") as writer:
         writer.write(requests.get(__HUGGINGFACE_BERT_BASE_UNCASED_VOCAB).content)
     return path
+
 
 @pytest.mark.skip(reason="Tests are flaky and need to be debugged")
 def test_preprocess_data_bert():

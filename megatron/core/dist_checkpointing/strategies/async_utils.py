@@ -76,11 +76,7 @@ class DistributedAsyncCaller:
         self.process: Optional[mp.Process] = None
         self.start_time: Optional[float] = None
 
-    def schedule_async_call(
-        self,
-        async_fn: Optional[Callable],
-        save_args: Tuple,
-    ) -> None:
+    def schedule_async_call(self, async_fn: Optional[Callable], save_args: Tuple) -> None:
         """Spawn a process with `async_fn` as the target.
 
         This method must be called on all ranks.
@@ -101,10 +97,7 @@ class DistributedAsyncCaller:
 
         ctx = mp.get_context('fork')
         self.start_time = time()
-        self.process = ctx.Process(
-            target=async_fn,
-            args=save_args,
-        )
+        self.process = ctx.Process(target=async_fn, args=save_args)
         self.process.start()
         init_time = time()
         logger.debug(

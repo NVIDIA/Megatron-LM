@@ -10,10 +10,7 @@ from tensorboard.backend.event_processing import event_accumulator
 # Since we expect every step to be there when we do our comparisons, we explicitly
 # set the size guidance to 0 so that we load everything. It's okay given our tests
 # are small/short.
-SIZE_GUIDANCE = {
-    event_accumulator.TENSORS: 0,
-    event_accumulator.SCALARS: 0,
-}
+SIZE_GUIDANCE = {event_accumulator.TENSORS: 0, event_accumulator.SCALARS: 0}
 
 logger = logging.getLogger()
 

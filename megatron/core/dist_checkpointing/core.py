@@ -11,14 +11,14 @@ CONFIG_FNAME = 'metadata.json'
 
 
 class CheckpointingException(Exception):
-    """ Base checkpointing related exception  """
+    """Base checkpointing related exception"""
 
     pass
 
 
 @dataclass
 class CheckpointingConfig:
-    """ Documents backends used in the checkpoint.
+    """Documents backends used in the checkpoint.
 
     Checkpoint config keeps track of formats used for storing the sharded tensors
     (sharded_backend) and other objects (common_backend).
@@ -34,7 +34,7 @@ class CheckpointingConfig:
 
 
 def check_is_distributed_checkpoint(checkpoint_dir):
-    """ Checks if `metadata.json` exists in the checkpoint and is a valid config.
+    """Checks if `metadata.json` exists in the checkpoint and is a valid config.
 
     Args:
         checkpoint_dir: checkpoint directory
@@ -46,7 +46,7 @@ def check_is_distributed_checkpoint(checkpoint_dir):
 
 
 def maybe_load_config(checkpoint_dir: str) -> Optional[CheckpointingConfig]:
-    """ Returns checkpoint config if `checkpoint_dir` is a distributed checkpoint and None otherwise
+    """Returns checkpoint config if `checkpoint_dir` is a distributed checkpoint and None otherwise
 
     Args:
         checkpoint_dir: checkpoint directory
@@ -63,7 +63,7 @@ def maybe_load_config(checkpoint_dir: str) -> Optional[CheckpointingConfig]:
 
 
 def save_config(config: CheckpointingConfig, checkpoint_dir: str):
-    """ Save given config to checkpoint directory.
+    """Save given config to checkpoint directory.
 
     Args:
         config: checkpoint config

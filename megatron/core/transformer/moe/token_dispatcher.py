@@ -23,11 +23,7 @@ class MoETokenDispatcher:
         self.config = config
 
     @abstractmethod
-    def token_permutation(
-        self,
-        tokens: torch.Tensor,
-        indices: torch.Tensor,
-    ):
+    def token_permutation(self, tokens: torch.Tensor, indices: torch.Tensor):
         """Dispatch tokens to experts.
 
         Args:
@@ -41,10 +37,7 @@ class MoETokenDispatcher:
 
     @abstractmethod
     def token_unpermutation(
-        self,
-        expert_output: torch.Tensor,
-        probs: torch.Tensor,
-        indices: torch.Tensor,
+        self, expert_output: torch.Tensor, probs: torch.Tensor, indices: torch.Tensor
     ):
         """Restores the expert output to its original ordering.
 
@@ -65,10 +58,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
     """
 
     def __init__(
-        self,
-        num_local_experts: int,
-        local_expert_indices: List[int],
-        config: TransformerConfig,
+        self, num_local_experts: int, local_expert_indices: List[int], config: TransformerConfig
     ) -> None:
         """
         Initialize the zero token dropping router.
@@ -163,8 +153,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             # The indices of local_indices that give its sorted order along dim 0.
             self.indices = torch.argsort(local_indices, dim=0)
             tokens_per_expert = torch.bincount(
-                local_indices.view(-1),
-                minlength=self.config.num_moe_experts,
+                local_indices.view(-1), minlength=self.config.num_moe_experts
             )
             if self.num_local_experts < self.config.num_moe_experts:
                 tokens_per_expert = tokens_per_expert[
@@ -179,16 +168,9 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             permuted_local_hidden_states = moe_gather.apply(local_hidden_states, self.indices)
         else:
             permuted_local_hidden_states = local_hidden_states
-        return (
-            permuted_local_hidden_states,
-            tokens_per_expert,
-        )
+        return (permuted_local_hidden_states, tokens_per_expert)
 
-    def token_unpermutation(
-        self,
-        hidden_states: torch.Tensor,
-        bias: torch.Tensor = None,
-    ):
+    def token_unpermutation(self, hidden_states: torch.Tensor, bias: torch.Tensor = None):
         """
         Reverse process of `dispatch()` which permutes the ouput of local
         experts locallay and across expert parallel rank into the original order to
@@ -299,10 +281,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
     """
 
     def __init__(
-        self,
-        num_local_experts: int,
-        local_expert_indices: List[int],
-        config: TransformerConfig,
+        self, num_local_experts: int, local_expert_indices: List[int], config: TransformerConfig
     ) -> None:
         """
         Initialize the AlltoAll token dispatcher.
@@ -442,10 +421,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         return num_tokens_per_local_expert
 
     def token_permutation(
-        self,
-        hidden_states: torch.Tensor,
-        probs: torch.Tensor,
-        indices: torch.Tensor,
+        self, hidden_states: torch.Tensor, probs: torch.Tensor, indices: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Dispatch tokens to local experts using AlltoAll communication.
@@ -522,9 +498,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         return global_input_tokens, tokens_per_expert
 
     def token_unpermutation(
-        self,
-        hidden_states: torch.Tensor,
-        bias: torch.Tensor = None,
+        self, hidden_states: torch.Tensor, bias: torch.Tensor = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Reverse the token permutation to restore the original order.
@@ -551,8 +525,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         if self.num_local_experts > 1:
             if not self.drop_and_pad:
                 hidden_states = unpermute(
-                    hidden_states,
-                    self.reversed_global_input_permutation_mapping,
+                    hidden_states, self.reversed_global_input_permutation_mapping
                 )
             else:
                 hidden_states = hidden_states.reshape(

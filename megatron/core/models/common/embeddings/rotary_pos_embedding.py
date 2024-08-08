@@ -223,10 +223,7 @@ def apply_rotary_pos_emb_thd(
 
 
 def apply_rotary_pos_emb(
-    t: Tensor,
-    freqs: Tensor,
-    config: TransformerConfig,
-    cu_seqlens: Optional[Tensor] = None,
+    t: Tensor, freqs: Tensor, config: TransformerConfig, cu_seqlens: Optional[Tensor] = None
 ):
     """
     Reroute to the appropriate apply_rotary_pos_emb function depending on

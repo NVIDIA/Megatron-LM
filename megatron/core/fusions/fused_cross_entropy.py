@@ -33,14 +33,10 @@ def calculate_predicted_logits(
     vocab_end_index: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
-    (
-        target_mask,
-        masked_target_1d,
-        predicted_logits,
-        sum_exp_logits,
-        exp_logits,
-    ) = VocabParallelCrossEntropy.calculate_predicted_logits(
-        vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
+    (target_mask, masked_target_1d, predicted_logits, sum_exp_logits, exp_logits) = (
+        VocabParallelCrossEntropy.calculate_predicted_logits(
+            vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
+        )
     )
 
     predicted_logits_sum_exp_logits = torch.cat((predicted_logits, sum_exp_logits))
@@ -71,12 +67,9 @@ def calculate_gradients(
     masked_target_1d: torch.Tensor,
 ) -> torch.Tensor:
 
-    (
-        grad_2d,
-        arange_1d,
-        softmax_update,
-        grad_input,
-    ) = VocabParallelCrossEntropy.prepare_gradient_calculation_operands(softmax, target_mask)
+    (grad_2d, arange_1d, softmax_update, grad_input) = (
+        VocabParallelCrossEntropy.prepare_gradient_calculation_operands(softmax, target_mask)
+    )
 
     grad_input = VocabParallelCrossEntropy.calculate_gradients(
         grad_2d, arange_1d, masked_target_1d, softmax_update, grad_input, grad_output
@@ -103,13 +96,10 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         world_size = get_tensor_model_parallel_world_size()
         vocab_start_index, vocab_end_index = get_vocab_range(partition_vocab_size, rank, world_size)
 
-        (
-            target_mask,
-            masked_target_1d,
-            predicted_logits_sum_exp_logits,
-            exp_logits,
-        ) = calculate_predicted_logits(
-            vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
+        (target_mask, masked_target_1d, predicted_logits_sum_exp_logits, exp_logits) = (
+            calculate_predicted_logits(
+                vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
+            )
         )
 
         # All reduce is needed to get the chunks from other GPUs.

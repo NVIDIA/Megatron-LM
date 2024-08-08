@@ -30,11 +30,7 @@ class BertLMHead(MegatronModule):
         config (TransformerConfig): TransformerConfig object
     """
 
-    def __init__(
-        self,
-        hidden_size: int,
-        config: TransformerConfig,
-    ):
+    def __init__(self, hidden_size: int, config: TransformerConfig):
         super().__init__(config=config)
 
         # TODO: Should switch this to TE ?
@@ -46,9 +42,7 @@ class BertLMHead(MegatronModule):
         setattr(self.dense.bias, 'sequence_parallel', config.sequence_parallel)
 
         self.layer_norm = LNImpl(
-            config=config,
-            hidden_size=hidden_size,
-            eps=config.layernorm_epsilon,
+            config=config, hidden_size=hidden_size, eps=config.layernorm_epsilon
         )
 
         self.gelu = torch.nn.functional.gelu

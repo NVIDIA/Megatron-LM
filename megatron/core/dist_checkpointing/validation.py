@@ -100,10 +100,7 @@ class StrictHandling(Enum):
     @staticmethod
     def requires_returning_mismatch_keys(val: 'StrictHandling') -> bool:
         """Whether a given strict option results in extra return value from the `load` function."""
-        return val in (
-            StrictHandling.RETURN_UNEXPECTED,
-            StrictHandling.RETURN_ALL,
-        )
+        return val in (StrictHandling.RETURN_UNEXPECTED, StrictHandling.RETURN_ALL)
 
 
 def parse_strict_flag(strict: Union[str, StrictHandling]) -> StrictHandling:
@@ -253,8 +250,7 @@ def verify_checkpoint_and_load_strategy(
 
 
 def adjust_non_strict_load(
-    sharded_state_dict: ShardedStateDict,
-    sharded_keys_to_remove: Set[str],
+    sharded_state_dict: ShardedStateDict, sharded_keys_to_remove: Set[str]
 ) -> ShardedStateDict:
     """Adjusts sharded state dict removing keys not existing in the checkpoint.
 

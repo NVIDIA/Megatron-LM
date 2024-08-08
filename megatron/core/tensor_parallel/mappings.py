@@ -368,7 +368,7 @@ class _AllGatherFromTensorParallelRegion(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input_):
-        return _gather_along_last_dim(input_,)
+        return _gather_along_last_dim(input_)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -384,7 +384,7 @@ class _ReduceScatterToTensorParallelRegion(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input_):
-        return _reduce_scatter_along_last_dim(input_,)
+        return _reduce_scatter_along_last_dim(input_)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -514,7 +514,7 @@ def all_to_all_hp2sp(input_):
 
     Args:
         input_ (torch.Tensor): The input tensor which has been distributed along the hidden dimension.
-        
+
     Returns:
         torch.Tensor: The output tensor with shape [num_tokens/TP, H].
     """

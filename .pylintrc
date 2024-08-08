@@ -1,0 +1,7 @@
+[MASTER]
+ignore=tests
+
+[MESSAGES CONTROL]
+disable=all
+
+enable=C0115,C0116

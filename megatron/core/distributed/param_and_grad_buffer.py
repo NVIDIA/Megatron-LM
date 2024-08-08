@@ -324,11 +324,7 @@ class ParamAndGradBuffer:
                     assert data_start_index % self.data_parallel_world_size == 0
                 _create_new_bucket(data_start_index)
 
-            self.param_index_map[param] = (
-                data_start_index,
-                data_end_index,
-                bucket_id,
-            )
+            self.param_index_map[param] = (data_start_index, data_end_index, bucket_id)
             bucket_params.add(param)
 
             # If we have enough elements already or the current param is part of the shared embedding

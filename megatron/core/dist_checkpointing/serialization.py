@@ -182,8 +182,7 @@ def load_common_state_dict(checkpoint_dir: Path) -> StateDict:
 
 
 def load_tensors_metadata(
-    checkpoint_dir: str,
-    sharded_strategy: Union[LoadShardedStrategy, None] = None,
+    checkpoint_dir: str, sharded_strategy: Union[LoadShardedStrategy, None] = None
 ) -> CkptShardedMetadata:
     """Load tensors metadata from the checkpoint.
 

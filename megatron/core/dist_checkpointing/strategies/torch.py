@@ -524,8 +524,7 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         ):
             self._intermediate_read_item_and_target = (read_item, target_tensor)
             target_tensor = Float8Tensor.make_like(
-                target_tensor,
-                data=target_tensor._data.contiguous(),
+                target_tensor, data=target_tensor._data.contiguous()
             )
         return target_tensor
 
@@ -588,9 +587,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self.use_cached_ckpt_structure: bool = cached_metadata
 
     def async_save(
-        self,
-        sharded_state_dict: ShardedStateDict,
-        checkpoint_dir: Path,
+        self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path
     ) -> AsyncRequest:
         """Translates MCore ShardedTensors to PyT ShardedTensors and saves in PyT Distributed format.
 
@@ -601,12 +598,10 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         Returns: None
         """
         # Translate the state dict
-        (
-            sharded_state_dict,
-            flat_mapping,
-            rename_mapping,
-        ) = _replace_state_dict_keys_with_sharded_keys(
-            sharded_state_dict, self.keep_only_main_replica
+        (sharded_state_dict, flat_mapping, rename_mapping) = (
+            _replace_state_dict_keys_with_sharded_keys(
+                sharded_state_dict, self.keep_only_main_replica
+            )
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
         # Use PyT saving mechanism
@@ -716,11 +711,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
 
         orig_sharded_state_dict = sharded_state_dict
         # MCore state dict to PyT Distributed compatible
-        (
-            sharded_state_dict,
-            flat_mapping,
-            rename_mapping,
-        ) = _replace_state_dict_keys_with_sharded_keys(sharded_state_dict)
+        (sharded_state_dict, flat_mapping, rename_mapping) = (
+            _replace_state_dict_keys_with_sharded_keys(sharded_state_dict)
+        )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, True)
         # Load PyT Distributed format
         checkpoint.load_state_dict(
@@ -764,8 +757,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             if nd_orig_global_shape is None:
                 # Regular tensor
                 sharded_metadata[k] = ShardedTensor.from_rank_offsets(
-                    k,
-                    torch.empty(tp.size, **tp.properties.__dict__, device='meta'),
+                    k, torch.empty(tp.size, **tp.properties.__dict__, device='meta')
                 ).without_data()
             else:
                 # N-D flattened tensor

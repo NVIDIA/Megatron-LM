@@ -63,9 +63,7 @@ def get_retro_encoder_layer_te_spec() -> ModuleSpec:
     spec.submodules.pre_cross_attn_layernorm = TENorm
     spec.submodules.cross_attention = ModuleSpec(
         module=RetroEncoderCrossAttention,
-        params={
-            "attn_mask_type": AttnMaskType.padding,
-        },
+        params={"attn_mask_type": AttnMaskType.padding},
         submodules=CrossAttentionSubmodules(
             linear_q=TEColumnParallelLinear,
             linear_kv=TEColumnParallelLinear,
@@ -74,16 +72,10 @@ def get_retro_encoder_layer_te_spec() -> ModuleSpec:
         ),
     )
     spec.submodules.cross_attn_bda = ModuleSpec(module=RetroEncoderBiasDropoutAdd)
-    spec.submodules.pre_mlp_layernorm = ModuleSpec(
-        module=RetroEncoderLayerNorm,
-        submodules=TENorm,
-    )
+    spec.submodules.pre_mlp_layernorm = ModuleSpec(module=RetroEncoderLayerNorm, submodules=TENorm)
     spec.submodules.mlp = ModuleSpec(
         module=MLP,
-        submodules=MLPSubmodules(
-            linear_fc1=TEColumnParallelLinear,
-            linear_fc2=TERowParallelLinear,
-        ),
+        submodules=MLPSubmodules(linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear),
     )
     return spec
 
@@ -103,9 +95,7 @@ def get_retro_encoder_layer_local_spec() -> ModuleSpec:
     spec.submodules.pre_cross_attn_layernorm = LNImpl
     spec.submodules.cross_attention = ModuleSpec(
         module=RetroEncoderCrossAttention,
-        params={
-            "attn_mask_type": AttnMaskType.padding,
-        },
+        params={"attn_mask_type": AttnMaskType.padding},
         submodules=CrossAttentionSubmodules(
             linear_q=ColumnParallelLinear,
             linear_kv=ColumnParallelLinear,
@@ -114,19 +104,13 @@ def get_retro_encoder_layer_local_spec() -> ModuleSpec:
         ),
     )
     spec.submodules.cross_attn_bda = ModuleSpec(module=RetroEncoderBiasDropoutAdd)
-    spec.submodules.pre_mlp_layernorm = ModuleSpec(
-        module=RetroEncoderLayerNorm,
-        submodules=LNImpl,
-    )
+    spec.submodules.pre_mlp_layernorm = ModuleSpec(module=RetroEncoderLayerNorm, submodules=LNImpl)
     spec.submodules.mlp = ModuleSpec(
         module=MLP,
-        submodules=MLPSubmodules(
-            linear_fc1=ColumnParallelLinear,
-            linear_fc2=RowParallelLinear,
-        ),
+        submodules=MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear),
     )
     spec.submodules.sharded_state_dict_keys_map = {
-        'input_layernorm.': 'self_attention.linear_qkv.layer_norm_',
+        'input_layernorm.': 'self_attention.linear_qkv.layer_norm_'
     }  # pre_mlp_layernorm doesn't need remapping
     return spec
 
@@ -168,9 +152,7 @@ def get_retro_encoder_block_spec(
         spec.submodules.self_attention.params["attn_mask_type"] = AttnMaskType.padding
         spec.submodules.self_attention.submodules.core_attention = ModuleSpec(
             module=TEDotProductAttention if use_transformer_engine else DotProductAttention,
-            params={
-                "attention_dropout": config.retro_encoder_attention_dropout,
-            },
+            params={"attention_dropout": config.retro_encoder_attention_dropout},
         )
 
     layer_specs = []

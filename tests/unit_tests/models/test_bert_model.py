@@ -1,33 +1,45 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import pytest
-
-import torch
 import os
+
+import pytest
+import torch
 from pkg_resources import packaging
-from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.bert.bert_model import BertModel
-from tests.unit_tests.test_utilities import Utils
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from pytest_mock import mocker
+
 from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec
-from pytest_mock import mocker 
+from megatron.core.models.bert.bert_model import BertModel
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.test_utilities import Utils
+
 
 class TestBertModel:
 
     def setup_method(self, method):
-        os.environ['NVTE_ALLOW_NONDETERMINISTIC_ALGO'] = '0' #Bert does not support flash attention
+        os.environ['NVTE_ALLOW_NONDETERMINISTIC_ALGO'] = (
+            '0'  # Bert does not support flash attention
+        )
         tp = 1
         pp = 1
         Utils.initialize_model_parallel(tp, pp)
         model_parallel_cuda_manual_seed(123)
         transformer_config = TransformerConfig(
-            num_layers=2, hidden_size=12, num_attention_heads=4,
-            use_cpu_initialization=True, perform_initialization=True,
-            tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp, pipeline_dtype=torch.bfloat16
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            perform_initialization=True,
+            tensor_model_parallel_size=tp,
+            pipeline_model_parallel_size=pp,
+            pipeline_dtype=torch.bfloat16,
         )
         self.bert_model = BertModel(
-            config=transformer_config, num_tokentypes=0,
-            transformer_layer_spec=bert_layer_with_transformer_engine_spec, vocab_size=100, max_sequence_length=4
+            config=transformer_config,
+            num_tokentypes=0,
+            transformer_layer_spec=bert_layer_with_transformer_engine_spec,
+            vocab_size=100,
+            max_sequence_length=4,
         )
 
     def teardown_method(self, method):
@@ -77,66 +89,105 @@ class TestBertModel:
 class TestBertModelAssertions:
 
     def test_te_assertions_te_less_than_1_7(self, mocker):
-        os.environ.pop('NVTE_ALLOW_NONDETERMINISTIC_ALGO',None)
-        os.environ.pop('NVTE_FLASH_ATTN',None)
-        os.environ.pop('NVTE_FUSED_ATTN',None)
+        os.environ.pop('NVTE_ALLOW_NONDETERMINISTIC_ALGO', None)
+        os.environ.pop('NVTE_FLASH_ATTN', None)
+        os.environ.pop('NVTE_FUSED_ATTN', None)
         tp = 1
         pp = 1
-        Utils.initialize_model_parallel(tp, pp)        
+        Utils.initialize_model_parallel(tp, pp)
         model_parallel_cuda_manual_seed(123)
         transformer_config = TransformerConfig(
-            num_layers=2, hidden_size=12, num_attention_heads=4,
-            use_cpu_initialization=True, perform_initialization=True,
-            tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp, pipeline_dtype=torch.bfloat16
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            perform_initialization=True,
+            tensor_model_parallel_size=tp,
+            pipeline_model_parallel_size=pp,
+            pipeline_dtype=torch.bfloat16,
         )
 
         with pytest.raises(Exception) as exc_info:
-            mocker.patch("megatron.core.models.bert.bert_model.get_te_version", return_value = packaging.version.Version("1.4"))
-            self.bert_model = BertModel(
-                config=transformer_config, num_tokentypes=0,
-                transformer_layer_spec=bert_layer_with_transformer_engine_spec, vocab_size=100, max_sequence_length=4
+            mocker.patch(
+                "megatron.core.models.bert.bert_model.get_te_version",
+                return_value=packaging.version.Version("1.4"),
             )
-        assert str(exc_info.value) == "Flash and fused attention is not supported with transformer engine version < 1.7. Set NVTE_FLASH_ATTN=0 and NVTE_FUSED_ATTN=0 or upgrade transformer engine >= 1.7 or set NVTE_ALLOW_NONDETERMINISTIC_ALGO=0"
+            self.bert_model = BertModel(
+                config=transformer_config,
+                num_tokentypes=0,
+                transformer_layer_spec=bert_layer_with_transformer_engine_spec,
+                vocab_size=100,
+                max_sequence_length=4,
+            )
+        assert (
+            str(exc_info.value)
+            == "Flash and fused attention is not supported with transformer engine version < 1.7. Set NVTE_FLASH_ATTN=0 and NVTE_FUSED_ATTN=0 or upgrade transformer engine >= 1.7 or set NVTE_ALLOW_NONDETERMINISTIC_ALGO=0"
+        )
 
     def test_te_assertions_te_equal_to_1_7_exception(self, mocker):
-        os.environ.pop('NVTE_ALLOW_NONDETERMINISTIC_ALGO',None)
+        os.environ.pop('NVTE_ALLOW_NONDETERMINISTIC_ALGO', None)
         os.environ['NVTE_FLASH_ATTN'] = '0'
         os.environ['NVTE_FUSED_ATTN'] = '0'
         tp = 1
         pp = 1
-        Utils.initialize_model_parallel(tp, pp)        
+        Utils.initialize_model_parallel(tp, pp)
         model_parallel_cuda_manual_seed(123)
         transformer_config = TransformerConfig(
-            num_layers=2, hidden_size=12, num_attention_heads=4,
-            use_cpu_initialization=True, perform_initialization=True,
-            tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp, pipeline_dtype=torch.bfloat16
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            perform_initialization=True,
+            tensor_model_parallel_size=tp,
+            pipeline_model_parallel_size=pp,
+            pipeline_dtype=torch.bfloat16,
         )
 
         with pytest.raises(Exception) as exc_info:
-            mocker.patch("megatron.core.models.bert.bert_model.get_te_version", return_value = packaging.version.Version("1.7"))
-            self.bert_model = BertModel(
-                config=transformer_config, num_tokentypes=0,
-                transformer_layer_spec=bert_layer_with_transformer_engine_spec, vocab_size=100, max_sequence_length=4
+            mocker.patch(
+                "megatron.core.models.bert.bert_model.get_te_version",
+                return_value=packaging.version.Version("1.7"),
             )
-        assert str(exc_info.value) == "Set env variable NVTE_FLASH_ATTN to 1 or NVTE_FUSED_ATTN to 1 to use a more optimized attention kernal. Currently using unfused attention path. If you want to proceed with this path set AttnMaskType in module spec to be arbitrary"
-
-    def test_te_assertions_te_equal_to_1_7_no_exception(self, mocker):
-        os.environ.pop('NVTE_ALLOW_NONDETERMINISTIC_ALGO',None)
-        os.environ.pop('NVTE_FLASH_ATTN',None)
-        os.environ.pop('NVTE_FUSED_ATTN',None)
-        tp = 1
-        pp = 1
-        Utils.initialize_model_parallel(tp, pp)        
-        model_parallel_cuda_manual_seed(123)
-        transformer_config = TransformerConfig(
-            num_layers=2, hidden_size=12, num_attention_heads=4,
-            use_cpu_initialization=True, perform_initialization=True,
-            tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp, pipeline_dtype=torch.bfloat16
+            self.bert_model = BertModel(
+                config=transformer_config,
+                num_tokentypes=0,
+                transformer_layer_spec=bert_layer_with_transformer_engine_spec,
+                vocab_size=100,
+                max_sequence_length=4,
+            )
+        assert (
+            str(exc_info.value)
+            == "Set env variable NVTE_FLASH_ATTN to 1 or NVTE_FUSED_ATTN to 1 to use a more optimized attention kernal. Currently using unfused attention path. If you want to proceed with this path set AttnMaskType in module spec to be arbitrary"
         )
 
-        mocker.patch("megatron.core.models.bert.bert_model.get_te_version", return_value = packaging.version.Version("1.7"))
+    def test_te_assertions_te_equal_to_1_7_no_exception(self, mocker):
+        os.environ.pop('NVTE_ALLOW_NONDETERMINISTIC_ALGO', None)
+        os.environ.pop('NVTE_FLASH_ATTN', None)
+        os.environ.pop('NVTE_FUSED_ATTN', None)
+        tp = 1
+        pp = 1
+        Utils.initialize_model_parallel(tp, pp)
+        model_parallel_cuda_manual_seed(123)
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            perform_initialization=True,
+            tensor_model_parallel_size=tp,
+            pipeline_model_parallel_size=pp,
+            pipeline_dtype=torch.bfloat16,
+        )
+
+        mocker.patch(
+            "megatron.core.models.bert.bert_model.get_te_version",
+            return_value=packaging.version.Version("1.7"),
+        )
         self.bert_model = BertModel(
-            config=transformer_config, num_tokentypes=0,
-            transformer_layer_spec=bert_layer_with_transformer_engine_spec, vocab_size=100, max_sequence_length=4
+            config=transformer_config,
+            num_tokentypes=0,
+            transformer_layer_spec=bert_layer_with_transformer_engine_spec,
+            vocab_size=100,
+            max_sequence_length=4,
         )
         Utils.destroy_model_parallel()

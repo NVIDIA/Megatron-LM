@@ -36,7 +36,7 @@ class TransformerLayerSubmodules:
 
 
 class BaseTransformerLayer(ABC):
-    """ A common parent class for `TransformerLayer` like implementations.
+    """A common parent class for `TransformerLayer` like implementations.
 
     A dummy class that is subclassed by similar `TransformerLayer`s e.g. the
     `TransformerLayer` in this file and possibly other `TransformerLayer`
@@ -82,7 +82,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         ## [Module 2: SelfAttention]
         self.self_attention = build_module(
-            submodules.self_attention, config=self.config, layer_number=layer_number,
+            submodules.self_attention, config=self.config, layer_number=layer_number
         )
 
         ## [Module 3: BiasDropoutFusion]
@@ -98,11 +98,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         ## [Module 5: CrossAttention]
         self.cross_attention = build_module(
-            submodules.cross_attention, config=self.config, layer_number=layer_number,
+            submodules.cross_attention, config=self.config, layer_number=layer_number
         )
 
         ## [Module 6: BiasDropoutFusion]
-        self.cross_attn_bda = build_module(submodules.cross_attn_bda, config=self.config,)
+        self.cross_attn_bda = build_module(submodules.cross_attn_bda, config=self.config)
 
         ## [Module 7: Pre MLP] Optional Layernorm before MLP
         self.pre_mlp_layernorm = build_module(

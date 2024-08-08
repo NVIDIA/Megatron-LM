@@ -80,9 +80,7 @@ def get_vit_layer_with_local_spec() -> ModuleSpec:
 
 
 # Helper function to get module spec for MLP/MoE
-def _get_mlp_module_spec(
-    use_te: bool = True,
-) -> ModuleSpec:
+def _get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
     # Dense MLP w/ or w/o TE modules.
     return ModuleSpec(
         module=MLP,

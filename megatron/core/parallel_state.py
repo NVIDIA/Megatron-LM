@@ -118,9 +118,7 @@ def get_nccl_options(pg_name, nccl_comm_cfgs):
 
 
 def generate_masked_orthogonal_rank_groups(
-    world_size: int,
-    parallel_size: List[int],
-    mask: List[bool],
+    world_size: int, parallel_size: List[int], mask: List[bool]
 ) -> List[List[int]]:
     """Generate orthogonal parallel groups based on the parallel size and mask.
 
@@ -748,9 +746,7 @@ def initialize_model_parallel(
 
         embedding_ranks = get_embedding_ranks(ranks)
         group = torch.distributed.new_group(
-            embedding_ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options('embd', nccl_comm_cfgs),
+            embedding_ranks, timeout=timeout, pg_options=get_nccl_options('embd', nccl_comm_cfgs)
         )
         if rank in embedding_ranks:
             _EMBEDDING_GROUP = group
@@ -871,10 +867,7 @@ def is_unitialized() -> bool:
     Deprecated. Use is_initialized instead.
 
     """
-    warnings.warn(
-        "is_unitialized is deprecated, use is_initialized instead",
-        DeprecationWarning,
-    )
+    warnings.warn("is_unitialized is deprecated, use is_initialized instead", DeprecationWarning)
     return not is_initialized()
 
 

@@ -24,8 +24,7 @@ mamba_stack_spec = ModuleSpec(
                 mixer=ModuleSpec(
                     module=MambaMixer,
                     submodules=MambaMixerSubmodules(
-                        in_proj=TELayerNormColumnParallelLinear,
-                        out_proj=TERowParallelLinear,
+                        in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
                     ),
                 ),
                 mamba_bda=get_bias_dropout_add,
@@ -58,8 +57,7 @@ mamba_stack_spec = ModuleSpec(
                 mlp=ModuleSpec(
                     module=MLP,
                     submodules=MLPSubmodules(
-                        linear_fc1=TELayerNormColumnParallelLinear,
-                        linear_fc2=TERowParallelLinear,
+                        linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
                     ),
                 ),
                 mlp_bda=get_bias_dropout_add,
