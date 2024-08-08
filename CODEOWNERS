@@ -1,12 +1,47 @@
-[MCORE][3]
-megatron/core/ @shanmugamr @jcasper @eharper @terryk @okoenig
+[Core-ADLR] @mcore-reviewers/core-adlr
+megatron/core/ 
 
-[TESTS]
-tests/ @shanmugamr @terryk @okoenig
+[Core-NeMo] @mcore-reviewers/core-nemo
+megatron/core/ 
 
-[MODELOPT]
-megatron/core/inference/modelopt_support @chenhany @kmorabia
-examples/inference/quantization @chenhany @kmorabia
+^[Core-MLPerf] @mcore-reviewers/mlperf
+megatron/core/
 
-[DATASETS]
-megatron/core/datasets @jkamalu @jcasper @eharper
+[MoE-ADLR] @mcore-reviewers/moe-adlr
+megatron/core/transformer/moe
+
+[MoE-Moe] @mcore-reviewers/moe-moe
+megatron/core/transformer/moe
+
+[Datasets] @mcore-reviewers/datasets
+megatron/core/datasets 
+
+[BERT] @mcore-reviewers/bert
+megatron/core/models/bert
+
+[GPT] @mcore-reviewers/gpt
+megatron/core/models/gpt
+
+[Retro] @mcore-reviewers/retro
+megatron/core/models/retro
+
+[Distributed Checkpointing] @mcore-reviewers/dist-checkpointing
+megatron/core/dist_checkpointing
+
+[Distributed Optimizer] @mcore-reviewers/dist-optimizer
+megatron/core/optimizer/distrib_optimizer 
+
+[Inference] @mcore-reviewers/inference
+megatron/core/inference
+
+[Quantization and Inference (QAT)] @mcore-reviewers/quantization-and-inference
+megatron/core/inference
+
+; [Context Parallelism] @mcore-reviewers/context-parallelism
+; 
+
+[CI] @mcore-reviewers/ci
+.gitlab-ci.yml
+Dockerfile.ci
+jet-tests.yml
+tests/
