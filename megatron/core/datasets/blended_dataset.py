@@ -74,6 +74,7 @@ class BlendedDataset(torch.utils.data.Dataset):
         unique_identifiers["split"] = self.split.name
         unique_identifiers["weights"] = self.weights
         unique_identifiers["size"] = self.size
+        unique_identifiers["renormalize_blend_weights"] = self.config.renormalize_blend_weights
 
         self.unique_description = json.dumps(
             unique_identifiers, indent=4, default=lambda obj: obj.unique_identifiers

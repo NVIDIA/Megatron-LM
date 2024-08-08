@@ -150,7 +150,8 @@ class BlendedMegatronDatasetBuilder(object):
                     for i, dataset_and_size in enumerate(zip(dataset.datasets, sizes)):
                         if len(dataset_and_size[0]) < dataset_and_size[1]:
                             raise IndexError(
-                                f"{type(dataset).__name__} blend goes out of bounds for {type([dataset_and_size[0]]).__name__} {i} for {dataset.split.name} split"
+                                f"The {dataset.split.name} blend oversamples (N = {dataset_and_size[1]}) {type(dataset_and_size[0]).__name__} {i} (len = {len(dataset_and_size[0])}). "
+                                f"Set renormalize_blend_weights to True and re-run. File an issue if the problem is not resolved."
                             )
 
         return datasets
@@ -208,7 +209,10 @@ class BlendedMegatronDatasetBuilder(object):
                 if split[i] is not None:
                     weights_i = weights
                     if weights_i is not None and self.sizes[i] is not None:
-                        size_i = sum(list(zip(*sizes_per_dataset))[i])
+                        size_per_dataset = list(zip(*sizes_per_dataset))[i]
+                        size_i = sum(size_per_dataset)
+                        if self.config.renormalize_blend_weights:
+                            weights_i = list(map(lambda _size: _size / size_i, size_per_dataset))
                     elif weights_i is None:
                         try:
                             weights_i = [
@@ -272,7 +276,10 @@ class BlendedMegatronDatasetBuilder(object):
 
                     # Build top-level dataset
                     if weights is not None and self.sizes[i] is not None:
-                        size = list(map(sum, zip(*sizes_per_dataset)))[i]
+                        size_per_dataset = list(zip(*sizes_per_dataset))[i]
+                        size = sum(size_per_dataset)
+                        if self.config.renormalize_blend_weights:
+                            weights = list(map(lambda _size: _size / size, size_per_dataset))
                     elif weights is None:
                         try:
                             weights = [
