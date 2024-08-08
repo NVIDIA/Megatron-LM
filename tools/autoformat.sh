@@ -15,6 +15,7 @@ fi
 if [[ -n "$CHANGED_FILES" ]]; then
     black --skip-magic-trailing-comma $ADDITIONAL_ARGS $ADDITIONAL_BLACK_ARGS --verbose $CHANGED_FILES
     isort $ADDITIONAL_ARGS $CHANGED_FILES
+    pylint $CHANGED_FILES
 else
     echo Changeset is empty, all good.
 fi
