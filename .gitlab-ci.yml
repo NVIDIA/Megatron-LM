@@ -34,6 +34,7 @@ workflow:
 stages:
   - test 
   - functional_tests
+  - publish
 
 default:
   interruptible: true
@@ -54,6 +55,12 @@ variables:
     options:
       - "yes"
       - "no"
+  PUBLISH: 
+    value: "no"
+    options: 
+      - "yes"
+      - "no"
+    description: Build and publish a wheel to PyPi
   SCOPE:
     value: "mr"
     options:
@@ -465,4 +472,19 @@ convergence-test:
 
       env
       bash tests/functional_tests/shell_test_utils/run_ci_test_locally.sh
-  
+
+publish-wheel:
+  image: quay.io/pypa/manylinux_2_28_x86_64
+  stage: publish
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^core_r/ && $PUBLISH == "yes"
+      when: manual
+    - when: never
+  before_script:
+    - pip install twine
+  script:
+    - /opt/python/cp310-cp310/bin/python -m build
+    - /opt/python/cp311-cp311/bin/python -m build
+    - auditwheel repair dist/*.whl
+    - twine upload --repository pypi wheelhouse/*
+
