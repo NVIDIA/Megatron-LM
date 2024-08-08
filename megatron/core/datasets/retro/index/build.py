@@ -41,7 +41,7 @@ def get_empty_index_path(config: RetroPreprocessingConfig) -> str:
 
     Args:
         config (RetroPreprocessingConfig): Retro preprocessing config.
-    
+
     Returns:
         Path to the empty (trained, but without added samples) vector index.
     """

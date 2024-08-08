@@ -28,8 +28,8 @@ class Net(nn.Module):
 
 def test_chained_optimizer():
     net = Net()
-    optimizer_1 = Adam(list(net.parameters())[:2], lr=0.01,)
-    optimizer_2 = SGD(list(net.parameters())[2:], lr=0.1, momentum=0.9,)
+    optimizer_1 = Adam(list(net.parameters())[:2], lr=0.01)
+    optimizer_2 = SGD(list(net.parameters())[2:], lr=0.1, momentum=0.9)
     chained_optimizer = ChainedOptimizer([optimizer_1, optimizer_2])
 
     # Test the chained optimizer's param groups is a reference of the underlying optimizers' param groups

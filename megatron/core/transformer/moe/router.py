@@ -40,10 +40,7 @@ class Router(ABC, MegatronModule):
 
         # Initialize the gate weights.
         self.weight = torch.nn.Parameter(
-            torch.empty(
-                (self.config.num_moe_experts, self.config.hidden_size),
-                dtype=torch.float32,
-            )
+            torch.empty((self.config.num_moe_experts, self.config.hidden_size), dtype=torch.float32)
         )
         if config.perform_initialization:
             if get_cuda_rng_tracker().is_initialized():
@@ -99,10 +96,7 @@ class Router(ABC, MegatronModule):
 class TopKRouter(Router):
     """Route each token to the top-k experts."""
 
-    def __init__(
-        self,
-        config: TransformerConfig,
-    ) -> None:
+    def __init__(self, config: TransformerConfig) -> None:
         """Initialize the zero token dropping router.
 
         Args:
@@ -228,10 +222,7 @@ class TopKRouter(Router):
             z_loss = z_loss_func(logits, moe_z_loss_coeff)
             logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
             save_to_aux_losses_tracker(
-                "z_loss",
-                z_loss / moe_z_loss_coeff,
-                self.layer_number,
-                self.config.num_layers,
+                "z_loss", z_loss / moe_z_loss_coeff, self.layer_number, self.config.num_layers
             )
         return logits
 

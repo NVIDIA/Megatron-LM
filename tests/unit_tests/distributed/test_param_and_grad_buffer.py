@@ -1,11 +1,12 @@
 import contextlib
 import math
+
 import pytest
 import torch
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallelConfig, ParamAndGradBuffer
-from tests.unit_tests.test_utilities import Utils, TestModel
+from tests.unit_tests.test_utilities import TestModel, Utils
 
 
 def get_model_and_buffers(

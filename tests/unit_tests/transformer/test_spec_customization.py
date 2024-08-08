@@ -55,7 +55,7 @@ class TestSpecCustomization:
 
         # specify layernorm spec with module path to test dynamic importing
         self.layernorm_spec = ModuleSpec(
-            module=("megatron.core.transformer.custom_layers.transformer_engine", "TENorm"),
+            module=("megatron.core.transformer.custom_layers.transformer_engine", "TENorm")
         )
 
         # specify bias dropout add with module path
@@ -97,7 +97,7 @@ class TestSpecCustomization:
         assert x == random_input
 
         # Check SelfAttention
-        self_attention = build_module(self.attention_spec, config=self.config, layer_number=1,)
+        self_attention = build_module(self.attention_spec, config=self.config, layer_number=1)
         assert isinstance(self_attention, SelfAttention)
         assert self_attention.layer_number == 1
         assert self_attention.attn_mask_type == self.attention_spec.params['attn_mask_type']

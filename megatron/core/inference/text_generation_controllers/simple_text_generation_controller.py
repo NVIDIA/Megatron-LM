@@ -189,8 +189,7 @@ class SimpleTextGenerationController:
         return torch.tensor(batch_prompt_tokens_list).cuda()
 
     def generate_output_tokens_dynamic_batch(
-        self,
-        active_requests: OrderedDict[int, InferenceRequest],
+        self, active_requests: OrderedDict[int, InferenceRequest]
     ) -> OrderedDict[int, InferenceRequest]:
         """Utility to generate the output tokens and probabilities for the prompts
 
@@ -205,8 +204,7 @@ class SimpleTextGenerationController:
         raise Exception("Not implemented yet")
 
     def generate_all_output_tokens_static_batch(
-        self,
-        active_requests: OrderedDict[int, InferenceRequest],
+        self, active_requests: OrderedDict[int, InferenceRequest]
     ) -> OrderedDict[int, InferenceRequest]:
         """Utility to generate the all the output tokens and probabilities for the prompts .
 
@@ -305,15 +303,14 @@ class SimpleTextGenerationController:
                 context_start_position = context_end_position
 
                 # Check end of generation status for each tensor and update generated sequence lengths
-                (
-                    is_generation_done_tensor,
-                    generated_sequence_lengths,
-                ) = self.update_generation_status(
-                    updated_prompts_tokens=batch_prompt_tokens,
-                    generation_started=generation_started,
-                    current_context_end_position=context_end_position,
-                    is_generation_done_tensor=is_generation_done_tensor,
-                    generated_sequence_lengths=generated_sequence_lengths,
+                (is_generation_done_tensor, generated_sequence_lengths) = (
+                    self.update_generation_status(
+                        updated_prompts_tokens=batch_prompt_tokens,
+                        generation_started=generation_started,
+                        current_context_end_position=context_end_position,
+                        is_generation_done_tensor=is_generation_done_tensor,
+                        generated_sequence_lengths=generated_sequence_lengths,
+                    )
                 )
                 # Boolean flag indicating if all prompts are finished
                 all_prompts_done = torch.all(is_generation_done_tensor)

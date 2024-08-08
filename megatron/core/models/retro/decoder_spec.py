@@ -73,9 +73,7 @@ def get_retro_decoder_layer_te_spec(
     spec.submodules.pre_cross_attn_layernorm = TENorm
     spec.submodules.cross_attention = ModuleSpec(
         module=RetroDecoderCrossAttention,
-        params={
-            "encoder_block_spec": encoder_block_spec,
-        },
+        params={"encoder_block_spec": encoder_block_spec},
         submodules=CrossAttentionSubmodules(
             linear_q=TEColumnParallelLinear,
             linear_kv=TEColumnParallelLinear,
@@ -108,9 +106,7 @@ def get_retro_decoder_layer_local_spec(
     spec.submodules.pre_cross_attn_layernorm = LNImpl
     spec.submodules.cross_attention = ModuleSpec(
         module=RetroDecoderCrossAttention,
-        params={
-            "encoder_block_spec": encoder_block_spec,
-        },
+        params={"encoder_block_spec": encoder_block_spec},
         submodules=CrossAttentionSubmodules(
             linear_q=ColumnParallelLinear,
             linear_kv=ColumnParallelLinear,

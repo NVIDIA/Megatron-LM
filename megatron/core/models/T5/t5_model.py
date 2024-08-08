@@ -247,12 +247,10 @@ class T5Model(LanguageModule):
             Tensor: loss tensor
         """
 
-        (
-            encoder_attn_mask,
-            decoder_attn_mask,
-            encoder_decoder_attn_mask,
-        ) = t5_extended_attention_mask(
-            [encoder_attn_mask, decoder_attn_mask, encoder_decoder_attn_mask]
+        (encoder_attn_mask, decoder_attn_mask, encoder_decoder_attn_mask) = (
+            t5_extended_attention_mask(
+                [encoder_attn_mask, decoder_attn_mask, encoder_decoder_attn_mask]
+            )
         )
 
         ## Encoder forward

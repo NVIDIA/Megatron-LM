@@ -21,7 +21,7 @@ class TestLLaVAModel:
             num_layers=3, hidden_size=128, num_attention_heads=8, use_cpu_initialization=True
         )
         vision_config = TransformerConfig(
-            num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True,
+            num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
         )
         vision_projection_config = TransformerConfig(
             num_layers=2,
@@ -101,7 +101,7 @@ class TestLLaVAModel:
         kv_dict = inference_params.key_value_memory_dict
 
         assert kv_dict["image_tokens_count"] == 577
-        for layer_no in range(1, 4):    # 3 layers in the model.
+        for layer_no in range(1, 4):  # 3 layers in the model.
             layer_kv = kv_dict[layer_no]
             # Expected shape is [sequence_len, batch_size, num_heads, hidden_size_per_head]
             assert layer_kv[0].shape == layer_kv[1].shape == torch.Size((1601, 2, 8, 16))

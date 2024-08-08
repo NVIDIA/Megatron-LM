@@ -22,7 +22,6 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 
 
 class RetroDecoderCrossAttention(BaseRetroCrossAttention):
-
     """Retro decoder's chunked cross attention operator.
 
     See this paper for more details: https://arxiv.org/abs/2112.04426.
@@ -69,7 +68,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
 
         if encoder_block_spec:
             self.encoder = TransformerBlock(
-                config=config, spec=encoder_block_spec, pre_process=True, post_process=False,
+                config=config, spec=encoder_block_spec, pre_process=True, post_process=False
             )
             # self._encoder_key = 'encoder' # ... necessary?
         else:
@@ -124,7 +123,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
 
                 # Pad partial chunk with zeros.
                 first_chunk = torch.nn.functional.pad(
-                    first_chunk, (0, 0, 0, 0, 0, self.retro_chunk_length - first_ns), 'constant', 0,
+                    first_chunk, (0, 0, 0, 0, 0, self.retro_chunk_length - first_ns), 'constant', 0
                 )
 
                 # Concatenate padded chunk with remaining chunks.
@@ -169,7 +168,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
 
         # Pad attending tokens to sequence length.
         padded_chunks = torch.nn.functional.pad(
-            attending_chunks, (0, 0, 0, 0, 0, self.retro_chunk_length - 1), 'constant', 0,
+            attending_chunks, (0, 0, 0, 0, 0, self.retro_chunk_length - 1), 'constant', 0
         )
 
         # Permute attending chunks.
@@ -210,7 +209,6 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
 
 
 class RetroDecoderBiasDropoutAdd(MegatronModule):
-
     """Retro decoder's bias-dropout-add operator.
 
     This operator takes care of reshaping and permuting the output from the
@@ -220,9 +218,7 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
         config (RetroConfig): Retro config.
     """
 
-    def __init__(
-        self, config: RetroConfig,
-    ):
+    def __init__(self, config: RetroConfig):
         super().__init__(config=config)
         self.retro_chunk_length = config.retro_chunk_length
 
@@ -282,7 +278,7 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
             )
 
             # Prepend zeros for non-attending tokens.
-            x = torch.nn.functional.pad(x, (0, 0, 0, 0, pad, 0), 'constant', 0,)[
+            x = torch.nn.functional.pad(x, (0, 0, 0, 0, pad, 0), 'constant', 0)[
                 :ns
             ]  # [ ns, bs, d ]
 

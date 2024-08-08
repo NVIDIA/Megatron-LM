@@ -154,15 +154,7 @@ class MaskedWordPieceDataset(MegatronDataset):
         )
         path_to_description = get_path_to("description.txt")
         path_to_sample_index = get_path_to("sample_index.npy")
-        cache_hit = all(
-            map(
-                os.path.isfile,
-                [
-                    path_to_description,
-                    path_to_sample_index,
-                ],
-            )
-        )
+        cache_hit = all(map(os.path.isfile, [path_to_description, path_to_sample_index]))
 
         if self.num_samples is not None:
             num_epochs = numpy.iinfo(numpy.int32).max - 1

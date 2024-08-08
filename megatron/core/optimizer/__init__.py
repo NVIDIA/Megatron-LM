@@ -247,12 +247,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                     hysteresis=config.hysteresis,
                 )
 
-        optimizer_args = [
-            optimizer,
-            config,
-            grad_scaler,
-            init_state_fn,
-        ]
+        optimizer_args = [optimizer, config, grad_scaler, init_state_fn]
         if config.use_distributed_optimizer:
             optimizer = DistributedOptimizer(
                 *optimizer_args,
@@ -266,11 +261,7 @@ def _get_megatron_optimizer_based_on_param_groups(
             setattr(optimizer, 'model_parallel_group', model_parallel_group)
     else:
         # FP32 optimizer.
-        optimizer = FP32Optimizer(
-            optimizer,
-            config,
-            init_state_fn,
-        )
+        optimizer = FP32Optimizer(optimizer, config, init_state_fn)
         setattr(optimizer, 'model_parallel_group', model_parallel_group)
 
     return optimizer

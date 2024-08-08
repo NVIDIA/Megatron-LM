@@ -58,7 +58,7 @@ class FaissParallelAddIndex(FaissBaseIndex):
         """
 
         # Embed block.
-        embeddings = self.embed_text_dataset_block(embedder, text_dataset, block["range"],)
+        embeddings = self.embed_text_dataset_block(embedder, text_dataset, block["range"])
 
         # Encode block.
         log_retro_rank_0("encode.")
@@ -108,7 +108,7 @@ class FaissParallelAddIndex(FaissBaseIndex):
             assert len(f["data"].shape) == 2
 
         blocks = get_blocks_by_rank(
-            codes_dir, len(text_dataset), config.retro_block_size, validate=validate,
+            codes_dir, len(text_dataset), config.retro_block_size, validate=validate
         )
 
         # Encode each block.
@@ -119,7 +119,7 @@ class FaissParallelAddIndex(FaissBaseIndex):
                 # Progress.
                 log_retro_rank_0(
                     "encode block %d / %d ... %s."
-                    % (block_index, len(blocks.missing), block["path"],)
+                    % (block_index, len(blocks.missing), block["path"])
                 )
 
                 # Encode and save.
@@ -156,7 +156,7 @@ class FaissParallelAddIndex(FaissBaseIndex):
         for code_path in pbar:
             pbar.set_description(
                 "add codes, mem %.3f gb, %.1f%%"
-                % (psutil.virtual_memory()[3] / 1024 ** 3, psutil.virtual_memory()[2],)
+                % (psutil.virtual_memory()[3] / 1024**3, psutil.virtual_memory()[2])
             )
             with h5py.File(code_path) as f:
 

@@ -156,8 +156,7 @@ class MegatronOptimizer(ABC):
     def get_grad_norm(self):
         grads_for_norm = self.get_main_grads_for_grad_norm()
         total_norm = get_grad_norm_fp32(
-            grads_for_norm,
-            model_parallel_group=self.get_model_parallel_group(),
+            grads_for_norm, model_parallel_group=self.get_model_parallel_group()
         )
         return total_norm
 
@@ -301,11 +300,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
-        super().__init__(
-            optimizer,
-            config,
-            init_state_fn,
-        )
+        super().__init__(optimizer, config, init_state_fn)
         self.grad_scaler = grad_scaler
 
         # None grad scaler is only supported for bf16.
@@ -477,12 +472,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         init_state_fn: Callable,
     ):
 
-        super().__init__(
-            optimizer,
-            config,
-            grad_scaler,
-            init_state_fn,
-        )
+        super().__init__(optimizer, config, grad_scaler, init_state_fn)
 
         # Handle main parameters.
 
@@ -713,19 +703,12 @@ class FP32Optimizer(MegatronOptimizer):
     """
 
     def __init__(
-        self,
-        optimizer: torch.optim.Optimizer,
-        config: OptimizerConfig,
-        init_state_fn: Callable,
+        self, optimizer: torch.optim.Optimizer, config: OptimizerConfig, init_state_fn: Callable
     ):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
-        super(FP32Optimizer, self).__init__(
-            optimizer,
-            config,
-            init_state_fn,
-        )
+        super(FP32Optimizer, self).__init__(optimizer, config, init_state_fn)
 
         self._scale = torch.tensor([1.0], dtype=torch.float, device='cuda')
 

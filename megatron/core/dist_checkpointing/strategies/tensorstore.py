@@ -115,10 +115,7 @@ def open_ts_array(arr_path: Path):
         arr_path (Path): path to a Zarr (Tensorstore) array
     """
     spec = {'driver': 'zarr', 'metadata_key': '.zarray', 'kvstore': {}}
-    spec['kvstore'] = {
-        'driver': 'file',
-        'path': str(arr_path),
-    }
+    spec['kvstore'] = {'driver': 'file', 'path': str(arr_path)}
     try:
         arr = ts.open(ts.Spec(spec), open=True).result()
     except Exception as e:

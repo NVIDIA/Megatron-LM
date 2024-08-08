@@ -156,9 +156,7 @@ class BlendedMegatronDatasetBuilder(object):
 
         return datasets
 
-    def _build_blended_dataset_splits(
-        self,
-    ) -> List[Optional[TopLevelDataset]]:
+    def _build_blended_dataset_splits(self) -> List[Optional[TopLevelDataset]]:
         """Build all dataset splits according to the provided blend(s)
 
         See the BlendedMegatronDatasetBuilder.build alias for more information.
@@ -306,10 +304,7 @@ class BlendedMegatronDatasetBuilder(object):
             return blended_datasets
 
     def _build_megatron_datasets_parallel(
-        self,
-        prefixes: List[str],
-        split: List[float],
-        sizes_per_dataset: List[List[int]],
+        self, prefixes: List[str], split: List[float], sizes_per_dataset: List[List[int]]
     ) -> List[List[Optional[MegatronDataset]]]:
         """Build the megatron datasets for a list of prefixes in parallel
 
@@ -369,11 +364,7 @@ class BlendedMegatronDatasetBuilder(object):
                     # i.e. meant for serial build, do not scale up.
                     num_workers *= min(2, max(1, torch.cuda.device_count()))
                 _threading_helper(
-                    megatron_datasets,
-                    num_workers,
-                    prefixes,
-                    split,
-                    sizes_per_dataset,
+                    megatron_datasets, num_workers, prefixes, split, sizes_per_dataset
                 )
 
             torch.distributed.barrier()
@@ -389,11 +380,7 @@ class BlendedMegatronDatasetBuilder(object):
                 )
         else:
             _threading_helper(
-                megatron_datasets,
-                num_dataset_builder_threads,
-                prefixes,
-                split,
-                sizes_per_dataset,
+                megatron_datasets, num_dataset_builder_threads, prefixes, split, sizes_per_dataset
             )
 
         return megatron_datasets

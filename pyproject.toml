@@ -9,7 +9,7 @@ requires = [
 [tool.isort]
 profile = "black"  # black-compatible
 line_length = 100  # should match black parameters
-py_version = 38  # python 3.8 as a target version
+py_version = 310  # python 3.8 as a target version
 known_first_party = ["megatron"]  # FIRSTPARTY section
 known_third_party = ["transformer_engine"]  # THIRDPARTY section
 sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]

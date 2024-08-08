@@ -111,12 +111,7 @@ def _kernel_make_viewless_tensor(inp, requires_grad):
     data, without linking the viewed tensor, referenced via the '._base'
     field.
     '''
-    out = torch.empty(
-        (1,),
-        dtype=inp.dtype,
-        device=inp.device,
-        requires_grad=requires_grad,
-    )
+    out = torch.empty((1,), dtype=inp.dtype, device=inp.device, requires_grad=requires_grad)
     out.data = inp.data
     return out
 
@@ -908,13 +903,7 @@ class StragglerDetector:
             et_flops = apir_flops / self.amp  # Estimated TFLOPs, not tracing backward
 
             o_dt = self._min_max(
-                ptime,
-                btime,
-                float(temp),
-                float(power),
-                float(util),
-                float(clock),
-                et_flops,
+                ptime, btime, float(temp), float(power), float(util), float(clock), et_flops
             )
             if self.rank == 0 and o_dt is not None and o_dt.aflops is not None:
                 now = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"

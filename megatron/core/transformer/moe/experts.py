@@ -94,9 +94,7 @@ class GroupedMLP(MegatronModule):
             )
             self.weight2 = Parameter(
                 torch.empty(
-                    fc2_input_size_per_partition,
-                    self.config.hidden_size,
-                    dtype=config.params_dtype,
+                    fc2_input_size_per_partition, self.config.hidden_size, dtype=config.params_dtype
                 )
             )
             if config.perform_initialization:

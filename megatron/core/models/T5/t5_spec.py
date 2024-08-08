@@ -69,8 +69,7 @@ def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(
-                    linear_fc1=TELayerNormColumnParallelLinear,
-                    linear_fc2=TERowParallelLinear,
+                    linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
                 ),
             ),
             mlp_bda=get_bias_dropout_add,
@@ -110,8 +109,7 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(
-                    linear_fc1=TELayerNormColumnParallelLinear,
-                    linear_fc2=TERowParallelLinear,
+                    linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
                 ),
             ),
             mlp_bda=get_bias_dropout_add,
@@ -142,8 +140,7 @@ def encoder_model_with_local_spec() -> ModuleSpec:
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(
-                    linear_fc1=ColumnParallelLinear,
-                    linear_fc2=RowParallelLinear,
+                    linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear
                 ),
             ),
             mlp_bda=get_bias_dropout_add,
@@ -189,8 +186,7 @@ def decoder_model_with_local_spec() -> ModuleSpec:
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(
-                    linear_fc1=ColumnParallelLinear,
-                    linear_fc2=RowParallelLinear,
+                    linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear
                 ),
             ),
             mlp_bda=get_bias_dropout_add,

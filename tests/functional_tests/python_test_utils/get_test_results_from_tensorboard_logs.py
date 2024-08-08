@@ -9,12 +9,7 @@ from tests.functional_tests.python_test_utils import common  # noqa: E402
 
 
 @click.command()
-@click.option(
-    "--logs-dir",
-    required=True,
-    type=str,
-    help="Path to Tensorboard logs",
-)
+@click.option("--logs-dir", required=True, type=str, help="Path to Tensorboard logs")
 @click.option(
     "--output-path",
     required=False,

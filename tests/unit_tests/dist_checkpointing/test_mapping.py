@@ -1,15 +1,20 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import pytest
-
 import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.core import CheckpointingException
-from megatron.core.dist_checkpointing.mapping import is_main_replica, \
-    ShardedTensorFactory, ShardedObject, apply_factories, apply_factory_merges
+from megatron.core.dist_checkpointing.mapping import (
+    ShardedObject,
+    ShardedTensorFactory,
+    apply_factories,
+    apply_factory_merges,
+    is_main_replica,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
 
 class TestShardedTensor:
 
@@ -20,14 +25,11 @@ class TestShardedTensor:
     #
     # def teardown_method(self, method):
     #     Utils.destroy_model_parallel()
-    
+
     def test_from_rank_offsets_constructor(self, dtype=torch.float, device='cuda'):
         data = torch.ones((1, 3, 7, 9), dtype=dtype, device=device)
         shape = data.shape
-        rank_offsets = [
-            (0, 0, 10),
-            (2, 3, 6)
-        ]
+        rank_offsets = [(0, 0, 10), (2, 3, 6)]
         sh_ten = ShardedTensor.from_rank_offsets('keyA', data, *rank_offsets)
 
         assert isinstance(sh_ten, ShardedTensor)
@@ -40,13 +42,12 @@ class TestShardedTensor:
     def test_from_rank_offsets_flat_constructor(self, dtype=torch.float, device='cuda'):
         data = torch.arange(28, dtype=dtype, device=device).reshape((1, 4, 7))
         shape = data.shape
-        rank_offsets = [
-            (1, 0, 2),
-            (2, 3, 5)
-        ]
+        rank_offsets = [(1, 0, 2), (2, 3, 5)]
         flattened_range = slice(4, 9)
         flat_data = data.flatten()[flattened_range]
-        sh_ten = ShardedTensor.from_rank_offsets_flat('keyA', flat_data, data.shape, *rank_offsets, flattened_range=flattened_range)
+        sh_ten = ShardedTensor.from_rank_offsets_flat(
+            'keyA', flat_data, data.shape, *rank_offsets, flattened_range=flattened_range
+        )
 
         # The main attributes properties are unchanged
         assert isinstance(sh_ten, ShardedTensor)
@@ -60,10 +61,7 @@ class TestShardedTensor:
 
     def test_metadata_integrity_violation(self):
         data = torch.ones((1, 3, 7, 9), device='meta')
-        rank_offsets = [
-            (0, 0, 10),
-            (2, 3, 6)
-        ]
+        rank_offsets = [(0, 0, 10), (2, 3, 6)]
         sh_ten = ShardedTensor.from_rank_offsets('keyA', data, *rank_offsets)
         sh_ten.validate_metadata_integrity()
         with pytest.raises(CheckpointingException):
@@ -76,16 +74,17 @@ class TestShardedTensor:
             sh_ten.validate_metadata_integrity()
 
         with pytest.raises(CheckpointingException):
-            sh_ten = ShardedTensor.from_rank_offsets_flat('keyA', data, data.shape, *rank_offsets,
-                                                          flattened_range=slice(4, 9))
+            sh_ten = ShardedTensor.from_rank_offsets_flat(
+                'keyA', data, data.shape, *rank_offsets, flattened_range=slice(4, 9)
+            )
 
-        sh_ten = ShardedTensor.from_rank_offsets_flat('keyA', data.flatten()[4:9], data.shape, *rank_offsets,
-                                                      flattened_range=slice(4, 9))
+        sh_ten = ShardedTensor.from_rank_offsets_flat(
+            'keyA', data.flatten()[4:9], data.shape, *rank_offsets, flattened_range=slice(4, 9)
+        )
         assert sh_ten.local_shape == (1, 3, 7, 9)
         with pytest.raises(CheckpointingException):
             sh_ten.local_shape = (5,)
             sh_ten.validate_metadata_integrity()
-
 
 
 class TestShardedTensorFactory:
@@ -93,15 +92,22 @@ class TestShardedTensorFactory:
         def build_fn(key, tensor, replica_id, flattened_range):
             assert flattened_range is None
             return {
-                'level2_a': ShardedTensor.from_rank_offsets(key + 'part1', tensor + 1, replica_id=replica_id),
-                'level2_b': ShardedTensor.from_rank_offsets(key + 'part2', tensor + 2, replica_id=replica_id)
+                'level2_a': ShardedTensor.from_rank_offsets(
+                    key + 'part1', tensor + 1, replica_id=replica_id
+                ),
+                'level2_b': ShardedTensor.from_rank_offsets(
+                    key + 'part2', tensor + 2, replica_id=replica_id
+                ),
             }
 
         # state_dict will be modified in-place
         def get_state_dict():
             return {
-                'level1': ShardedTensorFactory('a', torch.arange(3), build_fn, lambda x: x['level2_b'])
+                'level1': ShardedTensorFactory(
+                    'a', torch.arange(3), build_fn, lambda x: x['level2_b']
+                )
             }
+
         state_dict = get_state_dict()
         apply_factories(state_dict)
         assert torch.allclose(state_dict['level1']['level2_a'].data, torch.tensor([1, 2, 3]))

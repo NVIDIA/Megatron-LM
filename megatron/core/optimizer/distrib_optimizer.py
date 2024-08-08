@@ -168,9 +168,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         )
 
         # Group into dict.
-        data = {
-            "param_map": param_range_map,
-        }
+        data = {"param_map": param_range_map}
 
         return data
 
@@ -417,12 +415,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             HAVE_APEX_OR_TE
         ), f'Please install Apex or Transformer Engine to use DistributedOptimizer.'
 
-        super().__init__(
-            optimizer,
-            config,
-            grad_scaler,
-            init_state_fn,
-        )
+        super().__init__(optimizer, config, grad_scaler, init_state_fn)
 
         assert isinstance(
             optimizer, Adam
@@ -464,10 +457,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.model_param_gbuf_map = self._build_model_param_gbuf_map(self.gbuf_ranges)
 
         # Optimizer ranges.
-        (
-            self.model_param_group_index_map,
-            self.opt_group_ranges,
-        ) = self._build_optimizer_group_ranges(self.optimizer.param_groups, self.gbuf_ranges)
+        (self.model_param_group_index_map, self.opt_group_ranges) = (
+            self._build_optimizer_group_ranges(self.optimizer.param_groups, self.gbuf_ranges)
+        )
 
         # Allocate main param shards.
         (
@@ -626,10 +618,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         #   list.
         inner_state_dict = self.optimizer.state_dict()
         state_dict_param_groups = [
-            {
-                **group,
-                "params": list(inner_state_dict["param_groups"][idx]["params"]),
-            }
+            {**group, "params": list(inner_state_dict["param_groups"][idx]["params"])}
             for idx, group in enumerate(state_dict["optimizer"]["param_groups"])
         ]
 
@@ -655,13 +644,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         )
 
                         state_dict_state.append(
-                            (
-                                state_order,
-                                {
-                                    "exp_avg": init_shard(),
-                                    "exp_avg_sq": init_shard(),
-                                },
-                            )
+                            (state_order, {"exp_avg": init_shard(), "exp_avg_sq": init_shard()})
                         )
 
         # Sort by state order (see method docstring for details).
@@ -680,10 +663,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Optimizer.
         self.optimizer.load_state_dict(
-            {
-                "state": state_dict_state,
-                "param_groups": state_dict_param_groups,
-            }
+            {"state": state_dict_state, "param_groups": state_dict_param_groups}
         )
 
         # Grad scaler.
@@ -776,9 +756,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         )
 
         # Collect param states.
-        state = {
-            "buckets_coalesced": True,
-        }
+        state = {"buckets_coalesced": True}
         for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
 
             # Iterate grad buffers (by data type).
@@ -822,10 +800,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         main_param = self.optimizer.param_groups[group_index]["params"][group_order]
                         optim_state = self.optimizer.state[main_param]
 
-                        tensors = {
-                            "param": main_param,
-                            **optim_state,
-                        }
+                        tensors = {"param": main_param, **optim_state}
 
                         # Copy states into contiguous shard.
                         gbuf_local_start = param_range_map["gbuf_local"].start
@@ -1012,9 +987,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         if next_param_start != cur_param_end:
                             pad_tensors = {
                                 k: torch.empty(
-                                    next_param_start - cur_param_end,
-                                    dtype=v.dtype,
-                                    device=v.device,
+                                    next_param_start - cur_param_end, dtype=v.dtype, device=v.device
                                 )
                                 for k, v in bucket_state[i].items()
                                 if isinstance(v, torch.Tensor)
@@ -1112,10 +1085,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         main_param = self.optimizer.param_groups[group_index]["params"][group_order]
                         optim_state = self.optimizer.state[main_param]
 
-                        tensors = {
-                            "fp32_param": main_param,
-                            **optim_state,
-                        }
+                        tensors = {"fp32_param": main_param, **optim_state}
                         # Match optimizer parameter with model ShardedTensor (or ShardedTensorFactory)
                         try:
                             sharded_metadata = param_to_sharded_metadata[model_param]
@@ -1188,10 +1158,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         main_param = self.optimizer.param_groups[group_index]["params"][group_order]
                         optim_state = self.optimizer.state[main_param]
 
-                        dst_tensors = {
-                            "param": main_param,
-                            **optim_state,
-                        }
+                        dst_tensors = {"param": main_param, **optim_state}
                         for key in dst_tensors:
                             dst_tensors[key].copy_(src_tensors[key])
 
@@ -1211,10 +1178,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         optim_state = self.optimizer.state[main_param]
 
                         src_tensors = state_dict[param_idx]
-                        dst_tensors = {
-                            "fp32_param": main_param,
-                            **optim_state,
-                        }
+                        dst_tensors = {"fp32_param": main_param, **optim_state}
                         for key in dst_tensors:
                             dst_tensors[key].copy_(src_tensors[key])
 
@@ -1561,10 +1525,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             ]
             assert all_gather_handle_index < len(self.all_gather_handles)
             all_gather_handle = torch.distributed._all_gather_base(
-                pbuf,
-                pbuf_views[data_parallel_rank],
-                group=data_parallel_group,
-                async_op=async_op,
+                pbuf, pbuf_views[data_parallel_rank], group=data_parallel_group, async_op=async_op
             )
             self.all_gather_handles[all_gather_handle_index] = all_gather_handle
             assert self.all_gather_handle_index_to_bucket_index_map[all_gather_handle_index] == (

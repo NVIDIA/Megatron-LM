@@ -18,4 +18,3 @@ def set_default_dist_ckpt_strategy():
         new=get_pyt_dist_save_sharded_strategy,
     ) as _fixture:
         yield _fixture
-
