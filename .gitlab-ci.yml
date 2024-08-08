@@ -32,7 +32,6 @@ workflow:
     on_new_commit: interruptible
 
 stages:
-  - build
   - test 
   - functional_tests
 
@@ -237,7 +236,7 @@ build_image:
   tags:
     - 8xL40S-builder
   image: docker:26.1.4-dind
-  stage: build
+  stage: test
   timeout: 45m
   parallel:
     matrix:
@@ -305,14 +304,29 @@ unit_tests:
   stage: test
   needs: [build_image]
   timeout: 180m
+  parallel:
+    matrix:
+      - TAG: latest
+      - TAG: 9229390b3ef365694d323b0cd8d5e86f86268b05
   tags:
     - 8xL40S
   rules:
     - if: '$FUNCTIONAL_TEST == "no" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/)'
       allow_failure: true
     - when: always
+  variables:
+    GIT_STRATEGY: clone
+    GIT_DEPTH: 0
+  before_script:
+    - |
+      if [[ $TAG != latest ]]; then
+        git checkout $TAG
+        rm -rf /opt/megatron-lm/tests
+        cp -r tests/ /opt/megatron-lm
+      fi
   script:
     - |
+      cd /opt/megatron-lm  
       for i in $(seq $UNIT_TEST_REPEAT); do
         SEED=$((RANDOM % 9000 + 1000));
         timeout ${UNIT_TEST_TIMEOUT}m torchrun --nproc_per_node=8 -m pytest --random-order --random-order-seed ${SEED} -xvs --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail tests/unit_tests
@@ -343,6 +357,7 @@ formatting:
   tags:
     - mcore-docker-node-small
   stage: test
+  needs: [build_image]
   before_script:
     - git fetch origin main
   script:
@@ -355,10 +370,11 @@ formatting:
   interruptible: true
 
 copyright:
-  image: ${LINTING_IMAGE}:${CI_PIPELINE_ID}
   tags:
     - mcore-docker-node-small
   stage: test
+  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
+  needs: [build_image]
   before_script:
     - git fetch origin main
   script:
