@@ -178,15 +178,14 @@ class FusedScaleMaskSoftmax(nn.Module):
             and sk % 4 == 0  # sk must be divisor of 4
             and attn_batches % 4 == 0  # np * b must be divisor of 4
         ):
-            if 0 <= sk <= 16384:
-                batch_per_block = self.get_batch_per_block(sq, sk, b, np)
+            batch_per_block = self.get_batch_per_block(sq, sk, b, np)
 
-                if self.attn_mask_type == AttnMaskType.causal:
-                    if attn_batches % batch_per_block == 0:
-                        return True
-                else:
-                    if sq % batch_per_block == 0:
-                        return True
+            if self.attn_mask_type == AttnMaskType.causal:
+                if attn_batches % batch_per_block == 0:
+                    return True
+            else:
+                if sq % batch_per_block == 0:
+                    return True
         return False
 
     def forward_fused_softmax(self, input, mask):
