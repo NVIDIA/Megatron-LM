@@ -391,6 +391,7 @@ convergence-test:
       
       echo "${!SETTINGS}" > vars.sh
       source vars.sh
+      
 
       # Fill in data blend
       DATA_BLEND_ID=$(curl \
