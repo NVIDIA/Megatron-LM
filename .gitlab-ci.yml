@@ -21,6 +21,7 @@ stages:
   - build
   - unit_tests
   - functional_tests
+  - publish
 
 variables:
   JET_CUSTOM_FILTER:
@@ -28,6 +29,12 @@ variables:
       Selects what functional tests to run. For mr tests: "type == 'build' or 'mr' in spec.scope". For nightly tests: "type == 'build' or 'nightly' in spec.scope"
     value: ""
   TIME_LIMIT: "10:00" # Default time limit for all jobs
+  PUBLISH: 
+    value: "no"
+    options: 
+      - "yes"
+      - "no"
+    description: Build and publish a wheel to PyPi
   SLURM_CLUSTER:
     value: "dgxa100_dracooci"
     options:
@@ -333,3 +340,18 @@ formatting:
 
 include:
   - jet-tests.yml
+
+publish-wheel:
+  image: quay.io/pypa/manylinux_2_28_x86_64
+  stage: publish
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^core_r/ && $PUBLISH == "yes"
+      when: manual
+    - when: never
+  before_script:
+    - pip install twine
+  script:
+    - /opt/python/cp310-cp310/bin/python -m build
+    - /opt/python/cp311-cp311/bin/python -m build
+    - auditwheel repair dist/*.whl
+    - twine upload --repository pypi wheelhouse/*
