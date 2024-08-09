@@ -217,9 +217,8 @@ label_merge_request:
     - |
       source labels
       curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}" --data-urlencode "add_labels=$LABELS" -X PUT
-  only:
-    refs:
-      - merge_requests
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
 
 check_milestone:
   stage: .pre
@@ -235,6 +234,8 @@ check_milestone:
         echo Please assign a Milestone to this MR!
         exit 1
       fi
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
 
 build_image:
   tags:
@@ -311,7 +312,7 @@ unit_tests:
   parallel:
     matrix:
       - TAG: latest
-      - TAG: 9229390b3ef365694d323b0cd8d5e86f86268b05
+      - TAG: a2628239fc6427a9b5238a0bc46d24a259e7c5b8
   tags:
     - 8xL40S
   rules:
@@ -390,26 +391,23 @@ copyright:
     - when: always
   interruptible: true
 
-secret_detection_check:
-  extends: secret_detection # Is from the template - Secret-Detection.gitlab-ci.yml
+secret_detection:
   stage: test
+  variables:
+    GIT_DEPTH: 0
+    SECRET_DETECTION_LOG_OPTIONS: ${CI_MERGE_REQUEST_DIFF_BASE_SHA}..${CI_COMMIT_SHA}
   tags:
     - mcore-docker-node-small
-  rules:  # This is required because the template sets rules do not work for us.
-    - when: always
-  before_script:  # JQ to parse the parse JSON report generated 
-    - apk add jq
   allow_failure: false
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
   script:
-    - !reference [secret_detection, script]  # Source the script from the template
-    - echo "Secret detection Report can be downloaded from the Merge Request"
-    - echo -e "\n\n\n\n\n############# Printing Secret Detection Report#####################################################"
-    - echo -e "#############Looks for the vulnerabilities JSON section##################################################### \n\n\n\n\n"
-    - cat gl-secret-detection-report.json | jq '.'
-    # Parse to find vulnerabilities JSON key
+    - apk add jq
+    - /analyzer run
     - |
       if [[ $(cat gl-secret-detection-report.json | jq '.vulnerabilities | length > 0') == true ]]; then 
         echo "Atleast one vulnerability has been found"
+        cat gl-secret-detection-report.json | jq '.'
         exit 1
       fi
 

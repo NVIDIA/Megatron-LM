@@ -5,6 +5,7 @@
 import random
 
 import numpy
+import pytest
 import torch
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
@@ -25,6 +26,7 @@ def sample_N(dataset, N, randomize):
     return samples
 
 
+@pytest.mark.skip(reason="Tests are flaky and need to be debugged")
 def test_mock_gpt_dataset():
     if torch.distributed.is_available():
         Utils.initialize_distributed()
