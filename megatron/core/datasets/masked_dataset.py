@@ -33,7 +33,7 @@ class MaskedWordPieceDatasetConfig(BlendedMegatronDatasetConfig):
     """The maximum length N-gram to consider masking or permuting"""
 
     masking_do_full_word: bool = None
-    """Whether we mask the the whole word or its component parts"""
+    """Whether we mask the whole word or its component parts"""
 
     masking_do_permutation: bool = None
     """Whether we shuffle a subset of candidate N-grams in addition"""
@@ -274,7 +274,7 @@ class MaskedWordPieceDataset(MegatronDataset):
 
         ngram_nvals = numpy.arange(self.config.masking_max_ngram, dtype=numpy.int64) + 1
 
-        # By default, the N-gram probabilites are inversely proportional to N
+        # By default, the N-gram probabilities are inversely proportional to N
         # e.g. N = 3
         #    -> P = array([0.54545455, 0.27272727, 0.18181818])
         nprobs = 1.0 / ngram_nvals
