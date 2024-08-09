@@ -1223,10 +1223,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if args.exit_signal_handler:
             signal_handler = get_signal_handler()
             if any(signal_handler.signals_received()):
-                save_checkpoint_and_time(iteration, model, optimizer,
-                                         opt_param_scheduler,
-                                         num_floating_point_operations_so_far,
-                                         checkpointing_context, train_data_iterator=train_data_iterator)
+                if args.save:
+                    save_checkpoint_and_time(iteration, model, optimizer,
+                                             opt_param_scheduler,
+                                             num_floating_point_operations_so_far,
+                                             checkpointing_context, train_data_iterator=train_data_iterator)
                 print_datetime('exiting program after receiving SIGTERM.')
                 exit = True
                 break
@@ -1259,7 +1260,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 done_cuda, op=torch.distributed.ReduceOp.MAX)
             done = done_cuda.item()
             if done:
-                if not saved_checkpoint:
+                if args.save and not saved_checkpoint:
                     save_checkpoint_and_time(iteration, model, optimizer,
                                              opt_param_scheduler,
                                              num_floating_point_operations_so_far,
