@@ -312,7 +312,7 @@ unit_tests:
   parallel:
     matrix:
       - TAG: latest
-      - TAG: a2628239fc6427a9b5238a0bc46d24a259e7c5b8
+      - TAG: db5c60ae3fe5247f16ec0536bbf41ee5c7fb9c4a
   tags:
     - 8xL40S
   rules:
