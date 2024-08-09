@@ -1511,7 +1511,7 @@ class ParallelTransformer(MegatronModule):
                     **extra_transformer_engine_kwargs)
 
         if config.virtual_pipeline_model_parallel_size is not None:
-            assert config.num_layers % config.virtual_pipeline_model_parallel_size == 0, \
+            assert self.num_layers % config.virtual_pipeline_model_parallel_size == 0, \
                 'num_layers_per_stage must be divisible by ' \
                 'virtual_pipeline_model_parallel_size'
             assert args.model_type != ModelType.encoder_and_decoder
