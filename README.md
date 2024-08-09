@@ -129,6 +129,7 @@ python tools/preprocess_data.py \
        --vocab-file bert-vocab.txt \
        --tokenizer-type BertWordPieceLowerCase \
        --split-sentences
+       --workers 32
 </pre>
 
 The output will be two files named, in this case, `my-bert_text_sentence.bin` and `my-bert_text_sentence.idx`. The `--data-path` specified in later BERT training is the full path and new filename, but without the file extension.
