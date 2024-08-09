@@ -209,6 +209,7 @@ def sharded_tensor_to_torch_sharded_tensor(
         ]
 
     # Create a ShardedTensor without invoking communication. Determine global shards
+    world_size = torch.distributed.get_world_size()
     shard_metadata = []
     # NOTE: here we assume a regular grid of shards
     for fragment_offsets in itertools.product(*map(range, some_sh_ten.axis_fragmentations)):
@@ -232,13 +233,16 @@ def sharded_tensor_to_torch_sharded_tensor(
 
         else:
             # for shards from other ranks we provide simplistic data - this information will be discarded
-            # during TorchShardedTensor._init_from_local_shards_and_global_metadata call
+            # during TorchShardedTensor._init_from_local_shards_and_global_metadata call.
+            # Due to a bug in PyT 24.05 container we must specify some concrete rank within a world size.
+            # The exact rank doesn't matter as long as it's different than my rank - hence (rank + 1) % WS.
+            placement = f"rank:{(rank + 1) % world_size}/cuda"
             if has_flattened_range and not is_flattened_range_1d:
                 offset = offset + (0,)
                 size = (1,) * len(offsets_shape) + global_shape[-1:]
             else:
                 size = offsets_shape
-            shard_metadata.append(ShardMetadata(offset, size, "cuda"))
+            shard_metadata.append(ShardMetadata(offset, size, placement))
 
     tensor = some_sh_ten.data
     sharded_tensor_metadata = ShardedTensorMetadata(
