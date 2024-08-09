@@ -22,7 +22,6 @@ from megatron.training import pretrain
 from megatron.core.utils import StragglerDetector
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training.utils import (
-    get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
 )
 from megatron.training.arguments import core_transformer_config_from_args
@@ -102,9 +101,6 @@ def get_batch(data_iterator):
 
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(data_iterator)
-
-    # slice batch along sequence dimension for context parallelism
-    batch = get_batch_on_this_cp_rank(batch)
 
     return batch.values()
 
