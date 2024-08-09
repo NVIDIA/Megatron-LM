@@ -1,8 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 from pathlib import Path
-from typing import Dict
 
-import numpy as np
 import pytest
 import torch
 
@@ -22,7 +20,6 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
     _sharded_tensor_shard_id,
-    _ShardId,
 )
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -191,7 +188,7 @@ class TestFullyParallelSaveAndLoad:
         )
         assert expected_key_to_saving_ranks == key_to_saving_rank
 
-        for k, sh_ten in state_dict.items():
+        for _, sh_ten in state_dict.items():
             if (
                 _sharded_tensor_shard_id(sh_ten)
                 in save_strategy.cached_distribution.shards_in_this_group
@@ -231,7 +228,8 @@ class TestFullyParallelSaveAndLoad:
                 'keyE': [6],  # second largest tensor
             }
         else:
-            # When loading, expected key distribution is the same across TP, because every replica needs to be loaded
+            # When loading, expected key distribution is the same across TP, because every replica
+            # needs to be loaded
             expected_key_to_saving_ranks = {
                 # everyone must load (disjoint shards, coverage == 1):
                 'keyB': list(
@@ -312,7 +310,7 @@ class TestFullyParallelSaveAndLoad:
         mem_alloc_start = torch.cuda.memory_allocated()
 
         with TempNamedDir(tmp_path_dist_ckpt / 'mock_dir') as ckpt_dir_A:
-            loaded_state_dict = load_strategy.load(sharded_state_dict, ckpt_dir_A)
+            _ = load_strategy.load(sharded_state_dict, ckpt_dir_A)
 
         # Each rank is expected to do 7 * 10 empty allocations
         assert len(mem_alloc) == 7 * 10

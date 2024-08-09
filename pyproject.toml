@@ -22,3 +22,4 @@ skip_string_normalization = true
 # recongized by future versions, disallows to reformat code with incompatible versions
 # Matches NeMO version so people working on both codebases don't need two different version of black installed
 required_version = "24"  
+skip_magic_trailing_comma = true

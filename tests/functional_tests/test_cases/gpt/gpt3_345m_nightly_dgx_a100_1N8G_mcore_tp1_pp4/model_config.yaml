@@ -38,12 +38,12 @@ MODEL_ARGS:
   --eval-iters: 10
   --transformer-impl: local
   --tensor-model-parallel-size: 1
-  --pipeline-model-parallel-size: 4: 
+  --pipeline-model-parallel-size: 4
   --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --use-mcore-models: true
   --ckpt-format: torch_dist
   --data-cache-path: ${DATA_CACHE_PATH}
-  --fp16: true
+  --bf16: true
   --apply-query-key-layer-scaling: true
 TEST_TYPE: regular
