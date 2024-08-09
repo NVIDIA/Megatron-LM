@@ -14,11 +14,16 @@ workflow:
     - if: $CI_COMMIT_BRANCH =~ /^core_r/
       variables:
         FUNCTIONAL_TEST: "no"
-    - if: $CI_MERGE_REQUEST_LABELS =~ /Run tests and nightly/
+    - if: $CI_MERGE_REQUEST_LABELS =~ /Run nightly/
       variables:
         FUNCTIONAL_TEST: "yes"
         SLURM_CLUSTER: $DEFAULT_A100_CLUSTER
-        SCOPE: mr-and-nightly
+        SCOPE: nightly
+    - if: $CI_MERGE_REQUEST_LABELS =~ /Run weekly/
+      variables:
+        FUNCTIONAL_TEST: "yes"
+        SLURM_CLUSTER: $DEFAULT_A100_CLUSTER
+        SCOPE: weekly
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run tests/
       variables:
         FUNCTIONAL_TEST: "yes"
@@ -65,7 +70,7 @@ variables:
     value: "mr"
     options:
       - "mr"
-      - "mr-and-nightly"
+      - "nightly"
       - "weekly"
     description: "Testsuite to run"
   SLURM_CLUSTER:
@@ -92,6 +97,7 @@ metadata:
     - env
     - JET_CUSTOM_FILTER="type == 'basic'"
     - |
+      # Add cluster
       if [[ $SLURM_CLUSTER == dgxh100_eos ]]; then
         JET_CI_BRANCH=mcore/eos
         JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and 'dgx_h100' in spec.platforms"
@@ -103,17 +109,8 @@ metadata:
         JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and 'dgx_a100' in spec.platforms"
       fi
     - |
-      if [[ $SCOPE == mr ]]; then
-        JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and 'mr' in spec.scope"
-      elif [[ $SCOPE == nightly ]]; then
-        JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and 'nightly' in spec.scope"
-      elif [[ $SCOPE == mr-and-nightly ]]; then
-        JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and ('mr' in spec.scope or 'nightly' in spec.scope)"
-      elif [[ $SCOPE == weekly ]]; then
-        JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and 'weekly' in spec.scope"
-      elif [[ $SCOPE == release ]]; then
-        JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and 'release' in spec.scope"
-      fi
+      # Add scope
+      JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and '$SCOPE' in spec.scope"
     - |
       if [[ "$JET_CUSTOM_FILTER" == "type == 'basic'" ]]; then
         JET_CUSTOM_FILTER="False"

@@ -8,9 +8,6 @@ spec:
   build: mcore-pyt
   nodes: 1
   gpus: 8
-  platforms: dgx_a100
-  time_limit: 1200
-  scope: null
   artifacts:
     /workspace/data/gpt3_data: text/the_pile/shard00
   script: |-
@@ -32,6 +29,8 @@ spec:
 
 products:
   - scope: [mr]
+    platforms: [dgx_a100]
+    time_limit: [1200]
     test_case:
     - gpt3_mr_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer_dgx_a100_1N8G
@@ -105,6 +104,8 @@ products:
     - gpt3_mr_tp1_pp4_vp1_resume_torch_dgx_a100_1N8G
     - gpt3_mr_tp2_pp2_dgx_a100_1N8G
   - scope: [nightly]
+    platforms: [dgx_a100]
+    time_limit: [1200]
     test_case:
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_dist_optimizer_overlap_grad_reduce_param_gather
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather
@@ -135,6 +136,8 @@ products:
     - gpt3_345m_nightly_dgx_a100_1N8G_tp4_pp1_overlap_grad_reduce
     - gpt3_345m_nightly_dgx_a100_1N8G_tp4_pp1_resume_torch
   - scope: [weekly]
+    platforms: [dgx_h100]
+    time_limit: [9000]
     test_case:
     - gpt3_345m_weekly_dgx_h100_1N8G_mcore_nondet_tp1_pp1_fp8_no_model_parallel
     - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp1_pp1_bf16_baseline

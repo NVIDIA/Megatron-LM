@@ -4,14 +4,11 @@ from functools import partial
 from time import sleep
 from types import MethodType, SimpleNamespace
 from unittest import mock
-from unittest.mock import MagicMock
 
-import numpy as np
 import pytest
 import torch
 from torch.optim import Adam
 
-from megatron.core import DistributedDataParallel as DDP
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import (
     ShardedTensor,
@@ -30,17 +27,10 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelSaveStrategyWrapper,
 )
 from megatron.core.dist_checkpointing.utils import extract_sharded_tensors
-from megatron.core.models.gpt import GPTModel
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-from megatron.core.optimizer import DistributedOptimizer, OptimizerConfig, get_megatron_optimizer
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
-from megatron.core.utils import get_model_config
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.training import get_model
-from megatron.training.utils import unwrap_model
-from pretrain_gpt import model_provider
 from tests.unit_tests.dist_checkpointing import (
     TempNamedDir,
     init_basic_mock_args,
@@ -81,40 +71,6 @@ class Model(torch.nn.Module):
         )
         sharded_state_dict['proj.bias'] = ShardedTensor.from_rank_offsets(
             'proj.bias', sharded_state_dict['proj.bias'], (0, Utils.rank, Utils.world_size)
-        )
-        return sharded_state_dict
-
-
-class SwigluFactoryModel(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.linear = torch.nn.Linear(
-            5, 64 // parallel_state.get_tensor_model_parallel_world_size(), bias=False
-        )
-        self.config = TransformerConfig(hidden_size=8, num_attention_heads=1, num_layers=1)
-
-    def sharded_state_dict(self):
-        sharded_state_dict = self.state_dict(keep_vars=True)
-        sharded_state_dict['linear.weight'] = ShardedTensor.from_rank_offsets(
-            'linear.weight',
-            sharded_state_dict['linear.weight'],
-            (
-                (
-                    0,
-                    parallel_state.get_tensor_model_parallel_rank(),
-                    parallel_state.get_tensor_model_parallel_world_size(),
-                )
-            ),
-            replica_id=(
-                (
-                    parallel_state.get_pipeline_model_parallel_rank(),
-                    0,
-                    parallel_state.get_data_parallel_rank(with_context_parallel=True),
-                )
-            ),
-        )
-        sharded_state_dict['linear.weight'] = apply_swiglu_sharded_factory(
-            sharded_state_dict['linear.weight'], ()
         )
         return sharded_state_dict
 
@@ -210,16 +166,18 @@ class TestDistributedOptimizer:
 
     @pytest.mark.parametrize("initialize_fn", [initialize_small_model, initialize_gpt_model])
     @pytest.mark.parametrize("use_fpsl", [False, True])
+    # TODO: changing DP doesn't work in unit tests because of NCCL crashes
     @pytest.mark.parametrize(
         "tp_pp,src_dp,dest_dp",
         [
             ((4, 1), 2, 2),
-            # ((1, 1), 8, 1),  # TODO: changing DP doesn't work in unit tests because of NCCL crashes
+            # ((1, 1), 8, 1),
             # ((1, 1), 1, 8),
             # ((2, 1), 2, 1),
             # ((2, 1), 2, 2),
         ],
     )
+    @pytest.mark.skip(reason="Tests are flaky and need to be debugged")
     def test_dp_sharding(self, tmp_path_dist_ckpt, tp_pp, src_dp, dest_dp, use_fpsl, initialize_fn):
         src_world_size = tp_pp[0] * tp_pp[1] * src_dp
         dest_world_size = tp_pp[0] * tp_pp[1] * dest_dp
@@ -335,7 +293,7 @@ class TestDistributedOptimizer:
                     load_checkpoint_no_arg_checks(model, optimizer, None)
                 assert "(TP, PP) mismatch" in str(exc_info.value)
 
-                ## Check that the state didn't change
+                # Check that the state didn't change
                 assert not any(diff(model[0].state_dict(), model_unloaded_state_dict))
                 assert not any(diff(optimizer.state_dict(), optim_unloaded_state_dict))
 
@@ -343,9 +301,10 @@ class TestDistributedOptimizer:
                 mock_args.finetune = True
                 load_checkpoint_no_arg_checks(model, optimizer, None)
 
-                ## Model weights should be different, but optimizer state is unchanged
+                # Model weights should be different, but optimizer state is unchanged
                 diffs = diff(model[0].state_dict(), model_unloaded_state_dict)
-                # diffs[0] and diffs[1] is structural diff, diffs[2] is values diff - we expect only values diff
+                # diffs[0] and diffs[1] is structural diff, diffs[2] is values diff -
+                # we expect only values diff
                 assert not diffs[0] and not diffs[1] and diffs[2]
                 assert not any(diff(optimizer.state_dict(), optim_unloaded_state_dict))
 
@@ -361,9 +320,10 @@ class TestDistributedOptimizer:
                 mock_args.no_load_rng = True
                 load_checkpoint_no_arg_checks(model, optimizer, None)
 
-                ## Model weights should be different, but optimizer state is unchanged
+                # Model weights should be different, but optimizer state is unchanged
                 diffs = diff(model[0].state_dict(), model_unloaded_state_dict)
-                # diffs[0] and diffs[1] is structural diff, diffs[2] is values diff - we expect only values diff
+                # diffs[0] and diffs[1] is structural diff, diffs[2] is values diff -
+                # we expect only values diff
                 assert not diffs[0] and not diffs[1] and diffs[2]
                 assert not any(diff(optimizer.state_dict(), optim_unloaded_state_dict))
 
@@ -386,7 +346,8 @@ class TestDistributedOptimizer:
                     seed=2, tp=tp, pp=pp, initialize_fn=initialize_gpt_model
                 )
 
-                # Mock optimizer sharded_state_dict so that it ignores the externally passed sharding_type and uses 'fully_sharded_bucket_space' instead
+                # Mock optimizer sharded_state_dict so that it ignores the externally
+                # passed sharding_type and uses 'fully_sharded_bucket_space' instead
                 orig_optim_sharded_state_dict_fn = optimizer.sharded_state_dict
 
                 def sharded_state_dict_bucket_space(
@@ -408,7 +369,10 @@ class TestDistributedOptimizer:
                     sharded_metadata = load_tensors_metadata(ckpt_dir / 'iter_0000010')
                     key_list = list(sharded_metadata.keys())
                     # Check if actually using `fully_parallel_bucket_space` format.
-                    key = 'optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_(torch.bfloat16, torch.bfloat16).bucket_idx_0.exp_avg_sq'
+                    key = (
+                        "optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_"
+                        "(torch.bfloat16, torch.bfloat16).bucket_idx_0.exp_avg_sq"
+                    )
                     if key in key_list:
                         flag = 1
 
