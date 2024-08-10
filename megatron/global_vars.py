@@ -175,6 +175,7 @@ def _set_wandb_writer(args):
                   'project or experiment name provided, '
                   'therefore WANDB logs will be written '
                   'according to random generated project or experiment name.', flush=True)
+            return
 
         try:
             import wandb

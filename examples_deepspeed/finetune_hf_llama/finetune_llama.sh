@@ -1,8 +1,8 @@
 DS_CONFIG=./examples_deepspeed/finetune_hf_llama/ds_config.json
-DATASET_PATH=./alpaca_data.json
+DATASET_PATH=./examples_deepspeed/finetune_hf_llama/alpaca_data.json
 # dataset link: https://github.com/tatsu-lab/stanford_alpaca/blob/main/alpaca_data.json
 
-HF_LLAMA_PATH=/data/llama-7b/
+HF_LLAMA_PATH=/data/llama-2-7b-hf/
 # weights link: https://huggingface.co/huggyllama/llama-7b
 
 MICRO_BATCH_SIZE=16
@@ -44,10 +44,19 @@ cat <<EOT > $DS_CONFIG
 EOT
 
 
-covert_args="deepspeed tools/hf2megads_weight_converter.py \
+covert_hf2mds_args="deepspeed tools/hf2megads_weight_converter.py \
 --hf-ckpt-num-shards 2 \
---origin-hf-ckpt-dir $HF_LLAMA_PATH \
+--hf-ckpt-dir $HF_LLAMA_PATH \
+--load-mode auto \
 --save $MEGA_DS_LLAMA_PATH"
+
+covert_mds2hf_args="deepspeed tools/hf2megads_weight_converter.py \
+--hf-ckpt-num-shards 2 \
+--hf-ckpt-dir $HF_LLAMA_PATH \
+--load-mode auto \
+--to-hf-ckpt \
+--load $MEGA_DS_LLAMA_PATH \
+--save $HF_LLAMA_PATH'-hf-out' "
 
 finetune_args="deepspeed finetune_llama.py \
 --load $MEGA_DS_LLAMA_PATH"
@@ -98,8 +107,10 @@ comm_args="--tensor-model-parallel-size $TP \
 --no-gradient-accumulation-fusion \
 --repeated-dataloader"
 
-if [ "$1" = "convert" ]; then
-    task_args="$covert_args"
+if [ "$1" = "convert_hf2mds" ]; then
+    task_args="$covert_hf2mds_args"
+elif [ "$1" = "convert_mds2hf" ]; then
+    task_args="$covert_mds2hf_args"
 else
     task_args="$finetune_args"
 fi
