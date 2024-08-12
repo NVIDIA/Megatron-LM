@@ -1,9 +1,9 @@
 .jet_common:
   stage: functional_tests
   rules:
-    - if: '$FUNCTIONAL_TEST == "yes" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/ )'
+    - if: $FUNCTIONAL_TEST == "yes" && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
-    - if: '$FUNCTIONAL_TEST == "yes"'
+    - if: $FUNCTIONAL_TEST == "yes"
     - when: never
 
 default:
@@ -21,12 +21,36 @@ jet-configure:
     name: mikefarah/yq:4.35.2
     entrypoint: [""]
   extends: [.jet_common, .jet-configure]
-  tags:
-    - mcore-docker-node-small
+  tags: [mcore-docker-node-small]
   script:
     - set -x
-    - JET_FILTER=${JET_CUSTOM_FILTER:-False}
-    - echo "_JET_FILTER=$JET_FILTER" | tee -a jet.env
+    - |
+      JET_CUSTOM_FILTER="type == 'basic'"
+
+      if [[ $FUNCTIONAL_TEST_CLUSTER == dgxh100_eos ]]; then
+        JET_CI_BRANCH=mcore/eos
+        PLATFORM=dgx_h100
+      elif [[ $FUNCTIONAL_TEST_CLUSTER == dgxa100_dracooci ]]; then
+        JET_CI_BRANCH=mcore/draco-oci
+        PLATFORM=dgx_a100
+      elif [[ $FUNCTIONAL_TEST_CLUSTER == dgxa100_dracooci-ord ]]; then
+        JET_CI_BRANCH=mcore/draco-oci-ord
+        PLATFORM=dgx_a100
+      fi
+
+      # Add platform
+      JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and '$PLATFORM' in spec.platforms"
+
+      # Add scope
+      JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and '$FUNCTIONAL_TEST_SCOPE' in spec.scope"
+
+      if [[ "$JET_CUSTOM_FILTER" == "type == 'basic'" ]]; then
+        JET_CUSTOM_FILTER="False"
+      fi
+
+      echo "JET_CI_BRANCH=$JET_CI_BRANCH" | tee -a jet.env
+      echo "JET_CUSTOM_FILTER=$JET_CUSTOM_FILTER" | tee -a jet.env
+
     - |
       IMAGE=${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} yq '. |=
         (
@@ -50,7 +74,6 @@ jet-configure:
     max: 2
     when: job_execution_timeout
 
-  
 jet-build:
   extends: [build_image, .jet_common]
   variables:
@@ -58,13 +81,13 @@ jet-build:
 
 jet-trigger:
   extends: [.jet_common, .jet-trigger]
-  needs: [metadata, jet-configure, jet-build]
+  needs: [jet-configure, jet-build]
   trigger:
     project: dl/jet/ci
     branch: $JET_CI_BRANCH
     strategy: depend
   variables:
-    JET_WORKLOADS_FILTER: '$_JET_FILTER'
+    JET_WORKLOADS_FILTER: '$JET_CUSTOM_FILTER'
     JET_CUSTOM_CONFIG: |
       retrier:
         enabled: true
@@ -74,7 +97,6 @@ jet-trigger:
         environment: jet-auto-retrier
       builds: 
         jet_flavour: # An empty mapping will disable building the JET flavor 
-        
   inherit:
     variables: true
 
@@ -97,10 +119,10 @@ jet-results-summary:
     paths:
       - scripts
   rules:
-    - if: '$FUNCTIONAL_TEST == "yes" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/ )'
+    - if: '$FUNCTIONAL_TEST == "yes" && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"'
       allow_failure: true
-      when: always
     - if: '$FUNCTIONAL_TEST == "yes"'
+      allow_failure: false
       when: always
     - when: never
       
@@ -117,7 +139,7 @@ jet-results-notify:
     - export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
-    - export CONTEXT=$SCOPE
+    - export CONTEXT=$FUNCTIONAL_TEST_SCOPE
     - export DATE=$(date +"%Y-%m-%d")
     - bash tests/functional_tests/shell_test_utils/notify.sh ${CI_PIPELINE_ID}
   artifacts:

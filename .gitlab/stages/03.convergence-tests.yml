@@ -1,0 +1,50 @@
+convergence-test:
+  rules:
+    - if: $CONVERGENCE_TEST == "yes"
+    - when: never
+  stage: convergence_tests
+  needs: [build_image]
+  tags:
+    - ${TAG}
+  timeout: 7d
+  parallel:
+    matrix:
+      - SETTINGS: RELEASE_BERT
+        TAG: mcore-ssh-node-A
+      - SETTINGS: RELEASE_GPT  
+        TAG: mcore-ssh-node-B
+      - SETTINGS: RELEASE_MOE
+        TAG: mcore-ssh-node-B
+  before_script: |
+    python -m venv local/venv 
+    source local/venv/bin/activate
+    pip install jet-api --upgrade $JET_INDEX_URLS
+  script:
+    - |
+      set -x
+
+      export MCORE_RELEASE_NUM=${CI_COMMIT_BRANCH#core_r}
+      export IMAGE_TAG=v${MCORE_RELEASE_NUM}-${CI_PIPELINE_ID} 
+      export WANDB_API_KEY=${WANDB_API_KEY}
+      export GITLAB_TOKEN=${PAT}
+      
+      SETTINGS_ID=$(curl \
+          --request GET "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/snippets" \
+          --header "PRIVATE-TOKEN: $PROJECT_ACCESS_TOKEN_MCORE" \
+        | jq --arg TITLE "$SETTINGS" '
+                .[] 
+                | select(.title == $TITLE) 
+                | .id
+          ' \
+        | tr -d '"')
+      SETTINGS=$(curl \
+                    --request GET "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/snippets/${DATA_BLEND_ID}/raw" \
+                    --header "PRIVATE-TOKEN: $PROJECT_ACCESS_TOKEN_MCORE"
+                )
+      echo "$SETTINGS" > settings.txt
+      source settings.sh
+
+      yq '.MODEL_ARGS."--data-path" = env(DATA_PATH)' -i $TRAINING_PARAMS_PATH
+
+      env
+      bash tests/functional_tests/shell_test_utils/run_ci_test_locally.sh
