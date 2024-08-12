@@ -8,34 +8,34 @@ megatron/core/
 megatron/core/
 
 [MoE-ADLR] @mcore-reviewers/moe-adlr
-megatron/core/transformer/moe
+megatron/core/transformer/moe/
 
 [MoE-Moe] @mcore-reviewers/moe-moe
-megatron/core/transformer/moe
+megatron/core/transformer/moe/
 
 [Datasets] @mcore-reviewers/datasets
-megatron/core/datasets 
+megatron/core/datasets/
 
 [BERT] @mcore-reviewers/bert
-megatron/core/models/bert
+megatron/core/models/bert/
 
 [GPT] @mcore-reviewers/gpt
-megatron/core/models/gpt
+megatron/core/models/gpt/
 
 [Retro] @mcore-reviewers/retro
-megatron/core/models/retro
+megatron/core/models/retro/
 
 [Distributed Checkpointing] @mcore-reviewers/dist-checkpointing
-megatron/core/dist_checkpointing
+megatron/core/dist_checkpointing/
 
 [Distributed Optimizer] @mcore-reviewers/dist-optimizer
-megatron/core/optimizer/distrib_optimizer 
+megatron/core/optimizer/distrib_optimizer/ 
 
 [Inference] @mcore-reviewers/inference
-megatron/core/inference
+megatron/core/inference/
 
 [Quantization and Inference (QAT)] @mcore-reviewers/quantization-and-inference
-megatron/core/inference
+megatron/core/inference/
 
 ; [Context Parallelism] @mcore-reviewers/context-parallelism
 ; 
