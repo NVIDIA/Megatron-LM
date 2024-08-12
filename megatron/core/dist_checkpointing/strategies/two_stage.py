@@ -142,7 +142,7 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
         torch.distributed.all_gather_object(all_groups, self.dp_group_ranks)
         all_groups = set(tuple(sorted(gr)) for gr in all_groups)
         for group_ranks in sorted(all_groups):
-            gloo_pg = torch.distributed.new_group(ranks=group_ranks, backend='gloo')
+            gloo_pg = torch.distributed.new_group(ranks=group_ranks, backend='mpi')
             if self.global_rank in group_ranks:
                 self.data_parallel_group = gloo_pg
                 assert self.dp_group_rank == torch.distributed.get_rank(self.data_parallel_group)

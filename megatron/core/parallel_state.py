@@ -630,7 +630,7 @@ def initialize_model_parallel(
         group = torch.distributed.new_group(
             ranks, timeout=timeout, pg_options=get_nccl_options('dp', nccl_comm_cfgs)
         )
-        group_gloo = torch.distributed.new_group(ranks, timeout=timeout, backend="gloo")
+        group_gloo = torch.distributed.new_group(ranks, timeout=timeout, backend='mpi')
         if rank in ranks:
             _DATA_PARALLEL_GROUP = group
             _DATA_PARALLEL_GROUP_GLOO = group_gloo
@@ -641,7 +641,7 @@ def initialize_model_parallel(
             ranks_with_cp, timeout=timeout, pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs)
         )
         group_with_cp_gloo = torch.distributed.new_group(
-            ranks_with_cp, timeout=timeout, backend="gloo"
+            ranks_with_cp, timeout=timeout, backend='mpi'
         )
         if rank in ranks_with_cp:
             _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
@@ -828,7 +828,7 @@ def initialize_model_parallel(
         group = torch.distributed.new_group(
             ranks, timeout=timeout, pg_options=get_nccl_options('dp_modulo_exp', nccl_comm_cfgs)
         )
-        group_gloo = torch.distributed.new_group(ranks, backend="gloo")
+        group_gloo = torch.distributed.new_group(ranks, backend='mpi')
         if rank in ranks:
             _DATA_MODULO_EXPERT_PARALLEL_GROUP = group
             _DATA_MODULO_EXPERT_PARALLEL_GROUP_GLOO = group_gloo
@@ -841,7 +841,7 @@ def initialize_model_parallel(
                 timeout=timeout,
                 pg_options=get_nccl_options('dp_modulo_exp_cp', nccl_comm_cfgs),
             )
-            group_gloo = torch.distributed.new_group(ranks, backend="gloo")
+            group_gloo = torch.distributed.new_group(ranks, backend='mpi')
         else:
             group = _DATA_MODULO_EXPERT_PARALLEL_GROUP
             group_gloo = _DATA_MODULO_EXPERT_PARALLEL_GROUP_GLOO
