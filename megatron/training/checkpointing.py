@@ -293,7 +293,7 @@ def get_rng_state(use_dist_ckpt: bool = False):
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
-                    train_data_iterator=None):
+                    train_data_iterator=None, ft_client=None):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
     Checkpointing context is used to persist some checkpointing state
@@ -374,6 +374,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         state_dict = generate_state_dict(args, model, optimizer, opt_param_scheduler, rng_state,
                                          use_dist_ckpt, iteration, optim_sd_kwargs=optim_sd_kwargs)
 
+        if args.enable_ft_package and ft_client is not None:
+            state_dict["ft_state"] = ft_client.state_dict()
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if use_dist_ckpt:
             if non_persistent_ckpt and args.non_persistent_ckpt_type != 'global':
@@ -898,7 +900,8 @@ def load_args_from_checkpoint(args, load_arg='load'):
     return args, checkpoint_args
 
 
-def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', strict=True):
+def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
+                    ft_client=None):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
         :attr:`state_dict` of the checkpoint match the names of
@@ -930,6 +933,13 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         state_dict, checkpoint_name, release = _load_base_checkpoint(
             load_dir, args, rank0=True
         )
+
+        if args.enable_ft_package and ft_client is not None and state_dict is not None:
+            if 'ft_state' in state_dict:
+                ft_client.load_state_dict(state_dict['ft_state'])
+            else:
+                print_rank_0("ft_state is not present in state_dict")
+
         is_dist_ckpt = dist_checkpointing.check_is_distributed_checkpoint(checkpoint_name)
         if is_dist_ckpt:
             ckpt_tp_pp = (
@@ -984,6 +994,12 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     state_dict, checkpoint_name, release = _load_base_checkpoint(
         load_dir, args, rank0=False, **load_kwargs
     )
+
+    if args.enable_ft_package and ft_client is not None and state_dict is not None:
+        if 'ft_state' in state_dict:
+            ft_client.load_state_dict(state_dict['ft_state'])
+        else:
+            print_rank_0("ft_state is not present in state_dict")
 
     # Checkpoint not loaded.
     if state_dict is None:

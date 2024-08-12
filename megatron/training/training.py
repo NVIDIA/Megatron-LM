@@ -62,6 +62,7 @@ from .global_vars import (
     get_one_logger)
 from . import one_logger_utils
 
+from . import ft_integration
 
 stimer = StragglerDetector()
 
@@ -292,6 +293,11 @@ def pretrain(
     # Context used for persisting some state between checkpoint saves.
     checkpointing_context = {}
 
+    if args.enable_ft_package and ft_integration.get_rank_monitor_client() is not None:
+        ft_integration.get_rank_monitor_client().init_workload_monitoring()
+        ft_timeouts = ft_integration.get_rank_monitor_client().timeouts
+        print_rank_0(f"Fault tolerance client initialized. Timeouts: {ft_timeouts}")
+
     # Print setup timing.
     print_rank_0('done with setup ...')
     timers.log(['model-and-optimizer-setup',
@@ -321,7 +327,9 @@ def pretrain(
         if args.save and iteration != 0 and iteration % args.save_interval != 0:
             save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
                             num_floating_point_operations_so_far, checkpointing_context,
-                            train_data_iterator=train_data_iterator)
+                            train_data_iterator=train_data_iterator,
+                            ft_client=ft_integration.get_rank_monitor_client(
+                                ft_integration.StateMachineActions.SAVE_CHECKPOINT))
 
         one_logger and one_logger.log_metrics({
             'app_train_loop_finish_time': one_logger_utils.get_timestamp_in_ms()
@@ -572,8 +580,11 @@ def setup_model_and_optimizer(model_provider_func,
             'load_checkpoint_start_time': one_logger_utils.get_timestamp_in_ms()
         })
         timers('load-checkpoint', log_level=0).start(barrier=True)
+
         args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
-            model, optimizer, opt_param_scheduler)
+                model, optimizer, opt_param_scheduler,
+                ft_client=ft_integration.get_rank_monitor_client())
+
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics({
@@ -981,7 +992,9 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
         optimizer.disable_pre_hook()
     save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
                     num_floating_point_operations_so_far, checkpointing_context,
-                    non_persistent_ckpt=non_persistent_ckpt, train_data_iterator=train_data_iterator)
+                    non_persistent_ckpt=non_persistent_ckpt, train_data_iterator=train_data_iterator,
+                    ft_client=ft_integration.get_rank_monitor_client(
+                        ft_integration.StateMachineActions.SAVE_CHECKPOINT))
     if args.use_distributed_optimizer and args.overlap_param_gather:
         optimizer.enable_pre_hook()
     timers(timer_key).stop(barrier=True)
@@ -1149,6 +1162,21 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         num_floating_point_operations_so_far += num_fp_ops
         total_flops += num_fp_ops
 
+        # Fault tolerance
+        if args.enable_ft_package:
+            ft_client = ft_integration.get_rank_monitor_client(
+                ft_integration.StateMachineActions.TRAIN_HEARTBEAT)
+            if ft_client is not None:
+                ft_client.send_heartbeat()
+                # TODO we are always calculating timeouts in the current implementation
+                # if we want to rely on manually setup then we need to add additional argument
+                # to training and pass it here
+                if ft_integration.can_update_timeouts():
+                    ft_integration.get_rank_monitor_client(
+                        ft_integration.StateMachineActions.UPDATE_TIMEOUT).calculate_and_set_timeouts()
+                    print_rank_0(f'Updated FT timeouts. New values: \
+                        {ft_integration.get_rank_monitor_client().timeouts}')
+
         # Logging.
         loss_scale = optimizer.get_loss_scale().item()
         params_norm = None
@@ -1217,6 +1245,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             if args.use_distributed_optimizer and args.overlap_param_gather:
                 optimizer.enable_pre_hook()
             timers('interval-time', log_level=0).start(barrier=True)
+
+
+            if args.enable_ft_package and ft_integration.get_rank_monitor_client() is not None:
+                ft_integration.get_rank_monitor_client(
+                    ft_integration.StateMachineActions.EVAL_HEARTBEAT).send_heartbeat()
 
         # Checkpointing
         saved_checkpoint = False
@@ -1299,6 +1332,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if args.use_distributed_optimizer and args.overlap_param_gather:
         optimizer.disable_pre_hook()
+
+    if args.enable_ft_package and ft_integration.get_rank_monitor_client() is not None:
+        ft_integration.get_rank_monitor_client().shutdown_workload_monitoring()
 
     maybe_finalize_async_save(True)
 
