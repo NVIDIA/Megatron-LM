@@ -71,6 +71,8 @@ ARGUMENTS=(
 SLURM_LOGS=$OUTPUT_PATH/slurm_logs/
 mkdir -p $SLURM_LOGS
 
+echo ${ARGUMENTS[@]}
+
 while : 
 do
 ACTUAL_ITERATIONS=$(cat "$OUTPUT_PATH/checkpoints/latest_checkpointed_iteration.txt" || echo 0)

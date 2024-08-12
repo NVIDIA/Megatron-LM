@@ -1,0 +1,150 @@
+.tests_common:
+  rules:
+    - if: ($FUNCTIONAL_TEST == "no" || $FUNCTIONAL_TEST == "yes" || $CONVERGENCE_TEST == "yes") && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+      allow_failure: true
+    - if: $FUNCTIONAL_TEST == "no" || $FUNCTIONAL_TEST == "yes" || $CONVERGENCE_TEST == "yes"
+    - when: never
+  stage: test
+
+include:
+  - template: Security/Secret-Detection.gitlab-ci.yml
+
+build_image:
+  tags: [8xL40S-builder]
+  image: docker:26.1.4-dind
+  timeout: 45m
+  parallel:
+    matrix:
+      - IMAGE: CI_MCORE_IMAGE
+        FILE: Dockerfile.ci
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:24.01-py3
+      - IMAGE: CI_NEMO_IMAGE
+        FILE: Dockerfile.ci
+        BASE_IMAGE: nvcr.io/nvidian/nemo:nightly
+      - IMAGE: LINTING_IMAGE
+        FILE: Dockerfile.linting
+        BASE_IMAGE: python:3.10
+  before_script:
+    - echo "$NGC_API_KEY" | docker login nvcr.io -u '$oauthtoken' --password-stdin
+    - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
+  variables:
+    STAGE: main
+  script:
+    - |
+      set -x
+      eval "IMAGE=\$$IMAGE"
+
+      docker system prune -a --filter "until=96h" -f
+
+      if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
+        ADDITIONAL_PARAMS="--pull"
+      fi
+
+      docker build \
+        --secret id=JET_INDEX_URLS \
+        --target $STAGE \
+        -f $FILE \
+        -t ${IMAGE}:${CI_PIPELINE_ID} \
+        --build-arg CACHEBUST=$(cat /proc/sys/kernel/random/uuid) \
+        --cache-to type=inline \
+        --cache-from type=registry,ref=${IMAGE}:buildcache \
+        --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
+        ${ADDITIONAL_PARAMS} .
+
+      docker push ${IMAGE}:${CI_PIPELINE_ID}
+
+      if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
+        docker tag ${IMAGE}:${CI_PIPELINE_ID} ${IMAGE}:buildcache
+        docker push ${IMAGE}:buildcache
+      fi
+
+      if [[ $CI_COMMIT_BRANCH == core_r* ]]; then
+        docker tag ${IMAGE}:${CI_PIPELINE_ID} ${IMAGE}:v${CI_COMMIT_BRANCH#core_r}-${CI_PIPELINE_ID}
+        docker push ${IMAGE}:v${CI_COMMIT_BRANCH#core_r}-${CI_PIPELINE_ID}
+      fi
+  retry:
+    max: 2
+
+unit_tests:
+  # This job runs both test suite of ToT and of a historic ref against
+  # the current code. This is a form of backwards compatibility testing
+  # and helps in providing stable interfaces.
+  extends: [.tests_common]
+  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
+  needs: [build_image]
+  timeout: 180m
+  parallel:
+    matrix:
+      - TAG: latest
+      - TAG: db5c60ae3fe5247f16ec0536bbf41ee5c7fb9c4a  
+  tags: [8xL40S]
+  variables:
+    GIT_STRATEGY: clone
+    GIT_DEPTH: 0
+  before_script:
+    - |
+      if [[ $TAG != latest ]]; then
+        git checkout $TAG
+        rm -rf /opt/megatron-lm/tests
+        cp -r tests/ /opt/megatron-lm
+      fi
+  script:
+    - |      
+      cd /opt/megatron-lm  
+      for i in $(seq $UNIT_TEST_REPEAT); do
+        SEED=$((RANDOM % 9000 + 1000));
+        timeout ${UNIT_TEST_TIMEOUT}m torchrun --nproc_per_node=8 -m pytest --random-order --random-order-seed ${SEED} -xvs --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail `$([[ $TAG != latest ]] && echo -m 'not internal')` tests/unit_tests
+      done
+  artifacts:
+    paths:
+      - coverage
+
+docs_build_test:
+  image: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/python-format:0.0.1
+  tags: [mcore-docker-node-small]
+  script:
+    - cd ..
+    - rm -rf documentation && git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/nemo-megatron-core-tme/documentation.git
+    - mv megatron-lm/ documentation/
+    - cd documentation/
+    - ./repo docs
+  allow_failure: true
+  except:
+    - main
+
+formatting:
+  extends: [.tests_common]
+  image: ${LINTING_IMAGE}:${CI_PIPELINE_ID}
+  tags: [mcore-docker-node-small]
+  stage: test
+  needs: [build_image]
+  script:
+    - git fetch origin main
+    - CHECK_ONLY=true bash tools/autoformat.sh
+
+copyright:
+  extends: [.tests_common]
+  tags: [mcore-docker-node-small]
+  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
+  needs: [build_image]
+  script:
+    - git fetch origin main
+    - bash tools/copyright.sh
+
+secret_detection:
+  tags: [mcore-docker-node-small]
+  variables:
+    GIT_DEPTH: 0
+    SECRET_DETECTION_LOG_OPTIONS: ${CI_MERGE_REQUEST_DIFF_BASE_SHA}..${CI_COMMIT_SHA}
+  allow_failure: false
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  script:
+    - apk add jq
+    - /analyzer run
+    - |
+      if [[ $(cat gl-secret-detection-report.json | jq '.vulnerabilities | length > 0') == true ]]; then 
+        echo "Atleast one vulnerability has been found"
+        cat gl-secret-detection-report.json | jq '.'
+        exit 1
+      fi

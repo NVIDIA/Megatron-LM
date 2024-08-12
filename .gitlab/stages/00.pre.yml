@@ -1,0 +1,58 @@
+include:
+  - template: Security/Secret-Detection.gitlab-ci.yml
+
+mirror_to_github:
+  rules:
+    - if: '$CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+  tags: [mcore-docker-node-small]
+  stage: .pre
+  image: python:3.10
+  variables:
+    GIT_STRATEGY: "clone"
+  script:
+    - git checkout $CI_COMMIT_BRANCH
+    - git remote add github https://ko3n1g:$GH_TOKEN@github.com/NVIDIA/Megatron-LM.git || true
+    - git push -u github $CI_COMMIT_BRANCH
+  
+label_merge_request:
+  rules: 
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - when: never
+  stage: .pre
+  image: golang:1.22
+  tags:
+    - mcore-docker-node-small
+  before_script:
+    - git clone -b nv https://${GITLAB_ENDPOINT}/okoenig/gitlab-mr-labeler.git
+    - cd gitlab-mr-labeler
+    - go install .
+    - cd ..
+    - go install github.com/itchyny/gojq/cmd/gojq@latest
+    - |
+      echo LABELS=$(curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}" | gojq '.labels | join(",")') > labels
+  script:
+    - gitlab-mr-labeler -f .gitlab/labeler-config.yml -t ${PROJECT_ACCESS_TOKEN_MCORE} --debug true
+  after_script:
+    - |
+      source labels
+      curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}" --data-urlencode "add_labels=$LABELS" -X PUT
+
+check_milestone:
+  rules: 
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - when: never
+  stage: .pre
+  image: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_ci:buildcache
+  tags:
+    - mcore-docker-node-small
+  script:
+    - env
+    - |
+      MILESTONE=$(curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}" | jq '.milestone')
+    - |
+      if [[ "$MILESTONE" == "null" ]]; then
+        echo Please assign a Milestone to this MR!
+        exit 1
+      fi
+  

@@ -2,33 +2,35 @@ workflow:
   rules:
     - if: $CI_PROJECT_NAMESPACE != "ADLR"
       when: never
-    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $FUNCTIONAL_TEST_SCOPE == "mr"
+      auto_cancel:
+        on_new_commit: none
       variables:
         FUNCTIONAL_TEST: "yes"
         UNIT_TEST_TIMEOUT: 180
         UNIT_TEST_REPEAT: 10
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      auto_cancel:
+        on_new_commit: none
     - if: $CI_PIPELINE_SOURCE == "web"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_REF_PROTECTED == "true"
       variables:
         FUNCTIONAL_TEST: "no"
-    - if: $CI_COMMIT_BRANCH =~ /^core_r/
-      variables:
-        FUNCTIONAL_TEST: "no"
-    - if: $CI_MERGE_REQUEST_LABELS =~ /Run nightly/
-      variables:
-        FUNCTIONAL_TEST: "yes"
-        SLURM_CLUSTER: $DEFAULT_A100_CLUSTER
-        SCOPE: nightly
-    - if: $CI_MERGE_REQUEST_LABELS =~ /Run weekly/
-      variables:
-        FUNCTIONAL_TEST: "yes"
-        SLURM_CLUSTER: $DEFAULT_A100_CLUSTER
-        SCOPE: weekly
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run tests/
       variables:
         FUNCTIONAL_TEST: "yes"
-        SLURM_CLUSTER: $DEFAULT_A100_CLUSTER
-        SCOPE: mr
+        FUNCTIONAL_TEST_CLUSTER: $DEFAULT_A100_CLUSTER
+        FUNCTIONAL_TEST_SCOPE: mr
+    - if: $CI_MERGE_REQUEST_LABELS =~ /Run nightly/
+      variables:
+        FUNCTIONAL_TEST: "yes"
+        FUNCTIONAL_TEST_CLUSTER: $DEFAULT_A100_CLUSTER
+        FUNCTIONAL_TEST_SCOPE: nightly
+    - if: $CI_MERGE_REQUEST_LABELS =~ /Run weekly/
+      variables:
+        FUNCTIONAL_TEST: "yes"
+        FUNCTIONAL_TEST_CLUSTER: $DEFAULT_A100_CLUSTER
+        FUNCTIONAL_TEST_SCOPE: weekly
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       variables:
         FUNCTIONAL_TEST: "no"
@@ -39,14 +41,11 @@ workflow:
 stages:
   - test 
   - functional_tests
+  - convergence_tests
   - publish
 
 default:
   interruptible: true
-
-include:
-  - jet-tests.yml
-  - template: Security/Secret-Detection.gitlab-ci.yml
 
 variables:
   FUNCTIONAL_TEST: 
@@ -55,431 +54,43 @@ variables:
       - "yes"
       - "no"
     description: To run the funtional test suite
-  CONVERGENCE_TEST:
-    value: "no"
-    options:
-      - "yes"
-      - "no"
-  PUBLISH: 
-    value: "no"
-    options: 
-      - "yes"
-      - "no"
-    description: Build and publish a wheel to PyPi
-  SCOPE:
+  FUNCTIONAL_TEST_SCOPE:
     value: "mr"
     options:
       - "mr"
       - "nightly"
       - "weekly"
-    description: "Testsuite to run"
-  SLURM_CLUSTER:
+    description: "Testsuite to run (only for FUNCTIONAL_TEST=yes)"
+  FUNCTIONAL_TEST_CLUSTER:
     value: "dgxa100_dracooci"
     options:
       - "dgxa100_dracooci"
       - "dgxa100_dracooci-ord"
       - "dgxh100_eos"
     description: '"dgxa100_dracooci" for OCI-IAD, "dgxh100_eos" for EOS'
+  CONVERGENCE_TEST:
+    value: "no"
+    options:
+      - "yes"
+      - "no"
+    description: To run a convergence test
+  PUBLISH: 
+    value: "no"
+    options: 
+      - "yes"
+      - "no"
+    description: Build and publish a wheel to PyPi
+
   # CI wide variables
   CI_MCORE_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_ci
   CI_NEMO_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/nemo_ci
   LINTING_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_linting
   UNIT_TEST_TIMEOUT: 15
   UNIT_TEST_REPEAT: 1
-  
-metadata:
-  image: python:3.10
-  stage: .pre
-  tags:
-    - mcore-docker-node-small
-  script:
-    - set -x
-    - env
-    - JET_CUSTOM_FILTER="type == 'basic'"
-    - |
-      # Add cluster
-      if [[ $SLURM_CLUSTER == dgxh100_eos ]]; then
-        JET_CI_BRANCH=mcore/eos
-        JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and 'dgx_h100' in spec.platforms"
-      elif [[ $SLURM_CLUSTER == dgxa100_dracooci ]]; then
-        JET_CI_BRANCH=mcore/draco-oci
-        JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and 'dgx_a100' in spec.platforms"
-      elif [[ $SLURM_CLUSTER == dgxa100_dracooci-ord ]]; then
-        JET_CI_BRANCH=mcore/draco-oci-ord
-        JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and 'dgx_a100' in spec.platforms"
-      fi
-    - |
-      # Add scope
-      JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and '$SCOPE' in spec.scope"
-    - |
-      if [[ "$JET_CUSTOM_FILTER" == "type == 'basic'" ]]; then
-        JET_CUSTOM_FILTER="False"
-      fi
-    - | 
-      if [[ $CONVERGENCE_TEST == yes && $CI_COMMIT_BRANCH != core_r* ]]; then
-        echo "Please run convergence-tests only on release branches. Current branch: $CI_COMMIT_BRANCH".
-        exit 1
-      fi
-    - echo "JET_CI_BRANCH=$JET_CI_BRANCH" | tee -a build.env
-    - echo "JET_CUSTOM_FILTER=$JET_CUSTOM_FILTER" | tee -a build.env
-  artifacts:
-    reports:
-      dotenv: build.env
-  rules:
-    - if: '$FUNCTIONAL_TEST == "yes"'
 
-mirror_to_github:
-  tags: [mcore-docker-node-small]
-  stage: .pre
-  image: python:3.10
-  variables:
-    GIT_STRATEGY: "clone"
-  script:
-    - git checkout main
-    - git remote add github https://ko3n1g:$GH_TOKEN@github.com/NVIDIA/Megatron-LM.git || true
-    - git push -u github main
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "main"'
-
-ppp_capacity_statistics:
-  tags: [mcore-ssh-node-A]
-  stage: .pre
-  image: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_ci:buildcache
-  allow_failure: true
-  script:
-    - |
-      set -x
-
-      ALL_USER=$(sshare -aP | grep coreai_dlalgo_mcore | tail -n +2 | awk -F '|' '{print $2}' | tr '\n' ',')
-
-      # Get the current year, month, and day
-      YEAR=$(date +%Y)
-      MONTH=$(date +%m)
-      DAY=$([[ $(date +%-d) -le 15 ]] && echo "01" || echo "15")
-      TIMESTAMP="${YEAR}-${MONTH}-${DAY}T00:00:01"
-
-      CLUSTER_ID=$(curl "${RESOURCE_ENDPOINT}/api/v1/clusters" \
-        -H "accept: application/json, text/plain, */*" \
-        -H "accept-language: en-US,en;q=0.9" \
-        -H "authorization: Bearer $CSRG_API_KEY" | jq '.[] | select(.name == "draco-oci-iad") | .id' | tr -d '"')
-
-      INITIATIVE_ITEM_ID=$(curl "${RESOURCE_ENDPOINT}/api/v1/initiative-items" \
-        -H "accept: application/json, text/plain, */*" \
-        -H "accept-language: en-US,en;q=0.9" \
-        -H "authorization: Bearer $CSRG_API_KEY" | jq '.[] | select(.name == "coreai_dlalgo_mcore") | .id' | tr -d '"')
-
-      QUOTA=$(curl "${RESOURCE_ENDPOINT}/api/v1/capacity-requests" \
-        -H "accept: application/json, text/plain, */*" \
-        -H "accept-language: en-US,en;q=0.9" \
-        -H "authorization: Bearer $CSRG_API_KEY" | jq --arg CLUSTER_ID $CLUSTER_ID --arg INITIATIVE_ITEM_ID $INITIATIVE_ITEM_ID '[.[] | select(.clusterId == $CLUSTER_ID and .initiativeItemId == $INITIATIVE_ITEM_ID)] | to_entries | [last] | .[0].value.quantity')
-
-      USED_CAPA=$(sacct \
-        -u ${ALL_USER} \
-        --partition batch_block1,batch_block3,batch_block4 \
-        --truncate \
-        -A coreai_dlalgo_mcore \
-        -S ${TIMESTAMP} \
-        -X \
-        --format JobID,JobName%20,Partition,AllocNodes,ElapsedRaw \
-        -p \
-        -n \
-      | awk -F "|" '{{sum+=$4*$5}} END {{print sum*8/3600}}')
-      TOTAL_CAPA=$(( $QUOTA*24*30 ))
-
-      USAGE=$(echo "$USED_CAPA $TOTAL_CAPA" | awk '{print (1 - $1/$2)*100}')%
-
-      echo "Usage left: $USAGE"
-      echo "Disclaimer: Please be careful with this number. Usage does not imply
-        what we are guaranteed to get a slot, SLURM scheduling is more complicated
-        than that. The number is rather a proxy to the FairShare that determines
-        our job-scheduling-priority.
-
-        Most important take-away of this number is to get a sense how much much
-        we are eating up our budget such that we can discuss this with capacity planning.
-        "
-
-label_merge_request:
-  stage: .pre
-  image: golang:1.22
-  tags:
-    - mcore-docker-node-small
-  before_script:
-    - git clone -b nv https://${GITLAB_ENDPOINT}/okoenig/gitlab-mr-labeler.git
-    - cd gitlab-mr-labeler
-    - go install .
-    - cd ..
-    - |
-      go install github.com/itchyny/gojq/cmd/gojq@latest
-      echo LABELS=$(curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}" | gojq '.labels | join(",")') > labels
-  script:
-    - gitlab-mr-labeler -f .gitlab/labeler-config.yml -t ${PROJECT_ACCESS_TOKEN_MCORE} --debug true
-  after_script:
-    - |
-      source labels
-      curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}" --data-urlencode "add_labels=$LABELS" -X PUT
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-
-check_milestone:
-  stage: .pre
-  image: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_ci:buildcache
-  tags:
-    - mcore-docker-node-small
-  script:
-    - env
-    - |
-      MILESTONE=$(curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}" | jq '.milestone')
-    - |
-      if [[ "$MILESTONE" == "null" ]]; then
-        echo Please assign a Milestone to this MR!
-        exit 1
-      fi
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-
-build_image:
-  tags:
-    - 8xL40S-builder
-  image: docker:26.1.4-dind
-  stage: test
-  timeout: 45m
-  parallel:
-    matrix:
-      - IMAGE: CI_MCORE_IMAGE
-        FILE: Dockerfile.ci
-        BASE_IMAGE: nvcr.io/nvidia/pytorch:24.01-py3
-      - IMAGE: CI_NEMO_IMAGE
-        FILE: Dockerfile.ci
-        BASE_IMAGE: nvcr.io/nvidian/nemo:nightly
-      - IMAGE: LINTING_IMAGE
-        FILE: Dockerfile.linting
-        BASE_IMAGE: python:3.10
-  before_script:
-    - echo "$NGC_API_KEY" | docker login nvcr.io -u '$oauthtoken' --password-stdin
-    - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
-  variables:
-    STAGE: main
-  script:
-    - |
-      set -x
-      eval "IMAGE=\$$IMAGE"
-
-      OLD_IMAGES=$(docker image ls --format "{{.ID}} {{.Repository}}:{{.Tag}}" \
-                    | grep -v 'nvcr.io/nvidia/pytorch:24.01-py3' \
-                    | grep -v ${GITLAB_ENDPOINT}':5005/adlr/megatron-lm/mcore_ci:buildcache' \
-                    | grep -v ${GITLAB_ENDPOINT}':5005/adlr/megatron-lm/mcore_nemo:buildcache' \
-                    | grep -v ${GITLAB_ENDPOINT}':5005/adlr/megatron-lm/mcore_linting:buildcache' \
-                    | grep -v 'nvcr.io/nvidian/nemo:nightly' \
-                    | grep -v 'python:3.10' | awk '{ print $1 }'
-                 )
-      docker rmi $OLD_IMAGES || true
-      docker builder prune  -a --filter "until=24h" -f
-
-      if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
-        ADDITIONAL_PARAMS="--pull"
-      fi
-
-      docker build \
-        --secret id=JET_INDEX_URLS \
-        --target $STAGE \
-        -f $FILE \
-        -t ${IMAGE}:${CI_PIPELINE_ID} \
-        --build-arg CACHEBUST=$(cat /proc/sys/kernel/random/uuid) \
-        --cache-to type=inline \
-        --cache-from type=registry,ref=${IMAGE}:buildcache \
-        --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
-        ${ADDITIONAL_PARAMS} .
-
-      docker push ${IMAGE}:${CI_PIPELINE_ID}
-
-      if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
-        docker tag ${IMAGE}:${CI_PIPELINE_ID} ${IMAGE}:buildcache
-        docker push ${IMAGE}:buildcache
-      fi
-
-      if [[ $CI_COMMIT_BRANCH == core_r* ]]; then
-        docker tag ${IMAGE}:${CI_PIPELINE_ID} ${IMAGE}:v${CI_COMMIT_BRANCH#core_r}-${CI_PIPELINE_ID}
-        docker push ${IMAGE}:v${CI_COMMIT_BRANCH#core_r}-${CI_PIPELINE_ID}
-      fi
-  retry:
-    max: 2
-
-unit_tests:
-  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
-  stage: test
-  needs: [build_image]
-  timeout: 180m
-  parallel:
-    matrix:
-      - TAG: latest
-      - TAG: db5c60ae3fe5247f16ec0536bbf41ee5c7fb9c4a
-  tags:
-    - 8xL40S
-  rules:
-    - if: '$FUNCTIONAL_TEST == "no" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/)'
-      allow_failure: true
-    - when: always
-  variables:
-    GIT_STRATEGY: clone
-    GIT_DEPTH: 0
-  before_script:
-    - |
-      if [[ $TAG != latest ]]; then
-        git checkout $TAG
-        rm -rf /opt/megatron-lm/tests
-        cp -r tests/ /opt/megatron-lm
-      fi
-  script:
-    - |
-      cd /opt/megatron-lm  
-      for i in $(seq $UNIT_TEST_REPEAT); do
-        SEED=$((RANDOM % 9000 + 1000));
-        timeout ${UNIT_TEST_TIMEOUT}m torchrun --nproc_per_node=8 -m pytest --random-order --random-order-seed ${SEED} -xvs --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail tests/unit_tests
-      done
-      
-  artifacts:
-    paths:
-      - coverage
-
-docs_build_test:
-  image: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/python-format:0.0.1
-  stage: test
-  tags:
-    - mcore-docker-node-small
-  script:
-    - cd ..
-    - rm -rf documentation && git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/nemo-megatron-core-tme/documentation.git
-    - mv megatron-lm/ documentation/
-    - cd documentation/
-    - ./repo docs
-  allow_failure: true
-  except:
-    - main
-  interruptible: true
-
-formatting:
-  image: ${LINTING_IMAGE}:${CI_PIPELINE_ID}
-  tags:
-    - mcore-docker-node-small
-  stage: test
-  needs: [build_image]
-  before_script:
-    - git fetch origin main
-  script:
-    - CHECK_ONLY=true bash tools/autoformat.sh
-
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/)'
-      allow_failure: true
-    - when: always
-  interruptible: true
-
-copyright:
-  tags:
-    - mcore-docker-node-small
-  stage: test
-  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
-  needs: [build_image]
-  before_script:
-    - git fetch origin main
-  script:
-    - bash tools/copyright.sh
-
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME != $CI_DEFAULT_BRANCH && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME !~ /^core_r/)'
-      allow_failure: true
-    - when: always
-  interruptible: true
-
-secret_detection:
-  stage: test
-  variables:
-    GIT_DEPTH: 0
-    SECRET_DETECTION_LOG_OPTIONS: ${CI_MERGE_REQUEST_DIFF_BASE_SHA}..${CI_COMMIT_SHA}
-  tags:
-    - mcore-docker-node-small
-  allow_failure: false
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-  script:
-    - apk add jq
-    - /analyzer run
-    - |
-      if [[ $(cat gl-secret-detection-report.json | jq '.vulnerabilities | length > 0') == true ]]; then 
-        echo "Atleast one vulnerability has been found"
-        cat gl-secret-detection-report.json | jq '.'
-        exit 1
-      fi
-
-convergence-test:
-  stage: test
-  needs: [build_image]
-  tags:
-    - ${TAG}
-  timeout: 7d
-  rules:
-    - if: '$CONVERGENCE_TEST == "yes" && $CI_COMMIT_BRANCH =~ /^core_r/'
-    - when: never
-  parallel:
-    matrix:
-      - SETTINGS: RELEASE_BERT
-        TAG: mcore-ssh-node-A
-      - SETTINGS: RELEASE_GPT  
-        TAG: mcore-ssh-node-B
-      - SETTINGS: RELEASE_MOE
-        TAG: mcore-ssh-node-B
-  before_script: |
-    python -m venv local/venv 
-    source local/venv/bin/activate
-    pip install jet-api --upgrade $JET_INDEX_URLS
-  script:
-    - |
-      if [[ -z "${!SETTINGS}" ]]; then
-        echo Unknown model $SETTINGS
-        exit 1
-      fi
-      set -x
-
-      export MCORE_RELEASE_NUM=${CI_COMMIT_BRANCH#core_r}
-      export IMAGE_TAG=v${MCORE_RELEASE_NUM}-${CI_PIPELINE_ID} 
-      export WANDB_API_KEY=${WANDB_API_KEY}
-      export GITLAB_TOKEN=${PAT}
-      
-      echo "${!SETTINGS}" > vars.sh
-      source vars.sh
-      
-
-      # Fill in data blend
-      DATA_BLEND_ID=$(curl \
-                        --request GET "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/snippets" \
-                        --header "PRIVATE-TOKEN: $PROJECT_ACCESS_TOKEN_MCORE" \
-                      | jq --arg TITLE "$SETTINGS" '
-                              .[] 
-                              | select(.title == "GPT") 
-                              | .id
-                        ' \
-                      | tr -d '"')
-      export DATA_BLEND=$(curl \
-                    --request GET "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/snippets/${DATA_BLEND_ID}/raw" \
-                    --header "PRIVATE-TOKEN: $PROJECT_ACCESS_TOKEN_MCORE"
-                  )
-      yq '.MODEL_ARGS."--data-path" = env(DATA_BLEND)' -i $TRAINING_PARAMS_PATH
-
-      env
-      bash tests/functional_tests/shell_test_utils/run_ci_test_locally.sh
-
-publish-wheel:
-  image: quay.io/pypa/manylinux_2_28_x86_64
-  stage: publish
-  rules:
-    - if: $CI_COMMIT_BRANCH =~ /^core_r/ && $PUBLISH == "yes"
-      when: manual
-    - when: never
-  before_script:
-    - pip install twine
-  script:
-    - /opt/python/cp310-cp310/bin/python -m build
-    - /opt/python/cp311-cp311/bin/python -m build
-    - auditwheel repair dist/*.whl
-    - twine upload --repository pypi wheelhouse/*
-
+include:
+  - .gitlab/stages/00.pre.yml
+  - .gitlab/stages/01.tests.yml
+  - .gitlab/stages/02.functional-tests.yml
+  - .gitlab/stages/03.convergence-tests.yml
+  - .gitlab/stages/04.publish.yml
