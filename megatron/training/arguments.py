@@ -49,6 +49,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_retro_args(parser)
     parser = _add_experimental_args(parser)
     parser = _add_one_logger_args(parser)
+    parser = _add_ft_package_args(parser)
     parser = _add_config_logger_args(parser)
 
     # Custom arguments.
@@ -850,6 +851,7 @@ def _add_network_size_args(parser):
                        help='Untie embeddings and output weights.'),
     return parser
 
+
 def _add_straggler_detector_args(parser):
     group = parser.add_argument_group(title='straggler')
     group.add_argument('--log-straggler', action='store_true',
@@ -861,6 +863,7 @@ def _add_straggler_detector_args(parser):
     group.add_argument('--straggler-minmax-count', type=int, default=1,
                        help='Number of ranks to report with high/low estimated throughput')
     return parser
+
 
 def _add_one_logger_args(parser):
     group = parser.add_argument_group(title='one logger')
@@ -890,12 +893,22 @@ def _add_one_logger_args(parser):
                        'baseline')
     return parser
 
+
+def _add_ft_package_args(parser):
+    group = parser.add_argument_group(title='ft_package')
+    group.add_argument('--enable-ft-package', action='store_true',
+                       help='If set, Fault Tolerance package is enabled. '
+                       'Note: This feature is for Nvidia internal use only.')
+    return parser
+
+
 def _add_config_logger_args(parser):
     group = parser.add_argument_group(title='config logger')
     group.add_argument('--config-logger-dir', type=str, default='',
                        help='If set, will dump all configs to --config-logger-dir',
                        dest='config_logger_dir')
     return parser
+
 
 def _add_logging_args(parser):
     group = parser.add_argument_group(title='logging')
