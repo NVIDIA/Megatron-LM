@@ -116,7 +116,7 @@ def num_floating_point_operations(args, batch_size):
                 * gated_linear_multiplier
             )
             # Logit.
-            + (args.padded_vocab_size / (2 * args.num_layers * args.hidden_size))
+            + (args.padded_vocab_size / ((2 + 2 / 3) * args.num_layers * args.hidden_size))
         )
     )
 
