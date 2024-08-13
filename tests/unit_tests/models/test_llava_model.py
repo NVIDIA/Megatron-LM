@@ -13,6 +13,7 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestLLaVAModel:
+    @pytest.mark.internal  # The model is under active development and its methods may change.
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
@@ -50,21 +51,25 @@ class TestLLaVAModel:
             patch_dim=14,
         )
 
+    @pytest.mark.internal
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     def test_constructor(self):
         assert isinstance(self.model, LLaVAModel)
 
         num_weights = sum([p.numel() for p in self.model.parameters()])
         assert num_weights == 1439304
 
+    @pytest.mark.internal
     def test_set_input_tensor(self):
         expected_shape = (1, 2, 3, 4)
         input_tensor = torch.zeros(expected_shape)
         self.model.set_input_tensor(input_tensor)
         assert self.model.vision_model.decoder.input_tensor.shape == expected_shape
 
+    @pytest.mark.internal
     def test_forward(self):
         self.model.cuda()
 
@@ -106,12 +111,14 @@ class TestLLaVAModel:
             # Expected shape is [sequence_len, batch_size, num_heads, hidden_size_per_head]
             assert layer_kv[0].shape == layer_kv[1].shape == torch.Size((1601, 2, 8, 16))
 
+    @pytest.mark.internal
     def test_save_load(self, tmp_path):
         path = tmp_path / "model.pt"
         torch.save(self.model.state_dict(), path)
 
         self.model.load_state_dict(torch.load(path))
 
+    @pytest.mark.internal
     def test_freeze(self):
         self.model.freeze(
             freeze_language_model=True, freeze_vision_model=True, freeze_vision_projection=False
