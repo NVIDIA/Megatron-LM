@@ -1175,7 +1175,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         num_floating_point_operations_so_far += num_fp_ops
         total_flops += num_fp_ops
 
-        # Fault tolerance
+        # Send heartbeat to FT package and update timeouts.
         if args.enable_ft_package:
             ft_client = ft_integration.get_rank_monitor_client(
                 ft_integration.StateMachineActions.TRAIN_HEARTBEAT)
@@ -1189,6 +1189,13 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                         ft_integration.StateMachineActions.UPDATE_TIMEOUT).calculate_and_set_timeouts()
                     print_rank_0(f'Updated FT timeouts. New values: \
                         {ft_integration.get_rank_monitor_client().timeouts}')
+
+        # Bring CPU and GPU back in sync if on right iteration.
+        if (
+            args.train_sync_interval
+            and iteration % args.train_sync_interval == 0
+        ):
+            torch.cuda.synchronize()
 
         # Logging.
         loss_scale = optimizer.get_loss_scale().item()
