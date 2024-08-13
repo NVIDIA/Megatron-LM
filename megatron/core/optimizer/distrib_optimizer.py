@@ -45,6 +45,10 @@ class Range:
     """
     A range represents a start and end points for indexing a shard
     from a full tensor.
+
+    Args:
+        start (int): Start index.
+        end (int): End index.
     """
 
     def __init__(self, start: int, end: int):
@@ -53,6 +57,13 @@ class Range:
         self.size = end - start
 
     def normalize(self, start: int = 0):
+        """Shift start/end indexes to start at new start index.
+
+        Both start and end indexes will be shifted by [new start] - [old start].
+
+        Args:
+            start (int): New start index.
+        """
         return Range(start, start + self.size)
 
     def __str__(self):
@@ -63,6 +74,11 @@ class Range:
 
 
 class DistributedOptimizer(MixedPrecisionOptimizer):
+    """Distributed optimizer, for all data types (fp16, bf16, and fp32).
+
+    See __init__() below for argument details.
+    """
+
     @classmethod
     def _build_model_gbuf_param_range_map(
         cls,
@@ -613,7 +629,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Get the Torch optimizer's state dict.
         # - This 'inner' optimizer at this point is unallocated, and only
-        #   contains an integer odering of parameters within each group, and
+        #   contains an integer ordering of parameters within each group, and
         #   the ordering of parameters within its flattened parameter state
         #   list.
         inner_state_dict = self.optimizer.state_dict()
@@ -622,34 +638,45 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for idx, group in enumerate(state_dict["optimizer"]["param_groups"])
         ]
 
-        # Allocate 'dummy' data for optimizer state (i.e., torch.empty() below)
-        # - Real data is overwritten during load_parameter_state().
-        state_dict_state = []
-        for gbuf_range_maps in self.gbuf_ranges:
-            for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
-                for gbuf_range_map in gbuf_range_map_for_all_buckets:
-                    for model_param, param_range_map in gbuf_range_map["param_map"].items():
+        # Allocate or retrieve optimizer state (i.e., tensors).
+        if len(self.optimizer.state) == 0:
+            # Allocate empty optimizer state if not previously initialized.
+            # - If len(self.optimizer.state) == 0, this means that the optimizer
+            #   state has not been previously initialized. Once it has been
+            #   initialized, we skip this code block to avoid reallocating
+            #   empty tensors (i.e., torch.empty), which in turn reduces memory
+            #   fragmentation.
+            # - Real data is overwritten during load_parameter_state().
+            state_dict_state = []
+            for gbuf_range_maps in self.gbuf_ranges:
+                for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
+                    for gbuf_range_map in gbuf_range_map_for_all_buckets:
+                        for model_param, param_range_map in gbuf_range_map["param_map"].items():
 
-                        # Get parameter ordering information (see method docstring
-                        # for details).
-                        group_index, group_order = self.model_param_group_index_map[model_param]
-                        state_order = inner_state_dict["param_groups"][group_index]["params"][
-                            group_order
-                        ]
+                            # Get parameter ordering information (see method docstring
+                            # for details).
+                            group_index, group_order = self.model_param_group_index_map[model_param]
+                            state_order = inner_state_dict["param_groups"][group_index]["params"][
+                                group_order
+                            ]
 
-                        # Allocate dummy tensors.
-                        numel = len(param_range_map["gbuf_world"])
-                        init_shard = lambda: torch.empty(
-                            (numel,), dtype=torch.float32, device=torch.cuda.current_device()
-                        )
+                            # Allocate dummy tensors.
+                            numel = len(param_range_map["gbuf_world"])
+                            init_shard = lambda: torch.empty(
+                                (numel,), dtype=torch.float32, device=torch.cuda.current_device()
+                            )
 
-                        state_dict_state.append(
-                            (state_order, {"exp_avg": init_shard(), "exp_avg_sq": init_shard()})
-                        )
+                            state_dict_state.append(
+                                (state_order, {"exp_avg": init_shard(), "exp_avg_sq": init_shard()})
+                            )
 
-        # Sort by state order (see method docstring for details).
-        state_dict_state.sort(key=lambda s: s[0])
-        state_dict_state = {s[0]: s[1] for s in state_dict_state}
+            # Sort by state order (see method docstring for details).
+            state_dict_state.sort(key=lambda s: s[0])
+            state_dict_state = {s[0]: s[1] for s in state_dict_state}
+
+        else:
+            # Retrieve existing optimizer state.
+            state_dict_state = inner_state_dict["state"]
 
         # Extract 'step', for non-Apex/TE support.
         if not HAVE_APEX_OR_TE:
@@ -894,7 +921,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             }
 
         if is_loading:
-            self.init_state_fn(self.optimizer)
+            # Call the distributed optimizer's specialized load_state_dict(),
+            # which conditionally skips re-allocating the optimizer's state if
+            # already initialized, which in turn reduces memory fragmentation.
+            self.load_state_dict(self.state_dict())
 
         if sharding_type == 'fully_sharded_bucket_space':
             param_state = self.sharded_param_state_fs_bucket_space(

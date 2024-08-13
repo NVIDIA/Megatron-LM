@@ -1128,6 +1128,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                  f'p {mpu.get_pipeline_model_parallel_rank()} ] '
                  f'at iteration {iteration}')
 
+    torch.cuda.empty_cache()
     return iteration, num_floating_point_operations_so_far
 
 
