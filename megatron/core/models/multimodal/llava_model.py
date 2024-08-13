@@ -80,7 +80,7 @@ class LLaVAModel(MegatronModule):
             log_config_to_disk(language_transformer_config, locals(), prefix=type(self).__name__)
 
         logging.getLogger(__name__).warning(
-            "LLaVA model is under development and may be missing features."
+            "LLaVA model is under active development. It may be missing features and its methods may change."
         )
 
         self.pre_process = pre_process
@@ -150,6 +150,7 @@ class LLaVAModel(MegatronModule):
         return None
 
     def set_input_tensor(self, input_tensor) -> None:
+        """Set model chunk input tensor."""
         # This is usually handled in schedules.py but some inference code still
         # gives us non-lists or None
         if not isinstance(input_tensor, list):
