@@ -34,8 +34,13 @@ from megatron.training.initialize import set_jit_fusion_options
 from megatron.training.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
+from megatron.core.parallel_state import (
+    destroy_global_memory_buffer,
+    destroy_model_parallel,
+)
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.num_microbatches_calculator import (
+    destroy_num_microbatches_calculator,
     get_current_global_batch_size,
     get_current_running_global_batch_size,
     get_num_microbatches,
@@ -54,6 +59,7 @@ from .utils import (
     update_use_dist_ckpt,
 )
 from .global_vars import (
+    destroy_global_vars,
     get_args,
     get_signal_handler,
     get_timers,
@@ -65,6 +71,13 @@ from . import one_logger_utils
 from . import ft_integration
 
 stimer = StragglerDetector()
+
+def destroy_global_state():
+    destroy_global_vars()
+    destroy_num_microbatches_calculator()
+    destroy_global_memory_buffer()
+    destroy_model_parallel()
+    
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
