@@ -190,10 +190,10 @@ def validate_args(args, defaults={}):
     # Checks.
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
-              'context-parallel size: {} '
+              'context-parallel size: {}, '
               'tensor-model-parallel size: {}, '
-              'encoder-tensor-model-parallel size: {}'
-              'pipeline-model-parallel size: {} '
+              'encoder-tensor-model-parallel size: {}, '
+              'pipeline-model-parallel size: {}, '
               'encoder-pipeline-model-parallel size: {}'.format(
                   args.world_size, args.data_parallel_size,
                   args.context_parallel_size,
