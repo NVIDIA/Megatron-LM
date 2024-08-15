@@ -33,15 +33,16 @@ except ImportError:
 
 # Use this spec to use lower level Transformer Engine modules (required for fp8 training)
 def get_vit_layer_with_transformer_engine_spec() -> ModuleSpec:
+    '''
+    Returns ViT layer spec with Transformer Engine layers
+    '''
     mlp = _get_mlp_module_spec(use_te=True)
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
             self_attention=ModuleSpec(
                 module=SelfAttention,
-                params={
-                    "attn_mask_type": AttnMaskType.causal
-                },  # TODO: This should be no_mask when CI is upgraded
+                params={"attn_mask_type": AttnMaskType.no_mask},
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=TELayerNormColumnParallelLinear,
                     core_attention=TEDotProductAttention,
@@ -57,6 +58,9 @@ def get_vit_layer_with_transformer_engine_spec() -> ModuleSpec:
 
 
 def get_vit_layer_with_local_spec() -> ModuleSpec:
+    '''
+    Returns ViT layer spec with Mcore local layers
+    '''
     mlp = _get_mlp_module_spec(use_te=False)
     return ModuleSpec(
         module=TransformerLayer,
