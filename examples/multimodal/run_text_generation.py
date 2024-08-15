@@ -19,6 +19,7 @@ from PIL import Image
 from torchvision.transforms import Compose, Resize, ToPILImage
 from train import add_multimodal_extra_args, get_image_token_count, model_provider
 
+from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN_INDEX
 from megatron.inference.text_generation.api import generate_and_post_process
 from megatron.inference.text_generation.forward_step import ForwardStep
 from megatron.training import get_args, get_model, print_rank_0
@@ -282,7 +283,7 @@ def generate_samples(model):
                 elif args.task in ("TextVQA", "MMMU"):
                     output_name = "text"
 
-                generated = generation[len(prompt) + 1 :]
+                generated = generation[len(prompt):]
                 output[output_name] = generated
 
                 if args.task == "captioning":
@@ -329,6 +330,13 @@ class VLMForwardStep(ForwardStep):
         self._images = images
 
     def _forward(self, tokens, position_ids, attention_mask):
+        # Add image token index to the front if it's not included in the prompt. Note: This will change in a future MR.
+        num_tokens = tokens.shape[1]
+
+        if num_tokens > 1 and torch.sum(tokens == IMAGE_TOKEN_INDEX).item() == 0:
+            tokens = torch.cat([torch.tensor([[IMAGE_TOKEN_INDEX]], dtype=tokens.dtype, device=tokens.device), tokens], dim=1)
+            position_ids = torch.arange(num_tokens, dtype=position_ids.dtype, device=position_ids.device)
+
         return self.model(
             self._images,
             tokens,

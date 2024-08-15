@@ -76,7 +76,7 @@ unit_tests:
   parallel:
     matrix:
       - TAG: latest
-      - TAG: db5c60ae3fe5247f16ec0536bbf41ee5c7fb9c4a  
+      - TAG: a5efe829b1d34c691f0a7a5286e271b4f9c86b2a
   tags: [8xL40S]
   variables:
     GIT_STRATEGY: clone
@@ -89,11 +89,15 @@ unit_tests:
         cp -r tests/ /opt/megatron-lm
       fi
   script:
-    - |      
-      cd /opt/megatron-lm  
+    - |
+      cd /opt/megatron-lm
       for i in $(seq $UNIT_TEST_REPEAT); do
         SEED=$((RANDOM % 9000 + 1000));
-        timeout ${UNIT_TEST_TIMEOUT}m torchrun --nproc_per_node=8 -m pytest --random-order --random-order-seed ${SEED} -xvs --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail `$([[ $TAG != latest ]] && echo -m 'not internal')` tests/unit_tests
+        SKIPPED=()
+        if [[ $TAG != latest ]]; then
+          SKIPPED+=(-m "not internal")
+        fi
+        timeout ${UNIT_TEST_TIMEOUT}m torchrun --nproc_per_node=8 -m pytest --random-order --random-order-seed ${SEED} -xvs --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail "${SKIPPED[@]}" tests/unit_tests
       done
   artifacts:
     paths:
@@ -143,7 +147,7 @@ secret_detection:
     - apk add jq
     - /analyzer run
     - |
-      if [[ $(cat gl-secret-detection-report.json | jq '.vulnerabilities | length > 0') == true ]]; then 
+      if [[ $(cat gl-secret-detection-report.json | jq '.vulnerabilities | length > 0') == true ]]; then
         echo "Atleast one vulnerability has been found"
         cat gl-secret-detection-report.json | jq '.'
         exit 1

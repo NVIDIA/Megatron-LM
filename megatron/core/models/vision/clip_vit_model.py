@@ -150,3 +150,11 @@ class CLIPViTModel(VisionModule):
         x = x.contiguous()
 
         return x
+
+
+def get_image_sequence_length(img_h, img_w, patch_dim, add_class_token, class_token_len):
+    """Get image sequence length given image size, patch size, and class token."""
+    num_patches_per_dim_h = img_h // patch_dim
+    num_patches_per_dim_w = img_w // patch_dim
+    num_patches = num_patches_per_dim_h * num_patches_per_dim_w
+    return num_patches + (class_token_len if add_class_token else 0)
