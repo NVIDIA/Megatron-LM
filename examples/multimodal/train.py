@@ -85,7 +85,7 @@ def model_provider(
         vision_config.pipeline_model_parallel_size = args.encoder_pipeline_model_parallel_size
         vision_projection_config.pipeline_model_parallel_size = args.encoder_pipeline_model_parallel_size
         if args.encoder_tensor_model_parallel_size > 0:
-            vision_transformer_config.tensor_model_parallel_size = args.encoder_tensor_model_parallel_size
+            vision_config.tensor_model_parallel_size = args.encoder_tensor_model_parallel_size
             vision_projection_config.tensor_model_parallel_size = args.encoder_tensor_model_parallel_size
 
     vision_projection_layer_spec = get_mlp_module_spec(use_te=use_te).submodules
@@ -113,7 +113,6 @@ def model_provider(
         img_w=args.img_w,
         patch_dim=args.patch_dim,
         language_rotary_base=args.rotary_base,
-        img_embedding_idx=args.img_embedding_idx,
     )
 
     model.freeze(freeze_language_model=args.freeze_LM, freeze_vision_model=args.freeze_ViT, freeze_vision_projection=False)
@@ -171,10 +170,6 @@ def get_batch(data_iterator):
                                         question_length=prompt_len)
     torch.cuda.nvtx.range_pop()
 
-    loss_mask, labels, attention_mask = _preprocess_data_for_llava(loss_mask, labels, attention_mask)
-
-    tokens = tokens[:, 1:]  # drop image index token
-
     return tokens, labels, loss_mask, attention_mask, position_ids, img_raw
 
 
@@ -189,24 +184,6 @@ def get_image_token_count():
     num_image_tokens = num_patches + (1 if add_class_token else 0)
 
     return num_image_tokens
-
-
-def _preprocess_data_for_llava(loss_mask, labels, attention_mask):
-    """Preprocess data sample to the format expected by a LLaVA model."""
-    num_image_tokens = get_image_token_count()
-
-    batch_size = loss_mask.shape[0]
-
-    loss_mask2 = torch.cat(
-        [torch.zeros(batch_size, num_image_tokens - 1, dtype=torch.float32, device=loss_mask.device), loss_mask], dim=1
-    )
-    labels2 = torch.cat([torch.zeros(batch_size, num_image_tokens - 1, dtype=torch.int64, device=labels.device), labels], dim=1)
-
-    full_seq_length = len(labels2[0])
-    attention_mask2 = torch.tril(torch.ones((1, 1, full_seq_length, full_seq_length), device=attention_mask.device))
-    attention_mask2 = attention_mask2 < 0.5
-
-    return loss_mask2, labels2, attention_mask2
 
 
 def get_ltor_masks_and_position_ids(data,
@@ -312,7 +289,7 @@ def forward_step(data_iterator, model: LLaVAModel):
     tokens, labels, loss_mask, attention_mask, position_ids, images = get_batch(data_iterator)
     timers('batch-generator').stop()
 
-    output_tensor = model(images, tokens, position_ids, attention_mask, labels=labels)
+    output_tensor, loss_mask = model(images, tokens, position_ids, attention_mask, labels, loss_mask)
 
     return output_tensor, partial(loss_func, loss_mask)
 
@@ -332,10 +309,6 @@ def add_multimodal_extra_args(parser):
     group.add_argument("--disable-vision-class-token", action="store_true", default=False)
     group.add_argument("--allow-missing-vision-projection-checkpoint", action="store_true", default=False)
     group.add_argument("--use-te", action="store_true", default=False)
-    group.add_argument("--img-embedding-idx", type=int, default=0,
-                       help='Llava specific parameter. Defines at which index'
-                       'in the language_embedding tensor the image_embeddings'
-                       'should be inserted')
     group.add_argument("--dataloader-save", type=str, default=None, help="Energon dataloader state save path")
     return parser
 
