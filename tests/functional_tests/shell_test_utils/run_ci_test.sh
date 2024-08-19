@@ -34,9 +34,6 @@ done
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT_DIR=$(realpath $SCRIPT_DIR/../../../)
 
-# Training
-bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
-
 # Extract settings from params file
 TEST_TYPE=$(cat $TRAINING_PARAMS_PATH \
             | yq '.TEST_TYPE')
@@ -44,35 +41,48 @@ NVTE_ALLOW_NONDETERMINISTIC_ALGO=$(cat $TRAINING_PARAMS_PATH \
                                    | yq '.ENV_VARS.NVTE_ALLOW_NONDETERMINISTIC_ALGO')
 SKIP_PYTEST=$(cat $TRAINING_PARAMS_PATH \
               | yq '.ENV_VARS.SKIP_PYTEST')
+N_REPEATS=$(cat $TRAINING_PARAMS_PATH \
+              | yq '.ENV_VARS.N_REPEATS //1')
 
-# Maybe checkpoint resume training
-if [[ "$TEST_TYPE" == "ckpt-resume" ]]; then 
-    rm -rf $CHECKPOINT_PATH/iter_0000100; 
-    echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt;
+for i in $(seq 1 $N_REPEATS);
+do
+    rm -rf $CHECKPOINT_PATH/*
+    rm -rf $OUTPUT_PATH/*
+
+    # Training
     bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
-fi
 
-# Save run results
-export PYTHONPATH=$ROOT_DIR
-python3 $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
-    --logs-dir $TENSORBOARD_PATH \
-    --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH)
-
-# Maybe run tests
-if [[ ${SKIP_PYTEST:-0} != 1 ]]; then
-    export NVTE_ALLOW_NONDETERMINISTIC_ALGO
-    export LOGS_DIR=$TENSORBOARD_PATH
-    
-    if [[ "$TEST_TYPE" == "ckpt-resume" ]]; then
-        echo "Running pytest 1st vs 2nd run comparison"
-        pytest -s $ROOT_DIR/tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py
-
-    elif [[ "$TEST_TYPE" == "regular" ]]; then
-        echo "Running pytest checks against golden values"
-        export EXPECTED_METRICS_FILE=$GOLDEN_VALUES_PATH 
-        pytest -s $ROOT_DIR/tests/functional_tests/python_test_utils/test_ci_pipeline.py
-
-    else
-        echo "Test type $TEST_TYPE not yet implemented."
+    # Maybe checkpoint resume training
+    if [[ "$TEST_TYPE" == "ckpt-resume" ]]; then 
+        rm -rf $CHECKPOINT_PATH/iter_0000100; 
+        echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt;
+        bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
     fi
-fi
+
+    # Save run results
+    export PYTHONPATH=$ROOT_DIR
+    python3 $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
+        --logs-dir $TENSORBOARD_PATH \
+        --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH)
+
+    # Maybe run tests
+    if [[ ${SKIP_PYTEST:-0} != 1 ]]; then
+        export NVTE_ALLOW_NONDETERMINISTIC_ALGO
+        export LOGS_DIR=$TENSORBOARD_PATH
+        
+        if [[ "$TEST_TYPE" == "ckpt-resume" ]]; then
+            echo "Running pytest 1st vs 2nd run comparison"
+            pytest -s $ROOT_DIR/tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py
+
+        elif [[ "$TEST_TYPE" == "regular" ]]; then
+            echo "Running pytest checks against golden values"
+            export EXPECTED_METRICS_FILE=$GOLDEN_VALUES_PATH 
+            pytest -s $ROOT_DIR/tests/functional_tests/python_test_utils/test_ci_pipeline.py
+
+        else
+            echo "Test type $TEST_TYPE not yet implemented."
+        fi
+    fi
+done
+
+

@@ -105,7 +105,7 @@ products:
     - gpt3_mr_tp2_pp2_dgx_a100_1N8G
   - scope: [nightly]
     platforms: [dgx_a100]
-    time_limit: [1200]
+    time_limit: [12000]
     test_case:
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_dist_optimizer_overlap_grad_reduce_param_gather
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather

@@ -38,7 +38,7 @@ MODEL_ARGS:
   --eval-iters: 10
   --transformer-impl: transformer_engine
   --tensor-model-parallel-size: 2
-  --pipeline-model-parallel-size: 2: 
+  --pipeline-model-parallel-size: 2
   --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --fp8-format: hybrid
