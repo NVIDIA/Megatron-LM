@@ -2,11 +2,12 @@
 import argparse
 import os
 
-import clip
 import torch
 
+import clip
 
-def convert(download_root, output_path, tensor_parallel_size, use_te_layernorm_linear):
+
+def convert(download_root, output_path, tensor_parallel_size, use_te):
     device = "cuda"
 
     model, _ = clip.load("ViT-L/14@336px", device=device, download_root=download_root)
@@ -77,11 +78,11 @@ def convert(download_root, output_path, tensor_parallel_size, use_te_layernorm_l
                 new_name = f"{base}.self_attention.linear_proj.bias"
             elif "ln_1.weight" in name:
                 new_name = f"{base}.input_layernorm.weight"
-                if use_te_layernorm_linear:
+                if use_te:
                     new_name = f"{base}.self_attention.linear_qkv.layer_norm_weight"
             elif "ln_1.bias" in name:
                 new_name = f"{base}.input_layernorm.bias"
-                if use_te_layernorm_linear:
+                if use_te:
                     new_name = f"{base}.self_attention.linear_qkv.layer_norm_bias"
             elif "mlp.c_fc.weight" in name:
                 new_name = f"{base}.mlp.linear_fc1.weight"
@@ -96,11 +97,11 @@ def convert(download_root, output_path, tensor_parallel_size, use_te_layernorm_l
                 new_name = f"{base}.mlp.linear_fc2.bias"
             elif "ln_2.weight" in name:
                 new_name = f"{base}.pre_mlp_layernorm.weight"
-                if use_te_layernorm_linear:
+                if use_te:
                     new_name = f"{base}.mlp.linear_fc1.layer_norm_weight"
             elif "ln_2.bias" in name:
                 new_name = f"{base}.pre_mlp_layernorm.bias"
-                if use_te_layernorm_linear:
+                if use_te:
                     new_name = f"{base}.mlp.linear_fc1.layer_norm_bias"
 
         assert new_name != "", f"unexpected layer name {name}"
@@ -114,8 +115,21 @@ def convert(download_root, output_path, tensor_parallel_size, use_te_layernorm_l
             # chunk() creates a view of a bigger tensor. clone() is used here to avoid excessive storage.
             new_state_dicts[i]["model"][new_name] = new_tensors[i].clone()
 
+            # TE sets _extra_state (for FP8 purposes), so set an empty one here for compatibility.
+            extra_state_layers = ("linear_qkv", "linear_proj", "linear_fc1", "linear_fc2")
+            is_extra_state_layer = any([l in new_name for l in extra_state_layers])
+            if use_te and is_extra_state_layer:
+                layer = new_name.split(".")[-2]
+                if layer in extra_state_layers:
+                    extra_state_name = (
+                        new_name[: new_name.rfind(".") + 1] + "_extra_state"
+                    )  # Replace the weight name.
+                    new_state_dicts[i]["model"][extra_state_name] = None
+
     for i in range(tensor_parallel_size):
-        output_path_tp = os.path.join(output_path, f"state_dict_tp_{i}.pt")
+        output_dir_tp = os.path.join(output_path, "iter_0000001", f"mp_rank_0{i}")
+        os.makedirs(output_dir_tp)
+        output_path_tp = os.path.join(output_dir_tp, "model_optim_rng.pt")
         torch.save(new_state_dicts[i], output_path_tp)
 
 
@@ -132,24 +146,18 @@ python clip_converter.py --download-root /some/download/folder --output /some/ou
     )
 
     parser.add_argument(
-        "--download-root", type=str, required=True, help="Download folder for OpenAI CLIP weights",
+        "--download-root", type=str, required=True, help="Download folder for OpenAI CLIP weights"
     )
     parser.add_argument(
         "--output", type=str, required=True, help="output directory for megatron state dict file(s)"
     )
     parser.add_argument(
-        "--tensor-parallel-size", type=int, default=1, help="model tensor parallel size",
+        "--tensor-parallel-size", type=int, default=1, help="model tensor parallel size"
     )
-    parser.add_argument(
-        "--use-te-layernorm-linear",
-        action="store_true",
-        help="Use Transformer Engine's LayerNormLinear",
-    )
+    parser.add_argument("--use-te", action="store_true", help="Use Transformer Engine")
 
     args = parser.parse_args()
 
-    convert(
-        args.download_root, args.output, args.tensor_parallel_size, args.use_te_layernorm_linear
-    )
+    convert(args.download_root, args.output, args.tensor_parallel_size, args.use_te)
 
     print("done.")

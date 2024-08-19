@@ -21,7 +21,7 @@ Follow the instructions in `megatron-lm/docs/llama_mistral.md` to download weigh
 This example uses the OpenAI CLIP `ViT-L/14@336px` Vision model. To download the weights from OpenAI and convert them to a format that can be loaded in megatron, please run the following:
 
 ```
-python examples/multimodal/clip_converter.py --download-root /some/download/folder --output /some/output/folder --tensor-parallel-size 4 --use-te-layernorm-linear
+python examples/multimodal/clip_converter.py --download-root /some/download/folder --output /some/output/folder --tensor-parallel-size 4 --use-te
 ```
 
 ### Combined model checkpoint
@@ -29,7 +29,7 @@ python examples/multimodal/clip_converter.py --download-root /some/download/fold
 Update the paths to point to the mcore converted CLIP and Mistral models and run the following script to combine the Mistral and CLIP models into a single multimodal checkpoint folder:
 
 ```
-examples/multimodal/combine_mistral_clip.sh
+examples/multimodal/combine_mistral_clip.sh /path/to/mistral/model /path/to/clip/model /output/dir
 ```
 
 ## Training
