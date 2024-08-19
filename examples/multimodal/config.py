@@ -37,7 +37,7 @@ def get_language_model_config(config):
         config.add_bias_linear = False
         config.bias_activation_fusion = False
         config.gated_linear_unit = True
-        config.apply_query_key_layer_scaling = True
+        config.apply_query_key_layer_scaling = False
         config.layernorm_zero_centered_gamma = (
             False  # Zero centered gamma not supported for RMSNorm
         )
@@ -62,26 +62,28 @@ def get_language_model_config(config):
     return config
 
 
-def get_vision_model_config(config, apply_query_key_layer_scaling=False):
-    config.num_layers = 24
-    config.num_attention_heads = 16
-    config.add_bias_linear = True
-    config.add_qkv_bias = True
-    config.hidden_size = 1024
-    config.hidden_dropout = 0.0
-    config.attention_dropout = 0.0
-    config.ffn_hidden_size = 4096
-    config.gated_linear_unit = False
-    config.activation_func = quick_gelu
-    config.kv_channels = 64
-    config.num_attention_heads = 16
-    config.num_query_groups = 16
-    config.layernorm_zero_centered_gamma = False
-    config.apply_query_key_layer_scaling = apply_query_key_layer_scaling
-    config.bias_activation_fusion = False
-    config.bias_dropout_fusion = False
-    config.attention_softmax_in_fp32 = True
-    config.normalization = 'LayerNorm'
+def get_vision_model_config(config, apply_query_key_layer_scaling):
+    if config.vision_model_type == "clip":
+        config.num_layers = 24
+        config.num_attention_heads = 16
+        config.add_bias_linear = True
+        config.add_qkv_bias = True
+        config.hidden_size = 1024
+        config.hidden_dropout = 0.0
+        config.attention_dropout = 0.0
+        config.ffn_hidden_size = 4096
+        config.gated_linear_unit = False
+        config.activation_func = quick_gelu
+        config.kv_channels = 64
+        config.num_attention_heads = 16
+        config.num_query_groups = 16
+        config.layernorm_zero_centered_gamma = False
+        config.apply_query_key_layer_scaling = apply_query_key_layer_scaling
+        config.bias_activation_fusion = False
+        config.bias_dropout_fusion = False
+        config.attention_softmax_in_fp32 = True
+        config.normalization = 'LayerNorm'
+        config.apply_rope_fusion = False
 
     return config
 
@@ -90,7 +92,7 @@ def get_vision_projection_config(config, hidden_size):
     config.gated_linear_unit = False
     config.bias_activation_fusion = False
     config.add_bias_linear = False
-    config.hidden_size = hidden_size
+    config.hidden_size = hidden_size  # Used as the vision projection output size, i.e., the input to the language model.
     if config.language_model_type == "2b":
         config.ffn_hidden_size = 5440
         config.activation_func = torch.nn.functional.gelu
@@ -99,9 +101,9 @@ def get_vision_projection_config(config, hidden_size):
         config.activation_func = squared_relu
     elif config.language_model_type == "llama3_8b":
         config.ffn_hidden_size = 14336
-        config.activation_func = torch.nn.functional.silu
+        config.activation_func = torch.nn.functional.gelu
     elif config.language_model_type == "mistral_7b":
         config.ffn_hidden_size = 14336
-        config.activation_func = torch.nn.functional.silu
+        config.activation_func = torch.nn.functional.gelu
 
     return config

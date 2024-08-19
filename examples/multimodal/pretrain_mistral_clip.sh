@@ -52,7 +52,6 @@ else
 fi
 
 OPTIONS=" \
-    --img-embedding-idx 1 \
     --apply-layernorm-1p \
     --attention-softmax-in-fp32 \
     --use-checkpoint-args \
