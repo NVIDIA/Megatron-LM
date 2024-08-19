@@ -36,7 +36,7 @@ MODEL_ARGS:
   --eval-iters: 10
   --transformer-impl: transformer_engine
   --tensor-model-parallel-size: 1
-  --pipeline-model-parallel-size: 1: 
+  --pipeline-model-parallel-size: 1
   --no-gradient-accumulation-fusion: true
   --fp8-format: hybrid
   --fp8-amax-history-len: 1024

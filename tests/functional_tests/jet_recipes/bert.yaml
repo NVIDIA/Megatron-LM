@@ -9,8 +9,6 @@ spec:
   nodes: 1
   gpus: 8
   platforms: dgx_a100
-  time_limit: 1200
-  scope: null
   artifacts: 
     /workspace/data/bert_data: text/the_pile/bert_shard00
   script: |-
@@ -32,6 +30,7 @@ spec:
 
 products:
   - scope: [mr]
+    time_limit: [1200]
     test_case: 
     - bert_mr_mcore_tp2_pp2_dgx_a100_1N8G
     - bert_mr_mcore_tp2_pp2_local_spec_dgx_a100_1N8G
@@ -42,6 +41,7 @@ products:
     - bert_mr_tp2_pp2_dgx_a100_1N8G
     - bert_mr_tp2_pp2_resume_torch_dgx_a100_1N8G
   - scope: [nightly]
+    time_limit: [12000]
     test_case:
     - bert_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp2
     - bert_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp4_vp2
