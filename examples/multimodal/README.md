@@ -1,5 +1,7 @@
 # Multimodal Example
 
+*NOTE: This example is under active development and is expected change.*
+
 The following walks through all the steps required to pretrain and instruction tune a llava architecture vision-language model (VLM). It is important to precisely follow all steps to obtain the benchmark scores at the end.
 
 This example has been tested on an A100 based DGX cluster. Pretraining and instruction tuning took approximately 1 day and 11 hours respectively on 64 GPUs using four way tensor parallelism (tp=4). Training speed will scale approximately linearly with number of GPUs available.
@@ -80,7 +82,7 @@ examples/multimodal/combine_mistral_clip.sh
     examples/multimodal/pretrain_mistral_clip.sh
     ```
 
-All being well you should observe training and valiation loss curves similar to the following:
+All being well you should observe training and validation loss curves similar to the following:
 
 <img src="assets/pretrain_curves.png" alt="Pretraining loss curves" width="600"/>
 
