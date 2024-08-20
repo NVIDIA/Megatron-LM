@@ -1125,13 +1125,14 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     if one_logger:
         with one_logger.get_context_manager():
             one_logger.store_set('get_e2e_base_metrics', get_e2e_base_metrics)
-
+    profiler_status = 0
     while iteration < args.train_iters:
         if args.profile and \
            iteration == args.profile_step_start and \
            torch.distributed.get_rank() in args.profile_ranks:
             torch.cuda.cudart().cudaProfilerStart()
             torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
+            profiler_status = 1
 
         maybe_finalize_async_save(False)
 
@@ -1336,6 +1337,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
            iteration == args.profile_step_end and \
            torch.distributed.get_rank() in args.profile_ranks:
             torch.cuda.cudart().cudaProfilerStop()
+            torch.autograd.profiler.emit_nvtx(record_shapes=True).__exit__(None,None,None)
+            profiler_status = 0
 
         if args.manual_gc:
             if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:
@@ -1362,6 +1365,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         wandb_writer = get_wandb_writer()
         if wandb_writer:
             wandb_writer.finish()
+        if profiler_status != 0:
+            torch.autograd.profiler.emit_nvtx(record_shapes=True).__exit__(None,None,None)
         sys.exit()
 
     return iteration, num_floating_point_operations_so_far
