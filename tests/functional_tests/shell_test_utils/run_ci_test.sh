@@ -47,7 +47,6 @@ N_REPEATS=$(cat $TRAINING_PARAMS_PATH \
 for i in $(seq 1 $N_REPEATS);
 do
     rm -rf $CHECKPOINT_PATH/*
-    rm -rf $OUTPUT_PATH/*
 
     # Training
     bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
