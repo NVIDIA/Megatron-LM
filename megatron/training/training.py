@@ -1295,13 +1295,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
         elif args.save and args.non_persistent_save_interval and \
            iteration % args.non_persistent_save_interval == 0:
-            timers('interval-time').stop()
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler,
                                      num_floating_point_operations_so_far,
                                      non_persistent_ckpt=True, train_data_iterator=train_data_iterator)
             saved_checkpoint = True
-            timers('interval-time', log_level=0).start(barrier=True)
 
         # Exiting based on duration
         if args.exit_duration_in_mins:
