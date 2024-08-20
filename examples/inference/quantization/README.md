@@ -57,49 +57,106 @@ following checkpoint formats with some remedy:
 > a production-level API server or enterprise support, see [NeMo](https://github.com/NVIDIA/NeMo) and TensorRT-LLM's
 > backend for [NVIDIA Triton Inference Server](https://developer.nvidia.com/nvidia-triton-inference-server).
 
-### nemotron3-8B FP8 Quantization and TensorRT-LLM Deployment
-First download the nemotron checkpoint from https://huggingface.co/nvidia/nemotron-3-8b-base-4k, extract the
+### Minitron-8B FP8 Quantization and TensorRT-LLM Deployment
+First download the nemotron checkpoint from https://huggingface.co/nvidia/Minitron-8B-Base, extract the
 sharded checkpoint from the `.nemo` tarbal and fix the tokenizer file name.
 
 > **NOTE:** The following cloning method uses `ssh`, and assume you have registered the `ssh-key` in Hugging Face.
-> If you are want to clone with `https`, then `git clone https://huggingface.co/nvidia/nemotron-3-8b-base-4k` with an access token.
+> If you are want to clone with `https`, then `git clone https://huggingface.co/nvidia/Minitron-8B-Base` with an access token.
 
 ```sh
 git lfs install
-git clone git@hf.co:nvidia/nemotron-3-8b-base-4k
-cd nemotron-3-8b-base-4k
-tar -xvf Nemotron-3-8B-Base-4k.nemo
-mv 586f3f51a9cf43bc9369bd53fa08868c_a934dc7c3e1e46a6838bb63379916563_3feba89c944047c19d5a1d0c07a85c32_mt_nlg_plus_multilingual_ja_zh_the_stack_frac_015_256k.model tokenizer.model
-cd ..
+git clone git@hf.co:nvidia/Minitron-8B-Base
+cd Minitron-8B-Base/nemo
+tar -xvf minitron-8b-base.nemo
+cd ../..
 ```
 
 Now launch the PTQ + TensorRT-LLM export script,
 ```sh
-bash examples/inference/quantization/ptq_trtllm_nemotron3_8b ./nemotron-3-8b-base-4k None
+bash examples/inference/quantization/ptq_trtllm_minitron_8b ./Minitron-8B-Base None
 ```
 By default, `cnn_dailymail` is used for calibration. The `GPTModel` will have quantizers for simulating the
 quantization effect. The checkpoint will be saved optionally (with quantizers as additional states) and can
-be restored for further evaluation. TensorRT-LLM checkpoint and engine are exported to `/tmp/trtllm_ckpt` and
+be restored for further evaluation or quantization-aware training. TensorRT-LLM checkpoint and engine are exported to `/tmp/trtllm_ckpt` and
 built in `/tmp/trtllm_engine` by default.
 
-The script expects `${CHECKPOINT_DIR}` (`./nemotron-3-8b-base-4k`) to have the following structure:
+The script expects `${CHECKPOINT_DIR}` (`./Minitron-8B-Base/nemo`) to have the following structure:
+
+> **NOTE:** The .nemo checkpoint after extraction (including examples below) should all have the following strucure.
+
 ```
 ├── model_weights
 │   ├── common.pt
 │   ...
 │
 ├── model_config.yaml
-├── mt_nlg_plus_multilingual_ja_zh_the_stack_frac_015_256k.model
+│...
 ```
 
 > **NOTE:** The script is using `TP=8`. Change `$TP` in the script if your checkpoint has a different tensor
 > model parallelism.
 
-> **KNOWN ISSUES:** The `mt_nlg_plus_multilingual_ja_zh_the_stack_frac_015_256k.model` in the checkpoint is for
-> Megatron-LM's `GPTSentencePiece` tokenizer.
-> For TensorRT-LLM, we are trying to load this tokenizer as a Hugging Face `T5Tokenizer` by changing
-> some special tokens, `encode`, and `batch_decode`. As a result, the tokenizer behavior in TensorRT-LLM engine may
-> not match exactly.
+Then build TensorRT engine and run text generation example using the newly built TensorRT engine
+
+```sh
+export trtllm_options=" \
+    --checkpoint_dir /tmp/trtllm_ckpt \
+    --output_dir /tmp/trtllm_engine \
+    --max_input_len 2048 \
+    --max_output_len 512 \
+    --max_batch_size 8 "
+
+trtllm-build ${trtllm_options}
+
+python examples/inference/quantization/trtllm_text_generation.py --tokenizer nvidia/Minitron-8B-Base
+```
+
+### mistral-12B FP8 Quantization and TensorRT-LLM Deployment
+First download the nemotron checkpoint from https://huggingface.co/nvidia/Mistral-NeMo-12B-Base, extract the
+sharded checkpoint from the `.nemo` tarbal.
+
+> **NOTE:** The following cloning method uses `ssh`, and assume you have registered the `ssh-key` in Hugging Face.
+> If you are want to clone with `https`, then `git clone https://huggingface.co/nvidia/Mistral-NeMo-12B-Base` with an access token.
+
+```sh
+git lfs install
+git clone git@hf.co:nvidia/Mistral-NeMo-12B-Base
+cd Mistral-NeMo-12B-Base
+tar -xvf Mistral-NeMo-12B-Base.nemo
+cd ..
+```
+
+Then log in to huggingface so that you can access to model
+
+> **NOTE:** You need a token generated from huggingface.co/settings/tokens and access to mistralai/Mistral-Nemo-Base-2407 on huggingface
+
+```sh
+pip install -U "huggingface_hub[cli]"
+huggingface-cli login
+```
+
+Now launch the PTQ + TensorRT-LLM checkpoint export script,
+
+```sh
+bash examples/inference/quantization/ptq_trtllm_mistral_12b.sh ./Mistral-NeMo-12B-Base None
+```
+
+Then build TensorRT engine and run text generation example using the newly built TensorRT engine
+
+```sh
+export trtllm_options=" \
+    --checkpoint_dir /tmp/trtllm_ckpt \
+    --output_dir /tmp/trtllm_engine \
+    --max_input_len 2048 \
+    --max_output_len 512 \
+    --max_batch_size 8 "
+
+trtllm-build ${trtllm_options}
+
+python examples/inference/quantization/trtllm_text_generation.py --tokenizer mistralai/Mistral-Nemo-Base-2407
+```
+
 
 ### llama2-text-7b INT8 SmoothQuant and TensorRT-LLM Deployment
 > **NOTE:** Due to the LICENSE issue, we do not provide a MCore checkpoint to download. Users can follow
@@ -126,3 +183,49 @@ The script expect `${CHECKPOINT_DIR}` to have the following structure:
 ```
 In short, other than the converted llama megatron checkpoint, also put the Hugging Face checkpoint inside as
 the source of the tokenizer.
+
+### llama3-8b / llama3.1-8b INT8 SmoothQuant and TensorRT-LLM Deployment
+> **NOTE:** For llama3.1, the missing rope_scaling parameter will be fixed in modelopt-0.17 and trtllm-0.12.
+
+> **NOTE:** There are two ways to acquire the checkpoint. Users can follow
+> the instruction in `docs/llama2.md` to convert the checkpoint to megatron legacy `GPTModel` format and
+> use `--export-legacy-megatron` flag which will remap the checkpoint to the MCore `GPTModel` spec
+> that we support.
+> Or Users can download [nemo model](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/nemo/models/llama38bnemo) from NGC and extract the sharded checkpoint from the .nemo tarbal.
+
+If users choose to download the model from NGC, first extract the sharded checkpoint from the .nemo tarbal.
+
+```sh
+tar -xvf 8b_pre_trained_bf16.nemo
+```
+
+Now launch the PTQ + TensorRT-LLM checkpoint export script for llama-3,
+
+```sh
+bash examples/inference/quantization/ptq_trtllm_llama3_8b.sh ./llama-3-8b-nemo_v1.0 None
+```
+
+or llama-3.1
+
+```sh
+bash examples/inference/quantization/ptq_trtllm_llama3_1_8b.sh ./llama-3_1-8b-nemo_v1.0 None
+```
+
+Then build TensorRT engine and run text generation example using the newly built TensorRT engine
+
+```sh
+export trtllm_options=" \
+    --checkpoint_dir /tmp/trtllm_ckpt \
+    --output_dir /tmp/trtllm_engine \
+    --max_input_len 2048 \
+    --max_output_len 512 \
+    --max_batch_size 8 "
+
+trtllm-build ${trtllm_options}
+
+python examples/inference/quantization/trtllm_text_generation.py --tokenizer meta-llama/Meta-Llama-3-8B
+# For llama-3
+
+python examples/inference/quantization/trtllm_text_generation.py --tokenizer meta-llama/Meta-Llama-3.1-8B
+#For llama-3.1
+```
