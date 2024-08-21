@@ -21,7 +21,6 @@ from layer_specs import get_layer_spec, get_mlp_module_spec, get_layer_spec_te
 from megatron.training import pretrain
 from dataloader_provider import train_valid_test_dataloaders_provider
 
-
 def model_provider(
     pre_process=True, post_process=True, add_encoder=True, add_decoder=True,
     parallel_output=True) -> LLaVAModel:
@@ -250,8 +249,12 @@ def get_ltor_masks_and_position_ids(data,
 
 
     if question_length is not None:
-        for b in range(micro_batch_size):
-            loss_mask[b, :max(0, question_length[b].item())] = 0.0
+        # Create a mask based on question_length
+        question_length_mask = torch.arange(loss_mask.size(1), device=loss_mask.device)[None, :] < question_length[:, None]
+        # Invert the mask (1 where we want to keep the loss, 0 where we want to zero it out)
+        inverted_mask = ~question_length_mask
+        # Apply the mask to loss_mask
+        loss_mask = loss_mask * inverted_mask.float()
 
     if reset_position_ids or reset_attention_mask:
         # Loop through the batches:
