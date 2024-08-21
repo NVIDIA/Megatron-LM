@@ -15,7 +15,7 @@ from PIL import Image, ImageDraw
 from torchvision import transforms as T
 from torchvision.transforms import Compose, RandAugment, RandomResizedCrop, Resize, ToPILImage
 
-from megatron.core import mpu
+from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, IMAGE_TOKEN_INDEX
 from megatron.energon import (
     Batch,
     CaptioningSample,
@@ -27,10 +27,6 @@ from megatron.energon import (
 from megatron.energon.transforms import CustomTransform, MergeTransform
 from megatron.training import get_args
 from megatron.training.tokenizer import build_tokenizer
-
-IMAGE_TOKEN_INDEX = -200
-IGNORE_INDEX = -100
-
 
 try:
     from torchvision.transforms import InterpolationMode

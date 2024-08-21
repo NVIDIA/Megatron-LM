@@ -58,13 +58,12 @@ done
 
 # Please modify these as needed.
 NUM_PARTITIONS=100
-START=2
+START=0
 END=0
 
 for PARTITION_ID in $( eval echo {$START..$END} )
 do
     torchrun --nproc_per_node 4 examples/multimodal/run_text_generation.py \
-        --img-embedding-idx 1 \
         --apply-layernorm-1p \
         --attention-softmax-in-fp32 \
         --use-flash-attn \
@@ -113,5 +112,6 @@ do
         --output-path ${OUTPUT_PATH}-${TASK}-${PARTITION_ID}.jsonl \
         --gt-path ${GROUNDTRUTH_PATH} \
         --task ${TASK} \
-        --disable-vision-class-token
+        --disable-vision-class-token \
+        --prompt-format mistral
 done
