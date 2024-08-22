@@ -91,7 +91,7 @@ do
         --max-position-embeddings 4096 \
         --no-masked-softmax-fusion \
         --load ${MODEL_PATH} \
-        --tokenizer-type MistralTokenizer \
+        --tokenizer-type HuggingFaceTokenizer \
         --tokenizer-model ${TOKENIZER_PATH} \
         --bf16 \
         --micro-batch-size 1 \

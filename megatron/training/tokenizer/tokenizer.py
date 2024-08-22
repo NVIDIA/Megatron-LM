@@ -17,7 +17,7 @@ from .bert_tokenization import FullTokenizer as FullBertTokenizer
 from .gpt2_tokenization import GPT2Tokenizer
 
 
-def build_tokenizer(args):
+def build_tokenizer(args, **kwargs):
     """Initialize tokenizer."""
     if args.rank == 0:
         print('> building {} tokenizer ...'.format(args.tokenizer_type),
@@ -45,18 +45,10 @@ def build_tokenizer(args):
         assert args.tokenizer_model is not None
         tokenizer = _GPTSentencePieceTokenizer(args.tokenizer_model)
     elif args.tokenizer_type == 'HuggingFaceTokenizer':
-        tokenizer = _HuggingFaceTokenizer(args.tokenizer_model)
+        tokenizer = _HuggingFaceTokenizer(args.tokenizer_model, **kwargs)
     elif args.tokenizer_type == 'Llama2Tokenizer':
         assert args.tokenizer_model is not None
         tokenizer = _Llama2Tokenizer(args.tokenizer_model)
-    elif args.tokenizer_type == 'Llama3Tokenizer':
-        assert args.tokenizer_model is not None
-        tokenizer = create_llama3_tokenizer(args.tokenizer_model)
-    elif args.tokenizer_type == 'MistralTokenizer':
-        assert args.tokenizer_model is not None
-        tokenizer = create_mistral_tokenizer(args.tokenizer_model)
-        tokenizer.vocab_size = 32768
-        tokenizer.eos_id = tokenizer.instruct_tokenizer.tokenizer.eos_id
     elif args.tokenizer_type == 'TikTokenizer':
         assert args.tokenizer_model is not None
         assert args.tiktoken_pattern is not None
@@ -100,15 +92,15 @@ def _vocab_size_with_padding(orig_vocab_size, args, logging_enabled=True):
 
 
 class _HuggingFaceTokenizer(MegatronTokenizer):
-    def __init__(self, pretrained_model_name_or_path):
-        super().__init__(pretrained_model_name_or_path)
+    def __init__(self, pretrained_model_name_or_path, **kwargs):
+        super().__init__(pretrained_model_name_or_path, **kwargs)
         try:
             import transformers
         except ImportError:
             raise EnvironmentError(f"The transformers library must be installed to use huggingface_tokenizer_provider")
 
         # TODO(bnorick): download tokenizer once to lustre and use force offline to make sure all tasks read it from there
-        self._tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path=pretrained_model_name_or_path)
+        self._tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path=pretrained_model_name_or_path, **kwargs)
         self._vocab = self._tokenizer.get_vocab()
         self._inv_vocab = {token_id: token for token, token_id in self._vocab.items()}
 
@@ -130,11 +122,11 @@ class _HuggingFaceTokenizer(MegatronTokenizer):
     def decoder(self):
         return self._inv_vocab
 
-    def tokenize(self, text):
-        return self._tokenizer(text).input_ids
+    def tokenize(self, text, **kwargs):
+        return self._tokenizer(text, **kwargs).input_ids
 
-    def detokenize(self, token_ids):
-        return self._tokenizer.decode(token_ids)
+    def detokenize(self, token_ids, **kwargs):
+        return self._tokenizer.decode(token_ids, **kwargs)
 
     @property
     def eod(self):
@@ -555,111 +547,6 @@ class _Llama2Tokenizer(_SentencePieceTokenizer):
     @property
     def additional_special_tokens_ids(self):
         return None
-
-
-def create_llama3_tokenizer(*args, **kwargs):
-
-    try:
-        from llama.tokenizer import Tokenizer as Llama3Tokenizer
-    except ImportError:
-        raise ImportError("Module 'llama' is required but not installed.")
-
-    class _Llama3Tokenizer(Llama3Tokenizer):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-
-        def instruct_tokenize(self, s: str, bos=True, eos=False):
-            '''Default args for text completion, not chat/dialog.'''
-
-            assert type(s) is str
-
-            t = self.encode(s, bos=bos, eos=eos, allowed_special='all')
-            return t
-
-        def tokenize(self, s: str, bos=True, eos=False):
-            '''Default args for text completion, not chat/dialog.'''
-
-            assert type(s) is str
-
-            t = self.encode(s, bos=bos, eos=eos, allowed_special='all')
-            return t
-
-        def detokenize(self, ids):
-            return self.decode(ids)
-
-        @property
-        def cls(self):
-            return -1
-
-        @property
-        def sep(self):
-            return -1
-
-        @property
-        def mask(self):
-            return -1
-
-        @property
-        def eod(self):
-            return self.eos_id
-
-        @property
-        def additional_special_tokens_ids(self):
-            return None
-
-        @property
-        def vocab_size(self):
-            return self.model.n_vocab
-
-    return _Llama3Tokenizer(*args, **kwargs)
-
-
-def create_mistral_tokenizer(*args, **kwargs):
-    try:
-        from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
-        from mistral_common.tokens.instruct.request import InstructRequest
-        from mistral_common.protocol.instruct.messages import UserMessage
-    except ImportError:
-        raise ImportError("Module 'mistral-common' is required but not installed.")
-
-    class _MistralTokenizer(MistralTokenizer):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-
-    tokenizer = _MistralTokenizer.from_file(*args, **kwargs)
-
-    def tokenize(self, s: str, bos=True, eos=False):
-        '''Default args for text completion, not chat/dialog.'''
-
-        assert type(s) is str
-
-        t = self.instruct_tokenizer.tokenizer.encode(s, bos=bos, eos=eos)
-
-        return t
-
-    def instruct_tokenize(self, s: str):
-        '''Default args for text completion, not chat/dialog.'''
-
-        assert type(s) is str
-
-        t = self.instruct_tokenizer.encode_instruct(
-            InstructRequest(
-                messages=[
-                    UserMessage(content=s),
-                ],
-            )
-        )
-
-        return t.tokens[1:] # strip of box
-
-    def detokenize(self, ids):
-        return self.instruct_tokenizer.tokenizer.decode(ids)
-
-    tokenizer.tokenize = types.MethodType(tokenize, tokenizer)
-    tokenizer.detokenize = types.MethodType(detokenize, tokenizer)
-    tokenizer.instruct_tokenize = types.MethodType(instruct_tokenize, tokenizer)
-
-    return tokenizer
 
 
 def reload_mergeable_ranks(
