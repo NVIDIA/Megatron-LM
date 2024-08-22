@@ -1,6 +1,6 @@
 # Llama, Mistral and other Llama-like model support in Megatron-LM
 
-NOTE: Llama-3 and Mistral support in Megatron is currently experimental and we are still evaluting benchmark results to confirm model conversion, training and inference correctness.
+NOTE: Llama-3 and Mistral support in Megatron is currently experimental and we are still evalauting benchmark results to confirm model conversion, training and inference correctness.
 
 The [Llama-2](https://ai.meta.com/llama/) and [Llama-3](https://llama.meta.com/) family of models are an open-source set of pretrained & finetuned (for chat) models that have achieved strong results across a wide set of benchmarks. At their times of release, both Llama-2 and Llama-3 models achieved among the best results for open-source models, and were competitive with leading closed-source models (see https://arxiv.org/pdf/2307.09288.pdf and https://ai.meta.com/blog/meta-llama-3/).
 
