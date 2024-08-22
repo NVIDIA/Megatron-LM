@@ -894,7 +894,7 @@ try:
     def get_cpu_offload_context(
         enabled, num_layers, model_layers, activation_offloading, weight_offloading
     ):
-        if _te_version > packaging.version.Version("1.9.0"):
+        if _te_version >= packaging.version.Version("1.10.0.dev0"):
             context, sync_func = _get_cpu_offload_context(
                 enabled, num_layers, model_layers, activation_offloading, weight_offloading
             )
