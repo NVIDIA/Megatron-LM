@@ -194,7 +194,9 @@ def unpermute(
             permuted_tokens, sorted_indices, probs, restore_shape=restore_shape
         )
 
-    assert sorted_indices.numel() == permuted_tokens.size(0)
+    assert sorted_indices.numel() == permuted_tokens.size(
+        0
+    ), f"Got {sorted_indices.numel()} != {permuted_tokens.size(0)}."
     if probs is not None:
         # Unpermute and merge the tokens with their probabilities
         num_unpermuted_tokens = probs.numel()
@@ -277,6 +279,13 @@ def unpermute_with_padded_tokens(
     unpermuted_tokens = torch.scatter_add(empty_tokens, 0, indices, combined_output)
 
     return unpermuted_tokens
+
+
+def sort_chunks_by_idxs(input: torch.Tensor, split_sizes: torch.Tensor, sorted_idxs: torch.Tensor):
+    """Split and sort the input tensor based on the split_sizes and sorted indices."""
+    input = torch.split(input, split_sizes.tolist(), dim=0)
+    output = torch.cat([input[i] for i in sorted_idxs], dim=0)
+    return output
 
 
 def topk_softmax_with_capacity(
@@ -421,6 +430,7 @@ def reduce_aux_losses_tracker_across_ranks():
 def track_moe_metrics(
     loss_scale, iteration, writer, wandb_writer=None, total_loss_dict=None, per_layer_logging=False
 ):
+    """Track the MoE metrics for logging."""
     # Aux loss logging
     reduce_aux_losses_tracker_across_ranks()
     tracker = parallel_state.get_moe_layer_wise_logging_tracker()
@@ -459,14 +469,18 @@ def track_moe_metrics(
 
 
 class moe_gather(torch.autograd.Function):
+    """Gather the input tensor based on the map tensor."""
+
     @staticmethod
     def forward(ctx, input_, map_):
+        """Gather the input tensor based on the map tensor."""
         ctx.input_size = input_.size()
         ctx.map = map_
         return torch.gather(input_, 0, map_)
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Scatter the grad_output tensor based on the map tensor."""
         input_size = ctx.input_size
         map_ = ctx.map
 
@@ -478,8 +492,11 @@ class moe_gather(torch.autograd.Function):
 
 
 class moe_scatter(torch.autograd.Function):
+    """Scatter the input tensor based on the map tensor."""
+
     @staticmethod
     def forward(ctx, input_, map_, output_size=None):
+        """Scatter the input tensor based on the map tensor."""
         ctx.map = map_
 
         if output_size is not None:
@@ -494,6 +511,7 @@ class moe_scatter(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Gather the grad_output tensor based on the map tensor."""
         map_ = ctx.map
         grad_input = torch.gather(grad_output, 0, map_)
         return grad_input, None, None, None
