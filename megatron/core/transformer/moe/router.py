@@ -181,11 +181,11 @@ class TopKRouter(Router):
         """
         moe_aux_loss_coeff = self.config.moe_aux_loss_coeff
         sequence_partition_group = None
-        if self.config.moe_token_dispatcher_type == "allgather":
-            sequence_partition_group = parallel_state.get_tensor_and_context_parallel_group()
-        elif self.config.moe_token_dispatcher_type == "alltoall":
+        if self.config.moe_token_dispatcher_type == "alltoall_seq":
             sequence_partition_group = parallel_state.get_context_parallel_group()
             moe_aux_loss_coeff /= parallel_state.get_tensor_model_parallel_world_size()
+        else:
+            sequence_partition_group = parallel_state.get_tensor_and_context_parallel_group()
 
         aux_loss = switch_load_balancing_loss_func(
             probs,
@@ -262,10 +262,7 @@ class TopKRouter(Router):
         # Apply Z-Loss
         logits = self.apply_z_loss(logits)
 
-        if (
-            parallel_state.get_tensor_model_parallel_world_size() > 1
-            and self.config.moe_token_dispatcher_type == "alltoall"
-        ):
+        if self.config.moe_token_dispatcher_type == "alltoall_seq":
             # Gather the logits from the TP region
             logits = gather_from_sequence_parallel_region(logits)
 
