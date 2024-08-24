@@ -1082,7 +1082,8 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 optim_checkpoint_name = \
                     get_distributed_optimizer_checkpoint_name(
                         model_checkpoint_name)
-                optimizer.load_parameter_state(optim_checkpoint_name, update_legacy_format=args.ckpt_convert_update_legacy_dist_opt_format)
+                optimizer.load_parameter_state(optim_checkpoint_name,
+                                               update_legacy_format=args.ckpt_convert_update_legacy_dist_opt_format)
 
             # Load scheduler.
             if opt_param_scheduler is not None:

@@ -161,6 +161,9 @@ def validate_args(args, defaults={}):
     # Load saved args from Retro (if applicable).
     load_retro_args(args)
 
+    # Set args.use_dist_ckpt from args.ckpt_format.
+    update_use_dist_ckpt(args)
+
     if args.encoder_tensor_model_parallel_size > 0:
         assert args.encoder_pipeline_model_parallel_size > 0, "encoder_pipeline_model_parallel_size must be defined."
         assert args.num_attention_heads % args.encoder_tensor_model_parallel_size == 0
@@ -207,7 +210,6 @@ def validate_args(args, defaults={}):
         args.encoder_pipeline_model_parallel_size = args.pipeline_model_parallel_split_rank
         args.pipeline_model_parallel_size -= args.encoder_pipeline_model_parallel_size
         assert args.pipeline_model_parallel_size > 0
-
 
     if args.tp_comm_overlap:
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
@@ -293,9 +295,23 @@ def validate_args(args, defaults={}):
         assert args.use_distributed_optimizer, \
             '--overlap-param-gather only supported with distributed optimizer'
         assert args.overlap_grad_reduce, \
-            '--overlap-grad-reduce should be turned on when using --overlap-param-gather'
+            'Must use --overlap-param-gather with --overlap-grad-reduce'
         assert not args.use_legacy_models, \
             '--overlap-param-gather only supported with MCore models'
+
+    if args.overlap_param_gather_with_optimizer_step:
+        assert args.use_distributed_optimizer, \
+            '--overlap-param-gather-with-optimizer-step only supported with distributed optimizer'
+        assert args.overlap_param_gather, \
+            'Must use --overlap-param-gather-with-optimizer-step with --overlap-param-gather'
+        assert args.virtual_pipeline_model_parallel_size is not None, \
+            '--overlap-param-gather-with-optimizer-step only supported with interleaved pipeline parallelism'
+        assert not args.use_dist_ckpt, \
+            '--overlap-param-gather-with-optimizer-step not supported with distributed checkpointing yet'
+
+    if args.align_param_gather:
+        assert args.virtual_pipeline_model_parallel_size is not None, \
+            '--align-param-gather only supported with interleaved pipeline parallelism'
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -515,9 +531,6 @@ def validate_args(args, defaults={}):
         # Pipeline parallelism unsupported.
         assert args.pipeline_model_parallel_size == 1, \
             "retro currently does not support pipeline parallelism."
-
-    # Set args.use_dist_ckpt from args.ckpt_format.
-    update_use_dist_ckpt(args)
 
     if args.decoupled_lr is not None or args.decoupled_min_lr is not None:
         assert not args.use_legacy_models, \
@@ -1498,17 +1511,21 @@ def _add_distributed_args(parser):
                        'weight gradient computation of vocabulary projection is deferred, defaults to 0 which'
                        'means all the micro-batches are deferred. Invalid if `defer-embedding-wgrad-compute`'
                        'is not set')
-    group.add_argument('--no-delay-grad-reduce', action='store_false',
-                       help='If not set, delay / synchronize grad reductions in all but first PP stage.',
-                       dest='delay_grad_reduce')
+    group.add_argument('--no-align-grad-reduce', action='store_false',
+                       help='If not set, all PP stages will launch gradient reduces simultaneously. '
+                       'Otherwise, each PP stage will independently launch as needed.',
+                       dest='align_grad_reduce')
     group.add_argument('--ddp-bucket-size', type=int, default=None,
                        help='Bucket size for data-parallel communication')
     group.add_argument('--ddp-average-in-collective', action='store_true',
                        default=False, help='If set, average directly in data-parallel communication collective.')
     group.add_argument('--overlap-param-gather', action='store_true',
                        default=False, help='If set, overlap param all-gather in distributed optimizer.')
-    group.add_argument('--delay-param-gather', action='store_true',
-                       default=False, help='If set, delay / synchronize param all-gathers in all but first PP stage.')
+    group.add_argument('--overlap-param-gather-with-optimizer-step', action='store_true',
+                       default=False, help='If set, overlap param all-gather of first bucket with optimizer step.')
+    group.add_argument('--align-param-gather', action='store_true', default=False,
+                       help='If set, all PP stages will launch param all-gathers simultaneously. '
+                       'Otherwise, each PP stage will independently launch as needed.')
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
                        help='If not set, use scatter/gather to optimize communication of tensors in pipeline.',
                        dest='scatter_gather_tensors_in_pipeline')

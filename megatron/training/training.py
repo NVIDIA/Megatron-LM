@@ -4,6 +4,7 @@
 
 import dataclasses
 from datetime import datetime
+import functools
 import gc
 import logging
 import math
@@ -493,12 +494,13 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             check_for_nan_in_grad=args.check_for_nan_in_loss_and_grad,
             bucket_size=args.ddp_bucket_size,
             average_in_collective=args.ddp_average_in_collective)
+        overlap_param_gather_with_optimizer_step = getattr(args, 'overlap_param_gather_with_optimizer_step', False)
         model = [DDP(config,
                      ddp_config,
                      model_chunk,
                      # Turn off bucketing for model_chunk 2 onwards, since communication for these
                      # model chunks is overlapped with compute anyway.
-                     disable_bucketing=(model_chunk_idx > 0))
+                     disable_bucketing=(model_chunk_idx > 0) or overlap_param_gather_with_optimizer_step)
                  for (model_chunk_idx, model_chunk) in enumerate(model)]
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
@@ -1067,12 +1069,12 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
         if len(model) == 1:
             config.no_sync_func = config.no_sync_func[0]
-        if args.delay_grad_reduce:
+        if args.align_grad_reduce:
             config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
             if len(model) == 1:
                 config.grad_sync_func = config.grad_sync_func[0]
-    if args.overlap_param_gather and args.delay_param_gather:
-        config.param_sync_func = [lambda x: optimizer.finish_param_sync(model_index, x)
+    if args.overlap_param_gather and args.align_param_gather:
+        config.param_sync_func = [functools.partial(optimizer.start_param_sync, model_index)
                                   for model_index in range(len(model))]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
