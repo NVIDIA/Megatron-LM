@@ -231,7 +231,7 @@ class TransformerConfig(ModelParallelConfig):
     """Number of experts to route to for each token."""
 
     moe_router_pre_softmax: bool = False
-    """Enable pre-softmax routing for MoE, which means the top-k selection is before the softmax. By default, top-k is done after the softmax."""
+    """Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. By default, softmax is done after top-k."""
 
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
@@ -255,7 +255,7 @@ class TransformerConfig(ModelParallelConfig):
     currently unsupported so should remain False."""
 
     moe_token_dispatcher_type: str = "allgather"
-    """The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather' and 'alltoall'."""
+    """The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather', 'alltoall' and 'alltoall_seq'."""
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
@@ -268,6 +268,7 @@ class TransformerConfig(ModelParallelConfig):
     moe_token_drop_policy: str = 'probs'
     """The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.
     """
+
     moe_layer_recompute: bool = False
     """Memory optimization: checkpointing moe_layer to save actiavtion memory."""
 
@@ -283,6 +284,9 @@ class TransformerConfig(ModelParallelConfig):
 
     enable_cuda_graph: bool = False
     """When set to true, TransformerLayer blocks are wrapped with CUDA graph."""
+
+    config_logger_dir: str = ""
+    """When non-empty, dumps entry-point configs to config_logger_dir"""
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
@@ -345,7 +349,7 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(f'num_moe_experts must be non-negative.')
 
         if self.moe_expert_capacity_factor is not None:
-            if self.moe_token_dispatcher_type != "alltoall":
+            if self.moe_token_dispatcher_type not in ["alltoall", "alltoall_seq"]:
                 raise ValueError(
                     f'moe_expert_capacity_factor only works with alltoall token dispatcher'
                 )

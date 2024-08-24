@@ -1,12 +1,14 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+from collections import OrderedDict
 from typing import Dict, Literal, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
@@ -56,6 +58,9 @@ class GPTModel(LanguageModule):
     ) -> None:
         super().__init__(config=config)
 
+        if has_config_logger_enabled(config):
+            log_config_to_disk(config, locals(), prefix=type(self).__name__)
+
         self.transformer_layer_spec: ModuleSpec = transformer_layer_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
@@ -89,6 +94,7 @@ class GPTModel(LanguageModule):
                 rotary_interleaved=self.config.rotary_interleaved,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
+                use_cpu_initialization=self.config.use_cpu_initialization,
             )
 
         # Transformer.
@@ -131,6 +137,11 @@ class GPTModel(LanguageModule):
 
         if self.pre_process or self.post_process:
             self.setup_embeddings_and_output_layer()
+
+        if has_config_logger_enabled(self.config):
+            log_config_to_disk(
+                self.config, self.state_dict(), prefix=f'{type(self).__name__}_init_ckpt'
+            )
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
@@ -205,6 +216,18 @@ class GPTModel(LanguageModule):
             output_weight = self.shared_embedding_or_output_weight()
         logits, _ = self.output_layer(hidden_states, weight=output_weight)
 
+        if has_config_logger_enabled(self.config):
+            payload = OrderedDict(
+                {
+                    'input_ids': input_ids,
+                    'position_ids': position_ids,
+                    'attention_mask': attention_mask,
+                    'decoder_input': decoder_input,
+                    'logits': logits,
+                }
+            )
+            log_config_to_disk(self.config, payload, prefix='input_and_logits')
+
         if labels is None:
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
@@ -216,7 +239,7 @@ class GPTModel(LanguageModule):
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[Dict] = None
     ) -> ShardedStateDict:
-        """ Sharded state dict implementation for GPTModel backward-compatibility (removing extra state).
+        """Sharded state dict implementation for GPTModel backward-compatibility (removing extra state).
 
         Args:
             prefix (str): Module name prefix.

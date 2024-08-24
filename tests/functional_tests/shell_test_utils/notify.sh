@@ -173,10 +173,16 @@ else
                     ]'
     )
 
-    curl \
-        -X POST \
-        -H "Content-type: application/json" \
-        --data '{"blocks": '"$BLOCKS"'}' \
-        $WEBHOOK_URL
+    for row in $(echo "${BLOCKS}" | jq -r '.[] | @base64'); do
+        _jq() {
+            echo ${row} | base64 --decode
+        }
+
+        curl \
+            -X POST \
+            -H "Content-type: application/json" \
+            --data '{"blocks": '["$(_jq)"]'}' \
+            $WEBHOOK_URL
+    done
 
 fi

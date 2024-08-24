@@ -1,15 +1,12 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import os
 from megatron.core.device_utils import get_current_device
-import pytest
-
 import torch
-from megatron.core import dist_checkpointing
-from megatron.core.packed_seq_params import PackedSeqParams
+
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.transformer.transformer_block import TransformerBlock
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -52,7 +49,9 @@ class TestParallelTransformerBlock:
 
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).to(device=get_current_device())
 
-        hidden_states = parallel_transformer_block(hidden_states=hidden_states, attention_mask=attention_mask)
+        hidden_states = parallel_transformer_block(
+            hidden_states=hidden_states, attention_mask=attention_mask
+        )
         assert hidden_states.shape[0] == sequence_length
         assert hidden_states.shape[1] == micro_batch_size
         assert hidden_states.shape[2] == config.hidden_size
@@ -76,8 +75,9 @@ class TestParallelTransformerBlock:
         config.recompute_method = 'block'
         config.fp8 = fp8
         config.recompute_num_layers = config.num_layers
-        full_transformer_block = TransformerBlock(config,
-                                                  get_gpt_layer_with_transformer_engine_spec())
+        full_transformer_block = TransformerBlock(
+            config, get_gpt_layer_with_transformer_engine_spec()
+        )
         assert full_transformer_block.config.recompute_granularity == 'full'
         assert full_transformer_block.config.recompute_method == 'block'
         assert full_transformer_block.config.fp8 == fp8
@@ -92,7 +92,9 @@ class TestParallelTransformerBlock:
 
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).to(device=get_current_device())
 
-        hidden_states = full_transformer_block(hidden_states=hidden_states, attention_mask=attention_mask)
+        hidden_states = full_transformer_block(
+            hidden_states=hidden_states, attention_mask=attention_mask
+        )
         assert hidden_states.shape[0] == sequence_length
         assert hidden_states.shape[1] == micro_batch_size
         assert hidden_states.shape[2] == config.hidden_size
@@ -102,8 +104,9 @@ class TestParallelTransformerBlock:
         config = transformer_config
         config.recompute_granularity = 'selective'
         config.fp8 = fp8
-        selective_transformer_block = TransformerBlock(config,
-                                                       get_gpt_layer_with_transformer_engine_spec())
+        selective_transformer_block = TransformerBlock(
+            config, get_gpt_layer_with_transformer_engine_spec()
+        )
         assert selective_transformer_block.config.recompute_granularity == 'selective'
         assert selective_transformer_block.checkpoint_core_attention
         assert selective_transformer_block.config.fp8 == fp8
@@ -118,7 +121,9 @@ class TestParallelTransformerBlock:
 
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).to(device=get_current_device())
 
-        hidden_states = selective_transformer_block(hidden_states=hidden_states, attention_mask=attention_mask)
+        hidden_states = selective_transformer_block(
+            hidden_states=hidden_states, attention_mask=attention_mask
+        )
         assert hidden_states.shape[0] == sequence_length
         assert hidden_states.shape[1] == micro_batch_size
         assert hidden_states.shape[2] == config.hidden_size

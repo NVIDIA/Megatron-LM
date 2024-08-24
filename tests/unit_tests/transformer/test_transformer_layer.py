@@ -3,7 +3,6 @@
 
 from megatron.core.device_utils import get_current_device
 import pytest
-
 import torch
 
 from megatron.core import parallel_state
@@ -11,7 +10,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTenso
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -48,7 +47,9 @@ class TestParallelTransformerLayer:
 
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).to(device=get_current_device())
 
-        hidden_states, context = parallel_transformer_layer(hidden_states=hidden_states, attention_mask=attention_mask)
+        hidden_states, context = parallel_transformer_layer(
+            hidden_states=hidden_states, attention_mask=attention_mask
+        )
         assert hidden_states.shape[0] == sequence_length
         assert hidden_states.shape[1] == micro_batch_size
         assert hidden_states.shape[2] == config.hidden_size
@@ -67,7 +68,9 @@ class TestParallelTransformerLayer:
         sharded_state_dict = parallel_transformer_layer.sharded_state_dict()
 
         extra_states = {k: v for k, v in sharded_state_dict.items() if k.endswith('extra_state')}
-        sharded_tensors = {k: v for k, v in sharded_state_dict.items() if not k.endswith('extra_state')}
+        sharded_tensors = {
+            k: v for k, v in sharded_state_dict.items() if not k.endswith('extra_state')
+        }
         assert all(isinstance(t, ShardedObject) for t in extra_states.values())
         assert all(isinstance(t, ShardedTensor) for t in sharded_tensors.values())
 

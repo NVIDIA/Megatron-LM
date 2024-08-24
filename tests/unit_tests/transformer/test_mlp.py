@@ -2,14 +2,14 @@
 
 from megatron.core.device_utils import get_current_device
 import pytest
-
 import torch
 
 from megatron.core.transformer.mlp import MLP
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from tests.unit_tests.test_utilities import Utils
+
 
 class TestParallelMLP:
 
@@ -56,4 +56,3 @@ class TestParallelMLP:
         assert output.dtype == torch.float32
         assert output.device.type == 'cuda'
         assert output_bias.device.type == 'cuda'
-

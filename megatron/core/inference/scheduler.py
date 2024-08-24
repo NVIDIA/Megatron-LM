@@ -85,10 +85,9 @@ class Scheduler:
             len(self.active_request_pool) < self.max_batch_size
         ), "Active request pool is already full. Cant add any more requests"
         if len(self.waiting_request_pool) > 0:
-            (
-                earliest_waiting_request_request_id,
-                earliest_waiting_request,
-            ) = self.waiting_request_pool.popitem(last=False)
+            (earliest_waiting_request_request_id, earliest_waiting_request) = (
+                self.waiting_request_pool.popitem(last=False)
+            )
             earliest_waiting_request.status = Status.ACTIVE_BUT_NOT_GENERATING_TOKENS
             self.active_request_pool[earliest_waiting_request_request_id] = earliest_waiting_request
 

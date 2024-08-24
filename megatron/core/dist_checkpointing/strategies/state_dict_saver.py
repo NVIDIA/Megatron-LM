@@ -124,9 +124,7 @@ def save_state_dict_async_plan(
 
 
 def save_state_dict_async_finalize(
-    storage_writer: 'FileSystemWriterAsync',
-    global_metadata: Metadata,
-    dist_wrapper: _DistWrapper,
+    storage_writer: 'FileSystemWriterAsync', global_metadata: Metadata, dist_wrapper: _DistWrapper
 ) -> None:
     """
     Finalization of save_state_dict_async_plan.

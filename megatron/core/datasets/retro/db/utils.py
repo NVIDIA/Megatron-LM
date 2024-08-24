@@ -22,7 +22,7 @@ def get_db_dir(project_dir: str) -> str:
 
     Args:
         project_dir (str): Path to Retro project dir.
-    
+
     Returns:
         Path of the DB sub-directory within the project.
     """
@@ -55,9 +55,7 @@ def init_indexed_dataset_infos(config: RetroPreprocessingConfig) -> List[Dict]:
         prefix = data_blend[i + 1]
         path = os.path.join(data_dir, prefix + ".bin")
         assert os.path.exists(path), "couldn't find '%s'." % path
-        infos.append(
-            {"ratio": ratio, "prefix": prefix,}
-        )
+        infos.append({"ratio": ratio, "prefix": prefix})
 
     # Load indexed datasets.
     load_indexed_datasets(config.retro_project_dir, infos)

@@ -10,7 +10,6 @@ from megatron.core.inference.modelopt_support.gpt.state_dict_hooks import (
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.transformer_config import TransformerConfig
-
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -20,10 +19,7 @@ class TestModelOptGPTModel:
         Utils.initialize_model_parallel(1,1)
         model_parallel_device_manual_seed(123)
         transformer_config = TransformerConfig(
-            num_layers=2,
-            hidden_size=12,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
+            num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
         )
         self.gpt_model = GPTModel(
             config=transformer_config,

@@ -16,12 +16,12 @@ from megatron.core.utils import make_viewless_tensor
 try:
     from apex.contrib.layer_norm.layer_norm import FastLayerNormFN
     HAVE_PERSIST_LAYER_NORM = True
-except:
+except ImportError:
     HAVE_PERSIST_LAYER_NORM = False
 
 try:
     from apex.normalization.fused_layer_norm import fused_layer_norm_affine
-except:
+except ImportError:
     fused_layer_norm_affine = None
 
 global fused_layer_norm_cuda

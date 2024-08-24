@@ -4,7 +4,8 @@
 # repo: https://github.com/pytorch/pytorch
 
 import contextlib
-from importlib.metadata import version
+import logging
+from importlib.metadata import PackageNotFoundError, version
 
 from megatron.core.device_utils import get_current_rng_state, get_xla_model, set_current_rng_state, set_manual_seed
 import torch
@@ -108,10 +109,15 @@ class DeviceRNGStatesTracker:
         orig_rng_state = get_current_rng_state()
         # Set rng state to the desired one
         set_current_rng_state(self.states_[name])
+        # Record cpu RNG state
+        cpu_rng_state = torch.get_rng_state()
         # Do the stuff we wanted to do.
         try:
             yield
         finally:
+            # Throw a warning if cpu RNG state changed
+            if not torch.all(cpu_rng_state == torch.get_rng_state()).item():
+                logging.getLogger(__name__).warning('CPU RNG state changed within GPU RNG context')
             # Update the current rng state for later use.
             self.states_[name] = get_current_rng_state()
             # And set the state to the original state we started with.
@@ -141,8 +147,9 @@ def initialize_rng_tracker(use_te_rng_tracker: bool = False):
             _te_version = packaging.version.Version(version("transformer-engine"))
             if _te_version < packaging.version.Version("1.5.0"):
                 raise RuntimeError("use_te_rng_tracker requires TransformerEngine version >= 1.5")
-        except:
+        except PackageNotFoundError:
             raise RuntimeError("use_te_rng_tracker requires TransformerEngine, but not installed")
+        
     if use_te_rng_tracker:
         _DEVICE_RNG_STATE_TRACKER = te.distributed.DeviceRNGStatesTracker()
     else:
@@ -189,7 +196,7 @@ def model_parallel_device_manual_seed(seed):
 
 
 class CheckpointFunction(torch.autograd.Function):
-    """Checkpoint Function 
+    """Checkpoint Function
 
     This function is adapted from torch.utils.checkpoint with two main changes:
     1) torch.cuda.set_rng_state is replaced with `set_rng_state`

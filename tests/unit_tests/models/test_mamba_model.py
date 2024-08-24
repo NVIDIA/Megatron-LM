@@ -72,9 +72,7 @@ class TestMambaModel:
         ).to(device=get_current_device())
 
         logits = self.model.forward(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
+            input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
         )
 
         assert logits.shape[0] == micro_batch_size

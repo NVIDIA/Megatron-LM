@@ -1,0 +1,15 @@
+publish-wheel:
+  image: quay.io/pypa/manylinux_2_28_x86_64
+  stage: publish
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^core_r/ && $PUBLISH == "yes"
+      when: manual
+    - when: never
+  before_script:
+    - pip install twine
+  script:
+    - /opt/python/cp310-cp310/bin/python -m build
+    - /opt/python/cp311-cp311/bin/python -m build
+    - auditwheel repair dist/*.whl
+    - twine upload --repository pypi wheelhouse/*
+

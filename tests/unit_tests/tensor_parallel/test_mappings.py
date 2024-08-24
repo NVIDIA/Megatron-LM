@@ -1,7 +1,9 @@
+import torch
+
 from megatron.core.tensor_parallel import mappings
 from megatron.core.device_utils import get_current_device
 from tests.unit_tests.test_utilities import Utils
-import torch
+
 
 def test_CopyToModelParallelRegion():
     Utils.initialize_model_parallel(4,2)
@@ -9,10 +11,11 @@ def test_CopyToModelParallelRegion():
     output_data = mappings._CopyToModelParallelRegion.backward(None, input_data)
     result = torch.ones(1).to(device=get_current_device())
     result = result * 22 if Utils.rank >= 4 else result * 6
-    assert(torch.equal(output_data, result))
-    assert(torch.equal(input_data, mappings.copy_to_tensor_model_parallel_region(input_data)))
-    assert(torch.equal(input_data, mappings._CopyToModelParallelRegion.symbolic(None, input_data)))
+    assert torch.equal(output_data, result)
+    assert torch.equal(input_data, mappings.copy_to_tensor_model_parallel_region(input_data))
+    assert torch.equal(input_data, mappings._CopyToModelParallelRegion.symbolic(None, input_data))
     Utils.destroy_model_parallel()
+
 
 def test_ReduceFromModelParallelRegion():
     Utils.initialize_model_parallel(4,2)
@@ -26,14 +29,15 @@ def test_ReduceFromModelParallelRegion():
     assert(torch.equal(input_data, mappings._ReduceFromModelParallelRegion.backward(None, input_data)))
     Utils.destroy_model_parallel()
 
+
 def test_ScatterToModelParallelRegion():
     Utils.initialize_model_parallel(4,2)
     input_data = torch.rand((8,4)).to(device=get_current_device())
     output_data = mappings.scatter_to_tensor_model_parallel_region(input_data)
-    req_dim = int(Utils.rank%(Utils.world_size/2))
-    assert(torch.equal(output_data, input_data[:,req_dim].reshape((8,1))))
+    req_dim = int(Utils.rank % (Utils.world_size / 2))
+    assert torch.equal(output_data, input_data[:, req_dim].reshape((8, 1)))
     output_data = mappings._ScatterToModelParallelRegion.symbolic(None, input_data)
-    assert(torch.equal(output_data, input_data[:, req_dim].reshape((8,1))))
+    assert torch.equal(output_data, input_data[:, req_dim].reshape((8, 1)))
 
     input_data = torch.ones(8).to(device=get_current_device()) * Utils.rank
     actual_output_data = mappings._ScatterToModelParallelRegion.backward(None, input_data)
@@ -44,8 +48,9 @@ def test_ScatterToModelParallelRegion():
         torch.ones(8)*3)).to(device=get_current_device())
     if (Utils.rank >= 4):
         expected_output = expected_output + 4
-    assert(torch.equal(actual_output_data, expected_output))
+    assert torch.equal(actual_output_data, expected_output)
     Utils.destroy_model_parallel()
+
 
 def test_GatherFromModelParallelRegion():
     Utils.initialize_model_parallel(4,2)
@@ -62,16 +67,19 @@ def test_GatherFromModelParallelRegion():
         torch.ones(8)*3)).to(device=get_current_device())
     if (Utils.rank >= 4):
         expected_output = expected_output + 4
-    assert(torch.equal(actual_output_data, expected_output))
-    assert(torch.equal(mappings._GatherFromModelParallelRegion.symbolic(None, input_data), expected_output))
+    assert torch.equal(actual_output_data, expected_output)
+    assert torch.equal(
+        mappings._GatherFromModelParallelRegion.symbolic(None, input_data), expected_output
+    )
     Utils.destroy_model_parallel()
- 
+
+
 def test_ScatterToSequenceParallelRegion():
     Utils.initialize_model_parallel(4,2)
     input_data = torch.rand((8,4)).to(device=get_current_device())
     req_dim = int(Utils.rank%(Utils.world_size/2))*2
     output_data = mappings._ScatterToSequenceParallelRegion.symbolic(None, input_data)
-    assert(torch.equal(output_data, input_data[req_dim:req_dim+2, :]))
+    assert torch.equal(output_data, input_data[req_dim : req_dim + 2, :])
     output_data = mappings.scatter_to_sequence_parallel_region(input_data)
     assert(torch.equal(output_data, input_data[req_dim:req_dim+2, :]))
     input_data = torch.ones(4).to(device=get_current_device()) * Utils.rank
@@ -83,8 +91,9 @@ def test_ScatterToSequenceParallelRegion():
         torch.ones(4)*3)).to(device=get_current_device())
     if (Utils.rank >= 4):
         expected_output = expected_output + 4
-    assert(torch.equal(output_data, expected_output))
+    assert torch.equal(output_data, expected_output)
     Utils.destroy_model_parallel()
+
 
 def test_GatherFromSequenceParallelRegion():
     Utils.initialize_model_parallel(4,2)
@@ -106,10 +115,13 @@ def test_GatherFromSequenceParallelRegion():
         torch.ones(4)*3)).to(device=get_current_device())
     class Ctx:
         tensor_parallel_output_grad = True
+        output_split_sizes = None
+
     output_data = mappings._GatherFromSequenceParallelRegion.backward(Ctx(), input_data)
     expected_output = torch.ones((1,4)).to(device=get_current_device()) * 4 * int(Utils.rank % 4)
     assert(torch.equal(output_data[0], expected_output))
     Utils.destroy_model_parallel()
+
 
 def test_ReduceScatterToSequenceParallelRegion():
     Utils.initialize_model_parallel(4,2)
@@ -123,7 +135,11 @@ def test_ReduceScatterToSequenceParallelRegion():
     assert(torch.equal(output_data[0], expected_output))
     assert(torch.equal(mappings._ReduceScatterToSequenceParallelRegion.symbolic(None, input_data) , expected_output.reshape((1,4))))
     input_data = torch.ones(4).to(device=get_current_device()) * Utils.rank
-    output_data = mappings._ReduceScatterToSequenceParallelRegion.backward(None,input_data)
+
+    class Ctx:
+        input_split_sizes = None
+
+    output_data, _ = mappings._ReduceScatterToSequenceParallelRegion.backward(Ctx(),input_data)
     expected_output = torch.concat((
         torch.ones(4)*0,
         torch.ones(4)*1,
@@ -131,6 +147,5 @@ def test_ReduceScatterToSequenceParallelRegion():
         torch.ones(4)*3)).to(device=get_current_device())
     if (Utils.rank >= 4):
         expected_output = expected_output + 4
-    assert(torch.equal(output_data, expected_output))
+    assert torch.equal(output_data, expected_output)
     Utils.destroy_model_parallel()
-

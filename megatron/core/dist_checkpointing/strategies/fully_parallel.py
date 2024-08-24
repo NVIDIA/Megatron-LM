@@ -98,11 +98,7 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
 
         self.cached_distribution: Optional[SaveLoadDistribution] = None
 
-    def async_save(
-        self,
-        sharded_state_dict: ShardedStateDict,
-        checkpoint_dir: Path,
-    ):
+    def async_save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         if not isinstance(self.base_strategy, AsyncSaveShardedStrategy):
             raise CheckpointingException(
                 f'Cannot apply async_save to non-async base strategy {self.base_strategy}'
@@ -110,11 +106,7 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
         self.apply_saving_parallelization(sharded_state_dict)
         return self.base_strategy.async_save(sharded_state_dict, checkpoint_dir)
 
-    def save(
-        self,
-        sharded_state_dict: ShardedStateDict,
-        checkpoint_dir: Path,
-    ):
+    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         self.apply_saving_parallelization(sharded_state_dict)
         return self.base_strategy.save(sharded_state_dict, checkpoint_dir)
 
@@ -249,12 +241,9 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         # Step 3: load part of the checkpoint.
         # Load only sharded objects first. ShardedTensors will be loaded separately
         # so that we can keep track of sharded tensors loaded by this rank
-        (
-            sharded_tensors,
-            sharded_state_dict,
-            to_load_shards,
-            unloaded_shards,
-        ) = self._defer_loading_sharded_tensors(sharded_state_dict)
+        (sharded_tensors, sharded_state_dict, to_load_shards, unloaded_shards) = (
+            self._defer_loading_sharded_tensors(sharded_state_dict)
+        )
         loaded_state_dict = self.base_strategy.load(sharded_state_dict, checkpoint_dir)
 
         end = time()
@@ -280,10 +269,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             raise NotImplementedError(f'Unrecognized gather algorithm: {self.exchange_algo}')
 
         all_loaded_tensors = exchange_fn(
-            loaded_tensors,
-            unloaded_shards,
-            precomputed_distribution,
-            self.parallelization_group,
+            loaded_tensors, unloaded_shards, precomputed_distribution, self.parallelization_group
         )
         if not set(unloaded_shards.keys()).issubset(all_loaded_tensors.keys()):
             missing_shards = set(unloaded_shards.keys()) - all_loaded_tensors.keys()
@@ -302,7 +288,9 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         merge(loaded_state_dict, sharded_tensors)
         return loaded_state_dict
 
-    def _defer_loading_sharded_tensors(self, sharded_state_dict: ShardedStateDict) -> Tuple[
+    def _defer_loading_sharded_tensors(
+        self, sharded_state_dict: ShardedStateDict
+    ) -> Tuple[
         ShardedStateDict,
         ShardedStateDict,
         Dict[_ShardId, ShardedTensor],

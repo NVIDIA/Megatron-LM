@@ -5,6 +5,7 @@ from typing import Literal, Optional
 from torch import Tensor
 
 from megatron.core import InferenceParams, tensor_parallel
+from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
@@ -59,6 +60,9 @@ class MambaModel(LanguageModule):
     ) -> None:
         super().__init__(config=config)
 
+        if has_config_logger_enabled(config):
+            log_config_to_disk(config, locals(), prefix=type(self).__name__)
+
         self.mamba_stack_spec: ModuleSpec = mamba_stack_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
@@ -91,6 +95,7 @@ class MambaModel(LanguageModule):
                 rotary_percent=rotary_percent,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
+                use_cpu_initialization=self.config.use_cpu_initialization,
             )
 
         self.decoder = build_module(

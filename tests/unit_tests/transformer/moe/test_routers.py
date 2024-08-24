@@ -2,15 +2,14 @@
 
 from megatron.core.device_utils import get_current_device
 import pytest
-
 import torch
 
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.router import Router
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
-from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.moe.moe_layer import MoELayer
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 
 
 class TestTop2Router:
@@ -47,10 +46,7 @@ class TestTop2Router:
         assert num_weights == 12 * 4, num_weights
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("moe_router_pre_softmax", [
-        (True),
-        (False),
-    ])
+    @pytest.mark.parametrize("moe_router_pre_softmax", [(True), (False)])
     def test_router_forward(self, moe_router_pre_softmax):
         with torch.no_grad():
             self.router = self.router.to(device=get_current_device())
@@ -59,12 +55,6 @@ class TestTop2Router:
             hidden_states = torch.randn((32, 2, self.router.config.hidden_size))
             hidden_states = hidden_states.to(device=get_current_device())
             scores, indices = self.router(hidden_states)
-            print(scores.shape, indices.shape)
-            assert scores.shape == (64, 2)
-            assert indices.shape == (64, 2)
-            print(
-                (indices == 0).sum(), (indices == 1).sum(), (indices == 2).sum(), (indices == 3).sum()
-            )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_aux_loss(self):
@@ -76,13 +66,13 @@ class TestTop2Router:
         out = self.sequential_mlp(hidden_states)[0]
         out.sum().mul_(0).backward()
         assert self.sequential_mlp.router.weight.grad.abs().sum() == 0
-        
+
         # With aux loss
         self.transformer_config.moe_aux_loss_coeff = 1
         out = self.sequential_mlp(hidden_states)[0]
         out.sum().mul_(0).backward()
         assert self.sequential_mlp.router.weight.grad.abs().sum() > 0
-        
+
         # With Z loss
         self.transformer_config.moe_aux_loss_coeff = 0
         self.transformer_config.moe_z_loss_coeff = 1

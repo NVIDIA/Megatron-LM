@@ -1,8 +1,11 @@
+import numpy as np
+import torch
+
 from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.device_utils import get_current_device
 import torch
 from tests.unit_tests.test_utilities import Utils
-import numpy as np
+
 
 def test_vocab_parallel_cross_entropy():
     Utils.initialize_model_parallel(4,2)

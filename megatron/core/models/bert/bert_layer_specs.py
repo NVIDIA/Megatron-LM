@@ -40,7 +40,6 @@ except ImportError:
 
 # Use this spec to use lower level Transformer Engine modules (required for fp8 training)
 
-
 # Use this spec for an implementation using only modules in megatron core
 bert_layer_local_spec = ModuleSpec(
     module=TransformerLayer,
@@ -61,10 +60,7 @@ bert_layer_local_spec = ModuleSpec(
         pre_mlp_layernorm=LNImpl,
         mlp=ModuleSpec(
             module=MLP,
-            submodules=MLPSubmodules(
-                linear_fc1=ColumnParallelLinear,
-                linear_fc2=RowParallelLinear,
-            ),
+            submodules=MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear),
         ),
         mlp_bda=get_bias_dropout_add,
         sharded_state_dict_keys_map={

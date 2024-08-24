@@ -74,7 +74,7 @@ def validate_training_embeddings(config: RetroPreprocessingConfig) -> None:
             # Progress. (*note*: move world progress to here.)
             log_retro_rank_0(
                 "embed training block %d / %d ... %s."
-                % (block_idx, len(blocks.existing), block["path"],)
+                % (block_idx, len(blocks.existing), block["path"])
             )
 
             # Load existing block embeddings.
@@ -147,7 +147,7 @@ def validate_added_encodings(config: RetroPreprocessingConfig) -> None:
 
             # Progress.
             log_retro_rank_0(
-                "encode block %d / %d ... %s." % (block_idx, len(blocks.existing), block["path"],)
+                "encode block %d / %d ... %s." % (block_idx, len(blocks.existing), block["path"])
             )
 
             # Load existing codes.

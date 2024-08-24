@@ -1,0 +1,126 @@
+.jet_common:
+  stage: functional_tests
+  rules:
+    - if: $FUNCTIONAL_TEST == "yes" && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+      allow_failure: true
+    - if: $FUNCTIONAL_TEST == "yes"
+    - when: never
+
+default:
+  id_tokens:
+    VAULT_JWT_TOKEN:
+      aud: https://stg.vault.nvidia.com
+
+include:
+  - project: dl/jet/gitlab-templates
+    ref: main
+    file: downstreams.yml
+
+jet-configure:
+  image:
+    name: mikefarah/yq:4.35.2
+    entrypoint: [""]
+  extends: [.jet_common, .jet-configure]
+  tags: [mcore-docker-node-small]
+  script:
+    - set -x
+    - |
+      JET_CUSTOM_FILTER="type == 'basic'"
+
+      if [[ $FUNCTIONAL_TEST_CLUSTER == dgxh100_eos ]]; then
+        JET_CI_BRANCH=mcore/eos
+        PLATFORM=dgx_h100
+      elif [[ $FUNCTIONAL_TEST_CLUSTER == dgxa100_dracooci ]]; then
+        JET_CI_BRANCH=mcore/draco-oci
+        PLATFORM=dgx_a100
+      elif [[ $FUNCTIONAL_TEST_CLUSTER == dgxa100_dracooci-ord ]]; then
+        JET_CI_BRANCH=mcore/draco-oci-ord
+        PLATFORM=dgx_a100
+      fi
+
+      # Add platform
+      JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and '$PLATFORM' in spec.platforms"
+
+      # Add scope
+      JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and '$FUNCTIONAL_TEST_SCOPE' in spec.scope"
+
+      if [[ "$JET_CUSTOM_FILTER" == "type == 'basic'" ]]; then
+        JET_CUSTOM_FILTER="False"
+      fi
+
+      echo "JET_CI_BRANCH=$JET_CI_BRANCH" | tee -a jet.env
+      echo "JET_CUSTOM_FILTER=$JET_CUSTOM_FILTER" | tee -a jet.env
+
+    - |
+      IMAGE=${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} yq '. |=
+        (
+          select(.spec.name == "mcore-pyt")
+          | .spec.source.image = env(IMAGE)
+        )
+      ' -i tests/functional_tests/jet_recipes/_build-pyt.yaml
+
+      IMAGE=${CI_NEMO_IMAGE}:${CI_PIPELINE_ID} yq '. |=
+        (
+          select(.spec.name == "mcore-nemo")
+          | .spec.source.image = env(IMAGE)
+        )
+      ' -i tests/functional_tests/jet_recipes/_build-pyt.yaml
+  artifacts:
+    reports:
+      dotenv: jet.env
+    paths:
+      - tests/functional_tests/jet_recipes
+  retry:
+    max: 2
+    when: job_execution_timeout
+
+jet-build:
+  extends: [build_image, .jet_common]
+  variables:
+    STAGE: jet
+
+jet-trigger:
+  extends: [.jet_common, .jet-trigger]
+  needs: [jet-configure, jet-build]
+  trigger:
+    project: dl/jet/ci
+    branch: $JET_CI_BRANCH
+    strategy: depend
+  variables:
+    JET_WORKLOADS_FILTER: '$JET_CUSTOM_FILTER'
+    JET_CUSTOM_CONFIG: |
+      retrier:
+        enabled: true
+        max_retries: 2
+        retry_on: ['1.2', '1.2.*'] # All infra related issues
+        waiting_time: 60
+        environment: jet-auto-retrier
+      builds: 
+        jet_flavour: # An empty mapping will disable building the JET flavor 
+  inherit:
+    variables: true
+      
+jet-results-notify:
+  extends: [.jet_common]
+  image: ${GITLAB_ENDPOINT}:5005/dl/jet/api:latest
+  needs: [jet-trigger]
+  tags:
+    - mcore-docker-node-small
+  before_script:
+    - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $VAULT_JWT_TOKEN
+  script:
+    - env
+    - export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
+    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
+    - export GITLAB_ENDPOINT
+    - export CONTEXT=$FUNCTIONAL_TEST_SCOPE
+    - export DATE=$(date +"%Y-%m-%d")
+    - bash tests/functional_tests/shell_test_utils/notify.sh ${CI_PIPELINE_ID}
+  artifacts:
+    when: always
+    paths:
+      - scripts
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: always
+    - when: never

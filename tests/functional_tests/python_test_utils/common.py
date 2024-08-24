@@ -1,6 +1,7 @@
 import enum
 import glob
 import json
+import logging
 import os
 
 from tensorboard.backend.event_processing import event_accumulator
@@ -9,10 +10,9 @@ from tensorboard.backend.event_processing import event_accumulator
 # Since we expect every step to be there when we do our comparisons, we explicitly
 # set the size guidance to 0 so that we load everything. It's okay given our tests
 # are small/short.
-SIZE_GUIDANCE = {
-    event_accumulator.TENSORS: 0,
-    event_accumulator.SCALARS: 0,
-}
+SIZE_GUIDANCE = {event_accumulator.TENSORS: 0, event_accumulator.SCALARS: 0}
+
+logger = logging.getLogger()
 
 
 class TypeOfTest(enum.Enum):
@@ -46,10 +46,11 @@ def read_tb_logs_as_list(path, index=0):
     files = glob.glob(f"{path}/events*tfevents*")
     files += glob.glob(f"{path}/results/events*tfevents*")
 
+    summaries = {}
+
     if not files:
-        raise FileNotFoundError(
-            f"File not found matching: {path}/events* || {path}/results/events*"
-        )
+        logger.info(f"File not found matching: {path}/events* || {path}/results/events*")
+        return summaries
 
     files.sort(key=lambda x: os.path.getmtime(os.path.join(path, x)))
 
@@ -57,7 +58,6 @@ def read_tb_logs_as_list(path, index=0):
     ea = event_accumulator.EventAccumulator(event_file, size_guidance=SIZE_GUIDANCE)
     ea.Reload()
 
-    summaries = {}
     for scalar_name in ea.Tags()["scalars"]:
         summaries[scalar_name] = [round(x.value, 5) for x in ea.Scalars(scalar_name)]
 

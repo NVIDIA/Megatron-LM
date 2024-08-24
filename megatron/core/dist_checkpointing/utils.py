@@ -73,18 +73,14 @@ def extract_sharded_tensors_or_nonpersistent(
 def extract_sharded_base(
     sharded_state_dict: ShardedStateDict,
 ) -> Tuple[ShardedStateDict, StateDict]:
-    return extract_matching_values(
-        sharded_state_dict,
-        lambda v: isinstance(v, ShardedBase),
-    )
+    return extract_matching_values(sharded_state_dict, lambda v: isinstance(v, ShardedBase))
 
 
 def extract_nonpersistent(
     sharded_state_dict: ShardedStateDict,
 ) -> Tuple[ShardedStateDict, StateDict]:
     return extract_matching_values(
-        sharded_state_dict,
-        lambda v: isinstance(v, LocalNonpersistentObject),
+        sharded_state_dict, lambda v: isinstance(v, LocalNonpersistentObject)
     )
 
 

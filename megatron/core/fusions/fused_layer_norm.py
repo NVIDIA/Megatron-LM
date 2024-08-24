@@ -16,14 +16,14 @@ try:
     from apex.contrib.layer_norm.layer_norm import FastLayerNormFN
 
     HAVE_PERSIST_LAYER_NORM = True
-except:
+except ImportError:
     HAVE_PERSIST_LAYER_NORM = False
 
 try:
     from apex.normalization.fused_layer_norm import FusedLayerNormAffineFunction
 
     HAVE_FUSED_LAYER_NORM = True
-except:
+except ImportError:
     HAVE_FUSED_LAYER_NORM = False
 
 

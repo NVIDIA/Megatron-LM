@@ -61,9 +61,7 @@ class MultimodalProjector(MegatronModule):
         # deallocate_output_tensor() throwing an error, so a viewless tensor is
         # created to prevent this.
         encoder_output = make_viewless_tensor(
-            inp=encoder_output,
-            requires_grad=True,
-            keep_graph=True,
+            inp=encoder_output, requires_grad=True, keep_graph=True
         )
 
         return encoder_output

@@ -1,6 +1,6 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
-"""Megatron Core number of micro-batches calculators."""
+"""Megatron Core number of microbatches calculators."""
 
 import logging
 from abc import ABC, abstractmethod
@@ -15,7 +15,7 @@ _GLOBAL_NUM_MICROBATCHES_CALCULATOR: Union[
 
 
 def get_num_microbatches() -> int:
-    """Get number of micro-batches."""
+    """Get number of microbatches."""
     return _GLOBAL_NUM_MICROBATCHES_CALCULATOR.get()
 
 
@@ -36,9 +36,9 @@ def get_current_running_global_batch_size() -> int:
 
 
 def update_num_microbatches(
-    consumed_samples: int, consistency_check: Optional[bool] = True, verbose: Optional[bool] = False
+    consumed_samples: int, consistency_check: bool = True, verbose: bool = False
 ) -> None:
-    """Update number of micro-batches.
+    """Update number of microbatches.
 
     Args:
         consumed_samples (int): Number of samples consumed.
@@ -56,29 +56,31 @@ def init_num_microbatches_calculator(
     data_parallel_size: int,
     decrease_batch_size_if_needed: bool = False,
 ) -> None:
-    """Initialize number of micro-batches calculator.
+    """Initialize number of microbatches calculator. Supporting backward compatibility.
 
     Args:
         rank (int): Rank of the GPU, only rank 0 will log the information.
-        rampup_batch_size (Optional[List[int]]): Rampup batch size.
+        rampup_batch_size (Optional[List[int]]): Rampup batch size, should be in format of [start_global_batch_size, batch_size_increment, ramup_samples].
         global_batch_size (int): Global batch size for the model.
         micro_batch_size (int): Micro batch size at initialization.
         data_parallel_size (int): Data parallel size.
-        decrease_batch_size_if_needed (bool): If true, scale down batch size to ensure divisibility by DP size * microbatch size. Default false.
+        decrease_batch_size_if_needed (bool, optional): If true, scale down batch size to ensure divisibility by DP size * microbatch size. Defaults to False.
     """
-    global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
-    assert (
-        _GLOBAL_NUM_MICROBATCHES_CALCULATOR is None
-    ), 'num microbatches calculator is already initialized.'
-
-    _GLOBAL_NUM_MICROBATCHES_CALCULATOR = _build_num_microbatches_calculator(
+    _configure_global_num_microbatches_calculator(
         rank,
         rampup_batch_size,
         global_batch_size,
         micro_batch_size,
         data_parallel_size,
         decrease_batch_size_if_needed,
+        init=True,
     )
+
+
+def destroy_num_microbatches_calculator():
+    """Destroy number of microbatches calculator."""
+    global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
+    _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
 
 
 def reconfigure_num_microbatches_calculator(
@@ -87,9 +89,9 @@ def reconfigure_num_microbatches_calculator(
     global_batch_size: int,
     micro_batch_size: int,
     data_parallel_size: int,
-    decrease_batch_size_if_needed: bool,
+    decrease_batch_size_if_needed: bool = False,
 ) -> None:
-    """Reconfigure number of micro-batches calculator.
+    """Reconfigure number of microbatches calculator. Supporting backward compatibility.
 
     Args:
         rank (int): Rank of the GPU, only rank 0 will log the information.
@@ -97,9 +99,45 @@ def reconfigure_num_microbatches_calculator(
         global_batch_size (int): Global batch size for the model.
         micro_batch_size (int): Micro batch size at initialization.
         data_parallel_size (int): Data parallel size.
-        decrease_batch_size_if_needed (bool): If true, scale down batch size to ensure divisibility by DP size * microbatch size.
+        decrease_batch_size_if_needed (bool, optional): If true, scale down batch size to ensure divisibility by DP size * microbatch size. Defaults to False.
+    """
+    _configure_global_num_microbatches_calculator(
+        rank,
+        rampup_batch_size,
+        global_batch_size,
+        micro_batch_size,
+        data_parallel_size,
+        decrease_batch_size_if_needed,
+        init=False,
+    )
+
+
+def _configure_global_num_microbatches_calculator(
+    rank: int,
+    rampup_batch_size: Optional[List[int]],
+    global_batch_size: int,
+    micro_batch_size: int,
+    data_parallel_size: int,
+    decrease_batch_size_if_needed: bool = False,
+    init: bool = False,
+) -> None:
+    """Configure number of microbatches calculator. Can be used for initialization and reconfiguration.
+
+    Args:
+        rank (int): Rank of the GPU, only rank 0 will log the information.
+        rampup_batch_size (Optional[List[int]]): Rampup batch size, should be in format of [start_global_batch_size, batch_size_increment, ramup_samples].
+        global_batch_size (int): Global batch size for the model.
+        micro_batch_size (int): Micro batch size at initialization.
+        data_parallel_size (int): Data parallel size.
+        decrease_batch_size_if_needed (bool, optional): If true, scale down batch size to ensure divisibility by DP size * microbatch size. Defaults to False.
+        init (bool, optional): If true, initialize the calculator. Defaults to False.
     """
     global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
+
+    if init:
+        assert (
+            _GLOBAL_NUM_MICROBATCHES_CALCULATOR is None
+        ), 'num microbatches calculator is already initialized.'
 
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = _build_num_microbatches_calculator(
         rank,
@@ -119,7 +157,7 @@ def _build_num_microbatches_calculator(
     data_parallel_size: int,
     decrease_batch_size_if_needed: bool,
 ) -> Union['ConstantNumMicroBatchesCalculator', 'RampupBatchsizeNumMicroBatchesCalculator']:
-    """Build number of micro-batches calculator.
+    """Build number of microbatches calculator. Internal helper method.
 
     Args:
         rank (int): Rank of the GPU, only rank 0 will log the information.
@@ -130,7 +168,7 @@ def _build_num_microbatches_calculator(
         decrease_batch_size_if_needed (bool): If true, scale down batch size to ensure divisibility by DP size * microbatch size.
     """
 
-    # Constant num micro-batches.
+    # Constant batch size.
     if rampup_batch_size is None:
         num_microbatches_calculator = ConstantNumMicroBatchesCalculator(
             global_batch_size,
@@ -141,9 +179,9 @@ def _build_num_microbatches_calculator(
         )
         if rank == 0:
             logger.info(
-                f'setting number of micro-batches to constant {num_microbatches_calculator.get()}'
+                f'setting number of microbatches to constant {num_microbatches_calculator.get()}'
             )
-    # Batch size ramp up num micro-batches.
+    # Batch size ramp up.
     else:
         assert len(rampup_batch_size) == 3, (
             'expected the following '
@@ -177,7 +215,7 @@ def _round(batch_size: int, divisor: int) -> int:
 
 
 class NumMicroBatchesCalculator(ABC):
-    """Base class for number of micro-batches calculator."""
+    """Base class for number of microbatches calculator."""
 
     def __init__(self) -> None:
         self.num_micro_batches = None
@@ -186,7 +224,7 @@ class NumMicroBatchesCalculator(ABC):
         self.current_running_global_batch_size = None
 
     def get(self) -> int:
-        """Get number of micro-batches."""
+        """Get number of microbatches."""
         return self.num_micro_batches
 
     def get_current_global_batch_size(self) -> int:
@@ -203,11 +241,12 @@ class NumMicroBatchesCalculator(ABC):
 
     @abstractmethod
     def update(self, consumed_samples, consistency_check, verbose=False) -> None:
+        """Update number of microbatches depending on batch size rampup."""
         pass
 
 
 class ConstantNumMicroBatchesCalculator(NumMicroBatchesCalculator):
-    """Calculator of number of micro-batches with constant global batch size.
+    """Calculator of number of microbatches with constant global batch size.
 
     Args:
         global_batch_size (int): Global batch size.
@@ -250,7 +289,7 @@ class ConstantNumMicroBatchesCalculator(NumMicroBatchesCalculator):
             self.num_micro_batches = global_batch_size // micro_batch_times_data_parallel_size
         assert (
             self.num_micro_batches >= 1
-        ), 'number of micro-batches should be at least 1, got {}.'.format(self.num_micro_batches)
+        ), 'number of microbatches should be at least 1, got {}.'.format(self.num_micro_batches)
 
         self.current_global_batch_size = global_batch_size
         self.current_running_global_batch_size = running_global_batch_size
@@ -261,7 +300,7 @@ class ConstantNumMicroBatchesCalculator(NumMicroBatchesCalculator):
 
 
 class RampupBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
-    """Calculator of number of micro-batches with ramp up global batch size.
+    """Calculator of number of microbatches with batch size rampup.
     Over
         steps = (global-batch-size - start-batch-size) / batch_size_increment
     increment batch size from start-batch-size to global-batch-size using
@@ -335,10 +374,8 @@ class RampupBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
         # Initialize number of microbatches.
         self.update(0, False)
 
-    def update(
-        self, consumed_samples: int, consistency_check: bool, verbose: Optional[bool] = False
-    ) -> None:
-        """Update number of micro-batches.
+    def update(self, consumed_samples: int, consistency_check: bool, verbose: bool = False) -> None:
+        """Update number of microbatches.
 
         Args:
             consumed_samples (int): Number of samples consumed.

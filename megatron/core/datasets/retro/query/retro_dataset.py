@@ -94,7 +94,7 @@ class RetroDataset(torch.utils.data.Dataset):
 
         # Sample idx to chunk idxs.
         chunk_idxs = list(
-            range(sample_idx * n_chunks_per_sample, (sample_idx + 1) * n_chunks_per_sample,)
+            range(sample_idx * n_chunks_per_sample, (sample_idx + 1) * n_chunks_per_sample)
         )
 
         # Collect retrieved tokens.
@@ -144,7 +144,7 @@ class RetroDataset(torch.utils.data.Dataset):
 
 
 def get_retro_datasets(
-    config: RetroConfig, gpt_datasets: dict, sample_length: int, eod_token_id: int,
+    config: RetroConfig, gpt_datasets: dict, sample_length: int, eod_token_id: int
 ) -> Tuple[Optional[RetroDataset], Optional[RetroDataset], Optional[RetroDataset]]:
     """Get train, valid, test retro datasets.
 
@@ -190,7 +190,7 @@ def get_retro_datasets(
         # preprocessing and pretraining.
         chunk_dataset = chunk_ds_info["dataset"]
         chunk_ds_info["neighbor_dir"] = os.path.join(
-            query_dir, config.retro_neighbor_dirs[data_key],
+            query_dir, config.retro_neighbor_dirs[data_key]
         )
         neighbor_dir = chunk_ds_info["neighbor_dir"]
         neighbor_path_map = BlockPathMap.from_dir(
@@ -235,8 +235,4 @@ def get_retro_datasets(
             neighbor_path_map=neighbor_path_map,
         )
 
-    return (
-        retro_dataset_map["train"],
-        retro_dataset_map["valid"],
-        retro_dataset_map["test"],
-    )
+    return (retro_dataset_map["train"], retro_dataset_map["valid"], retro_dataset_map["test"])

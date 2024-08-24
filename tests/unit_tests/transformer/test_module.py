@@ -2,7 +2,6 @@
 
 from megatron.core.device_utils import get_current_device
 import pytest
-
 import torch
 
 from megatron.core.transformer.module import Float16Module, MegatronModule
@@ -25,6 +24,7 @@ class DummyModule(MegatronModule):
     def forward(self, x):
         return self.linear(x)
 
+
 class TestMegatronModule:
 
     def setup_method(self, method):
@@ -34,7 +34,7 @@ class TestMegatronModule:
         self.megatron_module = DummyModule(config=transformer_config).to(device=get_current_device())
 
     def teardown_method(self, method):
-        Utils.destroy_model_parallel()   
+        Utils.destroy_model_parallel()
 
     def test_megatron_module(self):
         megatron_module = self.megatron_module
@@ -61,8 +61,8 @@ class TestFloat16Module:
         self.megatron_module = DummyModule(config=self.transformer_config).to(device=get_current_device())
 
     def teardown_method(self, method):
-        Utils.destroy_model_parallel()   
-        
+        Utils.destroy_model_parallel()
+
     def test_fp16_module(self):
         transformer_config = self.transformer_config
         megatron_module = self.megatron_module
@@ -79,7 +79,8 @@ class TestFloat16Module:
         assert fp16_module(x).dtype == torch.float32
 
     pytest.mark.skipif(
-        not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8, reason='bfloat16 is not supported on this device'
+        not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8,
+        reason='bfloat16 is not supported on this device',
     )
 
     def test_bf16_module(self):
@@ -96,4 +97,3 @@ class TestFloat16Module:
         x = torch.ones((2, 2)).to(device=get_current_device())
         # inputs are converted to bf16 then outputs are converted to fp32
         assert bf16_module(x).dtype == torch.float32
-

@@ -29,7 +29,29 @@ def convert_to_mmmu_format(input_path):
     return output_file_path
 
 
+def mmmu_eval(input_path, groundtruth_path):
+    """Run MMMU evaluation."""
+    result_file = convert_to_mmmu_format(input_path)
+
+    # The MMMU repo has a script for running the actual evaluation but no API. So launching the script here.
+    output = subprocess.run(
+        [
+            "python",
+            "examples/multimodal/MMMU/eval/main_eval_only.py",
+            "--output_path",
+            result_file,
+            "--answer_path",
+            groundtruth_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    print(output.stdout)
+
+
 def main():
+    """Run MMMU evaluation."""
     # Using the validation groundtruth file from the MMMU repo by default. This assumes you have cloned the MMMU github repo here.
     default_groundtruth_path = "examples/multimodal/MMMU/eval/answer_dict_val.json"
 
@@ -43,23 +65,7 @@ def main():
     )
     args = parser.parse_args()
 
-    result_file = convert_to_mmmu_format(args.input_path)
-
-    # The MMMU repo has a script for running the actual evaluation but no API. So launching the script here.
-    output = subprocess.run(
-        [
-            "python",
-            "examples/multimodal/MMMU/eval/main_eval_only.py",
-            "--output_path",
-            result_file,
-            "--answer_path",
-            default_groundtruth_path,
-        ],
-        capture_output=True,
-        text=True,
-    )
-
-    print(output.stdout)
+    mmmu_eval(args.input_path, args.groundtruth_path)
 
 
 if __name__ == "__main__":

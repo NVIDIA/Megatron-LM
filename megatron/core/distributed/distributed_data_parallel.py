@@ -7,6 +7,7 @@ from typing import Dict, Optional
 import torch
 
 from .. import parallel_state
+from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..transformer.module import MegatronModule
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import log_single_rank
@@ -42,6 +43,9 @@ class DistributedDataParallel(MegatronModule):
         disable_bucketing: bool = False,
     ):
         super().__init__(config=config)
+        if has_config_logger_enabled(config):
+            log_config_to_disk(config, locals(), prefix=type(self).__name__)
+
         self.module = module
 
         # If bucket_size is not provided as an input, use sane default.
@@ -93,9 +97,7 @@ class DistributedDataParallel(MegatronModule):
                 expert_parallel_params.append(param)
 
         def allocate_buffers_for_parameters(
-            input_params,
-            data_parallel_group,
-            gradient_scaling_factor,
+            input_params, data_parallel_group, gradient_scaling_factor
         ):
             param_and_grad_dtype_to_params = {}
 

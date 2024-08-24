@@ -7,6 +7,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
@@ -40,6 +41,9 @@ class T5LMHead(MegatronModule):
         share_embeddings_and_output_weights: bool = False,
     ):
         super(T5LMHead, self).__init__(config=config)
+
+        if has_config_logger_enabled(config):
+            log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
         self.parallel_output = parallel_output
 
@@ -173,6 +177,7 @@ class T5Model(LanguageModule):
                 rotary_percent=rotary_percent,
                 rotary_interleaved=self.config.rotary_interleaved,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
+                use_cpu_initialization=self.config.use_cpu_initialization,
             )
 
         # Transformer encoder
@@ -242,12 +247,10 @@ class T5Model(LanguageModule):
             Tensor: loss tensor
         """
 
-        (
-            encoder_attn_mask,
-            decoder_attn_mask,
-            encoder_decoder_attn_mask,
-        ) = t5_extended_attention_mask(
-            [encoder_attn_mask, decoder_attn_mask, encoder_decoder_attn_mask]
+        (encoder_attn_mask, decoder_attn_mask, encoder_decoder_attn_mask) = (
+            t5_extended_attention_mask(
+                [encoder_attn_mask, decoder_attn_mask, encoder_decoder_attn_mask]
+            )
         )
 
         ## Encoder forward

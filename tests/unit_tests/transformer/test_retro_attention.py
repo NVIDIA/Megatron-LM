@@ -4,14 +4,16 @@ from megatron.core.device_utils import get_current_device
 import torch
 import types
 
+import torch
+
 from megatron.core.models.retro import RetroConfig, get_retro_decoder_block_spec
 from megatron.core.models.retro.decoder_attention import (
-    RetroDecoderCrossAttention,
     RetroDecoderBiasDropoutAdd,
+    RetroDecoderCrossAttention,
 )
 from megatron.core.models.retro.encoder_attention import (
-    RetroEncoderCrossAttention,
     RetroEncoderBiasDropoutAdd,
+    RetroEncoderCrossAttention,
     RetroEncoderLayerNorm,
 )
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
@@ -39,23 +41,32 @@ class TestRetroAttention:
 
         # Retro decoder layer.
         decoder_block_spec = get_retro_decoder_block_spec(
-            config, use_transformer_engine=use_transformer_engine)
+            config, use_transformer_engine=use_transformer_engine
+        )
         decoder_block = TransformerBlock(config=config, spec=decoder_block_spec)
-        decoder_layers = [ layer for layer in decoder_block.layers if isinstance(layer.cross_attention, RetroDecoderCrossAttention) ]
+        decoder_layers = [
+            layer
+            for layer in decoder_block.layers
+            if isinstance(layer.cross_attention, RetroDecoderCrossAttention)
+        ]
         decoder_layer = decoder_layers[0]
 
         # Retro encoder layer.
         encoder_block = decoder_layer.cross_attention.encoder
-        encoder_layers = [ layer for layer in encoder_block.layers if isinstance(layer.cross_attention, RetroEncoderCrossAttention) ]
+        encoder_layers = [
+            layer
+            for layer in encoder_block.layers
+            if isinstance(layer.cross_attention, RetroEncoderCrossAttention)
+        ]
         encoder_layer = encoder_layers[0]
 
         # Modules.
         modules = types.SimpleNamespace(
-            decoder_attn = decoder_layer.cross_attention,
-            decoder_bda = decoder_layer.cross_attn_bda,
-            encoder_attn = encoder_layer.cross_attention,
-            encoder_bda = encoder_layer.cross_attn_bda,
-            encoder_norm = encoder_layer.pre_mlp_layernorm,
+            decoder_attn=decoder_layer.cross_attention,
+            decoder_bda=decoder_layer.cross_attn_bda,
+            encoder_attn=encoder_layer.cross_attention,
+            encoder_bda=encoder_layer.cross_attn_bda,
+            encoder_norm=encoder_layer.pre_mlp_layernorm,
         )
 
         # GPU.
@@ -74,11 +85,7 @@ class TestRetroAttention:
     def test_constructor(self):
 
         config = self.get_config()
-        modules = self.get_modules(
-            config,
-            use_transformer_engine=True,
-            use_gpu=False,
-        )
+        modules = self.get_modules(config, use_transformer_engine=True, use_gpu=False)
 
         assert isinstance(modules.decoder_attn, RetroDecoderCrossAttention)
         assert isinstance(modules.decoder_bda, RetroDecoderBiasDropoutAdd)
@@ -89,7 +96,7 @@ class TestRetroAttention:
         assert modules.decoder_attn.attn.layer_number == 6
         assert modules.encoder_attn.attn.layer_number == 1
 
-        get_nparams = lambda m : sum(p.numel() for p in m.parameters())
+        get_nparams = lambda m: sum(p.numel() for p in m.parameters())
         assert get_nparams(modules.decoder_attn) == 8768
         assert get_nparams(modules.decoder_bda) == 0
         assert get_nparams(modules.encoder_attn) == 1088
@@ -129,34 +136,24 @@ class TestRetroAttention:
         )).to(device=get_current_device())
 
         # Forward decoder.
-        decoder_attn_output = modules.decoder_attn(
-            hidden_states,
-            attention_mask,
-            decoder_context,
-        )
+        decoder_attn_output = modules.decoder_attn(hidden_states, attention_mask, decoder_context)
         with torch.enable_grad():
             decoder_bda_output = modules.decoder_bda(True, True)(
-                decoder_attn_output,
-                hidden_states,
-                config.hidden_dropout,
+                decoder_attn_output, hidden_states, config.hidden_dropout
             )
 
         # Forward encoder.
-        encoder_attn_output_tuples = modules.encoder_attn(
-            decoder_context,
-            None,
-            encoder_context,
-        )
+        encoder_attn_output_tuples = modules.encoder_attn(decoder_context, None, encoder_context)
         with torch.enable_grad():
             encoder_bda_output = modules.encoder_bda(True, True)(
-                encoder_attn_output_tuples,
-                decoder_context,
-                config.retro_encoder_hidden_dropout,
+                encoder_attn_output_tuples, decoder_context, config.retro_encoder_hidden_dropout
             )
         encoder_norm_output = modules.encoder_norm(encoder_bda_output)
 
         # Verify decoder.
-        assert set(decoder_attn_output.keys()) == set([ "ns", "bs", "d", "l", "pad", "attention_output", "attention_bias", "context"])
+        assert set(decoder_attn_output.keys()) == set(
+            ["ns", "bs", "d", "l", "pad", "attention_output", "attention_bias", "context"]
+        )
         assert decoder_attn_output["ns"] == seq_length
         assert decoder_attn_output["bs"] == micro_batch_size
         assert decoder_attn_output["d"] == config.hidden_size
@@ -167,9 +164,7 @@ class TestRetroAttention:
             micro_batch_size * n_chunks_per_sample,
             config.hidden_size,
         )
-        assert tuple(decoder_attn_output["attention_bias"].shape) == (
-            config.hidden_size,
-        )
+        assert tuple(decoder_attn_output["attention_bias"].shape) == (config.hidden_size,)
         assert decoder_attn_output["context"].shape == (
             config.retro_retrieved_length * config.retro_num_neighbors,
             micro_batch_size * n_chunks_per_sample,

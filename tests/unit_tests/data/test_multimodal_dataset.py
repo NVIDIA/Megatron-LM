@@ -25,7 +25,7 @@ def test_mock_multimodal_dataset():
         torch.distributed.barrier()
     else:
         compile_helpers()
-        
+
     config = MultimodalDatasetConfig(
         random_seed=1234,
         sequence_length=1024,

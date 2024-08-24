@@ -1,4 +1,7 @@
 from argparse import Namespace
+
+import torch
+
 from megatron.core import parallel_state
 from megatron.core.device_utils import get_current_device
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import InferenceWrapperConfig
@@ -20,8 +23,13 @@ class TestGPTInferenceWrapper:
         self.sequence_length = 32
         hidden_size = 12
 
-        transformer_config = TransformerConfig(num_layers=4, hidden_size=hidden_size, num_attention_heads=4, use_cpu_initialization=True)
-                                                    
+        transformer_config = TransformerConfig(
+            num_layers=4,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+        )
+
         gpt_model = GPTModel(
             config=transformer_config, 
             transformer_layer_spec=get_gpt_layer_local_spec(), 
@@ -34,25 +42,31 @@ class TestGPTInferenceWrapper:
             inference_batch_times_seqlen_threshold=20,
             fp32_residual_connection=False,
             params_dtype=torch.float,
-            padded_vocab_size=self.vocab_size
+            padded_vocab_size=self.vocab_size,
         )
 
         self.inference_wrapped_model = GPTInferenceWrapper(gpt_model, inference_wrapper_config)
-     
-    # This will call the inference_wrapped_model.forward_pass_with_pipeline_parallel_small_input_batch()    
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    # This will call the inference_wrapped_model.forward_pass_with_pipeline_parallel_small_input_batch()
     def test_inference_pipeline_parallel_small_size(self):
         self.setup_model(tensor_parallel_size=2, pipeline_parallel_size=2)
         
         batch_prompt_tokens = torch.randint(low = 0, high = self.vocab_size, size=(self.batch_size, self.sequence_length)).int().to(device=get_current_device())
         self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=batch_prompt_tokens)
- 
+
         inference_input = self.inference_wrapped_model.get_batch_for_context_window(0, 5)
-        
+
         logits = self.inference_wrapped_model.run_one_forward_step(inference_input)
         # Logits are not returned in all ranks in PP
         if parallel_state.is_pipeline_last_stage():
-            assert logits.shape == (self.batch_size, 5, self.vocab_size), f"Shape mismatch . Expected {(self.batch_size, 5, self.vocab_size)}, but got {logits.shape}"
- 
+            assert logits.shape == (
+                self.batch_size,
+                5,
+                self.vocab_size,
+            ), f"Shape mismatch . Expected {(self.batch_size, 5, self.vocab_size)}, but got {logits.shape}"
 
     # This will call the inference_wrapped_model.forward_pass_with_pipeline_parallel_large_input_batch()
     def test_inference_pipeline_parallel_large__size(self):
@@ -62,12 +76,15 @@ class TestGPTInferenceWrapper:
         self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=batch_prompt_tokens)
 
         inference_input = self.inference_wrapped_model.get_batch_for_context_window(0, 10)
-        
+
         logits = self.inference_wrapped_model.run_one_forward_step(inference_input)
 
         if parallel_state.is_pipeline_last_stage():
-            assert logits.shape == (self.batch_size, 10, self.vocab_size), f"Shape mismatch . Expected {(self.batch_size,10, self.vocab_size)}, but got {logits.shape}"
-   
+            assert logits.shape == (
+                self.batch_size,
+                10,
+                self.vocab_size,
+            ), f"Shape mismatch . Expected {(self.batch_size,10, self.vocab_size)}, but got {logits.shape}"
 
     def test_inference_only_tensor_parallel(self):
         self.setup_model(tensor_parallel_size=4, pipeline_parallel_size=1)
@@ -77,6 +94,9 @@ class TestGPTInferenceWrapper:
 
         inference_input = self.inference_wrapped_model.get_batch_for_context_window(0, 5)
         logits = self.inference_wrapped_model.run_one_forward_step(inference_input)
-        
-        assert logits.shape == (self.batch_size, 5, self.vocab_size), f"Shape mismatch . Expected {(self.batch_size, 5, self.vocab_size)}, but got {logits.shape}"
 
+        assert logits.shape == (
+            self.batch_size,
+            5,
+            self.vocab_size,
+        ), f"Shape mismatch . Expected {(self.batch_size, 5, self.vocab_size)}, but got {logits.shape}"

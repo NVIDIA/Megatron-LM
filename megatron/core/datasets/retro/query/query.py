@@ -39,7 +39,7 @@ from megatron.core.datasets.retro.utils import (
 from .gpt_chunk_dataset import build_gpt_chunk_datasets_from_gpt_datasets
 
 
-def get_index(config: RetroPreprocessingConfig, ondisk: bool = False,) -> faiss.Index:
+def get_index(config: RetroPreprocessingConfig, ondisk: bool = False) -> faiss.Index:
     """Read index from disk.
 
     Args:
@@ -67,7 +67,7 @@ def get_index(config: RetroPreprocessingConfig, ondisk: bool = False,) -> faiss.
 
 
 def embed_block(
-    config: RetroPreprocessingConfig, gpt_dataset: GPTChunkDataset, block: dict,
+    config: RetroPreprocessingConfig, gpt_dataset: GPTChunkDataset, block: dict
 ) -> np.ndarray:
     """Embed block of chunks.
 
@@ -80,7 +80,7 @@ def embed_block(
         Embeddings array, with shape (len(block["range"]), dimension(embedder)).
     """
     text_block_dataset = torch.utils.data.Subset(
-        GPTToTextDataset(gpt_dataset, config.retro_tokenizers.gpt), range(*block["range"]),
+        GPTToTextDataset(gpt_dataset, config.retro_tokenizers.gpt), range(*block["range"])
     )
     return config.retro_bert_embedders.mem.embed_text_dataset(text_block_dataset)
 
@@ -248,17 +248,14 @@ def query_block_neighbors(
     sample_map = {}
     for i in sample_ids:
         sample = query_dataset.sample_dataset[i]
-        sample_map[i] = {
-            "dataset_idx": sample["dataset_id"],
-            "doc_ids": sample["document_ids"],
-        }
+        sample_map[i] = {"dataset_idx": sample["dataset_id"], "doc_ids": sample["document_ids"]}
 
     # Embed block.
     embeddings = embed_block(config, query_dataset, block)
 
     # Query embeddings.
     _, filtered_neighbor_ids = query_embedding_block(
-        config, db_dataset, index, embeddings, block["range"], sample_map, n_chunks_per_sample,
+        config, db_dataset, index, embeddings, block["range"], sample_map, n_chunks_per_sample
     )
 
     if config.retro_task_validate is None:
@@ -303,15 +300,17 @@ def query_dataset_neighbors(
         Args:
             f (h5py.File): File containing save neighbor IDs.
         """
-        assert f["neighbors"].shape[1] == config.retro_query_num_neighbors_save, (
-            "neighbors.shape == %s; num_neighbors_target == %d."
-            % (str(f["neighbors"].shape), config.retro_num_neighbors_target,)
+        assert (
+            f["neighbors"].shape[1] == config.retro_query_num_neighbors_save
+        ), "neighbors.shape == %s; num_neighbors_target == %d." % (
+            str(f["neighbors"].shape),
+            config.retro_num_neighbors_target,
         )
 
     if config.retro_task_validate is None:
         retro_makedir(config, neighbor_dir)
         blocks = get_blocks_by_rank(
-            neighbor_dir, num_active_chunks, config.retro_block_size, validate=validate,
+            neighbor_dir, num_active_chunks, config.retro_block_size, validate=validate
         )
         active_blocks = blocks.missing
     else:
@@ -339,7 +338,7 @@ def query_dataset_neighbors(
                     block_index,
                     len(active_blocks),
                     os.path.basename(block["path"]),
-                    psutil.virtual_memory()[3] / 1024 ** 3,
+                    psutil.virtual_memory()[3] / 1024**3,
                     psutil.virtual_memory()[2],
                 )
             )

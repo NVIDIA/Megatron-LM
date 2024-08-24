@@ -212,7 +212,7 @@ class BiEncoderModel(MegatronModule):
             state_dict = torch.load(checkpoint_name, map_location='cpu')
             sys.modules.pop('fp16.loss_scaler', None)
             sys.modules.pop('megatron.fp16.loss_scaler', None)
-        except BaseException:
+        except Exception:
             print_rank_0('could not load the BERT checkpoint')
             sys.exit()
 

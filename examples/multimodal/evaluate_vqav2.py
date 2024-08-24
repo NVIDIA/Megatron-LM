@@ -2,7 +2,7 @@ import argparse
 import glob
 import json
 
-from open_flamingo.eval.vqa_metric import compute_vqa_accuracy
+from open_flamingo.eval.vqa_metric import VQAEval
 
 
 def merge_input_files(input_path):
@@ -28,14 +28,38 @@ def merge_input_files(input_path):
     return output_file_path
 
 
+def compute_vqa_accuracy(result_file):
+    """Compute VQA accuracy."""
+    merged_results = json.load(open(result_file))
+
+    vqa = VQAEval(vqa=None, vqaRes=None)
+    all_acc = []
+    for res in merged_results:
+        pred = res["answer"]
+        pred = vqa.processPunctuation(pred)
+        pred = vqa.processDigitArticle(pred)
+
+        gt = res["gt_answer"]
+        gt = [vqa.processPunctuation(ans) for ans in gt]
+        gt = [vqa.processDigitArticle(ans) for ans in gt]
+
+        num_match = sum([pred == ans for ans in gt])
+        acc = min(1.0, num_match / 3.0)
+        all_acc.append(acc)
+
+    acc_avg = sum(all_acc) / len(all_acc) * 100
+    print(f"===== Accuracy {acc_avg:.2f}% =====")
+
+
+def vqav2_eval(input_path):
+    """Run VQAv2 evaluation."""
+    result_file = merge_input_files(input_path)
+    compute_vqa_accuracy(result_file)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--input-path', type=str, help="Path to input file(s)")
-    parser.add_argument('--groundtruth-path', type=str, help="Path to groundtruth file")
-    parser.add_argument('--question-path', type=str, help="Path to questions file")
     args = parser.parse_args()
 
-    result_file = merge_input_files(args.input_path)
-
-    accuracy = compute_vqa_accuracy(result_file, args.question_path, args.groundtruth_path)
-    print(accuracy)
+    vqav2_eval(args.input_path)

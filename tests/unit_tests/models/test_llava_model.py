@@ -15,22 +15,23 @@ from tests.unit_tests.test_utilities import Utils
 
 @pytest.mark.skipif(int(os.environ.get('ACCEL_MEMORY_GB', 40)) < 32 , reason="insufficient accelerator memory")
 class TestLLaVAModel:
+    @pytest.mark.internal  # The model is under active development and its methods may change.
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_device_manual_seed(123)
 
         language_config = TransformerConfig(
-            num_layers=3, hidden_size=128, num_attention_heads=8, use_cpu_initialization=True
+            num_layers=3, hidden_size=128, num_attention_heads=8, use_cpu_initialization=False
         )
         vision_config = TransformerConfig(
-            num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True,
+            num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=False
         )
         vision_projection_config = TransformerConfig(
             num_layers=2,
             hidden_size=128,
             ffn_hidden_size=72,
             num_attention_heads=1,
-            use_cpu_initialization=True,
+            use_cpu_initialization=False,
         )
 
         language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
@@ -52,15 +53,18 @@ class TestLLaVAModel:
             patch_dim=14,
         )
 
+    @pytest.mark.internal
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     def test_constructor(self):
         assert isinstance(self.model, LLaVAModel)
 
         num_weights = sum([p.numel() for p in self.model.parameters()])
         assert num_weights == 1439304
 
+    @pytest.mark.internal
     def test_set_input_tensor(self):
         expected_shape = (1, 2, 3, 4)
         input_tensor = torch.zeros(expected_shape)
@@ -80,40 +84,64 @@ class TestLLaVAModel:
         labels = torch.randint(0, 2048, (2, 1601)).to(device=get_current_device())
 
         # Try with labels.
-        loss = self.model.forward(img, input_ids, position_ids, attention_mask, labels=labels)
-        assert loss.shape == torch.Size((2, 1601))
+        loss, new_loss_mask = self.model.forward(
+            img,
+            input_ids,
+            position_ids,
+            attention_mask,
+            labels,
+            loss_mask,
+            num_image_tiles=num_image_tiles,
+        )
+
+        # The maximum sequence length is given by the sample with 2 images in 3 tiles, minus two image token indices, plus other text tokens.
+        img_seq_len = 577
+        max_seq_len = img_seq_len * 3 - 2 + 1024
+        assert loss.shape == new_loss_mask.shape == torch.Size((5, max_seq_len))
 
         # Try without labels and without inference params.
-        logits = self.model.forward(img, input_ids, position_ids, attention_mask, labels=None)
-        assert logits.shape == torch.Size((2, 1601, 2048))
-
-        # Try without labels and with inference params.
-        inference_params = InferenceParams(2, 1601)
         logits = self.model.forward(
             img,
             input_ids,
             position_ids,
             attention_mask,
             labels=None,
+            loss_mask=None,
+            num_image_tiles=num_image_tiles,
+        )
+        assert logits.shape == torch.Size((5, max_seq_len, 2048))
+
+        # Try without labels and with inference params.
+        inference_params = InferenceParams(5, max_seq_len)
+        logits = self.model.forward(
+            img,
+            input_ids,
+            position_ids,
+            attention_mask,
+            labels=None,
+            loss_mask=None,
+            num_image_tiles=num_image_tiles,
             inference_params=inference_params,
         )
-        assert logits.shape == torch.Size((2, 1601, 2048))
+        assert logits.shape == torch.Size((5, max_seq_len, 2048))
 
-        # Check KV cache got created correctly.
+        # Check KV cache got populated correctly.
         kv_dict = inference_params.key_value_memory_dict
 
-        assert kv_dict["image_tokens_count"] == 577
-        for layer_no in range(1, 4):    # 3 layers in the model.
+        assert kv_dict["image_tokens_count"] == 577 * 7
+        for layer_no in range(1, 4):  # 3 layers in the model.
             layer_kv = kv_dict[layer_no]
             # Expected shape is [sequence_len, batch_size, num_heads, hidden_size_per_head]
-            assert layer_kv[0].shape == layer_kv[1].shape == torch.Size((1601, 2, 8, 16))
+            assert layer_kv[0].shape == layer_kv[1].shape == torch.Size((max_seq_len, 5, 8, 16))
 
+    @pytest.mark.internal
     def test_save_load(self, tmp_path):
         path = tmp_path / "model.pt"
         torch.save(self.model.state_dict(), path)
 
         self.model.load_state_dict(torch.load(path))
 
+    @pytest.mark.internal
     def test_freeze(self):
         self.model.freeze(
             freeze_language_model=True, freeze_vision_model=True, freeze_vision_projection=False

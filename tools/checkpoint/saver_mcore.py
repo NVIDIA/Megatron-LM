@@ -3,7 +3,7 @@
 import os
 import sys
 import torch
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 from pkg_resources import packaging
 
 from setter import ModelSetter
@@ -288,7 +288,11 @@ def add_arguments(parser):
 def save_checkpoint(queue, args):
 
     # Transformer engine >= 0.12.0, for CPU initialization.
-    te_version = packaging.version.Version(version("transformer-engine"))
+    try:
+        te_version = packaging.version.Version(version("transformer-engine"))
+    except PackageNotFoundError:
+        te_version = None
+        
     assert te_version >= packaging.version.Version("0.12.0"), \
         "transformer engine version: %s (>=0.12.0 required)." % te_version
 
@@ -389,7 +393,8 @@ def save_checkpoint(queue, args):
                 '--no-save-rng',
                 '--no-initialization',
                 '--save-interval', '1',
-                '--save', args.save_dir
+                '--save', args.save_dir,
+                '--ckpt-format', 'torch', # only 'torch' supported for conversion
                 ]
 
     if md.make_vocab_size_divisible_by is not None:
@@ -424,7 +429,9 @@ def save_checkpoint(queue, args):
                         'encoder_num_layers', 'encoder_seq_length',
                         'distribute_saved_activations',
                         'train_iters', 'lr_decay_iters', 'lr_warmup_iters', 'lr_warmup_fraction',
-                        'start_weight_decay', 'end_weight_decay']
+                        'start_weight_decay', 'end_weight_decay',
+                        'ckpt_format',
+        ]
 
         for arg, value in vars(md.checkpoint_args).items():
             if arg in args_to_keep:

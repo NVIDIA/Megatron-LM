@@ -223,6 +223,7 @@ def sharded_tensor_to_torch_sharded_tensor(
         ]
 
     # Create a ShardedTensor without invoking communication. Determine global shards
+    world_size = torch.distributed.get_world_size()
     shard_metadata = []
     # NOTE: here we assume a regular grid of shards
     for fragment_offsets in itertools.product(*map(range, some_sh_ten.axis_fragmentations)):
@@ -246,7 +247,10 @@ def sharded_tensor_to_torch_sharded_tensor(
 
         else:
             # for shards from other ranks we provide simplistic data - this information will be discarded
-            # during TorchShardedTensor._init_from_local_shards_and_global_metadata call
+            # during TorchShardedTensor._init_from_local_shards_and_global_metadata call.
+            # Due to a bug in PyT 24.05 container we must specify some concrete rank within a world size.
+            # The exact rank doesn't matter as long as it's different than my rank - hence (rank + 1) % WS.
+            placement = f"rank:{(rank + 1) % world_size}/cuda"
             if has_flattened_range and not is_flattened_range_1d:
                 offset = offset + (0,)
                 size = (1,) * len(offsets_shape) + global_shape[-1:]
@@ -526,8 +530,7 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         ):
             self._intermediate_read_item_and_target = (read_item, target_tensor)
             target_tensor = Float8Tensor.make_like(
-                target_tensor,
-                data=target_tensor._data.contiguous(),
+                target_tensor, data=target_tensor._data.contiguous()
             )
         return target_tensor
 
@@ -590,9 +593,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self.use_cached_ckpt_structure: bool = cached_metadata
 
     def async_save(
-        self,
-        sharded_state_dict: ShardedStateDict,
-        checkpoint_dir: Path,
+        self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path
     ) -> AsyncRequest:
         """Translates MCore ShardedTensors to PyT ShardedTensors and saves in PyT Distributed format.
 
@@ -603,12 +604,10 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         Returns: None
         """
         # Translate the state dict
-        (
-            sharded_state_dict,
-            flat_mapping,
-            rename_mapping,
-        ) = _replace_state_dict_keys_with_sharded_keys(
-            sharded_state_dict, self.keep_only_main_replica
+        (sharded_state_dict, flat_mapping, rename_mapping) = (
+            _replace_state_dict_keys_with_sharded_keys(
+                sharded_state_dict, self.keep_only_main_replica
+            )
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
         # Use PyT saving mechanism
@@ -718,11 +717,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
 
         orig_sharded_state_dict = sharded_state_dict
         # MCore state dict to PyT Distributed compatible
-        (
-            sharded_state_dict,
-            flat_mapping,
-            rename_mapping,
-        ) = _replace_state_dict_keys_with_sharded_keys(sharded_state_dict)
+        (sharded_state_dict, flat_mapping, rename_mapping) = (
+            _replace_state_dict_keys_with_sharded_keys(sharded_state_dict)
+        )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, True)
         # Load PyT Distributed format
         checkpoint.load_state_dict(
@@ -766,8 +763,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             if nd_orig_global_shape is None:
                 # Regular tensor
                 sharded_metadata[k] = ShardedTensor.from_rank_offsets(
-                    k,
-                    torch.empty(tp.size, **tp.properties.__dict__, device='meta'),
+                    k, torch.empty(tp.size, **tp.properties.__dict__, device='meta')
                 ).without_data()
             else:
                 # N-D flattened tensor

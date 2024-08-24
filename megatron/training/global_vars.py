@@ -6,7 +6,8 @@ import os
 import sys
 import torch
 
-from megatron.core import Timers, init_num_microbatches_calculator
+from megatron.core import Timers
+from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator
 from megatron.training import dist_signal_handler
 from megatron.training.tokenizer import build_tokenizer
 
@@ -181,7 +182,7 @@ def _set_one_logger(args):
             }
             one_logger = OneLogger(config=config)
             _GLOBAL_ONE_LOGGER = one_logger
-        except BaseException:
+        except Exception:
             print('WARNING: one_logger package is required to enable e2e metrics '
                   'tracking. please go to '
                   'https://confluence.nvidia.com/display/MLWFO/Package+Repositories'
@@ -198,7 +199,7 @@ def _set_adlr_autoresume(args):
         sys.path.append(os.environ.get('SUBMIT_SCRIPTS', '.'))
         try:
             from userlib.auto_resume import AutoResume
-        except BaseException:
+        except ImportError:
             print('ADLR autoresume is not available, exiting ...')
             sys.exit()
 
@@ -221,4 +222,27 @@ def _ensure_var_is_not_initialized(var, name):
     """Make sure the input variable is not None."""
     assert var is None, '{} is already initialized.'.format(name)
 
+def destroy_global_vars():
+    global _GLOBAL_ARGS
+    _GLOBAL_ARGS = None
 
+    global _GLOBAL_TOKENIZER
+    _GLOBAL_TOKENIZER = None
+
+    global _GLOBAL_TENSORBOARD_WRITER
+    _GLOBAL_TENSORBOARD_WRITER = None
+
+    global _GLOBAL_WANDB_WRITER
+    _GLOBAL_WANDB_WRITER = None
+
+    global _GLOBAL_ONE_LOGGER
+    _GLOBAL_ONE_LOGGER = None
+
+    global _GLOBAL_ADLR_AUTORESUME
+    _GLOBAL_ADLR_AUTORESUME = None
+
+    global _GLOBAL_TIMERS
+    _GLOBAL_TIMERS = None
+
+    global _GLOBAL_SIGNAL_HANDLER
+    _GLOBAL_SIGNAL_HANDLER = None

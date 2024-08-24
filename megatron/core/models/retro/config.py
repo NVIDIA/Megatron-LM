@@ -14,7 +14,7 @@ from megatron.core.transformer import TransformerConfig
 
 @dataclass
 class RetroConfig(TransformerConfig):
-    """Configuration object for Retro models. """
+    """Configuration object for Retro models."""
 
     # Retro.
     retro_project_dir: str = None

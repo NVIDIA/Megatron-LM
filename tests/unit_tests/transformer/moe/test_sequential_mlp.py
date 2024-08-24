@@ -2,14 +2,14 @@
 
 from megatron.core.device_utils import get_current_device
 import pytest
-
 import torch
 
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from tests.unit_tests.test_utilities import Utils
+
 
 class TestParallelSequentialMLP:
 
@@ -28,11 +28,14 @@ class TestParallelSequentialMLP:
             gated_linear_unit=True,
             bias_activation_fusion=True,
             moe_router_load_balancing_type="sinkhorn",
-            moe_router_topk=1
+            moe_router_topk=1,
         )
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            num_experts=num_moe_experts, moe_grouped_gemm=False)
-        self.sequential_mlp = MoELayer(transformer_config, transformer_layer_spec.submodules.mlp.submodules)
+            num_experts=num_moe_experts, moe_grouped_gemm=False
+        )
+        self.sequential_mlp = MoELayer(
+            transformer_config, transformer_layer_spec.submodules.mlp.submodules
+        )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -42,7 +45,6 @@ class TestParallelSequentialMLP:
 
         num_weights = sum([p.numel() for p in self.sequential_mlp.parameters()])
         assert num_weights == 3696
-
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_gpu_forward(self):
@@ -59,4 +61,3 @@ class TestParallelSequentialMLP:
         assert output.dtype == torch.float32
         assert output.device.type == 'cuda'
         assert output_bias.device.type == 'cuda'
-

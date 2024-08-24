@@ -21,8 +21,7 @@ class BERTMaskedWordPieceDatasetConfig(MaskedWordPieceDatasetConfig):
     """Option to perform the next sequence prediction during sampling"""
 
     def __post_init__(self) -> None:
-        """Do asserts and set fields post init
-        """
+        """Do asserts and set fields post init"""
         super().__post_init__()
 
         assert self.classification_head is not None
@@ -73,22 +72,20 @@ class BERTMaskedWordPieceDataset(MaskedWordPieceDataset):
         """
         return super(
             BERTMaskedWordPieceDataset, BERTMaskedWordPieceDataset
-        )._key_config_attributes() + ["classification_head",]
+        )._key_config_attributes() + ["classification_head"]
 
     def __getitem__(self, idx: int) -> Dict[str, Union[int, numpy.ndarray]]:
         """Abstract method implementation
- 
+
         Args:
             idx (int): The index into the dataset
 
         Returns:
-            Dict[str, Union[int, numpy.ndarray]]: The 
+            Dict[str, Union[int, numpy.ndarray]]: The
         """
         idx_beg, idx_end, target_sequence_length = self.sample_index[idx]
         sample = [self.dataset[i] for i in range(idx_beg, idx_end)]
-        numpy_random_state = numpy.random.RandomState(
-            seed=(self.config.random_seed + idx) % 2 ** 32
-        )
+        numpy_random_state = numpy.random.RandomState(seed=(self.config.random_seed + idx) % 2**32)
 
         assert target_sequence_length <= self.config.sequence_length
 
@@ -127,11 +124,7 @@ class BERTMaskedWordPieceDataset(MaskedWordPieceDataset):
             truncated = True
 
         # Merge the subsegments and create the token assignment labels
-        tokens = [
-            self.config.tokenizer.cls,
-            *split_A,
-            self.config.tokenizer.sep,
-        ]
+        tokens = [self.config.tokenizer.cls, *split_A, self.config.tokenizer.sep]
         assignments = [0 for _ in range(1 + len(split_A) + 1)]
         if split_B:
             tokens += [*split_B, self.config.tokenizer.sep]

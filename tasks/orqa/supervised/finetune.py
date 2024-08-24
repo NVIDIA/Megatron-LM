@@ -54,7 +54,7 @@ def orqa(Dataset):
         timers('batch generator', log_level=2).start()
         try:
             batch_ = next(batch)
-        except BaseException:
+        except Exception:
             batch_ = batch
 
         group, rank, world_size = get_group_world_size_rank()

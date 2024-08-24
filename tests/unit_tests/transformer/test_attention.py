@@ -2,14 +2,14 @@
 
 from megatron.core.device_utils import get_current_device
 import pytest
-
 import torch
 
 from megatron.core.transformer.attention import SelfAttention
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from tests.unit_tests.test_utilities import Utils
+
 
 class TestParallelAttention:
 
@@ -81,13 +81,14 @@ class TestParallelAttention:
         assert bias.shape[0] == config.hidden_size
         self.parallel_attention.config.apply_rope_fusion = False
 
-
     def test_checkpointed_gpu_forward(self):
         transformer_config = self.transformer_config
-        transformer_config.recompute_granularity='selective'
-        checkpointed_parallel_attention = SelfAttention(transformer_config,
-                                                        get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
-                                                        layer_number=1)
+        transformer_config.recompute_granularity = 'selective'
+        checkpointed_parallel_attention = SelfAttention(
+            transformer_config,
+            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            layer_number=1,
+        )
         config = checkpointed_parallel_attention.config
 
         sequence_length = 32

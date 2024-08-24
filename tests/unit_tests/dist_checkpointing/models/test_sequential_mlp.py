@@ -24,6 +24,12 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
+try:
+    _te_version = packaging.version.Version(version("transformer-engine"))
+except PackageNotFoundError:
+    _te_version = None
+
+
 def initialize_expert_layer(seed, glu=True, moe_grouped_gemm=False, **config_kwargs):
     torch.manual_seed(seed)
     model_parallel_device_manual_seed(seed)
@@ -60,6 +66,7 @@ def get_pp_offsets():
     pp_size = parallel_state.get_pipeline_model_parallel_world_size()
     return ((0, pp_rank, pp_size),)
 
+
 moe_grouped_gemm_options = [False]
 try:
     _te_version = packaging.version.Version(version("transformer-engine"))
@@ -68,17 +75,14 @@ try:
 except PackageNotFoundError:
     _te_version = None
 
-@pytest.mark.skipif(
-    _te_version is None,
-    reason="TE is not installed.",
-)
+@pytest.mark.skipif(_te_version is None, reason="TE is not installed.")
 class TestExpertLayerReconfiguration:
     def setup_method(self, method):
         pass
-    
+
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
-        
+
     @pytest.mark.parametrize(
         "use_fpsl,src_tp_pp_exp,dest_tp_pp_exp,use_glu",
         [
@@ -102,7 +106,7 @@ class TestExpertLayerReconfiguration:
     def test_parallel_reconfiguration_e2e(
         self, tmp_path_dist_ckpt, src_tp_pp_exp, dest_tp_pp_exp, use_glu, use_fpsl, moe_grouped_gemm
     ):
-        """ Test model saving and loading with different TP/PP/expert parallelism """
+        """Test model saving and loading with different TP/PP/expert parallelism"""
         src_tp, src_pp, src_exp = src_tp_pp_exp
         dest_tp, dest_pp, dest_exp = dest_tp_pp_exp
         # Save checkpoint A
@@ -187,7 +191,7 @@ class TestExpertLayerReconfiguration:
     def test_sequential_grouped_mlp_interchangeable(
         self, tmp_path_dist_ckpt, src_tp_pp_exp, dest_tp_pp_exp, use_glu, src_module
     ):
-        """ Test model saving and loading with different TP/PP/expert parallelism """
+        """Test model saving and loading with different TP/PP/expert parallelism"""
         src_tp, src_pp, src_exp = src_tp_pp_exp
         dest_tp, dest_pp, dest_exp = dest_tp_pp_exp
         # Save checkpoint A
@@ -197,7 +201,7 @@ class TestExpertLayerReconfiguration:
         ) as ckpt_dir_A, TempNamedDir(
             tmp_path_dist_ckpt / 'test_sequential_grouped_mlp_interchangeable_model_B'
         ) as ckpt_dir_B:
-            
+
             model_A = initialize_expert_layer(
                 1, use_glu, moe_grouped_gemm=src_module != 'sequential'
             )

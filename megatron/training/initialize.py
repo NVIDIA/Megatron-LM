@@ -23,8 +23,9 @@ from megatron.training.arguments import parse_args, validate_args
 from megatron.training.yaml_arguments import validate_yaml
 from megatron.training.checkpointing import load_args_from_checkpoint
 from megatron.training.global_vars import set_global_variables
-from megatron.legacy.model.transformer import bias_dropout_add_fused_train
-from megatron.legacy.model.fused_bias_gelu import bias_gelu
+from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
+from megatron.core.fusions.fused_bias_gelu import bias_gelu
+from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
 
 logger = logging.getLogger(__name__)
 
@@ -52,8 +53,14 @@ def initialize_megatron(
     # Parse arguments
     args = parse_args(extra_args_provider, ignore_unknown_args)
 
+    # Prep for checkpoint conversion.
+    if args.ckpt_convert_format is not None:
+        assert args.ckpt_convert_save is not None
+        assert args.load is not None
+        args.exit_on_missing_checkpoint = True
+
     if args.use_checkpoint_args or args_defaults.get("use_checkpoint_args", False):
-        assert args.load is not None, "--use-checkpoints-args requires --load argument"
+        assert args.load is not None, "--use-checkpoint-args requires --load argument"
         load_args_from_checkpoint(args)
 
     if args.yaml_cfg is not None:
@@ -268,6 +275,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
                 distributed_timeout_minutes=args.distributed_timeout_minutes,
                 nccl_communicator_config_path=args.nccl_communicator_config_path,
                 order='tp-cp-ep-dp-pp' if not args.use_tp_pp_dp_mapping else 'tp-pp-dp',
+                encoder_tensor_model_parallel_size=args.encoder_tensor_model_parallel_size,
                 encoder_pipeline_model_parallel_size=args.encoder_pipeline_model_parallel_size,
                 get_embedding_ranks=get_embedding_ranks,
                 get_position_embedding_ranks=get_position_embedding_ranks,
@@ -360,7 +368,7 @@ def _warmup_jit_function():
     )
     input = torch.rand(
         (
-            args.seq_length,
+            args.seq_length // args.context_parallel_size,
             args.micro_batch_size,
             args.ffn_hidden_size // args.tensor_model_parallel_size,
         ),
@@ -372,7 +380,10 @@ def _warmup_jit_function():
     for bias_grad, input_grad in zip([True, True], [False, True]):
         bias.requires_grad, input.requires_grad = bias_grad, input_grad
         for _ in range(5):
-            output = bias_gelu(bias, input)
+            if args.swiglu:
+                output = bias_swiglu(input, bias)
+            else:
+                output = bias_gelu(bias, input)
     del bias, input, output
 
     # Warmup fused bias+dropout+add
@@ -381,12 +392,12 @@ def _warmup_jit_function():
     else:
         seq_length = args.seq_length
     input = torch.rand(
-        (seq_length, args.micro_batch_size, args.hidden_size),
+        (seq_length // args.context_parallel_size, args.micro_batch_size, args.hidden_size),
         dtype=dtype,
         device=get_current_device(),
     )
     residual = torch.rand(
-        (seq_length, args.micro_batch_size, args.hidden_size),
+        (seq_length // args.context_parallel_size, args.micro_batch_size, args.hidden_size),
         dtype=dtype,
         device=get_current_device(),
     )
@@ -403,7 +414,7 @@ def _warmup_jit_function():
         bias.requires_grad = bias_grad
         residual.requires_grad = residual_grad
         for _ in range(5):
-            output = bias_dropout_add_fused_train(input, bias, residual, dropout_rate)
+            output = bias_dropout_add_fused_train([input, bias], residual, dropout_rate)
     del bias, input, residual, output
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
