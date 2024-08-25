@@ -16,6 +16,16 @@ from .param_and_grad_buffer import ParamAndGradBuffer
 
 logger = logging.getLogger(__name__)
 
+HAVE_APEX_OR_TE = True
+try:
+    from transformer_engine.pytorch.optimizers import FusedAdam as Adam
+except ImportError:
+    try:
+        from apex.optimizers import FusedAdam as Adam
+    except ImportError:
+        from torch.optim import Adam
+
+        HAVE_APEX_OR_TE = False
 
 class DistributedDataParallel(MegatronModule):
     """
@@ -177,7 +187,7 @@ class DistributedDataParallel(MegatronModule):
         # if we re-mapped parameters (which happens when we use the distributed optimizer).
         # This is a temporary workaround around a TE bug that is fixed with
         # https://github.com/NVIDIA/TransformerEngine/pull/719.
-        if self.ddp_config.use_distributed_optimizer:
+        if self.ddp_config.use_distributed_optimizer and HAVE_APEX_OR_TE:
 
             @torch.no_grad()
             def unmap_weight_tensor(m):

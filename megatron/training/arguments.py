@@ -7,6 +7,7 @@ import dataclasses
 import json
 import logging
 import os
+from megatron.core.optimizer.distrib_optimizer import HAVE_APEX_OR_TE
 import torch
 import types
 
@@ -289,9 +290,11 @@ def validate_args(args, defaults={}):
             print('WARNING: Setting args.overlap_p2p_comm to False since non-interleaved '
                   'schedule does not support overlapping p2p communication')
 
+    if args.use_distributed_optimizer:
+        assert HAVE_APEX_OR_TE, "--use-distributed-optimizer is only suported with Apex or TE"
     if args.overlap_param_gather:
-        assert args.use_distributed_optimizer, \
-            '--overlap-param-gather only supported with distributed optimizer'
+        assert args.use_distributed_optimizer and HAVE_APEX_OR_TE, \
+            '--overlap-param-gather only supported with distributed optimizer with Apex or TE'
         assert args.overlap_grad_reduce, \
             '--overlap-grad-reduce should be turned on when using --overlap-param-gather'
         assert not args.use_legacy_models, \

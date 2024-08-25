@@ -13,6 +13,7 @@ import torch
 
 from megatron.core.device_utils import get_current_device
 
+HAVE_APEX_OR_TE = True
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_scale
 except ImportError:
@@ -32,6 +33,7 @@ except ImportError:
 
         l2_norm_impl = local_multi_tensor_l2_norm
         multi_tensor_scale_impl = local_multi_tensor_scale
+        HAVE_APEX_OR_TE = False
 
 from .. import parallel_state, tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
@@ -951,11 +953,11 @@ class ChainedOptimizer(MegatronOptimizer):
     def disable_pre_hook(self):
         for optimizer in self.chained_optimizers:
             if (
-                not optimizer.config.use_distributed_optimizer
+                not (optimizer.config.use_distributed_optimizer and HAVE_APEX_OR_TE)
                 or not optimizer.config.overlap_param_gather
             ):
                 raise ValueError(
-                    "disable_pre_hook should only be called with 'use_distributed_optimizer' "
+                    "disable_pre_hook should only be called with 'use_distributed_optimizer' with Apex or TE "
                     "and 'overlap_param_gather' both enabled."
                 )
             optimizer.disable_pre_hook()
@@ -963,11 +965,11 @@ class ChainedOptimizer(MegatronOptimizer):
     def enable_pre_hook(self):
         for optimizer in self.chained_optimizers:
             if (
-                not optimizer.config.use_distributed_optimizer
+                not ( optimizer.config.use_distributed_optimizer and HAVE_APEX_OR_TE)
                 or not optimizer.config.overlap_param_gather
             ):
                 raise ValueError(
-                    "enable_pre_hook should only be called with 'use_distributed_optimizer' "
+                    "enable_pre_hook should only be called with 'use_distributed_optimizer' with Apex or TE "
                     "and 'overlap_param_gather' both enabled."
                 )
             optimizer.enable_pre_hook()

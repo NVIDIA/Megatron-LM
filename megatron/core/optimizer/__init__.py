@@ -4,6 +4,8 @@ from typing import Callable, Dict, List, Optional
 
 import torch
 
+HAVE_APEX_OR_TE = True
+
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as Adam
     from transformer_engine.pytorch.optimizers import FusedSGD as SGD
@@ -21,13 +23,14 @@ except ImportError:
         ## apex's FusedAdam is a drop-in replacement for torch's AdamW
         ## see https://github.com/NVIDIA/apex/blob/7b73b12361068a10b0f44844534613f252a5ea75/apex/optimizers/fused_adam.py#L16
         from torch.optim import AdamW as Adam, SGD
+        HAVE_APEX_OR_TE = False
 
 from megatron.core import mpu
 
 from ..distributed import ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import log_single_rank
-from .distrib_optimizer import DistributedOptimizer
+from .distrib_optimizer import HAVE_APEX_OR_TE, DistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import (
     ChainedOptimizer,
@@ -221,7 +224,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     # - Note: both the Float16Optimizer and the DistributedOptimizer inherit
     #   from the MixedPrecisionOptimizer, which manages any optimizer where
     #   the model params and main params are distinct.
-    if config.fp16 or config.bf16 or config.use_distributed_optimizer:
+    if config.fp16 or config.bf16 or (config.use_distributed_optimizer and HAVE_APEX_OR_TE):
 
         # Grad scaler:
         #    if loss-scale is provided, instantiate the constant scaler.

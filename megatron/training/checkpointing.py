@@ -10,6 +10,7 @@ import sys
 import threading
 from pathlib import Path
 
+from megatron.core.optimizer.distrib_optimizer import HAVE_APEX_OR_TE
 import numpy as np
 from time import time
 
@@ -347,7 +348,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     save_dataloader_state(train_data_iterator, iteration, getattr(args, "dataloader_save", None))
 
     # Save distributed optimizer's custom parameter state.
-    if args.use_distributed_optimizer and not args.no_save_optim and optimizer is not None and not use_dist_ckpt:
+    if (args.use_distributed_optimizer and HAVE_APEX_OR_TE) and not args.no_save_optim and optimizer is not None and not use_dist_ckpt:
         optim_checkpoint_name = \
             get_distributed_optimizer_checkpoint_name(checkpoint_name)
         ensure_directory_exists(optim_checkpoint_name)
@@ -367,7 +368,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             or mpu.get_data_modulo_expert_parallel_rank(with_context_parallel=True) == 0 \
             or use_dist_ckpt:
         optim_sd_kwargs = {}
-        if use_dist_ckpt and args.use_distributed_optimizer:
+        if use_dist_ckpt and args.use_distributed_optimizer and HAVE_APEX_OR_TE:
             optim_sd_kwargs['sharding_type'] = ('fully_sharded_model_space'
                                                 if args.ckpt_fully_parallel_save
                                                 else 'dp_zero_gather_scatter')
@@ -971,7 +972,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 gen_sd_optim = optimizer
                 gen_sd_opt_param_scheduler = opt_param_scheduler
 
-                if args.use_distributed_optimizer:
+                if args.use_distributed_optimizer and HAVE_APEX_OR_TE:
                     optim_sd_kwargs['sharding_type'] = ('fully_sharded_model_space'
                                                         if getattr(state_dict['args'], 'ckpt_fully_parallel_save', False)
                                                         else 'dp_zero_gather_scatter')
@@ -1072,7 +1073,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above
-            if args.use_distributed_optimizer and not is_dist_ckpt:
+            if args.use_distributed_optimizer and HAVE_APEX_OR_TE and not is_dist_ckpt:
                 # NOTE: this is a manual read of the tracker file.
                 # This code should not be reached when reading from a non_persistent checkpoint
                 assert not is_dist_ckpt
@@ -1167,7 +1168,7 @@ def load_biencoder_checkpoint(model, only_query_model=False,
         iteration = int(f.read().strip())
 
     checkpoint_name = get_checkpoint_name(load_path, iteration,
-                                          args.use_distributed_optimizer,
+                                          args.use_distributed_optimizer and HAVE_APEX_OR_TE,
                                           release=False)
 
     if mpu.get_data_parallel_rank() == 0:

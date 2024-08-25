@@ -2,6 +2,7 @@ from functools import partial
 from types import SimpleNamespace
 from unittest import mock
 
+from megatron.core.optimizer.distrib_optimizer import HAVE_APEX_OR_TE
 import torch
 
 from megatron.core.models.gpt import GPTModel
@@ -54,7 +55,7 @@ def init_basic_mock_args(args, tp, pp, bf16=True):
     args.bf16 = bf16
     args.accumulate_allreduce_grads_in_fp32 = False
     args.overlap_grad_reduce = False
-    args.use_distributed_optimizer = True
+    args.use_distributed_optimizer = True and HAVE_APEX_OR_TE
     args.ddp_bucket_size = None
     args.check_for_nan_in_loss_and_grad = False
     args.ddp_average_in_collective = False
@@ -115,7 +116,7 @@ def setup_model_and_optimizer(
     config = OptimizerConfig(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
-        use_distributed_optimizer=dist_opt,
+        use_distributed_optimizer=dist_opt and HAVE_APEX_OR_TE,
     )
     optimizer = get_megatron_optimizer(config, model)
 

@@ -1,15 +1,13 @@
 import contextlib
 import math
 
+from megatron.core.optimizer.distrib_optimizer import HAVE_APEX_OR_TE
 import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.device_utils import get_xla_model
 from megatron.core.distributed import DistributedDataParallelConfig, ParamAndGradBuffer
 from tests.unit_tests.test_utilities import TestModel, Utils
-
-xm = get_xla_model()
 
 def get_model_and_buffers(
     input_dim: int,
@@ -22,7 +20,7 @@ def get_model_and_buffers(
 ):
     ddp_config = DistributedDataParallelConfig(
         grad_reduce_in_fp32=True,
-        use_distributed_optimizer=use_distributed_optimizer,
+        use_distributed_optimizer=use_distributed_optimizer and HAVE_APEX_OR_TE,
         overlap_grad_reduce=overlap_grad_reduce,
     )
     model = TestModel(input_dim=input_dim, output_dim=output_dim, num_layers=num_layers, bias=bias)
@@ -51,6 +49,7 @@ def get_model_and_buffers(
 def test_bucket_sizes(bucket_size: int, use_distributed_optimizer: bool, bias: bool):
     Utils.initialize_model_parallel()
 
+    use_distributed_optimizer = use_distributed_optimizer and HAVE_APEX_OR_TE
     input_dim = 100
     output_dim = 100
     num_layers = 10
@@ -129,6 +128,8 @@ def test_bucket_sizes(bucket_size: int, use_distributed_optimizer: bool, bias: b
 def test_grad_sync(use_distributed_optimizer: bool, overlap_grad_reduce: bool):
     Utils.initialize_model_parallel()
 
+    use_distributed_optimizer = use_distributed_optimizer and HAVE_APEX_OR_TE
+    
     input_dim = 100
     output_dim = 100
     num_layers = 10
@@ -164,9 +165,6 @@ def test_grad_sync(use_distributed_optimizer: bool, overlap_grad_reduce: bool):
             # params in the model have registered their grad above.
             # When overlap_grad_reduce is False, the collective is forced through.
             param_and_grad_buffer.finish_grad_sync()
-
-        if xm:
-            xm.mark_step()
 
         expected_grad_data_value = expected_grad_data_value_after_collective
         if overlap_grad_reduce and i < (len(params) - 1):
