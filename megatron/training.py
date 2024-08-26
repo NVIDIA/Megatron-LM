@@ -725,7 +725,7 @@ def train_step(forward_step_func, data_iterator,
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
-        torch.cuda.empty_cache()
+        get_accelerator().empty_cache()
 
     # Reduce gradients.
     if not args.deepspeed:
@@ -782,7 +782,7 @@ def train_step(forward_step_func, data_iterator,
 
         # Empty unused memory.
         if args.empty_unused_memory_level >= 2:
-            torch.cuda.empty_cache()
+            get_accelerator().empty_cache()
 
         if mpu.is_pipeline_last_stage(ignore_virtual=True):
             # Average loss across microbatches.
@@ -1438,7 +1438,7 @@ def evaluate(forward_step_func,
 
             # Empty unused memory
             if args.empty_unused_memory_level >= 1:
-                torch.cuda.empty_cache()
+                get_accelerator().empty_cache()
 
             if mpu.is_pipeline_last_stage(ignore_virtual=True):
                 # Reduce across processes.
