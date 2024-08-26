@@ -21,7 +21,7 @@ except ImportError:
 
         HAVE_APEX_OR_TE = False
 
-from .. import parallel_state, tensor_parallel
+from .. import tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing import ShardedTensor
 from ..dist_checkpointing.dict_utils import nested_values
@@ -93,7 +93,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         buffer shard ranges, specific to each data-parallel (DP) rank's
         set of 'owned' parameters. Each grad buffer (padded to be an even
         multiple of DP-world-size) is conceptually divided into DP-world-size
-        contiguous regions, where each DP rank 'owns' a contiguous regions.
+        contiguous regions, where each DP rank 'owns' a contiguous region.
         Ownership in this sense means DP rank is responsible for reducing
         the relevant subset of grads, and updating the relevant subset of
         params.
@@ -393,6 +393,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_group: torch.distributed.ProcessGroup,
         data_parallel_group_gloo: torch.distributed.ProcessGroup,
         data_parallel_group_idx: int,
+        overlap_param_gather_with_optimizer_step: bool = False,
     ):
         """
         Distributed optimizer, for all data types (fp16, bf16, and fp32).
@@ -422,6 +423,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 (used in checkpoint loading and saving).
             data_parallel_group_idx (int): index in data-parallel group (used by
                 distributed checkpointing logic).
+            overlap_param_gather_with_optimizer_step (bool, optional): if true, overlap parameter
+                all-gather with optimizer step. Defaults to False.
         """
 
         if has_config_logger_enabled(config):
@@ -516,6 +519,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.num_all_gather_handles = len(self.all_gather_handle_index_to_bucket_index_map)
 
         self.overlap_param_gather = self.config.overlap_param_gather
+        self.overlap_param_gather_with_optimizer_step = overlap_param_gather_with_optimizer_step
         self.remove_pre_hook_handle = None
         if self.overlap_param_gather:
             self.enable_pre_hook()
@@ -547,6 +551,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Make sure all-gathers are completed as needed.
         self._reset_metadata_and_sync_gather_all_model_params(force_sync=True)
+        self.update_successful = False
 
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """
@@ -1490,7 +1495,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # pre-hook when this all-gather finishes (to ensure that the communication
         # kernels don't head-of-line block the compute kernels since we run with
         # CUDA_DEVICE_MAX_CONNECTIONS=1 to support sequence parallelism).
-        if self.overlap_param_gather:
+        # If aligning param all-gather across pipeline stages, all-gather is dispatched
+        # by start_param_sync calls in core/pipeline_parallelism/schedules.py.
+        # If overlapping param all-gather with optimizer step, then all-gather has
+        # already been dispatched in optimizer step.
+        skip_dispatch = (
+            self.config.align_param_gather or self.overlap_param_gather_with_optimizer_step
+        )
+        if self.overlap_param_gather and not skip_dispatch:
             self._dispatch_gather_model_params(all_gather_handle_index=0)
 
     def _get_model_param_buffer_dp_views(self):
@@ -1587,25 +1599,47 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 # non-expert params.
                 if param in self.param_to_all_gather_handle_index_map:
                     all_gather_handle_index = self.param_to_all_gather_handle_index_map[param]
-                    self._finish_param_sync_helper(all_gather_handle_index)
+                    # If aligning param all-gather across pipeline stages, all-gather is dispatched
+                    # by start_param_sync calls in core/pipeline_parallelism/schedules.py.
+                    # If overlapping param all-gather with optimizer step, then all-gather has
+                    # already been dispatched in optimizer step.
+                    skip_dispatch = (
+                        self.config.align_param_gather
+                        or self.overlap_param_gather_with_optimizer_step
+                    )
+                    self._finish_param_sync_helper(
+                        all_gather_handle_index, skip_dispatch=skip_dispatch
+                    )
 
         return hook
 
-    def finish_param_sync(self, model_index: int, *unused):
+    def start_param_sync(self, model_index: int, *unused, force_dispatch: bool = False):
         """
-        Finishes all necessary param syncs for the model_index'th model chunk.
+        Starts all necessary param syncs for the model_index'th model chunk.
 
         Args:
             model_index (int): index of model chunk to synchronize params.
+            force_dispatch (bool, optional): force dispatch regardless of other settings.
         """
         if model_index not in self.model_index_to_all_gather_handle_index_map:
             return
 
-        all_gather_handle_indices = self.model_index_to_all_gather_handle_index_map[model_index]
-        for all_gather_handle_index in all_gather_handle_indices:
-            self._finish_param_sync_helper(all_gather_handle_index)
+        if self.overlap_param_gather_with_optimizer_step and not force_dispatch:
+            return
 
-    def _finish_param_sync_helper(self, all_gather_handle_index: int):
+        # If overlapping param AG with optimizer step, AG has already been dispatched.
+        if self.update_successful:
+            all_gather_handle_indices = self.model_index_to_all_gather_handle_index_map[model_index]
+            with torch.distributed._coalescing_manager(
+                group=self.data_parallel_group, async_ops=self.overlap_param_gather
+            ) as cm:
+                for all_gather_handle_index in all_gather_handle_indices:
+                    self._dispatch_gather_model_params(all_gather_handle_index)
+            if self.overlap_param_gather:
+                for all_gather_handle_index in all_gather_handle_indices:
+                    self.all_gather_handles[all_gather_handle_index] = cm
+
+    def _finish_param_sync_helper(self, all_gather_handle_index: int, skip_dispatch: bool = False):
         """
         Waits on all_gather_handle if necessary, then dispatches the next all-gather
         as necessary.
@@ -1625,7 +1659,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # (since we run with CUDA_DEVICE_MAX_CONNECTIONS=1 to support sequence
             # parallelism).
             next_all_gather_handle_index = all_gather_handle_index + 1
-            if next_all_gather_handle_index < self.num_all_gather_handles:
+            if next_all_gather_handle_index < self.num_all_gather_handles and not skip_dispatch:
                 self._dispatch_gather_model_params(next_all_gather_handle_index)
 
     def _collect_main_grad_data_for_unscaling(self):
@@ -1744,7 +1778,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # is explicitly set to True (e.g., if we are going to turn off all-gather overlapping for
         # validation / test iterations).
         if not self.overlap_param_gather or force_sync:
-            for all_gather_handle_index in range(self.num_all_gather_handles):
+            for all_gather_handle_index in range(len(self.all_gather_handles)):
                 self._dispatch_gather_model_params(all_gather_handle_index, force_sync=force_sync)
 
     @torch.no_grad()

@@ -254,7 +254,7 @@ class TransformerConfig(ModelParallelConfig):
     currently unsupported so should remain False."""
 
     moe_token_dispatcher_type: str = "allgather"
-    """The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather' and 'alltoall'."""
+    """The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather', 'alltoall' and 'alltoall_seq'."""
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
@@ -267,6 +267,7 @@ class TransformerConfig(ModelParallelConfig):
     moe_token_drop_policy: str = 'probs'
     """The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.
     """
+
     moe_layer_recompute: bool = False
     """Memory optimization: checkpointing moe_layer to save actiavtion memory."""
 
@@ -327,7 +328,7 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(f'num_moe_experts must be non-negative.')
 
         if self.moe_expert_capacity_factor is not None:
-            if self.moe_token_dispatcher_type != "alltoall":
+            if self.moe_token_dispatcher_type not in ["alltoall", "alltoall_seq"]:
                 raise ValueError(
                     f'moe_expert_capacity_factor only works with alltoall token dispatcher'
                 )

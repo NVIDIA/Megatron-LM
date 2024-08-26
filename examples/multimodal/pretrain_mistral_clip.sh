@@ -92,7 +92,7 @@ OPTIONS=" \
     --log-interval ${LI} \
     --eval-iters 10 \
     --eval-interval 1000 \
-    --tokenizer-type MistralTokenizer \
+    --tokenizer-type HuggingFaceTokenizer \
     --tokenizer-model ${WORKSPACE}/${TOKENIZER_MODEL} \
     --data-path ${DATA_TRAIN} \
     --valid-path ${DATA_VALID} \

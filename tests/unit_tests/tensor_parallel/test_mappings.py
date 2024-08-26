@@ -109,6 +109,7 @@ def test_GatherFromSequenceParallelRegion():
 
     class Ctx:
         tensor_parallel_output_grad = True
+        output_split_sizes = None
 
     output_data = mappings._GatherFromSequenceParallelRegion.backward(Ctx(), input_data)
     expected_output = torch.ones((1, 4)).cuda() * 4 * int(Utils.rank % 4)
@@ -129,7 +130,11 @@ def test_ReduceScatterToSequenceParallelRegion():
         expected_output.reshape((1, 4)),
     )
     input_data = torch.ones(4).cuda() * Utils.rank
-    output_data = mappings._ReduceScatterToSequenceParallelRegion.backward(None, input_data)
+
+    class Ctx:
+        input_split_sizes = None
+
+    output_data, _ = mappings._ReduceScatterToSequenceParallelRegion.backward(Ctx(), input_data)
     expected_output = torch.concat(
         (torch.ones(4) * 0, torch.ones(4) * 1, torch.ones(4) * 2, torch.ones(4) * 3)
     ).cuda()

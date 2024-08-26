@@ -215,9 +215,9 @@ fp16_lm_cross_entropy: False
 distributed_backend: nccl
 distributed_timeout_minutes: 10
 overlap_grad_reduce: False
-delay_grad_reduce: True
+align_grad_reduce: True
 overlap_param_gather: False
-delay_param_gather: False
+align_param_gather: False
 scatter_gather_tensors_in_pipeline: True
 local_rank: null
 lazy_mpu_init: null

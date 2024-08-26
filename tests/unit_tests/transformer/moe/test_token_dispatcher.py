@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import copy
+
 import pytest
 import torch
 
@@ -128,9 +130,7 @@ class MoEModelTestContainer:
         # Create the answer.
         prob_mask = probs != 0
         probs = torch.ones_like(probs) * prob_mask / moe_layer.router.topk
-        local_probss = probs[
-            probs.size(0) // tp_size * (tp_rank) : probs.size(0) // tp_size * (tp_rank + 1)
-        ]
+        local_probss = probs
         restored_hidden_states_answer = hidden_states * local_probss.sum(dim=1).unsqueeze(1)
 
         (permuted_local_hidden_states, tokens_per_expert) = (
@@ -157,6 +157,7 @@ class MoEModelTestContainer:
     def dispatcher_drop_and_pad_test(self):
         "Test if the tokens are dropped and padded correctly"
         moe_layer = self.moe_layer
+        moe_layer_2 = copy.deepcopy(moe_layer)
         hidden_states = torch.randn((256, moe_layer.config.hidden_size)).cuda()
         hidden_states.requires_grad = True
 
@@ -186,15 +187,13 @@ class MoEModelTestContainer:
         backward_answer = hidden_states.grad.clone()
         hidden_states.grad = None
         torch.cuda.synchronize()
-        moe_layer.token_dispatcher.drop_and_pad = True
-        moe_layer.config.moe_pad_expert_input_to_capacity = True
         # End
 
-        probs_2, indices_2 = moe_layer.router(hidden_states)
-        (permuted_input_2, tokens_per_expert) = moe_layer.token_dispatcher.token_permutation(
+        probs_2, indices_2 = moe_layer_2.router(hidden_states)
+        (permuted_input_2, tokens_per_expert) = moe_layer_2.token_dispatcher.token_permutation(
             hidden_states, probs_2, indices_2
         )
-        restored_hidden_states, restored_bias = moe_layer.token_dispatcher.token_unpermutation(
+        restored_hidden_states, restored_bias = moe_layer_2.token_dispatcher.token_unpermutation(
             permuted_input_2
         )
         torch.distributed.barrier()

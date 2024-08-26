@@ -87,11 +87,6 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
         from transformers import LlamaConfig as ModelConfig
     elif "mistral" in model_size:
         from transformers import MistralConfig as ModelConfig
-        try:
-            from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
-        except ImportError:
-            raise ImportError("Module 'mistral-common' is required but not installed.")
-
 
     # for backward compatibility, before you needed the repo to be called `my_repo/model_size`
     if not os.path.isfile(os.path.join(input_base_path, "params.json")):
@@ -116,14 +111,8 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
 
     if "llama2" in model_size:
         tokenizer_class = LlamaTokenizer if LlamaTokenizerFast is None else LlamaTokenizerFast
-    elif "llama3" in model_size:
-        try:
-            from llama.tokenizer import Tokenizer as Llama3Tokenizer
-        except ImportError:
-            raise AssertionError("Module 'llama' is required but not installed.")
-        tokenizer_class = Llama3Tokenizer
-    elif "mistral" in model_size:
-        tokenizer_class = MistralTokenizer
+    elif model_size in ["llama3", "mistral"]:
+        tokenizer_class = transformers.AutoTokenizer.from_pretrained
     else:
         raise AttributeError(f"model_size={model_size} not supported")
     if tokenizer_path is not None:
@@ -131,7 +120,9 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
             tokenizer = tokenizer_class(tokenizer_path)
             if "llama2" in model_size:
                 tokenizer.save_pretrained(model_path)
-            vocab_size = tokenizer.vocab_size if tokenizer_path is not None else 32000
+                vocab_size = tokenizer.vocab_size if tokenizer_path is not None else 32000
+            elif "llama3" in model_size:
+                 vocab_size = 128256
         elif "mistral" in model_size:
             tokenizer = tokenizer_class.from_file(tokenizer_path)
             vocab_size = 32768
@@ -315,8 +306,7 @@ def load_args_from_checkpoint(args):
     args.global_batch_size = 1024
     args.norm_epsilon = model_args["rms_norm_eps"]
     args.iteration = 1 # '0', 'release' don't work
-    args.add_position_embedding = False
-    args.use_rotary_position_embeddings = True
+    args.position_embedding_type = "rope"
     args.swiglu = True
     args.normalization = "RMSNorm"
     args.add_bias_linear = False
@@ -470,9 +460,9 @@ def _load_checkpoint(queue, args):
     if "llama2" in args.model_size or "yi" in args.model_size:
         margs.tokenizer_type = "Llama2Tokenizer"
     elif "llama3" in args.model_size:
-        margs.tokenizer_type = "Llama3Tokenizer"
+        margs.tokenizer_type = "HuggingFaceTokenizer"
     elif "mistral" in args.model_size:
-        margs.tokenizer_type = "MistralTokenizer"
+        margs.tokenizer_type = "HuggingFaceTokenizer"
 
     # Arguments do sanity checks on the world size, but we don't care,
     # so trick it into thinking we are plenty of processes.
@@ -482,6 +472,8 @@ def _load_checkpoint(queue, args):
 
     margs.use_legacy_models = True
     margs.transformer_impl = args.loader_transformer_impl
+
+    margs.position_embedding_type = "rope"
 
     def check_for_arg(arg_name, default=None):
         if getattr(margs, arg_name, None) is None:
@@ -555,15 +547,8 @@ def _load_checkpoint(queue, args):
     margs.model_size = args.model_size
 
     # Get true (non-padded) vocab size
-    if margs.tokenizer_model is not None and "llama3" in args.model_size:
-        try:
-            from llama.tokenizer import Tokenizer as Llama3Tokenizer
-        except ImportError:
-            raise AssertionError("Module 'llama' is required but not installed.")
-        tokenizer = Llama3Tokenizer(margs.tokenizer_model)
-        md.true_vocab_size = tokenizer.vocab_size
-    else:
-        md.true_vocab_size = None
+    tokenizer = transformers.AutoTokenizer.from_pretrained(margs.tokenizer_model)
+    md.true_vocab_size = tokenizer._tokenizer.get_vocab_size(with_added_tokens=True)
 
     # Get first pipe stage.
     mpu.set_tensor_model_parallel_rank(0)

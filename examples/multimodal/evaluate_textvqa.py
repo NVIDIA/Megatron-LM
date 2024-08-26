@@ -3,11 +3,7 @@ import glob
 import json
 import re
 
-# This can help resolve an import error of an mmf dependency that is not needed.
-try:
-    from mmf.utils.m4c_evaluators import TextVQAAccuracyEvaluator
-except ModuleNotFoundError:
-    from mmf.utils.m4c_evaluators import TextVQAAccuracyEvaluator
+from evaluate_vqav2 import compute_vqa_accuracy
 
 
 def merge_input_files(input_path):
@@ -23,7 +19,13 @@ def merge_input_files(input_path):
         with open(input_file_path, "r") as input_file:
             for line in input_file:
                 res = json.loads(line)
-                results.append(res)
+                results.append(
+                    {
+                        "question_id": res["sample_id"],
+                        "answer": res["answer"],
+                        "gt_answer": res["gt_answer"],
+                    }
+                )
 
     with open(output_file_path, "w") as output_file:
         json.dump(results, output_file)
@@ -31,56 +33,15 @@ def merge_input_files(input_path):
     return output_file_path
 
 
-# Note: This is based on https://github.com/haotian-liu/LLaVA/blob/c121f0432da27facab705978f83c4ada465e46fd/llava/eval/eval_textvqa.py#L17
-# and slightly modified.
-def prompt_processor(prompt):
-    if prompt.startswith('OCR tokens: '):
-        pattern = r"Question: (.*?) Short answer:"
-        match = re.search(pattern, prompt, re.DOTALL)
-        question = match.group(1)
-    elif "Reference OCR token: " in prompt and len(prompt.split("\n")) == 3:
-        if prompt.startswith("Reference OCR token:"):
-            question = prompt.split("\n")[1]
-        else:
-            question = prompt.split("\n")[0]
-    elif len(prompt.split("\n")) == 2:
-        question = prompt.split("\n")[0]
-    else:
-        raise RuntimeError("unexpected prompt format")
-
-    return question.lower()
-
-
-# Note: This is based on https://github.com/haotian-liu/LLaVA/blob/c121f0432da27facab705978f83c4ada465e46fd/llava/eval/eval_textvqa.py#L35
-# and slightly modified.
-def evaluate(result_file_path, groundtruth_path):
-    with open(groundtruth_path) as groundtruth_file:
-        groundtruth = json.load(groundtruth_file)["data"]
-
-    groundtruth = {(gt["image_id"]): gt["answers"] for gt in groundtruth}
-
-    with open(result_file_path, "r") as result_file:
-        results = json.load(result_file)
-
-    predictions = []
-    for result in results:
-        gt_answers = groundtruth[(result["sample_id"])]
-        predictions.append({"pred_answer": result["text"], "gt_answers": gt_answers})
-
-    evaluator = TextVQAAccuracyEvaluator()
-    print(
-        'Samples: {}\nAccuracy: {:.2f}%\n'.format(
-            len(predictions), 100.0 * evaluator.eval_pred_list(predictions)
-        )
-    )
+def textvqa_eval(input_path):
+    """Run TextVQA evaluation."""
+    result_file_path = merge_input_files(input_path)
+    compute_vqa_accuracy(result_file_path)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--input-path', type=str, help="Path to input file(s)")
-    parser.add_argument('--groundtruth-path', type=str, help="Path to groundtruth file")
     args = parser.parse_args()
 
-    result_file_path = merge_input_files(args.input_path)
-
-    evaluate(result_file_path, args.groundtruth_path)
+    textvqa_eval(args.input_path)
