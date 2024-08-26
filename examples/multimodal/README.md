@@ -1,5 +1,7 @@
 # Multimodal Example
 
+*NOTE: This example is under active development and is expected change.*
+
 The following walks through all the steps required to pretrain and instruction tune a llava architecture vision-language model (VLM). It is important to precisely follow all steps to obtain the benchmark scores at the end.
 
 This example has been tested on an A100 based DGX cluster. Pretraining and instruction tuning took approximately 1 day and 11 hours respectively on 64 GPUs using four way tensor parallelism (tp=4). Training speed will scale approximately linearly with number of GPUs available.
@@ -21,7 +23,7 @@ Follow the instructions in `megatron-lm/docs/llama_mistral.md` to download weigh
 This example uses the OpenAI CLIP `ViT-L/14@336px` Vision model. To download the weights from OpenAI and convert them to a format that can be loaded in megatron, please run the following:
 
 ```
-python examples/multimodal/clip_converter.py --download-root /some/download/folder --output /some/output/folder --tensor-parallel-size 4 --use-te-layernorm-linear
+python examples/multimodal/clip_converter.py --download-root /some/download/folder --output /some/output/folder --tensor-parallel-size 4 --use-te
 ```
 
 ### Combined model checkpoint
@@ -29,7 +31,7 @@ python examples/multimodal/clip_converter.py --download-root /some/download/fold
 Update the paths to point to the mcore converted CLIP and Mistral models and run the following script to combine the Mistral and CLIP models into a single multimodal checkpoint folder:
 
 ```
-examples/multimodal/combine_mistral_clip.sh
+examples/multimodal/combine_mistral_clip.sh /path/to/mistral/model /path/to/clip/model /output/dir
 ```
 
 ## Training
@@ -80,7 +82,7 @@ examples/multimodal/combine_mistral_clip.sh
     examples/multimodal/pretrain_mistral_clip.sh
     ```
 
-All being well you should observe training and valiation loss curves similar to the following:
+All being well you should observe training and validation loss curves similar to the following:
 
 <img src="assets/pretrain_curves.png" alt="Pretraining loss curves" width="600"/>
 
@@ -112,6 +114,8 @@ Run the following script:
 examples/multimodal/text_generation_mistral_clip.sh --input-image-path /path/to/input/images --output-path /some/output/directory \
     --model-path /path/to/model.pt --tokenizer-path /path/to/tokenizer.model --gt-path /path/to/groundtruth/file --task generation-task-name
 ```
+
+where `--task generation-task-name` is the name of the evaluation benchmark such as `captioning` or `MMMU`.
 
 ### After pretraining
 

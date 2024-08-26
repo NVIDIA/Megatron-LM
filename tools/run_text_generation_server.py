@@ -23,6 +23,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
 )
 
+from contextlib import nullcontext
 import torch
 from typing import Union
 import megatron
@@ -81,7 +82,8 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             parallel_output=False,
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
-            rotary_percent=args.rotary_percent
+            rotary_percent=args.rotary_percent,
+            rotary_base=args.rotary_base
         )
 
     return model
@@ -106,8 +108,14 @@ if __name__ == "__main__":
     print_rank_0("WARNING: Forcing exit_on_missing_checkpoint to True for text "
                  "generation.")
     args.exit_on_missing_checkpoint = True
+
     # Set up model and load checkpoint
-    model = get_model(model_provider, wrap_with_ddp=False)
+    load_context = nullcontext()
+    if args.fp8:
+        from transformer_engine.pytorch.fp8 import fp8_model_init
+        load_context = fp8_model_init()
+    with load_context:
+        model = get_model(model_provider, wrap_with_ddp=False)
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None)

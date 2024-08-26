@@ -49,6 +49,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_retro_args(parser)
     parser = _add_experimental_args(parser)
     parser = _add_one_logger_args(parser)
+    parser = _add_ft_package_args(parser)
     parser = _add_config_logger_args(parser)
 
     # Custom arguments.
@@ -160,6 +161,9 @@ def validate_args(args, defaults={}):
     # Load saved args from Retro (if applicable).
     load_retro_args(args)
 
+    # Set args.use_dist_ckpt from args.ckpt_format.
+    update_use_dist_ckpt(args)
+
     if args.encoder_tensor_model_parallel_size > 0:
         assert args.encoder_pipeline_model_parallel_size > 0, "encoder_pipeline_model_parallel_size must be defined."
         assert args.num_attention_heads % args.encoder_tensor_model_parallel_size == 0
@@ -189,10 +193,10 @@ def validate_args(args, defaults={}):
     # Checks.
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
-              'context-parallel size: {} '
+              'context-parallel size: {}, '
               'tensor-model-parallel size: {}, '
-              'encoder-tensor-model-parallel size: {}'
-              'pipeline-model-parallel size: {} '
+              'encoder-tensor-model-parallel size: {}, '
+              'pipeline-model-parallel size: {}, '
               'encoder-pipeline-model-parallel size: {}'.format(
                   args.world_size, args.data_parallel_size,
                   args.context_parallel_size,
@@ -206,7 +210,6 @@ def validate_args(args, defaults={}):
         args.encoder_pipeline_model_parallel_size = args.pipeline_model_parallel_split_rank
         args.pipeline_model_parallel_size -= args.encoder_pipeline_model_parallel_size
         assert args.pipeline_model_parallel_size > 0
-
 
     if args.tp_comm_overlap:
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
@@ -292,9 +295,23 @@ def validate_args(args, defaults={}):
         assert args.use_distributed_optimizer, \
             '--overlap-param-gather only supported with distributed optimizer'
         assert args.overlap_grad_reduce, \
-            '--overlap-grad-reduce should be turned on when using --overlap-param-gather'
+            'Must use --overlap-param-gather with --overlap-grad-reduce'
         assert not args.use_legacy_models, \
             '--overlap-param-gather only supported with MCore models'
+
+    if args.overlap_param_gather_with_optimizer_step:
+        assert args.use_distributed_optimizer, \
+            '--overlap-param-gather-with-optimizer-step only supported with distributed optimizer'
+        assert args.overlap_param_gather, \
+            'Must use --overlap-param-gather-with-optimizer-step with --overlap-param-gather'
+        assert args.virtual_pipeline_model_parallel_size is not None, \
+            '--overlap-param-gather-with-optimizer-step only supported with interleaved pipeline parallelism'
+        assert not args.use_dist_ckpt, \
+            '--overlap-param-gather-with-optimizer-step not supported with distributed checkpointing yet'
+
+    if args.align_param_gather:
+        assert args.virtual_pipeline_model_parallel_size is not None, \
+            '--align-param-gather only supported with interleaved pipeline parallelism'
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -515,14 +532,9 @@ def validate_args(args, defaults={}):
         assert args.pipeline_model_parallel_size == 1, \
             "retro currently does not support pipeline parallelism."
 
-    # Set args.use_dist_ckpt from args.ckpt_format.
-    update_use_dist_ckpt(args)
-
     if args.decoupled_lr is not None or args.decoupled_min_lr is not None:
         assert not args.use_legacy_models, \
             '--decoupled-lr and --decoupled-min-lr is not supported in legacy models.'
-        if args.load is not None or args.save is not None:
-            assert not args.use_dist_ckpt, "Distributed checkpointing does not work with decoupled LR yet."
 
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
@@ -850,6 +862,7 @@ def _add_network_size_args(parser):
                        help='Untie embeddings and output weights.'),
     return parser
 
+
 def _add_straggler_detector_args(parser):
     group = parser.add_argument_group(title='straggler')
     group.add_argument('--log-straggler', action='store_true',
@@ -861,6 +874,7 @@ def _add_straggler_detector_args(parser):
     group.add_argument('--straggler-minmax-count', type=int, default=1,
                        help='Number of ranks to report with high/low estimated throughput')
     return parser
+
 
 def _add_one_logger_args(parser):
     group = parser.add_argument_group(title='one logger')
@@ -890,12 +904,22 @@ def _add_one_logger_args(parser):
                        'baseline')
     return parser
 
+
+def _add_ft_package_args(parser):
+    group = parser.add_argument_group(title='ft_package')
+    group.add_argument('--enable-ft-package', action='store_true',
+                       help='If set, Fault Tolerance package is enabled. '
+                       'Note: This feature is for Nvidia internal use only.')
+    return parser
+
+
 def _add_config_logger_args(parser):
     group = parser.add_argument_group(title='config logger')
     group.add_argument('--config-logger-dir', type=str, default='',
                        help='If set, will dump all configs to --config-logger-dir',
                        dest='config_logger_dir')
     return parser
+
 
 def _add_logging_args(parser):
     group = parser.add_argument_group(title='logging')
@@ -1122,6 +1146,8 @@ def _add_training_args(parser):
     group.add_argument('--calculate-per-token-loss', action='store_true',
                        help=('Scale cross entropy loss by the number of non-padded tokens in the '
                              'global batch, versus the default behavior of assuming all tokens are non-padded.'))
+    group.add_argument('--train-sync-interval', type=int, default=None,
+                       help='Training CPU-GPU synchronization interval, to ensure that CPU is not running too far ahead of GPU.')
 
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
@@ -1485,17 +1511,21 @@ def _add_distributed_args(parser):
                        'weight gradient computation of vocabulary projection is deferred, defaults to 0 which'
                        'means all the micro-batches are deferred. Invalid if `defer-embedding-wgrad-compute`'
                        'is not set')
-    group.add_argument('--no-delay-grad-reduce', action='store_false',
-                       help='If not set, delay / synchronize grad reductions in all but first PP stage.',
-                       dest='delay_grad_reduce')
+    group.add_argument('--no-align-grad-reduce', action='store_false',
+                       help='If not set, all PP stages will launch gradient reduces simultaneously. '
+                       'Otherwise, each PP stage will independently launch as needed.',
+                       dest='align_grad_reduce')
     group.add_argument('--ddp-bucket-size', type=int, default=None,
                        help='Bucket size for data-parallel communication')
     group.add_argument('--ddp-average-in-collective', action='store_true',
                        default=False, help='If set, average directly in data-parallel communication collective.')
     group.add_argument('--overlap-param-gather', action='store_true',
                        default=False, help='If set, overlap param all-gather in distributed optimizer.')
-    group.add_argument('--delay-param-gather', action='store_true',
-                       default=False, help='If set, delay / synchronize param all-gathers in all but first PP stage.')
+    group.add_argument('--overlap-param-gather-with-optimizer-step', action='store_true',
+                       default=False, help='If set, overlap param all-gather of first bucket with optimizer step.')
+    group.add_argument('--align-param-gather', action='store_true', default=False,
+                       help='If set, all PP stages will launch param all-gathers simultaneously. '
+                       'Otherwise, each PP stage will independently launch as needed.')
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
                        help='If not set, use scatter/gather to optimize communication of tensors in pipeline.',
                        dest='scatter_gather_tensors_in_pipeline')
@@ -1624,8 +1654,6 @@ def _add_data_args(parser):
                                 'GPTSentencePieceTokenizer',
                                 'HuggingFaceTokenizer',
                                 'Llama2Tokenizer',
-                                'Llama3Tokenizer',
-                                'MistralTokenizer',
                                 'TikTokenizer',
                                 'NullTokenizer'],
                        help='What type of tokenizer to use.')
@@ -1817,9 +1845,9 @@ def _add_moe_args(parser):
     group.add_argument('--moe-input-jitter-eps', type=float, default=None,
                        help='Add noise to the input tensor by applying jitter with a specified epsilon value.')
     group.add_argument('--moe-token-dispatcher-type', type=str,
-                       choices=['allgather', 'alltoall'],
+                       choices=['allgather', 'alltoall', 'alltoall_seq'],
                        default='allgather',
-                       help='.')
+                       help="The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather', 'alltoall' and 'alltoall_seq'. We recommend using 'alltoall' when applying expert parallelism. For more information, please refer to the documentation in core/moe/README.")
     group.add_argument('--moe-per-layer-logging', action='store_true',
                        help='Enable per-layer logging for MoE, currently supports auxiliary loss and z loss.')
     # Token dropping arguments
