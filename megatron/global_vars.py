@@ -165,15 +165,13 @@ def _set_wandb_writer(args):
     global _GLOBAL_WANDB_WRITER
     _ensure_var_is_not_initialized(_GLOBAL_WANDB_WRITER,
                                    'wandb writer')
-    getattr(args, 'wandb_project', '')
-    getattr(args, 'wandb_exp_name', '')
 
     if args.rank == (args.world_size - 1):
-        if args.wandb_project == '' or \
-            args.wandb_exp_name == '':
+        if getattr(args, 'wandb_project', '') == '' and \
+           getattr(args, 'wandb_exp_name', '') == '':
             print('WARNING: WANDB writing requested but no legit wandb '
                   'project or experiment name provided, '
-                  'therefore WANDB logs will be written '
+                  'therefore no WANDB logs will be written '
                   'according to random generated project or experiment name.', flush=True)
             return
 
