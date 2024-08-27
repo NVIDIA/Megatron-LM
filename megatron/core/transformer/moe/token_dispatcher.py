@@ -84,10 +84,13 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         # self.local_probs: probs of global token assignment to local experts.
         self.local_probs = None
 
-        # self.indices: The indices of `local_indices` (which holds the un-sorted expert indices of tokens that local expert can process) that give its sorted order along dim 0.
+        # self.indices: The indices of `local_indices` (which holds the un-sorted expert indices of
+        # tokens that local expert can process) that give its sorted order along dim 0.
         self.indices = None
 
-        # self.global_local_map: 2D tensor. A mask of mapping between global and local tokens where each element is True if it's between the local_expert_indices. Only useful when cross device token permutation is enabled and **AllGahter** is performed.
+        # self.global_local_map: 2D tensor. A mask of mapping between global and local tokens where
+        # each element is True if it's between the local_expert_indices. Only useful when cross
+        # device token permutation is enabled and **AllGahter** is performed.
         self.global_local_map = None
 
     def token_permutation(
@@ -318,13 +321,17 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tp_size = config.tensor_model_parallel_size
         self.probs = None
 
-        # [ep_size]. Represents the number of tokens sent by the current rank to other EP ranks.
+        # [ep_size]. Represents the number of tokens sent by the current rank to other
+        # EP ranks.
         self.input_splits = None
-        # [ep_size]. Represents the number of tokens received by the current rank from other EP ranks.
+        # [ep_size]. Represents the number of tokens received by the current rank from
+        # other EP ranks.
         self.output_splits = None
-        # [tp_size]. Represents the number of tokens received by the current rank from other TP ranks.
+        # [tp_size]. Represents the number of tokens received by the current rank from
+        # other TP ranks.
         self.output_splits_tp = None
-        # [tp_size * ep_size, num_local_experts]. Represents the number of tokens sent to each local expert by all ranks.
+        # [tp_size * ep_size, num_local_experts]. Represents the number of tokens sent
+        # to each local expert by all ranks.
         self.num_global_tokens_per_local_expert_cpu = None
         input_chunk_idxs = torch.arange(self.num_experts * self.tp_size)
         # [num_local_experts, tp_size * ep_size]. Sort the input chunks by local experts.
@@ -348,12 +355,14 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # A cuda stream synchronization is needed in self.token_permutation() in some cases,
         # because there are several non-blocking DtoH data transfers called in self.preprocess().
         # The synchronization happens at different points based on MoE settings as late as possible.
-        # Valid sync points are "before_permutation_1", "before_ep_alltoall", "before_finish", and "no_sync".
+        # Valid sync points are "before_permutation_1", "before_ep_alltoall", "before_finish",
+        # and "no_sync".
         self.cuda_sync_point = "no_sync"
 
     def preprocess(self, indices: torch.Tensor) -> torch.Tensor:
         """
-        Preprocess token indices for AlltoAll communication and token permutation. This method computes the number of tokens assigned to each expert based on the input indices.
+        Preprocess token indices for AlltoAll communication and token permutation. This method
+        computes the number of tokens assigned to each expert based on the input indices.
         It also initializes the necessary data structures for AlltoAll communication, such as input
         and output splits, and the mapping between global tokens and local experts.
 
@@ -407,7 +416,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 .numpy()
             )
             # Gather the global distribution of tokens across ranks.
-            # num_global_tokens_per_expert represents the number of tokens sent to each expert by all ranks.
+            # num_global_tokens_per_expert represents the number of tokens sent to each
+            # expert by all ranks.
             # [tp_size, ep_size, num_experts]
             num_global_tokens_per_expert = (
                 _gather_along_first_dim_moe(num_local_tokens_per_expert)
@@ -421,14 +431,16 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             # [tp_size, ep_size, num_local_experts] -> [tp_size, ep_size]
             num_global_tokens_per_rank = num_global_tokens_per_local_expert.sum(axis=2)
             # [tp_size, ep_size] -> [ep_size]
-            # self.output_splits represents the number of tokens received by the current rank from other EP rank.
+            # self.output_splits represents the number of tokens received by the current rank
+            # from other EP rank.
             self.output_splits = (
                 num_global_tokens_per_rank[tp_rank]
                 .to(torch.device("cpu"), non_blocking=True)
                 .numpy()
             )
             # [tp_size, ep_size] -> [tp_size]
-            # self.output_splits_tp represents the number of tokens received by the current rank from other TP rank.
+            # self.output_splits_tp represents the number of tokens received by the current
+            # rank from other TP rank.
             self.output_splits_tp = (
                 num_global_tokens_per_rank.sum(axis=1)
                 .to(torch.device("cpu"), non_blocking=True)

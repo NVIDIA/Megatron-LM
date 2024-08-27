@@ -1,10 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-import types
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
-import torch
 import torch.nn.functional as F
 
 from ..model_parallel_config import ModelParallelConfig
@@ -15,7 +13,8 @@ from ..utils import init_method_normal, scaled_init_method_normal
 class TransformerConfig(ModelParallelConfig):
     """Configuration object for megatron-core transformers.
 
-    The initialization function has an argument for each parameter, including those in ModelParallelConfig.
+    The initialization function has an argument for each parameter,
+    including those in ModelParallelConfig.
     """
 
     ####################
@@ -34,7 +33,8 @@ class TransformerConfig(ModelParallelConfig):
     """Number of query groups for group query attention. If None, normal attention is used."""
 
     ffn_hidden_size: int = None
-    """Transformer Feed-Forward Network hidden size. This is set to 4*hidden_size if not provided."""
+    """Transformer Feed-Forward Network hidden size. This is set to 4*hidden_size
+    if not provided."""
 
     kv_channels: int = None
     """Projection weights dimension in multi-head attention. This is set to hidden_size //
@@ -210,7 +210,8 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     fp8_wgrad: bool = True
-    """When set to False, override FP8 config options and do the wgrad computation in higher precision."""
+    """When set to False, override FP8 config options and do the wgrad computation
+    in higher precision."""
 
     fp8_dot_product_attention: bool = False
     """When set to True, use the FP8 implementation of Dot Product Attention."""
@@ -230,7 +231,8 @@ class TransformerConfig(ModelParallelConfig):
     """Number of experts to route to for each token."""
 
     moe_router_pre_softmax: bool = False
-    """Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. By default, softmax is done after top-k."""
+    """Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. 
+    By default, softmax is done after top-k."""
 
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
@@ -254,18 +256,24 @@ class TransformerConfig(ModelParallelConfig):
     currently unsupported so should remain False."""
 
     moe_token_dispatcher_type: str = "allgather"
-    """The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather', 'alltoall' and 'alltoall_seq'."""
+    """The type of token dispatcher to use. The default is 'allgather'.
+    Options are 'allgather' and 'alltoall'."""
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
     moe_expert_capacity_factor: float = None
-    """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token will be dropped. The default is None."""
+    """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token
+    will be dropped. The default is None."""
 
     moe_pad_expert_input_to_capacity: bool = False
-    """moe_pad_expert_input_to_capacity (bool): If True, pads the input for each expert to match the expert capacity length, effective only after the moe_expert_capacity_factor is set. The default setting is False."""
+    """moe_pad_expert_input_to_capacity (bool): If True, pads the input for each expert to match
+    the expert capacity length, effective only after the moe_expert_capacity_factor is set. The
+    default setting is False."""
 
     moe_token_drop_policy: str = 'probs'
-    """The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.
+    """The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with
+    the lowest probabilities will be dropped. If "position", tokens at the end of each batch will
+    be dropped.
     """
 
     moe_layer_recompute: bool = False
@@ -289,7 +297,8 @@ class TransformerConfig(ModelParallelConfig):
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
-        See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more details.
+        See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
+        details.
         """
         super().__post_init__()
         if self.fp16 and self.bf16:
@@ -322,27 +331,27 @@ class TransformerConfig(ModelParallelConfig):
             self.attention_softmax_in_fp32 = True
 
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
-            raise ValueError(f'num_moe_experts must be non None to use expert-parallel.')
+            raise ValueError('num_moe_experts must be non None to use expert-parallel.')
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
-            raise ValueError(f'num_moe_experts must be non-negative.')
+            raise ValueError('num_moe_experts must be non-negative.')
 
         if self.moe_expert_capacity_factor is not None:
             if self.moe_token_dispatcher_type not in ["alltoall", "alltoall_seq"]:
                 raise ValueError(
-                    f'moe_expert_capacity_factor only works with alltoall token dispatcher'
+                    'moe_expert_capacity_factor only works with alltoall token dispatcher'
                 )
             if self.moe_expert_capacity_factor < 0:
                 self.moe_expert_capacity_factor = None
             if self.moe_router_load_balancing_type not in ["aux_loss", "none"]:
                 raise ValueError(
-                    f'moe_expert_capacity_factor only works with aux_loss or none load balancing'
+                    'moe_expert_capacity_factor only works with aux_loss or none load balancing'
                 )
 
         if self.moe_pad_expert_input_to_capacity:
             if self.moe_expert_capacity_factor is None:
                 raise ValueError(
-                    f'moe_expert_capacity_factor must be set to use moe_pad_expert_input_to_capacity'
+                    'moe_expert_capacity_factor must be set to use moe_pad_expert_input_to_capacity'
                 )
 
         if self.cpu_offloading and (
@@ -354,51 +363,58 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.cpu_offloading and self.pipeline_model_parallel_size > 1:
             raise ValueError(
-                f'Currently there is no support for Pipeline parallelism with CPU offloading'
+                'Currently there is no support for Pipeline parallelism with CPU offloading'
             )
 
         if self.cpu_offloading and self.recompute_granularity is not None:
             raise ValueError(
-                f'CPU offloading does not work when activation recomputation is enabled'
+                'CPU offloading does not work when activation recomputation is enabled'
             )
 
         if self.recompute_granularity is not None:
-            if not self.recompute_granularity in ['full', 'selective']:
+            if self.recompute_granularity not in ['full', 'selective']:
                 raise ValueError(
-                    f'When using recompute_granuarlity: {self.recompute_granularity} must be "full" or "selective".'
+                    f'When using recompute_granuarlity: {self.recompute_granularity} must be "full"'
+                    'or "selective".'
                 )
 
             if self.recompute_method is not None:
-                if not self.recompute_method in ['block', 'uniform']:
+                if self.recompute_method not in ['block', 'uniform']:
                     raise ValueError(
                         f'recompute_method: {self.recompute_method} must be "block" or "uniform".'
                     )
             elif self.recompute_granularity != 'selective':
                 raise ValueError(
-                    f'Using recompute_granularity: {self.recompute_granularity} so recompute_method must be "block" or "uniform"'
+                    f'Using recompute_granularity: {self.recompute_granularity} so '
+                    'recompute_method must be "block" or "uniform"'
                 )
 
             if self.recompute_granularity != 'selective' and self.recompute_num_layers is None:
                 raise ValueError(
-                    f'When using recompute_granularity: {self.recompute_granularity} recompute_num_layers must be between '
-                    f'1 and num_layers_per_pipeline_rank: {self.num_layers // self.pipeline_model_parallel_size}'
+                    f'When using recompute_granularity: {self.recompute_granularity} '
+                    'recompute_num_layers must be between '
+                    '1 and num_layers_per_pipeline_rank: '
+                    f'{self.num_layers // self.pipeline_model_parallel_size}'
                 )
             elif (
                 self.recompute_granularity == 'selective' and self.recompute_num_layers is not None
             ):
                 raise ValueError(
-                    f'When using recompute_granularity: {self.recompute_granularity} recompute_num_layers must be None.'
+                    f'When using recompute_granularity: {self.recompute_granularity} '
+                    'recompute_num_layers must be None.'
                 )
 
             if self.distribute_saved_activations and self.sequence_parallel:
                 raise ValueError(
-                    f'distribute_saved_activations: {self.distribute_saved_activations} must be false when sequence parallel is enabled: {self.sequence_parallel}'
+                    f'distribute_saved_activations: {self.distribute_saved_activations} must be '
+                    f'false when sequence parallel is enabled: {self.sequence_parallel}'
                 )
 
             if self.virtual_pipeline_model_parallel_size is not None:
                 if not self.num_layers % self.virtual_pipeline_model_parallel_size == 0:
                     raise ValueError(
-                        f'num_layers: {self.num_layers} must be divisible by virtual_model_parallel_size {self.virtual_pipeline_model_parallel_size}'
+                        f'num_layers: {self.num_layers} must be divisible by '
+                        f'virtual_model_parallel_size {self.virtual_pipeline_model_parallel_size}'
                     )
 
         if self.apply_query_key_layer_scaling:
@@ -407,7 +423,8 @@ class TransformerConfig(ModelParallelConfig):
         if self.bias_activation_fusion:
             if self.activation_func not in [F.gelu, F.silu]:
                 raise ValueError(
-                    "When bias_activation_fusion is True, activation function should be either gelu or swiglu"
+                    "When bias_activation_fusion is True, activation function should be either "
+                    "gelu or swiglu"
                 )
             if (
                 self.activation_func == F.gelu
@@ -422,7 +439,7 @@ class TransformerConfig(ModelParallelConfig):
             if self.activation_func != F.silu or not self.gated_linear_unit:
                 raise ValueError("Storing activation input in FP8 is supported only for SwiGLU.")
         if self.apply_rope_fusion and self.rotary_interleaved:
-            raise ValueError(f'rotary_interleaved does not work with apply_rope_fusion.')
+            raise ValueError('rotary_interleaved does not work with apply_rope_fusion.')
 
         if self.init_method is None:
             self.init_method = init_method_normal(self.init_method_std)
@@ -440,5 +457,6 @@ class TransformerConfig(ModelParallelConfig):
             extended_tp_size = self.tensor_model_parallel_size * self.expert_model_parallel_size
             if self.ffn_hidden_size % extended_tp_size != 0:
                 raise ValueError(
-                    f'ffn_hidden_size: {self.ffn_hidden_size} must be divisible by extended_tp_size {extended_tp_size}'
+                    f'ffn_hidden_size: {self.ffn_hidden_size} must be divisible by '
+                    f'extended_tp_size {extended_tp_size}'
                 )
