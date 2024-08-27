@@ -49,12 +49,14 @@ do
     rm -rf $CHECKPOINT_PATH/*
 
     # Training
+    export RUN_NUMBER=1
     bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
 
     # Maybe checkpoint resume training
     if [[ "$TEST_TYPE" == "ckpt-resume" ]]; then 
         rm -rf $CHECKPOINT_PATH/iter_0000100; 
         echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt;
+        export RUN_NUMBER=2
         bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
     fi
 
