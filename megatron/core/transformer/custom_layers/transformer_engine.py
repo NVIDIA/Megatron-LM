@@ -389,7 +389,7 @@ class TERowParallelLinear(TELinear):
             init_method=condition_init_method(config, init_method),
             bias=bias,
             skip_bias_add=skip_bias_add,
-            skip_weight_param_allocation=False,  # We don't currently use this for row parallel layers
+            skip_weight_param_allocation=False,  # We don't currently use this for row parallel layers # pylint: disable=line-too-long
             tp_comm_buffer_name=tp_comm_buffer_name,
         )
 
@@ -477,9 +477,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
         if config.window_size is not None:
             # Check version
-            assert _te_version >= packaging.version.Version(
-                "1.2.0"
-            ), f"Transformer-Engine version ({str(_te_version)}) must be >= 1.2.0 to support sliding window attention."
+            assert _te_version >= packaging.version.Version("1.2.0"), (
+                f"Transformer-Engine version ({str(_te_version)}) must be >= 1.2.0 to support"
+                "sliding window attention."
+            )
             extra_kwargs['window_size'] = config.window_size
 
         super().__init__(
@@ -511,14 +512,16 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         packed_seq_kwargs = (
             dataclasses.asdict(packed_seq_params) if packed_seq_params is not None else {}
         )
-        # overwrite self.qkv_format depending on self.config.apply_rope_fusion, which can be set after init
+        # overwrite self.qkv_format depending on self.config.apply_rope_fusion, which can be set
+        # after init
         if self.config.apply_rope_fusion and _te_version > packaging.version.Version("0.13.0"):
             self.qkv_format = 'bshd'
 
         qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
 
         if _te_version < packaging.version.Version("1.3.0"):
-            # TE 1.3.0 introduces precomputing max_seqlen to remove unnecessary kernels and D2H copies (#555)
+            # TE 1.3.0 introduces precomputing max_seqlen to remove unnecessary kernels and D2H
+            # copies (#555)
             # These two arguments did not exist prior to 1.3.0
             packed_seq_kwargs.pop("max_seqlen_q", None)
             packed_seq_kwargs.pop("max_seqlen_kv", None)
@@ -536,9 +539,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
         if self.te_forward_mask_type:
             if qkv_format == 'thd' and _te_version >= packaging.version.Version("1.7.0"):
-                # thd format uses flash attention with cuDNN kernel which requires is_padding=True, so the only
-                # acceptable mask types are `padding_causal` and `padding`. These do not necessarily indicate
-                # there are padded tokens in the sequence.
+                # thd format uses flash attention with cuDNN kernel which requires is_padding=True,
+                # so the only acceptable mask types are `padding_causal` and `padding`. These do not
+                # necessarily indicate there are padded tokens in the sequence.
                 if attn_mask_type == AttnMaskType.causal:
                     attn_mask_type = AttnMaskType.padding_causal
                 elif attn_mask_type == AttnMaskType.no_mask:
@@ -603,8 +606,8 @@ if _te_version >= packaging.version.Version("1.9.0.dev0"):
             if self.expert_parallel:
                 extra_kwargs["rng_tracker_name"] = get_expert_parallel_rng_tracker_name()
 
-            # For MoE models, the comms between TP and EP group is explicitly handled by MoE token dispatcher.
-            # So we disable comms by making TE agnostic of model parallel.
+            # For MoE models, the comms between TP and EP group is explicitly handled by
+            # MoE token dispatcher. So we disable comms by making TE agnostic of model parallel.
             self.explicit_expert_comm = is_expert and (
                 config.tensor_model_parallel_size > 1 or self.expert_parallel
             )

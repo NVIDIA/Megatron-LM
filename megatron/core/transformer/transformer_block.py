@@ -1,10 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-import re
-import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Union
 
 import torch
 from torch import Tensor
@@ -14,17 +12,12 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
+from megatron.core.transformer.transformer_layer import BaseTransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import (
-    assert_viewless_tensor,
-    make_sharded_tensor_for_checkpoint,
-    make_viewless_tensor,
-)
+from megatron.core.utils import make_viewless_tensor
 
 try:
     from megatron.core.transformer.custom_layers.transformer_engine import (
@@ -39,11 +32,13 @@ try:
 except ImportError:
     HAVE_TE = False
     get_cpu_offload_context = None
+
     try:
-        import apex
+        import apex  # pylint: disable=unused-import
 
         LayerNormImpl = FusedLayerNorm
-    except ModuleNotFoundError:
+
+    except ImportError:
         from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
 
         LayerNormImpl = WrappedTorchLayerNorm
@@ -158,7 +153,7 @@ class TransformerBlock(MegatronModule):
             )
         else:
             assert (
-                self.config.cpu_offloading == False
+                self.config.cpu_offloading is False
             ), "CPU Offloading is enabled when TE is not present"
 
             self.offload_context, self.group_prefetch_offload_commit_async = nullcontext(), None
@@ -185,21 +180,7 @@ class TransformerBlock(MegatronModule):
             ]
         )
 
-        # # TODO: add back standalone_embedding_stage
-        # if self.num_layers == 0:
-        #     # When a standalone embedding stage is used (e.g.,
-        #     # args.standalone_embedding_stage == True), virtual pipeline ranks
-        #     # on pipeline rank 0 will have zero transformer layers assigned to
-        #     # them. This results in the model's input and output tensors to be
-        #     # the same, which will cause failure for certain output tensor
-        #     # optimizations (e.g., pipeline output deallocation). To remedy
-        #     # this, we assign a 'no-op' layer on these ranks, which will
-        #     # disconnect the input tensor from the output tensor.
-        #     self.num_layers = 1
-        #     self.layers = torch.nn.ModuleList([NoopTransformerLayer(1)])
-        # else:
-        #     self.layers = torch.nn.ModuleList([build_layer(i + 1 + offset) for i in range(self.num_layers)])
-
+        # @TODO: add back standalone_embedding_stage (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
         # self.post_process and self.post_layer_norm guide this behavior
         if self.submodules.layer_norm and self.post_process and self.post_layer_norm:
@@ -273,32 +254,32 @@ class TransformerBlock(MegatronModule):
             # Uniformly divide the total number of Transformer layers and checkpoint
             # the input activation of each divided chunk.
             # A method to further reduce memory usage reducing checkpoints.
-            l = 0
-            while l < self.num_layers_per_pipeline_rank:
+            layer_idx = 0
+            while layer_idx < self.num_layers_per_pipeline_rank:
                 hidden_states, context = checkpoint_handler(
-                    custom(l, l + self.config.recompute_num_layers)
+                    custom(layer_idx, layer_idx + self.config.recompute_num_layers)
                 )
 
-                l += self.config.recompute_num_layers
+                layer_idx += self.config.recompute_num_layers
 
         elif self.config.recompute_method == 'block':
             # Checkpoint the input activation of only a set number of individual
             # Transformer layers and skip the rest.
             # A method fully use the device memory removing redundant re-computation.
             recompute_skip_num_layers = 0
-            for l in range(self.num_layers_per_pipeline_rank):
+            for layer_idx in range(self.num_layers_per_pipeline_rank):
                 # Skip recomputation when input grad computation is not needed.
                 # Need to have at least one input tensor with gradient computation
                 # for re-enterant autograd engine.
                 if self.config.fp8 and not hidden_states.requires_grad:
                     recompute_skip_num_layers += 1
                 if (
-                    l >= recompute_skip_num_layers
-                    and l < self.config.recompute_num_layers + recompute_skip_num_layers
+                    layer_idx >= recompute_skip_num_layers
+                    and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
                 ):
-                    hidden_states, context = checkpoint_handler(custom(l, l + 1))
+                    hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
                 else:
-                    hidden_states, context = custom(l, l + 1)(
+                    hidden_states, context = custom(layer_idx, layer_idx + 1)(
                         hidden_states, attention_mask, context, context_mask, rotary_pos_emb
                     )
         else:
@@ -410,10 +391,12 @@ class TransformerBlock(MegatronModule):
                                 or (not self.training)
                             )
                         else:
-                            # CUDA graph replay for layer `l_no` and microbatch `self.current_microbatch`
-                            # CUDA graph requires positional arguments with the exception of is_first_microbatch.
-                            # Also CUDA graph accepts only Tensor inputs and outputs. Hence, the arg list and
-                            # returned list is limited to `hidden_states`.
+                            # CUDA graph replay for layer `l_no` and microbatch
+                            # `self.current_microbatch`
+                            # CUDA graph requires positional arguments with the exception
+                            # of is_first_microbatch.
+                            # Also CUDA graph accepts only Tensor inputs and outputs.
+                            # Hence, the arg list and returned list is limited to `hidden_states`.
                             assert (len(self.cuda_graphs) > l_no) and (
                                 self.current_microbatch < len(self.cuda_graphs[l_no])
                             )
@@ -455,7 +438,7 @@ class TransformerBlock(MegatronModule):
             offset = layer._get_layer_offset()
 
             global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
-            state_dict_prefix = f'{layer_prefix}{global_layer_offset - offset}.'  # module list index in TransformerBlock
+            state_dict_prefix = f'{layer_prefix}{global_layer_offset - offset}.'  # module list index in TransformerBlock # pylint: disable=line-too-long
             if non_homogeneous_layers:
                 sharded_prefix = f'{layer_prefix}{global_layer_offset}.'
                 sharded_pp_offset = []

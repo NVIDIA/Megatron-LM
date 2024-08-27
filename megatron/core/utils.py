@@ -292,7 +292,8 @@ def check_param_hashes_across_dp_replicas(model: List[torch.nn.Module]) -> bool:
             if not torch.equal(local_param_hashes[i], all_param_hashes[0][i]):
                 rank = torch.distributed.get_rank()
                 logger.info(
-                    f"[Rank {rank}] Hash not matching for {param_name} in model chunk {model_chunk_id}"
+                    f"[Rank {rank}] Hash not matching for {param_name} in model chunk"
+                    f"{model_chunk_id}"
                 )
     return param_hashes_match
 
@@ -300,7 +301,8 @@ def check_param_hashes_across_dp_replicas(model: List[torch.nn.Module]) -> bool:
 def make_tp_sharded_tensor_for_checkpoint(
     tensor, key, tp_axis=0, replica_id=None, prepend_offsets=(), **kwargs
 ):
-    """Helper for instantiating a ShardedTensor where the `tp_axis` dimension is sharded across TP group.
+    """Helper for instantiating a ShardedTensor where the `tp_axis` dimension
+    is sharded across TP group.
 
     Optionally, can provide offsets which prepend new dimensions to the tensor.
     """
@@ -370,9 +372,11 @@ def prepare_input_tensors_for_wgrad_compute(grad_output, all_gathered_input):
 
 
 def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_output_buffer, weight):
-    """Helper for performing embedding wgrad GEMM's during the pipeline drain phase, pipelines the AllGather and GEMM's.
+    """Helper for performing embedding wgrad GEMM's during the pipeline drain phase, pipelines the
+    AllGather and GEMM's.
 
-    Should only be used when pipeline model parallelism and gradient accumulation fusion are enabled.
+    Should only be used when pipeline model parallelism and gradient accumulation
+    fusion are enabled.
     """
 
     assert len(embedding_activation_buffer) == len(
@@ -459,8 +463,8 @@ def local_multi_tensor_applier(op, noop_flag_buffer, tensor_lists, *args):
     return op(2048 * 32, noop_flag_buffer, tensor_lists, *args)
 
 
-## computes l2 norm for a list of contiguous tensors
-## works as a drop-in replacement for amp_C.multi_tensor_l2norm
+# computes l2 norm for a list of contiguous tensors
+# works as a drop-in replacement for amp_C.multi_tensor_l2norm
 def local_multi_tensor_l2_norm(chunk_size, noop_flag, tensor_lists, per_tensor, *args):
     l2 = [[(torch.norm(tensor)) for tensor in tensor_list] for tensor_list in tensor_lists]
     l2_reduced = torch.norm(torch.tensor(l2))
@@ -468,12 +472,12 @@ def local_multi_tensor_l2_norm(chunk_size, noop_flag, tensor_lists, per_tensor, 
     return l2_cuda, None
 
 
-## works as a drop-in replacement for amp_C.multi_tensor_scale
+# works as a drop-in replacement for amp_C.multi_tensor_scale
 def local_multi_tensor_scale(chunk_size, noop_flag, tensor_lists, scale):
     inputs, targets = tensor_lists[0], tensor_lists[1]
     if inputs == targets:
         for i in range(len(targets)):
-            ## for parity with apex implementation
+            # for parity with apex implementation
             targets[i] *= scale
     else:
         for i in range(len(targets)):
@@ -980,7 +984,7 @@ class StragglerDetector:
         collection state. The actual toggling happens at the end of
         calling report() when _check_toggle() is called.
         """
-        resp = f"HTTP/1.0 200 OK\r\nConnection: Close\r\nContent-length: "
+        resp = r"HTTP/1.0 200 OK\r\nConnection: Close\r\nContent-length: "
 
         if self.rank == 0:
             state = "OFF" if self._off else "ON"

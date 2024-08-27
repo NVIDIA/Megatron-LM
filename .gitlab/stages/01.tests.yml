@@ -123,8 +123,9 @@ formatting:
   stage: test
   needs: [build_image]
   script:
+    - env
     - git fetch origin main
-    - CHECK_ONLY=true bash tools/autoformat.sh
+    - CHECK_ONLY=true SKIP_DOCS=$([[ "$CI_MERGE_REQUEST_LABELS" == *"Skip docs"* ]] && echo "true" || echo "false") bash tools/autoformat.sh
 
 copyright:
   extends: [.tests_common]

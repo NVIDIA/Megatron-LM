@@ -9,7 +9,6 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
-from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -71,7 +70,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self.layer_number = layer_number + self._get_layer_offset()
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
 
-        ## [Module 1: Input Layernorm] Optional Layernorm on the input data
+        # [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
         self.input_layernorm = build_module(
             submodules.input_layernorm,
@@ -80,15 +79,15 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             eps=self.config.layernorm_epsilon,
         )
 
-        ## [Module 2: SelfAttention]
+        # [Module 2: SelfAttention]
         self.self_attention = build_module(
             submodules.self_attention, config=self.config, layer_number=layer_number
         )
 
-        ## [Module 3: BiasDropoutFusion]
+        # [Module 3: BiasDropoutFusion]
         self.self_attn_bda = build_module(submodules.self_attn_bda)
 
-        ## [Module 4: Post SelfAttention] Optional Layernorm after self-attn
+        # [Module 4: Post SelfAttention] Optional Layernorm after self-attn
         self.pre_cross_attn_layernorm = build_module(
             submodules.pre_cross_attn_layernorm,
             config=self.config,
@@ -96,15 +95,15 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             eps=self.config.layernorm_epsilon,
         )
 
-        ## [Module 5: CrossAttention]
+        # [Module 5: CrossAttention]
         self.cross_attention = build_module(
             submodules.cross_attention, config=self.config, layer_number=layer_number
         )
 
-        ## [Module 6: BiasDropoutFusion]
+        # [Module 6: BiasDropoutFusion]
         self.cross_attn_bda = build_module(submodules.cross_attn_bda, config=self.config)
 
-        ## [Module 7: Pre MLP] Optional Layernorm before MLP
+        # [Module 7: Pre MLP] Optional Layernorm before MLP
         self.pre_mlp_layernorm = build_module(
             submodules.pre_mlp_layernorm,
             config=self.config,
@@ -112,14 +111,14 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             eps=self.config.layernorm_epsilon,
         )
 
-        ## [Module 8: MLP block]
+        # [Module 8: MLP block]
         # TODO how to set the gpt_layer_spec.py when we have moe_frequency > 1,
         #      where MLP and MoE layer both appear alternately?
         self.mlp = build_module(submodules.mlp, config=self.config)
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)
 
-        ## [Module 9: BiasDropoutFusion]
+        # [Module 9: BiasDropoutFusion]
         self.mlp_bda = build_module(submodules.mlp_bda)
 
         # @jcasper how should we handle nvfuser?

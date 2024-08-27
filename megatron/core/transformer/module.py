@@ -88,7 +88,8 @@ class MegatronModule(torch.nn.Module):
         return sharded_state_dict
 
     def set_is_first_microbatch(self):
-        """Sets the is_first_microbatch flag if it exists. When this flag is set, TE modules will update their fp8 parameter cache."""
+        """Sets the is_first_microbatch flag if it exists. When this flag is set, TE modules will
+        update their fp8 parameter cache."""
         for m in self.modules():
             if hasattr(m, "is_first_microbatch"):
                 m.is_first_microbatch = True
