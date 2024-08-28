@@ -12,46 +12,51 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-from megatron.core.datasets.utils import compile_helpers 
+from megatron.core.datasets.utils import compile_helpers
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
 from megatron.training.tokenizer.tokenizer import _NullTokenizer
 
+from torch.profiler import profile, ExecutionTraceObserver
 
 _SEQUENCE_LENGTH = 64
+rank = int(os.environ['LOCAL_RANK'])
 
 
-def initialize_distributed(tensor_model_parallel_size=1, pipeline_model_parallel_size=1):
+def initialize_distributed(tensor_model_parallel_size=1,
+                           pipeline_model_parallel_size=1):
     parallel_state.destroy_model_parallel()
 
     # Torch setup for distributed training
-    rank = int(os.environ['LOCAL_RANK'])
     world_size = torch.cuda.device_count()
     torch.cuda.set_device(rank)
     torch.distributed.init_process_group(world_size=world_size, rank=rank)
 
     # Megatron core distributed training initialization
-    parallel_state.initialize_model_parallel(tensor_model_parallel_size, pipeline_model_parallel_size)
+    parallel_state.initialize_model_parallel(tensor_model_parallel_size,
+                                             pipeline_model_parallel_size)
+
 
 def model_provider():
     """Build the model."""
 
     transformer_config = TransformerConfig(
-        num_layers=2, 
-        hidden_size=12, 
-        num_attention_heads=4, 
-        use_cpu_initialization=True, 
+        num_layers=2,
+        hidden_size=12,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
         pipeline_dtype=torch.float32,
     )
 
     gpt_model = GPTModel(
-        config=transformer_config, 
-        transformer_layer_spec=get_gpt_layer_local_spec(), 
-        vocab_size=100, 
+        config=transformer_config,
+        transformer_layer_spec=get_gpt_layer_local_spec(),
+        vocab_size=100,
         max_sequence_length=_SEQUENCE_LENGTH,
     )
-
+    print(gpt_model)
     return gpt_model
+
 
 def get_train_data_iterator():
     if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -70,9 +75,9 @@ def get_train_data_iterator():
         tokenizer=_NullTokenizer(vocab_size=_SEQUENCE_LENGTH),
     )
 
-    datasets = BlendedMegatronDatasetBuilder(
-        MockGPTDataset, [1000, None, None], lambda: True, config
-    ).build()
+    datasets = BlendedMegatronDatasetBuilder(MockGPTDataset,
+                                             [1000, None, None], lambda: True,
+                                             config).build()
 
     train_dataloader = DataLoader(datasets[0], batch_size=8, shuffle=True)
 
@@ -80,8 +85,8 @@ def get_train_data_iterator():
 
     return train_iterator
 
-def forward_step_func(data_iterator, model):
 
+def forward_step_func(data_iterator, model):
     def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
 
         losses = output_tensor.float()
@@ -99,23 +104,28 @@ def forward_step_func(data_iterator, model):
     labels = data['labels'].to(device)
     loss_mask = data['loss_mask'].to(device)
 
-    output_tensor = model(tokens, position_ids, attention_mask,
-                          labels=labels)
+    output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
 
     return output_tensor, partial(loss_func, loss_mask)
 
+
 def save_distributed_checkpoint(checkpoint_path, gpt_model):
     sharded_state_dict = gpt_model.sharded_state_dict(prefix='')
-    dist_checkpointing.save(sharded_state_dict=sharded_state_dict, checkpoint_dir=checkpoint_path)
+    dist_checkpointing.save(sharded_state_dict=sharded_state_dict,
+                            checkpoint_dir=checkpoint_path)
+
 
 def load_distributed_checkpoint(checkpoint_path, gpt_model):
-    sharded_state_dict=gpt_model.sharded_state_dict(prefix='')
-    checkpoint = dist_checkpointing.load(sharded_state_dict=sharded_state_dict, checkpoint_dir=checkpoint_path)
+    sharded_state_dict = gpt_model.sharded_state_dict(prefix='')
+    checkpoint = dist_checkpointing.load(sharded_state_dict=sharded_state_dict,
+                                         checkpoint_dir=checkpoint_path)
     gpt_model.load_state_dict(checkpoint)
     return gpt_model
 
+
 if __name__ == "__main__":
-    initialize_distributed(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
+    initialize_distributed(tensor_model_parallel_size=2,
+                           pipeline_model_parallel_size=1)
     model_parallel_cuda_manual_seed(123)
 
     gpt_model = model_provider()
@@ -128,23 +138,34 @@ if __name__ == "__main__":
 
     forward_backward_func = get_forward_backward_func()
 
-    # Running the model for 5 iterations
-    for _ in range(5):
-        optim.zero_grad()
+    # Running the model for 7 iterations
+    with profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        schedule=torch.profiler.schedule(wait=1, warmup=5, active=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(f'./result/{rank}'),
+        execution_trace_observer=ExecutionTraceObserver().register_callback(f'pytorch_et_{rank}.json')
+    ) as prof:
+        for _ in range(7):
+            optim.zero_grad()
 
-        losses_reduced = forward_backward_func(
-            forward_step_func=forward_step_func,
-            data_iterator=train_iterator,
-            model=gpt_model,
-            num_microbatches=1,
-            seq_length=_SEQUENCE_LENGTH,
-            micro_batch_size=8,
-            decoder_seq_length=_SEQUENCE_LENGTH,
-            forward_only=False)
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step_func,
+                data_iterator=train_iterator,
+                model=gpt_model,
+                num_microbatches=1,
+                seq_length=_SEQUENCE_LENGTH,
+                micro_batch_size=8,
+                decoder_seq_length=_SEQUENCE_LENGTH,
+                forward_only=False)
 
-        optim.step()
+            optim.step()
 
-        print(f'Losses reduced :  {losses_reduced}')
+            print(f'Losses reduced :  {losses_reduced}')
+
+            prof.step()
 
     # Saving the model
     ckpt_path = os.getcwd() + '/ckpt'
@@ -152,7 +173,8 @@ if __name__ == "__main__":
     save_distributed_checkpoint(gpt_model=gpt_model, checkpoint_path=ckpt_path)
 
     # Loading the model
-    gpt_model = load_distributed_checkpoint(gpt_model=gpt_model, checkpoint_path=ckpt_path)
+    gpt_model = load_distributed_checkpoint(gpt_model=gpt_model,
+                                            checkpoint_path=ckpt_path)
     gpt_model.to(device)
     print('Successfully loaded the model')
 
