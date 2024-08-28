@@ -104,17 +104,15 @@ unit_tests:
       - coverage
 
 docs_build_test:
-  image: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/python-format:0.0.1
+  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
   tags: [mcore-docker-node-small]
+  needs: [build_image]
   script:
     - cd ..
     - rm -rf documentation && git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/nemo-megatron-core-tme/documentation.git
     - mv megatron-lm/ documentation/
     - cd documentation/
     - ./repo docs
-  allow_failure: true
-  except:
-    - main
 
 formatting:
   extends: [.tests_common]
