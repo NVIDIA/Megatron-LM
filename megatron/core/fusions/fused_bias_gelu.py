@@ -4,7 +4,7 @@ import torch
 
 from megatron.core.jit import jit_fuser
 
-###### BIAS GELU FUSION/ NO AUTOGRAD ################
+# BIAS GELU FUSION/ NO AUTOGRAD ################
 # 1/sqrt(2*pi)-> 0.3989423
 # 1/sqrt(2)   -> 0.70710678
 # sqrt(2/pi)  -> 0.79788456
@@ -45,6 +45,11 @@ class GeLUFunction(torch.autograd.Function):
         input, bias = ctx.saved_tensors
         tmp = bias_gelu_back(grad_output, bias, input)
         return tmp, tmp
+
+    # This is required to make Sphinx happy :-(
+    @classmethod
+    def apply(cls, *args, **kwargs):
+        super().apply(*args, **kwargs)
 
 
 bias_gelu_impl = GeLUFunction.apply
