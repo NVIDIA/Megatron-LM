@@ -50,7 +50,8 @@ RUN cd /tmp && \
 ##### For Mamba end #####
 
 ##### For JET-API start #####
-RUN apt-get install -y python3-venv && \
+RUN apt-get update && \ 
+    apt-get install -y python3-venv && \
     apt-get clean -y && \
     python -m venv /opt/jet
 ##### For JET-API end #####

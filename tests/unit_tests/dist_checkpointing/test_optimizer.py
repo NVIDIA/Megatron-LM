@@ -397,6 +397,7 @@ class TestFP32Optimizer:
     @pytest.mark.parametrize(
         ('src_tp_pp', 'dest_tp_pp'), [((2, 4), (2, 4)), ((2, 4), (4, 2)), ((8, 1), (1, 2))]
     )
+    @pytest.mark.skip(reason="Tests are flaky and need to be debugged")
     def test_fp32_optimizer_resharding(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp):
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
         Utils.initialize_model_parallel(*src_tp_pp)

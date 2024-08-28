@@ -1,11 +1,11 @@
 import os
 
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
-import json  # noqa: E402
+import json
 
-import click  # noqa: E402
+import click
 
-from tests.functional_tests.python_test_utils import common  # noqa: E402
+from tests.functional_tests.python_test_utils import common
 
 
 @click.command()

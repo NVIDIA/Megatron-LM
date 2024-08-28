@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from typing import Optional
+
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
@@ -9,7 +11,6 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
 try:
@@ -27,7 +28,7 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    import apex
+    import apex  # pylint: disable=unused-import
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 
@@ -38,14 +39,26 @@ except ImportError:
 
     from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
 
-    warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
+    warnings.warn('Apex is not installed. Falling back to Torch LayerNorm')
     LNImpl = WrappedTorchLayerNorm
 
 
-# Use this spec to use lower level Transformer Engine modules (required for fp8 training)
 def get_gpt_layer_with_transformer_engine_spec(
-    num_experts: int = None, moe_grouped_gemm: bool = False, qk_layernorm: bool = False
+    num_experts: Optional[int] = None,
+    moe_grouped_gemm: Optional[bool] = False,
+    qk_layernorm: Optional[bool] = False,
 ) -> ModuleSpec:
+    """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
+
+
+    Args:
+        num_experts (int, optional): Number of experts. Defaults to None.
+        moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
+        qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
+
+    Returns:
+        ModuleSpec: Module specification with TE modules
+    """
     mlp = _get_mlp_module_spec(
         use_te=True, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
     )
@@ -73,10 +86,22 @@ def get_gpt_layer_with_transformer_engine_spec(
     )
 
 
-# Use this spec for an implementation using only modules in megatron core
 def get_gpt_layer_local_spec(
-    num_experts: int = None, moe_grouped_gemm: bool = False, qk_layernorm: bool = False
+    num_experts: Optional[int] = None,
+    moe_grouped_gemm: Optional[bool] = False,
+    qk_layernorm: Optional[bool] = False,
 ) -> ModuleSpec:
+    """Use this spec for an implementation using only modules in Megatron-Core.
+
+
+    Args:
+        num_experts (int, optional): Number of experts. Defaults to None.
+        moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
+        qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
+
+    Returns:
+        ModuleSpec: Module specification with Megatron-Core modules
+    """
     mlp = _get_mlp_module_spec(
         use_te=False, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
     )
@@ -107,10 +132,12 @@ def get_gpt_layer_local_spec(
     )
 
 
-# Helper function to get module spec for MLP/MoE
 def _get_mlp_module_spec(
-    use_te: bool = True, num_experts: int = None, moe_grouped_gemm: bool = False
+    use_te: Optional[bool] = True,
+    num_experts: Optional[int] = None,
+    moe_grouped_gemm: Optional[bool] = False,
 ) -> ModuleSpec:
+    """Helper function to get module spec for MLP/MoE"""
     if num_experts is None:
         # Dense MLP w/ or w/o TE modules.
         return ModuleSpec(

@@ -394,7 +394,7 @@ def update_train_iters(args):
         iterations = 0
         consumed_samples = 0
         # Rampup phase.
-        while consumed_samples <= int(args.rampup_batch_size[2]):
+        while consumed_samples <= int(args.rampup_batch_size[2]) and consumed_samples <= args.train_samples:
             update_num_microbatches(consumed_samples, consistency_check=False)
             consumed_samples += get_current_global_batch_size()
             iterations += 1
@@ -402,8 +402,9 @@ def update_train_iters(args):
         update_num_microbatches(0, consistency_check=False)
         # Constant phase
         # Note that we throw away any partial last batch.
-        iterations += (args.train_samples - consumed_samples) // \
-                      args.global_batch_size
+        if args.train_samples > consumed_samples:
+            iterations += (args.train_samples - consumed_samples) // \
+                          args.global_batch_size
         args.train_iters = iterations
 
     print_rank_0('setting training iterations to {}'.format(args.train_iters))

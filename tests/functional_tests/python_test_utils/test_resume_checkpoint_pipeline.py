@@ -1,12 +1,9 @@
 import os
 
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
-import pytest  # noqa: E402
+import pytest
 
-from tests.functional_tests.python_test_utils.common import (  # noqa: E402
-    TypeOfTest,
-    read_tb_logs_as_list,
-)
+from tests.functional_tests.python_test_utils.common import TypeOfTest, read_tb_logs_as_list
 
 LOGS_DIR = os.getenv("LOGS_DIR")
 ALLOW_NONDETERMINISTIC = os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO")

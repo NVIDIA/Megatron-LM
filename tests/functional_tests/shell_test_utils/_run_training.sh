@@ -28,6 +28,7 @@ MANDATORY_VARS=(
     "TENSORBOARD_PATH"
     "CHECKPOINT_PATH"
     "DATA_PATH"
+    "RUN_NUMBER"
 )
 for mandatory_var in "${MANDATORY_VARS[@]}"; do
     if [[ -z "${!mandatory_var}" ]]; then
@@ -52,7 +53,13 @@ if [[ $(echo "$TRAINING_SCRIPT_PATH" | tr '[:upper:]' '[:lower:]') == *nemo* ]];
     TRAINING_PARAMS_FROM_CONFIG=$(yq '... comments="" | .MODEL_ARGS | to_entries | .[] | with(select(.value == "true"); .value = "") | [.key + "=" + .value] | join("")' $TRAINING_PARAMS_PATH | tr '\n' ' ')
 
 else
-    TRAINING_PARAMS_FROM_CONFIG=$(yq '... comments="" | .MODEL_ARGS | to_entries | .[] | with(select(.value == "true"); .value = "") | [.key + " " + .value] | join("")' $TRAINING_PARAMS_PATH | tr '\n' ' ')
+    if [[ $RUN_NUMBER -eq 2 && $(yq 'has("MODEL_ARGS_2")' $TRAINING_PARAMS_PATH) == true ]]; then
+        export KEY="MODEL_ARGS_2"
+    else
+        export  KEY="MODEL_ARGS"
+    fi
+
+    TRAINING_PARAMS_FROM_CONFIG=$(yq '... comments="" | .[env(KEY)] | to_entries | .[] | with(select(.value == "true"); .value = "") | [.key + " " + .value] | join("")' $TRAINING_PARAMS_PATH | tr '\n' ' ')
     PARAMS="--exit-duration-in-mins $((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60 - 15))"
 fi
 
