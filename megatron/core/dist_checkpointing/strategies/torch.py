@@ -14,7 +14,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union, cast
 
 import numpy as np
 import torch
-from pkg_resources import packaging
+from pkg_resources.extern import packaging
 from torch.distributed import checkpoint
 from torch.distributed._shard._utils import narrow_tensor_by_index
 from torch.distributed._shard.metadata import ShardMetadata
