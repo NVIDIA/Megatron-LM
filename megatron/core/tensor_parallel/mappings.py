@@ -108,8 +108,11 @@ def _gather_along_first_dim(input_, output_split_sizes=None):
     """Gather tensors and concatenate along the first dimension.
 
     Args:
-        input_tensor (torch.Tensor): A tensor to be gathered.
-        output_split_sizes (List[int], optional): A list specifying the sizes of the output splits along the first dimension. If None, equal splitting is assumed. Default: None.
+        input_tensor (torch.Tensor):
+            A tensor to be gathered.
+        output_split_sizes (List[int], optional):
+            A list specifying the sizes of the output splits along the first dimension.
+            If None, equal splitting is assumed. Default: None.
 
     Returns:
         torch.Tensor: Gathered tensor.
@@ -578,10 +581,13 @@ def all_to_all(group, input_, output_split_sizes_=None, input_split_sizes=None):
 
 def all_to_all_sp2hp(input_):
     """
-    Perform AlltoAll communication on tensor parallel group, transform the input tensor from shape [num_tokens/TP, H] to [num_tokens, H/TP].
+    Perform AlltoAll communication on tensor parallel group, transform the input tensor from shape
+    [num_tokens/TP, H] to [num_tokens, H/TP].
 
     Args:
-        input_ (torch.Tensor): The input tensor which has been distributed along the sequence dimension.
+        input_ (torch.Tensor):
+            The input tensor which has been distributed along the sequence
+            dimension.
 
     Returns:
         torch.Tensor: The output tensor with shape [num_tokens, H/TP].
@@ -600,10 +606,13 @@ def all_to_all_sp2hp(input_):
 
 def all_to_all_hp2sp(input_):
     """
-    Perform AlltoAll communication on tensor parallel group, transform the input tensor from shape [num_tokens, H/TP] to [num_tokens/TP, H].
+    Perform AlltoAll communication on tensor parallel group, transform the input tensor from shape
+    [num_tokens, H/TP] to [num_tokens/TP, H].
 
     Args:
-        input_ (torch.Tensor): The input tensor which has been distributed along the hidden dimension.
+        input_ (torch.Tensor):
+            The input tensor which has been distributed along the hidden
+            dimension.
 
     Returns:
         torch.Tensor: The output tensor with shape [num_tokens/TP, H].
