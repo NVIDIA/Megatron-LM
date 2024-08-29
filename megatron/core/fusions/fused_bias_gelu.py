@@ -49,7 +49,7 @@ class GeLUFunction(torch.autograd.Function):
     # This is required to make Sphinx happy :-(
     @classmethod
     def apply(cls, *args, **kwargs):
-        super().apply(*args, **kwargs)
+        return super().apply(*args, **kwargs)
 
 
 bias_gelu_impl = GeLUFunction.apply
