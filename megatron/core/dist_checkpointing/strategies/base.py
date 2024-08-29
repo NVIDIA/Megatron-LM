@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from enum import Enum
 from pathlib import Path
+from typing import Any, DefaultDict
 
 from ..mapping import CheckpointingException, ShardedStateDict, StateDict
 from .async_utils import AsyncCallsQueue, AsyncRequest
@@ -18,7 +19,8 @@ class StrategyAction(Enum):
     SAVE_SHARDED = 'save_sharded'
 
 
-default_strategies = defaultdict(dict)
+_import_trigger = None
+default_strategies: DefaultDict[str, dict[tuple, Any]] = defaultdict(dict)
 
 async_calls = AsyncCallsQueue()
 
@@ -35,7 +37,8 @@ def get_default_strategy(action: StrategyAction, backend: str, version: int):
             from .torch import _import_trigger
     except ImportError as e:
         raise CheckpointingException(
-            f'Cannot import a default strategy for: {(action.value, backend, version)}. Error: {e}. Hint: {error_hint}'
+            f'Cannot import a default strategy for: {(action.value, backend, version)}. '
+            f'Error: {e}. Hint: {error_hint}'
         ) from e
     try:
         return default_strategies[action.value][(backend, version)]
@@ -46,7 +49,8 @@ def get_default_strategy(action: StrategyAction, backend: str, version: int):
 
 
 class LoadStrategyBase(ABC):
-    """Base class for a load strategy. Requires implementing checks for compatibility with a given checkpoint version."""
+    """Base class for a load strategy. Requires implementing checks for compatibility with a
+    given checkpoint version."""
 
     @abstractmethod
     def check_backend_compatibility(self, loaded_version):
@@ -63,7 +67,8 @@ class LoadStrategyBase(ABC):
 
 
 class SaveStrategyBase(ABC):
-    """Base class for a save strategy. Requires defining a backend type and version of the saved format."""
+    """Base class for a save strategy. Requires defining a backend type and
+    version of the saved format."""
 
     def __init__(self, backend: str, version: int):
         self.backend = backend

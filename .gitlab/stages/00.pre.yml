@@ -38,6 +38,13 @@ label_merge_request:
       source labels
       curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}" --data-urlencode "add_labels=$LABELS" -X PUT
 
+clean_docker_node:
+  stage: .pre
+  image: docker:26.1.4-dind
+  tags: [mcore-docker-node]
+  script:
+    - docker system prune -a --filter "until=48h" -f
+
 check_milestone:
   rules: 
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"

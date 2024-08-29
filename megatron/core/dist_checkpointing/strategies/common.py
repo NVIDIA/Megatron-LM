@@ -4,7 +4,6 @@
 
 import logging
 import os
-from itertools import product
 from pathlib import Path
 
 import torch
@@ -68,10 +67,12 @@ class TorchCommonLoadStrategy(LoadCommonStrategy):
     def load_sharded_objects(
         self, sharded_objects_state_dict: ShardedStateDict, checkpoint_dir: Path
     ):
-        """Replaces all ShardedObject from a given state dict with values loaded from the checkpoint.
+        """Replaces all ShardedObject from a given state dict with values loaded from the
+        checkpoint.
 
         Args:
-            sharded_objects_state_dict (ShardedStateDict): sharded state dict defining what objects should be loaded.
+            sharded_objects_state_dict (ShardedStateDict):
+                sharded state dict defining what objects should be loaded.
             checkpoint_dir (Path): checkpoint directory
 
         Returns:
@@ -99,7 +100,8 @@ class TorchCommonLoadStrategy(LoadCommonStrategy):
                     else:
                         ckpt_files = [f.name for f in checkpoint_dir.iterdir()]
                         logger.debug(
-                            f'{err_msg}. Object {sh_obj.key} directory does not exist. Checkpoint directory content: {ckpt_files}'
+                            f'{err_msg}. Object {sh_obj.key} directory does not exist. Checkpoint'
+                            f' directory content: {ckpt_files}'
                         )
                     raise CheckpointingException(err_msg) from e
             return loaded_obj
@@ -119,7 +121,8 @@ class TorchCommonLoadStrategy(LoadCommonStrategy):
                 full_key = f'{subdir.name}/{shard_file.stem}'
                 sh_objs.append(ShardedObject.empty_from_unique_key(full_key))
 
-            # This is a backward-compatibility fix, where the last global shape is missing in the name
+            # This is a backward-compatibility fix, where the last global shape is missing in the
+            # name
             if sh_objs[0].global_shape[-1] < 0:
                 max_last_offset = max(map(lambda sh_obj: sh_obj.global_offset[-1], sh_objs))
                 for sh_obj in sh_objs:
