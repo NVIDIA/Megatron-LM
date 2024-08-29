@@ -12,6 +12,7 @@ API Guide
    transformer
    moe
    dist_checkpointing
+   dist_optimizer
    distributed
    datasets
    num_microbatches_calculator

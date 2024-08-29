@@ -1,0 +1,49 @@
+{
+    "communicators": [
+        {
+            "communicatorId": 13,
+            "type": null,
+            "nodes": [
+                {
+                    "globalRank": 1,
+                    "rank": 0,
+                    "commList": [
+                        "All_Reduce",
+                        "All_Reduce",
+                        "All_Reduce",
+                        "All_Reduce",
+                        "All_Reduce",
+                        "All_Reduce",
+                        "All_Reduce",
+                        "All_Reduce",
+                        "All_Reduce",
+                        "All_Reduce",
+                        "All_Reduce",
+                        "All_Reduce",
+                        "All_Reduce"
+                    ]
+                },
+                {
+                    "globalRank": 0,
+                    "rank": 1,
+                    "commList": [
+                        "All_Reduce",
+                        "All_Reduce",
+                        "All_Reduce",
+                        "All_Reduce",
+                        "All_Reduce",
+                        "All_Reduce",
+                        "All_Reduce",
+                        "All_Reduce",
+                        "All_Reduce",
+                        "All_Reduce",
+                        "All_Reduce",
+                        "All_Reduce",
+                        "All_Reduce"
+                    ]
+                }
+            ],
+            "collImpl": []
+        }
+    ]
+}

@@ -1,7 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import contextlib
-from typing import Callable, Iterator, List, Optional, Union
+from typing import Iterator, List, Union
 
 import torch
 from torch.autograd.variable import Variable
@@ -96,7 +96,8 @@ def get_forward_backward_func():
     collect_non_loss_data (optional, bool, default=False): TODO
 
     first_val_step (bool, optional): Is the first step of the validation phase. Used by
-        Transformer Engine modules to only update their fp8 weights only on the first validation step.
+        Transformer Engine modules to only update their fp8 weights only on the first validation
+        step.
 
     """
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
@@ -187,9 +188,11 @@ def forward_step(
     Otherwise, the passed-in input_tensor is used.
 
     Args:
-        forward_step_func (callable): The forward step function for the model that takes the
+        forward_step_func (callable):
+            The forward step function for the model that takes the
             data iterator as the first argument, and model as the second.
             This user's forward step is expected to output a tuple of two elements:
+
                 1. The output object from the forward step. This output object needs to be a
                     tensor or some kind of collection of tensors. The only hard requirement
                     for this object is that it needs to be acceptible as input into the second
@@ -198,7 +201,8 @@ def forward_step(
                     could be a reduction over the loss from the model, it could be a function that
                     grabs the output from the model and reformats, it could be a function that just
                     passes through the model output. This function must have one of the following
-                    patterns, and depending on the pattern different things happen internally.
+                    patterns, and depending on the pattern different things happen internally:
+
                         a. A tuple of reduced loss and some other data. Note that in this case
                             the first argument is divided by the number of global microbatches,
                             assuming it is a loss, so that the loss is stable as a function of
@@ -212,23 +216,33 @@ def forward_step(
                             to specify `collect_non_loss_data=True` and you may also want to
                             specify `forward_only=True` in the call to the parent forward_backward
                             function.
-        data_iterator (iterator): The data iterator.
-        model (nn.Module): The model to perform the forward step on.
-        num_microbatches (int): The number of microbatches.
-        input_tensor (Tensor or list[Tensor]): The input tensor(s) for the forward step.
-        forward_data_store (list): The list to store the forward data. If you go down path 2.a or
+        data_iterator (iterator):
+            The data iterator.
+        model (nn.Module):
+            The model to perform the forward step on.
+        num_microbatches (int):
+            The number of microbatches.
+        input_tensor (Tensor or list[Tensor]):
+            The input tensor(s) for the forward step.
+        forward_data_store (list):
+            The list to store the forward data. If you go down path 2.a or
             2.b for the return of your forward reduction function then this will store only the
             final dimension of the output, for example the metadata output by the loss function.
             If you go down the path of 2.c then this will store the entire output of the forward
             reduction function applied to the model output.
-        config (object): The configuration object.
-        collect_non_loss_data (bool, optional): Whether to collect non-loss data. Defaults to False.
+        config (object):
+            The configuration object.
+        collect_non_loss_data (bool, optional):
+            Whether to collect non-loss data. Defaults to False.
             This is the path to use if you want to collect arbitrary output from the model forward,
             such as with inference use cases. Defaults to False.
-        checkpoint_activations_microbatch (int, optional): The microbatch to checkpoint activations.
+        checkpoint_activations_microbatch (int, optional):
+            The microbatch to checkpoint activations.
             Defaults to None.
-        is_first_microbatch (bool, optional): Whether it is the first microbatch. Defaults to False.
-        current_microbatch (int, optional): The current microbatch. Defaults to None.
+        is_first_microbatch (bool, optional):
+            Whether it is the first microbatch. Defaults to False.
+        current_microbatch (int, optional):
+            The current microbatch. Defaults to None.
 
     Returns:
         Tensor or list[Tensor]: The output object(s) from the forward step.
@@ -285,7 +299,8 @@ def forward_step(
         config.timers('forward-compute').stop()
 
     # Set the loss scale for the auxiliary loss of the MoE layer.
-    # Since we use a trick to do backward on the auxiliary loss, we need to set the scale explicitly.
+    # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
+    # explicitly.
     if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
         # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
         loss_scale = (
@@ -685,7 +700,6 @@ def forward_backward_pipelining_with_interleaving(
     def is_first_microbatch_for_model_chunk(microbatch_id: int) -> bool:
         """Check if an iteration is the first for a model chunk."""
         microbatch_group_size = pipeline_parallel_size * num_model_chunks
-        num_microbatch_groups = total_num_microbatches // microbatch_group_size
         microbatch_group_id = microbatch_id // microbatch_group_size
         microbatch_id_in_group = microbatch_id % microbatch_group_size
         if microbatch_group_id == 0:
@@ -814,7 +828,6 @@ def forward_backward_pipelining_with_interleaving(
             for req in fwd_wait_handles:
                 req.wait()
 
-        cur_model_chunk_id = get_model_chunk_id(k, forward=True)
         # Decide to checkpoint all layers' activations of the current micro-batch
         if max_outstanding_backprops is not None:
             checkpoint_activations_microbatch = (
@@ -918,7 +931,6 @@ def forward_backward_pipelining_with_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
-        cur_model_chunk_id = get_model_chunk_id(forward_k, forward=True)
         current_microbatch = get_microbatch_id_in_model_chunk(forward_k, forward=True)
         if config.overlap_p2p_comm:
             if fwd_wait_handles is not None:
@@ -1145,8 +1157,10 @@ def get_tensor_shapes(
     config,
     encoder_decoder_xattn: bool,
 ):
-    # Determine right tensor sizes (based on position of rank with respect to split rank) and model size.
-    # Send two tensors if model decoder requires the encoder's output (via cross-attention) and rank is in decoder stage.
+    # Determine right tensor sizes (based on position of rank with
+    # respect to split rank) and model size.
+    # Send two tensors if model decoder requires the encoder's output
+    # (via cross-attention) and rank is in decoder stage.
     #     first tensor is decoder.
     #     second tensor is encoder.
     # If model has an encoder & decoder and rank is at the boundary:
@@ -1260,9 +1274,7 @@ def forward_backward_pipelining_without_interleaving(
     first_val_step: bool = None,
 ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
-    stages.
-
-    Returns dictionary with losses if the last stage, empty dict otherwise."""
+    stages. Returns dictionary with losses if the last stage, empty dict otherwise."""
 
     if isinstance(model, list):
         assert (

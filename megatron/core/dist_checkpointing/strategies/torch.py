@@ -14,7 +14,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union, cast
 
 import numpy as np
 import torch
-from pkg_resources import packaging
+from pkg_resources.extern import packaging
 from torch.distributed import checkpoint
 from torch.distributed._shard._utils import narrow_tensor_by_index
 from torch.distributed._shard.metadata import ShardMetadata
@@ -444,7 +444,8 @@ class MCoreSavePlanner(DefaultSavePlanner):
 
     def create_local_plan(self) -> SavePlan:
         plan = create_default_local_save_plan(self.state_dict, self.is_coordinator)
-        self._add_non_coordinator_iobytes_request(plan)
+        if packaging.version.Version(torch.__version__) <= packaging.version.Version("2.3"):
+            self._add_non_coordinator_iobytes_request(plan)
         if self.flatten_state_dict:
             plan = dataclasses.replace(plan, planner_data=self.mappings)
         plan = MCoreSavePlan(

@@ -8,7 +8,7 @@ import logging
 from importlib.metadata import version
 
 import torch
-from pkg_resources import packaging
+from pkg_resources.extern import packaging
 from torch import _C
 from torch.cuda import _lazy_call
 from torch.cuda import device as device_ctx_manager

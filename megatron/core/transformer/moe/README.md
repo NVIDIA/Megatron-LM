@@ -87,7 +87,8 @@ To enable the token drop mechanism, such as GShard and SwitchTransformer, includ
 ```
 
 The following figure illustrates differenting dropping strategies in MCore:
-![Token Droppling Strategies](../../../../docs/source/images/moe/token_drop.png)
+<!-- This image is uncommented for now as Sphinx cannot resolve this path. Sphinx imports this markdown file, and from the imported location this relative path does not exist anymore. Ideally, this markdown should not live here but rather in the `docs/` directory that Sphinx uses. -->
+<!-- ![Token Droppling Strategies](../../../../docs/source/images/moe/token_drop.png) -->
 
 1. The default dropless strategy will not drop or pad any token.
 2. By setting `--moe-expert-capacity-factor`, the tokens exceed the capacity of expert will be dropped based on their selected probabilities. 
@@ -97,7 +98,7 @@ The following figure illustrates differenting dropping strategies in MCore:
 
 ### Fine-tuning Mixtral Models
 Megatron-Core has full support for Mixtral MoE models, and we provide the checkpoint converter for Mixtral models from huggingface format to MCore format. 
-See more details in the [mixtral example](../../../../examples/mixtral/README.md).
+<!-- See more details in the [mixtral example](../../../../examples/mixtral/README.md). -->
 
 ### Distributed Checkpointing
 MCore v0.7 introduced fully parallel and asynchronous saving capabilities to distributed checkpointing, 
