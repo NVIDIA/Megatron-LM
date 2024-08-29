@@ -15,6 +15,10 @@ logger = logging.getLogger(__name__)
 
 
 class BufferType(Enum):
+    """
+    Enumeration for buffer type.
+    """
+
     PARAM = 1
     GRAD = 2
 
@@ -40,8 +44,8 @@ class Bucket:
     Args:
         ddp_config: DistributedDataParallel config object.
         params: List of parameters whose gradients are collated in this bucket.
-        param_data: View in larger ParamAndGradBuffer.param_data that this bucket is responsible for.
-        grad_data: View in larger ParamAndGradBuffer.grad_data that this bucket is responsible for.
+        param_data: View in ParamAndGradBuffer.param_data that this bucket is responsible for.
+        grad_data: View in ParamAndGradBuffer.grad_data that this bucket is responsible for.
         offset: Offset of this bucket's view in the larger ParamAndGradBuffer.
         numel_unpadded: Number of unpadded elements in bucket.
         data_parallel_group: Data-parallel process group.
@@ -293,42 +297,45 @@ class ParamAndGradBuffer:
             # Return the potentially padded data_end_index.
             return data_end_index
 
+        def _does_param_require_new_bucket(param):
+            """
+            Split shared embedding parameters into separate bucket if using distributed
+            optimizer that makes use of reduce-scatters instead of all-reduces.
+            This ensures that the first and last pipeline stage partition optimizer state
+            for the shared embedding parameters the same way across DP replicas, allowing
+            the DP reduce-scatter to be before the embedding all-reduce.
+            """
+            return (
+                getattr(param, "shared_embedding", False)
+                and self.ddp_config.use_distributed_optimizer
+            )
+
         for param in params[::-1]:
             # Iterate through parameters in reverse order to roughly follow backprop order,
             # and skip parameters that don't require gradients.
             if not param.requires_grad:
                 continue
+
             this_numel = param.data.nelement()
             data_start_index = _pad_start_of_param_if_needed(data_start_index)
-            data_end_index = data_start_index + this_numel
 
-            def _does_param_require_new_bucket(param):
-                """
-                Split shared embedding parameters into separate bucket if using distributed
-                optimizer that makes use of reduce-scatters instead of all-reduces.
-                This ensures that the first and last pipeline stage partition optimizer state
-                for the shared embedding parameters the same way across DP replicas, allowing
-                the DP reduce-scatter to be before the embedding all-reduce.
-                """
-                return (
-                    getattr(param, "shared_embedding", False)
-                    and self.ddp_config.use_distributed_optimizer
-                )
-
-            # Create bucket with already collected parameters if current param needs its own bucket.
-            if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
+            # Create bucket with collected parameters if current param needs its own bucket.
+            if _does_param_require_new_bucket(param):
                 # We are creating a bucket for the already accumulated parameters, whose params
                 # end at the current data_start_index.
                 if self.ddp_config.use_distributed_optimizer:
-                    # data_start_index should already be padded.
-                    assert data_start_index % self.data_parallel_world_size == 0
-                _create_new_bucket(data_start_index)
+                    # Make sure new bucket is appropriately padded.
+                    if data_start_index % self.data_parallel_world_size != 0:
+                        data_start_index = _pad_end_of_bucket_if_needed(data_start_index)
+                if len(bucket_params) > 0:
+                    _create_new_bucket(data_start_index)
 
+            data_end_index = data_start_index + this_numel
             self.param_index_map[param] = (data_start_index, data_end_index, bucket_id)
             bucket_params.add(param)
 
-            # If we have enough elements already or the current param is part of the shared embedding
-            # layer and needs a separate bucket, form a new bucket.
+            # If we have enough elements already or the current param is part of the shared
+            # embedding layer and needs a separate bucket, form a new bucket.
             if (
                 bucket_size is not None
                 and (data_end_index - bucket_data_start_index) >= bucket_size
