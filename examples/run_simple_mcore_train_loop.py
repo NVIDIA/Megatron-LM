@@ -19,6 +19,7 @@ from megatron.training.tokenizer.tokenizer import _NullTokenizer
 
 
 _SEQUENCE_LENGTH = 64
+_VACAB_SIZE = 100
 
 
 def initialize_distributed(tensor_model_parallel_size=1, pipeline_model_parallel_size=1):
@@ -47,7 +48,7 @@ def model_provider():
     gpt_model = GPTModel(
         config=transformer_config, 
         transformer_layer_spec=get_gpt_layer_local_spec(), 
-        vocab_size=100, 
+        vocab_size=_VACAB_SIZE, 
         max_sequence_length=_SEQUENCE_LENGTH,
     )
 
@@ -67,7 +68,7 @@ def get_train_data_iterator():
         reset_position_ids=False,
         reset_attention_mask=False,
         eod_mask_loss=False,
-        tokenizer=_NullTokenizer(vocab_size=_SEQUENCE_LENGTH),
+        tokenizer=_NullTokenizer(vocab_size=_VACAB_SIZE),
     )
 
     datasets = BlendedMegatronDatasetBuilder(
