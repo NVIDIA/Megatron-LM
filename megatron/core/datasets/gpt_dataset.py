@@ -710,7 +710,7 @@ class MockGPTLowLevelDataset:
 
     def __getitem__(self, idx: int) -> numpy.number:
         length = self.sequence_lengths[idx]
-        sample = numpy.int64(numpy.arange(length - 1) + 1))
+        sample = numpy.int64(numpy.arange(length - 1) + 1)
         return sample
 
     def get(self, idx: int, offset: int = 0, length: Optional[int] = None) -> numpy.ndarray:
