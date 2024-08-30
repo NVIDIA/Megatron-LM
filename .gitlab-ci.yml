@@ -2,13 +2,6 @@ workflow:
   rules:
     - if: $CI_PROJECT_NAMESPACE != "ADLR"
       when: never
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $FUNCTIONAL_TEST_SCOPE == "mr"
-      auto_cancel:
-        on_new_commit: none
-      variables:
-        FUNCTIONAL_TEST: "yes"
-        UNIT_TEST_TIMEOUT: 180
-        UNIT_TEST_REPEAT: 10
     - if: $CI_PIPELINE_SOURCE == "schedule"
       auto_cancel:
         on_new_commit: none
