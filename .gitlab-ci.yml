@@ -12,17 +12,14 @@ workflow:
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run tests/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
         FUNCTIONAL_TEST: "yes"
-        FUNCTIONAL_TEST_CLUSTER: $DEFAULT_A100_CLUSTER
         FUNCTIONAL_TEST_SCOPE: mr
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run nightly/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
         FUNCTIONAL_TEST: "yes"
-        FUNCTIONAL_TEST_CLUSTER: $DEFAULT_A100_CLUSTER
         FUNCTIONAL_TEST_SCOPE: nightly
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run weekly/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
         FUNCTIONAL_TEST: "yes"
-        FUNCTIONAL_TEST_CLUSTER: $DEFAULT_A100_CLUSTER
         FUNCTIONAL_TEST_SCOPE: weekly
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:

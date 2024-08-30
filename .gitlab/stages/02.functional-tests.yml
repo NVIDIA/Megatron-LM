@@ -25,6 +25,12 @@ jet-configure:
   script:
     - set -x
     - |
+      if [[ "$CI_MERGE_REQUEST_LABELS" == "*H100*" ]]; then
+        FUNCTIONAL_TEST_CLUSTER=$DEFAULT_H100_CLUSTER
+      else
+        FUNCTIONAL_TEST_CLUSTER=$DEFAULT_A100_CLUSTER
+      fi
+    - |
       JET_CUSTOM_FILTER="type == 'basic'"
 
       if [[ $FUNCTIONAL_TEST_CLUSTER == dgxh100_eos ]]; then
