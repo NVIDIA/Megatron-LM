@@ -1,16 +1,17 @@
 .tests_common:
   rules:
-    - if: ($FUNCTIONAL_TEST == "no" || $FUNCTIONAL_TEST == "yes" || $CONVERGENCE_TEST == "yes") && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
-    - if: $FUNCTIONAL_TEST == "no" || $FUNCTIONAL_TEST == "yes" || $CONVERGENCE_TEST == "yes"
-    - when: never
+      when: always
+    - when: always
   stage: test
 
 include:
   - template: Security/Secret-Detection.gitlab-ci.yml
 
 build_image:
-  tags: [8xL40S-builder]
+  tags: 
+    - ${TAG}
   image: docker:26.1.4-dind
   timeout: 45m
   parallel:
@@ -18,12 +19,15 @@ build_image:
       - IMAGE: CI_MCORE_IMAGE
         FILE: Dockerfile.ci
         BASE_IMAGE: nvcr.io/nvidia/pytorch:24.01-py3
+        TAG: mcore-docker-node-large
       - IMAGE: CI_NEMO_IMAGE
         FILE: Dockerfile.ci
         BASE_IMAGE: nvcr.io/nvidian/nemo:nightly
+        TAG: mcore-docker-node-large
       - IMAGE: LINTING_IMAGE
         FILE: Dockerfile.linting
         BASE_IMAGE: python:3.10
+        TAG: mcore-docker-node-small
   before_script:
     - echo "$NGC_API_KEY" | docker login nvcr.io -u '$oauthtoken' --password-stdin
     - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
@@ -34,7 +38,7 @@ build_image:
       set -x
       eval "IMAGE=\$$IMAGE"
 
-      docker system prune -a --filter "until=24h" -f
+      docker system prune -a --filter "until=24h" -f || true
 
       if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
         ADDITIONAL_PARAMS="--pull"

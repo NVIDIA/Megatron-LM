@@ -41,8 +41,9 @@ label_merge_request:
 clean_docker_node:
   stage: .pre
   image: docker:26.1.4-dind
-  tags: [mcore-docker-node]
+  tags: [mcore-docker-node-small]
   script:
+    - export DOCKER_HOST='unix:///var/run/docker.sock'
     - docker system prune -a --filter "until=48h" -f
 
 check_milestone:
