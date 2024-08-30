@@ -29,10 +29,10 @@ MODEL_ARGS:
 
   # Model parallel
   --tensor-model-parallel-size: 8 
-  --pipeline-model-parallel-size: 16 
+  --pipeline-model-parallel-size: 8 
 
   # Data args
-  --data-path: $DATA_BLEND
+  --data-path: ${DATA_BLEND}
   --vocab-file: ${DATA_PATH}/vocab.txt 
   --split: 949,50,1
   --data-cache-path: ${DATA_CACHE_PATH}
@@ -51,4 +51,4 @@ MODEL_ARGS:
   --log-params-norm: true
   --log-validation-ppl-to-tensorboard: true
   --wandb-project: megatron-core-release-runs
-  --wandb-exp-name: ${MCORE_RELEASE_NUM}_bert_release
+  --wandb-exp-name: ${WANDB_EXPERIMENT}

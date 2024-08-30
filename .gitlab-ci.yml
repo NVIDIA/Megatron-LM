@@ -74,6 +74,15 @@ variables:
       - "yes"
       - "no"
     description: To run a convergence test
+  CONVERGENCE_TEST_SCOPE:
+    value: "release"
+    options:
+      - "release"
+      - "pre-release"
+    description: "Test suite to run (only for CONVERGENCE_TEST=yes)"
+  CONVERGENCE_TEST_RUN_NAME:
+    value: "pre-release-$$CI_PIPELINE_ID"
+    description: "Run directory of convergence test"
   PUBLISH: 
     value: "no"
     options: 
