@@ -63,9 +63,11 @@ def model_provider(pre_process=True, post_process=True) -> MambaModel:
         hybrid_override_pattern=args.hybrid_override_pattern,
         post_process=post_process,
         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
-        parallel_output=True,
+        parallel_output=False,
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-        position_embedding_type=args.position_embedding_type
+        position_embedding_type=args.position_embedding_type,
+        rotary_percent=args.rotary_percent,
+        rotary_base=args.rotary_base
     )
 
     for l in range(model.decoder.num_layers_per_pipeline_rank):

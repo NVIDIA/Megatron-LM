@@ -114,7 +114,7 @@ class CLIPViTModel(VisionModule):
 
         Args:
             x (torch.Tensor): input data of shape [batch, img_h, img_w]
-            attention_mask (torch.Tensor with dtype=bool): Attention mask to use. If none, all ones.
+            attention_mask (torch.Tensor with dtype=bool): Attention mask to use.
 
         Returns:
             x (torch.Tensor): output after final transformer block of shape [b, s, h].
@@ -139,14 +139,16 @@ class CLIPViTModel(VisionModule):
             x.contiguous()
         )  # contiguous() call required as `permute` can sparsify the tensor and this breaks pipelining
 
-        if attention_mask is None:
-            attention_mask = torch.ones(
-                1, 1, self.seq_length, self.seq_length
-            ).cuda()  # [1, 1, s, s]
-            attention_mask = attention_mask < 0.5  # to bool
-
         x = self.decoder(x, attention_mask)
         x = x.permute(1, 0, 2)  # [s, b, h] -> [b, s, h]
         x = x.contiguous()
 
         return x
+
+
+def get_image_sequence_length(img_h, img_w, patch_dim, add_class_token, class_token_len):
+    """Get image sequence length given image size, patch size, and class token."""
+    num_patches_per_dim_h = img_h // patch_dim
+    num_patches_per_dim_w = img_w // patch_dim
+    num_patches = num_patches_per_dim_h * num_patches_per_dim_w
+    return num_patches + (class_token_len if add_class_token else 0)

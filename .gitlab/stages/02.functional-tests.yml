@@ -99,32 +99,6 @@ jet-trigger:
         jet_flavour: # An empty mapping will disable building the JET flavor 
   inherit:
     variables: true
-
-jet-results-summary:
-  extends: [.jet_common]
-  image: ${GITLAB_ENDPOINT}:5005/dl/jet/api:latest
-  needs: [jet-trigger]
-  tags:
-    - mcore-docker-node-small
-  before_script:
-    - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $VAULT_JWT_TOKEN
-  script:
-    - env
-    - python -m pip install -U --no-cache-dir prettytable
-    - rc=0
-    - python tests/functional_tests/python_test_utils/jet_test_pipeline.py ${CI_PIPELINE_ID} --artifact_links $CI_JOB_ID --download_scripts_dir ./scripts || rc=$?
-    - exit $rc
-  artifacts:
-    when: always
-    paths:
-      - scripts
-  rules:
-    - if: '$FUNCTIONAL_TEST == "yes" && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"'
-      allow_failure: true
-    - if: '$FUNCTIONAL_TEST == "yes"'
-      allow_failure: false
-      when: always
-    - when: never
       
 jet-results-notify:
   extends: [.jet_common]

@@ -54,15 +54,6 @@ class TestTop2Router:
             hidden_states = torch.randn((32, 2, self.router.config.hidden_size))
             hidden_states = hidden_states.cuda()
             scores, indices = self.router(hidden_states)
-            print(scores.shape, indices.shape)
-            assert scores.shape == (64, 2)
-            assert indices.shape == (64, 2)
-            print(
-                (indices == 0).sum(),
-                (indices == 1).sum(),
-                (indices == 2).sum(),
-                (indices == 3).sum(),
-            )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_aux_loss(self):

@@ -19,9 +19,7 @@ from config import get_language_model_config, get_vision_model_config, get_visio
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from layer_specs import get_layer_spec, get_mlp_module_spec, get_layer_spec_te
 from megatron.training import pretrain
-from megatron.training.utils import average_losses_across_data_parallel_group
 from dataloader_provider import train_valid_test_dataloaders_provider
-
 
 def model_provider(
     pre_process=True, post_process=True, add_encoder=True, add_decoder=True,
@@ -60,22 +58,28 @@ def model_provider(
 
     base_config = core_transformer_config_from_args(get_args())
     base_config.language_model_type = args.language_model_type
+    base_config.vision_model_type = args.vision_model_type
+    base_config.calculate_per_token_loss = True
 
     language_config = deepcopy(base_config)
     language_config = get_language_model_config(language_config)
 
     if use_te:
-        language_transformer_layer_spec = get_layer_spec_te(is_vit=False)
+        language_transformer_layer_spec = get_layer_spec_te(is_vit=False)   # TENorm detects LayerNorm/RMS automatically.
     else:
-        language_transformer_layer_spec = get_layer_spec(is_vit=False)
+        language_transformer_layer_spec = get_layer_spec(is_vit=False, normalization=language_config.normalization)
 
     vision_config = deepcopy(base_config)
     vision_config = get_vision_model_config(vision_config, apply_query_key_layer_scaling=args.apply_query_key_layer_scaling)
 
-    if use_te:
-        vision_transformer_layer_spec = get_layer_spec_te(is_vit=True)
+    vision_model_type = args.vision_model_type
+    if vision_model_type == "clip":
+        if use_te:
+            vision_transformer_layer_spec = get_layer_spec_te(is_vit=True)  # TENorm detects LayerNorm/RMS automatically.
+        else:
+            vision_transformer_layer_spec = get_layer_spec(is_vit=True, normalization=vision_config.normalization)
     else:
-        vision_transformer_layer_spec = get_layer_spec(is_vit=True)
+        raise RuntimeError("unsupported vision model type", vision_model_type)
 
     vision_projection_config = deepcopy(base_config)
     vision_projection_config = get_vision_projection_config(vision_projection_config, language_config.hidden_size)
@@ -85,7 +89,7 @@ def model_provider(
         vision_config.pipeline_model_parallel_size = args.encoder_pipeline_model_parallel_size
         vision_projection_config.pipeline_model_parallel_size = args.encoder_pipeline_model_parallel_size
         if args.encoder_tensor_model_parallel_size > 0:
-            vision_transformer_config.tensor_model_parallel_size = args.encoder_tensor_model_parallel_size
+            vision_config.tensor_model_parallel_size = args.encoder_tensor_model_parallel_size
             vision_projection_config.tensor_model_parallel_size = args.encoder_tensor_model_parallel_size
 
     vision_projection_layer_spec = get_mlp_module_spec(use_te=use_te).submodules
@@ -113,7 +117,6 @@ def model_provider(
         img_w=args.img_w,
         patch_dim=args.patch_dim,
         language_rotary_base=args.rotary_base,
-        img_embedding_idx=args.img_embedding_idx,
     )
 
     model.freeze(freeze_language_model=args.freeze_LM, freeze_vision_model=args.freeze_ViT, freeze_vision_projection=False)
@@ -140,14 +143,22 @@ def get_batch(data_iterator):
         data = None
 
     data_text = tensor_parallel.broadcast_data(["text"], data, torch.int64)["text"]
-    data_img = tensor_parallel.broadcast_data(["img"], data, torch.float32)
     prompt_len = tensor_parallel.broadcast_data(["prompt_len"], data, torch.int64)["prompt_len"]
+    target = tensor_parallel.broadcast_data(["target"], data, torch.int64)["target"]
+
+    data_img = tensor_parallel.broadcast_data(["img"], data, torch.float32)
 
     torch.cuda.nvtx.range_pop()
 
     tokens_ = data_text.long()
 
-    img_raw = data_img['img'].reshape(-1, 3, args.img_h, args.img_w)
+    # Dummy image, no image.
+    img_raw = None
+    if bool( data_img['img'].shape == torch.Size([1, 1])):
+        if torch.distributed.get_rank() == 0:
+            assert "no-image" in data["__keys__"][0], f'invalid sample {data_img["img"].shape}, {data_img["img"]}, {data["img"]}'
+    else:
+        img_raw = data_img['img'].reshape(-1, 3, args.img_h, args.img_w)
 
     torch.cuda.nvtx.range_push("index tokens")
     tokenizer = get_tokenizer()
@@ -168,12 +179,10 @@ def get_batch(data_iterator):
                                         args.reset_position_ids,
                                         args.reset_attention_mask,
                                         args.eod_mask_loss,
-                                        question_length=prompt_len)
+                                        question_length=prompt_len,
+                                        target=target[:, 1:text_length+1]
+                                        )
     torch.cuda.nvtx.range_pop()
-
-    loss_mask, labels, attention_mask = _preprocess_data_for_llava(loss_mask, labels, attention_mask)
-
-    tokens = tokens[:, 1:]  # drop image index token
 
     return tokens, labels, loss_mask, attention_mask, position_ids, img_raw
 
@@ -191,30 +200,13 @@ def get_image_token_count():
     return num_image_tokens
 
 
-def _preprocess_data_for_llava(loss_mask, labels, attention_mask):
-    """Preprocess data sample to the format expected by a LLaVA model."""
-    num_image_tokens = get_image_token_count()
-
-    batch_size = loss_mask.shape[0]
-
-    loss_mask2 = torch.cat(
-        [torch.zeros(batch_size, num_image_tokens - 1, dtype=torch.float32, device=loss_mask.device), loss_mask], dim=1
-    )
-    labels2 = torch.cat([torch.zeros(batch_size, num_image_tokens - 1, dtype=torch.int64, device=labels.device), labels], dim=1)
-
-    full_seq_length = len(labels2[0])
-    attention_mask2 = torch.tril(torch.ones((1, 1, full_seq_length, full_seq_length), device=attention_mask.device))
-    attention_mask2 = attention_mask2 < 0.5
-
-    return loss_mask2, labels2, attention_mask2
-
-
 def get_ltor_masks_and_position_ids(data,
                                     eod_token,
                                     reset_position_ids,
                                     reset_attention_mask,
                                     eod_mask_loss,
                                     question_length=None,
+                                    target=None,
                                     weights=None):
     """Build masks and position id for left to right model."""
 
@@ -226,14 +218,26 @@ def get_ltor_masks_and_position_ids(data,
         att_mask_batch = micro_batch_size
     else:
         att_mask_batch = 1
+
     attention_mask = torch.tril(torch.ones(
         (att_mask_batch, seq_length, seq_length), device=data.device)).view(
             att_mask_batch, 1, seq_length, seq_length)
 
-    # Loss mask.
-    loss_mask = torch.ones(data.size(), dtype=torch.float, device=data.device)
-    if eod_mask_loss:
-        loss_mask[data == eod_token] = 0.0
+     # Loss mask.
+    if target != None: # use target to create loss mask that is created in data preparation step
+        loss_mask = torch.ones(target.size(), dtype=torch.float, device=data.device)
+        loss_mask[target == eod_token] = 0.0 # mask paddings
+        loss_mask[target == -100] = 0.0 # mask prompts
+
+    else: # default creation
+        loss_mask = torch.ones(data.size(), dtype=torch.float, device=data.device)
+        if eod_mask_loss:
+            loss_mask[data == eod_token] = 0.0
+
+        if question_length is not None:
+            for b in range(micro_batch_size):
+                loss_mask[b, :max(0, question_length[b].item() - 1)] = 0.0
+
 
     # Position ids.
     position_ids = torch.arange(seq_length, dtype=torch.long,
@@ -245,8 +249,12 @@ def get_ltor_masks_and_position_ids(data,
 
 
     if question_length is not None:
-        for b in range(micro_batch_size):
-            loss_mask[b, :max(0, question_length[b].item())] = 0.0
+        # Create a mask based on question_length
+        question_length_mask = torch.arange(loss_mask.size(1), device=loss_mask.device)[None, :] < question_length[:, None]
+        # Invert the mask (1 where we want to keep the loss, 0 where we want to zero it out)
+        inverted_mask = ~question_length_mask
+        # Apply the mask to loss_mask
+        loss_mask = loss_mask * inverted_mask.float()
 
     if reset_position_ids or reset_attention_mask:
         # Loop through the batches:
@@ -280,17 +288,23 @@ def get_ltor_masks_and_position_ids(data,
 
 def loss_func(loss_mask, output_tensor):
     losses = output_tensor.float()
-    if loss_mask is not None:
-        loss_mask = loss_mask.view(-1).float()
-        loss = torch.sum(losses.view(-1) * loss_mask) / max( 1,loss_mask.sum() )
-    else:
-        loss = torch.mean(losses)
 
-    # Reduce loss for logging.
-    averaged_loss = average_losses_across_data_parallel_group([loss])
+    loss_mask = loss_mask.contiguous().view(-1).float()
 
-    return loss, {'lm loss': averaged_loss[0]}
+    total_tokens = loss_mask.sum()
+    total_loss = torch.sum(losses.view(-1) * loss_mask)
+    loss = torch.cat([total_loss.view(1), total_tokens.view(1)])
 
+    reporting_loss = loss.clone().detach()
+    torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
+
+    local_num_tokens = loss[1].clone().detach().to(torch.int)
+
+    return (
+        total_loss,
+        local_num_tokens,
+        {'lm loss': (reporting_loss[0], reporting_loss[1])},
+    )
 
 
 def forward_step(data_iterator, model: LLaVAModel):
@@ -304,7 +318,6 @@ def forward_step(data_iterator, model: LLaVAModel):
         output_tensor (torch.Tensor): Loss of shape [b, s] if labels are provided, otherwise logits of shape [b, s, vocab_size].
         loss_func (callable): Loss function with a loss mask specified.
     """
-    args = get_args()
     timers = get_timers()
 
     # Get the batch.
@@ -312,7 +325,7 @@ def forward_step(data_iterator, model: LLaVAModel):
     tokens, labels, loss_mask, attention_mask, position_ids, images = get_batch(data_iterator)
     timers('batch-generator').stop()
 
-    output_tensor = model(images, tokens, position_ids, attention_mask, labels=labels)
+    output_tensor, loss_mask = model(images, tokens, position_ids, attention_mask, labels, loss_mask)
 
     return output_tensor, partial(loss_func, loss_mask)
 
@@ -329,13 +342,10 @@ def add_multimodal_extra_args(parser):
     group.add_argument('--freeze-LM', action='store_true', default=False)
     group.add_argument('--freeze-ViT', action='store_true', default=False)
     group.add_argument('--language-model-type', type=str, required=True)
+    group.add_argument('--vision-model-type', type=str, default="clip")
     group.add_argument("--disable-vision-class-token", action="store_true", default=False)
     group.add_argument("--allow-missing-vision-projection-checkpoint", action="store_true", default=False)
     group.add_argument("--use-te", action="store_true", default=False)
-    group.add_argument("--img-embedding-idx", type=int, default=0,
-                       help='Llava specific parameter. Defines at which index'
-                       'in the language_embedding tensor the image_embeddings'
-                       'should be inserted')
     group.add_argument("--dataloader-save", type=str, default=None, help="Energon dataloader state save path")
     return parser
 
