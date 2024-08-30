@@ -113,7 +113,7 @@ products:
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp2_resume_torch_dist
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp4
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp4_resume_torch_dist
-    - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_resume_torch_dist_te_4experts2parallel
+    # - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_resume_torch_dist_te_4experts2parallel
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_te_4experts2parallel
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_resume_torch_dist_te_2experts
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_te_2experts
