@@ -302,6 +302,7 @@ def generate_samples(model):
                 add_BOS=False,
                 temperature=args.temperature,
                 random_seed=args.seed,
+                detokenize_segments=False,
             )
 
             for prompt, generation in zip([prompt], resp_sentences):
@@ -340,7 +341,7 @@ def generate_samples(model):
                 yield output
                 idx += 1
         else:
-            generate_and_post_process(model, forward_step=forward_step)
+            generate_and_post_process(model, forward_step=forward_step, detokenize_segments=False)
 
             idx += 1
 
@@ -473,7 +474,6 @@ def patch_tokenizer(args):
     tokenizer = get_tokenizer()
     tokenizer.tokenize = _decorate_tokenize(tokenizer.tokenize)
     tokenizer.detokenize = _decorate_detokenize(tokenizer.detokenize)
-    tokenizer.decode = _decorate_detokenize(tokenizer.decode)
 
 
 def main():
