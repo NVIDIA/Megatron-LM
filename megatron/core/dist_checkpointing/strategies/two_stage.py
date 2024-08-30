@@ -7,17 +7,17 @@ from collections import defaultdict
 from dataclasses import dataclass
 from functools import partial, wraps
 from itertools import chain
-from logging import DEBUG, INFO, StreamHandler, getLogger
+from logging import getLogger
 from operator import attrgetter, itemgetter
 from pathlib import Path
-from typing import Iterable, List, NamedTuple, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 
 from ..dict_utils import dict_list_map_inplace, map_reduce, nested_values
-from ..mapping import ShardedStateDict, ShardedTensor, StateDict
+from ..mapping import ShardedStateDict, ShardedTensor
 from .base import LoadShardedStrategy
-from .tensorstore import TensorStoreLoadShardedStrategy, _load_from_array, open_ts_array
+from .tensorstore import _load_from_array, open_ts_array
 from .zarr import flatten_range, load_zarr_based_sharded_metadata
 
 _import_trigger = None
@@ -136,13 +136,19 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
 
     @timed()
     def maybe_init_gloo_group(self):
+        """if self.cpu_transfer, sets self.data_parallel_group to a new gloo group. (If
+        not self.cpu_transfer, self.data_parallel_group should already be
+        pointing to valid nccl groups)
+        """
         if not self.cpu_transfer:
             return
         all_groups = [None] * torch.distributed.get_world_size()
         torch.distributed.all_gather_object(all_groups, self.dp_group_ranks)
         all_groups = set(tuple(sorted(gr)) for gr in all_groups)
         for group_ranks in sorted(all_groups):
-            gloo_pg = torch.distributed.new_group(ranks=group_ranks, backend='gloo')
+            gloo_pg = torch.distributed.new_group(
+                ranks=group_ranks, backend=os.getenv('CPU_COMMS_BACKEND_OVERRIDE', 'gloo')
+            )
             if self.global_rank in group_ranks:
                 self.data_parallel_group = gloo_pg
                 assert self.dp_group_rank == torch.distributed.get_rank(self.data_parallel_group)
@@ -211,7 +217,9 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
                 )
 
             logger.debug(
-                f'exchange {ten_meta.sharded_tensor_no_data.key}, {exchange_tensor.shape}({exchange_tensor.numel()}), broadcast({src_rank} -> {self.dp_group_ranks})'
+                f'exchange {ten_meta.sharded_tensor_no_data.key}, '
+                f'{exchange_tensor.shape}({exchange_tensor.numel()}), '
+                f'broadcast({src_rank} -> {self.dp_group_ranks})'
             )
             torch.distributed.broadcast(
                 exchange_tensor, group=self.data_parallel_group, src=src_rank
