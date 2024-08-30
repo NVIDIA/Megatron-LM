@@ -1,23 +1,19 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import logging
-from typing import List, Literal, Optional, Tuple
+from typing import List, Literal, Optional
 
 import torch
 from torch import Tensor
 
-from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core import InferenceParams, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.transformer.enums import AttnMaskType, ModelType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
 
 class T5LMHead(MegatronModule):
@@ -28,8 +24,8 @@ class T5LMHead(MegatronModule):
         parallel_output (bool): wether output logits being distributed or not.
         vocab_size (int): vocabulary size
         pre_process (bool): Include embedding layer
-        share_embeddings_and_output_weights (bool): When True, input embeddings and output logit weights are
-            shared.
+        share_embeddings_and_output_weights (bool): When True, input
+            embeddings and output logit weights are shared.
     """
 
     def __init__(
@@ -81,9 +77,11 @@ class T5Model(LanguageModule):
 
         encoder_config (TransformerConfig): encoder transformer config
 
-        transformer_encoder_layer_spec (ModuleSpec): transformer layer customization specs for encoder
+        transformer_encoder_layer_spec (ModuleSpec): transformer layer
+            customization specs for encoder
 
-        transformer_decoder_layer_spec (ModuleSpec): transformer layer customization specs for decoder
+        transformer_decoder_layer_spec (ModuleSpec): transformer layer
+            customization specs for decoder
 
         vocab_size (int): vocabulary size
 
@@ -95,25 +93,30 @@ class T5Model(LanguageModule):
 
         fp16_lm_cross_entropy (bool, optional): Defaults to False
 
-        parallel_output (bool): Do not gather the outputs, keep them split across tensor parallel ranks
+        parallel_output (bool): Do not gather the outputs,
+            keep them split across tensor parallel ranks
 
-        share_embeddings_and_output_weights (bool): When True, input embeddings and output logit weights are
-            shared. Defaults to False.
+        share_embeddings_and_output_weights (bool): When True,
+            input embeddings and output logit weights are shared. Defaults to False.
 
-        position_embedding_type (string): Position embedding type. Options ['learned_absolute', 'rope'].
+        position_embedding_type (string): Position embedding type.
+            Options ['learned_absolute', 'rope'].
             Defaults is 'learned_absolute'.
 
         rotary_percent (float): Percent of rotary dimension to use for rotary position embeddings.
             Defaults to 1.0 (100%). Ignored unless position_embedding_type is 'rope'.
 
-        seq_len_interpolation_factor (float): scale of linearly interpolating RoPE for longer sequences.
-            The value must be a float larger than 1.0. Defaults to None.
+        seq_len_interpolation_factor (float): scale of linearly interpolating
+            RoPE for longer sequences. The value must be a float larger than 1.0.
+            Defaults to None.
 
-        add_encoder (bool): Create the encoder (used with pipeline parallelism). When using pipelining,
-            the encoder will only be created on a subset of the pipeline ranks.
+        add_encoder (bool): Create the encoder (used with pipeline parallelism).
+            When using pipelining, the encoder will only be created on a subset
+            of the pipeline ranks.
 
-        add_decoder (bool): Include an output layer (used with pipeline parallelism). As with `add_encoder`, when
-            using this model and pipelining, the decoder will only be created on a subset of the pipeline ranks.
+        add_decoder (bool): Include an output layer (used with pipeline parallelism).
+            As with `add_encoder`, when using this model and pipelining,
+            the decoder will only be created on a subset of the pipeline ranks.
     """
 
     def __init__(
@@ -154,12 +157,14 @@ class T5Model(LanguageModule):
         self.position_embedding_type = position_embedding_type
         self.encoder_hidden_state = None
 
-        # Tells schedules.py that this model has a skip connection between the encoder's output and the decoder
+        # Tells schedules.py that this model has a skip connection
+        # between the encoder's output and the decoder
         # (and hence both the encoder and decoder's tensors are required for correct backprop).
         self.xattn_needed = True
 
-        # specify the position embeddings as a member variable in the T5 class
-        # so that they are easy to find for `finalize_model_grads._allreduce_position_embedding_grads`
+        # specify the position embeddings as a member
+        # variable in the T5 class so that they are easy to
+        # find for `finalize_model_grads._allreduce_position_embedding_grads`
         self.position_embeddings = None
         if self.pre_process:
             self.embedding = LanguageModelEmbedding(
@@ -374,81 +379,20 @@ class T5Model(LanguageModule):
             return self.lm_head.output_layer.weight
         return None
 
-    def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
-    ) -> ShardedStateDict:
-        assert not sharded_offsets, "Unexpected sharded offsets"
-        sharded_state_dict = {}
-
-        if self.pre_process:
-            embedding_prefix = f'{prefix}embedding.'
-            embedding_sharded_state_dict = self.embedding.sharded_state_dict(
-                prefix=embedding_prefix, metadata=metadata
-            )
-            sharded_state_dict.update(embedding_sharded_state_dict)
-
-        encoder_prefix = f'{prefix}encoder.'
-        encoder_sharded_state_dict = self.encoder.sharded_state_dict(
-            prefix=encoder_prefix, metadata=metadata
-        )
-        sharded_state_dict.update(encoder_sharded_state_dict)
-
-        decoder_prefix = f'{prefix}decoder.'
-        decoder_sharded_state_dict = self.decoder.sharded_state_dict(
-            prefix=decoder_prefix, metadata=metadata
-        )
-        sharded_state_dict.update(decoder_sharded_state_dict)
-
-        if self.post_process:
-            output_layer_prefix = f'{prefix}output_layer.'
-            output_layer_weight_key = f'{output_layer_prefix}weight'
-            output_layer_bias_key = f'{output_layer_prefix}bias'
-            if self.share_embeddings_and_output_weights:
-                if not self.pre_process:
-                    # when sharing embeddings with last stage, we need to use the weights from the first stage
-                    # on pipeline first rank, word embeddings are saved to {prefix}embedding.word_embeddings.weight
-                    tensor = self.shared_embedding_or_output_weight()
-                    first_stage_word_emb_key = f'{prefix}embedding.word_embeddings.weight'
-                    dp_rank = parallel_state.get_data_parallel_rank()
-                    dp_size = parallel_state.get_data_parallel_world_size()
-                    last_stage_word_emb_replica_id = (
-                        dp_rank + dp_size
-                    )  # copy of first stage embedding
-
-                    sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
-                        tensor=tensor,
-                        key=first_stage_word_emb_key,
-                        replica_id=last_stage_word_emb_replica_id,
-                        allow_shape_mismatch=True,
-                    )
-
-                    sharded_state_dict[output_layer_weight_key] = sharded_output_layer_tensor
-                # output_layer.weight is shared, but we still need to process output_layer.bias
-                sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
-                    tensor=self.lm_head.output_layer.bias,
-                    key=output_layer_bias_key,
-                    allow_shape_mismatch=True,
-                )
-                sharded_state_dict[output_layer_bias_key] = sharded_output_layer_tensor
-            else:
-                output_layer_state_dict = self.output_layer.state_dict(
-                    prefix=output_layer_prefix, keep_vars=True
-                )
-                output_layer_tensor = output_layer_state_dict[output_layer_weight_key]
-                # independent output layer
-                sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
-                    tensor=output_layer_tensor,
-                    key=output_layer_weight_key,
-                    replica_id=parallel_state.get_data_parallel_rank(),
-                    allow_shape_mismatch=True,
-                )
-
-                sharded_state_dict[output_layer_weight_key] = sharded_output_layer_tensor
-
-        return sharded_state_dict
-
 
 def t5_extended_attention_mask(attention_mask_list: List[Tensor]) -> List[Tensor]:
+    """Creates the extended attention mask
+
+    Converts the attention mask of dimension [batch size, seq_len, seq_len]
+    to [batch size, 1, seq_len, seq_len]
+
+    Args:
+        attention_mask (Tensor): The input attention mask
+
+    Returns:
+        Tensor: The extended binary attention mask
+    """
+
     def attn_mask_postprocess(attn_mask):
         # [b, 1, s, s]
         extended_attention_mask = attn_mask.unsqueeze(1)
