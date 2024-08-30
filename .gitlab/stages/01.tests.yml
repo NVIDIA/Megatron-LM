@@ -1,9 +1,9 @@
 .tests_common:
   rules:
-    - if: ($FUNCTIONAL_TEST == "no" || $FUNCTIONAL_TEST == "yes" || $CONVERGENCE_TEST == "yes") && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
-    - if: $FUNCTIONAL_TEST == "no" || $FUNCTIONAL_TEST == "yes" || $CONVERGENCE_TEST == "yes"
-    - when: never
+      when: always
+    - when: always
   stage: test
 
 include:
