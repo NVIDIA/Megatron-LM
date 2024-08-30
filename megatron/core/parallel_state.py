@@ -630,7 +630,9 @@ def initialize_model_parallel(
         group = torch.distributed.new_group(
             ranks, timeout=timeout, pg_options=get_nccl_options('dp', nccl_comm_cfgs)
         )
-        group_gloo = torch.distributed.new_group(ranks, timeout=timeout, backend=os.getenv('CPU_COMMS_BACKEND_OVERRIDE', 'gloo'))
+        group_gloo = torch.distributed.new_group(
+            ranks, timeout=timeout, backend=os.getenv('CPU_COMMS_BACKEND_OVERRIDE', 'gloo')
+        )
         if rank in ranks:
             _DATA_PARALLEL_GROUP = group
             _DATA_PARALLEL_GROUP_GLOO = group_gloo
@@ -828,7 +830,9 @@ def initialize_model_parallel(
         group = torch.distributed.new_group(
             ranks, timeout=timeout, pg_options=get_nccl_options('dp_modulo_exp', nccl_comm_cfgs)
         )
-        group_gloo = torch.distributed.new_group(ranks, backend=os.getenv('CPU_COMMS_BACKEND_OVERRIDE', 'gloo'))
+        group_gloo = torch.distributed.new_group(
+            ranks, backend=os.getenv('CPU_COMMS_BACKEND_OVERRIDE', 'gloo')
+        )
         if rank in ranks:
             _DATA_MODULO_EXPERT_PARALLEL_GROUP = group
             _DATA_MODULO_EXPERT_PARALLEL_GROUP_GLOO = group_gloo
@@ -841,7 +845,9 @@ def initialize_model_parallel(
                 timeout=timeout,
                 pg_options=get_nccl_options('dp_modulo_exp_cp', nccl_comm_cfgs),
             )
-            group_gloo = torch.distributed.new_group(ranks, backend=os.getenv('CPU_COMMS_BACKEND_OVERRIDE', 'gloo'))
+            group_gloo = torch.distributed.new_group(
+                ranks, backend=os.getenv('CPU_COMMS_BACKEND_OVERRIDE', 'gloo')
+            )
         else:
             group = _DATA_MODULO_EXPERT_PARALLEL_GROUP
             group_gloo = _DATA_MODULO_EXPERT_PARALLEL_GROUP_GLOO
