@@ -34,7 +34,7 @@ build_image:
       set -x
       eval "IMAGE=\$$IMAGE"
 
-      docker system prune -a --filter "until=48h" -f
+      docker system prune -a --filter "until=24h" -f
 
       if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
         ADDITIONAL_PARAMS="--pull"
@@ -48,6 +48,7 @@ build_image:
         --build-arg CACHEBUST=$(cat /proc/sys/kernel/random/uuid) \
         --cache-to type=inline \
         --cache-from type=registry,ref=${IMAGE}:buildcache \
+        --cache-from type=registry,ref=${IMAGE}:${CI_PIPELINE_ID} \
         --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
         ${ADDITIONAL_PARAMS} .
 

@@ -9,11 +9,20 @@ import megatron.core.parallel_state as ps
 
 
 class TestModel(torch.nn.Module):
-    def __init__(self, input_dim: int, output_dim: int, num_layers: int, bias: bool):
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        num_layers: int,
+        bias: bool,
+        shared_embedding: bool = False,
+    ):
         super().__init__()
         self.layers = torch.nn.ModuleList(
             [torch.nn.Linear(input_dim, output_dim, bias) for _ in range(num_layers)]
         )
+        if shared_embedding:
+            self.layers[-1].weight.shared_embedding = True
 
 
 class Utils:
