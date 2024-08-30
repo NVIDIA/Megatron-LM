@@ -15,6 +15,7 @@ from megatron.energon import (
     get_val_datasets,
 )
 from megatron.core.num_microbatches_calculator import get_num_microbatches
+from megatron.core.parallel_state import get_tensor_model_parallel_rank
 from megatron.training import get_args, print_rank_0
 from megatron.training.checkpointing import get_checkpoint_name
 
@@ -62,6 +63,9 @@ def datasets_provider(worker_config=None):
 
 def train_valid_test_dataloaders_provider(train_val_test_num_samples):
     """Build multimodal train, validation and test dataloaders."""
+    if get_tensor_model_parallel_rank() != 0:
+        return None, None, None
+
     args = get_args()
 
     worker_debug_path = None

@@ -15,6 +15,7 @@ from megatron.training import get_args, get_timers, get_tokenizer, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
+from megatron.core.parallel_state import get_tensor_model_parallel_rank
 from config import get_language_model_config, get_vision_model_config, get_vision_projection_config
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from layer_specs import get_layer_spec, get_mlp_module_spec, get_layer_spec_te
@@ -44,7 +45,7 @@ def model_provider(
 
     print_rank_0('building a multimodal model ...')
 
-    num_image_tokens = get_image_token_count()
+    num_image_tokens = get_num_image_embeddings()
 
     old_seq_length = args.seq_length
     args.decoder_seq_length = args.seq_length + num_image_tokens
@@ -129,15 +130,17 @@ def get_batch(data_iterator):
 
     args = get_args()
 
+    imgs = None
     tokens = None
     labels = None
     loss_mask = None
     attention_mask = None
     position_ids = None
+    num_tiles = None
 
     # Broadcast data.
     torch.cuda.nvtx.range_push("get_data")
-    if data_iterator is not None:
+    if data_iterator is not None and get_tensor_model_parallel_rank() == 0:
         data = next(data_iterator)
     else:
         data = None
@@ -146,19 +149,17 @@ def get_batch(data_iterator):
     prompt_len = tensor_parallel.broadcast_data(["prompt_len"], data, torch.int64)["prompt_len"]
     target = tensor_parallel.broadcast_data(["target"], data, torch.int64)["target"]
 
-    data_img = tensor_parallel.broadcast_data(["img"], data, torch.float32)
+    imgs = tensor_parallel.broadcast_data(["imgs"], data, torch.float32)["imgs"]
+    num_tiles = tensor_parallel.broadcast_data(["num_tiles"], data, torch.int)["num_tiles"]
+
+    # Dummy image, no image.
+    if imgs.shape == torch.Size([1, 1]):
+        imgs = torch.tensor([], dtype=torch.float32, device=data_text.device)
+        num_tiles = torch.tensor([], dtype=torch.int, device=data_text.device)
 
     torch.cuda.nvtx.range_pop()
 
     tokens_ = data_text.long()
-
-    # Dummy image, no image.
-    img_raw = None
-    if bool( data_img['img'].shape == torch.Size([1, 1])):
-        if torch.distributed.get_rank() == 0:
-            assert "no-image" in data["__keys__"][0], f'invalid sample {data_img["img"].shape}, {data_img["img"]}, {data["img"]}'
-    else:
-        img_raw = data_img['img'].reshape(-1, 3, args.img_h, args.img_w)
 
     torch.cuda.nvtx.range_push("index tokens")
     tokenizer = get_tokenizer()
@@ -184,10 +185,11 @@ def get_batch(data_iterator):
                                         )
     torch.cuda.nvtx.range_pop()
 
-    return tokens, labels, loss_mask, attention_mask, position_ids, img_raw
+    return tokens, labels, loss_mask, attention_mask, position_ids, imgs, num_tiles
 
 
-def get_image_token_count():
+def get_num_image_embeddings():
+    """Get the number of image embeddings per tile."""
     args = get_args()
 
     add_class_token = not args.disable_vision_class_token
@@ -195,9 +197,14 @@ def get_image_token_count():
     num_patches_per_dim_h = args.img_h // args.patch_dim
     num_patches_per_dim_w = args.img_w // args.patch_dim
     num_patches = num_patches_per_dim_h * num_patches_per_dim_w
-    num_image_tokens = num_patches + (1 if add_class_token else 0)
+    num_image_embeddings_per_tile = num_patches + (1 if add_class_token else 0)
 
-    return num_image_tokens
+    max_num_image_embeddings = (args.max_num_tiles + int(args.use_thumbnail)) * num_image_embeddings_per_tile
+
+    if max_num_image_embeddings > args.max_position_embeddings:
+        raise RuntimeError(f"Too many image embeddings {max_num_image_embeddings} for language model max embedding size {args.max_position_embeddings}")
+
+    return num_image_embeddings_per_tile
 
 
 def get_ltor_masks_and_position_ids(data,
@@ -322,10 +329,10 @@ def forward_step(data_iterator, model: LLaVAModel):
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()
-    tokens, labels, loss_mask, attention_mask, position_ids, images = get_batch(data_iterator)
+    tokens, labels, loss_mask, attention_mask, position_ids, images, num_image_tiles = get_batch(data_iterator)
     timers('batch-generator').stop()
 
-    output_tensor, loss_mask = model(images, tokens, position_ids, attention_mask, labels, loss_mask)
+    output_tensor, loss_mask = model(images, tokens, position_ids, attention_mask, labels, loss_mask, num_image_tiles=num_image_tiles)
 
     return output_tensor, partial(loss_func, loss_mask)
 
@@ -347,6 +354,10 @@ def add_multimodal_extra_args(parser):
     group.add_argument("--allow-missing-vision-projection-checkpoint", action="store_true", default=False)
     group.add_argument("--use-te", action="store_true", default=False)
     group.add_argument("--dataloader-save", type=str, default=None, help="Energon dataloader state save path")
+    group.add_argument("--use-tiling", action="store_true", default=False, help="Use input image tiling")
+    group.add_argument("--max-num-tiles", type=int, default=1, help="Maximum number of image tiles")
+    group.add_argument("--use-thumbnail", action="store_true", default=False, help="Add image thumbnail as a tile")
+
     return parser
 
 

@@ -25,8 +25,8 @@ from MMMU.eval.utils.data_utils import (
 )
 from MMMU.eval.utils.eval_utils import parse_multi_choice_response
 from PIL import Image
-from torchvision.transforms import Compose, Resize, ToPILImage
-from train import add_multimodal_extra_args, get_image_token_count, model_provider
+from image_processing import get_visual_transform
+from train import add_multimodal_extra_args, get_num_image_embeddings, model_provider
 
 from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN_INDEX
 from megatron.inference.text_generation.api import generate_and_post_process
@@ -78,44 +78,6 @@ def add_text_generation_args(parser):
     return parser
 
 
-def preprocess_image(target_h, target_w, img):
-    """Example image preprocessing. Resizes input image to target size.
-
-    Args:
-        target_h (int): Target height in pixels.
-        target_w (int): Target width in pixels
-        img (np.array [h, w, c]): Input image in a numpy array.
-
-    Returns:
-        output_img (torch.Tensor [c, h, w]): Input image resized to target size.
-    """
-    # Imagenet's mean and std for normalization.
-    pixel_mean = [123.675, 116.28, 103.53]
-    pixel_std = [58.395, 57.12, 57.375]
-    pixel_mean = torch.Tensor(pixel_mean).view(-1, 1, 1)
-    pixel_std = torch.Tensor(pixel_std).view(-1, 1, 1)
-
-    # Resize image considering ratio between input and target image sizes.
-    img_h, img_w = img.shape[0], img.shape[1]
-    ratio = float(max(target_h, target_w)) / max(img_h, img_w)
-
-    scaled_h, scaled_w = int(img_h * ratio + 0.5), int(img_w * ratio + 0.5)
-
-    image_transform = Compose(
-        [ToPILImage(), Resize((scaled_h, scaled_w)), lambda x: x.convert("RGB")]
-    )
-    img = image_transform(img)
-
-    # Normalize pixel values.
-    img = (torch.Tensor(np.array(img)).permute(2, 0, 1) - pixel_mean) / pixel_std
-
-    # Pad to target size.
-    delta_h, delta_w = target_h - scaled_h, target_w - scaled_w
-    output_img = torch.nn.functional.pad(img, (0, delta_w, 0, delta_h))
-
-    return output_img
-
-
 def _get_partition_bounds(
     total_num_samples, num_samples_per_partition, num_partitions, partition_id
 ):
@@ -129,6 +91,7 @@ def generate_samples(model):
     args = get_args()
 
     images = []
+    tile_counts = []
     questions, answers = [], []
     samples, sample_ids = [], []
 
@@ -151,9 +114,19 @@ def generate_samples(model):
             if not os.path.exists(img_file):
                 img_file = img_file.replace('.jpg', '.png')
 
-            img_sample = np.array(Image.open(img_file))
-            processed_img = preprocess_image(args.img_h, args.img_w, img_sample)
-            images.append(processed_img.reshape(-1, 3, args.img_h, args.img_w))
+            img = Image.open(img_file)
+            imgs = get_visual_transform(
+                img,
+                args.img_h,
+                args.img_w,
+                args.use_tiling,
+                args.max_num_tiles,
+                args.use_thumbnail,
+                augment=False,
+            )
+
+            images.append(imgs)
+            tile_counts.append(torch.tensor([len(imgs)], dtype=torch.int))
 
             questions.append(sample["question"])
             answers.append(sample["answers"])
@@ -178,9 +151,19 @@ def generate_samples(model):
 
             img_file = "{}/{}".format(args.input_image_path, sample["image"])
 
-            img_sample = np.array(Image.open(img_file))
-            processed_img = preprocess_image(args.img_h, args.img_w, img_sample)
-            images.append(processed_img.reshape(-1, 3, args.img_h, args.img_w))
+            img = Image.open(img_file)
+            imgs = get_visual_transform(
+                img,
+                args.img_h,
+                args.img_w,
+                args.use_tiling,
+                args.max_num_tiles,
+                args.use_thumbnail,
+                augment=False,
+            )
+
+            images.append(imgs)
+            tile_counts.append(torch.tensor([len(imgs)], dtype=torch.int))
 
             questions.append(sample["question"])
             answers.append(sample["answer"])
@@ -206,10 +189,19 @@ def generate_samples(model):
         # Run image preprocessing.
         for i in range(num_samples):
             image_file = image_files[i]
-            img = np.array(Image.open(image_file))
-            img = preprocess_image(args.img_h, args.img_w, img)
+            img = Image.open(image_file)
+            imgs = get_visual_transform(
+                img,
+                args.img_h,
+                args.img_w,
+                args.use_tiling,
+                args.max_num_tiles,
+                args.use_thumbnail,
+                augment=False,
+            )
 
-            images.append(img.reshape(-1, 3, args.img_h, args.img_w))
+            images.append(imgs)
+            tile_counts.append(torch.tensor([len(imgs)], dtype=torch.int))
 
             image_id = int(image_file.split("_")[-1].split(".")[0])
             sample_ids.append(image_id)
@@ -259,9 +251,19 @@ def generate_samples(model):
             sample = process_single_sample(sample)
             sample = construct_prompt(sample, config)
 
-            img = np.array(sample['image'].convert("RGB"))
-            img = preprocess_image(args.img_h, args.img_w, img)
-            images.append(img.reshape(-1, 3, args.img_h, args.img_w))
+            img = sample["image"]
+            imgs = get_visual_transform(
+                img,
+                args.img_h,
+                args.img_w,
+                args.use_tiling,
+                args.max_num_tiles,
+                args.use_thumbnail,
+                augment=False,
+            )
+
+            images.append(imgs)
+            tile_counts.append(torch.tensor([len(imgs)], dtype=torch.int))
 
             sample_ids.append(sample['id'])
 
@@ -280,12 +282,13 @@ def generate_samples(model):
 
     idx = 0
     while idx < num_samples:
-        image = images[idx].cuda()
+        imgs = torch.stack(images[idx]).cuda()
+        num_tiles = tile_counts[idx].cuda()
         sample_id = sample_ids[idx]
 
         prompt = get_prompt(args.task, questions, idx, args.prompt_format)
 
-        forward_step = partial(VLMForwardStep, image, get_image_token_count())
+        forward_step = partial(VLMForwardStep, imgs, num_tiles)
 
         if torch.distributed.get_rank() == 0:
             resp_sentences, _, _, _ = generate_and_post_process(
@@ -298,7 +301,7 @@ def generate_samples(model):
                 top_p_sampling=args.top_p,
                 add_BOS=False,
                 temperature=args.temperature,
-                random_seed=123,
+                random_seed=args.seed,
             )
 
             for prompt, generation in zip([prompt], resp_sentences):
@@ -352,9 +355,13 @@ def generate_and_write_samples(model):
 
 
 class VLMForwardStep(ForwardStep):
-    def __init__(self, images, num_image_tokens, model, max_batch_size, max_sequence_length):
-        super().__init__(model, max_batch_size, max_sequence_length + num_image_tokens)
+    def __init__(self, images, num_tiles, model, max_batch_size, max_sequence_length):
+        total_num_tiles = torch.sum(num_tiles).item()
+        num_img_embeddings = get_num_image_embeddings() * total_num_tiles
+
+        super().__init__(model, max_batch_size, max_sequence_length + num_img_embeddings)
         self._images = images
+        self._num_tiles = num_tiles
 
     def _forward(self, tokens, position_ids, attention_mask):
         return self.model(
@@ -363,6 +370,7 @@ class VLMForwardStep(ForwardStep):
             position_ids,
             attention_mask=None,
             inference_params=self.inference_params,
+            num_image_tiles=self._num_tiles,
         )
 
     def __call__(self, tokens, position_ids, attention_mask):
@@ -370,11 +378,11 @@ class VLMForwardStep(ForwardStep):
 
         # On the first inference iteration, we compute image tokens.
         # Update the sequence length offset by the number of image tokens.
-        num_image_tokens = (tokens == -200).sum().item()
+        num_images = (tokens == -200).sum().item()
         num_tokens = tokens.size(1)
-        if num_tokens > 1 and num_image_tokens > 0:
+        if num_tokens > 1 and num_images > 0:
             self.inference_params.sequence_len_offset += (
-                self.inference_params.key_value_memory_dict["image_tokens_count"] - num_image_tokens
+                self.inference_params.key_value_memory_dict["image_tokens_count"] - num_images
             )
 
         return logits

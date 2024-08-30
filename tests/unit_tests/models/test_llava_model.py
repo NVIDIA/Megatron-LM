@@ -40,7 +40,7 @@ class TestLLaVAModel:
             language_transformer_config=language_config,
             language_transformer_layer_spec=language_layer_spec,
             language_vocab_size=2048,
-            language_max_sequence_length=1024,
+            language_max_sequence_length=4096,
             vision_transformer_config=vision_config,
             vision_transformer_layer_spec=vision_layer_spec,
             drop_vision_class_token=False,
@@ -60,7 +60,7 @@ class TestLLaVAModel:
         assert isinstance(self.model, LLaVAModel)
 
         num_weights = sum([p.numel() for p in self.model.parameters()])
-        assert num_weights == 1439304
+        assert num_weights == 1832520
 
     @pytest.mark.internal
     def test_set_input_tensor(self):
@@ -285,6 +285,19 @@ class TestLLaVAModel:
         img_seq_len = 577
         max_seq_len = img_seq_len * 3 - 2 + 1024
         assert loss.shape == new_loss_mask.shape == torch.Size((5, max_seq_len))
+
+        # Try text-only input.
+        loss, new_loss_mask = self.model.forward(
+            torch.tensor([], dtype=torch.float).cuda(),
+            torch.randint(0, 2048, (5, 1024)).cuda(),
+            position_ids,
+            attention_mask,
+            torch.randint(0, 2048, (5, 1024)).cuda(),
+            loss_mask,
+            num_image_tiles=torch.tensor([], dtype=torch.int).cuda(),
+        )
+
+        assert loss.shape == new_loss_mask.shape == torch.Size((5, 1024))
 
         # Try without labels and without inference params.
         logits = self.model.forward(

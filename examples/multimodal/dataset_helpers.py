@@ -8,12 +8,12 @@ import traceback
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from image_processing import get_visual_transform
 import conversation as conversation_lib
 import numpy as np
 import torch
 from PIL import Image, ImageDraw
 from torchvision import transforms as T
-from torchvision.transforms import Compose, RandAugment, RandomResizedCrop, Resize, ToPILImage
 
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, IMAGE_TOKEN_INDEX
 from megatron.energon import (
@@ -28,43 +28,6 @@ from megatron.energon.transforms import CustomTransform, MergeTransform
 from megatron.training import get_args
 from megatron.training.tokenizer import build_tokenizer
 
-try:
-    from torchvision.transforms import InterpolationMode
-    BICUBIC = InterpolationMode.BICUBIC
-except ImportError:
-    BICUBIC = Image.BICUBIC
-
-
-# Imagenet's mean and std.
-pixel_mean = [123.675, 116.28, 103.53]
-pixel_std = [58.395, 57.12, 57.375]
-
-
-def convert_to_rgb(image):
-    return image.convert("RGB")
-
-def _transform_train(img_h, img_w):
-    return Compose([
-        ToPILImage(),
-        RandomResizedCrop((img_h, img_w), scale=(0.5, 1.0)),
-        convert_to_rgb,
-    ])
-
-def _transform_train_aug(img_h, img_w):
-    return Compose([
-        ToPILImage(),
-        RandomResizedCrop((img_h, img_w), scale=(0.5, 1.0)),
-        convert_to_rgb,
-        RandAugment(2, 5, isPIL=True, augs=['Identity', 'AutoContrast', 'Brightness', 'Sharpness', 'Equalize',
-                                              'ShearX', 'ShearY', 'TranslateX', 'TranslateY', 'Rotate']),
-    ])
-
-def _transform_test(img_h, img_w):
-    return Compose([
-        ToPILImage(),
-        Resize((img_h, img_w)),
-        convert_to_rgb,
-    ])
 
 class RandomResize(CustomTransform):
     """Resizes the image by a random scale factor in the given interval, but at most max_size"""
@@ -202,11 +165,11 @@ class ImageTaskSample:
     __key__: str
     __subflavors__: Dict
     # (c, h, w)
-    img: torch.Tensor
+    imgs: List[torch.Tensor]
+    num_tiles: List[int]
     text: np.ndarray
     prompt_len: np.int64
     target: torch.Tensor = None
-    img_size: Optional[tuple] = None
 
 
 # Typing for the resulting batch data after encode_batch()
@@ -214,8 +177,9 @@ class ImageTaskSample:
 class ImageTaskBatch(Batch):
     __keys__: List[str]
     __subflavors__: List[Dict]
-    # (n, c, h, w)
-    img: torch.Tensor
+    # (num_tiles, c, h, w)
+    imgs: torch.Tensor
+    num_tiles: List[int]
     # (n, seq_len)
     text: torch.Tensor
     # (n, 1)
@@ -233,7 +197,6 @@ class Tokenizer:
         args = get_args()
         self.args = args
 
-        self.IMAGE_TOKEN_INDEX = -200
         self.initializer()
 
     def initializer(self):
@@ -297,40 +260,9 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
 
         self.img_h, self.img_w = self.args.img_h, self.args.img_w
 
-        self.pixel_mean = torch.Tensor(pixel_mean).view(-1, 1, 1)
-        self.pixel_std = torch.Tensor(pixel_std).view(-1, 1, 1)
-
         self.ocr_document_visual_transform = _get_ocr_document_visual_transform(self.img_h, self.img_w)
         self.ocr_document_identity_transform = _get_ocr_document_identity_transform(self.img_h, self.img_w)
         self.ocr_paragraph_visual_transform = _get_ocr_paragraph_visual_transform(self.img_h, self.img_w)
-
-    def get_visual_transform(self, img_sample, sample_augmentation=False):
-        img_sample = np.array(img_sample)
-
-        raw_h, raw_w = img_sample.shape[0], img_sample.shape[1]
-        ratio = float(max(self.img_h, self.img_w)) / max(raw_h, raw_w)
-        scaled_h, scaled_w = int(raw_h * ratio + 0.5), int(raw_w * ratio + 0.5)
-
-        # if the sample needs augmentation or not
-        if sample_augmentation:
-            # further check if augmentation is a global flag in args
-            if self.args.aug:
-                visual_transform = _transform_train_aug(scaled_h, scaled_w)
-            else:
-                visual_transform = _transform_train(scaled_h, scaled_w)
-        else:
-            visual_transform = _transform_test(scaled_h, scaled_w)
-
-        img = visual_transform(img_sample)
-
-        # Normalize pixel values.
-        img = (torch.Tensor(np.array(img)).permute(2, 0, 1) - self.pixel_mean) / self.pixel_std
-
-        # Pad to target image size.
-        delta_h, delta_w = self.img_h - scaled_h, self.img_w - scaled_w
-        img = torch.nn.functional.pad(img, (0, delta_w, 0, delta_h))
-
-        return img
 
     def encode_sample(self, sample: Union[CaptioningSample, OCRSample, VQASample, SimilarityInterleavedSample]):
         if isinstance(sample, OCRSample):
@@ -353,14 +285,13 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
             raise NotImplementedError('Sample format not supported')
 
     def encode_captioning(self, sample: CaptioningSample):
-        sample_augmentation = sample.__subflavors__.get("augmentation")
+        augment = sample.__subflavors__.get("augmentation")
         conv_format = sample.__subflavors__['conv_format'] if 'conv_format' in sample.__subflavors__ else 'mistral'
-        no_instruction = sample.__subflavors__['no_instruction'] if 'no_instruction' in sample.__subflavors__ else False
 
-        img_size = np.array(sample.image.size)
-        img = self.get_visual_transform(
-            np.array(sample.image), sample_augmentation=sample_augmentation
+        imgs = get_visual_transform(
+            sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles, self.args.use_thumbnail, augment,
         )
+        num_tiles = [len(imgs)]
 
         prompt_list = self.manual_prompts["CaptioningPretraining"]["llava"]
 
@@ -396,23 +327,25 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
         return ImageTaskSample(
             __key__=sample.__key__,
             __subflavors__=sample.__subflavors__,
-            img=img,
+            imgs=imgs,
+            num_tiles=num_tiles,
             text=input_ids,
             prompt_len=prompt_len,
             target=target,
-            img_size=img_size
         )
 
     def encode_llava_pretrain(self, sample: VQASample):
-        sample_augmentation = sample.__subflavors__['augmentation'] if 'augmentation' in sample.__subflavors__ else False
-
+        augment = sample.__subflavors__['augmentation'] if 'augmentation' in sample.__subflavors__ else False
         use_chat_format = sample.__subflavors__['use_chat_format'] if 'use_chat_format' in sample.__subflavors__ else False
         conv_format = sample.__subflavors__['conv_format'] if 'conv_format' in sample.__subflavors__ else "mistral"
 
-        img_size = np.array(sample.image.size)
-        img = self.get_visual_transform(sample.image, sample_augmentation=sample_augmentation)
+        imgs = get_visual_transform(
+            sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles, self.args.use_thumbnail, augment,
+        )
+        num_tiles = [len(imgs)]
 
         assert "<image>" in sample.context
+        has_image = True
 
         if use_chat_format:
             prompt_idx = np.random.randint(len(self.manual_prompts["Captioning"]["raw"]))
@@ -428,10 +361,10 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
             elif conv_format == "mistral":
                 conversation = sample.context + sample.answers + conversation_lib.mistral_instruct.sep2
 
-        input_ids = np.array(tokenizer_image_token(self.args, conversation, self.tokenizer, has_image=True))
+        input_ids = np.array(tokenizer_image_token(self.args, conversation, self.tokenizer, has_image=has_image))
         target = input_ids.copy()
 
-        prompt_len = len(tokenizer_image_token(self.args, sample.context, self.tokenizer))
+        prompt_len = len(tokenizer_image_token(self.args, sample.context, self.tokenizer, has_image=has_image))
         target[:prompt_len] = IGNORE_INDEX
 
         input_ids = self.tokenizer.pad(input_ids, self.max_seq_len+1) # pad with EOD
@@ -440,27 +373,27 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
         return ImageTaskSample(
             __key__=sample.__key__,
             __subflavors__=sample.__subflavors__,
-            img=img,
+            imgs=imgs,
+            num_tiles=num_tiles,
             text=input_ids,
             prompt_len=prompt_len,
             target=target,
-            img_size=img_size
         )
 
     # Based on https://github.com/haotian-liu/LLaVA/blob/c121f0432da27facab705978f83c4ada465e46fd/llava/train/train.py#L500
     def encode_llava_sft(self, sample: SimilarityInterleavedSample):
-        sample_augmentation = sample.__subflavors__['augmentation'] if 'augmentation' in sample.__subflavors__ else False
+        augment = sample.__subflavors__['augmentation'] if 'augmentation' in sample.__subflavors__ else False
         use_chat_format = sample.__subflavors__['use_chat_format'] if 'use_chat_format' in sample.__subflavors__ else False
         has_image = sample.__subflavors__['has_image'] if 'has_image' in sample.__subflavors__ else False
-        no_instruction = sample.__subflavors__['no_instruction'] if 'no_instruction' in sample.__subflavors__ else False
         conv_format = sample.__subflavors__['conv_format'] if 'conv_format' in sample.__subflavors__ else "mistral"
 
         if has_image:
-            img_size = np.array(sample.images[0].size)
-            img = self.get_visual_transform(sample.images[0], sample_augmentation=sample_augmentation)
+            imgs = get_visual_transform(
+                sample.images[0], self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles, self.args.use_thumbnail, augment,
+            )
+            num_tiles = [len(imgs)]
         else:
-            img_size = np.array([0,0])
-            img = torch.from_numpy(np.array([-1]).astype(np.float32))
+            imgs = num_tiles = []
             sample.__key__ = "{}-{}".format("no-image", sample.__key__)
 
         if conv_format == 'llama3_sft':
@@ -580,19 +513,20 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
         return ImageTaskSample(
             __key__=sample.__key__,
             __subflavors__=sample.__subflavors__,
-            img=img,
+            imgs=imgs,
+            num_tiles=num_tiles,
             text=input_ids,
             prompt_len=instruction_len,
             target=target,
-            img_size=img_size
         )
 
     def encode_vqa(self, sample: VQASample):
-        sample_augmentation = sample.__subflavors__['augmentation'] if 'augmentation' in sample.__subflavors__ else False
+        augment = sample.__subflavors__['augmentation'] if 'augmentation' in sample.__subflavors__ else False
 
-        img = self.get_visual_transform(sample.image, sample_augmentation=sample_augmentation)
-
-        img_size = np.array(sample.image.size)
+        imgs = get_visual_transform(
+            sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles, self.args.use_thumbnail, augment,
+        )
+        num_tiles = [len(imgs)]
 
         if sample.context[-1:] != "\n":
             sample.context = sample.context + "\n"
@@ -621,11 +555,11 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
         return ImageTaskSample(
             __key__=sample.__key__,
             __subflavors__=sample.__subflavors__,
-            img=img,
+            imgs=imgs,
+            num_tiles=num_tiles,
             text=text_sample,
             prompt_len=prompt_len,
             target=target,
-            img_size=img_size
         )
 
     def encode_ocr(self, sample: OCRSample) -> ImageTaskSample:
@@ -681,16 +615,30 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
         return ImageTaskSample(
             __key__=sample.__key__,
             __subflavors__=sample.__subflavors__,
-            img=img,
+            imgs=[img],
+            num_tiles=[1],
             text=text_sample,
             prompt_len=prompt_len
         )
 
     def batch(self, samples: List[ImageTaskSample]) -> ImageTaskBatch:
+        # Stack images to [num_tiles, c, h, w]. If there are no images (text-only), then use a dummy image.
+        imgs = [img for s in samples for img in s.imgs]
+        if len(imgs) > 0:
+            imgs = torch.stack(imgs)
+        else:
+            imgs = torch.tensor([[0]], dtype=torch.float32)
+
+        # Put tile counts to a single tensor. If there are no images (text-only), then use a dummy tensor.
+        num_tiles = torch.tensor([n for s in samples for n in s.num_tiles], dtype=torch.int)
+        if len(num_tiles) == 0:
+            num_tiles = torch.tensor([[0]], dtype=torch.int)
+
         batch = ImageTaskBatch(
             __keys__=[s.__key__ for s in samples],
             __subflavors__=[s.__subflavors__ for s in samples],
-            img=torch.stack([s.img for s in samples]),
+            imgs=imgs,
+            num_tiles=num_tiles,
             text=torch.from_numpy(np.stack([s.text for s in samples], axis=0).astype(np.int64)),
             prompt_len=torch.from_numpy(np.array([s.prompt_len for s in samples], dtype=np.int64)),
             target=torch.from_numpy(np.stack([s.target for s in samples], axis=0).astype(np.int64)),
