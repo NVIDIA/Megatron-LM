@@ -138,40 +138,61 @@ else
                             ')
     done
 
-    echo "$JET_LOGS" | jq 'length'
-    BLOCKS=$(echo -e "$FAILED_JET_LOGS" \
-                | jq --arg DATE "$DATE" --arg CONTEXT "$CONTEXT" --arg URL "$PIPELINE_URL" '
-                    [
-                        {                
-                            "type": "section",
-                            "text": {            
-                                "type": "mrkdwn",
-                                "text": ("<" + $URL + "|Report of " + $DATE + " (" + $CONTEXT + ")>:")
+    NUM_FAILED=$(echo "$FAILED_JET_LOGS" | jq 'length')
+    NUM_TOTAL=$(echo "$JET_LOGS" | jq 'length')
+
+    if [[ $NUM_FAILED -eq 0 ]]; then
+        BLOCKS='[
+            {                
+                "type": "section",
+                "text": {            
+                    "type": "mrkdwn",
+                    "text": "<'$PIPELINE_URL'|Report of '$DATE' ('$CONTEXT')>: All '$NUM_TOTAL' passed :doge3d:"
+                }
+            },
+            {                
+                "type": "section",
+                "text": {            
+                    "type": "mrkdwn",
+                    "text": "==============================================="
+                }
+            }
+        ]'
+    else
+        BLOCKS=$(echo -e "$FAILED_JET_LOGS" \
+                    | jq --arg DATE "$DATE" --arg CONTEXT "$CONTEXT" --arg URL "$PIPELINE_URL" --arg NUM_FAILED "$NUM_FAILED" --arg NUM_TOTAL "$NUM_TOTAL" '
+                        [
+                            {                
+                                "type": "section",
+                                "text": {            
+                                    "type": "mrkdwn",
+                                    "text": ("<" + $URL + "|Report of " + $DATE + " (" + $CONTEXT + ")>: " + $NUM_FAILED + " of " + $NUM_TOTAL + " failed :doctorge:")
+                                }
                             }
-                        }
-                    ] + [
-                        .[] 
-                        | {                
-                            "type": "section",
-                            "text": {            
-                                "type": "mrkdwn",
-                                "text": (                               
-                                    "• Job: <" +.url + "|" + .name + ">"
-                                    + "\n    SLURM failure reason: \n```" + .slurm_failure_reason[-2000:] + "```"
-                                    
-                                )
+                        ] + [
+                            .[] 
+                            | {                
+                                "type": "section",
+                                "text": {            
+                                    "type": "mrkdwn",
+                                    "text": (                               
+                                        "• Job: <" +.url + "|" + .name + ">"
+                                        + "\n    SLURM failure reason: \n```" + .slurm_failure_reason[-2000:] + "```"
+                                        
+                                    )
+                                }
                             }
-                        }
-                    ] + [
-                        {                
-                            "type": "section",
-                            "text": {            
-                                "type": "mrkdwn",
-                                "text": ("===============================================")
+                        ] + [
+                            {                
+                                "type": "section",
+                                "text": {            
+                                    "type": "mrkdwn",
+                                    "text": ("===============================================")
+                                }
                             }
-                        }
-                    ]'
-    )
+                        ]'
+        )
+    fi
 
     for row in $(echo "${BLOCKS}" | jq -r '.[] | @base64'); do
         _jq() {
