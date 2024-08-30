@@ -19,6 +19,8 @@ from megatron.core.utils import make_viewless_tensor
 
 @dataclass
 class TransformerLayerSubmodules:
+    """TransformerLayer submodule type class."""
+
     input_layernorm: Union[ModuleSpec, type] = IdentityOp
     self_attention: Union[ModuleSpec, type] = IdentityOp
     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
@@ -159,13 +161,14 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
     def forward(
         self,
         hidden_states,
-        attention_mask,
+        attention_mask=None,
         context=None,
         context_mask=None,
         rotary_pos_emb=None,
         inference_params=None,
         packed_seq_params=None,
     ):
+        """forward() method for TransformerLayer class."""
         # hidden_states: [s, b, h]
 
         # Residual connection.
@@ -240,11 +243,15 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
+        # CUDA graph requires returned values to be Tensors
+        if self.config.enable_cuda_graph and self.training:
+            return output
         return output, context
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
+        """sharded_state_dict() method for TransformerLayer class."""
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
         prefixed_map = {
             f'{prefix}{k}': f'{prefix}{v}'
