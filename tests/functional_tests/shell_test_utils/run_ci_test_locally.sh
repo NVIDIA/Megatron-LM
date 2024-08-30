@@ -9,24 +9,35 @@
 #
 ########################################################################################
 
-set -euxo pipefail
+set -exo pipefail
+
+echo "------ARGUMENTS LIST --------"
+for ARGUMENT in "$@"; do
+    KEY=$(echo $ARGUMENT | cut -f1 -d=)
+
+    KEY_LENGTH=${#KEY}
+    VALUE="${ARGUMENT:$KEY_LENGTH+1}"
+
+    export "$KEY"="$VALUE"
+    echo "$KEY=$VALUE"
+done
+echo "---------------------------------"
 
 # Check that mandatory vars are set
 MANDATORY_VARS=(
     "MODEL"
-    "MCORE_RELEASE_NUM"
+    "VARIANT"
     "TRAINING_SCRIPT_PATH"
-    "TRAINING_PARAMS_PATH"
     "OUTPUT_PATH"
     "IMAGE_TAG"
     "NODES"
     "PPP"
     "PARTITION"
     "ITERATIONS"
-    "GITLAB_TOKEN"
     "WANDB_API_KEY"
     "CLUSTER"
     "DATASET"
+    "WANDB_EXPERIMENT"
 )
 for mandatory_var in "${MANDATORY_VARS[@]}"; do
     if [[ -z "${!mandatory_var}" ]]; then
@@ -35,48 +46,40 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
     fi
 done
 
-DATA_PATH=$(jet \
-    -c \
-    -tf plain \
-    -th \
-    artifacts \
-        registry \
-            list \
-            -c storages.$CLUSTER.identifier \
-            -f 'key == "'$DATASET'"'
-)
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+ROOT_DIR=$(realpath $SCRIPT_DIR/../../../)
+
+# Fetch dataset base path via JET and refresh DATA_BELDN
+DATA_PATH=$(jet -c -tf plain -th artifacts registry list -c storages.$CLUSTER.identifier -f "key == '$DATASET'")
+DATA_BLEND=$(eval echo "$DATA_BLEND")
 
 ########################################################################################
 # Dont change below
 ########################################################################################
 
+SLURM_LOGS=$OUTPUT_PATH/slurm_logs/
+mkdir -p $SLURM_LOGS
+
 # Container settings
-IMAGE="gitlab-master.nvidia.com/adlr/megatron-lm/mcore_ci:$IMAGE_TAG"
-MOUNTS="${DATA_PATH}:${DATA_PATH},${OUTPUT_PATH}:${OUTPUT_PATH}"
-MODEL_TYPE=$(basename $TRAINING_SCRIPT_PATH | awk -F'[_.]' '{print $2}')
-GOLDEN_VALUES_PATH=${OUTPUT_PATH}/$MODEL.json
-GOLDEN_VALUES_PATH_IN_REPO=./tests/functional_tests/test_results/$MODEL_TYPE/$MODEL-${MCORE_RELEASE_NUM}.json
 ARGUMENTS=(
     "TRAINING_SCRIPT_PATH=${TRAINING_SCRIPT_PATH}"
-    "TRAINING_PARAMS_PATH=${TRAINING_PARAMS_PATH}"
-    "DATA_PATH=${DATA_PATH}"
-    "DATA_CACHE_PATH=${OUTPUT_PATH}/data-cache"
+    "TEST_CASE_PATH=./tests/functional_tests/test_cases/$MODEL/$VARIANT"
     "OUTPUT_PATH=${OUTPUT_PATH}"
     "TENSORBOARD_PATH=${OUTPUT_PATH}/tensorboard"
     "CHECKPOINT_PATH=${OUTPUT_PATH}/checkpoints"
+    "DATA_PATH=${DATA_PATH}"
+    "DATA_CACHE_PATH=${OUTPUT_PATH}/data-cache"
     "WANDB_API_KEY=${WANDB_API_KEY}"
-    "GOLDEN_VALUES_PATH=${GOLDEN_VALUES_PATH}/$MODEL_TYPE/$MODEL.json"
-    "MCORE_RELEASE_NUM=${MCORE_RELEASE_NUM}"
+    "WANDB_EXPERIMENT=${WANDB_EXPERIMENT}"
+    "DATA_BLEND=\"${DATA_BLEND}\""
 )
-SLURM_LOGS=$OUTPUT_PATH/slurm_logs/
-mkdir -p $SLURM_LOGS
 
 echo ${ARGUMENTS[@]}
 
 while : 
 do
-ACTUAL_ITERATIONS=$(cat "$OUTPUT_PATH/checkpoints/latest_checkpointed_iteration.txt" || echo 0)
-if [[ $ACTUAL_ITERATIONS -gt $ITERATIONS ]]; then
+
+if [[ $(cat "${OUTPUT_PATH}/checkpoints/latest_checkpointed_iteration.txt" || echo 0) -gt $ITERATIONS ]]; then
     break
 fi
 
@@ -102,21 +105,13 @@ echo "SLURM_JOB_ID=\$SLURM_JOB_ID" > "$SLURM_LOGS/\${SLURM_JOB_ID}.log"
 
 srun \
     --ntasks-per-node=1 \
-    --container-image=${IMAGE} \
-    --container-mounts=${MOUNTS} \
+    --container-image="gitlab-master.nvidia.com/adlr/megatron-lm/mcore_ci:$IMAGE_TAG" \
+    --container-mounts="${DATA_PATH}:${DATA_PATH},${OUTPUT_PATH}:${OUTPUT_PATH}" \
     --container-workdir=/workspace/megatron-lm \
-    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${ARGUMENTS[@]} >>"$SLURM_LOGS/\${SLURM_JOB_ID}.log" 2>&1
+    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${ARGUMENTS[@]}>>"$SLURM_LOGS/\${SLURM_JOB_ID}.log" 2>&1
 EOF
 set -e
 done
 
 # Write golden values into repo if this run should become a reference
-cp $GOLDEN_VALUES_PATH > $GOLDEN_VALUES_PATH_IN_REPO
-
-# Finally upload everything to JET
-jet artifacts registry add \
-    --token $GITLAB_TOKEN \
-    --source-path $OUTPUT_PATH \
-    --automerge \
-    --reference-storage $CLUSTER:$OUTPUT_PATH \
-    "unverified/model/mcore-$MCORE_RELEASE_NUM/$MODEL" 
+cp $OUTPUT_PATH/golden_values.json > ./golden_values.json

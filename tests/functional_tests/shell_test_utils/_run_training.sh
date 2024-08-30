@@ -47,12 +47,27 @@ if [[ "$SCRIPT" != null ]]; then
     eval "$SCRIPT"
 fi;
 
+# Pull env vars to export
+ENV_VARS=$(yq '... comments="" | .ENV_VARS | to_entries | .[] | [.key + "=" + .value] | join(" ")' $TRAINING_PARAMS_PATH)
+for ARGUMENT in $ENV_VARS; do
+    KEY=$(echo $ARGUMENT | cut -f1 -d=)
+
+    KEY_LENGTH=${#KEY}
+    VALUE="${ARGUMENT:$KEY_LENGTH+1}"
+
+    export "$KEY"="$VALUE"
+    echo "$KEY=$VALUE"
+done
+
 # Exit earlier to leave time for properly saving checkpoint
 if [[ $(echo "$TRAINING_SCRIPT_PATH" | tr '[:upper:]' '[:lower:]') == *nemo* ]]; then
     PARAMS=""
     TRAINING_PARAMS_FROM_CONFIG=$(yq '... comments="" | .MODEL_ARGS | to_entries | .[] | with(select(.value == "true"); .value = "") | [.key + "=" + .value] | join("")' $TRAINING_PARAMS_PATH | tr '\n' ' ')
 
 else
+    # If this is a second run (of checkpoint-resume), we might want to use a 
+    # different model configuration than during first time. So if key `MODEL_ARGS_2`
+    # exists we use it, otherwise we use the same as for the first run.
     if [[ $RUN_NUMBER -eq 2 && $(yq 'has("MODEL_ARGS_2")' $TRAINING_PARAMS_PATH) == true ]]; then
         export KEY="MODEL_ARGS_2"
     else
@@ -65,18 +80,6 @@ fi
 
 # Extract training params
 PARAMS="$PARAMS $TRAINING_PARAMS_FROM_CONFIG"
-
-# Pull env vars to export
-ENV_VARS=$(yq '... comments="" | .ENV_VARS | to_entries | .[] | [.key + "=" + .value] | join(" ")' $TRAINING_PARAMS_PATH)
-for ARGUMENT in $ENV_VARS; do
-    KEY=$(echo $ARGUMENT | cut -f1 -d=)
-
-    KEY_LENGTH=${#KEY}
-    VALUE="${ARGUMENT:$KEY_LENGTH+1}"
-
-    export "$KEY"="$VALUE"
-    echo "$KEY=$VALUE"
-done
 
 # Set PYTHONPATH
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"

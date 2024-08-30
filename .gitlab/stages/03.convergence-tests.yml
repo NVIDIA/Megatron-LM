@@ -1,7 +1,6 @@
-convergence-test:
+release-test:
   rules:
-    - if: $CONVERGENCE_TEST == "yes"
-    - when: never
+    - if: $CONVERGENCE_TEST == "yes" && $CONVERGENCE_TEST_SCOPE == "release"
   stage: convergence_tests
   needs: [build_image]
   tags:
@@ -9,11 +8,14 @@ convergence-test:
   timeout: 7d
   parallel:
     matrix:
-      - SETTINGS: RELEASE_BERT
-        TAG: mcore-ssh-node-A
-      - SETTINGS: RELEASE_GPT  
+      - MODEL: bert
+        VARIANT: bert_release
         TAG: mcore-ssh-node-B
-      - SETTINGS: RELEASE_MOE
+      - MODEL: gpt
+        VARIANT: gpt3_15b_8t_release 
+        TAG: mcore-ssh-node-B
+      - MODEL: mixtral
+        VARIANT: mixtral_8x7b_alltoall_tp2pp4ep4_release 
         TAG: mcore-ssh-node-B
   before_script: |
     python -m venv local/venv 
@@ -21,30 +23,64 @@ convergence-test:
     pip install jet-api --upgrade $JET_INDEX_URLS
   script:
     - |
+      env
       set -x
 
-      export MCORE_RELEASE_NUM=${CI_COMMIT_BRANCH#core_r}
-      export IMAGE_TAG=v${MCORE_RELEASE_NUM}-${CI_PIPELINE_ID} 
-      export WANDB_API_KEY=${WANDB_API_KEY}
-      export GITLAB_TOKEN=${PAT}
+      MCORE_RELEASE_NUM=$(python -c "from megatron import core; print(core.__version__)")
+      export IMAGE_TAG=v$MCORE_RELEASE_NUM-${CI_PIPELINE_ID} 
+      export RUN_NAME=release-testing/mcore-v$MCORE_RELEASE_NUM/$MODEL/$VARIANT
+      export WANDB_EXPERIMENT=v$MCORE_RELEASE_NUM_$MODEL_$VARIANT
+      export WANDB_API_KEY
+
+      bash ./tests/functional_tests/local_recipes/$MODEL/$VARIANT.sh
+
+  artifacts:
+    paths:
+      - ./golden_values.json
       
-      SETTINGS_ID=$(curl \
-          --request GET "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/snippets" \
-          --header "PRIVATE-TOKEN: $PROJECT_ACCESS_TOKEN_MCORE" \
-        | jq --arg TITLE "$SETTINGS" '
-                .[] 
-                | select(.title == $TITLE) 
-                | .id
-          ' \
-        | tr -d '"')
-      SETTINGS=$(curl \
-                    --request GET "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/snippets/${DATA_BLEND_ID}/raw" \
-                    --header "PRIVATE-TOKEN: $PROJECT_ACCESS_TOKEN_MCORE"
-                )
-      echo "$SETTINGS" > settings.txt
-      source settings.sh
+pre-release-test:
+  rules:
+    - if: $CONVERGENCE_TEST == "yes" && $CONVERGENCE_TEST_SCOPE == "pre-release"
+  stage: convergence_tests
+  needs: [build_image]
+  tags:
+    - ${TAG}
+  timeout: 7d
+  parallel:
+    matrix:
+      - MODEL: bert
+        VARIANT: bert_release
+        TAG: mcore-ssh-node-B
+      - MODEL: gpt
+        VARIANT: gpt3_15b_8t_release_sm 
+        TAG: mcore-ssh-node-B
+      - MODEL: mixtral
+        VARIANT: mixtral_8x7b_alltoall_tp2pp4ep4_release_sm
+        TAG: mcore-ssh-node-B
+  variables:
+    GIT_SUBMODULE_STRATEGY: normal
+  before_script:
+    - python -m venv local/venv 
+    - source local/venv/bin/activate
+    - pip install jet-api --upgrade $JET_INDEX_URLS
+  script:
+    - |
+      env 
+      set -x
+      
+      export IMAGE_TAG=${CI_PIPELINE_ID} 
+      export WANDB_API_KEY
+      CONVERGENCE_TEST_RUN_NAME=$(eval echo $CONVERGENCE_TEST_RUN_NAME)
+      
+      if [[ -z $CONVERGENCE_TEST_RUN_NAME ]]; then
+        echo Please assign a CONVERGENCE_TEST_RUN_NAME
+      fi
 
-      yq '.MODEL_ARGS."--data-path" = env(DATA_PATH)' -i $TRAINING_PARAMS_PATH
+      export RUN_NAME=$CONVERGENCE_TEST_RUN_NAME/$MODEL/$VARIANT
+      export WANDB_EXPERIMENT=$CONVERGENCE_TEST_RUN_NAME_$MODEL_$VARIANT
 
-      env
-      bash tests/functional_tests/shell_test_utils/run_ci_test_locally.sh
+      bash ./tests/functional_tests/local_recipes/$MODEL/$VARIANT.sh
+
+  artifacts:
+    paths:
+      - ./golden_values.json

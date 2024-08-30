@@ -21,8 +21,7 @@ spec:
         "TENSORBOARD_PATH={assets_dir}/tensorboard"
         "CHECKPOINT_PATH=/workspace/checkpoints"
         "TRAINING_SCRIPT_PATH=pretrain_gpt.py"
-        "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
-        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values.json"
+        "TEST_CASE_PATH=./tests/functional_tests/test_cases/{model}/{test_case}"
     )
 
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
