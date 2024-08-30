@@ -127,6 +127,7 @@ jet-results-notify:
     paths:
       - scripts
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $FUNCTIONAL_TEST == "yes"
       when: always
     - when: never
+
