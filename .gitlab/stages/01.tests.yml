@@ -45,19 +45,26 @@ build_image:
         ADDITIONAL_PARAMS="--pull"
       fi
 
+      docker pull ${IMAGE}:${CI_PIPELINE_ID} || true
+      docker pull ${IMAGE}:${CI_MERGE_REQUEST_IID:-noop} || true
+      docker pull ${IMAGE}:buildcache || true
+
       docker build \
         --secret id=JET_INDEX_URLS \
         --target $STAGE \
         -f $FILE \
         -t ${IMAGE}:${CI_PIPELINE_ID} \
+        -t ${IMAGE}:${CI_MERGE_REQUEST_IID:-noop} \
         --build-arg CACHEBUST=$(cat /proc/sys/kernel/random/uuid) \
         --cache-to type=inline \
         --cache-from type=registry,ref=${IMAGE}:buildcache \
         --cache-from type=registry,ref=${IMAGE}:${CI_PIPELINE_ID} \
+        --cache-from type=registry,ref=${IMAGE}:${CI_MERGE_REQUEST_IID:-noop} \
         --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
         ${ADDITIONAL_PARAMS} .
 
       docker push ${IMAGE}:${CI_PIPELINE_ID}
+      docker push ${IMAGE}:${CI_MERGE_REQUEST_IID:-noop}
 
       if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
         docker tag ${IMAGE}:${CI_PIPELINE_ID} ${IMAGE}:buildcache
