@@ -3,7 +3,7 @@ include:
 
 mirror_to_github:
   rules:
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
     - when: never
   tags: [mcore-docker-node-small]
   stage: .pre
@@ -17,7 +17,8 @@ mirror_to_github:
 
 create_ci_branches:
   rules:
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+    - when: never
   parallel:
     matrix:
       - branch: ci-unit-test-extended

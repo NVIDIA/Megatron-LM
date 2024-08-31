@@ -17,10 +17,13 @@ release-test:
       - MODEL: mixtral
         VARIANT: mixtral_8x7b_alltoall_tp2pp4ep4_release 
         TAG: mcore-ssh-node-B
-  before_script: |
-    python -m venv local/venv 
-    source local/venv/bin/activate
-    pip install jet-api --upgrade $JET_INDEX_URLS
+  before_script:
+    - git rm -r tests/functional_tests/local_recipes || true
+    - git submodule add --force https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/ADLR/megatron-lm-convergence-tests.git tests/functional_tests/local_recipes
+    - ls tests/functional_tests/local_recipes
+    - python -m venv local/venv 
+    - source local/venv/bin/activate
+    - pip install jet-api --upgrade $JET_INDEX_URLS
   script:
     - |
       env
@@ -58,8 +61,11 @@ pre-release-test:
         VARIANT: mixtral_8x7b_alltoall_tp2pp4ep4_release_sm
         TAG: mcore-ssh-node-B
   variables:
-    GIT_SUBMODULE_STRATEGY: normal
+    GIT_SUBMODULE_STRATEGY: none
   before_script:
+    - git rm -r tests/functional_tests/local_recipes || true
+    - git submodule add --force https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/ADLR/megatron-lm-convergence-tests.git tests/functional_tests/local_recipes
+    - ls tests/functional_tests/local_recipes
     - python -m venv local/venv 
     - source local/venv/bin/activate
     - pip install jet-api --upgrade $JET_INDEX_URLS

@@ -25,9 +25,9 @@ jet-configure:
   script:
     - set -x
     - |
-      if [[ "$CI_MERGE_REQUEST_LABELS" == "*H100*" ]]; then
+      if [[ "$FUNCTIONAL_TEST_CLUSTER" == "" && "$CI_MERGE_REQUEST_LABELS" == "*H100*" ]]; then
         FUNCTIONAL_TEST_CLUSTER=$DEFAULT_H100_CLUSTER
-      else
+      elif [[ "$FUNCTIONAL_TEST_CLUSTER" == "" ]]; then
         FUNCTIONAL_TEST_CLUSTER=$DEFAULT_A100_CLUSTER
       fi
     - |
