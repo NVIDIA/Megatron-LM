@@ -1,6 +1,6 @@
 .tests_common:
   rules:
-    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
       when: always
     - when: always
@@ -65,6 +65,11 @@ build_image:
 
       docker push ${IMAGE}:${CI_PIPELINE_ID}
       docker push ${IMAGE}:${CI_MERGE_REQUEST_IID:-noop}
+
+      if [[ "$CI_COMMIT_BRANCH" == "ci-nightly-a100" ]]; then
+        docker tag ${IMAGE}:${CI_PIPELINE_ID} ${IMAGE}:nightly
+        docker push ${IMAGE}:nightly
+      fi
 
       if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
         docker tag ${IMAGE}:${CI_PIPELINE_ID} ${IMAGE}:buildcache

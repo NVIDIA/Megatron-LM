@@ -3,7 +3,7 @@ include:
 
 mirror_to_github:
   rules:
-    - if: '$CI_COMMIT_REF_PROTECTED == "true"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     - when: never
   tags: [mcore-docker-node-small]
   stage: .pre
@@ -14,7 +14,29 @@ mirror_to_github:
     - git checkout $CI_COMMIT_BRANCH
     - git remote add github https://ko3n1g:$GH_TOKEN@github.com/NVIDIA/Megatron-LM.git || true
     - git push -u github $CI_COMMIT_BRANCH
-  
+
+create_ci_branches:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  parallel:
+    matrix:
+      - branch: ci-unit-test-extended
+      - branch: ci-rebuild-mcore-nemo-image
+      - branch: ci-mr-a100
+      - branch: ci-nightly-a100
+      - branch: ci-weekly-a100
+      - branch: ci-weekly-h100
+      - branch: ci-pre-release
+  tags: [mcore-docker-node-small]
+  stage: .pre
+  image: python:3.10
+  variables:
+    GIT_STRATEGY: "clone"
+  script:
+    - git remote set-url origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/adlr/megatron-lm.git"
+    - git switch --force-create $branch;
+    - git push --force -u origin $branch
+
 label_merge_request:
   rules: 
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -44,7 +66,7 @@ clean_docker_node:
   tags: [mcore-docker-node-small]
   script:
     - export DOCKER_HOST='unix:///var/run/docker.sock'
-    - docker system prune -a --filter "until=48h" -f
+    - docker system prune -a --filter "until=48h" -f || true
 
 check_milestone:
   rules: 
