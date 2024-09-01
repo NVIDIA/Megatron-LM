@@ -147,14 +147,7 @@ else
                 "type": "section",
                 "text": {            
                     "type": "mrkdwn",
-                    "text": "<'$PIPELINE_URL'|Report of '$DATE' ('$CONTEXT')>: All '$NUM_TOTAL' passed :doge3d:"
-                }
-            },
-            {                
-                "type": "section",
-                "text": {            
-                    "type": "mrkdwn",
-                    "text": "==============================================="
+                    "text": ":doge3d: <'$PIPELINE_URL'|Report of '$DATE' ('$CONTEXT')>: All '$NUM_TOTAL' passed"
                 }
             }
         ]'
@@ -166,7 +159,7 @@ else
                                 "type": "section",
                                 "text": {            
                                     "type": "mrkdwn",
-                                    "text": ("<" + $URL + "|Report of " + $DATE + " (" + $CONTEXT + ")>: " + $NUM_FAILED + " of " + $NUM_TOTAL + " failed :doctorge:")
+                                    "text": (":doctorge: <" + $URL + "|Report of " + $DATE + " (" + $CONTEXT + ")>: " + $NUM_FAILED + " of " + $NUM_TOTAL + " failed")
                                 }
                             }
                         ] + [
