@@ -79,7 +79,7 @@ echo ${ARGUMENTS[@]}
 while : 
 do
 
-if [[ $(cat "${OUTPUT_PATH}/checkpoints/latest_checkpointed_iteration.txt" || echo 0) -gt $ITERATIONS ]]; then
+if [[ $(cat "${OUTPUT_PATH}/checkpoints/latest_checkpointed_iteration.txt" || echo 0) -ge $ITERATIONS ]]; then
     break
 fi
 
