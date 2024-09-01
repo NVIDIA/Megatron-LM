@@ -2,6 +2,8 @@ workflow:
   rules:
     - if: $CI_PROJECT_NAMESPACE != "ADLR"
       when: never
+    - if: $CI_COMMIT_BRANCH =~ /ci-/ && $CI_PIPELINE_SOURCE != "schedule"
+      when: never
     - if: $CI_PIPELINE_SOURCE == "schedule"
       auto_cancel:
         on_new_commit: none
