@@ -1,16 +1,17 @@
 .tests_common:
   rules:
-    - if: ($FUNCTIONAL_TEST == "no" || $FUNCTIONAL_TEST == "yes" || $CONVERGENCE_TEST == "yes") && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
-    - if: $FUNCTIONAL_TEST == "no" || $FUNCTIONAL_TEST == "yes" || $CONVERGENCE_TEST == "yes"
-    - when: never
+      when: always
+    - when: always
   stage: test
 
 include:
   - template: Security/Secret-Detection.gitlab-ci.yml
 
 build_image:
-  tags: [8xL40S-builder]
+  tags: 
+    - ${TAG}
   image: docker:26.1.4-dind
   timeout: 45m
   parallel:
@@ -18,12 +19,15 @@ build_image:
       - IMAGE: CI_MCORE_IMAGE
         FILE: Dockerfile.ci
         BASE_IMAGE: nvcr.io/nvidia/pytorch:24.01-py3
+        TAG: mcore-docker-node-large
       - IMAGE: CI_NEMO_IMAGE
         FILE: Dockerfile.ci
         BASE_IMAGE: nvcr.io/nvidian/nemo:nightly
+        TAG: mcore-docker-node-large
       - IMAGE: LINTING_IMAGE
         FILE: Dockerfile.linting
         BASE_IMAGE: python:3.10
+        TAG: mcore-docker-node-small
   before_script:
     - echo "$NGC_API_KEY" | docker login nvcr.io -u '$oauthtoken' --password-stdin
     - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
@@ -32,37 +36,46 @@ build_image:
   script:
     - |
       set -x
+      env
       eval "IMAGE=\$$IMAGE"
 
-      docker system prune -a --filter "until=24h" -f
+      docker system prune -a --filter "until=24h" -f || true
 
       if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
         ADDITIONAL_PARAMS="--pull"
       fi
+
+      docker pull ${IMAGE}:${CI_PIPELINE_ID} || true
+      docker pull ${IMAGE}:${CI_MERGE_REQUEST_IID:-noop} || true
+      docker pull ${IMAGE}:buildcache || true
 
       docker build \
         --secret id=JET_INDEX_URLS \
         --target $STAGE \
         -f $FILE \
         -t ${IMAGE}:${CI_PIPELINE_ID} \
+        -t ${IMAGE}:${CI_MERGE_REQUEST_IID:-noop} \
         --build-arg CACHEBUST=$(cat /proc/sys/kernel/random/uuid) \
         --cache-to type=inline \
         --cache-from type=registry,ref=${IMAGE}:buildcache \
         --cache-from type=registry,ref=${IMAGE}:${CI_PIPELINE_ID} \
+        --cache-from type=registry,ref=${IMAGE}:${CI_MERGE_REQUEST_IID:-noop} \
         --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
         ${ADDITIONAL_PARAMS} .
 
       docker push ${IMAGE}:${CI_PIPELINE_ID}
+      docker push ${IMAGE}:${CI_MERGE_REQUEST_IID:-noop}
+
+      if [[ "$CI_COMMIT_BRANCH" == "ci-nightly-a100" ]]; then
+        docker tag ${IMAGE}:${CI_PIPELINE_ID} ${IMAGE}:nightly
+        docker push ${IMAGE}:nightly
+      fi
 
       if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
         docker tag ${IMAGE}:${CI_PIPELINE_ID} ${IMAGE}:buildcache
         docker push ${IMAGE}:buildcache
       fi
 
-      if [[ $CI_COMMIT_BRANCH == core_r* ]]; then
-        docker tag ${IMAGE}:${CI_PIPELINE_ID} ${IMAGE}:v${CI_COMMIT_BRANCH#core_r}-${CI_PIPELINE_ID}
-        docker push ${IMAGE}:v${CI_COMMIT_BRANCH#core_r}-${CI_PIPELINE_ID}
-      fi
   retry:
     max: 2
 

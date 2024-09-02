@@ -2,13 +2,8 @@ workflow:
   rules:
     - if: $CI_PROJECT_NAMESPACE != "ADLR"
       when: never
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $FUNCTIONAL_TEST_SCOPE == "mr"
-      auto_cancel:
-        on_new_commit: none
-      variables:
-        FUNCTIONAL_TEST: "yes"
-        UNIT_TEST_TIMEOUT: 180
-        UNIT_TEST_REPEAT: 10
+    - if: $CI_COMMIT_BRANCH =~ /ci-/ && $CI_PIPELINE_SOURCE != "schedule"
+      when: never
     - if: $CI_PIPELINE_SOURCE == "schedule"
       auto_cancel:
         on_new_commit: none
@@ -19,17 +14,14 @@ workflow:
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run tests/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
         FUNCTIONAL_TEST: "yes"
-        FUNCTIONAL_TEST_CLUSTER: $DEFAULT_A100_CLUSTER
         FUNCTIONAL_TEST_SCOPE: mr
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run nightly/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
         FUNCTIONAL_TEST: "yes"
-        FUNCTIONAL_TEST_CLUSTER: $DEFAULT_A100_CLUSTER
         FUNCTIONAL_TEST_SCOPE: nightly
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run weekly/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
         FUNCTIONAL_TEST: "yes"
-        FUNCTIONAL_TEST_CLUSTER: $DEFAULT_A100_CLUSTER
         FUNCTIONAL_TEST_SCOPE: weekly
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
@@ -74,6 +66,15 @@ variables:
       - "yes"
       - "no"
     description: To run a convergence test
+  CONVERGENCE_TEST_SCOPE:
+    value: "release"
+    options:
+      - "release"
+      - "pre-release"
+    description: "Test suite to run (only for CONVERGENCE_TEST=yes)"
+  CONVERGENCE_TEST_RUN_NAME:
+    value: "pre-release-$$CI_PIPELINE_ID"
+    description: "Run directory of convergence test"
   PUBLISH: 
     value: "no"
     options: 

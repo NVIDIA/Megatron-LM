@@ -1,7 +1,7 @@
 .jet_common:
   stage: functional_tests
   rules:
-    - if: $FUNCTIONAL_TEST == "yes" && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+    - if: $FUNCTIONAL_TEST == "yes" && ($CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true")
       allow_failure: true
     - if: $FUNCTIONAL_TEST == "yes"
     - when: never
@@ -24,6 +24,12 @@ jet-configure:
   tags: [mcore-docker-node-small]
   script:
     - set -x
+    - |
+      if [[ "$FUNCTIONAL_TEST_CLUSTER" == "" && "$CI_MERGE_REQUEST_LABELS" == "*H100*" ]]; then
+        FUNCTIONAL_TEST_CLUSTER=$DEFAULT_H100_CLUSTER
+      elif [[ "$FUNCTIONAL_TEST_CLUSTER" == "" ]]; then
+        FUNCTIONAL_TEST_CLUSTER=$DEFAULT_A100_CLUSTER
+      fi
     - |
       JET_CUSTOM_FILTER="type == 'basic'"
 
@@ -121,6 +127,7 @@ jet-results-notify:
     paths:
       - scripts
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $FUNCTIONAL_TEST == "yes"
       when: always
     - when: never
+

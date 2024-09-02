@@ -22,8 +22,7 @@ spec:
         "TENSORBOARD_PATH={assets_dir}/tensorboard"
         "CHECKPOINT_PATH=/workspace/checkpoints"
         "TRAINING_SCRIPT_PATH=/opt/NeMo/examples/nlp/language_modeling/megatron_gpt_pretraining.py"
-        "TRAINING_PARAMS_PATH=/opt/megatron-lm/tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
-        "GOLDEN_VALUES_PATH=/opt/megatron-lm/tests/functional_tests/test_cases/{model}/{test_case}/golden_values.json"
+        "TEST_CASE_PATH=/opt/megatron-lm/tests/functional_tests/test_cases/{model}/{test_case}"
     )
 
     bash /opt/megatron-lm/tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}

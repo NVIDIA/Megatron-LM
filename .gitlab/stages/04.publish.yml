@@ -24,7 +24,7 @@ create-gh-release:
     entrypoint: [""]
   script: 
     - |
-      RELEASE_NUMBER=${CI_COMMIT_BRANCH#core_r}
+      RELEASE_NUMBER=$(python -c "from megatron import core; print(core.__version__)")
       NAME="NVIDIA Megatron Core $RELEASE_NUMBER"
       CHANGELOG=$(awk '/^## '$NAME'/{flag=1; next} /^## /{flag=0} flag' CHANGELOG.md)
       CHANGELOG=$(echo "$CHANGELOG" | sed '/./!d')

@@ -16,3 +16,4 @@ API Guide
    distributed
    datasets
    num_microbatches_calculator
+   optimizer_param_scheduler

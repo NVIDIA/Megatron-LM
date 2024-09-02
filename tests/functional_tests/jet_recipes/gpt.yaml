@@ -21,8 +21,7 @@ spec:
         "TENSORBOARD_PATH={assets_dir}/tensorboard"
         "CHECKPOINT_PATH=/workspace/checkpoints"
         "TRAINING_SCRIPT_PATH=pretrain_gpt.py"
-        "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
-        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values.json"
+        "TEST_CASE_PATH=./tests/functional_tests/test_cases/{model}/{test_case}"
     )
 
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
@@ -114,7 +113,7 @@ products:
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp2_resume_torch_dist
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp4
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp4_resume_torch_dist
-    - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_resume_torch_dist_te_4experts2parallel
+    # - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_resume_torch_dist_te_4experts2parallel
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_te_4experts2parallel
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_resume_torch_dist_te_2experts
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_te_2experts

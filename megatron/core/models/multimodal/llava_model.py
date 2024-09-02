@@ -25,28 +25,31 @@ class LLaVAModel(MegatronModule):
 
     Args:
         language_transformer_config (TransformerConfig): Transformer config for the language model.
-        language_transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers of the language model.
+        language_transformer_layer_spec (ModuleSpec): Language model spec.
         language_vocab_size (int): Language model vocabulary size.
-        language_max_sequence_length (int): Language model maximum sequence length. This is used for positional embedding.
+        language_max_sequence_length (int): Language model maximum sequence length.
         vision_transformer_config (TransformerConfig): Transformer config for the vision model.
-        vision_transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers of the vision model.
-        drop_vision_class_token (bool): Drop vision class token(s) before input to the language model.
-        vision_projection_config (TransformerConfig): Config for the projection from vision model outputs to language model inputs.
-        vision_projection_layer_spec (ModuleSpec): Specifies the module to use for the vision projection.
-        vision_projection_type (str): Type of the vision projection to use. Default is a 2-layer MLP.
-        allow_missing_vision_projection_checkpoint (bool): Allow vision projection weights to be missing when loading a checkpoint. Default False.
-        parallel_output (bool): Do not gather the outputs, keep them split across tensor parallel ranks. This is typically True for training and False for inference.
-        language_position_embedding_type (str): Position embedding type to use in the language model. Default learned absolute.
-        language_rotary_percent (float): Percent of rotary dimension to use for rotary position embeddings in the language model. Defaults to 1.0.
-        pre_process (bool): Include the embedding layer in the gpt decoder (used with pipeline parallelism). Defaults to True.
-        post_process (bool): Include an output layer and a layernorm in the gpt decoder (used with pipeline parallelism). Defaults to True.
-        add_encoder (bool): Construct the encoder module (used with pipeline parallelism). Defaults to True. When we use pipelining, the encoder
-            will live on only a subset of the pipeline stages (specifically, only the first stage).
-        add_decoder (bool): Construct the decoder module (used with pipeline parallelism). Defaults to True. When we use pipelining, the decoder
-            will live on only a subset of the pipeline stages (specifically, every stage after the first one).
-        img_h (int): The height of each image that the ViT will see.
-        img_w (int): The width of each image that the ViT will see.
-        patch_dim (int): The size of each patch side.
+        vision_transformer_layer_spec (ModuleSpec): Vision model spec.
+        drop_vision_class_token (bool): Drop vision class token(s) before the language model.
+        vision_projection_config (TransformerConfig): Vision projection config.
+        vision_projection_layer_spec (ModuleSpec): Vision projection spec.
+        vision_projection_type (str): Type of the vision projection. Default: 2-layer MLP.
+        allow_missing_vision_projection_checkpoint (bool): Allow vision projection weights to be
+            missing when loading a checkpoint. Default False.
+        parallel_output (bool): Keep outputs split across tensor parallel ranks.
+            This is typically True for training and False for inference.
+        language_position_embedding_type (str): Language model position embedding type.
+        language_rotary_percent (float): RoPE percent. Defaults to 1.0.
+        pre_process (bool): Include embedding layer in the decoder (used with pipeline parallel).
+        post_process (bool): Include output layer in the decoder (used with pipeline parallel).
+        add_encoder (bool): Construct the encoder (used with pipeline parallel).
+            When we use pipelining, the encoder will live on only the first stage
+        add_decoder (bool): Construct the decoder (used with pipeline parallel).
+            When we use pipelining, the decoder will live on every stage after the first one.
+        img_h (int): Input image height.
+        img_w (int): Input image width.
+        patch_dim (int): The size of each image patch side.
+        language_rotary_base (int): RoPE base.
     """
 
     def __init__(
@@ -80,7 +83,8 @@ class LLaVAModel(MegatronModule):
             log_config_to_disk(language_transformer_config, locals(), prefix=type(self).__name__)
 
         logging.getLogger(__name__).warning(
-            "LLaVA model is under active development. It may be missing features and its methods may change."
+            "LLaVA model is under active development. "
+            "It may be missing features and its methods may change."
         )
 
         self.pre_process = pre_process
@@ -112,6 +116,7 @@ class LLaVAModel(MegatronModule):
             self.share_embeddings_and_output_weights = (
                 self.language_model.share_embeddings_and_output_weights
             )
+            self._language_max_sequence_length = language_max_sequence_length
 
         class_token_len = 1
         if self.add_encoder:
@@ -131,9 +136,10 @@ class LLaVAModel(MegatronModule):
                 vision_projection_type,
                 vision_transformer_config.hidden_size,  # input size to the projection.
             )
-            # This allows ignoring missing weights for the vision projection during checkpoint loading.
-            # This should be disabled by default but can be enabled if your checkpoint contains pretrained
-            # vision and language models but not the projection from vision model outputs to language model inputs.
+            # Ignore missing weights for the vision projection during checkpoint loading.
+            # This should be disabled by default but can be enabled if your checkpoint contains
+            # pretrained vision and language models but not the projection from vision model
+            # outputs to language model inputs.
             if allow_missing_vision_projection_checkpoint:
                 vision_projection_param_names = [
                     f"vision_projection.{name}"
@@ -176,7 +182,7 @@ class LLaVAModel(MegatronModule):
     ):
         """Freeze model modules.
 
-        Make specific modules non-trainable by setting requires_grad to False for the module's parameters.
+        Make specific modules non-trainable by setting requires_grad to False.
 
         Args:
             freeze_language_model (bool): Freeze the language model module.
@@ -212,33 +218,39 @@ class LLaVAModel(MegatronModule):
         https://github.com/huggingface/transformers/blob/85817d98fb60977c97e3014196a462b732d2ed1a/src/transformers/models/llava_next/modeling_llava_next.py#L409
         for our input data conventions.
 
-        image_token_index = -200 indicates the image position in the input_ids = [0, 1, -200, 2, 3] and labels = [1, -200, 2, 3, 4], for example.
+        image_token_index = -200 indicates the image position in the input_ids = [0, 1, -200, 2, 3]
+        and labels = [1, -200, 2, 3, 4], for example.
         We want to replace the image position (-200) with image_embeddings and return the following:
         - final_embeddings = [0, 1, image_embeddings, 2, 3],
         - final_labels = [1, -100, 2, 3, 4]
         - final_loss_mask = [1, 0, 0, 1, 1]
 
-        This function also handles the case where the input does not contain an image (text-only sample). It also handles the case where a single input
-        image is split into multiple tiles.
+        This function handles samples without images (text-only sample). It also handles samples
+        with images that are split into multiples tiles.
 
-        If pipeline parallelism is not used, then self.pre_process and self.post_process are both True and we update both
-        input embeddings, labels and loss masks (if available).
+        If pipeline parallelism is not used, then self.pre_process and self.post_process
+        are both True and we update both input embeddings, labels and loss masks (if available).
 
         If pipeline parallelism is used, then we do the following
-        - the first language model chunk has self.pre_process = True and self.post_process = False. We update input embeddings.
-        - the middle language model chunk(s) has self.pre_process = False and self.post_process = False. We don't need to update anything.
-        - the last language model chunk has self.pre_process = False and self.post_process = True. We update labels and loss mask.
+        - the first language model chunk has self.pre_process = True and
+          self.post_process = False. We update input embeddings.
+        - the middle language model chunk(s) has self.pre_process = False and
+          self.post_process = False. We don't need to update anything.
+        - the last language model chunk has self.pre_process = False and
+          self.post_process = True. We update labels and loss mask.
 
-        TODO: This function should adjust the attention mask too. Currently, we assume the language model uses a causal mask.
+        TODO: This function should adjust the attention mask too.
+        Currently, we assume the language model uses a causal mask.
 
         Returns:
-            final_embedding (torch.Tensor): image and text embeddings concated [combined_seq_len, b, h].
+            final_embedding (torch.Tensor): image and text embeddings [combined_seq_len, b, h].
             final_labels (torch.Tensor): labels for image and text positions [b, combined_seq_len].
-            final_loss_mask (torch.Tensor): loss mask for image and text positions [b, combined_seq_len].
+            final_loss_mask (torch.Tensor): loss mask [b, combined_seq_len].
         """
         assert self.add_decoder, "input text preprocessing is only needed for the language model"
 
-        # No pre- or postprocessing needed. With pipeline parallel > 2, this means a chunk in the middle of the model.
+        # No pre- or postprocessing needed.
+        # With pipeline parallel > 2, this means a chunk in the middle of the model.
         if not self.pre_process and not self.post_process:
             return language_embeddings, loss_mask, labels
 
@@ -266,15 +278,16 @@ class LLaVAModel(MegatronModule):
                 [x.sum() for x in num_image_tiles_batch], device=input_ids.device
             )
 
-            # Sequence length for each sample is the image sequence length multiplied by the number of tiles for that image, minus image token indices,
+            # Sequence length for each sample is the image sequence length multiplied by
+            # the number of tiles for that image, minus image token indices,
             # plus text sequence length.
             seq_lens = num_image_tiles_batch * img_seq_len - num_images_per_sample + text_seq_len
             max_seq_len = seq_lens.max()
             batch_indices, non_image_indices = torch.where(input_ids != image_token_index)
 
             # New position ids for the text tokens, shifted by the image sequence length.
-            # E.g. for input_ids = [-200, 1, 2, 3] and img_seq_len = 576, we get new_position_ids = [576, 577, 578, 579].
-            # text_position_ids are then [577, 578, 579].
+            # E.g. for input_ids = [-200, 1, 2, 3] and img_seq_len = 576, we get
+            # new_position_ids = [576, 577, 578, 579]. text_position_ids are then [577, 578, 579].
             image_token_mask_lens = image_token_mask.int().clone()
             # -1 is for the removed image token index.
             image_token_mask_lens[image_token_mask] = num_image_tiles * img_seq_len - 1
@@ -282,7 +295,8 @@ class LLaVAModel(MegatronModule):
             new_position_ids = torch.cumsum((image_token_mask_lens + 1), dim=-1) - 1
             text_position_ids = new_position_ids[batch_indices, non_image_indices]
 
-            # Labels are shifted to left by one. So, shift text position ids and non-image indices to left by one.
+            # Labels are shifted to left by one.
+            # So, shift text position ids and non-image indices to left by one.
             if has_labels:
                 label_text_position_ids = text_position_ids - 1
                 valid_label_text_position_ids = label_text_position_ids >= 0
@@ -300,7 +314,8 @@ class LLaVAModel(MegatronModule):
             )
             # No images in the text positions.
             images_mask[batch_indices, text_position_ids] = False
-            # Samples can have different amount of images tokens. new_position_ids[:, -1] gives the last text position id for each sample.
+            # Samples can have different amount of images tokens.
+            # new_position_ids[:, -1] gives the last text position id for each sample.
             # Padding is needed when the number of image tokens differs.
             first_padding_idx = new_position_ids[:, -1] + 1
             images_mask[
@@ -316,8 +331,8 @@ class LLaVAModel(MegatronModule):
                 batch_size,
                 max_seq_len,
                 embed_dim,
-                dtype=image_embeddings.dtype,
-                device=image_embeddings.device,
+                dtype=language_embeddings.dtype,
+                device=language_embeddings.device,
             )
 
             # Put text embeddings to the text positions in the result tensor.
@@ -347,7 +362,7 @@ class LLaVAModel(MegatronModule):
                 batch_indices, non_image_indices
             ]
 
-            # For labels, we need to pick the last label index that got dropped by the shift to left.
+            # For labels, pick the last label index that got dropped by the shift to left.
             label_extra_text_position_ids = seq_lens - 1
             batch_range = torch.arange(len(label_extra_text_position_ids))
             final_labels[batch_range, label_extra_text_position_ids] = labels[batch_range, -1]
@@ -355,7 +370,8 @@ class LLaVAModel(MegatronModule):
             # Loss mask the image positions.
             final_loss_mask[images_mask] = 0
 
-            # Loss mask last text position just before an image so that text token does not need to predict the first image token.
+            # Loss mask last text position just before an image
+            # so that text token does not need to predict the first image token.
             batch_image_indices, image_indices = torch.where(image_token_mask)
             # Indices just before image tokens. If it's -1, skip it.
             before_image_indices = image_indices - 1
@@ -377,6 +393,17 @@ class LLaVAModel(MegatronModule):
         if final_embedding is not None:
             final_embedding = final_embedding.transpose(1, 0).contiguous()
 
+        # Truncate if exceeding the language model's max sequence length.
+        if (
+            final_embedding is not None
+            and final_embedding.shape[0] > self._language_max_sequence_length
+        ):
+            final_embedding = final_embedding[: self._language_max_sequence_length]
+
+        if has_labels and final_labels.shape[1] > self._language_max_sequence_length:
+            final_labels = final_labels[:, : self._language_max_sequence_length]
+            final_loss_mask = final_loss_mask[:, : self._language_max_sequence_length]
+
         return final_embedding, final_labels, final_loss_mask
 
     def forward(
@@ -394,32 +421,42 @@ class LLaVAModel(MegatronModule):
         """Forward function of the LLaVA model.
 
         Args:
-            images (torch.Tensor): input image of shape [num_tiles, img_h, img_w]. num_tiles means the number of image tiles in this batch.
+            images (torch.Tensor): input images of shape [num_tiles, img_h, img_w].
+                num_tiles means the number of image tiles in this batch.
+                num_tiles = 0 if the batch doesn't contain images.
             input_ids (torch.Tensor): input text ids [batch, text_seq_len].
             position_ids (torch.Tensor): input text position ids [batch, text_seq_len].
-            attention_mask (torch.Tensor): Attention mask for the language model [batch, 1, combined_seq_len, combined_seq_len].
+            attention_mask (torch.Tensor): Language model attention mask
+                [batch, 1, combined_seq_len, combined_seq_len].
             labels (torch.Tensor): Optional target text labels [batch, combined_seq_len].
             loss_mask (torch.Tensor): Text loss mask [batch, text_seq_len].
             inference_params (InferenceParams): Inference-time parameters including KV cache.
-            num_image_tiles (list of int): Number of tiles per image. Default None assumes 1 tile per image.
+            num_image_tiles (list of int): Number of tiles per image. Default 1 tile per image.
             image_token_index (int): ID for input images.
 
         Returns:
-            output (torch.Tensor): Loss of shape [b, s] if labels are provided, otherwise logits of shape [b, s, vocab_size].
+            output (torch.Tensor): Loss of shape [b, s] if labels are provided,
+                otherwise logits of shape [b, s, vocab_size].
             loss_mask (torch.Tensor): Loss mask expanded to combined sequence length. Shape [b, s].
         """
         use_inference_kv_cache = (
             inference_params is not None
             and "image_tokens_count" in inference_params.key_value_memory_dict
         )
-        # If running inference, we can skip image token computation if they were computed already earlier for this sample.
+        has_images = images.shape[0] > 0
+
+        # If running inference, we can skip image token computation
+        # if they were computed already earlier for this sample.
         if use_inference_kv_cache:
             image_embeddings = None
-        elif self.add_encoder:
+        elif self.add_encoder and not has_images:
+            # If no images provided, use an empty image embeddings tensor.
+            image_embeddings = torch.tensor([], dtype=images.dtype, device=images.device)
+        elif self.add_encoder and has_images:
             image_embeddings = self.vision_model(images)  # [num_tiles, img_seq_len, h_vision]
             if self._drop_vision_class_token:
                 image_embeddings = image_embeddings[:, self.vision_model.class_token_len :, :]
-            # contiguous() call required as `permute` can sparsify the tensor and this breaks pipelining
+            # contiguous() required as `permute` can sparsify the tensor and this breaks pipelining
             image_embeddings = image_embeddings.permute(
                 1, 0, 2
             ).contiguous()  # [img_seq_len, num_tiles, h_vision]
@@ -430,8 +467,8 @@ class LLaVAModel(MegatronModule):
             )  # [img_seq_len, num_tiles, h_language]
 
             # TODO: Support batched inference.
-            # If running inference, the language model KV cache will be updated for image token positions.
-            # Here we store the image tokens sequence length, which can be used as an offset to the KV cache later.
+            # In inference, the language model KV cache will be updated for image token positions.
+            # Store the image tokens sequence length to be used as an offset to the KV cache later.
             if inference_params is not None:
                 inference_params.key_value_memory_dict["image_tokens_count"] = (
                     image_embeddings.shape[0] * image_embeddings.shape[1]
@@ -446,8 +483,9 @@ class LLaVAModel(MegatronModule):
         if self.pre_process:
             input_ids_text = input_ids.clone()
             input_ids_text[input_ids_text == image_token_index] = 0
-            # Note: This adds absolute position embedding but not RoPE. Each image is counted as one position.
-            # RoPE is added in language_model forward call. Each image embedding is one position.
+            # Note: This adds absolute position embedding but not RoPE.
+            # Each image is counted as one position.
+            # RoPE is added in language_model forward. Each image embedding is one position.
             language_embeddings = self.language_model.embedding(
                 input_ids=input_ids_text, position_ids=position_ids
             )  # [text_seq_len, b, h_language]
@@ -493,14 +531,14 @@ def _load_state_dict_hook_ignore_param_names(
 
     By default, this should not be used to avoid accidentally missing weights in checkpoint loading.
 
-    Example use case: Use this for the vision projection if you want to load a checkpoint that contains vision and language model weights
-    but not the vision projection weights.
+    Example use case: Use this if you want to load a checkpoint that contains vision and language
+    model weights but not the vision projection weights.
 
     Args:
-        param_names (list of str): Parameter names allowed to be missing when calling load_state_dict.
-        module (torch.nn.Module): The torch module this hook applies to. Unused here but required by the torch API.
-        incompatible_keys (namedtuple): Namedtuple with fields missing_keys and unexpected_keys, which collect the missing and unexpected
-            keys when calling load_state_dict on this torch module, respectively.
+        param_names (list str): Parameter names allowed to be missing when calling load_state_dict.
+        module (torch.nn.Module): The torch module this hook applies to. Required by the torch API.
+        incompatible_keys (namedtuple): Namedtuple with fields missing_keys and unexpected_keys,
+            which collect the missing and unexpected keys, respectively.
     """
     for param_name in param_names:
         if param_name in incompatible_keys.missing_keys:
