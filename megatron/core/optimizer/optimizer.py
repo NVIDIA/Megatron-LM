@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 
 HAVE_APEX_OR_TE = True
 try:
@@ -352,9 +352,13 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         )
 
         # Update across all model parallel instances.
-        torch.distributed.all_reduce(
-            self.found_inf, op=torch.distributed.ReduceOp.MAX, group=self.get_model_parallel_group()
-        )
+        xm = get_xla_model()
+        if xm:
+            xm.all_reduce(xm.REDUCE_MAX, [self.found_inf], groups=parallel_state.get_model_parallel_groups())
+        else:
+            torch.distributed.all_reduce(
+                self.found_inf, op=torch.distributed.ReduceOp.MAX, group=self.get_model_parallel_group()
+            )
 
         # Check for nan.
         found_inf_flag = self.found_inf.item() > 0

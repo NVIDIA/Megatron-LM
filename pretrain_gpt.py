@@ -2,7 +2,7 @@
 """Pretrain GPT."""
 
 import os
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 from functools import partial
 
@@ -130,8 +130,12 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     total_tokens = loss_mask.sum()
     loss = torch.cat([torch.sum(losses.view(-1) * loss_mask).view(1), total_tokens.view(1)])
 
+    xm = get_xla_model()
     if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
+        if xm:
+            xm.all_reduce(xm.REDUCE_SUM, [loss], groups=mpu.get_context_parallel_groups())
+        else:
+            torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     if args.check_for_nan_in_loss_and_grad:
@@ -143,7 +147,10 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
 
     # Reduce loss for logging.
     reporting_loss = loss.clone().detach()
-    torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
+    if xm:
+        xm.all_reduce(xm.REDUCE_SUM, [reporting_loss], groups=mpu.get_data_parallel_groups())
+    else:
+        torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
 
     local_num_tokens = loss[1].clone().detach().to(torch.int)
     return (

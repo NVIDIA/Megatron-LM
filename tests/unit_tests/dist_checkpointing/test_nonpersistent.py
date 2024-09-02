@@ -5,7 +5,7 @@ import os
 from types import SimpleNamespace
 from unittest import mock
 
-from megatron.core.optimizer.distrib_optimizer import HAVE_APEX_OR_TE
+from megatron.core.distributed import HAVE_APEX_OR_TE
 import pytest
 
 from megatron.training.checkpointing import (

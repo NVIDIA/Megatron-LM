@@ -21,7 +21,7 @@ from megatron.core.dist_checkpointing.serialization import \
 from megatron.core.dist_checkpointing.strategies.fully_parallel import \
     FullyParallelSaveStrategyWrapper
 from megatron.core.dist_checkpointing.utils import extract_sharded_tensors
-from megatron.core.optimizer.distrib_optimizer import HAVE_APEX_OR_TE
+from megatron.core.distributed import HAVE_APEX_OR_TE
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory

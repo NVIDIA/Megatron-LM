@@ -4,7 +4,7 @@ import torch
 
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.utils import attention_mask_func, get_default_causal_mask
+from megatron.core.transformer.utils import attention_mask_func
 
 
 class TestTorchSoftmax:
@@ -20,9 +20,6 @@ class TestTorchSoftmax:
             softmax_in_fp32=True,
             scale=None,
         )
-
-    def teardown_method(self):
-        get_default_causal_mask.cache_clear()
 
     def test_output_shape(self):
         x = torch.randn(8, 2, 4, 4, device=get_current_device())

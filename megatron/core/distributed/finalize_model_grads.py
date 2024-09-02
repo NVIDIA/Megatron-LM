@@ -8,7 +8,7 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from .. import parallel_state
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import get_attr_wrapped_model, get_model_config
-
+from .distributed_data_parallel_config import HAVE_APEX_OR_TE
 
 def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig):
     """
@@ -102,6 +102,8 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
     embedding grads across first and last pipeline stages (if not tied),
     scale gradients by `num_tokens`.
     """
+
+    assert HAVE_APEX_OR_TE, "Install Apex or TE to use finalize_model_grads"
 
     config = get_model_config(model[0])
 

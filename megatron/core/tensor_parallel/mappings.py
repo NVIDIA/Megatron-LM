@@ -1,6 +1,6 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 from megatron.core.parallel_state import (
@@ -8,6 +8,7 @@ from megatron.core.parallel_state import (
     get_global_memory_buffer,
     get_tensor_and_expert_parallel_group,
     get_tensor_model_parallel_group,
+    get_tensor_model_parallel_groups,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -23,7 +24,12 @@ def _reduce(input_):
         return input_
 
     # All-reduce.
-    torch.distributed.all_reduce(input_.contiguous(), group=get_tensor_model_parallel_group())
+    xm = get_xla_model()
+    input_ = input_.contiguous()
+    if xm:
+        xm.all_reduce(xm.REDUCE_SUM, [input_], groups=get_tensor_model_parallel_groups())
+    else:
+        torch.distributed.all_reduce(input_, group=get_tensor_model_parallel_group())
 
     return input_
 
@@ -121,21 +127,25 @@ def _gather_along_first_dim(input_, output_split_sizes=None):
     if world_size == 1:
         return input_
 
-    dim_size = list(input_.size())
-    if output_split_sizes is None:
-        dim_size[0] = dim_size[0] * world_size
-
-        output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
-        torch.distributed._all_gather_base(
-            output, input_.contiguous(), group=get_tensor_model_parallel_group()
-        )
+    xm = get_xla_model()
+    if xm:
+        output = xm.all_gather(input_, groups=get_tensor_model_parallel_groups())
     else:
-        dim_size[0] = sum(output_split_sizes)
-        output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
-        output_tensor_list = list(torch.split(output, output_split_sizes, dim=0))
-        torch.distributed.all_gather(
-            output_tensor_list, input_, group=get_tensor_model_parallel_group()
-        )
+        dim_size = list(input_.size())
+        if output_split_sizes is None:
+            dim_size[0] = dim_size[0] * world_size
+
+            output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
+            torch.distributed._all_gather_base(
+                output, input_.contiguous(), group=get_tensor_model_parallel_group()
+            )
+        else:
+            dim_size[0] = sum(output_split_sizes)
+            output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
+            output_tensor_list = list(torch.split(output, output_split_sizes, dim=0))
+            torch.distributed.all_gather(
+                output_tensor_list, input_, group=get_tensor_model_parallel_group()
+            )
 
     return output
 

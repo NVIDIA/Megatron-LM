@@ -27,7 +27,7 @@ import collections
 import numpy as np
 import torch
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.training import (
     get_args,
     print_rank_0
@@ -709,8 +709,15 @@ def get_samples_mapping(indexed_dataset,
     # device_index=rank which is not the case for model
     # parallel case
     counts = torch.tensor([1], dtype=torch.long, device=get_current_device())
-    torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
-    torch.distributed.all_reduce(counts, group=mpu.get_pipeline_model_parallel_group())
+    xm = get_xla_model()
+    if xm:
+        xm.all_reduce(xm.REDUCE_SUM, [counts], 
+                                    groups=mpu.get_data_parallel_groups())
+        xm.all_reduce(xm.REDUCE_SUM, [counts], 
+                                    groups=mpu.get_pipeline_model_parallel_group())
+    else:
+        torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
+        torch.distributed.all_reduce(counts, group=mpu.get_pipeline_model_parallel_group())
     assert counts[0].item() == (
         torch.distributed.get_world_size() //
         torch.distributed.get_world_size(group=mpu.get_tensor_model_parallel_group()))

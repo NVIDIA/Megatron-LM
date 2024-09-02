@@ -4,7 +4,7 @@
 
 import math
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 from megatron.training import get_args
@@ -131,7 +131,12 @@ def evaluate(data_loader, model, eval_metric):
 
             # Reduce across processes.
             if parallel_state.is_pipeline_last_stage():
-                torch.distributed.all_reduce(output,
+                xm = get_xla_model()
+                if xm:
+                    xm.all_reduce(xm.REDUCE_SUM, [output], 
+                                  groups=parallel_state.get_data_parallel_groups())
+                else:
+                    torch.distributed.all_reduce(output,
                                              group=parallel_state.get_data_parallel_group())
 
                 total_output += output

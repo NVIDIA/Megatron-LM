@@ -16,13 +16,13 @@ class TestModel(torch.nn.Module):
 
 class Utils:
 
-    world_size = get_local_device_count()
-    rank = int(os.environ['LOCAL_RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
+    rank = int(os.environ['RANK'])
     inited = False
 
     @staticmethod
     def initialize_distributed():
-        if not torch.distributed.is_initialized() and Utils.rank >= 0:
+        if not torch.distributed.is_initialized():
             print(f'Initializing torch.distributed with rank: {Utils.rank}, world_size: {Utils.world_size}')
             
             init_method = get_distributed_init_method()

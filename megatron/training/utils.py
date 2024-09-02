@@ -5,9 +5,10 @@ import os
 import sys
 from datetime import datetime
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
+HAVE_APEX_OR_TE=True
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
 except ImportError:
@@ -19,6 +20,7 @@ except ImportError:
     try:
         from amp_C import multi_tensor_l2norm
     except ImportError:
+        HAVE_APEX_OR_TE = False
         import warnings
         warnings.warn(
             f'Transformer Engine and Apex are not installed. '
@@ -35,14 +37,15 @@ from megatron.training import (
     get_args,
     get_adlr_autoresume,
 )
-from megatron.core import DistributedDataParallel as DDP
+if HAVE_APEX_OR_TE:
+    from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core import mpu
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.legacy.model import Float16Module
 from megatron.legacy.model.module import param_is_not_shared
 
 
-ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, Float16Module)
+ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, Float16Module) if HAVE_APEX_OR_TE else (Float16Module)
 
 
 def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
@@ -88,19 +91,30 @@ def calc_params_l2_norm(model):
         False # no per-parameter norm
     )
     norm_2 = norm * norm
+    xm = get_xla_model()
     if mpu.get_expert_model_parallel_world_size() == 1:
         # Sum across all model-parallel GPUs(tensor + pipeline).
-        torch.distributed.all_reduce(norm_2,
+        if xm:
+            xm.all_reduce(xm.REDUCE_SUM, [norm_2], 
+                                    groups=mpu.get_model_parallel_group())
+        else:
+            torch.distributed.all_reduce(norm_2,
                                      op=torch.distributed.ReduceOp.SUM,
                                      group=mpu.get_model_parallel_group())
     else:
         # Sum across tensor, pipeline and expert model-parallel GPUs.
-        torch.distributed.all_reduce(norm_2,
-                                     op=torch.distributed.ReduceOp.SUM,
-                                     group=mpu.get_tensor_and_expert_parallel_group())
-        torch.distributed.all_reduce(norm_2,
-                                     op=torch.distributed.ReduceOp.SUM,
-                                     group=mpu.get_pipeline_model_parallel_group())
+        if xm:
+            xm.all_reduce(xm.REDUCE_SUM, [norm_2], 
+                                    groups=mpu.get_tensor_and_expert_parallel_groups())
+            xm.all_reduce(xm.REDUCE_SUM, [norm_2], 
+                                    groups=mpu.get_pipeline_model_parallel_groups())
+        else:
+            torch.distributed.all_reduce(norm_2,
+                                        op=torch.distributed.ReduceOp.SUM,
+                                        group=mpu.get_tensor_and_expert_parallel_group())
+            torch.distributed.all_reduce(norm_2,
+                                        op=torch.distributed.ReduceOp.SUM,
+                                        group=mpu.get_pipeline_model_parallel_group())
     return norm_2.item() ** 0.5
 
 
@@ -108,8 +122,13 @@ def average_losses_across_data_parallel_group(losses):
     """Reduce a tensor of losses across all GPUs."""
     averaged_losses = torch.cat(
         [loss.clone().detach().view(1) for loss in losses])
-    torch.distributed.all_reduce(averaged_losses,
-                                 group=mpu.get_data_parallel_group())
+    xm = get_xla_model()
+    if xm:
+        xm.all_reduce(xm.REDUCE_SUM, [averaged_losses], 
+                                    groups=mpu.get_data_parallel_groups())
+    else:
+        torch.distributed.all_reduce(averaged_losses,
+                                    group=mpu.get_data_parallel_group())
     averaged_losses = averaged_losses / \
         torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
 
@@ -259,7 +278,7 @@ def get_batch_on_this_cp_rank(batch):
                     *val.shape[(seq_dim + 1) :],
                 )
                 index = torch.tensor([cp_rank, (2 * cp_size - cp_rank - 1)], 
-                                     device="cpu", pin_memory=True).cuda(non_blocking=True)
+                                     device="cpu", pin_memory=True).to(get_current_device())
                 val = val.index_select(seq_dim, index)
                 val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
                 batch[key] = val
@@ -320,11 +339,11 @@ def get_batch_on_this_tp_rank(data_iterator):
            data = None
 
        batch = {
-           'tokens': data["tokens"].cuda(non_blocking = True),
-           'labels': data["labels"].cuda(non_blocking = True),
-           'loss_mask': data["loss_mask"].cuda(non_blocking = True),
-           'attention_mask': None if "attention_mask" not in data else data["attention_mask"].cuda(non_blocking = True),
-           'position_ids': data["position_ids"].cuda(non_blocking = True)
+           'tokens': data["tokens"].to(get_current_device()),
+           'labels': data["labels"].to(get_current_device()),
+           'loss_mask': data["loss_mask"].to(get_current_device()),
+           'attention_mask': None if "attention_mask" not in data else data["attention_mask"].to(get_current_device()),
+           'position_ids': data["position_ids"].to(get_current_device())
        }
 
        if args.pipeline_model_parallel_size == 1:

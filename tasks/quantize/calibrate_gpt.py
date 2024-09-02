@@ -125,7 +125,7 @@ def calibrate(data_loader, model):
             if iteration % args.log_interval == 0:
                 print_rank_0('> working on iteration: {}'.format(iteration))
             with te.fp8_autocast(enabled=False, calibrating=True), torch.autocast(
-                device_type=get_current_device(), dtype=torch.bfloat16
+                device_type='cuda', dtype=torch.bfloat16
             ):
                 output = forward_step(batch, model, config)
 

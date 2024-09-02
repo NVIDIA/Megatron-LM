@@ -1,7 +1,7 @@
 import contextlib
 import math
 
-from megatron.core.optimizer.distrib_optimizer import HAVE_APEX_OR_TE
+from megatron.core.distributed import HAVE_APEX_OR_TE
 import pytest
 import torch
 
@@ -20,7 +20,7 @@ def get_model_and_buffers(
 ):
     ddp_config = DistributedDataParallelConfig(
         grad_reduce_in_fp32=True,
-        use_distributed_optimizer=use_distributed_optimizer and HAVE_APEX_OR_TE,
+        use_distributed_optimizer=use_distributed_optimizer,
         overlap_grad_reduce=overlap_grad_reduce,
     )
     model = TestModel(input_dim=input_dim, output_dim=output_dim, num_layers=num_layers, bias=bias)
@@ -42,14 +42,14 @@ def get_model_and_buffers(
 
     return model, param_and_grad_buffer
 
-
+@pytest.mark.skipif(not HAVE_APEX_OR_TE, reason="Apex or Transfomer Engine is required")
 @pytest.mark.parametrize("bucket_size", [None, 9999, 10000, 10001, 19999, 20000])
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("bias", [False, True])
 def test_bucket_sizes(bucket_size: int, use_distributed_optimizer: bool, bias: bool):
     Utils.initialize_model_parallel()
 
-    use_distributed_optimizer = use_distributed_optimizer and HAVE_APEX_OR_TE
+    use_distributed_optimizer = use_distributed_optimizer
     input_dim = 100
     output_dim = 100
     num_layers = 10
@@ -122,7 +122,9 @@ def test_bucket_sizes(bucket_size: int, use_distributed_optimizer: bool, bias: b
         )
 
     Utils.destroy_model_parallel()
+    
 
+@pytest.mark.skipif(not HAVE_APEX_OR_TE, reason="Apex or Transfomer Engine is required")
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("overlap_grad_reduce", [False, True])
 def test_grad_sync(use_distributed_optimizer: bool, overlap_grad_reduce: bool):

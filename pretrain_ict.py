@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.training import get_args
 from megatron.training import print_rank_0
 from megatron.training import get_timers
@@ -20,6 +20,8 @@ from megatron.legacy.data.dataset_utils import build_train_valid_test_datasets
 from megatron.legacy.model.biencoder_model import biencoder_model_provider
 from megatron.training import pretrain
 from megatron.training.utils import average_losses_across_data_parallel_group
+
+xm = get_xla_model()
 
 
 def pretrain_ict_model_provider(pre_process=True, post_process=True):
@@ -48,13 +50,17 @@ class AllgatherFromDataParallelRegion(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input_):
         assert input_.dim() == 2
-        group, rank, world_size = get_group_world_size_rank()
+        
+        if xm:
+            output = xm.all_gather(input_, groups=mpu.get_data_parallel_groups())
+        else:
+            group, rank, world_size = get_group_world_size_rank()
 
-        tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
-        tensor_list[rank] = input_
-        torch.distributed.all_gather(tensor_list, input_, group=group)
+            tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
+            tensor_list[rank] = input_
+            torch.distributed.all_gather(tensor_list, input_, group=group)
 
-        output = torch.cat(tensor_list, dim=0).contiguous()
+            output = torch.cat(tensor_list, dim=0).contiguous()
 
         return output
 

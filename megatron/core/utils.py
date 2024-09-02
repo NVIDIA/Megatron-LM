@@ -18,7 +18,7 @@ from functools import reduce
 from types import TracebackType
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 from megatron.core import parallel_state

@@ -1,4 +1,4 @@
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch.nn.functional as F
 import torch
 from megatron.training import print_rank_0, get_args
@@ -68,20 +68,27 @@ def compute_feature_bank(model):
     feature_bank = torch.cat(feature_bank, dim=0).contiguous()
     feature_label = torch.cat(feature_label, dim=0).contiguous()
 
-    feature_banks = [torch.zeros_like(feature_bank)
-                     for i in range(mpu.get_data_parallel_world_size())]
-    torch.distributed.all_gather(feature_banks,
-                                 feature_bank,
-                                 group=mpu.get_data_parallel_group())
+    xm = get_xla_model()
+    if xm:
+        feature_banks = list(xm.all_gather(feature_bank, groups=mpu.get_data_parallel_groups()).split(feature_bank.size()[0]))
+    else:
+        feature_banks = [torch.zeros_like(feature_bank)
+                        for i in range(mpu.get_data_parallel_world_size())]
+        torch.distributed.all_gather(feature_banks,
+                                    feature_bank,
+                                    group=mpu.get_data_parallel_group())
 
     assert torch.all(torch.eq(feature_banks[mpu.get_data_parallel_rank()],
                               feature_bank))
 
-    feature_labels = [torch.zeros_like(feature_label)
-                      for i in range(mpu.get_data_parallel_world_size())]
-    torch.distributed.all_gather(feature_labels,
-                                 feature_label,
-                                 group=mpu.get_data_parallel_group())
+    if xm:
+        feature_labels = list(xm.all_gather(feature_label, groups=mpu.get_data_parallel_groups()).split(feature_label.size()[0]))
+    else:
+        feature_labels = [torch.zeros_like(feature_label)
+                        for i in range(mpu.get_data_parallel_world_size())]
+        torch.distributed.all_gather(feature_labels,
+                                    feature_label,
+                                    group=mpu.get_data_parallel_group())
 
     # [D, N]
     feature_banks = torch.cat(feature_banks, dim=0).t().contiguous()

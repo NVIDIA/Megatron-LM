@@ -2,7 +2,7 @@
 
 """Vision-classification finetuning/evaluation."""
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 import torch.nn.functional as F
 from functools import partial
@@ -153,7 +153,12 @@ def segmentation():
             m.train()
         # Reduce.
         if mpu.is_pipeline_last_stage():
-            torch.distributed.all_reduce(performs,
+            xm = get_xla_model()
+            if xm:
+                xm.all_reduce(xm.REDUCE_SUM, [performs], 
+                                  groups=mpu.get_data_parallel_groups())
+            else:
+                torch.distributed.all_reduce(performs,
                                          group=mpu.get_data_parallel_group())
             # Print on screen.
             # performs[int(ch), :] = [nb_tp, nb_fp, nb_tn, nb_fn]

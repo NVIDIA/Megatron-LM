@@ -3,6 +3,14 @@
 from dataclasses import dataclass
 from typing import Optional
 
+HAVE_APEX_OR_TE = True
+try:
+    from transformer_engine.pytorch.optimizers import FusedAdam
+except ImportError:
+    try:
+        from apex.optimizers import FusedAdam
+    except ImportError:
+        HAVE_APEX_OR_TE = False
 
 @dataclass
 class DistributedDataParallelConfig:

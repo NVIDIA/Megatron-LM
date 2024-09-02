@@ -10,7 +10,7 @@ import sys
 import threading
 from pathlib import Path
 
-from megatron.core.optimizer.distrib_optimizer import HAVE_APEX_OR_TE
+from megatron.core.distributed import HAVE_APEX_OR_TE
 import numpy as np
 from time import time
 

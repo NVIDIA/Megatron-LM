@@ -12,9 +12,11 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.common.embeddings.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.core.parallel_state import (
     get_data_parallel_group,
+    get_data_parallel_groups,
     get_data_parallel_rank,
     get_data_parallel_world_size,
     get_tensor_model_parallel_group,
+    get_tensor_model_parallel_groups,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -417,9 +419,13 @@ class SelfAttention(Attention):
                 self.k_layernorm.bias.data,
             ]
         )
-        dp_list = [torch.empty_like(inputs) for _ in range(get_data_parallel_world_size())]
-        dp_list[rank] = inputs
-        torch.distributed.all_gather(dp_list, inputs, group=get_data_parallel_group())
+        xm = get_xla_model()
+        if xm:
+            dp_list = list(xm.all_gather(inputs, groups=get_data_parallel_groups()).split(inputs.size()[0]))
+        else:
+            dp_list = [torch.empty_like(inputs) for _ in range(get_data_parallel_world_size())]
+            dp_list[rank] = inputs
+            torch.distributed.all_gather(dp_list, inputs, group=get_data_parallel_group())
 
         def _compare(srcs, tgts, names, parallelism):
             assert len(srcs) == len(tgts) == len(names)
@@ -442,10 +448,14 @@ class SelfAttention(Attention):
                 "DP",
             )
 
-        rank = get_tensor_model_parallel_rank()
-        tp_list = [torch.empty_like(inputs) for _ in range(get_tensor_model_parallel_world_size())]
-        tp_list[rank] = inputs
-        torch.distributed.all_gather(tp_list, inputs, group=get_tensor_model_parallel_group())
+        xm = get_xla_model()
+        if xm:
+            tp_list = list(xm.all_gather(inputs, groups=get_tensor_model_parallel_groups()).split(inputs.size()[0]))
+        else:
+            rank = get_tensor_model_parallel_rank()
+            tp_list = [torch.empty_like(inputs) for _ in range(get_tensor_model_parallel_world_size())]
+            tp_list[rank] = inputs
+            torch.distributed.all_gather(tp_list, inputs, group=get_tensor_model_parallel_group())
 
         for i, tp in enumerate(tp_list):
             q_w, q_b, k_w, k_b = torch.unbind(tp)

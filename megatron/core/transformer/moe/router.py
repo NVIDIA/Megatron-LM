@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
     get_device_rng_tracker,
@@ -186,11 +186,16 @@ class TopKRouter(Router):
         """
         moe_aux_loss_coeff = self.config.moe_aux_loss_coeff
         sequence_partition_group = None
+        xm = get_xla_model()
         if self.config.moe_token_dispatcher_type == "alltoall_seq":
             sequence_partition_group = parallel_state.get_context_parallel_group()
             moe_aux_loss_coeff /= parallel_state.get_tensor_model_parallel_world_size()
         else:
-            sequence_partition_group = parallel_state.get_tensor_and_context_parallel_group()
+            if xm:
+                sequence_partition_group = parallel_state.get_tensor_and_context_parallel_groups()
+            else:
+                sequence_partition_group = parallel_state.get_tensor_and_context_parallel_group()
+            
 
         aux_loss = switch_load_balancing_loss_func(
             probs,
@@ -204,7 +209,7 @@ class TopKRouter(Router):
             aux_loss / moe_aux_loss_coeff,
             self.layer_number,
             self.config.num_layers,
-            reduce_group=sequence_partition_group,
+            reduce_group=sequence_partition_group
         )
         activation = MoEAuxLossAutoScaler.apply(activation, aux_loss)
         return activation

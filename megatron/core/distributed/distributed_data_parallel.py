@@ -11,21 +11,10 @@ from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..transformer.module import MegatronModule
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import log_single_rank
-from .distributed_data_parallel_config import DistributedDataParallelConfig
+from .distributed_data_parallel_config import DistributedDataParallelConfig, HAVE_APEX_OR_TE
 from .param_and_grad_buffer import ParamAndGradBuffer
 
 logger = logging.getLogger(__name__)
-
-HAVE_APEX_OR_TE = True
-try:
-    from transformer_engine.pytorch.optimizers import FusedAdam as Adam
-except ImportError:
-    try:
-        from apex.optimizers import FusedAdam as Adam
-    except ImportError:
-        from torch.optim import Adam
-
-        HAVE_APEX_OR_TE = False
 
 class DistributedDataParallel(MegatronModule):
     """
@@ -52,7 +41,9 @@ class DistributedDataParallel(MegatronModule):
         module: torch.nn.Module,
         disable_bucketing: bool = False,
     ):
+        assert HAVE_APEX_OR_TE, "Install Apex or TE to use DistributedDataParallel"
         super().__init__(config=config)
+
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
@@ -187,7 +178,7 @@ class DistributedDataParallel(MegatronModule):
         # if we re-mapped parameters (which happens when we use the distributed optimizer).
         # This is a temporary workaround around a TE bug that is fixed with
         # https://github.com/NVIDIA/TransformerEngine/pull/719.
-        if self.ddp_config.use_distributed_optimizer and HAVE_APEX_OR_TE:
+        if self.ddp_config.use_distributed_optimizer:
 
             @torch.no_grad()
             def unmap_weight_tensor(m):

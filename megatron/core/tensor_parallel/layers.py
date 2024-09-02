@@ -9,7 +9,7 @@ import os
 import warnings
 from typing import Any, Callable, List, Optional, Tuple
 
-from ..device_utils import get_current_device, get_current_device_type
+from ..device_utils import get_current_device, get_current_device_type, get_xla_model
 import torch
 import torch.nn.functional as F
 import torch.nn.init as init
@@ -21,6 +21,7 @@ from megatron.core.parallel_state import (
     get_tensor_and_expert_parallel_rank,
     get_tensor_and_expert_parallel_world_size,
     get_tensor_model_parallel_group,
+    get_tensor_model_parallel_groups,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -297,7 +298,11 @@ class LinearWithFrozenWeight(torch.autograd.Function):
 
         if ctx.allreduce_dgrad:
             # All-reduce. Note: here async and sync are effectively the same.
-            torch.distributed.all_reduce(grad_input, group=get_tensor_model_parallel_group())
+            xm = get_xla_model()
+            if xm:
+                xm.all_reduce(xm.REDUCE_SUM, [grad_input], groups=get_tensor_model_parallel_groups())
+            else:
+                torch.distributed.all_reduce(grad_input, group=get_tensor_model_parallel_group())
 
         return grad_input, None, None, None
 
@@ -460,9 +465,13 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         if ctx.allreduce_dgrad:
             # Asynchronous all-reduce
-            handle = torch.distributed.all_reduce(
-                grad_input, group=get_tensor_model_parallel_group(), async_op=True
-            )
+            xm = get_xla_model()
+            if xm:
+                xm.all_reduce(xm.REDUCE_SUM, [grad_input], groups=get_tensor_model_parallel_groups())
+            else:
+                handle = torch.distributed.all_reduce(
+                    grad_input, group=get_tensor_model_parallel_group(), async_op=True
+                )
             # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
             # all-reduce is scheduled before the weight gradient computation
 

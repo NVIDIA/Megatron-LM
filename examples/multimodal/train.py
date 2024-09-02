@@ -6,6 +6,7 @@ import os
 import sys
 import warnings
 
+from megatron.core.device_utils import get_xla_model
 import torch
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
@@ -296,7 +297,11 @@ def loss_func(loss_mask, output_tensor):
     loss = torch.cat([total_loss.view(1), total_tokens.view(1)])
 
     reporting_loss = loss.clone().detach()
-    torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
+    xm = get_xla_model()
+    if xm:
+        xm.all_reduce(xm.REDUCE_SUM, [reporting_loss], groups=mpu.get_data_parallel_groups())
+    else:
+        torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
 
     local_num_tokens = loss[1].clone().detach().to(torch.int)
 

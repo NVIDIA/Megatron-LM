@@ -1,8 +1,9 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import math
+from typing import List, Union
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 from megatron.core import parallel_state
@@ -376,8 +377,8 @@ def save_to_aux_losses_tracker(
     loss: torch.Tensor,
     layer_number: int,
     num_layers: int,
-    reduce_group: torch.distributed.ProcessGroup = None,
-    avg_group: torch.distributed.ProcessGroup = None,
+    reduce_group: Union[torch.distributed.ProcessGroup, List[List[int]]] = None,
+    avg_group: Union[torch.distributed.ProcessGroup, List[List[int]]] = None,
 ):
     """Save the auxiliary loss for logging.
     Args:
@@ -416,16 +417,29 @@ def reduce_aux_losses_tracker_across_ranks():
     for name in tracker:
         values = tracker[name]["values"]
         # Collect aux losses across PP.
-        torch.distributed.all_reduce(
-            values, group=parallel_state.get_pipeline_model_parallel_group()
-        )
+        xm = get_xla_model()
+        if xm:
+            xm.all_reduce(xm.REDUCE_SUM, [values], 
+                                        groups=parallel_state.get_pipeline_model_parallel_groups())
+        else:
+            torch.distributed.all_reduce(
+                values, group=parallel_state.get_pipeline_model_parallel_group()
+            )
         # Reduce aux losses across ranks.
         if tracker[name].get('reduce_group') is not None:
-            torch.distributed.all_reduce(values, group=tracker[name].get('reduce_group'))
+            if xm:
+                xm.all_reduce(xm.REDUCE_SUM, [values], 
+                                        groups=tracker[name].get('reduce_group'))
+            else:
+                torch.distributed.all_reduce(values, group=tracker[name].get('reduce_group'))
         if tracker[name].get('avg_group') is not None:
-            torch.distributed.all_reduce(
-                values, group=tracker[name]['avg_group'], op=torch.distributed.ReduceOp.AVG
-            )
+            if xm:
+                xm.all_reduce(xm.REDUCE_AVG, [values], 
+                                        groups=tracker[name].get('avg_group'))
+            else:
+                torch.distributed.all_reduce(
+                    values, group=tracker[name]['avg_group'], op=torch.distributed.ReduceOp.AVG
+                )
 
 
 def track_moe_metrics(

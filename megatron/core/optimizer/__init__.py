@@ -30,7 +30,7 @@ from megatron.core import mpu
 from ..distributed import ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import log_single_rank
-from .distrib_optimizer import HAVE_APEX_OR_TE, DistributedOptimizer
+from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import (
     ChainedOptimizer,

@@ -9,22 +9,10 @@ from typing import Dict, List, Optional
 from megatron.core.device_utils import get_current_device
 import torch
 
-from ..utils import log_on_each_pipeline_stage
-from .distributed_data_parallel_config import DistributedDataParallelConfig
-
-HAVE_APEX_OR_TE = True
-try:
-    from transformer_engine.pytorch.optimizers import FusedAdam as Adam
-except ImportError:
-    try:
-        from apex.optimizers import FusedAdam as Adam
-    except ImportError:
-        from torch.optim import Adam
-
-        HAVE_APEX_OR_TE = False
+from ..utils import log_on_each_pipeline_stage  
+from .distributed_data_parallel_config import DistributedDataParallelConfig, HAVE_APEX_OR_TE
 
 logger = logging.getLogger(__name__)
-
 
 class BufferType(Enum):
     PARAM = 1
@@ -74,7 +62,7 @@ class Bucket:
         data_parallel_group: torch.distributed.ProcessGroup,
         data_parallel_world_size: int,
         gradient_scaling_factor: float,
-    ):
+    ):  
         self.ddp_config = ddp_config
 
         # State for bookkeeping: params is the set of parameters this bucket is
@@ -140,7 +128,7 @@ class Bucket:
             reduce_op = torch.distributed.ReduceOp.AVG
 
         # Use async_op only when overlap_grad_reduce is True.
-        if self.ddp_config.use_distributed_optimizer and HAVE_APEX_OR_TE:
+        if self.ddp_config.use_distributed_optimizer:
             local_data_view = shard_buffer(self.grad_data, self.data_parallel_world_size)[
                 self.data_parallel_rank
             ]
@@ -229,6 +217,8 @@ class ParamAndGradBuffer:
         param_to_name: Dict[torch.nn.Parameter, str],
         gradient_scaling_factor: float,
     ):
+        assert HAVE_APEX_OR_TE, "Install Apex or TE to use ParamAndGradBuffer"
+
         self.ddp_config = ddp_config
 
         # Check that params are unique.
@@ -260,7 +250,7 @@ class ParamAndGradBuffer:
             """
             Pads end index of bucket if using distributed optimizer (to ensure uniform sharding).
             """
-            if self.ddp_config.use_distributed_optimizer and HAVE_APEX_OR_TE:
+            if self.ddp_config.use_distributed_optimizer:
                 # Workaround for TE bug causing cuBLAS to pick an incompatible algorithm.
                 # This also helps cuBLAS pick more efficient algorithms for GEMMs.
                 # We now ensure that all buckets start at a memory address that is 256-byte
@@ -272,7 +262,7 @@ class ParamAndGradBuffer:
             """
             Pads start index of param if using distributed optimizer (to ensure "good" alignment).
             """
-            if self.ddp_config.use_distributed_optimizer and HAVE_APEX_OR_TE:
+            if self.ddp_config.use_distributed_optimizer:
                 # Ensure that params start at 128-byte aligned addresses (64 values
                 # since params are >= 16-bit precision).
                 return _pad(param_start_index, 64)
@@ -325,14 +315,13 @@ class ParamAndGradBuffer:
                 return (
                     getattr(param, "shared_embedding", False)
                     and self.ddp_config.use_distributed_optimizer
-                    and HAVE_APEX_OR_TE
                 )
 
             # Create bucket with already collected parameters if current param needs its own bucket.
             if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
                 # We are creating a bucket for the already accumulated parameters, whose params
                 # end at the current data_start_index.
-                if self.ddp_config.use_distributed_optimizer and HAVE_APEX_OR_TE:
+                if self.ddp_config.use_distributed_optimizer:
                     # data_start_index should already be padded.
                     assert data_start_index % self.data_parallel_world_size == 0
                 _create_new_bucket(data_start_index)
@@ -358,14 +347,14 @@ class ParamAndGradBuffer:
         self.numel = data_end_index
         self.numel_unpadded = sum(per_bucket_numel_unpadded)
         assert self.numel_unpadded <= self.numel
-        if self.ddp_config.use_distributed_optimizer and HAVE_APEX_OR_TE:
+        if self.ddp_config.use_distributed_optimizer:
             assert self.numel % self.data_parallel_world_size == 0
         else:
             assert self.numel == self.numel_unpadded
 
         self.param_data = None
         # Only re-map param tensors if using distributed optimizer.
-        if self.ddp_config.use_distributed_optimizer and HAVE_APEX_OR_TE:
+        if self.ddp_config.use_distributed_optimizer:
             self.param_data = torch.zeros(
                 self.numel,
                 dtype=self.param_dtype,
@@ -479,7 +468,7 @@ class ParamAndGradBuffer:
 
         # Assert that indices are correctly padded (if needed), and that bucket
         # position is same as originally computed.
-        if self.ddp_config.use_distributed_optimizer and HAVE_APEX_OR_TE:
+        if self.ddp_config.use_distributed_optimizer:
             assert start_index % self.data_parallel_world_size == 0
             assert end_index % self.data_parallel_world_size == 0
         assert (start_index, end_index) == self.bucket_indices[bucket_id]

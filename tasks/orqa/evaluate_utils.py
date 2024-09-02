@@ -1,6 +1,6 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core.device_utils import get_local_device_count
 import torch
 
@@ -114,19 +114,26 @@ class ORQAEvaluator(object):
         num_nodes = torch.distributed.get_world_size() // device_count
         node_id = rank // device_count
 
+        groups = []
         for node in range(num_nodes):
             start_rank = node * device_count
             end_rank = (node + 1) * device_count
             ranks_list = list(range(start_rank, end_rank))
+
+            groups.append(ranks_list)
             node_group = torch.distributed.new_group(ranks=ranks_list)
 
             if node_id == node:
                 device_start_rank = start_rank
                 group = node_group
-        
-        input_ = torch.empty_like(query_tensor).copy_(query_tensor).detach_()
-        tensor_list = [torch.empty_like(input_) for _ in range(device_count)]
-        torch.distributed.all_gather(tensor_list, query_tensor, group=group)
+                
+        xm = get_xla_model()
+        if xm:
+            tensor_list = list(xm.all_gather(query_tensor, groups=groups).split(query_tensor.size()[0]))
+        else:
+            input_ = torch.empty_like(query_tensor).copy_(query_tensor).detach_()
+            tensor_list = [torch.empty_like(input_) for _ in range(device_count)]
+            torch.distributed.all_gather(tensor_list, query_tensor, group=group)
 
         if local_rank == 0 and self.mips_index is not None:
             all_query_tensor = torch.cat(tensor_list, dim=0).contiguous()

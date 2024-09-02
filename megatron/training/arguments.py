@@ -7,7 +7,6 @@ import dataclasses
 import json
 import logging
 import os
-from megatron.core.optimizer.distrib_optimizer import HAVE_APEX_OR_TE
 import torch
 import types
 
@@ -22,6 +21,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.training.activations import squared_relu
 from megatron.training.utils import update_use_dist_ckpt
 
+from megatron.core.distributed import HAVE_APEX_OR_TE
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""

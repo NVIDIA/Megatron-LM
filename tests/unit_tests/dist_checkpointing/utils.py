@@ -2,7 +2,7 @@ from functools import partial
 from types import SimpleNamespace
 from unittest import mock
 
-from megatron.core.optimizer.distrib_optimizer import HAVE_APEX_OR_TE
+from megatron.core.distributed import HAVE_APEX_OR_TE
 import torch
 
 from megatron.core.models.gpt import GPTModel

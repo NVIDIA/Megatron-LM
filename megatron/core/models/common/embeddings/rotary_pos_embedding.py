@@ -38,7 +38,7 @@ def get_pos_emb_on_this_cp_rank(pos_emb, seq_dim):
     cp_rank = parallel_state.get_context_parallel_rank()
     cp_idx = torch.tensor(
         [cp_rank, (2 * cp_size - cp_rank - 1)], device="cpu", pin_memory=True
-    ).cuda(non_blocking=True)
+    ).to(get_current_device())
     pos_emb = pos_emb.view(
         *pos_emb.shape[:seq_dim], 2 * cp_size, -1, *pos_emb.shape[(seq_dim + 1) :]
     )
