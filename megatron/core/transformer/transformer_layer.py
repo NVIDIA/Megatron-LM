@@ -18,6 +18,8 @@ from megatron.core.utils import make_viewless_tensor
 
 @dataclass
 class TransformerLayerSubmodules:
+    """Simple container class that contains the ops for a transformer layer."""
+
     input_layernorm: Union[ModuleSpec, type] = IdentityOp
     self_attention: Union[ModuleSpec, type] = IdentityOp
     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
@@ -130,11 +132,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
     def _get_layer_offset(self):
-
+        """Get the index number of this layer, given the level of pipelining."""
         pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
 
         num_layers_per_pipeline_rank = (
-            self.config.num_layers // parallel_state.get_pipeline_model_parallel_world_size()
+            self.config.num_layers // self.config.pipeline_model_parallel_size
         )
 
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
@@ -148,7 +150,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         else:
             # Each stage gets a contiguous set of layers.
-            if parallel_state.get_pipeline_model_parallel_world_size() > 1:
+            if self.config.pipeline_model_parallel_size > 1:
                 offset = pipeline_rank * num_layers_per_pipeline_rank
             else:
                 offset = 0
@@ -165,6 +167,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         inference_params=None,
         packed_seq_params=None,
     ):
+        """Transformer forward function."""
         # hidden_states: [s, b, h]
 
         # Residual connection.
@@ -244,6 +247,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
+        """State dict for dist checkpointing."""
+
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
         prefixed_map = {
             f'{prefix}{k}': f'{prefix}{v}'
