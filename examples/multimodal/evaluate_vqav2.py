@@ -28,7 +28,15 @@ def merge_input_files(input_path):
     return output_file_path
 
 
-def compute_vqa_accuracy(result_file):
+def is_number(n: str):
+    try:
+        float(n)
+        return True
+    except ValueError:
+        return False
+
+
+def compute_vqa_accuracy(result_file, use_chartqa_metric=False):
     """Compute VQA accuracy."""
     merged_results = json.load(open(result_file))
 
@@ -43,9 +51,27 @@ def compute_vqa_accuracy(result_file):
         gt = [vqa.processPunctuation(ans) for ans in gt]
         gt = [vqa.processDigitArticle(ans) for ans in gt]
 
-        num_match = sum([pred == ans for ans in gt])
-        acc = min(1.0, num_match / 3.0)
-        all_acc.append(acc)
+        # ChartQA uses relaxed accuracy:
+        # "We consider an answer to be correct if it is within 5% of the gold answer.
+        #  For non-numeric answers, we still need an exact match to consider an answer to be correct."
+        if use_chartqa_metric:
+            acc = 0.
+            assert len(gt) == 1, "expected exactly one groundtruth answer."
+            gt = gt[0]
+
+            if is_number(pred) and is_number(gt):
+                pred = float(pred)
+                gt = float(gt)
+                if pred >= (gt * 0.95) and pred <= (gt * 1.05):
+                    acc = 1.0
+            elif pred == gt:
+                acc = 1.0
+
+            all_acc.append(acc)
+        else:
+            num_match = sum([pred == ans for ans in gt])
+            acc = min(1.0, num_match / 3.0)
+            all_acc.append(acc)
 
     acc_avg = sum(all_acc) / len(all_acc) * 100
     print(f"===== Accuracy {acc_avg:.2f}% =====")
