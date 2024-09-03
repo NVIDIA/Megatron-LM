@@ -17,6 +17,7 @@ import datasets
 import numpy as np
 import torch
 from dataset_helpers import tokenizer_image_token
+from image_processing import get_visual_transform
 from MMMU.eval.utils.data_utils import (
     CAT_SHORT2LONG,
     construct_prompt,
@@ -25,7 +26,6 @@ from MMMU.eval.utils.data_utils import (
 )
 from MMMU.eval.utils.eval_utils import parse_multi_choice_response
 from PIL import Image
-from image_processing import get_visual_transform
 from train import add_multimodal_extra_args, get_num_image_embeddings, model_provider
 
 from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN_INDEX
@@ -58,7 +58,7 @@ def add_text_generation_args(parser):
     group.add_argument(
         "--task",
         type=str,
-        choices=["captioning", "TextVQA", "VQAv2", "MMMU"],
+        choices=["captioning", "TextVQA", "VQAv2", "ChartQA", "MMMU"],
         help="Generation task to run",
     )
     group.add_argument(
@@ -86,43 +86,45 @@ def _get_partition_bounds(
     return num_samples_per_partition * partition_id, num_samples_per_partition * (partition_id + 1)
 
 
-def generate_samples(model):
-    """Text generation using a trained vision language model."""
-    args = get_args()
-
+def get_evaluation_dataset(
+    task,
+    input_image_path,
+    gt_path,
+    img_h,
+    img_w,
+    use_tiling,
+    max_num_tiles,
+    use_thumbnail,
+    num_samples_per_partition,
+    num_partitions,
+    partition_id,
+):
+    """Build evaluation dataset."""
     images = []
     tile_counts = []
     questions, answers = [], []
     samples, sample_ids = [], []
 
-    if args.task == "TextVQA":
-        samples = json.load(open(args.gt_path, encoding='utf-8'))['data']
+    if task == "TextVQA":
+        samples = json.load(open(gt_path, encoding='utf-8'))['data']
 
         # Optionally, process only a subset of the input files.
-        if args.num_partitions > 0:
+        if num_partitions > 0:
             lb, ub = _get_partition_bounds(
-                len(samples), args.num_samples_per_partition, args.num_partitions, args.partition_id
+                len(samples), num_samples_per_partition, num_partitions, partition_id
             )
             samples = samples[lb:ub]
-
-        num_samples = len(samples)
 
         for i in range(len(samples)):
             sample = samples[i]
 
-            img_file = "{}/{}.jpg".format(args.input_image_path, sample["image_id"])
+            img_file = "{}/{}.jpg".format(input_image_path, sample["image_id"])
             if not os.path.exists(img_file):
                 img_file = img_file.replace('.jpg', '.png')
 
             img = Image.open(img_file)
             imgs = get_visual_transform(
-                img,
-                args.img_h,
-                args.img_w,
-                args.use_tiling,
-                args.max_num_tiles,
-                args.use_thumbnail,
-                augment=False,
+                img, img_h, img_w, use_tiling, max_num_tiles, use_thumbnail, augment=False
             )
 
             images.append(imgs)
@@ -131,35 +133,24 @@ def generate_samples(model):
             questions.append(sample["question"])
             answers.append(sample["answers"])
             sample_ids.append(sample["question_id"])
-
-            if len(images) == num_samples:
-                break
-    elif args.task == "VQAv2":
-        samples = json.load(open(args.gt_path, encoding='utf-8'))
+    elif task == "VQAv2":
+        samples = json.load(open(gt_path, encoding='utf-8'))
 
         # Optionally, process only a subset of the input files.
-        if args.num_partitions > 0:
+        if num_partitions > 0:
             lb, ub = _get_partition_bounds(
-                len(samples), args.num_samples_per_partition, args.num_partitions, args.partition_id
+                len(samples), num_samples_per_partition, num_partitions, partition_id
             )
             samples = samples[lb:ub]
-
-        num_samples = len(samples)
 
         for i in range(len(samples)):
             sample = samples[i]
 
-            img_file = "{}/{}".format(args.input_image_path, sample["image"])
+            img_file = "{}/{}".format(input_image_path, sample["image"])
 
             img = Image.open(img_file)
             imgs = get_visual_transform(
-                img,
-                args.img_h,
-                args.img_w,
-                args.use_tiling,
-                args.max_num_tiles,
-                args.use_thumbnail,
-                augment=False,
+                img, img_h, img_w, use_tiling, max_num_tiles, use_thumbnail, augment=False
             )
 
             images.append(imgs)
@@ -168,36 +159,52 @@ def generate_samples(model):
             questions.append(sample["question"])
             answers.append(sample["answer"])
             sample_ids.append(sample["question_id"])
+    elif task == "ChartQA":
+        samples = json.load(open(gt_path, encoding='utf-8'))
 
-            if len(images) == num_samples:
-                break
-    elif args.task == "captioning":
-        image_files = sorted(glob.glob(args.input_image_path + "/*"))
         # Optionally, process only a subset of the input files.
-        if args.num_partitions > 0:
+        if num_partitions > 0:
             lb, ub = _get_partition_bounds(
-                len(image_files),
-                args.num_samples_per_partition,
-                args.num_partitions,
-                args.partition_id,
+                len(samples), num_samples_per_partition, num_partitions, partition_id
+            )
+            samples = samples[lb:ub]
+
+        for i in range(len(samples)):
+            sample = samples[i]
+
+            img_file = "{}/{}".format(input_image_path, sample["imgname"])
+
+            img = Image.open(img_file)
+            imgs = get_visual_transform(
+                img, img_h, img_w, use_tiling, max_num_tiles, use_thumbnail, augment=False
+            )
+
+            images.append(imgs)
+            tile_counts.append(torch.tensor([len(imgs)], dtype=torch.int))
+
+            questions.append(sample["query"])
+            answers.append(sample["label"])
+            sample_ids.append(i)
+    elif task == "captioning":
+        image_files = sorted(glob.glob(input_image_path + "/*"))
+        # Optionally, process only a subset of the input files.
+        if num_partitions > 0:
+            lb, ub = _get_partition_bounds(
+                len(image_files), num_samples_per_partition, num_partitions, partition_id
             )
             image_files = image_files[lb:ub]
 
-        num_samples = len(image_files)
-        images = []
+        gts = json.load(open(gt_path))
+        answers = defaultdict(list)
+        for gt in gts["annotations"]:
+            answers[gt["image_id"]].append(gt['caption'])
 
         # Run image preprocessing.
-        for i in range(num_samples):
+        for i in range(len(image_files)):
             image_file = image_files[i]
             img = Image.open(image_file)
             imgs = get_visual_transform(
-                img,
-                args.img_h,
-                args.img_w,
-                args.use_tiling,
-                args.max_num_tiles,
-                args.use_thumbnail,
-                augment=False,
+                img, img_h, img_w, use_tiling, max_num_tiles, use_thumbnail, augment=False
             )
 
             images.append(imgs)
@@ -205,14 +212,7 @@ def generate_samples(model):
 
             image_id = int(image_file.split("_")[-1].split(".")[0])
             sample_ids.append(image_id)
-
-        # Load optional ground truth.
-        gt_sample_id_to_captions = defaultdict(list)
-        if args.gt_path:
-            gts = json.load(open(args.gt_path))
-            for gt in gts["annotations"]:
-                gt_sample_id_to_captions[gt["image_id"]].append(gt['caption'])
-    elif args.task == 'MMMU':
+    elif task == 'MMMU':
         # The following downloads the MMMU dataset from HuggingFace and uses the API from the MMMU github repo to run MMMU evaluation.
         all_mmmu_datasets = []
 
@@ -232,9 +232,9 @@ def generate_samples(model):
         # Optionally, process only a subset of the input files.
         start_idx = 0
         end_idx = len(dataset)
-        if args.num_partitions > 0:
+        if num_partitions > 0:
             start_idx, end_idx = _get_partition_bounds(
-                len(dataset), args.num_samples_per_partition, args.num_partitions, args.partition_id
+                len(dataset), num_samples_per_partition, num_partitions, partition_id
             )
 
         end_idx = min(len(dataset), end_idx)
@@ -253,13 +253,7 @@ def generate_samples(model):
 
             img = sample["image"]
             imgs = get_visual_transform(
-                img,
-                args.img_h,
-                args.img_w,
-                args.use_tiling,
-                args.max_num_tiles,
-                args.use_thumbnail,
-                augment=False,
+                img, img_h, img_w, use_tiling, max_num_tiles, use_thumbnail, augment=False
             )
 
             images.append(imgs)
@@ -275,11 +269,31 @@ def generate_samples(model):
 
             answers.append(sample['answer'])
             samples.append(sample)
-
-        num_samples = len(samples)
     else:
         raise NotImplementedError("unsupported task")
 
+    return images, tile_counts, samples, sample_ids, questions, answers
+
+
+def generate_samples(model):
+    """Text generation using a trained vision language model."""
+    args = get_args()
+
+    images, tile_counts, samples, sample_ids, questions, answers = get_evaluation_dataset(
+        args.task,
+        args.input_image_path,
+        args.gt_path,
+        args.img_h,
+        args.img_w,
+        args.use_tiling,
+        args.max_num_tiles,
+        args.use_thumbnail,
+        args.num_samples_per_partition,
+        args.num_partitions,
+        args.partition_id,
+    )
+
+    num_samples = len(sample_ids)
     idx = 0
     while idx < num_samples:
         imgs = torch.stack(images[idx]).cuda()
@@ -296,7 +310,6 @@ def generate_samples(model):
                 forward_step=forward_step,
                 prompts=[prompt],
                 tokens_to_generate=args.out_seq_length,
-                return_output_log_probs=False,
                 top_k_sampling=args.top_k,
                 top_p_sampling=args.top_p,
                 add_BOS=False,
@@ -311,7 +324,7 @@ def generate_samples(model):
                 output_name = ""
                 if args.task == "captioning":
                     output_name = "caption"
-                elif args.task in ("TextVQA", "VQAv2"):
+                elif args.task in ("TextVQA", "VQAv2", "ChartQA"):
                     output_name = "answer"
                 elif args.task in ("MMMU"):
                     output_name = "text"
@@ -320,11 +333,11 @@ def generate_samples(model):
                 output[output_name] = generated
 
                 if args.task == "captioning":
-                    output["ground_truth"] = gt_sample_id_to_captions[sample_id]
-                elif args.task == "TextVQA":
+                    output["ground_truth"] = answers[sample_id]
+                elif args.task in ("TextVQA", "VQAv2"):
                     output["gt_answer"] = [ans for ans in answers[idx]]
-                elif args.task == "VQAv2":
-                    output["gt_answer"] = [ans for ans in answers[idx]]
+                elif args.task == "ChartQA":
+                    output["gt_answer"] = [answers[idx]]
                 elif args.task == "MMMU":
                     sample = samples[idx]
 
@@ -347,6 +360,7 @@ def generate_samples(model):
 
 
 def generate_and_write_samples(model):
+    """Generate text and write to an output file."""
     args = get_args()
 
     for output in generate_samples(model):
@@ -356,7 +370,10 @@ def generate_and_write_samples(model):
 
 
 class VLMForwardStep(ForwardStep):
+    """Inference forward step for a multimodal model."""
+
     def __init__(self, images, num_tiles, model, max_batch_size, max_sequence_length):
+        """Create multimodal forward step."""
         total_num_tiles = torch.sum(num_tiles).item()
         num_img_embeddings = get_num_image_embeddings() * total_num_tiles
 
@@ -390,6 +407,7 @@ class VLMForwardStep(ForwardStep):
 
 
 def get_prompt(task, questions, idx, prompt_format):
+    """Get a prompt for the evaluation task."""
     if task == "captioning":
         if prompt_format == "llama3":
             prompt = "<|start_header_id|>system<|end_header_id|>\n\nA chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n<image>\nProvide a one-sentence caption for provided image.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
@@ -417,6 +435,17 @@ def get_prompt(task, questions, idx, prompt_format):
             prompt = "<image>\n{}\nAnswer the question using a single word or phrase.".format(
                 question
             )
+    elif task == "ChartQA":
+        question = questions[idx]
+
+        if prompt_format == "llama3":
+            prompt = "<|start_header_id|>system<|end_header_id|>\n\nAnswer the questions.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n<image>\n{}\nAnswer the question using a single word or phrase.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n".format(
+                questions
+            )
+        elif prompt_format == "mistral":
+            prompt = "<image>\n{}\nAnswer the question using a single word or phrase.".format(
+                question
+            )
     elif task == "MMMU":
         question = questions[idx]
 
@@ -438,10 +467,11 @@ def get_generated(prompt, prompt_format, prompt_and_generation):
         start += len("<|begin_of_text|>")
         start += 1
     elif prompt_format == "mistral":
-        start += 4
+        start += len("<s><unk><s> ")
 
     generated = prompt_and_generation[start:]
     generated = generated.split("<|eot_id|>")[0]
+    generated = generated.split("</s>")[0]
     generated = generated.strip()
     generated = generated.split("\n\n")[0]
     generated = generated.split("\n")[0]
