@@ -242,7 +242,7 @@ torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
 
 # Performance Best Practice
 
-### Tuning Guide of Paralell Mappings
+### Tuning Guide of Parallel Mappings
 
 To find a good parallel mapping that help you achieve a high throughput of a new model, there are some general rule that could help. Here is an overview of properties in different aspects for each parallel strategy.
 

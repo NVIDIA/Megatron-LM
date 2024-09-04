@@ -36,7 +36,8 @@ from megatron.core.transformer.utils import make_sharded_object_for_checkpoint
 class GroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using CUTLASS GroupedGEMM.
 
-    This class is designed to execute multiple experts in parallel, thereby maximizing computational efficiency.
+    This class is designed to execute multiple experts in parallel, thereby maximizing
+    computational efficiency.
     """
 
     def __init__(self, num_local_experts: int, config: TransformerConfig):
@@ -46,7 +47,8 @@ class GroupedMLP(MegatronModule):
         gg.assert_grouped_gemm_is_available()
         assert (
             config.add_bias_linear == False
-        ), "bias in the expert layer is not supported in Grouped GEMM yet, please set '--disable-bias-linear' instead."
+        ), "bias in the expert layer is not supported in Grouped GEMM yet, please set \
+        '--disable-bias-linear' instead."
 
         self.expert_parallel = config.expert_model_parallel_size > 1
         if self.config.gated_linear_unit:
@@ -162,6 +164,7 @@ class GroupedMLP(MegatronModule):
         self.register_load_state_dict_post_hook(remove_extra_states_check)
 
     def forward(self, permuted_local_hidden_states, tokens_per_expert):
+        """Forward step of the GroupedMLP."""
         if permuted_local_hidden_states.nelement() != 0:
             # Reshape the weights for the grouped GEMMs.
             w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
@@ -178,7 +181,8 @@ class GroupedMLP(MegatronModule):
             # No token is allocated for local experts.
             assert torch.count_nonzero(tokens_per_expert) == 0
 
-            # Make sure parameters still have gradients when no tokens are routed to this set of experts.
+            # Make sure parameters still have gradients when no tokens are routed to this set of
+            # experts.
             w1 = self.weight1.view(self.config.hidden_size, -1)
             w2 = self.weight2.view(-1, self.config.hidden_size)
             h = torch.matmul(permuted_local_hidden_states, w1)
@@ -343,7 +347,8 @@ class GroupedMLP(MegatronModule):
 class TEGroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using TE's GroupedLinear.
 
-    This class is designed to execute multiple experts in parallel, thereby maximizing computational efficiency.
+    This class is designed to execute multiple experts in parallel, thereby maximizing
+    computational efficiency.
     """
 
     def __init__(self, num_local_experts, config: TransformerConfig, submodules: MLPSubmodules):
@@ -352,7 +357,8 @@ class TEGroupedMLP(MegatronModule):
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size
 
-        # If this is a gated linear unit we double the output width, see https://arxiv.org/pdf/2002.05202.pdf
+        # If this is a gated linear unit we double the output width, see
+        # https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = self.config.ffn_hidden_size
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
@@ -500,14 +506,14 @@ class SequentialMLP(MegatronModule):
             self.local_experts.append(expert)
 
     def forward(self, permuted_local_hidden_states, tokens_per_expert):
-
+        """Forward step of the SequentialMLP."""
         output_local = torch.zeros_like(permuted_local_hidden_states)
         output_bias_local = None
         if self.add_bias:
             output_bias_local = torch.zeros_like(permuted_local_hidden_states)
 
         cumsum_num_tokens = torch.cumsum(tokens_per_expert, dim=0)
-        # Insert zero at the begining for offset index's convenience
+        # Insert zero at the beginning for offset index's convenience
         zero_tensor = torch.zeros(1, dtype=torch.long, device=cumsum_num_tokens.device)
         cumsum_num_tokens = torch.cat((zero_tensor, cumsum_num_tokens))
         for expert_num, expert in enumerate(self.local_experts):
