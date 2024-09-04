@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """GPT-2 model."""
@@ -393,9 +394,12 @@ class GPTModelPipe(PipelineModule,MegatronModule):
         if args.normalization == 'layernorm':
             self.specs.append(LayerSpec(LayerNorm,
                           args.hidden_size,
-                          eps=args.layernorm_epsilon))
+                          eps=args.layernorm_epsilon,
+                          sequence_parallel=args.sequence_parallel))
         else:
-            self.specs.append(LayerSpec(RMSNorm, args.hidden_size, args.layernorm_epsilon))
+            self.specs.append(LayerSpec(RMSNorm, args.hidden_size,
+                                        args.layernorm_epsilon,
+                                        sequence_parallel=args.sequence_parallel))
 
         def _logits_helper(embedding, lm_output):
             """A wrapper to massage inputs/outputs from pipeline. """
