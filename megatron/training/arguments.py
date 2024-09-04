@@ -692,7 +692,7 @@ def _add_transformer_engine_args(parser):
                        help='Scaling margin for fp8',
                        dest='fp8_margin')
     group.add_argument('--fp8-interval', type=int, default=1,
-                       help='Scaling update interval for fp8',
+                       help='DEPRECATED. This flag is ignored. Scaling update interval for fp8',
                        dest='fp8_interval')
     group.add_argument('--fp8-amax-history-len', type=int, default=1,
                        help='Number of steps for which amax history is recorded per tensor',

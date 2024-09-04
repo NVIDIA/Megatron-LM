@@ -158,7 +158,6 @@ class TransformerConfig(ModelParallelConfig):
     # activation recomputation
     ####################
     recompute_granularity: str = None
-    recompute_granularity: str = None
     """Determines which type of activation recompute to use.  Megatron-core supports 'selective'
     activation checkpointing where only the memory intensive part of attention is checkpointed.
     These memory intensive activations are also less compute intensive which makes activation
@@ -197,7 +196,9 @@ class TransformerConfig(ModelParallelConfig):
     """Margin for the scaling factor computation."""
 
     fp8_interval: int = 1
-    """Controls how often the scaling factor is recomputed."""
+    """DEPRECATED from TransformerEngine v1.8.0. This flag is ignored.
+    Controls how often the scaling factor is recomputed.
+    """
 
     fp8_amax_history_len: int = 1
     """The length of the amax history window used for scaling factor computation."""
