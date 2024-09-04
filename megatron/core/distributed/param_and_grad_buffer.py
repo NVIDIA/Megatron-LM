@@ -132,7 +132,7 @@ class Bucket:
             local_data_view = shard_buffer(self.grad_data, self.data_parallel_world_size)[
                 self.data_parallel_rank
             ]
-            self.communication_handle = torch.distributed._reduce_scatter_base(
+            self.communication_handle = torch.distributed.reduce_scatter_tensor(
                 local_data_view,
                 self.grad_data,
                 op=reduce_op,

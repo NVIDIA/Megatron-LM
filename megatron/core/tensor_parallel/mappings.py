@@ -170,6 +170,7 @@ def _reduce_scatter_along_first_dim(input_, input_split_sizes=None):
     if world_size == 1:
         return input_
 
+    xm = get_xla_model()
     if input_split_sizes is None:
         dim_size = list(input_.size())
         assert (
@@ -178,17 +179,23 @@ def _reduce_scatter_along_first_dim(input_, input_split_sizes=None):
 
         dim_size[0] = dim_size[0] // world_size
 
-        output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
-        torch.distributed._reduce_scatter_base(
-            output, input_.contiguous(), group=get_tensor_model_parallel_group()
-        )
+        if xm:
+            output = xm.reduce_scatter(xm.REDUCE_SUM, input_.contiguous(), groups=get_tensor_model_parallel_groups())
+        else:
+            output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
+            torch.distributed.reduce_scatter_tensor(
+                output, input_.contiguous(), group=get_tensor_model_parallel_group()
+            )
     else:
         rank = torch.distributed.get_rank(get_tensor_model_parallel_group())
         input_tensor_list = list(torch.split(input_, input_split_sizes, dim=0))
-        output = torch.empty_like(input_tensor_list[rank])
-        torch.distributed.reduce_scatter(
-            output, input_tensor_list, group=get_tensor_model_parallel_group()
-        )
+        if xm:
+            output = xm.reduce_scatter(xm.REDUCE_SUM, input_tensor_list, groups=get_tensor_model_parallel_groups())
+        else:
+            output = torch.empty_like(input_tensor_list[rank])
+            torch.distributed.reduce_scatter(
+                output, input_tensor_list, group=get_tensor_model_parallel_group()
+            )
     return output
 
 
@@ -228,11 +235,15 @@ def _reduce_scatter_along_first_dim_moe(input_, use_global_buffer=False):
     assert dim_size[0] % world_size == 0
     dim_size[0] = dim_size[0] // world_size
 
-    if use_global_buffer:
-        output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
+    xm = get_xla_model()
+    if xm:
+        output = xm.reduce_scatter(xm.REDUCE_SUM, input, groups=get_tensor_and_expert_parallel_groups())
     else:
-        output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
-    torch.distributed._reduce_scatter_base(output, input_.contiguous(), group=group)
+        if use_global_buffer:
+            output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
+        else:
+            output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
+        torch.distributed.reduce_scatter_tensor(output, input_.contiguous(), group=group)
     return output
 
 
