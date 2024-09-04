@@ -79,6 +79,7 @@ def common_test_parallel_reconfiguration_e2e(
             save_strategy = FullyParallelSaveStrategyWrapper(
                 save_strategy,
                 parallel_state.get_data_parallel_group(with_context_parallel=True),
+                parallel_state.get_data_parallel_group_gloo(with_context_parallel=True),
                 True,
             )
         save(gpt_model_A.sharded_state_dict(), ckpt_dir_A, save_strategy)

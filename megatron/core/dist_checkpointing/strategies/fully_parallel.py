@@ -7,7 +7,7 @@ from pathlib import Path
 from time import time
 from typing import Dict, List, NamedTuple, Optional, Set, Tuple, TypeVar, cast
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -89,11 +89,13 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
         self,
         strategy: SaveShardedStrategy,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
+        parallelization_group_gloo: Optional[torch.distributed.ProcessGroup] = None,
         do_cache_distribution: bool = False,
     ):
         super().__init__(strategy.backend, strategy.version)
         self.base_strategy = strategy
         self.parallelization_group = parallelization_group
+        self.parallelization_group_gloo = parallelization_group_gloo
         self.do_cache_distribution = do_cache_distribution
 
         self.cached_distribution: Optional[SaveLoadDistribution] = None
@@ -132,7 +134,7 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
         else:
             logger.debug(f'Apply save parallelization')
             precomputed_distribution = determine_main_replica_uniform_distribution(
-                sharded_state_dict, self.parallelization_group
+                sharded_state_dict, self.parallelization_group, self.parallelization_group_gloo
             )
 
         distribute_main_replicas_with_precomputed_distribution(
@@ -181,6 +183,8 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         self,
         strategy: LoadShardedStrategy,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
+        parallelization_group_gloo: Optional[torch.distributed.ProcessGroup] = None,
+        parallelization_groups: Optional[List[List[int]]] = None,
         do_cache_distribution: bool = False,
         exchange_algo: str = 'broadcast',
     ):
@@ -191,6 +195,8 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                 dist.GroupMember.WORLD
             )  # explicit group needed for torch.distributed.get_global_rank call
         self.parallelization_group = parallelization_group
+        self.parallelization_group_gloo = parallelization_group_gloo
+        self.parallelization_groups = parallelization_groups
         self.do_cache_distribution = do_cache_distribution
         self.exchange_algo = exchange_algo
 
@@ -269,7 +275,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             raise NotImplementedError(f'Unrecognized gather algorithm: {self.exchange_algo}')
 
         all_loaded_tensors = exchange_fn(
-            loaded_tensors, unloaded_shards, precomputed_distribution, self.parallelization_group
+            loaded_tensors, unloaded_shards, precomputed_distribution
         )
         if not set(unloaded_shards.keys()).issubset(all_loaded_tensors.keys()):
             missing_shards = set(unloaded_shards.keys()) - all_loaded_tensors.keys()
@@ -359,7 +365,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         else:
             logger.debug(f'Apply load parallelization')
             precomputed_distribution = determine_main_replica_uniform_distribution(
-                sharded_state_dict, self.parallelization_group, True
+                sharded_state_dict, self.parallelization_group, self.parallelization_group_gloo, True
             )
 
         distribute_main_replicas_with_precomputed_distribution(
@@ -374,8 +380,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         self,
         loaded_tensors: Dict[_ShardId, torch.Tensor],
         unloaded_shards: Dict[_ShardId, ShardedTensor],
-        precomputed_distribution: SaveLoadDistribution,
-        parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
+        precomputed_distribution: SaveLoadDistribution
     ) -> Dict[_ShardId, torch.Tensor]:
         """Exchange the tensors loaded by different ranks with a simple all_gather_object call.
 
@@ -397,12 +402,22 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                 previously loaded tensors (from `loaded_tensors` input)
 
         """
-        all_loaded_tensors_list = [None] * torch.distributed.get_world_size(
-            group=parallelization_group
-        )
-        torch.distributed.all_gather_object(
-            all_loaded_tensors_list, loaded_tensors, group=parallelization_group
-        )
+        xm = get_xla_model()
+        if xm:
+            assert self.parallelization_group_gloo is not None
+            all_loaded_tensors_list = [None] * torch.distributed.get_world_size(
+                group=self.parallelization_group_gloo
+            )
+            torch.distributed.all_gather_object(
+                all_loaded_tensors_list, loaded_tensors, group=self.parallelization_group_gloo
+            )
+        else:
+            all_loaded_tensors_list = [None] * torch.distributed.get_world_size(
+                group=self.parallelization_group
+            )
+            torch.distributed.all_gather_object(
+                all_loaded_tensors_list, loaded_tensors, group=self.parallelization_group
+            )
         all_loaded_tensors_list = cast(List[Dict[_ShardId, torch.Tensor]], all_loaded_tensors_list)
         all_loaded_tensors = reduce(lambda x, y: {**x, **y}, all_loaded_tensors_list)
 
@@ -422,8 +437,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         self,
         loaded_tensors: Dict[_ShardId, torch.Tensor],
         unloaded_shards: Dict[_ShardId, ShardedTensor],
-        precomputed_distribution: SaveLoadDistribution = None,
-        parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
+        precomputed_distribution: SaveLoadDistribution = None
     ) -> Dict[_ShardId, torch.Tensor]:
         """Exchange the tensors loaded by different ranks with several all_gather calls.
 
@@ -463,7 +477,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             start = time()
             # shards_by_rank maps rank to tensors loaded by this rank
             shards_by_rank: List[List[torch.Tensor]] = [
-                [] for _ in range(torch.distributed.get_world_size(group=parallelization_group))
+                [] for _ in range(torch.distributed.get_world_size(group=self.parallelization_group))
             ]
             for shard_id, rank in shard_to_saving_rank.items():
                 if shard_to_metadata[shard_id].dtype == dtype:
@@ -497,12 +511,17 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                     if orig_device is not None:
                         orig_devices[shard_id] = orig_device
 
-                torch.distributed.all_gather(
-                    list(round_tensors),
-                    round_tensors[local_rank],
-                    group=self.parallelization_group,
-                    async_op=False,
-                )
+                xm = get_xla_model()
+                if xm:
+                    local_round_tensor = round_tensors[local_rank]
+                    round_tensors = list(xm.all_gather(local_round_tensor, groups=self.parallelization_groups).split(local_round_tensor.size()[0]))
+                else:
+                    torch.distributed.all_gather(
+                        list(round_tensors),
+                        round_tensors[local_rank],
+                        group=self.parallelization_group,
+                        async_op=False,
+                    )
 
                 # Move tensors back to CPU if originally was on CPU
                 for shard_id, orig_device in orig_devices.items():
@@ -521,8 +540,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         self,
         loaded_tensors: Dict[_ShardId, torch.Tensor],
         unloaded_shards: Dict[_ShardId, ShardedTensor],
-        precomputed_distribution: SaveLoadDistribution = None,
-        parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
+        precomputed_distribution: SaveLoadDistribution = None
     ) -> Dict[_ShardId, torch.Tensor]:
         """Exchange the tensors loaded by different ranks by a series of broadcasts.
 
@@ -560,14 +578,22 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                     shard_id, unloaded_shards, shard_to_metadata, all_loaded_tensors
                 )
 
-            global_src_rank = torch.distributed.get_global_rank(parallelization_group, rank)
+            global_src_rank = torch.distributed.get_global_rank(self.parallelization_group, rank)
             # We can do async_op=True only if there is no CPU-copy follow-up
-            torch.distributed.broadcast(
-                local_ten,
-                src=global_src_rank,
-                group=parallelization_group,
-                async_op=orig_device is None,
-            )
+            xm = get_xla_model()
+            if xm:
+                assert self.parallelization_groups is not None
+                xm.collective_broadcast([local_ten],
+                                global_src_rank,
+                                groups=self.parallelization_groups,
+                                pin_layout=False)
+            else:
+                torch.distributed.broadcast(
+                    local_ten,
+                    src=global_src_rank,
+                    group=self.parallelization_group,
+                    async_op=orig_device is None,
+                )
             # Move tensor back to CPU if originally was on CPU
             if orig_device is not None:
                 all_loaded_tensors[shard_id] = local_ten.to(orig_device)
@@ -700,6 +726,7 @@ def _shard_size(sh_ten: ShardedTensor):
 def determine_main_replica_uniform_distribution(
     sharded_state_dict: ShardedStateDict,
     parallelization_group: torch.distributed.ProcessGroup,
+    parallelization_group_gloo: Optional[torch.distributed.ProcessGroup] = None,
     is_loading: bool = False,
 ) -> Optional[SaveLoadDistribution]:
     """Computes the save distribution.
@@ -732,10 +759,18 @@ def determine_main_replica_uniform_distribution(
     )
     local_shards_no_data = [ten.without_data() for ten in local_shards]
 
-    all_shards = [None] * torch.distributed.get_world_size(group=parallelization_group)
-    torch.distributed.all_gather_object(
-        all_shards, local_shards_no_data, group=parallelization_group
-    )
+    xm = get_xla_model()
+    if xm:
+        assert parallelization_group_gloo is not None
+        all_shards = [None] * torch.distributed.get_world_size(group=parallelization_group_gloo)
+        torch.distributed.all_gather_object(
+            all_shards, local_shards_no_data, group=parallelization_group_gloo
+        )
+    else:
+        all_shards = [None] * torch.distributed.get_world_size(group=parallelization_group)
+        torch.distributed.all_gather_object(
+            all_shards, local_shards_no_data, group=parallelization_group
+        )
 
     shard_to_ranks = defaultdict(list)
     shard_to_size = {}

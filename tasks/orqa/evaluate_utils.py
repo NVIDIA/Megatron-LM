@@ -150,10 +150,21 @@ class ORQAEvaluator(object):
             topkindex = torch.empty(device_count * len(query_tensor), \
                 args.faiss_topk_retrievals, dtype=torch.int64).to(device=get_current_device())
 
-        torch.distributed.broadcast(distance, src=device_start_rank, \
-            group=group)
-        torch.distributed.broadcast(topkindex, src=device_start_rank, \
-            group=group)
+        xm = get_xla_model()
+        if xm:
+            xm.collective_broadcast([distance],
+                            device_start_rank,
+                            groups=groups,
+                            pin_layout=False)
+            xm.collective_broadcast([topkindex],
+                            device_start_rank,
+                            groups=groups,
+                            pin_layout=False)
+        else:
+            torch.distributed.broadcast(distance, src=device_start_rank, \
+                group=group)
+            torch.distributed.broadcast(topkindex, src=device_start_rank, \
+                group=group)
 
         distance = torch.split(distance, len(query_tensor), dim=0)\
             [local_rank]

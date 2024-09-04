@@ -2,7 +2,7 @@
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 
 
 def _is_device(tensor):
@@ -21,8 +21,16 @@ def broadcast_from_last_pipeline_stage(size, dtype, tensor=None):
         tensor = torch.empty(size, dtype=dtype, device=get_current_device())
     # Get the group and corresponding source rank.
     src = parallel_state.get_pipeline_model_parallel_last_rank()
-    group = parallel_state.get_pipeline_model_parallel_group()
-    torch.distributed.broadcast(tensor, src, group)
+    xm = get_xla_model()
+    if xm:
+        groups = parallel_state.get_pipeline_model_parallel_groups()
+        xm.collective_broadcast([tensor],
+                         src,
+                         groups=groups,
+                         pin_layout=False)
+    else:
+        group = parallel_state.get_pipeline_model_parallel_group()
+        torch.distributed.broadcast(tensor, src, group)
     return tensor
 
 

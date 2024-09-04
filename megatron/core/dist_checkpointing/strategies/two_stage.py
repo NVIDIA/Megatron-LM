@@ -12,7 +12,7 @@ from operator import attrgetter, itemgetter
 from pathlib import Path
 from typing import Iterable, List, NamedTuple, Optional, Tuple, Union
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 from ..dict_utils import dict_list_map_inplace, map_reduce, nested_values
@@ -89,12 +89,13 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
     2.c) broadcast
     """
 
-    def __init__(self, data_parallel_group, cpu_transfer=True):
+    def __init__(self, data_parallel_group, cpu_transfer=True, data_parallel_group_gloo=None):
         super().__init__()
 
         self.cpu_transfer = cpu_transfer
         self.data_parallel_group_orig = data_parallel_group
         self.data_parallel_group = None if cpu_transfer else data_parallel_group
+        self.data_parallel_group_gloo = None if cpu_transfer else data_parallel_group_gloo
         self.dp_group_ranks = tuple(
             sorted(torch.distributed.get_process_group_ranks(data_parallel_group))
         )
@@ -167,8 +168,15 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
             )
             for sharded_ten in nested_values(sharded_state_dict)
         ]
-        all_meta = [None] * torch.distributed.get_world_size(group=self.data_parallel_group)
-        torch.distributed.all_gather_object(all_meta, local_meta, group=self.data_parallel_group)
+        
+        xm = get_xla_model()
+        if xm:
+            assert self.data_parallel_group_gloo is not None
+            all_meta = [None] * torch.distributed.get_world_size(group=self.data_parallel_group_gloo)
+            torch.distributed.all_gather_object(all_meta, local_meta, group=self.data_parallel_group_gloo)
+        else:
+            all_meta = [None] * torch.distributed.get_world_size(group=self.data_parallel_group)
+            torch.distributed.all_gather_object(all_meta, local_meta, group=self.data_parallel_group)
         all_meta = list(chain.from_iterable(all_meta))
         all_tensors_sorted = self.deduplicate_chunks(all_meta)
         return all_tensors_sorted
@@ -214,9 +222,17 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
             logger.debug(
                 f'exchange {ten_meta.sharded_tensor_no_data.key}, {exchange_tensor.shape}({exchange_tensor.numel()}), broadcast({src_rank} -> {self.dp_group_ranks})'
             )
-            torch.distributed.broadcast(
-                exchange_tensor, group=self.data_parallel_group, src=src_rank
-            )
+            xm = get_xla_model()
+            if xm:
+                assert self.data_parallel_group_gloo is not None
+                xm.collective_broadcast([exchange_tensor],
+                         src_rank,
+                         groups=self.data_parallel_group_gloo,
+                         pin_layout=False)
+            else:
+                torch.distributed.broadcast(
+                    exchange_tensor, group=self.data_parallel_group, src=src_rank
+                )
             self._distribute_data_to_state_dict(ten_meta, exchange_tensor, sharded_state_dict)
             logger.debug(f'exchange {ten_meta.sharded_tensor_no_data.key} done')
 

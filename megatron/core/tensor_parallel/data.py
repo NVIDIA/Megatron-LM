@@ -1,10 +1,11 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
+    get_tensor_model_parallel_groups,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_src_rank,
 )
@@ -39,9 +40,16 @@ def _build_key_size_numel_dictionaries(keys, data):
 
     # Move to GPU and broadcast.
     sizes_device = torch.tensor(sizes, dtype=torch.long, device=get_current_device())
-    torch.distributed.broadcast(
-        sizes_device, get_tensor_model_parallel_src_rank(), group=get_tensor_model_parallel_group()
-    )
+    xm = get_xla_model()
+    if xm:
+        xm.collective_broadcast([sizes_device],
+                         get_tensor_model_parallel_src_rank(),
+                         groups=get_tensor_model_parallel_groups(),
+                         pin_layout=False)
+    else:
+        torch.distributed.broadcast(
+            sizes_device, get_tensor_model_parallel_src_rank(), group=get_tensor_model_parallel_group()
+        )
 
     # Move back to cpu and unpack.
     sizes_cpu = sizes_device.cpu()
@@ -90,9 +98,16 @@ def broadcast_data(keys, data, datatype):
         flatten_data = torch.empty(total_numel, device=get_current_device(), dtype=datatype)
 
     # Broadcast
-    torch.distributed.broadcast(
-        flatten_data, get_tensor_model_parallel_src_rank(), group=get_tensor_model_parallel_group()
-    )
+    xm = get_xla_model()
+    if xm:
+        xm.collective_broadcast([flatten_data],
+                         get_tensor_model_parallel_src_rank(),
+                         groups=get_tensor_model_parallel_groups(),
+                         pin_layout=False)
+    else:
+        torch.distributed.broadcast(
+            flatten_data, get_tensor_model_parallel_src_rank(), group=get_tensor_model_parallel_group()
+        )
 
     # Unpack
     output = {}

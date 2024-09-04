@@ -97,6 +97,7 @@ class TestGroupedMLPReconfiguration:
                 save_strategy = FullyParallelSaveStrategyWrapper(
                     save_strategy,
                     parallel_state.get_data_parallel_group(with_context_parallel=True),
+                    parallel_state.get_data_parallel_group_gloo(with_context_parallel=True),
                     True,
                 )
             save(sharded_state_dict, ckpt_dir_A, save_strategy)
@@ -111,6 +112,8 @@ class TestGroupedMLPReconfiguration:
                 load_strategy = FullyParallelLoadStrategyWrapper(
                     load_strategy,
                     parallel_state.get_data_parallel_group(with_context_parallel=True),
+                    parallel_state.get_data_parallel_group_gloo(with_context_parallel=True),
+                    parallel_state.get_data_parallel_groups(with_context_parallel=True)
                 )
             else:
                 load_strategy = None

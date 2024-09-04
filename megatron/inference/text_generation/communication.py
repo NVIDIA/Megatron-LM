@@ -3,7 +3,7 @@
 """Communications utilities."""
 
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 from megatron.core import mpu
@@ -76,8 +76,17 @@ def broadcast_from_last_pipeline_stage(size, dtype, tensor=None):
                              device=get_current_device())
     # Get the group and corresponding source rank.
     src = mpu.get_pipeline_model_parallel_last_rank()
-    group = mpu.get_pipeline_model_parallel_group()
-    torch.distributed.broadcast(tensor, src, group)
+    
+    xm = get_xla_model()
+    if xm:
+        groups = mpu.get_pipeline_model_parallel_groups()
+        xm.collective_broadcast([tensor],
+                         src,
+                         groups=groups,
+                         pin_layout=False)
+    else:
+        group = mpu.get_pipeline_model_parallel_group()
+        torch.distributed.broadcast(tensor, src, group)
 
     return tensor
 
@@ -101,9 +110,18 @@ def broadcast_from_last_to_first_pipeline_stage(size, dtype, tensor=None):
                                  dtype=dtype,
                                  device=get_current_device())
         src = mpu.get_pipeline_model_parallel_last_rank()
-        group = mpu.get_embedding_group()
+        
         # Broadcast from last stage into the first stage.
-        torch.distributed.broadcast(tensor, src, group)
+        xm = get_xla_model()
+        if xm:
+            groups = mpu.get_embedding_groups()
+            xm.collective_broadcast([tensor],
+                            src,
+                            groups=groups,
+                            pin_layout=False)
+        else:
+            group = mpu.get_embedding_group()
+            torch.distributed.broadcast(tensor, src, group)
     else:
         tensor = None
 
@@ -137,7 +155,15 @@ def copy_from_last_to_first_pipeline_stage(size, dtype, tensor=None):
                                       dtype=dtype,
                                       device=get_current_device())
         # Broadcast from last stage into the first stage.
-        torch.distributed.broadcast(tensor_, src, group)
+        xm = get_xla_model()
+        if xm:
+            groups = mpu.get_embedding_groups()
+            xm.collective_broadcast([tensor_],
+                            src,
+                            groups=groups,
+                            pin_layout=False)
+        else:
+            torch.distributed.broadcast(tensor_, src, group)
         # Update the first stage tensor
         if is_first_stage and not is_contiguous:
             tensor[...] = tensor_

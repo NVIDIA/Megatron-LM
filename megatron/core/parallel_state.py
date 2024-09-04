@@ -9,13 +9,11 @@ from functools import partial
 from itertools import cycle
 from typing import Callable, List, Optional
 
-from .device_utils import get_current_device, get_xla_model
+from .device_utils import get_current_device
 import torch
 from torch.distributed import ProcessGroup
 
 from .utils import GlobalMemoryBuffer
-
-xm = get_xla_model()
 
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
@@ -656,7 +654,7 @@ def initialize_model_parallel(
         )
         _DATA_PARALLEL_GROUPS.append(ranks)
 
-        group_gloo = torch.distributed.new_group(ranks, timeout=timeout, backend="gloo") if xm is None else None
+        group_gloo = torch.distributed.new_group(ranks, timeout=timeout, backend="gloo") 
         if rank in ranks:
             _DATA_PARALLEL_GROUP = group
             _DATA_PARALLEL_GROUP_GLOO = group_gloo
@@ -671,7 +669,7 @@ def initialize_model_parallel(
 
         group_with_cp_gloo = torch.distributed.new_group(
             ranks_with_cp, timeout=timeout, backend="gloo"
-        ) if xm is None else None
+        ) 
         if rank in ranks_with_cp:
             _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
             _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
@@ -899,7 +897,7 @@ def initialize_model_parallel(
         group = torch.distributed.new_group(
             ranks, timeout=timeout, pg_options=pg_options
         )
-        group_gloo = torch.distributed.new_group(ranks, backend="gloo") if xm is None else None
+        group_gloo = torch.distributed.new_group(ranks, backend="gloo") 
         _DATA_MODULO_EXPERT_PARALLEL_GROUPS.append(ranks)
 
         if rank in ranks:
@@ -915,7 +913,7 @@ def initialize_model_parallel(
                 timeout=timeout,
                 pg_options=pg_options,
             )
-            group_gloo = torch.distributed.new_group(ranks, backend="gloo") if xm is None else None
+            group_gloo = torch.distributed.new_group(ranks, backend="gloo") 
         else:
             group = _DATA_MODULO_EXPERT_PARALLEL_GROUP
             group_gloo = _DATA_MODULO_EXPERT_PARALLEL_GROUP_GLOO

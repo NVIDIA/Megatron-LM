@@ -199,6 +199,7 @@ class TestDistributedOptimizer:
                         save_strategy = FullyParallelSaveStrategyWrapper(
                             save_strategy,
                             parallel_state.get_data_parallel_group(with_context_parallel=True),
+                            parallel_state.get_data_parallel_group_gloo(with_context_parallel=True),
                             True,
                         )
                     save(

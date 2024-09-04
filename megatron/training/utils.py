@@ -39,13 +39,15 @@ from megatron.training import (
 )
 if HAVE_APEX_OR_TE:
     from megatron.core.distributed import DistributedDataParallel as DDP
+else:
+    from torch.nn.parallel import DistributedDataParallel as DDP
 from megatron.core import mpu
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.legacy.model import Float16Module
 from megatron.legacy.model.module import param_is_not_shared
 
 
-ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, Float16Module) if HAVE_APEX_OR_TE else (Float16Module)
+ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, Float16Module)
 
 
 def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
@@ -329,7 +331,15 @@ def get_batch_on_this_tp_rank(data_iterator):
 
     def _broadcast(item):
        if item is not None:
-           torch.distributed.broadcast(item, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group())
+            xm = get_xla_model()
+            if xm:
+                xm.collective_broadcast([item],
+                                mpu.get_tensor_model_parallel_src_rank(),
+                                groups=mpu.get_tensor_model_parallel_groups(),
+                                pin_layout=False)
+            else:
+                torch.distributed.broadcast(item, mpu.get_tensor_model_parallel_src_rank(), 
+                                            group=mpu.get_tensor_model_parallel_group())
 
     if mpu.get_tensor_model_parallel_rank() == 0:
 

@@ -167,6 +167,13 @@ class TestFullyParallelSaveAndLoad:
             if parallelization_along_dp
             else None
         )
+
+        parallelization_group_gloo = (
+            parallel_state.get_data_parallel_group_gloo(with_context_parallel=True)
+            if parallelization_along_dp
+            else None
+        )
+
         dp_rank = torch.distributed.get_rank(parallelization_group)
         expected_keys_saved_by_current_rank = {
             k for k, v in expected_key_to_saving_ranks.items() if dp_rank in v
@@ -175,7 +182,7 @@ class TestFullyParallelSaveAndLoad:
         # Run save and tests
         mock_strategy = MockSaveStrategy()
         save_strategy = FullyParallelSaveStrategyWrapper(
-            mock_strategy, parallelization_group, do_cache_distribution=True
+            mock_strategy, parallelization_group, parallelization_group_gloo, do_cache_distribution=True
         )
         with TempNamedDir(tmp_path_dist_ckpt / 'mock_dir') as ckpt_dir_A:
             save_strategy.save(state_dict, ckpt_dir_A)
@@ -248,6 +255,16 @@ class TestFullyParallelSaveAndLoad:
             if parallelization_along_dp
             else None
         )
+        parallelization_group_gloo = (
+            parallel_state.get_data_parallel_group_gloo(with_context_parallel=True)
+            if parallelization_along_dp
+            else None
+        )
+        parallelization_groups = (
+            parallel_state.get_data_parallel_groups(with_context_parallel=True)
+            if parallelization_along_dp
+            else None
+        )
         dp_rank = torch.distributed.get_rank(parallelization_group)
         expected_keys_saved_by_current_rank = {
             k for k, v in expected_key_to_saving_ranks.items() if dp_rank in v
@@ -256,7 +273,11 @@ class TestFullyParallelSaveAndLoad:
         # Run save and tests
         mock_strategy = MockLoadStrategy()
         load_strategy = FullyParallelLoadStrategyWrapper(
-            mock_strategy, parallelization_group, do_cache_distribution=True
+            strategy=mock_strategy, 
+            parallelization_group=parallelization_group, 
+            parallelization_group_gloo=parallelization_group_gloo, 
+            parallelization_groups=parallelization_groups, 
+            do_cache_distribution=True
         )
         with TempNamedDir(tmp_path_dist_ckpt / 'mock_dir') as ckpt_dir_A:
             loaded_state_dict = load_strategy.load(state_dict, ckpt_dir_A)

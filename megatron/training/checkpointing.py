@@ -17,7 +17,7 @@ from time import time
 import torch
 
 from megatron.core import mpu, tensor_parallel, dist_checkpointing
-from megatron.core.device_utils import get_current_device, get_current_rng_state
+from megatron.core.device_utils import get_current_device, get_current_rng_state, get_xla_model
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.dist_checkpointing.serialization import get_default_load_sharded_strategy
 from megatron.core.dist_checkpointing.strategies.fully_parallel import \
@@ -273,12 +273,21 @@ def get_rng_state(use_dist_ckpt: bool = False):
     if torch.distributed.is_initialized() and \
             mpu.get_data_parallel_world_size() > 1 and \
             args.data_parallel_random_init:
+        
         rng_state_list = \
-            [None for i in range(mpu.get_data_parallel_world_size())]
-        torch.distributed.all_gather_object(
-            rng_state_list,
-            rng_state,
-            group=mpu.get_data_parallel_group())
+                [None for i in range(mpu.get_data_parallel_world_size())]
+       
+        xm = get_xla_model()
+        if xm:
+             torch.distributed.all_gather_object(
+                rng_state_list,
+                rng_state,
+                group=mpu.get_data_parallel_group_gloo())
+        else:
+            torch.distributed.all_gather_object(
+                rng_state_list,
+                rng_state,
+                group=mpu.get_data_parallel_group())
     else:
         rng_state_list = [rng_state]
 
@@ -398,6 +407,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     save_strategy.use_cached_ckpt_structure = args.ckpt_assume_constant_structure
                 if args.ckpt_fully_parallel_save:
                     save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, mpu.get_data_parallel_group(with_context_parallel=True),
+                                                                     mpu.get_data_parallel_group_gloo(with_context_parallel=True),
                                                                      args.ckpt_assume_constant_structure)
             # Store save strategy for future checkpoint saves
             if checkpointing_context is not None:
@@ -716,7 +726,10 @@ def _load_global_dist_base_checkpoint(
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if args.ckpt_fully_parallel_load:
         load_strategy = FullyParallelLoadStrategyWrapper(
-            load_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
+            strategy=load_strategy, 
+            parallelization_group=mpu.get_data_parallel_group(with_context_parallel=True),
+            parallelization_group_gloo=mpu.get_data_parallel_group_gloo(with_context_parallel=True),
+            parallelization_groups=mpu.get_data_parallel_groups(with_context_parallel=True)
         )
     state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name, load_strategy, strict=args.dist_ckpt_strictness)
     return state_dict, checkpoint_name, release
