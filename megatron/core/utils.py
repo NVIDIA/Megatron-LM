@@ -408,10 +408,14 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
 
     all_gathered_input = [None, None]
     if config.sequence_parallel:
-        all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu_0")
-        handle = torch.distributed._all_gather_base(
-            all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=False
-        )
+        xm = get_xla_model()
+        if xm:
+            all_gather_buffer = xm.all_gather(input, groups=parallel_state.get_tensor_model_parallel_groups())
+        else:
+            all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu_0")
+            handle = torch.distributed.all_gather_into_tensor(
+                all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=False
+            )
 
         all_gathered_input[0] = all_gather_buffer
         all_gather_buffer = None
@@ -446,10 +450,14 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
         input = embedding_activation_buffer.pop(0)
         if config.sequence_parallel:
             name = "mpu_" + str((i + 1) % 2)
-            all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, name)
-            handle = torch.distributed._all_gather_base(
-                all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
-            )
+            xm = get_xla_model()
+            if xm:
+                all_gather_buffer = xm.all_gather(input, groups=parallel_state.get_tensor_model_parallel_groups())
+            else:
+                all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, name)
+                handle = torch.distributed.all_gather_into_tensor(
+                    all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
+                )
 
             all_gathered_input[(i + 1) % 2] = all_gather_buffer
             all_gather_buffer = None

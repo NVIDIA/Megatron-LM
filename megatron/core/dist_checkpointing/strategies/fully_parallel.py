@@ -585,8 +585,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                 assert self.parallelization_groups is not None
                 xm.collective_broadcast([local_ten],
                                 global_src_rank,
-                                groups=self.parallelization_groups,
-                                pin_layout=False)
+                                groups=self.parallelization_groups)
             else:
                 torch.distributed.broadcast(
                     local_ten,

@@ -154,12 +154,10 @@ class ORQAEvaluator(object):
         if xm:
             xm.collective_broadcast([distance],
                             device_start_rank,
-                            groups=groups,
-                            pin_layout=False)
+                            groups=groups)
             xm.collective_broadcast([topkindex],
                             device_start_rank,
-                            groups=groups,
-                            pin_layout=False)
+                            groups=groups)
         else:
             torch.distributed.broadcast(distance, src=device_start_rank, \
                 group=group)

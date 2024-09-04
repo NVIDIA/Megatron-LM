@@ -409,10 +409,14 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             dim_size = list(input.size())
             dim_size[0] = dim_size[0] * world_size
 
-            all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
-            torch.distributed._all_gather_base(
-                all_gather_buffer, input, group=get_tensor_model_parallel_group()
-            )
+            xm = get_xla_model()
+            if xm:
+                all_gather_buffer = xm.all_gather(input, groups=get_tensor_model_parallel_groups())
+            else:
+                all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
+                torch.distributed.all_gather_into_tensor(
+                    all_gather_buffer, input, group=get_tensor_model_parallel_group()
+                )
             total_input = all_gather_buffer
         else:
             total_input = input
@@ -441,12 +445,16 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 dim_size = list(input.size())
                 dim_size[0] = dim_size[0] * world_size
 
-                all_gather_buffer = get_global_memory_buffer().get_tensor(
-                    dim_size, input.dtype, "mpu"
-                )
-                handle = torch.distributed._all_gather_base(
-                    all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
-                )
+                xm = get_xla_model()
+                if xm:
+                    all_gather_buffer = xm.all_gather(input, groups=get_tensor_model_parallel_groups())
+                else:
+                    all_gather_buffer = get_global_memory_buffer().get_tensor(
+                        dim_size, input.dtype, "mpu"
+                    )
+                    handle = torch.distributed.all_gather_into_tensor(
+                        all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
+                    )
 
                 # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
                 # gather is scheduled before the input gradient computation

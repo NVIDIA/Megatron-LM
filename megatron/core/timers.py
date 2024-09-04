@@ -6,7 +6,7 @@ import time
 from abc import ABC, abstractmethod
 from typing import List
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 
@@ -239,9 +239,13 @@ class Timers:
                 rank_name_to_time[rank, i] = self._timers[name].elapsed(reset=reset)
 
         # See the note above for why we are not using gather.
-        torch.distributed._all_gather_base(
-            rank_name_to_time.view(-1), rank_name_to_time[rank, :].view(-1)
-        )
+        xm = get_xla_model()
+        if xm:
+            rank_name_to_time = xm.all_gather(rank_name_to_time[rank, :].view(-1))
+        else:
+            torch.distributed.all_gather_into_tensor(
+                rank_name_to_time.view(-1), rank_name_to_time[rank, :].view(-1)
+            )
 
         return rank_name_to_time
 

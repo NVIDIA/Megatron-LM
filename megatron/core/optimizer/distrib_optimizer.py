@@ -1556,7 +1556,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 all_gather_handle_index
             ]
             assert all_gather_handle_index < len(self.all_gather_handles)
-            all_gather_handle = torch.distributed._all_gather_base(
+            all_gather_handle = torch.distributed.all_gather_into_tensor(
                 pbuf, pbuf_views[data_parallel_rank], group=data_parallel_group, async_op=async_op
             )
             self.all_gather_handles[all_gather_handle_index] = all_gather_handle

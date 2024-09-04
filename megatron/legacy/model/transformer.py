@@ -26,7 +26,7 @@ from megatron.core.tensor_parallel import (
     get_device_rng_tracker,
     get_data_parallel_rng_tracker_name
 )
-from megatron.core.parallel_state import get_tensor_model_parallel_group, get_tensor_and_expert_parallel_group
+from megatron.core.parallel_state import get_tensor_and_expert_parallel_groups, get_tensor_model_parallel_group, get_tensor_and_expert_parallel_group
 from megatron.core.jit import jit_fuser
 
 try:
@@ -217,12 +217,17 @@ class SwitchMLP(MegatronModule):
         dim_size = list(local_indices.size())
         dim_size[0] = dim_size[0] * world_size
 
-        # TODO pre allocate memory
-        output = torch.empty(dim_size, dtype=local_indices.dtype,
-                             device=get_current_device())
-        torch.distributed._all_gather_base(
-            output, local_indices.contiguous(), group=group
-        )
+        xm = get_xla_model()
+        if xm:
+            groups = get_tensor_and_expert_parallel_groups()
+            output = xm.all_gather(local_indices.contiguous(), groups=groups)
+        else:
+            # TODO pre allocate memory
+            output = torch.empty(dim_size, dtype=local_indices.dtype,
+                                device=get_current_device())
+            torch.distributed.all_gather_into_tensor(
+                output, local_indices.contiguous(), group=group
+            )
         return output
 
     def forward(self, hidden_states):

@@ -5,8 +5,10 @@ import torch
 
 from megatron.core.parallel_state import (
     get_expert_model_parallel_group,
+    get_expert_model_parallel_groups,
     get_global_memory_buffer,
     get_tensor_and_expert_parallel_group,
+    get_tensor_and_expert_parallel_groups,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_groups,
     get_tensor_model_parallel_rank,
@@ -87,10 +89,14 @@ def _gather_along_last_dim(input_):
     dim_size = list(input_.size())
     dim_size[0] = dim_size[0] * world_size
 
-    output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
-    torch.distributed.all_gather_into_tensor(
-        output, input_.contiguous(), group=get_tensor_model_parallel_group()
-    )
+    xm = get_xla_model()
+    if xm:
+        output = xm.all_gather(input_.contiguous(), groups=get_tensor_model_parallel_groups())
+    else:
+        output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
+        torch.distributed.all_gather_into_tensor(
+            output, input_.contiguous(), group=get_tensor_model_parallel_group()
+        )
     tensor_list = output.chunk(world_size, dim=0)
     output = torch.cat(tensor_list, dim=-1).contiguous()
 
@@ -129,14 +135,14 @@ def _gather_along_first_dim(input_, output_split_sizes=None):
 
     xm = get_xla_model()
     if xm:
-        output = xm.all_gather(input_, groups=get_tensor_model_parallel_groups())
+        output = xm.all_gather(input_.contiguous(), groups=get_tensor_model_parallel_groups())
     else:
         dim_size = list(input_.size())
         if output_split_sizes is None:
             dim_size[0] = dim_size[0] * world_size
 
             output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
-            torch.distributed._all_gather_base(
+            torch.distributed.all_gather_into_tensor(
                 output, input_.contiguous(), group=get_tensor_model_parallel_group()
             )
         else:
@@ -197,11 +203,15 @@ def _gather_along_first_dim_moe(input_, use_global_buffer=False):
     dim_size = list(input_.size())
     dim_size[0] = dim_size[0] * world_size
 
-    if use_global_buffer:
-        output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
+    xm = get_xla_model()
+    if xm:
+        output = xm.all_gather(input, groups=get_tensor_and_expert_parallel_groups())
     else:
-        output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
-    torch.distributed._all_gather_base(output, input_.contiguous(), group=group)
+        if use_global_buffer:
+            output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
+        else:
+            output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
+        torch.distributed.all_gather_into_tensor(output, input_.contiguous(), group=group)
 
     return output
 
@@ -237,8 +247,12 @@ def _gather_along_first_dim_expert_parallel(input_):
     dim_size = list(input_.size())
     dim_size[0] = dim_size[0] * world_size
 
-    output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
-    torch.distributed._all_gather_base(output, input_.contiguous(), group=group)
+    xm = get_xla_model()
+    if xm:
+        output = xm.all_gather(input, groups=get_expert_model_parallel_groups())
+    else:
+        output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
+        torch.distributed.all_gather_into_tensor(output, input_.contiguous(), group=group)
 
     return output
 

@@ -82,8 +82,7 @@ def broadcast_from_last_pipeline_stage(size, dtype, tensor=None):
         groups = mpu.get_pipeline_model_parallel_groups()
         xm.collective_broadcast([tensor],
                          src,
-                         groups=groups,
-                         pin_layout=False)
+                         groups=groups)
     else:
         group = mpu.get_pipeline_model_parallel_group()
         torch.distributed.broadcast(tensor, src, group)
@@ -117,8 +116,7 @@ def broadcast_from_last_to_first_pipeline_stage(size, dtype, tensor=None):
             groups = mpu.get_embedding_groups()
             xm.collective_broadcast([tensor],
                             src,
-                            groups=groups,
-                            pin_layout=False)
+                            groups=groups)
         else:
             group = mpu.get_embedding_group()
             torch.distributed.broadcast(tensor, src, group)
@@ -160,8 +158,7 @@ def copy_from_last_to_first_pipeline_stage(size, dtype, tensor=None):
             groups = mpu.get_embedding_groups()
             xm.collective_broadcast([tensor_],
                             src,
-                            groups=groups,
-                            pin_layout=False)
+                            groups=groups)
         else:
             torch.distributed.broadcast(tensor_, src, group)
         # Update the first stage tensor

@@ -2,7 +2,7 @@
 
 from typing import List, Sequence
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 from megatron.core import parallel_state
@@ -88,9 +88,13 @@ def gather_split_1d_tensor(tensor):
     # as opposed to torch.distributed.all_gather for efficiency reasons.
     # This API calls directly NCCL all-gather versus the former does
     # internal copies and can potentially cause slow down.
-    torch.distributed._all_gather_base(
-        gathered, tensor, group=parallel_state.get_tensor_model_parallel_group()
-    )
+    xm = get_xla_model()
+    if xm:
+        gathered = xm.all_gather(tensor, parallel_state.get_tensor_model_parallel_groups())
+    else:
+        torch.distributed.all_gather_into_tensor(
+            gathered, tensor, group=parallel_state.get_tensor_model_parallel_group()
+        )
     return gathered
 
 

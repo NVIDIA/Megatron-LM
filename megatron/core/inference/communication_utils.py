@@ -26,8 +26,7 @@ def broadcast_from_last_pipeline_stage(size, dtype, tensor=None):
         groups = parallel_state.get_pipeline_model_parallel_groups()
         xm.collective_broadcast([tensor],
                          src,
-                         groups=groups,
-                         pin_layout=False)
+                         groups=groups)
     else:
         group = parallel_state.get_pipeline_model_parallel_group()
         torch.distributed.broadcast(tensor, src, group)
