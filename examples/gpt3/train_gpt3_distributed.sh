@@ -2,6 +2,7 @@
 
 # Runs the "175B" parameter model
 
+export OMP_NUM_THREADS=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 GPUS_PER_NODE=2
