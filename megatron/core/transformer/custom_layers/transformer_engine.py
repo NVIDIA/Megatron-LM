@@ -2,6 +2,7 @@
 
 import dataclasses
 import os
+import warnings
 from importlib.metadata import version
 from typing import Callable
 
@@ -26,6 +27,8 @@ from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
 
 def get_te_version():
+    """Get TE version from __version__; if not available use pip's. Use caching."""
+
     def get_te_version_str():
         if hasattr(te, '__version__'):
             return str(te.__version__)
@@ -50,6 +53,7 @@ def _get_extra_te_kwargs(config: TransformerConfig):
 
 
 def condition_init_method(config, init_method):
+    """Condition TE init_method on config.perform_initialization."""
     return init_method if config.perform_initialization else (lambda w: None)
 
 
@@ -168,6 +172,7 @@ class TELinear(te.pytorch.Linear):
         )
 
     def forward(self, x):
+        """Forward."""
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
         )
@@ -287,6 +292,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         )
 
     def forward(self, x):
+        """Forward."""
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
         )
@@ -508,6 +514,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         attn_mask_type: AttnMaskType,
         packed_seq_params: PackedSeqParams = None,
     ):
+        """Forward."""
         packed_seq_kwargs = (
             dataclasses.asdict(packed_seq_params) if packed_seq_params is not None else {}
         )
@@ -644,6 +651,7 @@ if _te_version >= packaging.version.Version("1.9.0.dev0"):
                 setattr(param, 'allreduce', not (is_expert and self.expert_parallel))
 
         def forward(self, x, m_splits):
+            """Forward."""
             _is_first_microbatch = (
                 None if self.disable_parameter_transpose_cache else self.is_first_microbatch
             )
@@ -824,10 +832,13 @@ class TEDelayedScaling(te.common.recipe.DelayedScaling):
         if _te_version >= packaging.version.Version("1.6.0.dev0"):
             extra_kwargs["fp8_dpa"] = config.fp8_dot_product_attention
             extra_kwargs["fp8_mha"] = config.fp8_multi_head_attention
+        if _te_version < packaging.version.Version("1.8.0"):
+            extra_kwargs["interval"] = config.fp8_interval
+        elif config.fp8_interval != 1:
+            warnings.warn("fp8_interval is deprecated and ignored from Transformer-Engine v1.8.0.")
 
         super().__init__(
             margin=config.fp8_margin,
-            interval=config.fp8_interval,
             fp8_format=fp8_format,
             amax_compute_algo=config.fp8_amax_compute_algo,
             amax_history_len=config.fp8_amax_history_len,
@@ -847,6 +858,7 @@ def te_checkpoint(
     context_mask,
     rotary_pos_emb,
 ):
+    """Checkpointing with Transformer-Engine."""
     from transformer_engine.pytorch.distributed import checkpoint
 
     if _te_version >= packaging.version.Version("1.5.0"):
@@ -894,7 +906,8 @@ try:
     def get_cpu_offload_context(
         enabled, num_layers, model_layers, activation_offloading, weight_offloading
     ):
-        if _te_version > packaging.version.Version("1.8.0"):
+        """Get CPU offload context and sync function."""
+        if _te_version >= packaging.version.Version("1.10.0.dev0"):
             context, sync_func = _get_cpu_offload_context(
                 enabled, num_layers, model_layers, activation_offloading, weight_offloading
             )
