@@ -86,6 +86,52 @@ class TestShardedTensor:
             sh_ten.local_shape = (5,)
             sh_ten.validate_metadata_integrity()
 
+    def test_narrowing(self):
+        data = torch.ones((1, 3, 7, 9))
+        rank_offsets = [(0, 0, 10), (2, 3, 6)]
+        sh_ten = ShardedTensor.from_rank_offsets('keyA', data, *rank_offsets)
+        (narr_sh_ten,) = sh_ten.narrow(1, 1, 2)
+        assert narr_sh_ten.local_shape == (1, 2, 7, 9)
+        assert narr_sh_ten.global_shape == (10, 2, 42, 9)
+        assert narr_sh_ten.global_offset == (0, 0, 21, 0)
+
+        (narr_sh_ten,) = sh_ten.narrow(2, 3, 2)
+        assert narr_sh_ten.local_shape == (1, 3, 2, 9)
+        assert narr_sh_ten.global_shape == (10, 3, 12, 9)
+        assert narr_sh_ten.global_offset == (0, 0, 6, 0)
+
+    def test_flat_narrow(self):
+        data = torch.arange(28).reshape((4, 7))
+        rank_offsets = [(0, 1, 2), (1, 3, 5)]
+        flattened_range = slice(4, 9)
+        flat_data = data.flatten()[flattened_range]
+        sh_ten = ShardedTensor.from_rank_offsets_flat(
+            'keyA', flat_data, data.shape, *rank_offsets, flattened_range=flattened_range
+        )
+
+        # The main attributes properties are unchanged
+        assert isinstance(sh_ten, ShardedTensor)
+        assert torch.all(sh_ten.data == torch.arange(4, 9))
+
+        (narrow_sh_ten,) = sh_ten.narrow(
+            0, 0, 1
+        )  # First seven elements of unflat, intersection has 3 elements
+        assert torch.all(narrow_sh_ten.data == torch.arange(4, 7))
+        assert narrow_sh_ten.local_shape == (1, 7)
+        assert narrow_sh_ten.global_shape == (2, 35)
+        assert narrow_sh_ten.global_offset == (1, 21)
+
+        (narrow_sh_ten,) = sh_ten.narrow(
+            0, 0, 3
+        )  # First 21 elements of unflat, intersection has all 5 elements
+        assert torch.all(narrow_sh_ten.data == torch.arange(4, 9))
+        assert narrow_sh_ten.local_shape == (3, 7)
+        assert narrow_sh_ten.global_shape == (6, 35)
+        assert narrow_sh_ten.global_offset == (3, 21)
+
+        narrow_sh_ten = sh_ten.narrow(0, 2, 1)  # empty intersection
+        assert not narrow_sh_ten, narrow_sh_ten
+
 
 class TestShardedTensorFactory:
     def test_build_and_merge(self):
