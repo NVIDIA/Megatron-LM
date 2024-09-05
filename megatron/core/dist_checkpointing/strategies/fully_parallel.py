@@ -10,6 +10,7 @@ from typing import Dict, List, NamedTuple, Optional, Set, Tuple, TypeVar, cast
 import numpy as np
 import torch
 import torch.distributed as dist
+from transformer_engine.pytorch.float8_tensor import Float8Tensor
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.core import CheckpointingException
@@ -491,6 +492,11 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                             local_ten, orig_device = self._get_empty_tensor_for_exchange(
                                 shard_id, unloaded_shards, shard_to_metadata, all_loaded_tensors
                             )
+
+                        if isinstance(local_ten, Float8Tensor):
+                            local_ten = local_ten.bfloat16()
+                            all_loaded_tensors[shard_id] = local_ten
+
                     round_tensors.append(local_ten)
                     if orig_device is not None:
                         orig_devices[shard_id] = orig_device
@@ -560,6 +566,11 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
 
             global_src_rank = torch.distributed.get_global_rank(parallelization_group, rank)
             # We can do async_op=True only if there is no CPU-copy follow-up
+
+            if isinstance(local_ten, Float8Tensor):
+                local_ten = local_ten.bfloat16()
+                all_loaded_tensors[shard_id] = local_ten
+
             torch.distributed.broadcast(
                 local_ten,
                 src=global_src_rank,
