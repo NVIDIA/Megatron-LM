@@ -23,6 +23,14 @@ class TransformerConfig(ModelParallelConfig):
     num_layers: int = 0
     """Number of transformer layers in a transformer block."""
 
+    first_pipeline_num_layers: int = None
+    """Number of transformer layers on first pipeline stage. 
+    None implies equal layer division across PP ranks."""
+
+    last_pipeline_num_layers: int = None
+    """Number of transformer layers on last pipeline stage. 
+    None implies equal layer division across PP ranks."""
+
     hidden_size: int = 0
     """Transformer hidden size."""
 

@@ -51,6 +51,7 @@ products:
     - gpt3_mr_mcore_te_tp1_pp4_untie_embeddings_and_outputs_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp1_pp4_vp1_calculate_per_token_loss_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp1_pp4_vp1_decoupled_lr_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp4_vp1_uneven_pipeline_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp1_pp4_vp1_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G
