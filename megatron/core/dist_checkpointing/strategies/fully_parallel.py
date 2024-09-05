@@ -689,7 +689,7 @@ def _sharded_tensor_shard_id(sharded_tensor: ShardedTensor) -> _ShardId:
 def _shard_size(sh_ten: ShardedTensor):
     """Returns size in bytes of a given sharded tensor."""
     if sh_ten.flattened_range is None:
-        numel = np.product(sh_ten.local_shape)
+        numel = np.prod(sh_ten.local_shape)
     else:
         numel = sh_ten.flattened_range.stop - sh_ten.flattened_range.start
     return numel * torch._utils._element_size(sh_ten.dtype)
