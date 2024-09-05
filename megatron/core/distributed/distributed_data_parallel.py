@@ -2,7 +2,7 @@
 
 import logging
 from contextlib import contextmanager
-from typing import Dict, Optional
+from typing import Dict
 
 import torch
 
@@ -114,7 +114,9 @@ class DistributedDataParallel(MegatronModule):
                 param_and_grad_dtype_to_params[(param_dtype, grad_dtype)] = params
 
             if not config.calculate_per_token_loss:
-                target_gradient_scaling_factor = 1.0 / parallel_state.get_data_parallel_world_size()
+                target_gradient_scaling_factor = 1.0 / parallel_state.get_data_parallel_world_size(
+                    with_context_parallel=True
+                )
                 if self.ddp_config.average_in_collective:
                     # Collective is averaging gradients in collective with data_parallel_group.
                     assert (
@@ -155,7 +157,9 @@ class DistributedDataParallel(MegatronModule):
                     1.0 / parallel_state.get_expert_model_parallel_world_size()
                 )
             else:
-                data_parallel_world_size = parallel_state.get_data_parallel_world_size()
+                data_parallel_world_size = parallel_state.get_data_parallel_world_size(
+                    with_context_parallel=True
+                )
                 gradient_scaling_factor = 1.0 / data_parallel_world_size
                 expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
 
