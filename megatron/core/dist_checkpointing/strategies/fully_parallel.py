@@ -51,12 +51,15 @@ class SaveLoadDistribution(NamedTuple):
             in this parallelization group
         shard_to_metadata (Dict[_ShardId, ShardedTensor]): maps ShardedTensor
             identifier to the original ShardedTensor
+        all_ranks_for_shard (Dict[_ShardId, List[int]]): specifies which ranks
+            need a given shard in a given parallelization group
 
     """
 
     main_rank_for_shard: Dict[_ShardId, int]
     shards_in_this_group: Set[_ShardId]
     shard_to_metadata: Dict[_ShardId, ShardedTensor]
+    all_ranks_for_shard: Dict[_ShardId, List[int]]
 
 
 class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
@@ -409,7 +412,8 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             err_msg = 'Duplicate shard ids loaded by different ranks'
             if torch.distributed.get_rank() == 0:
                 logger.error(
-                    f'{err_msg}. Shards ids by rank: {[lt.keys() for lt in all_loaded_tensors_list]}'
+                    f'{err_msg}. Shards ids by rank:'
+                    f' {[lt.keys() for lt in all_loaded_tensors_list]}'
                 )
             raise CheckpointingException(err_msg)
 
@@ -448,7 +452,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                 needed by this rank to load a given state dict. Includes
                 previously loaded tensors (from `loaded_tensors` input)
         """
-        shard_to_saving_rank, _, shard_to_metadata = precomputed_distribution
+        main_rank_for_shard, _, shard_to_metadata, all_ranks_for_shard = precomputed_distribution
         local_rank = torch.distributed.get_rank(group=self.parallelization_group)
 
         all_loaded_tensors = dict(loaded_tensors)
@@ -463,7 +467,19 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             shards_by_rank: List[List[torch.Tensor]] = [
                 [] for _ in range(torch.distributed.get_world_size(group=parallelization_group))
             ]
-            for shard_id, rank in shard_to_saving_rank.items():
+            for shard_id, rank in main_rank_for_shard.items():
+                if len(all_ranks_for_shard[shard_id]) == 1:
+                    assert all_ranks_for_shard[shard_id][0] == main_rank_for_shard[shard_id], (
+                        f'When there is only 1 ranks that needs a given shard,'
+                        f' it should be the loading rank.'
+                        f' Got: needs [{all_ranks_for_shard[shard_id][0]}]'
+                        f' vs loads [{main_rank_for_shard[shard_id]}]'
+                    )
+                    # Skipping the exchange since only the loading rank needs this tensor
+                    # TODO: we can employ some optimizations even for `len(shard_to_ranks) > 1`
+                    #  case, e.g. P2P exchange. Currently handling this case saves most of the
+                    #  work though.
+                    continue
                 if shard_to_metadata[shard_id].dtype == dtype:
                     shards_by_rank[rank].append(shard_id)
 
@@ -541,14 +557,25 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                 needed by this rank to load a given state dict. Includes
                 previously loaded tensors (from `loaded_tensors` input)
         """
-        shard_to_saving_rank, _, shard_to_metadata = precomputed_distribution
+        main_rank_for_shard, _, shard_to_metadata, all_ranks_for_shard = precomputed_distribution
         local_rank = torch.distributed.get_rank(group=self.parallelization_group)
 
         all_loaded_tensors = dict(loaded_tensors)
 
         start = time()
 
-        for idx, (shard_id, rank) in enumerate(shard_to_saving_rank.items()):
+        for idx, (shard_id, rank) in enumerate(main_rank_for_shard.items()):
+            if len(all_ranks_for_shard[shard_id]) == 1:
+                assert all_ranks_for_shard[shard_id][0] == main_rank_for_shard[shard_id], (
+                    f'When there is only 1 ranks that needs a given shard,'
+                    f' it should be the loading rank.'
+                    f'Got: needs [{all_ranks_for_shard[shard_id][0]}]'
+                    f' vs loads [{main_rank_for_shard[shard_id]}]'
+                )
+                # Skipping the exchange since only the loading rank needs this tensor
+                # TODO: we can employ some optimizations even for `len(shard_to_ranks) > 1` case,
+                #  e.g. P2P exchange. Currently handling this case saves most of the work though.
+                continue
             if rank == local_rank:
                 assert shard_id in all_loaded_tensors, (shard_id, all_loaded_tensors.keys())
                 orig_device = all_loaded_tensors[shard_id].device
@@ -758,7 +785,10 @@ def determine_main_replica_uniform_distribution(
     )
 
     return SaveLoadDistribution(
-        shard_to_saving_rank, shards_saved_by_this_parallelization_group, shard_to_metadata
+        shard_to_saving_rank,
+        shards_saved_by_this_parallelization_group,
+        shard_to_metadata,
+        shard_to_ranks,
     )
 
 
@@ -831,10 +861,12 @@ def distribute_shards_to_ranks(
     2. Secondly, the size of each shard (larger size is assigned first)
     3. Finally, shard id for differentiation.
 
-    Third step is added because we rely on the fact that the assignment is deterministic on all ranks.
+    Third step is added because we rely on the fact
+    that the assignment is deterministic on all ranks.
 
     Args:
-        shard_to_ranks (Dict[T, List[int]]): mapping which tells which rank have access to which shards
+        shard_to_ranks (Dict[T, List[int]]): mapping which tells which rank
+            have access to which shards
         shard_to_size (Dict[T, int]): sizes of each shard
         num_ranks (int): number of ranks in the parallelization group
 
@@ -845,7 +877,8 @@ def distribute_shards_to_ranks(
     shard_to_saving_rank = {}
     rank_sizes = [(0, rank) for rank in range(num_ranks)]
 
-    # start from tensors with lowest coverage, then go by tensor size from largest (hence minus size)
+    # start from tensors with lowest coverage,
+    # then go by tensor size from largest (hence minus size)
     for shard_id, shard_ranks in sorted(
         shard_to_ranks.items(),
         key=lambda sh_id_ranks: (
