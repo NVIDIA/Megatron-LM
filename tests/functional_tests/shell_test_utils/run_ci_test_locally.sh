@@ -74,6 +74,10 @@ ARGUMENTS=(
     "DATA_BLEND=\"${DATA_BLEND}\""
 )
 
+if [[ -n $LOAD_PATH ]]; then
+    ARGUMENTS+=("LOAD_PATH=${LOAD_PATH}")
+fi
+
 echo ${ARGUMENTS[@]}
 
 while : 
