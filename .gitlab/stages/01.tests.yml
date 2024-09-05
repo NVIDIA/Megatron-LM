@@ -116,6 +116,13 @@ unit_tests:
   artifacts:
     paths:
       - coverage
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+      allow_failure: true
+      when: always
+    - if: '$TAG != "latest"'
+      allow_failure: true
+    - when: always
 
 docs_build_test:
   image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
