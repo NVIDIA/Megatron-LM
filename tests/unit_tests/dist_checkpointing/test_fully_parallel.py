@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 from pathlib import Path
+from typing import List, Tuple
+from unittest import mock
 
 import pytest
 import torch
@@ -11,7 +13,7 @@ from megatron.core.dist_checkpointing.dict_utils import (
     map_reduce,
     nested_values,
 )
-from megatron.core.dist_checkpointing.mapping import is_main_replica
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict, is_main_replica
 from megatron.core.dist_checkpointing.strategies.base import (
     LoadShardedStrategy,
     SaveShardedStrategy,
@@ -319,5 +321,53 @@ class TestFullyParallelSaveAndLoad:
             max(mem_alloc),
             mem_alloc_start,
         )
+
+        Utils.destroy_model_parallel()
+
+    def test_only_necessary_exchanges_performed_during_load(self, tmp_path_dist_ckpt):
+        Utils.initialize_model_parallel(2, 1)
+
+        # State dict with 2 expected exchanges
+        sharded_state_dict_baseline_two_exchanges = {
+            'needed_by_all_A': ShardedTensor.from_rank_offsets(
+                'needed_by_all_A',
+                torch.ones(4, dtype=torch.float, device='cuda'),
+                replica_id=Utils.rank,
+            ),
+            'needed_by_all_B': ShardedTensor.from_rank_offsets(
+                'needed_by_all_B',
+                torch.ones(4, dtype=torch.float, device='cuda'),
+                replica_id=Utils.rank,
+            ),
+        }
+        # State dict with 1 expected exchange
+        sharded_state_dict_baseline_one_exchange = {
+            'needed_by_all': sharded_state_dict_baseline_two_exchanges['needed_by_all_A']
+        }
+        # State dict with 1 expected exchanges even though there are 2 tensors to load (1 is unique for each rank)
+        sharded_state_dict_test_one_exchange = sharded_state_dict_baseline_one_exchange.copy()
+        sharded_state_dict_test_one_exchange['unique'] = ShardedTensor.from_rank_offsets(
+            'unique',
+            torch.ones(4, dtype=torch.float, device='cuda'),
+            (0, Utils.rank, Utils.world_size),
+        )
+
+        expected_call_counts: List[Tuple[ShardedStateDict, int]] = [
+            (sharded_state_dict_baseline_one_exchange, 1),
+            (sharded_state_dict_baseline_two_exchanges, 2),
+            (sharded_state_dict_test_one_exchange, 1),
+        ]
+
+        mock_strategy = MockLoadStrategy()
+        with TempNamedDir(tmp_path_dist_ckpt / 'mock_dir') as ckpt_dir:
+            for sharded_state_dict, expected_count in expected_call_counts:
+                load_strategy = FullyParallelLoadStrategyWrapper(
+                    mock_strategy, None, do_cache_distribution=True, exchange_algo='broadcast'
+                )
+                with mock.patch(
+                    'megatron.core.dist_checkpointing.strategies.fully_parallel.torch.distributed.broadcast'
+                ) as broadcast_mock:
+                    _ = load_strategy.load(sharded_state_dict, ckpt_dir)
+                    assert broadcast_mock.call_count == expected_count
 
         Utils.destroy_model_parallel()
