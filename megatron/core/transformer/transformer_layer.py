@@ -18,7 +18,31 @@ from megatron.core.utils import make_viewless_tensor
 
 @dataclass
 class TransformerLayerSubmodules:
-    """Simple container class that contains the ops for a transformer layer."""
+    """
+    Configuration class for specifying the submodules of a transformer layer.
+
+    This class defines the structure and default implementations for various
+    components of a transformer layer, allowing for flexible customization
+    of the layer's architecture.
+
+    Args:
+        input_layernorm (Union[ModuleSpec, type]): Specification for the input layer normalization.
+        self_attention (Union[ModuleSpec, type]): Specification for the self-attention mechanism.
+        self_attn_bda (Union[ModuleSpec, type]): Specification for the bias-dropout-add operation
+            after self-attention.
+        pre_cross_attn_layernorm (Union[ModuleSpec, type]): Specification for the layer
+            normalization before cross-attention.
+        cross_attention (Union[ModuleSpec, type]): Specification for the cross-attention mechanism.
+        cross_attn_bda (Union[ModuleSpec, type]): Specification for the bias-dropout-add operation
+            after cross-attention.
+        pre_mlp_layernorm (Union[ModuleSpec, type]): Specification for the layer normalization
+            before the MLP.
+        mlp (Union[ModuleSpec, type]): Specification for the MLP.
+        mlp_bda (Union[ModuleSpec, type]): Specification for the bias-dropout-add operation
+            after the MLP.
+        sharded_state_dict_keys_map (Dict[str, str]): Mapping for sharded tensor keys to be applied
+            in the `sharded_state_dict` method.
+    """
 
     input_layernorm: Union[ModuleSpec, type] = IdentityOp
     self_attention: Union[ModuleSpec, type] = IdentityOp
@@ -150,8 +174,58 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         else:
             # Each stage gets a contiguous set of layers.
-            if self.config.pipeline_model_parallel_size > 1:
-                offset = pipeline_rank * num_layers_per_pipeline_rank
+            if parallel_state.get_pipeline_model_parallel_world_size() > 1:
+                if (
+                    self.config.first_pipeline_num_layers is not None
+                    or self.config.last_pipeline_num_layers is not None
+                ):
+                    # Calculate number of pipelines for distributing layers
+                    middle_pipeline_stages = parallel_state.get_pipeline_model_parallel_world_size()
+                    middle_pipeline_stages -= sum(
+                        [
+                            1 if x is not None else 0
+                            for x in (
+                                self.config.first_pipeline_num_layers,
+                                self.config.last_pipeline_num_layers,
+                            )
+                        ]
+                    )
+
+                    # Calculate layers to distribute
+                    first_pipeline_offset = (
+                        0
+                        if self.config.first_pipeline_num_layers is None
+                        else self.config.first_pipeline_num_layers
+                    )
+                    last_pipeline_offset = (
+                        0
+                        if self.config.first_pipeline_num_layers is None
+                        else self.config.last_pipeline_num_layers
+                    )
+
+                    middle_num_layers = (
+                        self.config.num_layers - first_pipeline_offset - last_pipeline_offset
+                    )
+
+                    if middle_pipeline_stages > 0:
+                        num_layers_per_pipeline_rank = middle_num_layers // middle_pipeline_stages
+                    else:
+                        num_layers_per_pipeline_rank = 0
+
+                    middle_pipeline_rank = (
+                        pipeline_rank
+                        if self.config.first_pipeline_num_layers is None
+                        else pipeline_rank - 1
+                    )
+
+                    if pipeline_rank == 0:
+                        offset = 0
+                    else:
+                        offset = (
+                            middle_pipeline_rank * num_layers_per_pipeline_rank
+                        ) + first_pipeline_offset
+                else:
+                    offset = pipeline_rank * num_layers_per_pipeline_rank
             else:
                 offset = 0
 
@@ -167,8 +241,28 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         inference_params=None,
         packed_seq_params=None,
     ):
-        """Transformer forward function."""
-        # hidden_states: [s, b, h]
+        """
+        Perform a forward pass through the transformer layer.
+
+        This method implements the core computation of a transformer layer, including
+        self-attention, cross-attention (if applicable), and feed-forward operations.
+
+        Args:
+            hidden_states (Tensor): Input tensor of shape [s, b, h] where s is sequence length,
+                b is batch size, and h is hidden size.
+            attention_mask (Tensor): Mask tensor for self-attention.
+            context (Tensor, optional): Context tensor for cross-attention.
+            context_mask (Tensor, optional): Mask tensor for cross-attention.
+            rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
+            inference_params (object, optional): Parameters for inference-time optimizations.
+            packed_seq_params (object, optional): Parameters for packed sequence processing.
+
+        Returns:
+            Tuple[Tensor, Tensor]: A tuple containing:
+                output (Tensor): Transformed hidden states of shape [s, b, h].
+                context (Tensor): Updated context tensor if cross-attention is used,
+                otherwise None.
+        """
 
         # Residual connection.
         residual = hidden_states
@@ -247,8 +341,17 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
-        """State dict for dist checkpointing."""
+        """
+        Generate a sharded state dictionary for the transformer layer.
 
+        Args:
+            prefix (str, optional): Prefix to be added to all keys in the state dict.
+            sharded_offsets (tuple, optional): Tuple of sharding offsets.
+            metadata (Optional[dict], optional): Additional metadata for sharding.
+
+        Returns:
+            ShardedStateDict: A dictionary containing the sharded state of the transformer layer.
+        """
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
         prefixed_map = {
             f'{prefix}{k}': f'{prefix}{v}'

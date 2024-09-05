@@ -45,10 +45,43 @@ except ImportError:
 
 
 def get_num_layers_to_build(config: TransformerConfig) -> int:
+    """
+    Determine the number of transformer layers to build for the current pipeline stage.
+    Args:
+        config (TransformerConfig): Configuration object containing transformer model parameters.
 
-    pipeline_ranks = config.pipeline_model_parallel_size
+    Returns:
+        int: The number of layers to be built for the current pipeline stage.
+    """
+    if config.first_pipeline_num_layers is not None or config.last_pipeline_num_layers is not None:
+        assert (
+            parallel_state.get_virtual_pipeline_model_parallel_world_size() is None
+        ), "Uneven number of layer not compatible with interleaved pipeline schedule"
 
-    num_layers_per_pipeline_rank = config.num_layers // pipeline_ranks
+        # Number of layers to distribute over rest of pipeline stages
+        layers_to_distribute = config.num_layers
+        # Number of pipeline stages left for distributing transformer layers
+        pipeline_stages_left = parallel_state.get_pipeline_model_parallel_world_size()
+
+        if config.first_pipeline_num_layers is not None:
+            layers_to_distribute -= config.first_pipeline_num_layers
+            pipeline_stages_left -= 1
+            if parallel_state.is_pipeline_first_stage():
+                return config.first_pipeline_num_layers
+
+        if config.last_pipeline_num_layers is not None:
+            layers_to_distribute -= config.last_pipeline_num_layers
+            pipeline_stages_left -= 1
+            if parallel_state.is_pipeline_last_stage():
+                return config.last_pipeline_num_layers
+
+        assert (
+            layers_to_distribute % pipeline_stages_left == 0
+        ), "With uneven pipelineing the left over layers must be divisible by left over stages"
+        num_layers_per_pipeline_rank = layers_to_distribute // pipeline_stages_left
+    else:
+        pipeline_ranks = config.pipeline_model_parallel_size
+        num_layers_per_pipeline_rank = config.num_layers // pipeline_ranks
 
     if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
         # Interleaved pipeline parallelism:
@@ -80,6 +113,20 @@ def get_num_layers_to_build(config: TransformerConfig) -> int:
 
 @dataclass
 class TransformerBlockSubmodules:
+    """
+    Dataclass for specifying the submodules of a transformer block.
+
+    This class defines the structure for configuring the layers and normalization
+    within a transformer block, allowing for flexible and customizable architecture designs.
+
+    Args:
+        layer_specs (List[ModuleSpec], optional): A list of module specifications for
+            the layers within the transformer block. Each specification typically
+            defines a complete transformer layer (e.g., self-attention, feed-forward network).
+        layer_norm (Optional[Union[ModuleSpec, torch.nn.Module]], optional): Specification
+            or instance of the layer normalization to be applied.
+    """
+
     layer_specs: List[ModuleSpec] = None
     layer_norm: Optional[Union[ModuleSpec, torch.nn.Module]] = None
 
@@ -87,6 +134,18 @@ class TransformerBlockSubmodules:
 def _get_block_submodules(
     config: TransformerConfig, spec: Union[TransformerBlockSubmodules, ModuleSpec]
 ) -> TransformerBlockSubmodules:
+    """
+    Retrieve or construct TransformerBlockSubmodules based on the provided specification.
+
+    Args:
+        config (TransformerConfig): Configuration object for the transformer model.
+        spec (Union[TransformerBlockSubmodules, ModuleSpec]): Specification for the
+            transformer block submodules. Can be either a TransformerBlockSubmodules
+            instance or a ModuleSpec.
+
+    Returns:
+        TransformerBlockSubmodules: The submodules for the transformer block.
+    """
 
     # Transformer block submodules.
     if isinstance(spec, TransformerBlockSubmodules):
@@ -307,8 +366,29 @@ class TransformerBlock(MegatronModule):
         inference_params: InferenceParams = None,
         packed_seq_params: PackedSeqParams = None,
     ):
-        # hidden_states (float): [s, b, h]
-        # attention_mask (bool): [1, 1, s, s]
+        """
+        Perform the forward pass through the transformer block.
+
+        This method handles the core computation of the transformer, including
+        self-attention, optional cross-attention, and feed-forward operations.
+
+        Args:
+            hidden_states (Tensor): Input tensor of shape [s, b, h] where s is the
+                sequence length, b is the batch size, and h is the hidden size.
+            attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking
+                self-attention.
+            context (Tensor, optional): Context tensor for cross-attention.
+            context_mask (Tensor, optional): Mask for cross-attention context
+            rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
+            inference_params (InferenceParams, optional): Parameters for inference-time
+                optimizations.
+            packed_seq_params (PackedSeqParams, optional): Parameters for packed sequence
+                processing.
+
+        Returns:
+            Union[Tensor, Tuple[Tensor, Tensor]]: The output hidden states tensor of shape
+            [s, b, h], and optionally the updated context tensor if cross-attention is used.
+        """
 
         if not self.pre_process:
             # See set_input_tensor()
@@ -426,6 +506,19 @@ class TransformerBlock(MegatronModule):
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None
     ) -> ShardedStateDict:
+        """
+        Generate a sharded state dictionary for the transformer block.
+
+        Args:
+            prefix (str, optional): Prefix to be added to all keys in the state dict.
+                Defaults to an empty string.
+            sharded_offsets (tuple, optional): Tuple of sharding offsets.
+            metadata (dict, optional): Additional metadata for sharding.
+                Can specify if layers are non-homogeneous. Defaults to None.
+
+        Returns:
+            ShardedStateDict: A dictionary containing the sharded state of the model.
+        """
         assert not sharded_offsets, "Unexpected sharded offsets"
         non_homogeneous_layers = metadata is not None and metadata.get(
             'non_homogeneous_layers', False

@@ -663,6 +663,8 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
     kw_args['rotary_interleaved'] = args.rotary_interleaved
+    kw_args['first_pipeline_num_layers']= args.decoder_first_pipeline_num_layers
+    kw_args['last_pipeline_num_layers']= args.decoder_last_pipeline_num_layers
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
@@ -1496,6 +1498,14 @@ def _add_distributed_args(parser):
                        type=int, default=None,
                        help=('Rank where encoder and decoder should be split. '
                              'Deprecated; use --encoder-pipeline-model-parallel-size instead.'))
+    group.add_argument('--decoder-first-pipeline-num-layers',
+                       type=int, default=None,
+                       help=('The number of transformer layers on the first pipeline stage of the decoder. '
+                       'Default None is even split of transformer layers across all pipeline stages'))
+    group.add_argument('--decoder-last-pipeline-num-layers',
+                       type=int, default=None,
+                       help=('The number of transformer layers on the last pipeline stage of the decoder. '
+                       'Default None is even split of transformer layers across all pipeline stages'))
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')
