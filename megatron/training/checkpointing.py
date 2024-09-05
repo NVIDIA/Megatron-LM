@@ -21,6 +21,7 @@ from megatron.core.dist_checkpointing.serialization import get_default_load_shar
 from megatron.core.dist_checkpointing.strategies.fully_parallel import \
     FullyParallelSaveStrategyWrapper, FullyParallelLoadStrategyWrapper
 from megatron.core.num_microbatches_calculator import update_num_microbatches
+from megatron.core.utils import is_float8tensor
 from .async_utils import schedule_async_save
 from .global_vars import get_args, get_one_logger
 from .utils import unwrap_model, print_rank_0, append_to_progress_log, is_last_rank
@@ -900,6 +901,20 @@ def load_args_from_checkpoint(args, load_arg='load'):
     return args, checkpoint_args
 
 
+def fix_fp8_params_lose_precision_when_loading_dist_ckpt(state_dict):
+    """
+    When "--fp8-param-gather" and "--use-dist-ckpt" are both enabled, the state dict read from
+    dist-checkpoint loses precision (the weights read from checkpoint go through the process of
+    bf16/fp16 -> fp8 -> bf16/fp16). This function is implemented to solve this problem.
+    When "--fp8-param-gather" is disabled, this function doesn't modify anything.
+    """
+    for key in state_dict.keys():
+        if key.startswith('model'):
+            for _, sharded_tensor in state_dict[key].items():
+                if is_float8tensor(sharded_tensor.data):
+                    sharded_tensor.data = sharded_tensor.data.from_float8().cpu()
+
+
 def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
                     ft_client=None):
     """Load a model checkpoint and return the iteration.
@@ -990,6 +1005,8 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 gen_sd_opt_param_scheduler = None
             load_kwargs['sharded_state_dict'] = generate_state_dict(args, model, gen_sd_optim, gen_sd_opt_param_scheduler,
                                                                     gen_sd_rng_state, True, optim_sd_kwargs=optim_sd_kwargs)
+            # When "--fp8-param-gather" is disabled, this function doesn't modify anything.
+            fix_fp8_params_lose_precision_when_loading_dist_ckpt(load_kwargs['sharded_state_dict'])
 
     state_dict, checkpoint_name, release = _load_base_checkpoint(
         load_dir, args, rank0=False, **load_kwargs

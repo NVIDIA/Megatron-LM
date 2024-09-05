@@ -20,7 +20,12 @@ _TRAIN_START_TIME = time.time()
 import torch
 
 from megatron.core import mpu, tensor_parallel
-from megatron.core.utils import check_param_hashes_across_dp_replicas, get_model_config, StragglerDetector
+from megatron.core.utils import (
+    check_param_hashes_across_dp_replicas,
+    get_model_config,
+    StragglerDetector,
+    is_float8tensor,
+)
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.legacy.model import Float16Module
@@ -73,12 +78,13 @@ from . import ft_integration
 
 stimer = StragglerDetector()
 
+
 def destroy_global_state():
     destroy_global_vars()
     destroy_num_microbatches_calculator()
     destroy_global_memory_buffer()
     destroy_model_parallel()
-    
+
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -486,6 +492,21 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if args.fp16 or args.bf16:
         model = [Float16Module(model_module, args) for model_module in model]
 
+    # The model_module.bfloat16()/model_module.half() above will call the inplace copy of TE's
+    # Float8Tensor, which will write an unwanted value (amax calculated from the current fp8
+    # param) to its amax_history. The following logic will correct the amax_history back.
+    for model_module in model:
+        for param in model_module.parameters():
+            if is_float8tensor(param) and param._fp8_meta is not None:
+                fp8_meta = param._fp8_meta['scaling_fwd']
+                fp8_meta_index = param._fp8_meta_index
+                if hasattr(param, 'get_high_precision_init_val'):
+                    fp8_meta.amax_history[0][fp8_meta_index].copy_(
+                        param.get_high_precision_init_val().abs().max()
+                    )
+                else:
+                    fp8_meta.amax_history[0][fp8_meta_index] = 0
+
     if wrap_with_ddp:
         config = get_model_config(model[0])
         ddp_config = DistributedDataParallelConfig(
@@ -494,7 +515,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             use_distributed_optimizer=args.use_distributed_optimizer,
             check_for_nan_in_grad=args.check_for_nan_in_loss_and_grad,
             bucket_size=args.ddp_bucket_size,
-            average_in_collective=args.ddp_average_in_collective)
+            average_in_collective=args.ddp_average_in_collective,
+            fp8_param_gather=args.fp8_param_gather)
         overlap_param_gather_with_optimizer_step = getattr(args, 'overlap_param_gather_with_optimizer_step', False)
         model = [DDP(config,
                      ddp_config,
@@ -625,7 +647,7 @@ def setup_model_and_optimizer(model_provider_func,
         args.ckpt_format = args.ckpt_convert_format
         args.save = os.path.join(args.ckpt_convert_save, args.ckpt_convert_format)
         update_use_dist_ckpt(args)
-        
+
         save_checkpoint(args.iteration, model, optimizer, opt_param_scheduler,
                         args.num_floating_point_operations_so_far)
 

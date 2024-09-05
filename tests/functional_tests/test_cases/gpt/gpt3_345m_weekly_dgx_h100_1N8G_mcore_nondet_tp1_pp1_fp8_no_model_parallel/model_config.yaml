@@ -42,7 +42,7 @@ MODEL_ARGS:
   --fp8-amax-history-len: 1024
   --fp8-amax-compute-algo: max
   --attention-softmax-in-fp32: true
-  --ckpt-format: true
+  --ckpt-format: torch_dist
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
 TEST_TYPE: regular

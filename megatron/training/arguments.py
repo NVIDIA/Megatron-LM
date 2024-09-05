@@ -313,6 +313,10 @@ def validate_args(args, defaults={}):
         assert args.virtual_pipeline_model_parallel_size is not None, \
             '--align-param-gather only supported with interleaved pipeline parallelism'
 
+    if args.fp8_param_gather:
+        assert args.use_distributed_optimizer, \
+            '--fp8-param-gather only supported with distributed optimizer'
+
     # Parameters dtype.
     args.params_dtype = torch.float
     if args.fp16:
@@ -707,6 +711,9 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--transformer-impl', default='transformer_engine',
                        choices=['local', 'transformer_engine'],
                        help='Which Transformer implementation to use.')
+    group.add_argument('--fp8-param-gather', action='store_true',
+                       help='Keep the compute param in fp8 (do not use any other intermediate '
+                            'dtype) and perform the param all-gather in fp8.')
 
     return parser
 

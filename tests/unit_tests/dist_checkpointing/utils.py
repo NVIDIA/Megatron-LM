@@ -55,6 +55,7 @@ def init_basic_mock_args(args, tp, pp, bf16=True):
     args.accumulate_allreduce_grads_in_fp32 = False
     args.overlap_grad_reduce = False
     args.overlap_param_gather_with_optimizer_step = False
+    args.fp8_param_gather = False
     args.use_distributed_optimizer = True
     args.ddp_bucket_size = None
     args.check_for_nan_in_loss_and_grad = False
