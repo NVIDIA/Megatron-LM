@@ -1,7 +1,6 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
 """ Strategies using PyTorch distributed.checkpoint as an underlying format. """
-import dataclasses
 import io
 from collections import ChainMap, defaultdict
 from dataclasses import dataclass
@@ -16,6 +15,7 @@ from torch.distributed import checkpoint
 from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed._shard.sharded_tensor import Shard, ShardedTensorMetadata, TensorProperties
 from torch.distributed._sharded_tensor import ShardedTensor as TorchShardedTensor
+from torch.distributed._tensor import DTensor
 from torch.distributed.checkpoint import (
     BytesStorageMetadata,
     DefaultLoadPlanner,
@@ -30,7 +30,6 @@ from torch.distributed.checkpoint import (
 )
 from torch.distributed.checkpoint._nested_dict import FLATTEN_MAPPING, unflatten_state_dict
 from torch.distributed.checkpoint._traverse import OBJ_PATH, traverse_state_dict
-from torch.distributed.checkpoint.default_planner import create_default_local_save_plan
 from torch.distributed.checkpoint.metadata import Metadata
 from torch.distributed.checkpoint.planner_helpers import _create_write_items
 
@@ -443,22 +442,30 @@ class MCoreSavePlanner(DefaultSavePlanner):
 
     def create_local_plan(self) -> SavePlan:
         """Adds IOBytes write request on non-coordinator ranks."""
-        plan = create_default_local_save_plan(self.state_dict, self.is_coordinator)
-        self._add_non_coordinator_iobytes_request(plan)
-        if self.flatten_state_dict:
-            plan = dataclasses.replace(plan, planner_data=self.mappings)
-        plan = MCoreSavePlan(
-            items=plan.items,
-            storage_data=plan.storage_data,
-            planner_data=plan.planner_data,
+
+        # NOTE: for PyT 2.4.0a0 we can't rely on `create_default_local_save_plan` because
+        # some alpha versions (specifically 2.4.0a0+f70bd71a48 in 24.06 NGC PyTorch container)
+        # add iobytes request only on coordinator ranks and some alpha versions
+        # (specifically 2.4.0a0+3bcc3cddb5 in 24.07 NGC PyTorch container)
+        # add those requests on all ranks. We inline a simplified version of this method below.
+        write_items = []
+        for fqn, obj in self.state_dict.items():
+            assert not isinstance(
+                obj, DTensor
+            )  # translation from MCore ShardedTensors shouldn't result in DTensors
+            # Create write requests for tensor and bytes values.
+            # For MCore, these should be already non-duplicates.
+            write_items += _create_write_items(fqn, obj)
+
+        self.plan = MCoreSavePlan(
+            items=write_items,
+            planner_data=self.mappings,
             mcore_data={
                 k: sh_ten.mcore_metadata
                 for k, sh_ten in self.state_dict.items()
                 if isinstance(sh_ten, TorchShardedTensor)
             },
         )
-        self.plan = plan
-
         return self.plan
 
     def create_global_plan(self, all_plans: List[MCoreSavePlan]) -> Tuple[List[SavePlan], Metadata]:
@@ -466,13 +473,6 @@ class MCoreSavePlanner(DefaultSavePlanner):
         global_plan, metadata = super().create_global_plan(all_plans)
         metadata.mcore_data = dict(ChainMap(*(plan.mcore_data for plan in all_plans)))
         return global_plan, metadata
-
-    def _add_non_coordinator_iobytes_request(self, plan):
-        if self.is_coordinator:
-            return
-        for fqn, obj in self.state_dict.items():
-            if isinstance(obj, io.BytesIO):
-                plan.items.extend(_create_write_items(fqn, obj))
 
     def transform_object(self, write_item: WriteItem, object: Any):
         """Make no transformations - bytes objects are already serialized."""
@@ -674,7 +674,17 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
 def get_reformulation_metadata(
     sharded_state_dict: ShardedStateDict, checkpoint_dir: Path
 ) -> Dict[str, TensorReformulationMetadata]:
-    """get_reformulation_metadata"""
+    """Reads MCore data for N-D flattened tensors from checkpoint metadata during ckpt load.
+
+    Args:
+        sharded_state_dict (ShardedStateDict): sharded state dict to load
+        checkpoint_dir (Path): checkpoint directory
+
+    Returns:
+        Dict[str, TensorReformulationMetadata] - dictionary that maps keys of every
+            N-D flattened tensor from the sharded_state_dict to its original global shape
+            as stored in `mcore_data` in the checkpoint.
+    """
     ckpt_metadata = FileSystemReader(checkpoint_dir).read_metadata()
     reformulation_metadata = {}
     for sh_ten in nested_values(sharded_state_dict):
