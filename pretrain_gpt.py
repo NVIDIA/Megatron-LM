@@ -4,6 +4,8 @@
 import os
 import torch
 from functools import partial
+from contextlib import nullcontext
+import inspect
 
 from typing import Union
 from megatron.training import get_args
@@ -75,20 +77,36 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             else:
                 transformer_layer_spec = get_gpt_layer_local_spec(args.num_experts, args.moe_grouped_gemm, args.qk_layernorm)
 
-        model = GPTModel(
-            config=config,
-            transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.padded_vocab_size,
-            max_sequence_length=args.max_position_embeddings,
-            pre_process=pre_process,
-            post_process=post_process,
-            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
-            parallel_output=True,
-            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-            position_embedding_type=args.position_embedding_type,
-            rotary_percent=args.rotary_percent,
-            rotary_base=args.rotary_base
-        )
+        build_model_context = nullcontext
+        build_model_context_args = {}
+        if args.fp8_param_gather:
+            try:
+                from transformer_engine.pytorch import fp8_model_init
+
+                build_model_context = fp8_model_init
+                build_model_context_args["enabled"] = True
+
+                # Check if fp8_model_init supports preserve_high_precision_init_val
+                if "preserve_high_precision_init_val" in inspect.signature(fp8_model_init).parameters:
+                    build_model_context_args["preserve_high_precision_init_val"] = True
+            except:
+                raise RuntimeError("--fp8-param-gather requires `fp8_model_init` from TransformerEngine, but not found.")
+
+        with build_model_context(**build_model_context_args):
+            model = GPTModel(
+                config=config,
+                transformer_layer_spec=transformer_layer_spec,
+                vocab_size=args.padded_vocab_size,
+                max_sequence_length=args.max_position_embeddings,
+                pre_process=pre_process,
+                post_process=post_process,
+                fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+                parallel_output=True,
+                share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+                position_embedding_type=args.position_embedding_type,
+                rotary_percent=args.rotary_percent,
+                rotary_base=args.rotary_base
+            )
 
     return model
 

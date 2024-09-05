@@ -2,7 +2,7 @@
 
 import logging
 from contextlib import contextmanager
-from typing import Dict, Optional
+from typing import Dict
 
 import torch
 
@@ -10,9 +10,9 @@ from .. import parallel_state
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..transformer.module import MegatronModule
 from ..transformer.transformer_config import TransformerConfig
-from ..utils import log_single_rank
+from ..utils import is_float8tensor, log_single_rank
 from .distributed_data_parallel_config import DistributedDataParallelConfig
-from .param_and_grad_buffer import ParamAndGradBuffer
+from .param_and_grad_buffer import BucketGroup, ParamAndGradBuffer, partition_buckets
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +78,7 @@ class DistributedDataParallel(MegatronModule):
             self.bucket_size = None
 
         self.module = module
-        self.param_to_buffer = {}
+        self.param_to_bucket_group = {}
 
         # Group parameters by their gradient type.
         param_to_name = {}
@@ -100,6 +100,8 @@ class DistributedDataParallel(MegatronModule):
             input_params, data_parallel_group, gradient_scaling_factor
         ):
             param_and_grad_dtype_to_params = {}
+            param_and_grad_dtype_to_offsets = {}
+            param_and_grad_dtype_to_indices = {}
 
             # Group parameters by their gradient type.
             for param in input_params:
@@ -107,11 +109,40 @@ class DistributedDataParallel(MegatronModule):
                     continue
 
                 param_dtype = param.dtype
+                if is_float8tensor(param):
+                    # Currently TE's Float8Tensor is a wrapper of torch.Tensor. It has a "fake"
+                    # dtype (usually a higher precision dtype such as bfloat16), but its actual
+                    # data is stored in the form of a torch uint8 tensor within the Float8Tensor's
+                    # ".data" attribute. Therefore, when creating the param buffer for fp8 params,
+                    # it is necessary to use torch.uint8, not the "fake" dtype got from
+                    # "param.dtype".
+                    param_dtype = torch.uint8
                 grad_dtype = torch.float if self.ddp_config.grad_reduce_in_fp32 else param.dtype
 
                 params = param_and_grad_dtype_to_params.get((param_dtype, grad_dtype), [])
                 params.append(param)
                 param_and_grad_dtype_to_params[(param_dtype, grad_dtype)] = params
+
+                # Get the index of each param among the params with same dtype, if a param is fp8,
+                # use its "fake" high precision dtype to find which params have same dtype with it.
+                # For example:
+                #     Case 1:
+                #         params = [p1(bf16), p2(bf16), p3(bf16), p4(bf16)]
+                #         param_and_grad_dtype_to_indices = {
+                #             (torch.bfloat16, torch.float32): [0, 1, 2, 3],
+                #         }
+                #     Case 2:
+                #         params = [p1(bf16), p2(fp8), p3(fp8), p4(bf16)]
+                #         param_and_grad_dtype_to_indices = {
+                #             (torch.bfloat16, torch.float32): [0, 3],
+                #             (torch.uint8, torch.float32): [1, 2],
+                #         }
+                # We need these indices to load a non-native-fp8 checkpoint in native-fp8 mode.
+                offset = param_and_grad_dtype_to_offsets.get((param.dtype, grad_dtype), 0)
+                param_and_grad_dtype_to_offsets[(param.dtype, grad_dtype)] = offset + 1
+                indices = param_and_grad_dtype_to_indices.get((param_dtype, grad_dtype), [])
+                indices.append(offset)
+                param_and_grad_dtype_to_indices[(param_dtype, grad_dtype)] = indices
 
             if not config.calculate_per_token_loss:
                 target_gradient_scaling_factor = 1.0 / parallel_state.get_data_parallel_world_size()
@@ -138,12 +169,26 @@ class DistributedDataParallel(MegatronModule):
                         self.bucket_size,
                         param_to_name,
                         gradient_scaling_factor,
+                        param_and_grad_dtype_to_indices[(param_dtype, grad_dtype)],
                     )
                 )
-                for param in params:
-                    self.param_to_buffer[param] = buffers[-1]
 
-            return buffers
+            # In some scenarios, we want to put buckets from different buffers into a group so that
+            # their communication can be aggregated. For example, when there are both fp8 buffers
+            # and bf16 buffers in the model and vpp is enabled, each model chunk will have an fp8
+            # bucket and a bf16 bucket, which doubles the number of communication kernels, and
+            # because of the use of CUDA_DEVICE_MAX_CONNECTIONS=1, having multiple back-to-back
+            # communications will prevent the overlap of the communication kernels with computation
+            # kernels.
+            bucket_groups = partition_buckets(buffers)
+
+            # Create map from param to BucketGroup, used in pre_hook.
+            for bucket_group in bucket_groups:
+                for bucket in bucket_group.buckets:
+                    for param in bucket.params_list:
+                        self.param_to_bucket_group[param] = bucket_group
+
+            return buffers, bucket_groups
 
         if config.calculate_per_token_loss:
             gradient_scaling_factor = 1.0
@@ -160,17 +205,19 @@ class DistributedDataParallel(MegatronModule):
                 expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
 
         # Allocate the param+grad buffers for dense params' grads.
-        self.buffers = allocate_buffers_for_parameters(
+        self.buffers, self.bucket_groups = allocate_buffers_for_parameters(
             dense_params,
             parallel_state.get_data_parallel_group(with_context_parallel=True),
             gradient_scaling_factor=gradient_scaling_factor,
         )
 
         # Allocate separate param+grad buffers for expert parallel params' grads.
-        self.expert_parallel_buffers = allocate_buffers_for_parameters(
-            expert_parallel_params,
-            parallel_state.get_data_modulo_expert_parallel_group(with_context_parallel=True),
-            gradient_scaling_factor=expert_gradient_scaling_factor,
+        self.expert_parallel_buffers, self.expert_parallel_bucket_groups = (
+            allocate_buffers_for_parameters(
+                expert_parallel_params,
+                parallel_state.get_data_modulo_expert_parallel_group(with_context_parallel=True),
+                gradient_scaling_factor=expert_gradient_scaling_factor,
+            )
         )
 
         # Delete references to weight_tensor if they exist since we don't want two parameter copies
@@ -196,7 +243,7 @@ class DistributedDataParallel(MegatronModule):
                 param_tmp = param.expand_as(param)
                 # Get the gradient accumulator function.
                 grad_acc = param_tmp.grad_fn.next_functions[0][0]
-                grad_acc.register_hook(self._make_param_hook(param, self.param_to_buffer))
+                grad_acc.register_hook(self._make_param_hook(param, self.param_to_bucket_group))
                 self.grad_accs.append(grad_acc)
 
     def forward(self, *inputs, **kwargs):
@@ -208,7 +255,7 @@ class DistributedDataParallel(MegatronModule):
     def _make_param_hook(
         self,
         param: torch.nn.Parameter,
-        param_to_buffer: Dict[torch.nn.Parameter, ParamAndGradBuffer],
+        param_to_bucket_group: Dict[torch.nn.Parameter, BucketGroup],
     ):
         """
         Creates the all-reduce / reduce-scatter hook for backprop.
@@ -227,7 +274,7 @@ class DistributedDataParallel(MegatronModule):
                 param.grad = None
 
                 if self.ddp_config.overlap_grad_reduce:
-                    param_to_buffer[param].register_grad_ready(param)
+                    param_to_bucket_group[param].register_grad_ready(param)
 
         return param_hook
 
@@ -236,13 +283,13 @@ class DistributedDataParallel(MegatronModule):
         """
         Context manager that turns off gradient synchronization.
         """
-        for buffer in self.buffers + self.expert_parallel_buffers:
-            buffer.is_last_microbatch = False
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            bucket_group.is_last_microbatch = False
         try:
             yield
         finally:
-            for buffer in self.buffers + self.expert_parallel_buffers:
-                buffer.is_last_microbatch = True
+            for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+                bucket_group.is_last_microbatch = True
 
     def start_grad_sync(self, *unused):
         """
@@ -253,8 +300,8 @@ class DistributedDataParallel(MegatronModule):
         calls. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
         """
-        for buffer in self.buffers + self.expert_parallel_buffers:
-            buffer.start_grad_sync()
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            bucket_group.start_grad_sync()
 
     def scale_gradients(self, scaling_factor: float) -> None:
         """Scale all gradients inside the buffers by `scaling_factor`."""
@@ -270,8 +317,8 @@ class DistributedDataParallel(MegatronModule):
         calls to complete. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
         """
-        for buffer in self.buffers + self.expert_parallel_buffers:
-            buffer.finish_grad_sync()
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            bucket_group.finish_grad_sync()
 
     def zero_grad_buffer(self):
         """
@@ -283,6 +330,8 @@ class DistributedDataParallel(MegatronModule):
                 param.grad_added_to_main_grad = False
         for buffer in self.buffers + self.expert_parallel_buffers:
             buffer.reset()
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            bucket_group.reset()
 
     def broadcast_params(self):
         """

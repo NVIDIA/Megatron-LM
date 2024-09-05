@@ -38,13 +38,16 @@ MODEL_ARGS:
   --eval-interval: 1000
   --eval-iters: 10
   --transformer-impl: transformer_engine
-  --tensor-model-parallel-size: 1
-  --pipeline-model-parallel-size: 1
+  --tensor-model-parallel-size: 2
+  --pipeline-model-parallel-size: 2
+  --sequence-parallel: true
   --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --fp8-format: hybrid
   --fp8-amax-history-len: 1024
   --fp8-amax-compute-algo: max
+  --fp8-param-gather: true
+  --use-distributed-optimizer: true
   --attention-softmax-in-fp32: true
   --ckpt-format: torch_dist
   --data-cache-path: ${DATA_CACHE_PATH}

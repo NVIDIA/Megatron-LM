@@ -10,7 +10,7 @@ include:
   - template: Security/Secret-Detection.gitlab-ci.yml
 
 build_image:
-  tags: 
+  tags:
     - ${TAG}
   image: docker:26.1.4-dind
   timeout: 45m
@@ -90,7 +90,7 @@ unit_tests:
   parallel:
     matrix:
       - TAG: latest
-      - TAG: f2d356582247e1df5a4c0f7c426d33096a394dc1
+      - TAG: f6ee2ebaf2c8a3bfa091a8327452078ecd89fc3a
   tags: [8xL40S]
   variables:
     GIT_STRATEGY: clone
