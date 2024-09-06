@@ -313,6 +313,10 @@ def validate_args(args, defaults={}):
         assert args.virtual_pipeline_model_parallel_size is not None, \
             '--align-param-gather only supported with interleaved pipeline parallelism'
 
+    if args.fp8_param_gather:
+        assert args.use_distributed_optimizer, \
+            '--fp8-param-gather only supported with distributed optimizer'
+
     # Parameters dtype.
     args.params_dtype = torch.float
     if args.fp16:
@@ -659,6 +663,8 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
     kw_args['rotary_interleaved'] = args.rotary_interleaved
+    kw_args['first_pipeline_num_layers']= args.decoder_first_pipeline_num_layers
+    kw_args['last_pipeline_num_layers']= args.decoder_last_pipeline_num_layers
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
@@ -707,6 +713,9 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--transformer-impl', default='transformer_engine',
                        choices=['local', 'transformer_engine'],
                        help='Which Transformer implementation to use.')
+    group.add_argument('--fp8-param-gather', action='store_true',
+                       help='Keep the compute param in fp8 (do not use any other intermediate '
+                            'dtype) and perform the param all-gather in fp8.')
 
     return parser
 
@@ -1107,6 +1116,10 @@ def _add_training_args(parser):
                        help='Global step to start profiling.')
     group.add_argument('--profile-step-end', type=int, default=12,
                        help='Global step to stop profiling.')
+    group.add_argument('--use-pytorch-profiler', action='store_true',
+                       help='Use the built-in pytorch profiler. '
+                       'Useful if you wish to view profiles in tensorboard.',
+                       dest='use_pytorch_profiler')
     group.add_argument('--profile-ranks', nargs='+', type=int, default=[0],
                        help='Global ranks to profile.')
     group.add_argument('--tp-comm-overlap', action='store_true', help='Enables the '
@@ -1489,6 +1502,14 @@ def _add_distributed_args(parser):
                        type=int, default=None,
                        help=('Rank where encoder and decoder should be split. '
                              'Deprecated; use --encoder-pipeline-model-parallel-size instead.'))
+    group.add_argument('--decoder-first-pipeline-num-layers',
+                       type=int, default=None,
+                       help=('The number of transformer layers on the first pipeline stage of the decoder. '
+                       'Default None is even split of transformer layers across all pipeline stages'))
+    group.add_argument('--decoder-last-pipeline-num-layers',
+                       type=int, default=None,
+                       help=('The number of transformer layers on the last pipeline stage of the decoder. '
+                       'Default None is even split of transformer layers across all pipeline stages'))
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')

@@ -83,6 +83,8 @@ def model_provider(
     # TODO: Make these configurable via input .yaml config.
     vision_transformer_config = deepcopy(language_transformer_config)
     vision_transformer_config.num_layers = args.encoder_num_layers
+    vision_transformer_config.first_pipeline_num_layers = None
+    vision_transformer_config.last_pipeline_num_layers = None
 
     vision_projection_type = "mlp"
     vision_projection_config = deepcopy(language_transformer_config)

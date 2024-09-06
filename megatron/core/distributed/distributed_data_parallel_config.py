@@ -30,3 +30,7 @@ class DistributedDataParallelConfig:
     average_in_collective: bool = False
     """If true, compute average in collective directly, as opposed to dividing by the
        dp_size first and then computing sum in the collective."""
+
+    fp8_param_gather: bool = False
+    """If true, keep the compute param in fp8 (do not use any other intermediate dtype) and
+       perform the param all-gather in fp8."""

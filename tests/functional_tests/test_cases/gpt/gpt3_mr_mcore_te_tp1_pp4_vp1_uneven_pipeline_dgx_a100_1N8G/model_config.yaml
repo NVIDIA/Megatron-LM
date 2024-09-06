@@ -1,7 +1,6 @@
 ENV_VARS:
   CUDA_DEVICE_MAX_CONNECTIONS: 1
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
-  NVTE_FUSED_ATTN: 0
   NCCL_ALGO: Tree
   CUBLAS_WORKSPACE_CONFIG: :4096:8
 MODEL_ARGS:
@@ -13,11 +12,11 @@ MODEL_ARGS:
   --log-validation-ppl-to-tensorboard: true
   --log-timers-to-tensorboard: true
   --tensorboard-dir: ${TENSORBOARD_PATH}
-  --micro-batch-size: 2
-  --global-batch-size: 128
+  --micro-batch-size: 4
+  --global-batch-size: 32
   --seq-length: 1024
   --max-position-embeddings: 1024
-  --train-iters: 2000
+  --train-iters: 50
   --timing-log-level: 2
   --lr-decay-iters: 320000
   --save: ${CHECKPOINT_PATH}
@@ -39,14 +38,15 @@ MODEL_ARGS:
   --eval-iters: 10
   --transformer-impl: transformer_engine
   --tensor-model-parallel-size: 1
-  --pipeline-model-parallel-size: 1
+  --pipeline-model-parallel-size: 4
+  --untie-embeddings-and-output-weights: true
   --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
-  --fp8-format: hybrid
-  --fp8-amax-history-len: 1024
-  --fp8-amax-compute-algo: max
   --attention-softmax-in-fp32: true
+  --use-mcore-models: true
   --ckpt-format: torch_dist
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
+  --decoder-first-pipeline-num-layers: 2
+  --decoder-last-pipeline-num-layers: 2
 TEST_TYPE: regular

@@ -4,7 +4,8 @@
 
 Functions `load` and `save` are equivalents of `torch.load` and `torch.save`
 but expect torch.Tensors to be wrapped with classes from the `mapping module`.
-Additionally, `load` expects the sharded state dict argument as a guidance for loading the sharded tensors.
+Additionally, `load` expects the sharded state dict argument as a guidance for
+loading the sharded tensors.
 """
 
 import logging
@@ -79,8 +80,10 @@ def load(
             populated with ShardedTensors. Used as a mapping to determine which
             parts of global tensors stored in the checkpoint should be loaded.
         checkpoint_dir (str): directory with the checkpoint
-        sharded_strategy (LoadShardedStrategy, Tuple[str, int], optional): configures loading behavior for sharded tensors
-        common_strategy (LoadCommonStrategy, Tuple[str, int], optional): configures loading behavior for common data
+        sharded_strategy (LoadShardedStrategy, Tuple[str, int], optional):
+            configures loading behavior for sharded tensors
+        common_strategy (LoadCommonStrategy, Tuple[str, int], optional):
+            configures loading behavior for common data
         validate_access_integrity (bool default = True): checks if each tensor shard is accessed
             exactly once (as main replica) by some process
         strict (StrictHandling, str, optional): determines the behavior in case of a mismatch
@@ -159,9 +162,10 @@ def load(
 
     loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir)
 
-    loaded_state_dict = apply_factory_merges(loaded_state_dict, sh_ten_factories)
-
     merge(common_state_dict, loaded_state_dict)
+
+    loaded_state_dict = apply_factory_merges(common_state_dict, sh_ten_factories)
+
     if StrictHandling.requires_returning_mismatch_keys(strict):
         return common_state_dict, missing_keys, unexpected_keys
     else:
@@ -199,10 +203,12 @@ def load_tensors_metadata(
     Args:
         checkpoint_dir (str): checkpoint directory to load from
         sharded_strategy (LoadShardedStrategy, optional): sharded strategy to load metadata.
-            Defaults to None - in this case a default load strategy for a given checkpoint type is used.
+            Defaults to None - in this case a default load strategy for a given checkpoint type
+            is used.
 
     Returns:
-        CkptShardedMetadata: flat state dict without data describing ShardedTensors in the checkpoint
+        CkptShardedMetadata: flat state dict without data describing ShardedTensors
+            in the checkpoint
     """
     sharded_strategy, common_strategy = verify_checkpoint_and_load_strategy(
         checkpoint_dir, sharded_strategy
@@ -232,10 +238,11 @@ def load_sharded_metadata(
     Args:
         checkpoint_dir (str): checkpoint directory to load from
         sharded_strategy (LoadShardedStrategy, optional): sharded strategy to load metadata.
-            Defaults to None - in this case a default load strategy for a given checkpoint type is used.
+            Defaults to None - in this case a default load strategy for a given checkpoint type
+            is used.
         common_strategy (LoadCommonStrategy, optional): common strategy to load metadata.
-            Defaults to None - in this case a default load strategy for a given checkpoint type is used.
-            This strategy won't be used unless `sharded_strategy` can't handle ShardedObjects
+            Defaults to None - in this case a default load strategy for a given checkpoint type is
+            used. This strategy won't be used unless `sharded_strategy` can't handle ShardedObjects
 
     Returns:
         CkptShardedMetadata: flat state dict without data describing ShardedTensors
@@ -323,8 +330,10 @@ def save(
             ShardedTensors. Used as a mapping to determine how local tensors
             should be saved as global tensors in the checkpoint.
         checkpoint_dir (str): directory to save the checkpoint to
-        sharded_strategy (SaveShardedStrategy, Tuple[str, int], optional): configures sharded tensors saving behavior and backend
-        common_strategy (SaveCommonStrategy, Tuple[str, int], optional): configures common data saving behavior and backend
+        sharded_strategy (SaveShardedStrategy, Tuple[str, int], optional):
+            configures sharded tensors saving behavior and backend
+        common_strategy (SaveCommonStrategy, Tuple[str, int], optional):
+            configures common data saving behavior and backend
         validate_access_integrity (bool default = True): checks if each tensor shard is accessed
             exactly once (as main replica) by some process
         async_sharded_save (bool, optional): if True, for the sharded state dict part
@@ -406,14 +415,17 @@ def save(
 def get_default_save_sharded_strategy(
     backend: str = 'torch_dist', version: int = 1
 ) -> SaveShardedStrategy:
+    """Get default save sharded strategy."""
     return get_default_strategy(StrategyAction.SAVE_SHARDED, backend, version)
 
 
 def get_default_save_common_strategy(
     backend: str = 'torch', version: int = 1
 ) -> SaveCommonStrategy:
+    """Get default save common strategy."""
     return get_default_strategy(StrategyAction.SAVE_COMMON, backend, version)
 
 
 def get_default_load_sharded_strategy(checkpoint_dir: str) -> LoadShardedStrategy:
+    """Get default load sharded strategy."""
     return verify_checkpoint_and_load_strategy(checkpoint_dir)[0]

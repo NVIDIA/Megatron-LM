@@ -19,6 +19,7 @@ except ImportError:
         )
 
         ## apex's FusedAdam is a drop-in replacement for torch's AdamW
+        # pylint: disable-next=line-too-long
         ## see https://github.com/NVIDIA/apex/blob/7b73b12361068a10b0f44844534613f252a5ea75/apex/optimizers/fused_adam.py#L16
         from torch.optim import AdamW as Adam, SGD
 
@@ -107,7 +108,8 @@ def _get_param_groups(
                 wd_mult, _lr_mult = 0.0, lr_mult
 
             is_decoupled_lr = False
-            # For input/embedding and output layer: embedding.word_embeddings.weight / output_layer.weight.
+            # For input/embedding and output layer: embedding.word_embeddings.weight /
+            # output_layer.weight.
             if use_decoupled_learning_rate and getattr(
                 param, 'is_embedding_or_output_parameter', False
             ):
@@ -189,7 +191,7 @@ def _get_param_groups_and_buffers(
     lr_mult: float,
     filter_fn: Callable,
     buffer_name: str,
-) -> Tuple[List[Dict], Dict[int, ParamAndGradBuffer]]:
+) -> Tuple[List[Dict], Dict[int, List[ParamAndGradBuffer]]]:
     """Returns parameter groups and buffer for optimizer.
 
     Args:

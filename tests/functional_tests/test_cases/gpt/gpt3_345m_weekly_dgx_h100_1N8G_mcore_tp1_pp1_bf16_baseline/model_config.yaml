@@ -41,7 +41,7 @@ MODEL_ARGS:
   --pipeline-model-parallel-size: 1
   --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
-  --ckpt-format: true
+  --ckpt-format: torch_dist
   --data-cache-path: ${DATA_CACHE_PATH}
   --fp16: true
   --apply-query-key-layer-scaling: true
