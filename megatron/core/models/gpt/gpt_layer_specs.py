@@ -16,6 +16,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayer, Transf
 try:
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelGroupedLinear,
+        TEColumnParallelLinear,
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
         TENorm,
@@ -47,6 +48,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
     qk_layernorm: Optional[bool] = False,
+    fp8: Optional[str] = None,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -55,12 +57,13 @@ def get_gpt_layer_with_transformer_engine_spec(
         num_experts (int, optional): Number of experts. Defaults to None.
         moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
         qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
+        fp8 (str, optional): Flag to decide the linear layer spec for MoE. Defaults to None.
 
     Returns:
         ModuleSpec: Module specification with TE modules
     """
     mlp = _get_mlp_module_spec(
-        use_te=True, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
+        use_te=True, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm, fp8=fp8
     )
     return ModuleSpec(
         module=TransformerLayer,
@@ -136,6 +139,7 @@ def _get_mlp_module_spec(
     use_te: Optional[bool] = True,
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
+    fp8: Optional[str] = None,
 ) -> ModuleSpec:
     """Helper function to get module spec for MLP/MoE"""
     if num_experts is None:
@@ -152,6 +156,9 @@ def _get_mlp_module_spec(
         if use_te and moe_grouped_gemm:
             linear_fc1 = TEColumnParallelGroupedLinear
             linear_fc2 = TERowParallelGroupedLinear
+        elif use_te and fp8:
+            linear_fc1 = TEColumnParallelLinear
+            linear_fc2 = TERowParallelLinear
         else:
             linear_fc1 = ColumnParallelLinear
             linear_fc2 = RowParallelLinear
