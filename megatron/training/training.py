@@ -1229,7 +1229,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 iteration % args.check_weight_hash_across_dp_replicas_interval == 0:
             if args.use_distributed_optimizer and args.overlap_param_gather:
                 optimizer.disable_pre_hook()
-            assert check_param_hashes_across_dp_replicas(model), \
+            assert check_param_hashes_across_dp_replicas(model, cross_check=True), \
                 "Parameter hashes not matching across DP replicas"
             torch.distributed.barrier()
             print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
