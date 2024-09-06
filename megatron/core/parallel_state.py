@@ -631,9 +631,9 @@ def initialize_model_parallel(
 
     for ranks in generator_wrapper('dp'):
         group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('dp', nccl_comm_cfgs)
+            ranks, timeout=timeout, pg_options=get_nccl_options('dp', nccl_comm_cfgs), group_desc="dp_group"
         )
-        group_gloo = torch.distributed.new_group(ranks, timeout=timeout, backend="gloo")
+        group_gloo = torch.distributed.new_group(ranks, timeout=timeout, backend="gloo", group_desc="dp_group")
         if rank in ranks:
             _DATA_PARALLEL_GROUP = group
             _DATA_PARALLEL_GROUP_GLOO = group_gloo
@@ -641,10 +641,10 @@ def initialize_model_parallel(
 
     for ranks_with_cp in generator_wrapper('dp-cp'):
         group_with_cp = torch.distributed.new_group(
-            ranks_with_cp, timeout=timeout, pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs)
+            ranks_with_cp, timeout=timeout, pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs), group_desc="dp_cp_group"
         )
         group_with_cp_gloo = torch.distributed.new_group(
-            ranks_with_cp, timeout=timeout, backend="gloo"
+            ranks_with_cp, timeout=timeout, backend="gloo", group_desc="dp_cp_group"
         )
         if rank in ranks_with_cp:
             _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
@@ -677,7 +677,7 @@ def initialize_model_parallel(
     assert _CONTEXT_PARALLEL_GROUP is None, 'context parallel group is already initialized'
     for ranks in generator_wrapper('cp'):
         group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('cp', nccl_comm_cfgs)
+            ranks, timeout=timeout, pg_options=get_nccl_options('cp', nccl_comm_cfgs), group_desc="cp_group"
         )
         if rank in ranks:
             _CONTEXT_PARALLEL_GROUP = group
@@ -687,8 +687,8 @@ def initialize_model_parallel(
     global _MODEL_PARALLEL_GROUP
     assert _MODEL_PARALLEL_GROUP is None, 'model parallel group is already initialized'
     for ranks in generator_wrapper('tp-pp'):
-        group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('mp', nccl_comm_cfgs)
+        group = torch.distributed.(
+            ranks, timeout=timeout, pg_options=get_nccl_options('mp', nccl_comm_cfgs), group_desc="mp_group"
         )
         if rank in ranks:
             _MODEL_PARALLEL_GROUP = group
@@ -699,8 +699,8 @@ def initialize_model_parallel(
         _MODEL_AND_EXPERT_PARALLEL_GROUP is None
     ), 'model and expert parallel group is already initialized'
     for ranks in generator_wrapper('tp-ep-pp', independent_ep=True):
-        group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('mp_exp', nccl_comm_cfgs)
+        group = torch.distributed.(
+            ranks, timeout=timeout, pg_options=get_nccl_options('mp_exp', nccl_comm_cfgs), group_desc="mp_exp_group"
         )
         if rank in ranks:
             _MODEL_AND_EXPERT_PARALLEL_GROUP = group
@@ -712,8 +712,8 @@ def initialize_model_parallel(
         _TENSOR_MODEL_PARALLEL_GROUP is None
     ), 'tensor model parallel group is already initialized'
     for ranks in generator_wrapper('tp'):
-        group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('tp', nccl_comm_cfgs)
+        group = torch.distributed.(
+            ranks, timeout=timeout, pg_options=get_nccl_options('tp', nccl_comm_cfgs), group_desc="tp_group"
         )
         if rank in ranks:
             _TENSOR_MODEL_PARALLEL_GROUP = group
@@ -733,8 +733,8 @@ def initialize_model_parallel(
     global _POSITION_EMBEDDING_GLOBAL_RANKS
     assert _POSITION_EMBEDDING_GROUP is None, 'position embedding group is already initialized'
     for ranks in generator_wrapper('pp'):
-        group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('pp', nccl_comm_cfgs)
+        group = torch.distributed.(
+            ranks, timeout=timeout, pg_options=get_nccl_options('pp', nccl_comm_cfgs), group_desc="pp_group"
         )
         if rank in ranks:
             if _PIPELINE_MODEL_PARALLEL_GROUP is None:
@@ -748,18 +748,19 @@ def initialize_model_parallel(
                 _PIPELINE_GLOBAL_RANKS = [_PIPELINE_GLOBAL_RANKS, ranks]
 
         embedding_ranks = get_embedding_ranks(ranks)
-        group = torch.distributed.new_group(
-            embedding_ranks, timeout=timeout, pg_options=get_nccl_options('embd', nccl_comm_cfgs)
+        group = torch.distributed.(
+            embedding_ranks, timeout=timeout, pg_options=get_nccl_options('embd', nccl_comm_cfgs), group_desc="embd_group"
         )
         if rank in embedding_ranks:
             _EMBEDDING_GROUP = group
             _EMBEDDING_GLOBAL_RANKS = embedding_ranks
 
         position_embedding_ranks = get_position_embedding_ranks(ranks)
-        group = torch.distributed.new_group(
+        group = torch.distributed.(
             position_embedding_ranks,
             timeout=timeout,
             pg_options=get_nccl_options('embd', nccl_comm_cfgs),
+            group_desc="embd_group"
         )
         if rank in position_embedding_ranks:
             _POSITION_EMBEDDING_GROUP = group
@@ -772,14 +773,14 @@ def initialize_model_parallel(
         _TENSOR_AND_DATA_PARALLEL_GROUP is None
     ), 'Tensor + data parallel group is already initialized'
     for ranks in generator_wrapper('tp-dp-cp'):
-        group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('tp_dp_cp', nccl_comm_cfgs)
+        group = torch.distributed.(
+            ranks, timeout=timeout, pg_options=get_nccl_options('tp_dp_cp', nccl_comm_cfgs), group_desc="tp_dp_cp_group"
         )
         if rank in ranks:
             _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = group
     for ranks in generator_wrapper('tp-dp'):
-        group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('tp_dp', nccl_comm_cfgs)
+        group = torch.distributed.(
+            ranks, timeout=timeout, pg_options=get_nccl_options('tp_dp', nccl_comm_cfgs), group_desc="tp_dp_group"
         )
         if rank in ranks:
             _TENSOR_AND_DATA_PARALLEL_GROUP = group
@@ -789,8 +790,8 @@ def initialize_model_parallel(
         _TENSOR_AND_CONTEXT_PARALLEL_GROUP is None
     ), 'Tensor + context parallel group is already initialized'
     for ranks in generator_wrapper('tp-cp'):
-        group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('tp_cp', nccl_comm_cfgs)
+        group = torch.distributed.(
+            ranks, timeout=timeout, pg_options=get_nccl_options('tp_cp', nccl_comm_cfgs), group_desc="tp_cp_group"
         )
         if rank in ranks:
             _TENSOR_AND_CONTEXT_PARALLEL_GROUP = group
@@ -815,23 +816,23 @@ def initialize_model_parallel(
 
     for ranks in generator_wrapper('tp-ep', independent_ep=True):
         group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('tp_exp', nccl_comm_cfgs)
+            ranks, timeout=timeout, pg_options=get_nccl_options('tp_exp', nccl_comm_cfgs), group_desc="tp_exp_group"
         )
         if rank in ranks:
             _TENSOR_AND_EXPERT_PARALLEL_GROUP = group
 
     for ranks in generator_wrapper('ep', independent_ep=True):
         group = torch.distributed.new_group(
-            ranks, pg_options=get_nccl_options('exp', nccl_comm_cfgs)
+            ranks, pg_options=get_nccl_options('exp', nccl_comm_cfgs), group_desc="exp_group"
         )
         if rank in ranks:
             _EXPERT_MODEL_PARALLEL_GROUP = group
 
     for ranks in generator_wrapper('dp', independent_ep=True):
         group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('dp_modulo_exp', nccl_comm_cfgs)
+            ranks, timeout=timeout, pg_options=get_nccl_options('dp_modulo_exp', nccl_comm_cfgs), group_desc="dp_modulo_exp_group"
         )
-        group_gloo = torch.distributed.new_group(ranks, backend="gloo")
+        group_gloo = torch.distributed.new_group(ranks, backend="gloo", group_desc="dp_modulo_exp_group")
         if rank in ranks:
             _DATA_MODULO_EXPERT_PARALLEL_GROUP = group
             _DATA_MODULO_EXPERT_PARALLEL_GROUP_GLOO = group_gloo
@@ -843,8 +844,9 @@ def initialize_model_parallel(
                 ranks,
                 timeout=timeout,
                 pg_options=get_nccl_options('dp_modulo_exp_cp', nccl_comm_cfgs),
+                group_desc="dp_modulo_exp_cp_group"
             )
-            group_gloo = torch.distributed.new_group(ranks, backend="gloo")
+            group_gloo = torch.distributed.new_group(ranks, backend="gloo", group_desc="dp_modulo_exp_cp_group")
         else:
             group = _DATA_MODULO_EXPERT_PARALLEL_GROUP
             group_gloo = _DATA_MODULO_EXPERT_PARALLEL_GROUP_GLOO
