@@ -965,18 +965,30 @@ def get_position_embedding_group():
     return _POSITION_EMBEDDING_GROUP
 
 
-def get_amax_reduction_group(with_context_parallel=False):
+def get_amax_reduction_group(with_context_parallel=False, tp_only_amax_red=False):
     """Get the FP8 amax reduction group the caller rank belongs to."""
     if with_context_parallel:
-        assert (
-            _TENSOR_AND_CONTEXT_PARALLEL_GROUP is not None
-        ), 'FP8 amax reduction group is not initialized'
-        return _TENSOR_AND_CONTEXT_PARALLEL_GROUP
+        if not tp_only_amax_red:
+            assert (
+                _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP is not None
+            ), 'FP8 amax reduction group is not initialized'
+            return _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
+        else:
+            assert (
+                _TENSOR_AND_CONTEXT_PARALLEL_GROUP is not None
+            ), 'FP8 amax reduction group is not initialized'
+            return _TENSOR_AND_CONTEXT_PARALLEL_GROUP
     else:
-        assert (
-            _TENSOR_MODEL_PARALLEL_GROUP is not None
-        ), 'FP8 amax reduction group is not initialized'
-        return _TENSOR_MODEL_PARALLEL_GROUP
+        if not tp_only_amax_red:
+            assert (
+                _TENSOR_AND_DATA_PARALLEL_GROUP is not None
+            ), 'FP8 amax reduction group is not initialized'
+            return _TENSOR_AND_DATA_PARALLEL_GROUP
+        else:
+            assert (
+                _TENSOR_MODEL_PARALLEL_GROUP is not None
+            ), 'FP8 amax reduction group is not initialized'
+            return _TENSOR_MODEL_PARALLEL_GROUP
 
 
 def get_tensor_and_data_parallel_group(with_context_parallel=False):
