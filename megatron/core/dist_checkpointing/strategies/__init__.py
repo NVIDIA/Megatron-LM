@@ -1,9 +1,7 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
 """ Various loading and saving strategies """
+from megatron.core.dist_checkpointing.strategies.common import register_default_common_strategies
 
-# We mock imports to populate the `default_strategies` objects.
-# Since they are defined in base but populated in common, we have to mock
-# import both modules.
-from megatron.core.dist_checkpointing.strategies.base import _import_trigger
-from megatron.core.dist_checkpointing.strategies.common import _import_trigger
+# We load "common" strategies by default to be always available
+register_default_common_strategies()
