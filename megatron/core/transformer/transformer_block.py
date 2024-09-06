@@ -220,6 +220,7 @@ class TransformerBlock(MegatronModule):
 
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
+        self.tp_only_amax_red = config.tp_only_amax_red
 
     def _build_layers(self):
         # Transformer layers.
@@ -433,7 +434,9 @@ class TransformerBlock(MegatronModule):
             )
             fp8_group = None
             if parallel_state.model_parallel_is_initialized():
-                fp8_group = parallel_state.get_amax_reduction_group(with_context_parallel=True)
+                fp8_group = parallel_state.get_amax_reduction_group(
+                    with_context_parallel=True, tp_only_amax_red=self.tp_only_amax_red
+                )
             fp8_context = transformer_engine.pytorch.fp8_autocast(
                 enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group
             )

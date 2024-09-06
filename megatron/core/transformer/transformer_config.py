@@ -228,6 +228,9 @@ class TransformerConfig(ModelParallelConfig):
     fp8_multi_head_attention: bool = False
     """When set to True, use the FP8 implementation of Multi Head Attention."""
 
+    tp_only_amax_red: bool = False
+    """When set to True, reduce the FP8 AMAX only in the TP or TP-CP domain"""
+
     ####################
     # MoE related
     ####################

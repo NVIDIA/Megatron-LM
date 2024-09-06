@@ -1430,7 +1430,7 @@ class ParallelTransformer(MegatronModule):
         if self.use_fp8:
             assert args.transformer_impl == 'transformer_engine', \
                 'transformer-engine required for fp8 training and inference'
-            self.fp8_group = mpu.get_amax_reduction_group()
+            self.fp8_group = mpu.get_amax_reduction_group(tp_only_amax_red=config.tp_only_amax_red)
             if args.fp8 == "e4m3":
                 fp8_format = transformer_engine.common.recipe.Format.E4M3
             elif args.fp8 == "hybrid":
