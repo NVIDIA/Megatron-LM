@@ -7,7 +7,7 @@ import types
 from dataclasses import dataclass
 from importlib.metadata import version
 
-from pkg_resources import packaging
+from pkg_resources.extern import packaging
 
 from megatron.core.transformer import TransformerConfig
 
