@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from functools import partial
+from math import ceil
 from typing import Optional, Tuple
 
 import torch
@@ -34,10 +35,9 @@ from megatron.core.transformer.utils import make_sharded_object_for_checkpoint
 
 
 class GroupedMLP(MegatronModule):
-    """An efficient implementation of the Experts layer using CUTLASS GroupedGEMM.
+    """An efficient implementation of the Experts layer using GroupedGEMM.
 
-    This class is designed to execute multiple experts in parallel, thereby maximizing
-    computational efficiency.
+    Executes multiple experts in parallel to maximize computational efficiency.
     """
 
     def __init__(self, num_local_experts: int, config: TransformerConfig):
@@ -47,8 +47,7 @@ class GroupedMLP(MegatronModule):
         gg.assert_grouped_gemm_is_available()
         assert (
             config.add_bias_linear == False
-        ), "bias in the expert layer is not supported in Grouped GEMM yet, please set \
-        '--disable-bias-linear' instead."
+        ), "bias not supported in Grouped GEMM yet, please set '--disable-bias-linear' instead."
 
         self.expert_parallel = config.expert_model_parallel_size > 1
         if self.config.gated_linear_unit:
@@ -163,7 +162,7 @@ class GroupedMLP(MegatronModule):
 
         self.register_load_state_dict_post_hook(remove_extra_states_check)
 
-    def forward(self, permuted_local_hidden_states, tokens_per_expert):
+    def forward(self, permuted_local_hidden_states: torch.Tensor, tokens_per_expert: torch.Tensor):
         """Forward step of the GroupedMLP."""
         if permuted_local_hidden_states.nelement() != 0:
             # Reshape the weights for the grouped GEMMs.
@@ -181,8 +180,7 @@ class GroupedMLP(MegatronModule):
             # No token is allocated for local experts.
             assert torch.count_nonzero(tokens_per_expert) == 0
 
-            # Make sure parameters still have gradients when no tokens are routed to this set of
-            # experts.
+            # Make sure params of experts still have gradients even given zero tokens.
             w1 = self.weight1.view(self.config.hidden_size, -1)
             w2 = self.weight2.view(-1, self.config.hidden_size)
             h = torch.matmul(permuted_local_hidden_states, w1)
@@ -347,8 +345,7 @@ class GroupedMLP(MegatronModule):
 class TEGroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using TE's GroupedLinear.
 
-    This class is designed to execute multiple experts in parallel, thereby maximizing
-    computational efficiency.
+    Executes multiple experts in parallel to maximize computational efficiency.
     """
 
     def __init__(self, num_local_experts, config: TransformerConfig, submodules: MLPSubmodules):
@@ -357,8 +354,7 @@ class TEGroupedMLP(MegatronModule):
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size
 
-        # If this is a gated linear unit we double the output width, see
-        # https://arxiv.org/pdf/2002.05202.pdf
+        # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = self.config.ffn_hidden_size
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
@@ -505,29 +501,54 @@ class SequentialMLP(MegatronModule):
             expert = MLP(self.config, submodules, is_expert=True)
             self.local_experts.append(expert)
 
-    def forward(self, permuted_local_hidden_states, tokens_per_expert):
+    def _pad_tensor_for_fp8(self, hidden):
+        """Padding tensor shape to multiples of 16."""
+        actual_num_tokens = hidden.shape[0]
+        divisor = 16
+        padded_num_tokens = ceil(actual_num_tokens / divisor) * divisor - actual_num_tokens
+        if padded_num_tokens > 0:
+            pad_tensor = torch.zeros(
+                padded_num_tokens, hidden.shape[1], dtype=hidden.dtype, device=hidden.device
+            )
+            hidden = torch.cat((hidden, pad_tensor), dim=0)
+        return hidden
+
+    def forward(self, permuted_local_hidden_states: torch.Tensor, tokens_per_expert: torch.Tensor):
         """Forward step of the SequentialMLP."""
-        output_local = torch.zeros_like(permuted_local_hidden_states)
-        output_bias_local = None
-        if self.add_bias:
-            output_bias_local = torch.zeros_like(permuted_local_hidden_states)
+        if self.num_local_experts == 1:
+            if self.config.fp8:
+                hidden = self._pad_tensor_for_fp8(permuted_local_hidden_states)
+                output, output_bias = self.local_experts[0](hidden)
+                output = output[: permuted_local_hidden_states.shape[0]]
+            else:
+                output, output_bias = self.local_experts[0](permuted_local_hidden_states)
 
-        cumsum_num_tokens = torch.cumsum(tokens_per_expert, dim=0)
-        # Insert zero at the beginning for offset index's convenience
-        zero_tensor = torch.zeros(1, dtype=torch.long, device=cumsum_num_tokens.device)
-        cumsum_num_tokens = torch.cat((zero_tensor, cumsum_num_tokens))
-        for expert_num, expert in enumerate(self.local_experts):
-            start = cumsum_num_tokens[expert_num]
-            end = cumsum_num_tokens[expert_num + 1]
-            hidden = permuted_local_hidden_states[start:end]
-            output, output_bias = expert(hidden)
+            return output, output_bias
+        else:
+            tokens_per_expert = tokens_per_expert.tolist()
+            tokens_list = torch.split(permuted_local_hidden_states, tokens_per_expert)
 
-            output_local[start:end] = output
+            output_local_list = []
+            output_bias_list = []
+
+            for expert, tokens in zip(self.local_experts, tokens_list):
+                if self.config.fp8:
+                    hidden = self._pad_tensor_for_fp8(tokens)
+                    output, output_bias = expert(hidden)
+                    output = output[: tokens.shape[0]]
+                else:
+                    output, output_bias = expert(tokens)
+                output_local_list.append(output)
+                if self.add_bias:
+                    output_bias_list.append(output_bias.expand_as(output))
+
+            output_local = torch.cat(output_local_list, dim=0)
             if self.add_bias:
-                output_bias = output_bias.expand_as(output)
-                output_bias_local[start:end, :] = output_bias
+                output_bias_local = torch.cat(output_bias_list, dim=0)
+            else:
+                output_bias_local = None
 
-        return output_local, output_bias_local
+            return output_local, output_bias_local
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Maps local expert to global experts."""
