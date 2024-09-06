@@ -23,7 +23,7 @@ MODEL_ARGS:
   --disable-bias-linear: true
   --micro-batch-size: 1
   --global-batch-size: 256
-  --train-samples: 268554688
+  --train-samples: 38400
   --exit-duration-in-mins: 230
 
   # Transformer Engine args
