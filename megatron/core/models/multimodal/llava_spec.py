@@ -1,34 +1,22 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.gpt.gpt_layer_specs import _get_mlp_module_spec
-from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
-from megatron.core.transformer.attention import (
-    CrossAttention,
-    CrossAttentionSubmodules,
-    SelfAttention,
-    SelfAttentionSubmodules,
-)
-from megatron.core.transformer.custom_layers.transformer_engine import (
-    TEColumnParallelLinear,
+from megatron.core.extensions.transformer_engine import (
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
     TENorm,
     TERowParallelLinear,
 )
+from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.models.gpt.gpt_layer_specs import _get_mlp_module_spec
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_block import (
-    TransformerBlockSubmodules,
-    get_num_layers_to_build,
-)
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
 try:
-    import apex
+    import apex  # pylint: disable=unused-import
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 

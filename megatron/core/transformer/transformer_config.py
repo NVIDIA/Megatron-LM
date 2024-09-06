@@ -299,7 +299,10 @@ class TransformerConfig(ModelParallelConfig):
     """When set to true, the parameter transposes are not cached for subsequent iterations."""
 
     enable_cuda_graph: bool = False
-    """When set to true, TransformerLayer blocks are wrapped with CUDA graph."""
+    """When set to true, TransformerLayer layers are swapped with a CUDA graphed version."""
+
+    external_cuda_graph: bool = False
+    """When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
 
     config_logger_dir: str = ""
     """When non-empty, dumps entry-point configs to config_logger_dir"""

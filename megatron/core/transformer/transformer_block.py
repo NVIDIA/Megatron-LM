@@ -20,7 +20,7 @@ from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import make_viewless_tensor
 
 try:
-    from megatron.core.transformer.custom_layers.transformer_engine import (
+    from megatron.core.extensions.transformer_engine import (
         TEDelayedScaling,
         TENorm,
         get_cpu_offload_context,
@@ -454,6 +454,7 @@ class TransformerBlock(MegatronModule):
             else:
                 for l_no, layer in enumerate(self.layers):
                     with self.offload_context:
+                        layer.use_cudagraph = True
                         if (len(self.cuda_graphs) == 0) or (not self.training):
                             hidden_states, context = layer(
                                 hidden_states=hidden_states,
@@ -463,12 +464,6 @@ class TransformerBlock(MegatronModule):
                                 rotary_pos_emb=rotary_pos_emb,
                                 inference_params=inference_params,
                                 packed_seq_params=packed_seq_params,
-                            )
-                            # CUDA graph doesn't output context and is expected to be None
-                            assert (
-                                (context is None)
-                                or (not self.config.enable_cuda_graph)
-                                or (not self.training)
                             )
                         else:
                             # CUDA graph replay for layer `l_no` and microbatch
