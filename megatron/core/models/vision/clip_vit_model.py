@@ -5,8 +5,8 @@ from typing import Optional, Union
 import torch
 
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.models.common.vision_module.vision_module import VisionModule
-from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -89,8 +89,10 @@ class CLIPViTModel(VisionModule):
         self.model_type = ModelType.encoder_or_decoder
 
         # Transformer layers.
-        # TODO: Follow-up changes will make pre and post_process configurable. They are needed for supporting pipeline parallelism.
-        # Note: a final layer norm and/or linear layer present in some implementations are omitted here. They can be added separately where needed.
+        # TODO: Follow-up changes will make pre and post_process configurable.
+        # They are needed for supporting pipeline parallelism.
+        # Note: a final layer norm and/or linear layer present in some implementations
+        # are omitted here. They can be added separately where needed.
         self.decoder = TransformerBlock(
             config=transformer_config,
             spec=transformer_layer_spec,
@@ -135,9 +137,8 @@ class CLIPViTModel(VisionModule):
         x = x + self.position_embeddings(self.position_ids)
         x = self.ln_pre(x)
         x = x.permute(1, 0, 2)  # [b, s, h] -> [s, b, h]
-        x = (
-            x.contiguous()
-        )  # contiguous() call required as `permute` can sparsify the tensor and this breaks pipelining
+        x = x.contiguous()
+        # contiguous() call required as `permute` can sparsify the tensor and this breaks pipelining
 
         x = self.decoder(x, attention_mask)
         x = x.permute(1, 0, 2)  # [s, b, h] -> [b, s, h]

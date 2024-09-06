@@ -5,21 +5,16 @@
 
 import contextlib
 import logging
-from importlib.metadata import version
 
 import torch
-from pkg_resources import packaging
 from torch import _C
 from torch.cuda import _lazy_call
 from torch.cuda import device as device_ctx_manager
 from torch.utils.checkpoint import detach_variable
 
 from megatron.core.parallel_state import (
-    get_data_parallel_rank,
     get_expert_model_parallel_rank,
-    get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
 )
 from megatron.core.utils import safely_set_viewless_tensor_data
 
@@ -66,11 +61,13 @@ def _set_cuda_rng_state(new_state, device=-1):
 
 
 def get_expert_parallel_rng_tracker_name():
+    """Get the expert parallel rng tracker name"""
     global _EXPERT_PARALLEL_RNG_TRACKER_NAME
     return _EXPERT_PARALLEL_RNG_TRACKER_NAME
 
 
 def get_data_parallel_rng_tracker_name():
+    """Get the data parallel rng tracker name"""
     global _DATA_PARALLEL_RNG_TRACKER_NAME
     return _DATA_PARALLEL_RNG_TRACKER_NAME
 
@@ -88,6 +85,7 @@ class CudaRNGStatesTracker:
         self.reset()
 
     def is_initialized(self):
+        """Checks if the internal RNG state has been set wirth set_states()."""
         return self._is_initialized
 
     def reset(self):
@@ -166,29 +164,28 @@ _CUDA_RNG_STATE_TRACKER_INITIALIZED = False
 
 
 def initialize_rng_tracker(use_te_rng_tracker: bool = False):
+    """Create the RNG tracker. 'use_te_rng_tracker' determines whether to use
+    Megatron or TransformerEngine's implementation.
+    In particular, TransformerEngine's implementation is cudagraphable and supports FP8.
+    """
+
     global _CUDA_RNG_STATE_TRACKER
     global _CUDA_RNG_STATE_TRACKER_INITIALIZED
     if _CUDA_RNG_STATE_TRACKER_INITIALIZED:
         return
-    if use_te_rng_tracker:
-        try:
-            import transformer_engine.pytorch as te
 
-            _te_version = packaging.version.Version(version("transformer-engine"))
-            if _te_version < packaging.version.Version("1.5.0"):
-                raise RuntimeError("use_te_rng_tracker requires TransformerEngine version >= 1.5")
-        except ImportError:
-            raise RuntimeError("use_te_rng_tracker requires TransformerEngine, but not installed")
     if use_te_rng_tracker:
-        _CUDA_RNG_STATE_TRACKER = te.distributed.CudaRNGStatesTracker()
+        from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
+
+        _CUDA_RNG_STATE_TRACKER = TECudaRNGStatesTracker()
     else:
         _CUDA_RNG_STATE_TRACKER = CudaRNGStatesTracker()
     _CUDA_RNG_STATE_TRACKER_INITIALIZED = True
 
 
-def get_cuda_rng_tracker():
+def get_cuda_rng_tracker(use_te_rng_tracker=False):
     """Get cuda rng tracker."""
-    initialize_rng_tracker()
+    initialize_rng_tracker(use_te_rng_tracker)
     return _CUDA_RNG_STATE_TRACKER
 
 
@@ -200,8 +197,12 @@ def model_parallel_cuda_manual_seed(seed):
     after this function. Basically, this is replacement for that
     function.
     Two set of RNG states are tracked:
-    default state: This is for data parallelism and is the same among a set of model parallel GPUs but different across different model paralle groups. This is used for example for dropout in the non-tensor-model-parallel regions.
-    tensor-model-parallel state: This state is different among a set of model parallel GPUs, but the same across data parallel groups. This is used for example for dropout in model parallel regions.
+    default state: This is for data parallelism and is the same among a set of model parallel GPUs
+    but different across different model parallel groups. This is used for example for dropout
+    in the non-tensor-model-parallel regions.
+    tensor-model-parallel state: This state is different among a set of model parallel GPUs,
+    but the same across data parallel groups. This is used for example for dropout
+    in model parallel regions.
     """
     # 2718 is just for fun and any POSITIVE value will work.
     offset = seed + 2718
