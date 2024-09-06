@@ -13,16 +13,19 @@ from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
-from megatron.core.transformer.custom_layers.transformer_engine import (
-    TEColumnParallelGroupedLinear,
-    TEDotProductAttention,
-    TELayerNormColumnParallelLinear,
-    TENorm,
-    TERowParallelGroupedLinear,
-    TERowParallelLinear,
-)
+try:
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelGroupedLinear,
+        TEDotProductAttention,
+        TELayerNormColumnParallelLinear,
+        TENorm,
+        TERowParallelGroupedLinear,
+        TERowParallelLinear,
+    )
 
-HAVE_TE = True
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 try:
     import apex  # pylint: disable=unused-import

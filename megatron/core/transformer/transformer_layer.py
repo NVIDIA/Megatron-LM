@@ -9,6 +9,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
+from megatron.core.transformer.cuda_graphs import CudaGraphManager
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -91,8 +92,14 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         hidden_dropout: float = None,
     ):
         super().__init__(config=config)
-        self.submodules_config = submodules
 
+        if config.enable_cuda_graph and self.training:
+            assert (
+                not config.cpu_offloading and config.recompute_granularity is None
+            ), "Cudagraphs not supported"
+            self.cudagraph_manager = CudaGraphManager()
+
+        self.submodules_config = submodules
         self.layer_number = layer_number + self._get_layer_offset()
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
 
@@ -360,3 +367,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         if prefixed_map:
             apply_prefix_mapping(sharded_state_dict, prefixed_map)
         return sharded_state_dict
+
+    def __call__(self, *args, **kwargs):
+        if hasattr(self, 'cudagraph_manager'):
+            return self.cudagraph_manager(self, args, kwargs)
+        return super(MegatronModule, self).__call__(*args, **kwargs)
