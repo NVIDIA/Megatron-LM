@@ -1379,6 +1379,11 @@ def _add_checkpointing_args(parser):
                            'None - No non-persistent checkpointing (default option).')
     group.add_argument('--non-persistent-global-ckpt-dir', type=str, default=None,
                        help='Directory containing global non-persistent model checkpoints.')
+    group.add_argument('--non-persistent-local-ckpt-dir', type=str, default=None,
+                       help='Directory containing local non-persistent model checkpoints.')
+    group.add_argument('--non-persistent-local-ckpt-algo', type=str, default='fully_parallel',
+                       choices=['fully_parallel', 'atomic'],
+                       help='Algorithm for local non-persistent checkpointing.')
     group.add_argument('--finetune', action='store_true',
                        help='Load model for finetuning. Do not load optimizer '
                        'or rng state from checkpoint and set iteration to 0. '

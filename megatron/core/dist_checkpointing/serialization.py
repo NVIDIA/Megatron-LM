@@ -16,16 +16,15 @@ import torch
 
 from . import ShardedTensor
 from .core import CheckpointingConfig, save_config
-from .dict_utils import dict_list_map_inplace, extract_matching_values, merge
+from .dict_utils import extract_matching_values, merge
 from .mapping import (
     CheckpointingException,
     ShardedObject,
     ShardedStateDict,
-    ShardedTensorFactory,
     StateDict,
-    apply_factories,
     apply_factory_merges,
 )
+from .state_dict_transformation import load_preprocess, save_preprocess
 from .strategies.async_utils import AsyncRequest
 from .strategies.base import (
     AsyncSaveShardedStrategy,
@@ -36,14 +35,13 @@ from .strategies.base import (
     StrategyAction,
     get_default_strategy,
 )
-from .utils import extract_nonpersistent, extract_sharded_base
+from .utils import extract_sharded_base
 from .validation import (
     StrictHandling,
     determine_global_metadata,
     parse_strict_flag,
     validate_integrity_and_strict_load,
     validate_sharded_objects_handling,
-    validate_sharding_integrity,
     verify_checkpoint_and_load_strategy,
 )
 
@@ -108,22 +106,9 @@ def load(
     if not sharded_state_dict:
         return common_state_dict
 
-    # Create a copy of sharded_state_dict as the passed in state dict may have
-    # references that prevent tensors from being deallocated
-    sharded_state_dict, _ = extract_matching_values(sharded_state_dict, lambda x: True)
-
-    sh_ten_factories, _ = extract_matching_values(
-        sharded_state_dict,
-        lambda x: isinstance(x, ShardedTensorFactory),
-        return_lists_as_dicts=True,
+    sharded_state_dict, nonpersistent_state_dict, sh_ten_factories = load_preprocess(
+        sharded_state_dict
     )
-    apply_factories(sharded_state_dict)
-
-    # Data inside sh_ten_factories no longer needed so delete them to reduce memory usage
-    dict_list_map_inplace(ShardedTensorFactory.without_data, sh_ten_factories)
-    # Non-persistent objects
-    nonpersistent_state_dict, sharded_state_dict = extract_nonpersistent(sharded_state_dict)
-    dict_list_map_inplace(lambda o: o.unwrap(), nonpersistent_state_dict)
     merge(common_state_dict, nonpersistent_state_dict)
 
     # At this point we are only dealing with ShardedBase objects
@@ -374,14 +359,9 @@ def save(
         assert isinstance(common_strategy, tuple), type(common_strategy)
         common_strategy = get_default_strategy(StrategyAction.SAVE_COMMON, *common_strategy)
 
-    apply_factories(sharded_state_dict)
-    _, sharded_state_dict = extract_nonpersistent(sharded_state_dict)
-    sharded_state_dict, state_dict = extract_sharded_base(sharded_state_dict)
+    sharded_state_dict, state_dict = save_preprocess(sharded_state_dict, validate_access_integrity)
 
     common_strategy.save_common(state_dict, checkpoint_dir)
-
-    if validate_access_integrity:
-        validate_sharding_integrity(determine_global_metadata(sharded_state_dict)[1])
 
     if not sharded_strategy.can_handle_sharded_objects:
         validate_sharded_objects_handling(sharded_strategy, common_strategy)
