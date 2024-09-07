@@ -44,7 +44,6 @@ MODEL_ARGS:
   --overlap-grad-reduce: true
   --overlap-param-gather: true
   --overlap-param-gather-with-optimizer-step: true
-  --align-param-gather: true
   --check-weight-hash-across-dp-replicas-interval: 10
   --ckpt-fully-parallel-load: true
   --deterministic-mode: true

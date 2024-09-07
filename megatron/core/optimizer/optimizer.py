@@ -4,6 +4,7 @@
 
 import copy
 import math
+import warnings
 from abc import ABC, abstractmethod
 from itertools import chain
 from logging import getLogger
@@ -12,7 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 
 try:
-    from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_scale
+    from transformer_engine.pytorch.optimizers import multi_tensor_applier
 except ImportError:
     try:
         from apex.multi_tensor_apply import multi_tensor_applier
@@ -253,8 +254,8 @@ class MegatronOptimizer(ABC):
 
         Args:
             model_sharded_state_dict (ShardedStateDict): sharded state dict of the model
-            is_loading (bool, optional): flag indicating whether the state dict will be used to save or load the optimizer state.
-                Defaults to False.
+            is_loading (bool, optional): flag indicating whether the state dict will be
+                used to save or load the optimizer state. Defaults to False.
 
         Returns: optimizer sharded state dict
         """
@@ -878,8 +879,13 @@ class ChainedOptimizer(MegatronOptimizer):
     """
 
     def __init__(self, chained_optimizers: List[MegatronOptimizer]):
+        self.model_chunks = []
         self.config = getattr(chained_optimizers[0], 'config', None)
-        for optimizer in chained_optimizers[1:]:
+        for optimizer in chained_optimizers:
+            if hasattr(optimizer, 'model_chunks'):
+                for model_chunk in optimizer.model_chunks:
+                    if model_chunk not in self.model_chunks:
+                        self.model_chunks.append(model_chunk)
             assert self.config == getattr(optimizer, 'config', None)
         self.chained_optimizers = chained_optimizers
 
@@ -953,35 +959,28 @@ class ChainedOptimizer(MegatronOptimizer):
             success &= optimizer.step_with_ready_grads()
             if self.config.overlap_param_gather_with_optimizer_step and optimizer_idx == 0:
                 assert success
-                optimizer.start_param_sync(model_index=0, force_dispatch=True)
+                assert len(optimizer.model_chunks) == 1
+                optimizer.model_chunks[0].start_param_sync(force_dispatch=True)
 
         return success
 
     def disable_pre_hook(self):
         """Disable pre-hooks for underlying distributed optimizers."""
-        for optimizer in self.chained_optimizers:
-            if (
-                not optimizer.config.use_distributed_optimizer
-                or not optimizer.config.overlap_param_gather
-            ):
-                raise ValueError(
-                    "disable_pre_hook should only be called with 'use_distributed_optimizer' "
-                    "and 'overlap_param_gather' both enabled."
-                )
-            optimizer.disable_pre_hook()
+        warnings.warn(
+            "`ChainedOptimizer.disable_pre_hook` will be deprecated in a future release. "
+            "Use `DistributedDataParallel.disable_forward_pre_hook` directly."
+        )
+        for model_chunk in self.model_chunks:
+            model_chunk.disable_forward_pre_hook()
 
     def enable_pre_hook(self):
         """Enable pre-hooks for underlying distributed optimizers."""
-        for optimizer in self.chained_optimizers:
-            if (
-                not optimizer.config.use_distributed_optimizer
-                or not optimizer.config.overlap_param_gather
-            ):
-                raise ValueError(
-                    "enable_pre_hook should only be called with 'use_distributed_optimizer' "
-                    "and 'overlap_param_gather' both enabled."
-                )
-            optimizer.enable_pre_hook()
+        warnings.warn(
+            "`ChainedOptimizer.enable_pre_hook` will be deprecated in a future release. "
+            "Use `DistributedDataParallel.enable_forward_pre_hook` directly."
+        )
+        for model_chunk in self.model_chunks:
+            model_chunk.enable_forward_pre_hook()
 
     @torch.no_grad()
     def step(self):

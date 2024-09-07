@@ -4,12 +4,12 @@
 
 
 import itertools
+import warnings
 from dataclasses import replace
 from logging import getLogger
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
-from torch.distributed import _coalescing_manager
 
 HAVE_APEX_OR_TE = True
 try:
@@ -33,7 +33,8 @@ from ..dist_checkpointing.mapping import (
     ShardedTensorFactory,
 )
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
-from ..distributed import ParamAndGradBuffer, partition_buckets, shard_buffer
+from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
+from ..transformer.module import MegatronModule
 from ..utils import is_float8tensor
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
@@ -155,7 +156,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return param_range_map
 
     @classmethod
-    def _build_model_gbuf_range(cls, param_and_grad_buffer: ParamAndGradBuffer, bucket_index: int):
+    def _build_model_gbuf_range(cls, param_and_grad_buffer: _ParamAndGradBuffer, bucket_index: int):
         """
         Build mapping between params and their grad buffers.
 
@@ -202,7 +203,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return data
 
     @classmethod
-    def _build_gbuf_range_map(cls, param_and_grad_buffer: ParamAndGradBuffer):
+    def _build_gbuf_range_map(cls, param_and_grad_buffer: _ParamAndGradBuffer):
         """
         Build mapping between params and their grad buffers. These mappings are
         partitioned according to data type.
@@ -212,7 +213,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         shard is 1/dp_world_size of the bucket).
 
         Args:
-            param_and_grad_buffer (ParamAndGradBuffer): buffer to build mapping for.
+            param_and_grad_buffer (_ParamAndGradBuffer): buffer to build mapping for.
         """
         return {
             (param_and_grad_buffer.param_dtype, param_and_grad_buffer.grad_dtype): [
@@ -234,8 +235,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for bucket_index, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
                     for param, _ in gbuf_range_map["param_map"].items():
                         assert param not in param_gbuf_map, (
-                            "Param should not be in param_gbuf_map; "
-                            "each param only belongs to a single bucket"
+                            "Param should not be in param_gbuf_map; each param only belongs "
+                            "to a single bucket."
                         )
                         param_gbuf_map[param] = (gbuf_index, dtype, bucket_index)
         return param_gbuf_map
@@ -421,11 +422,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         config: OptimizerConfig,
         grad_scaler: MegatronGradScaler,
         init_state_fn: Optional[Callable],
-        per_model_buffers: Dict[int, List[ParamAndGradBuffer]],
+        model_chunks: List[MegatronModule],
+        per_model_buffers: Dict[int, List[_ParamAndGradBuffer]],
         data_parallel_group: torch.distributed.ProcessGroup,
         data_parallel_group_gloo: torch.distributed.ProcessGroup,
         data_parallel_group_idx: int,
-        overlap_param_gather_with_optimizer_step: bool = False,
     ):
         """
         Distributed optimizer, for all data types (fp16, bf16, and fp32).
@@ -444,6 +445,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 a constant gradient scaler. Also for `bf16 = False`, we
                 always require a grad scaler.
             init_state_fn (Callable, optional): function to initialize state in the optimizer.
+            model_chunks (List[MegatronModule]): list of model chunks.
             per_model_buffers (Dict[int, List[ParamAndGradBuffer]]): the implementation of the
                 distributed optimizer is centered on using a contiguous buffer for
                 communicating grads & params between the model state and the optimizer state.
@@ -455,8 +457,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 (used in checkpoint loading and saving).
             data_parallel_group_idx (int): index in data-parallel group (used by
                 distributed checkpointing logic).
-            overlap_param_gather_with_optimizer_step (bool, optional): if true, overlap parameter
-                all-gather with optimizer step. Defaults to False.
         """
 
         if has_config_logger_enabled(config):
@@ -467,6 +467,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         ), f'Please install Apex or Transformer Engine to use DistributedOptimizer.'
 
         super().__init__(optimizer, config, grad_scaler, init_state_fn)
+        self.model_chunks = model_chunks
+        self.ddp_config = self.model_chunks[0].ddp_config
+        for model_chunk in self.model_chunks:
+            assert self.ddp_config == model_chunk.ddp_config
 
         assert isinstance(
             optimizer, Adam
@@ -529,41 +533,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges
         )
 
-        # Now construct data structures to manage all-gather handles.
-        self.all_gather_handles = []
-        self.all_gather_handle_index_to_bucket_index_map = []
-        self.model_index_to_all_gather_handle_index_map = {}
-        self.all_gather_handle_indices = []
-        self.param_to_all_gather_handle_index_map = {}
-
-        self.pbuf_view_items = self._get_model_param_buffer_dp_views()
-        for model_idx, dtypes, bucket_group_index, _, _ in self.pbuf_view_items:
-            self.all_gather_handle_index_to_bucket_index_map.append(
-                (model_idx, dtypes, bucket_group_index)
-            )
-            all_gather_handle_index = len(self.all_gather_handle_index_to_bucket_index_map) - 1
-            self.all_gather_handles.append(None)
-
-            # Store all all_gather_handle_indices.
-            if model_idx not in self.model_index_to_all_gather_handle_index_map:
-                self.model_index_to_all_gather_handle_index_map[model_idx] = []
-            self.model_index_to_all_gather_handle_index_map[model_idx].append(
-                all_gather_handle_index
-            )
-
-            for bucket in self.per_model_bucket_groups[model_idx][bucket_group_index].buckets:
-                for param in bucket.params_list:
-                    self.param_to_all_gather_handle_index_map[param] = all_gather_handle_index
-        self.num_all_gather_handles = len(self.all_gather_handle_index_to_bucket_index_map)
-
-        self.overlap_param_gather = self.config.overlap_param_gather
-        self.overlap_param_gather_with_optimizer_step = overlap_param_gather_with_optimizer_step
-        self.remove_pre_hook_handle = None
-        if self.overlap_param_gather:
-            self.enable_pre_hook()
-
-        self.update_successful = False
-
         # Update optimizer groups.
         # - Also, leverage state_dict() and load_state_dict() to
         #   recast preexisting per-param state tensors.
@@ -574,22 +543,23 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         Enable forward pre-hook needed for param all-gather overlap with forward compute.
         """
-        assert self.remove_pre_hook_handle is None
-        self.remove_pre_hook_handle = torch.nn.modules.module.register_module_forward_pre_hook(
-            self._make_forward_pre_hook()
+        warnings.warn(
+            "`DistributedOptimizer.enable_pre_hook` will be deprecated in a future release. "
+            "Use `DistributedDataParallel.enable_forward_pre_hook` directly."
         )
+        for model_chunk in self.model_chunks:
+            model_chunk.enable_forward_pre_hook()
 
     def disable_pre_hook(self):
         """
         Disable forward pre-hook needed for param all-gather overlap with forward compute.
         """
-        assert self.remove_pre_hook_handle is not None
-        self.remove_pre_hook_handle.remove()
-        self.remove_pre_hook_handle = None
-
-        # Make sure all-gathers are completed as needed.
-        self._reset_metadata_and_sync_gather_all_model_params(force_sync=True)
-        self.update_successful = False
+        warnings.warn(
+            "`DistributedOptimizer.disable_pre_hook` will be deprecated in a future release. "
+            "Use `DistributedDataParallel.disable_forward_pre_hook` directly."
+        )
+        for model_chunk in self.model_chunks:
+            model_chunk.disable_forward_pre_hook()
 
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """
@@ -1030,12 +1000,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         state = self.get_parameter_state_fs_bucket_space()
         # per_bucket_numel metadata is saved separately for each TPxPP domain.
         for per_bucket_key in ('per_bucket_numel', 'per_bucket_numel_unpadded'):
+            key = (
+                f'optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}'
+                f'.{per_bucket_key}'
+            )
             state[per_bucket_key] = ShardedObject(
-                f'optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}.{per_bucket_key}',  # pylint: disable=line-too-long
-                state[per_bucket_key],
-                (1,),
-                (0,),
-                replica_id=data_parallel_rank,
+                key, state[per_bucket_key], (1,), (0,), replica_id=data_parallel_rank
             )
 
         for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
@@ -1046,7 +1016,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     assert gbuf_world_numel % data_parallel_world_size == 0
                     gbuf_local_numel = gbuf_world_numel // data_parallel_world_size
 
-                    sharded_bucket_key = f'optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}.gbuf_idx_{gbuf_idx}.dtype_{dtype}.bucket_idx_{bucket_idx}'  # pylint: disable=line-too-long
+                    sharded_bucket_key = (
+                        f'optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}'
+                        f'.gbuf_idx_{gbuf_idx}.dtype_{dtype}.bucket_idx_{bucket_idx}'
+                    )
 
                     # The global ckpt tensors must be fully covered.
                     # We add extra empty padding if necessary
@@ -1147,8 +1120,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         prefix = 'optimizer.state'
         state = {}
-        # this is not stored in the checkpoint, used only to identify params in
-        # `sharded_param_state_fs_model_space`
+
+        # Not stored in the checkpoint, used only to identify params in
+        # `sharded_param_state_fs_model_space`.
         param_idx = 0
         for gbuf_range_maps in self.gbuf_ranges:
             for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
@@ -1162,7 +1136,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                         tensors = {"fp32_param": main_param, **optim_state}
                         # Match optimizer parameter with model ShardedTensor (or
-                        # ShardedTensorFactory)
+                        # ShardedTensorFactory).
                         try:
                             sharded_metadata = param_to_sharded_metadata[model_param]
                         except KeyError as e:
@@ -1170,13 +1144,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 f'Model param {model_param} not in model_sharded_state_dict'
                             ) from e
 
-                        # Set DP corresponding replica_id coordinate to 0
+                        # Set DP corresponding replica_id coordinate to 0.
                         assert (
                             len(sharded_metadata.replica_id) == 3
                         ), f'Expected replica_id format (PP, TP, DP), got: {sharded_metadata}'
                         replica_id = (*sharded_metadata.replica_id[:2], 0)
 
-                        # Instantiate ShardedTensor (or ShardedTensorFactory) for optimizer params
+                        # Instantiate ShardedTensor (or ShardedTensorFactory) for optimizer
+                        # params.
                         for state_key, state_ten in tensors.items():
                             replace_kwargs = dict(
                                 key=f'{prefix}.{state_key}.{sharded_metadata.key}',
@@ -1281,8 +1256,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return new_tensors
 
     def load_parameter_state_from_dp_zero_legacy(self, state_dict):
-        """Load parameter state (i.e., parameter & optimizer tensors) from DP 0 rank, using the
-        legacy checkpoint format as described below.
+        """Load parameter state (i.e., parameter & optimizer tensors) from DP 0 rank,
+        using the legacy checkpoint format as described below.
 
         The difference between this method and `load_parameter_state_from_dp_zero_modern()`
         is that this method is used for updating the format of checkpoints that
@@ -1351,8 +1326,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             ), "%d vs. %d." % (world_tensor.numel(), gbuf_world_numel_unpadded)
                             offset_in_world_tensors += gbuf_world_numel_unpadded
 
-                            # Pad world_tensor to gbuf_world_numel. Don't pad at the front, pad at
-                            # the back.
+                            # Pad world_tensor to gbuf_world_numel. Don't pad at the front,
+                            # pad at the back.
                             world_tensor = torch.nn.functional.pad(
                                 world_tensor, (0, gbuf_world_numel - gbuf_world_numel_unpadded)
                             )
@@ -1461,8 +1436,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             world_tensor = world_tensors[start:end]
                             offset_in_world_tensors += gbuf_world_numel_unpadded
 
-                            # Pad world_tensor to gbuf_world_numel. Don't pad at the front, pad at
-                            # the back.
+                            # Pad world_tensor to gbuf_world_numel. Don't pad at the front,
+                            # pad at the back.
                             world_tensor = torch.nn.functional.pad(
                                 world_tensor, (0, gbuf_world_numel - gbuf_world_numel_unpadded)
                             )
@@ -1670,216 +1645,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for group in groups:
                 _zero_grad_group_helper(group, set_to_none)
 
-        # If overlapping param all-gather with forward compute, launch all-gather
-        # for first accessed bucket here before forward compute is initiated.
-        # The all-gather for the next bucket will be launched in the forward
-        # pre-hook when this all-gather finishes (to ensure that the communication
-        # kernels don't head-of-line block the compute kernels since we run with
-        # CUDA_DEVICE_MAX_CONNECTIONS=1 to support sequence parallelism).
-        # If aligning param all-gather across pipeline stages, all-gather is dispatched
-        # by start_param_sync calls in core/pipeline_parallelism/schedules.py.
-        # If overlapping param all-gather with optimizer step, then all-gather has
-        # already been dispatched in optimizer step.
-        skip_dispatch = (
-            self.config.align_param_gather or self.overlap_param_gather_with_optimizer_step
-        )
-        if self.overlap_param_gather and not skip_dispatch:
-            self._dispatch_gather_model_params(all_gather_handle_index=0)
-
-    def _get_model_param_buffer_dp_views(self):
-        """
-        Get shard views of each of the param buffers.
-
-        In this nested list, the top level is grouped by the virtual model
-        index and the buffer's data type. The sub-level is a list of
-        shards of that buffer, where each shard in the list represents
-        a contiguous view of the buffer, that is owned by a data-parallel
-        rank. The shard boundary does not respect parameter boundaries, and
-        so the elements of some parameters are split across data parallel
-        ranks.
-
-        Additionally, return references to the entire buffers, for use
-        in _all_gather_base.
-        """
-
-        # Buffer views.
-        # Add in reverse order in each model chunk since buckets start from the end of the model
-        # but we want all-gathers to run first for the start of the model (same order as forward
-        # pass).
-        # We keep the view_items in model chunk order since we want to still first run all_gather
-        # and all_gather_handle.wait() for the first model chunk.
-        # In all cases, we want all_gather and all_gather_handle.wait() to be called in the same
-        # order, and all_gather_handle.wait() needs to be called just before the corresponding
-        # forward pass.
-        view_items = []
-        for model_idx, bucket_groups in self.per_model_bucket_groups.items():
-            view_items_per_model_chunk = []
-            for bucket_group_idx, bucket_group in enumerate(bucket_groups):
-                dtypes = []
-                bucket_data = []
-                buf_views = []
-                for bucket in bucket_group.buckets:
-                    dtypes.append(bucket.param_data.dtype)
-                    data_parallel_world_size = torch.distributed.get_world_size(
-                        self.data_parallel_group
-                    )
-                    buf_view = shard_buffer(bucket.param_data, data_parallel_world_size)
-                    bucket_data.append(bucket.param_data)
-                    buf_views.append(buf_view)
-                view_items_per_model_chunk.insert(
-                    0, (model_idx, dtypes, bucket_group_idx, bucket_data, buf_views)
-                )
-            view_items.extend(view_items_per_model_chunk)
-
-        return view_items
-
-    def _dispatch_gather_model_params(
-        self,
-        all_gather_handle_index: int,
-        force_sync: bool = False,
-        already_in_coalescing_manager: bool = False,
-    ):
-        """
-        All-gather updated model params.
-
-        When using the distributed optimizer, the params are already laid out in a contiguous
-        buffer (see mcore/distributed/param_and_grad_buffer.py for details), and so the
-        all-gather will put the results in the right region of memory.
-        """
-        async_op = self.overlap_param_gather and not force_sync
-        if self.update_successful:
-            data_parallel_group = self.data_parallel_group
-            data_parallel_rank = torch.distributed.get_rank(data_parallel_group)
-
-            # All-gather updated main params.
-            # All param_buf views are guaranteed to have the same number of elements
-            # across all data-parallel ranks, due to padding done in
-            # param_and_grad_buffer.py). Thus, all sub-views will have consistent
-            # start / end indexes across data-parallel ranks.
-            (model_index, dtypes, bucket_group_index, pbuf_list, pbuf_views_list) = (
-                self.pbuf_view_items[all_gather_handle_index]
-            )
-            assert all_gather_handle_index < len(self.all_gather_handles)
-            if not already_in_coalescing_manager:
-                with _coalescing_manager(data_parallel_group, async_ops=async_op) as cm:
-                    for i in range(len(pbuf_list)):
-                        torch.distributed._all_gather_base(
-                            pbuf_list[i],
-                            pbuf_views_list[i][data_parallel_rank],
-                            group=data_parallel_group,
-                            async_op=async_op,
-                        )
-                if async_op:
-                    self.all_gather_handles[all_gather_handle_index] = cm
-                else:
-                    # When using `_coalescing_manager`, even if a synchronous op (async_op=False)
-                    # is used, `cm` is not None, which is different from when `_coalescing_manager`
-                    # is not used in which case the torch.distributed._reduce_scatter_base() will
-                    # return None. In order to maintain consistency with prior code, we need to
-                    # manually set communication handel to None.
-                    self.all_gather_handles[all_gather_handle_index] = None
-            else:
-                for i in range(len(pbuf_list)):
-                    torch.distributed._all_gather_base(
-                        pbuf_list[i],
-                        pbuf_views_list[i][data_parallel_rank],
-                        group=data_parallel_group,
-                        async_op=async_op,
-                    )
-            assert self.all_gather_handle_index_to_bucket_index_map[all_gather_handle_index] == (
-                model_index,
-                dtypes,
-                bucket_group_index,
-            )
-
-    def _make_forward_pre_hook(self):
-        """
-        Create a forward pre-hook to wait on all-gather handles when necessary (i.e.,
-        when a module uses a parameter in a bucket with a still incomplete all-gather)
-        and then copy the results from the param_buffer into model_params.
-        """
-
-        def hook(module, *unused):
-            assert (
-                self.overlap_param_gather
-            ), "Should use pre-hook only when overlap_param_gather is True"
-
-            # Make sure all parameters in this module have been all-gathered as necessary.
-            for param in module.parameters(recurse=False):
-                # Skip parameters that don't require grad.
-                if not param.requires_grad:
-                    continue
-
-                # Some params might be handled in another DistributedOptimizer instance; for
-                # example, we use separate DistributedOptimizer instances for expert and
-                # non-expert params.
-                if param in self.param_to_all_gather_handle_index_map:
-                    all_gather_handle_index = self.param_to_all_gather_handle_index_map[param]
-                    # If aligning param all-gather across pipeline stages, all-gather is dispatched
-                    # by start_param_sync calls in core/pipeline_parallelism/schedules.py.
-                    # If overlapping param all-gather with optimizer step, then all-gather has
-                    # already been dispatched in optimizer step.
-                    skip_dispatch = (
-                        self.config.align_param_gather
-                        or self.overlap_param_gather_with_optimizer_step
-                    )
-                    self._finish_param_sync_helper(
-                        all_gather_handle_index, skip_dispatch=skip_dispatch
-                    )
-
-        return hook
-
-    def start_param_sync(self, model_index: int, *unused, force_dispatch: bool = False):
-        """
-        Starts all necessary param syncs for the model_index'th model chunk.
-
-        Args:
-            model_index (int): index of model chunk to synchronize params.
-            force_dispatch (bool, optional): force dispatch regardless of other settings.
-        """
-        if model_index not in self.model_index_to_all_gather_handle_index_map:
-            return
-
-        if self.overlap_param_gather_with_optimizer_step and not force_dispatch:
-            return
-
-        # If overlapping param AG with optimizer step, AG has already been dispatched.
-        if self.update_successful:
-            all_gather_handle_indices = self.model_index_to_all_gather_handle_index_map[model_index]
-            with torch.distributed._coalescing_manager(
-                group=self.data_parallel_group, async_ops=self.overlap_param_gather
-            ) as cm:
-                for all_gather_handle_index in all_gather_handle_indices:
-                    self._dispatch_gather_model_params(
-                        all_gather_handle_index, already_in_coalescing_manager=True
-                    )
-            if self.overlap_param_gather:
-                for all_gather_handle_index in all_gather_handle_indices:
-                    self.all_gather_handles[all_gather_handle_index] = cm
-
-    def _finish_param_sync_helper(self, all_gather_handle_index: int, skip_dispatch: bool = False):
-        """
-        Waits on all_gather_handle if necessary, then dispatches the next all-gather
-        as necessary.
-        """
-
-        # First check if there is an outstanding all-gather handle for this param.
-        # If so, wait on the handle to ensure the communication is finished.
-        assert all_gather_handle_index < len(self.all_gather_handles)
-        all_gather_handle = self.all_gather_handles[all_gather_handle_index]
-        if all_gather_handle is not None:
-            all_gather_handle.wait()
-            self.all_gather_handles[all_gather_handle_index] = None
-
-            # Launch the all-gather for the next bucket now.
-            # We can't pre-launch all-gathers for all buckets at once since we don't
-            # want to head-of-line block the compute kernels with communication kernels
-            # (since we run with CUDA_DEVICE_MAX_CONNECTIONS=1 to support sequence
-            # parallelism).
-            next_all_gather_handle_index = all_gather_handle_index + 1
-            if next_all_gather_handle_index < self.num_all_gather_handles and not skip_dispatch:
-                self._dispatch_gather_model_params(next_all_gather_handle_index)
-
     def _collect_main_grad_data_for_unscaling(self):
         """
         Note: this should be equivalent to the float-16 optimizer's method,
@@ -2005,19 +1770,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
         copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)
 
-    def _reset_metadata_and_sync_gather_all_model_params(self, force_sync: bool):
-        """
-        Reset metadata needed to track results of all-gathers.
-        """
-        self.all_gather_handles = [None for _ in range(len(self.all_gather_handles))]
-
-        # Launch synchronous all-gather if --overlap-param-gather is turned on or if force_sync
-        # is explicitly set to True (e.g., if we are going to turn off all-gather overlapping for
-        # validation / test iterations).
-        if not self.overlap_param_gather or force_sync:
-            for all_gather_handle_index in range(len(self.all_gather_handles)):
-                self._dispatch_gather_model_params(all_gather_handle_index, force_sync=force_sync)
-
     def _update_fp8_scale_inv_and_amax(self):
         """
         If detect FP8 parameters, update their `_scale_inv` and do reduce-max for their
@@ -2066,7 +1818,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Under the hood, either launch synchronous param all-gathers or get ready to launch
         asynchorous all-gathers that get overlapped with the next forward pass.
         """
-        self.update_successful = super().step_with_ready_grads()
+        update_successful = super().step_with_ready_grads()
 
         # If there is no FP8 parameters, this will do nothing.
         self._update_fp8_scale_inv_and_amax()
@@ -2076,11 +1828,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             timers('params-all-gather', log_level=1).start(barrier=self.config.barrier_with_L1_time)
         # If not overlapping all-gather for parameters, launch synchronous all-gather
         # communication calls here. If overlapping all-gather for parameters, the following
-        # call to _gather_all_model_params is a no-op: the first all-gather is launched
-        # asynchronously in the next optimizer.zero_grad() call and subsequent all-gathers
-        # are launched in the forward pre-hook.
-        self._reset_metadata_and_sync_gather_all_model_params(force_sync=False)
+        # the first all-gather is launched asynchronously in the next optimizer.zero_grad()
+        # call and subsequent all-gathers are launched in the forward pre-hook.
+        if not self.ddp_config.overlap_param_gather:
+            for model_chunk in self.model_chunks:
+                model_chunk.start_param_sync()
         if timers is not None:
             timers('params-all-gather').stop()
 
-        return self.update_successful
+        return update_successful
