@@ -39,6 +39,7 @@ from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
 from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
@@ -622,7 +623,32 @@ def setup_model_and_optimizer(model_provider_func,
                                        scale_lr_cond, lr_mult)
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
-    if args.load is not None or args.pretrained_checkpoint is not None:
+    if args.moe_use_upcycling:
+        assert not os.path.exists(
+            args.save
+        ), ("The upcycling destination directory already exists. "
+            "Please check if --moe-use-upcycling is mistakenly enabled. "
+            "Upcycling should only be set for the first run when converting the dense model. "
+            "All subsequent runs should remove this flag. ")
+        num_experts = args.num_experts
+        args.num_experts = None
+        dense_model_for_upcycling = get_model(model_provider_func, model_type)
+        args.num_experts = num_experts
+        _, args.num_floating_point_operations_so_far = upcycling_utils.load_and_upcycle_model(
+            load_checkpoint,
+            unwrapped_model,
+            dense_model_for_upcycling,
+            load_kwargs = {'model': dense_model_for_upcycling, 'optimizer': None, 'opt_param_scheduler': None}
+        )
+        args.iteration = 0
+        save_checkpoint(args.iteration, model, None, None, args.num_floating_point_operations_so_far)
+        torch.distributed.barrier()
+        del dense_model_for_upcycling
+        if (args.fp16 or args.bf16) and optimizer is not None:
+            optimizer.reload_model_params()
+        print_rank_0(f'Upcycled checkpoint saved to {args.save}')
+
+    if (args.load is not None or args.pretrained_checkpoint is not None) and not args.moe_use_upcycling:
         one_logger and one_logger.log_metrics({
             'load_checkpoint_start_time': one_logger_utils.get_timestamp_in_ms()
         })
@@ -664,7 +690,6 @@ def setup_model_and_optimizer(model_provider_func,
         exit()
 
     return model, optimizer, opt_param_scheduler
-
 
 
 def train_step(forward_step_func, data_iterator,
