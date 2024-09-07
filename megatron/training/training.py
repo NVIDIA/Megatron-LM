@@ -518,14 +518,17 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     if wrap_with_ddp:
         config = get_model_config(model[0])
-        ddp_config = DistributedDataParallelConfig(
-            grad_reduce_in_fp32=args.accumulate_allreduce_grads_in_fp32,
-            overlap_grad_reduce=args.overlap_grad_reduce,
-            use_distributed_optimizer=args.use_distributed_optimizer,
-            check_for_nan_in_grad=args.check_for_nan_in_loss_and_grad,
-            bucket_size=args.ddp_bucket_size,
-            average_in_collective=args.ddp_average_in_collective,
-            fp8_param_gather=args.fp8_param_gather)
+
+        kwargs = {}
+        for f in dataclasses.fields(DistributedDataParallelConfig):
+            if hasattr(args, f.name):
+                kwargs[f.name] = getattr(args, f.name)
+        kwargs['grad_reduce_in_fp32'] = args.accumulate_allreduce_grads_in_fp32
+        kwargs['check_for_nan_in_grad'] = args.check_for_nan_in_loss_and_grad
+        kwargs['bucket_size'] = args.ddp_bucket_size
+        kwargs['average_in_collective'] = args.ddp_average_in_collective
+        ddp_config = DistributedDataParallelConfig(**kwargs)
+
         overlap_param_gather_with_optimizer_step = getattr(args, 'overlap_param_gather_with_optimizer_step', False)
         model = [DDP(config,
                      ddp_config,
@@ -1128,8 +1131,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             if len(model) == 1:
                 config.grad_sync_func = config.grad_sync_func[0]
     if args.overlap_param_gather and args.align_param_gather:
-        config.param_sync_func = [functools.partial(optimizer.start_param_sync, model_index)
-                                  for model_index in range(len(model))]
+        config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
     config.finalize_model_grads_func = finalize_model_grads

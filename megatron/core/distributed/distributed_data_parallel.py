@@ -2,7 +2,6 @@
 
 import logging
 from contextlib import contextmanager
-from typing import Dict
 
 import torch
 
@@ -12,7 +11,7 @@ from ..transformer.module import MegatronModule
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import is_float8tensor, log_single_rank
 from .distributed_data_parallel_config import DistributedDataParallelConfig
-from .param_and_grad_buffer import BucketGroup, ParamAndGradBuffer, partition_buckets
+from .param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +76,6 @@ class DistributedDataParallel(MegatronModule):
         if disable_bucketing:
             self.bucket_size = None
 
-        self.module = module
         self.param_to_bucket_group = {}
 
         # Group parameters by their gradient type.
@@ -101,7 +99,7 @@ class DistributedDataParallel(MegatronModule):
             else:
                 expert_parallel_params.append(param)
 
-        def allocate_buffers_for_parameters(
+        def _allocate_buffers_for_parameters(
             input_params, data_parallel_group, gradient_scaling_factor
         ):
             param_and_grad_dtype_to_params = {}
@@ -110,8 +108,7 @@ class DistributedDataParallel(MegatronModule):
 
             # Group parameters by their gradient type.
             for param in input_params:
-                if not param.requires_grad:
-                    continue
+                assert param.requires_grad
 
                 param_dtype = param.dtype
                 if is_float8tensor(param):
@@ -167,7 +164,7 @@ class DistributedDataParallel(MegatronModule):
             buffers = []
             for (param_dtype, grad_dtype), params in param_and_grad_dtype_to_params.items():
                 buffers.append(
-                    ParamAndGradBuffer(
+                    _ParamAndGradBuffer(
                         self.ddp_config,
                         param_dtype,
                         grad_dtype,
@@ -187,9 +184,20 @@ class DistributedDataParallel(MegatronModule):
             # because of the use of CUDA_DEVICE_MAX_CONNECTIONS=1, having multiple back-to-back
             # communications will prevent the overlap of the communication kernels with computation
             # kernels.
-            bucket_groups = partition_buckets(buffers)
+            # If bucketing is explicitly disabled, then put all buckets in a buffer into a single
+            # bucket group.
+            bucket_groups = partition_buckets(buffers, force_single_bucket_group=disable_bucketing)
 
-            # Create map from param to BucketGroup, used in pre_hook.
+            # Set `next_param_gather_bucket_group` for different bucket groups by iterating through
+            # buckets in reverse order (since all-gathers happen in reverse order of buckets).
+            if self.ddp_config.use_distributed_optimizer and self.ddp_config.overlap_param_gather:
+                num_bucket_groups = len(bucket_groups)
+                for i in range(1, num_bucket_groups):
+                    bucket_groups[num_bucket_groups - i].next_param_gather_bucket_group = (
+                        bucket_groups[num_bucket_groups - i - 1]
+                    )
+
+            # Create map from param to bucket group, used in pre_hook.
             for bucket_group in bucket_groups:
                 for bucket in bucket_group.buckets:
                     for param in bucket.params_list:
@@ -214,7 +222,7 @@ class DistributedDataParallel(MegatronModule):
                 expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
 
         # Allocate the param+grad buffers for dense params' grads.
-        self.buffers, self.bucket_groups = allocate_buffers_for_parameters(
+        self.buffers, self.bucket_groups = _allocate_buffers_for_parameters(
             dense_params,
             parallel_state.get_data_parallel_group(with_context_parallel=True),
             gradient_scaling_factor=gradient_scaling_factor,
@@ -222,7 +230,7 @@ class DistributedDataParallel(MegatronModule):
 
         # Allocate separate param+grad buffers for expert parallel params' grads.
         self.expert_parallel_buffers, self.expert_parallel_bucket_groups = (
-            allocate_buffers_for_parameters(
+            _allocate_buffers_for_parameters(
                 expert_parallel_params,
                 parallel_state.get_data_modulo_expert_parallel_group(with_context_parallel=True),
                 gradient_scaling_factor=expert_gradient_scaling_factor,
@@ -252,8 +260,43 @@ class DistributedDataParallel(MegatronModule):
                 param_tmp = param.expand_as(param)
                 # Get the gradient accumulator function.
                 grad_acc = param_tmp.grad_fn.next_functions[0][0]
-                grad_acc.register_hook(self._make_param_hook(param, self.param_to_bucket_group))
+                grad_acc.register_hook(self._make_backward_post_hook(param))
                 self.grad_accs.append(grad_acc)
+
+        self.use_forward_hook = (
+            self.ddp_config.use_distributed_optimizer and self.ddp_config.overlap_param_gather
+        )
+        self.remove_forward_pre_hook_handles = {}
+        if self.use_forward_hook:
+            self.enable_forward_pre_hook()
+        self.overlap_param_gather_with_optimizer_step = False
+
+    def enable_forward_pre_hook(self):
+        """
+        Enable forward pre-hooks needed for param all-gather overlap with forward compute.
+        """
+        assert self.use_forward_hook
+        assert len(self.remove_forward_pre_hook_handles) == 0
+        # Register forward pre-hook for all sub-modules.
+        for module in self.module.modules():
+            self.remove_forward_pre_hook_handles[module] = module.register_forward_pre_hook(
+                self._make_forward_pre_hook()
+            )
+
+    def disable_forward_pre_hook(self):
+        """
+        Disable forward pre-hooks needed for param all-gather overlap with forward compute.
+        """
+        assert self.use_forward_hook
+        # De-register forward pre-hook for all sub-modules.
+        for module in self.module.modules():
+            assert self.remove_forward_pre_hook_handles[module] is not None
+            self.remove_forward_pre_hook_handles[module].remove()
+            del self.remove_forward_pre_hook_handles[module]
+        assert len(self.remove_forward_pre_hook_handles) == 0
+
+        # Force synchronize parameters.
+        self.start_param_sync(force_sync=True)
 
     def forward(self, *inputs, **kwargs):
         """
@@ -261,17 +304,49 @@ class DistributedDataParallel(MegatronModule):
         """
         return self.module(*inputs, **kwargs)
 
-    def _make_param_hook(
-        self,
-        param: torch.nn.Parameter,
-        param_to_bucket_group: Dict[torch.nn.Parameter, BucketGroup],
-    ):
+    def _make_forward_pre_hook(self):
         """
-        Creates the all-reduce / reduce-scatter hook for backprop.
+        Create a forward pre-hook to wait on all-gather handles when necessary (i.e.,
+        when a module uses a parameter in a bucket with a still incomplete all-gather).
         """
 
-        def param_hook(*unused):
-            if param.requires_grad:
+        def hook(module, *unused):
+            assert (
+                self.use_forward_hook
+            ), "Should use pre-hook only when overlap_param_gather is True"
+
+            # Make sure all parameters in this module have been all-gathered as necessary.
+            for param in module.parameters(recurse=False):
+                # Skip parameters without an associated buffer (such parameters have a
+                # .requires_grad field equal to False).
+                if param not in self.param_to_bucket_group:
+                    continue
+                assert param.requires_grad
+
+                # If aligning param all-gather across pipeline stages, all-gather is dispatched
+                # by start_param_sync calls in core/pipeline_parallelism/schedules.py.
+                # If overlapping param all-gather with optimizer step, then all-gather has
+                # already been dispatched in optimizer step.
+                skip_next_bucket_dispatch = (
+                    self.ddp_config.align_param_gather
+                    or self.overlap_param_gather_with_optimizer_step
+                )
+                self.param_to_bucket_group[param].finish_param_sync(
+                    skip_next_bucket_dispatch=skip_next_bucket_dispatch
+                )
+
+        return hook
+
+    def _make_backward_post_hook(self, param: torch.nn.Parameter):
+        """
+        Creates a backward post-hook to dispatch an all-reduce / reduce-scatter when
+        ready (i.e., when all grads in a bucket have been computed in all microbatches
+        in a batch).
+        """
+
+        def hook(*unused):
+            if param in self.param_to_bucket_group:
+                assert param.requires_grad
                 if self.ddp_config.overlap_grad_reduce:
                     assert (
                         param.grad is not None
@@ -283,9 +358,9 @@ class DistributedDataParallel(MegatronModule):
                 param.grad = None
 
                 if self.ddp_config.overlap_grad_reduce:
-                    param_to_bucket_group[param].register_grad_ready(param)
+                    self.param_to_bucket_group[param].register_grad_ready(param)
 
-        return param_hook
+        return hook
 
     @contextmanager
     def no_sync(self):
@@ -300,6 +375,28 @@ class DistributedDataParallel(MegatronModule):
             for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
                 bucket_group.is_last_microbatch = True
 
+    def start_param_sync(self, *unused, force_sync: bool = False, force_dispatch: bool = False):
+        """
+        Initiates param sync (all-gather) communication operations for all model parameters.
+
+        By default, when overlap_param_gather is set to True, dispatches asynchronous communication
+        calls; when overlap_param_gather is set to False, calls synchronous communication
+        ops. Can override this default behavior using flags below.
+
+        Args:
+            force_sync (bool, optional): force synchronous collective regardless of
+                other settings.
+            force_dispatch (bool, optional): force dispatch regardless of other settings.
+        """
+        if not force_sync:
+            # If overlapping param AG with optimizer step, AG should not be dispatched again
+            # in forward_backward_step.
+            if self.overlap_param_gather_with_optimizer_step and not force_dispatch:
+                return
+
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            bucket_group.start_param_sync(force_sync=force_sync)
+
     def start_grad_sync(self, *unused):
         """
         Initiates grad sync (all-reduce or reduce-scatter) communication operations
@@ -312,11 +409,6 @@ class DistributedDataParallel(MegatronModule):
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.start_grad_sync()
 
-    def scale_gradients(self, scaling_factor: float) -> None:
-        """Scale all gradients inside the buffers by `scaling_factor`."""
-        for buffer in self.buffers + self.expert_parallel_buffers:
-            buffer.scale_gradients(scaling_factor)
-
     def finish_grad_sync(self):
         """
         Finishes grad sync (all-reduce or reduce-scatter) communication operations
@@ -328,6 +420,11 @@ class DistributedDataParallel(MegatronModule):
         """
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.finish_grad_sync()
+
+    def scale_gradients(self, scaling_factor: float):
+        """Scale all gradients inside the buffers by `scaling_factor`."""
+        for buffer in self.buffers + self.expert_parallel_buffers:
+            buffer.scale_gradients(scaling_factor)
 
     def zero_grad_buffer(self):
         """

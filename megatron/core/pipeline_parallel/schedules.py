@@ -591,6 +591,13 @@ def forward_backward_pipelining_with_interleaving(
     if config.param_sync_func is not None and not isinstance(config.param_sync_func, list):
         config.param_sync_func = [config.param_sync_func for _ in model]
 
+    # Disable config.grad_sync_func and config.param_sync_func if only running forward passes.
+    # They will be re-enabled at the end of this function.
+    grad_sync_func, param_sync_func = None, None
+    if forward_only:
+        grad_sync_func, param_sync_func = config.grad_sync_func, config.param_sync_func
+        config.grad_sync_func, config.param_sync_func = None, None
+
     def disable_grad_sync():
         """Disable asynchronous grad reductions"""
         nonlocal no_sync_context
@@ -1140,6 +1147,10 @@ def forward_backward_pipelining_with_interleaving(
         config.finalize_model_grads_func(
             model, total_num_tokens if config.calculate_per_token_loss else None
         )
+
+    # Restore config.grad_sync_func and config.param_sync_func.
+    if forward_only:
+        config.grad_sync_func, config.param_sync_func = grad_sync_func, param_sync_func
 
     if config.timers is not None:
         config.timers('forward-backward').stop()

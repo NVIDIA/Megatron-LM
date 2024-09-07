@@ -18,14 +18,14 @@ except ImportError:
             f'Transformer Engine and Apex are not installed. Falling back to Torch optimizers.'
         )
 
-        ## apex's FusedAdam is a drop-in replacement for torch's AdamW
-        # pylint: disable-next=line-too-long
-        ## see https://github.com/NVIDIA/apex/blob/7b73b12361068a10b0f44844534613f252a5ea75/apex/optimizers/fused_adam.py#L16
+        # Apex's FusedAdam is a drop-in replacement for torch's AdamW.
+        # pylint: disable-next=line-too-long.
+        # See https://github.com/NVIDIA/apex/blob/7b73b12361068a10b0f44844534613f252a5ea75/apex/optimizers/fused_adam.py#L16.
         from torch.optim import AdamW as Adam, SGD
 
 from megatron.core import mpu
 
-from ..distributed import ParamAndGradBuffer
+from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import log_single_rank
 from .distrib_optimizer import DistributedOptimizer
@@ -191,7 +191,7 @@ def _get_param_groups_and_buffers(
     lr_mult: float,
     filter_fn: Callable,
     buffer_name: str,
-) -> Tuple[List[Dict], Dict[int, List[ParamAndGradBuffer]]]:
+) -> Tuple[List[Dict], Dict[int, List[_ParamAndGradBuffer]]]:
     """Returns parameter groups and buffer for optimizer.
 
     Args:
@@ -234,18 +234,19 @@ def _get_param_groups_and_buffers(
 
 def _get_megatron_optimizer_based_on_param_groups(
     config: OptimizerConfig,
+    model_chunks: List[MegatronModule],
     param_groups: List,
-    per_model_buffers: Optional[Dict[int, List[ParamAndGradBuffer]]] = None,
+    per_model_buffers: Optional[Dict[int, List[_ParamAndGradBuffer]]] = None,
     model_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group_gloo: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group_idx: Optional[int] = None,
-    overlap_param_gather_with_optimizer_step: bool = False,
 ) -> MegatronOptimizer:
     """Get Megatron optimizer based on parameter groups.
 
     Args:
         config (OptimizerConfig): optimizer configuration object.
+        model_chunks (list): list of model chunks.
         param_groups (list): list of parameter groups.
         per_model_buffers (dict, optional): buffers for distributed optimizer. Defaults to None.
         data_parallel_group (torch.distributed.ProcessGroup, optional): data-parallel group for
@@ -254,8 +255,6 @@ def _get_megatron_optimizer_based_on_param_groups(
             group for distributed optimizer. Defaults to None.
         data_parallel_group_idx (int, optional): data-parallel group index for distributed
             optimizer. Defaults to None.
-        overlap_param_gather_with_optimizer_step (bool, optional): if true, overlap parameter
-            all-gather with optimizer step if using distributed optimizer. Defaults to False.
 
     Returns:
         Instance of MegatronOptimizer.
@@ -321,11 +320,11 @@ def _get_megatron_optimizer_based_on_param_groups(
         if config.use_distributed_optimizer:
             optimizer = DistributedOptimizer(
                 *optimizer_args,
+                model_chunks=model_chunks,
                 per_model_buffers=per_model_buffers,
                 data_parallel_group=data_parallel_group,
                 data_parallel_group_gloo=data_parallel_group_gloo,
                 data_parallel_group_idx=data_parallel_group_idx,
-                overlap_param_gather_with_optimizer_step=overlap_param_gather_with_optimizer_step,
             )
         else:
             optimizer = Float16OptimizerWithFloat16Params(*optimizer_args)
@@ -389,9 +388,14 @@ def get_megatron_optimizer(
             filter_fn=lambda g: not g['is_expert_parallel'],
             buffer_name='buffers',
         )
+        for model_chunk in dense_model_chunks:
+            model_chunk.overlap_param_gather_with_optimizer_step = (
+                overlap_param_gather_with_optimizer_step
+            )
         optimizers.append(
             _get_megatron_optimizer_based_on_param_groups(
                 config,
+                model_chunks=dense_model_chunks,
                 param_groups=param_groups,
                 per_model_buffers=buffers,
                 model_parallel_group=mpu.get_model_parallel_group(),
@@ -400,7 +404,6 @@ def get_megatron_optimizer(
                     with_context_parallel=True
                 ),
                 data_parallel_group_idx=model_parallel_rank,
-                overlap_param_gather_with_optimizer_step=overlap_param_gather_with_optimizer_step,
             )
         )
         model_chunk_offset += 1
@@ -421,6 +424,7 @@ def get_megatron_optimizer(
         optimizers.append(
             _get_megatron_optimizer_based_on_param_groups(
                 config,
+                model_chunks=model_chunks,
                 param_groups=moe_param_groups,
                 per_model_buffers=moe_buffers,
                 model_parallel_group=mpu.get_model_parallel_group(with_expert_parallel=True),

@@ -287,9 +287,11 @@ def validate_args(args, defaults={}):
         args.virtual_pipeline_model_parallel_size = None
         # Overlap P2P communication is disabled if not using the interleaved schedule.
         args.overlap_p2p_comm = False
+        args.align_param_gather = False
         if args.rank == 0:
-            print('WARNING: Setting args.overlap_p2p_comm to False since non-interleaved '
-                  'schedule does not support overlapping p2p communication')
+            print('WARNING: Setting args.overlap_p2p_comm and args.align_param_gather to False '
+                  'since non-interleaved schedule does not support overlapping p2p communication '
+                  'and aligned param AG')
 
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer, \
@@ -308,10 +310,6 @@ def validate_args(args, defaults={}):
             '--overlap-param-gather-with-optimizer-step only supported with interleaved pipeline parallelism'
         assert not args.use_dist_ckpt, \
             '--overlap-param-gather-with-optimizer-step not supported with distributed checkpointing yet'
-
-    if args.align_param_gather:
-        assert args.virtual_pipeline_model_parallel_size is not None, \
-            '--align-param-gather only supported with interleaved pipeline parallelism'
 
     if args.fp8_param_gather:
         assert args.use_distributed_optimizer, \
@@ -1559,9 +1557,10 @@ def _add_distributed_args(parser):
                        default=False, help='If set, overlap param all-gather in distributed optimizer.')
     group.add_argument('--overlap-param-gather-with-optimizer-step', action='store_true',
                        default=False, help='If set, overlap param all-gather of first bucket with optimizer step.')
-    group.add_argument('--align-param-gather', action='store_true', default=False,
-                       help='If set, all PP stages will launch param all-gathers simultaneously. '
-                       'Otherwise, each PP stage will independently launch as needed.')
+    group.add_argument('--no-align-param-gather', action='store_false',
+                       help='If not set, all PP stages will launch param all-gathers simultaneously. '
+                       'Otherwise, each PP stage will independently launch as needed.',
+                       dest='align_param_gather')
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
                        help='If not set, use scatter/gather to optimize communication of tensors in pipeline.',
                        dest='scatter_gather_tensors_in_pipeline')
