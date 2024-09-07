@@ -227,6 +227,8 @@ def generate_masked_orthogonal_rank_groups(
 
 
 class RankGenerator(object):
+    """A class for generating rank groups based on various parallelism strategies."""
+
     def __init__(
         self, tp: int, ep: int, dp: int, pp: int, cp: int, order: str, rank_offset: int = 0
     ) -> None:
@@ -277,6 +279,13 @@ class RankGenerator(object):
                 self.ordered_size_wo_ep.append(self.name_to_size[token])
 
     def get_mask(self, order: str, token: str):
+        """Create a mask for the specified tokens based on the given order.
+
+        Args:
+            order (str): The order of parallelism types (e.g., 'tp-dp-pp').
+            token (str): The specific parallelism types to include in the mask,
+                         separated by hyphens (e.g., 'tp-dp').
+        """
         ordered_token = order.split('-')
         token = token.split('-')
         mask = [False] * len(ordered_token)
@@ -1508,6 +1517,7 @@ def destroy_global_memory_buffer():
 
 
 def get_all_ranks():
+    """Retrieve the ranks for various parallel groups associated with the current rank."""
     ranks = [
         get_tensor_model_parallel_rank(),
         get_data_parallel_rank(),
@@ -1619,3 +1629,6 @@ def destroy_model_parallel():
 
     global _DATA_MODULO_EXPERT_PARALLEL_GROUP_WITH_CP_GLOO
     _DATA_MODULO_EXPERT_PARALLEL_GROUP_WITH_CP_GLOO = None
+
+    global _MOE_LAYER_WISE_LOGGING_TRACKER
+    _MOE_LAYER_WISE_LOGGING_TRACKER = {}
