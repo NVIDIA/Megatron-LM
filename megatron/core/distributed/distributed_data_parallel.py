@@ -84,9 +84,14 @@ class DistributedDataParallel(MegatronModule):
         param_to_name = {}
         dense_params = []
         expert_parallel_params = []
+        self.params_with_grad = []
         for name, param in self.module.named_parameters():
             if not param.requires_grad:
                 continue
+
+            # Track params with grad to enable direct setting
+            # of param.grad_added_to_main_grad
+            self.params_with_grad.append(param)
 
             param.grad_added_to_main_grad = False
             param_to_name[param] = name
@@ -329,9 +334,8 @@ class DistributedDataParallel(MegatronModule):
         Zeros out all grad buffers. Needs to be called at the beginning of each
         training iteration.
         """
-        for param in self.module.parameters():
-            if param.requires_grad:
-                param.grad_added_to_main_grad = False
+        for param in self.params_with_grad:
+            param.grad_added_to_main_grad = False
         for buffer in self.buffers + self.expert_parallel_buffers:
             buffer.reset()
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
