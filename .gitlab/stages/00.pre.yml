@@ -3,7 +3,7 @@ include:
 
 mirror_to_github:
   rules:
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_COMMIT_REF_PROTECTED == "true" && $CI_PIPELINE_SOURCE == "push"'
     - when: never
   tags: [mcore-docker-node-small]
   stage: .pre
@@ -97,6 +97,11 @@ maybe_cherry_pick_commit:
       LABELS=$(curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${MR_ID}" | jq '.labels | join(",")' | tr -d '"')
       
       TARGET_BRANCHES=$(echo "$LABELS" | grep -o 'core_[^,]*')
+
+      if [[ $TARGET_BRANCHES == "" ]]; then
+        echo Nothing to cherry pick
+        exit 0
+      fi
       
       echo $TARGET_BRANCHES | while read -r RELEASE_BRANCH ; do
         TARGET_BRANCH_EXISTS_OK=$([[ "$(git ls-remote --heads origin refs/heads/$RELEASE_BRANCH)" != "" ]] && echo true || echo false)
