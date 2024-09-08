@@ -105,6 +105,10 @@ unit_tests:
   script:
     - |
       cd /opt/megatron-lm
+      if [[ $UNIT_TEST_REPEAT -eq 0 ]]; then
+        exit 0
+      fi
+
       for i in $(seq $UNIT_TEST_REPEAT); do
         SEED=$((RANDOM % 9000 + 1000));
         SKIPPED=()
