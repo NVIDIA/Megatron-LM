@@ -81,6 +81,12 @@ variables:
       - "yes"
       - "no"
     description: Build and publish a wheel to PyPi
+  PUBLISH_SCOPE:
+    value: "code-freeze"
+    options:
+      - "code-freeze"
+      - "release"
+    description: Type of publish (freeze or final release)
 
   # CI wide variables
   CI_MCORE_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_ci
