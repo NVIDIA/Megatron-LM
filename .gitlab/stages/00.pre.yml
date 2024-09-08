@@ -74,6 +74,79 @@ clean_docker_node:
     - export DOCKER_HOST='unix:///var/run/docker.sock'
     - docker system prune -a --filter "until=48h" -f || true
 
+maybe_cherry_pick_commit:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+    - when: never
+  tags: [mcore-docker-node-small]
+  stage: .pre
+  image:
+    name: registry.gitlab.com/gitlab-ci-utils/curl-jq
+    entrypoint: [""]
+  variables:
+    GIT_STRATEGY: "clone"
+  script: 
+    - set -x
+    - SHA=$(git rev-list --no-merges -n 1 HEAD)
+    - MESSAGE=$(git log -n 1 --pretty=format:%s $SHA)
+    - MR_ID=$(echo $MESSAGE | awk -F'!' '{print $2}' | awk '{print $1}' )  
+    - git remote set-url origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
+    - git config --global user.email "mcore-bot@nvidia.com"
+    - git config --global user.name "Mcore Bot"
+    - |
+      LABELS=$(curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${MR_ID}" | jq '.labels | join(",")' | tr -d '"')
+      
+      TARGET_BRANCHES=$(echo "$LABELS" | grep -o 'core_[^,]*')
+      
+      echo $TARGET_BRANCHES | while read -r RELEASE_BRANCH ; do
+        TARGET_BRANCH_EXISTS_OK=$([[ "$(git ls-remote --heads origin refs/heads/$RELEASE_BRANCH)" != "" ]] && echo true || echo false)
+      
+        if [[ "$TARGET_BRANCH_EXISTS_OK" == "false" ]]; then
+          echo Release branch does not yet exist, will not  cherry-pick
+          continue
+        fi
+        
+        (
+          git fetch origin $RELEASE_BRANCH:$RELEASE_BRANCH
+          git switch --force-create cherry-pick-$MR_ID-$RELEASE_BRANCH $RELEASE_BRANCH
+          git cherry-pick $SHA
+          git push -u origin --force cherry-pick-$MR_ID-$RELEASE_BRANCH
+          git checkout ${CI_DEFAULT_BRANCH:-main}
+        )
+
+        CHERRYPICK_SUCCESSFUL=$?
+
+        if [[ $CHERRYPICK_SUCCESSFUL -eq 0 ]]; then
+          curl \
+            --header "PRIVATE-TOKEN: $PROJECT_ACCESS_TOKEN_MCORE" \
+            --url https://${GITLAB_ENDPOINT}/api/v4/projects/141257/merge_requests \
+            -d "source_branch=cherry-pick-$MR_ID-$RELEASE_BRANCH" \
+            -d "target_branch=$RELEASE_BRANCH" \
+            -d "title=Cherry-pick $MR_ID into $RELEASE_BRANCH" \
+            -d "labels=cherry-pick"
+
+        else
+          URL=https://${GITLAB_ENDPOINT}/ADLR/megatron-lm/-/merge_requests/$MR_ID
+
+          MESSAGE='{
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": ":alert: Cherrypick bot 🤖: Cherry-pick of <'$URL'|!'$MR_ID'> failed"
+                }
+              }
+            ]
+          }'
+
+          curl -X POST -H "Content-type: application/json" --data "$MESSAGE" ${MCORE_NOTIFICATION_HOOK}
+
+        fi
+
+      done
+  interruptible: false
+
 check_milestone:
   rules: 
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
