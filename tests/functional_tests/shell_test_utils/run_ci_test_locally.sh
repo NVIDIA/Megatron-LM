@@ -96,7 +96,7 @@ sbatch -W <<EOF
 #SBATCH --account $PPP
 #SBATCH --partition $PARTITION
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=8
+#SBATCH --gres=gpu:8
 #SBATCH --time "04:00:00"
 #SBATCH --job-name=$PPP:mcore:release:$MODEL
 #SBATCH --dependency=singleton
