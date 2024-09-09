@@ -123,7 +123,7 @@ maybe_cherry_pick_commit:
 
         if [[ $CHERRYPICK_SUCCESSFUL -eq 0 ]]; then
           curl \
-            --header "PRIVATE-TOKEN: $PROJECT_ACCESS_TOKEN_MCORE" \
+            --header "PRIVATE-TOKEN: $PAT" \
             --url https://${GITLAB_ENDPOINT}/api/v4/projects/141257/merge_requests \
             -d "source_branch=cherry-pick-$MR_ID-$RELEASE_BRANCH" \
             -d "target_branch=$RELEASE_BRANCH" \
