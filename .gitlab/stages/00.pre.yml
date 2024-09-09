@@ -87,6 +87,7 @@ maybe_cherry_pick_commit:
     GIT_STRATEGY: "clone"
   script: 
     - set -x
+    - set +e
     - SHA=$(git rev-list --no-merges -n 1 HEAD)
     - MESSAGE=$(git log -n 1 --pretty=format:%s $SHA)
     - MR_ID=$(echo $MESSAGE | awk -F'!' '{print $2}' | awk '{print $1}' )  
