@@ -15,14 +15,20 @@ workflow:
       variables:
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: mr
+        UNIT_TEST_REPEAT: 5
+        UNIT_TEST_TIMEOUT: 50
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run nightly/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: nightly
+        UNIT_TEST_REPEAT: 5
+        UNIT_TEST_TIMEOUT: 50
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run weekly/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: weekly
+        UNIT_TEST_REPEAT: 5
+        UNIT_TEST_TIMEOUT: 50
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
         FUNCTIONAL_TEST: "no"
