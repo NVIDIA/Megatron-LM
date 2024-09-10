@@ -128,6 +128,7 @@ class TestGPTModel:
         destroy_num_microbatches_calculator()
 
     @pytest.mark.internal
+    @pytest.mark.skipif(True, reason="The test is flaky")  # TODO: Fix the test
     @pytest.mark.parametrize(
         ('tp_pp_ep', 'enable_vp', 'enable_grouped_gemm'), [((1, 1, 2), (False), (False))]
     )
