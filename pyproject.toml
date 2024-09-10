@@ -6,6 +6,56 @@ requires = [
     "pybind11",
 ]
 
+[project]
+name = "megatron-core"
+dynamic = ["dependencies", "version"]
+description = "Megatron Core - a library for efficient and scalable training of transformer based models"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
+maintainers = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
+keywords = [
+    "NLP",
+    "NLU",
+    "deep",
+    "gpu",
+    "language",
+    "learning",
+    "learning",
+    "machine",
+    "nvidia",
+    "pytorch",
+    "torch",
+    "transformer",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Natural Language :: English",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Utilities",
+]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["megatron/core/requirements.txt"] }
+
+[project.urls]
+Download = "https://github.com/NVIDIA/Megatron-LM/releases"
+Homepage = "https://github.com/NVIDIA/Megatron-LM/megatron/core"
+
 [tool.isort]
 profile = "black"  # black-compatible
 line_length = 100  # should match black parameters
