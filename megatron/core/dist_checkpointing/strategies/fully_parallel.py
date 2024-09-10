@@ -30,6 +30,23 @@ from megatron.core.dist_checkpointing.validation import (
     validate_sharding_integrity,
 )
 
+# TODO: remove TE references once the TE bug is fixed
+# Check if Transformer Engine has Float8Tensor class
+HAVE_TE_FLOAT8TENSOR = False
+try:
+    from transformer_engine.pytorch.float8_tensor import Float8Tensor
+
+    HAVE_TE_FLOAT8TENSOR = True
+except (ImportError, ModuleNotFoundError):
+    # Float8Tensor not found
+    pass
+
+
+def is_float8tensor(tensor: torch.Tensor) -> bool:
+    """Check if a tensor is a Transformer Engine Float8Tensor"""
+    return HAVE_TE_FLOAT8TENSOR and isinstance(tensor, Float8Tensor)
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -491,6 +508,15 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                             local_ten, orig_device = self._get_empty_tensor_for_exchange(
                                 shard_id, unloaded_shards, shard_to_metadata, all_loaded_tensors
                             )
+
+                        # Because of a TE bug, we have to exchange a nominal dtype instead of FP8
+                        # It's ok to keep the nominal dtype after exchange, because TE will handle
+                        # this during state dict load.
+                        # TODO: remove it once the bug is fixed
+                        if is_float8tensor(local_ten):
+                            local_ten = local_ten.from_float8()
+                            all_loaded_tensors[shard_id] = local_ten
+
                     round_tensors.append(local_ten)
                     if orig_device is not None:
                         orig_devices[shard_id] = orig_device
@@ -560,6 +586,15 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
 
             global_src_rank = torch.distributed.get_global_rank(parallelization_group, rank)
             # We can do async_op=True only if there is no CPU-copy follow-up
+
+            # Because of a TE bug, we have to exchange a nominal dtype instead of FP8
+            # It's ok to keep the nominal dtype after exchange, because TE will handle
+            # this during state dict load.
+            # TODO: remove it once the bug is fixed
+            if is_float8tensor(local_ten):
+                local_ten = local_ten.from_float8()
+                all_loaded_tensors[shard_id] = local_ten
+
             torch.distributed.broadcast(
                 local_ten,
                 src=global_src_rank,
