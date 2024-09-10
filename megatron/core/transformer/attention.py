@@ -360,7 +360,7 @@ class SelfAttention(Attention):
         if submodules.q_layernorm is not None:
             self.q_layernorm = build_module(
                 submodules.q_layernorm,
-                hidden_size=self.hidden_size_per_attention_head,
+                hidden_size=self.query_projection_size,
                 config=self.config,
                 eps=self.config.layernorm_epsilon,
             )
@@ -370,7 +370,7 @@ class SelfAttention(Attention):
         if submodules.k_layernorm is not None:
             self.k_layernorm = build_module(
                 submodules.k_layernorm,
-                hidden_size=self.hidden_size_per_attention_head,
+                hidden_size=self.kv_projection_size,
                 config=self.config,
                 eps=self.config.layernorm_epsilon,
             )
@@ -490,10 +490,16 @@ class SelfAttention(Attention):
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
 
         if self.q_layernorm is not None:
+            query_shape = list(query.shape)
+            query = query.reshape(query.size(0), query.size(1), 1, -1)
             query = self.q_layernorm(query)
+            query = query.reshape(*query_shape)
 
         if self.k_layernorm is not None:
+            key_shape = list(key.shape)
+            key = key.reshape(key.size(0), key.size(1), 1, -1)
             key = self.k_layernorm(key)
+            key = key.reshape(*key_shape)
 
         if self.config.test_mode:
             self.run_realtime_tests()
