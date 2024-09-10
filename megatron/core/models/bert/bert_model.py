@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 import os
 from importlib.metadata import version
-from typing import Dict, Literal, Optional
+from typing import Literal, Optional
 
 import torch
 from pkg_resources import packaging
@@ -9,7 +9,6 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec
 from megatron.core.models.bert.bert_lm_head import BertLMHead
 from megatron.core.models.bert.pooler import Pooler
@@ -24,6 +23,7 @@ from megatron.core.transformer.utils import get_linear_layer
 
 
 def get_te_version():
+    """Returns the installed version of transformer engine"""
     return packaging.version.Version(version("transformer-engine"))
 
 
@@ -32,16 +32,19 @@ class BertModel(LanguageModule):
 
     Args:
         config (TransformerConfig): transformer config
-        num_tokentypes (int) : Set to 2 when args.bert_binary_head is True, and 0 otherwise. Defaults to 0.
+        num_tokentypes (int) : Set to 2 when args.bert_binary_head is True, and 0 otherwise.
+            Defaults to 0.
         transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers
         vocab_size (int): vocabulary size
         max_sequence_length (int): maximum size of sequence. This is used for positional embedding
         pre_process (bool): Include embedding layer (used with pipeline parallelism)
         post_process (bool): Include an output layer (used with pipeline parallelism)
-        parallel_output (bool): Do not gather the outputs, keep them split across tensor parallel ranks
-        share_embeddings_and_output_weights (bool): When True, input embeddings and output logit weights are shared. Defaults to False.
-        position_embedding_type (string): Position embedding type. Options ['learned_absolute', 'rope'].
-            Defaults is 'learned_absolute'.
+        parallel_output (bool): Do not gather the outputs, keep them split across tensor parallel
+            ranks
+        share_embeddings_and_output_weights (bool): When True, input embeddings and output logit
+            weights are shared. Defaults to False.
+        position_embedding_type (string): Position embedding type.
+            Options ['learned_absolute', 'rope']. Defaults is 'learned_absolute'.
         rotary_percent (float): Percent of rotary dimension to use for rotary position embeddings.
             Defaults to 1.0 (100%). Ignored unless position_embedding_type is 'rope'.
     """
@@ -154,10 +157,17 @@ class BertModel(LanguageModule):
     ) -> str:
         """We do some checks and return attention mask dimensions for self attention
 
-        Transformer engine library underwent a lot of change. So we need to change dimensions of the attention mask depending on the TE version. We also santiy check some arguments.
+        Transformer engine library underwent a lot of change. So we need to change dimensions of
+        the attention mask depending on the TE version. We also santiy check some arguments.
+
         1. If we use local version of attention dimension of the mask is [b,1,s,s]
-        2. If we use transformer engine < 1.7 (Flash and Fused attention not supported. We use unfused path). Attn mask dimension is  [b,1,s,s]
-        2. If we use transformer engine >= 1.7 (Flash and fused attention supported with attn mask dimension [b,1,1,s]). Unfused path will use attn mask dimension [b,1,s,s] with attn mask type arbitrary. Default if you dont set any NVTE_ATTN flag will just use unfused path.
+        2. If we use transformer engine < 1.7
+          (Flash and Fused attention not supported. We use unfused path).
+          Attn mask dimension is [b,1,s,s]
+        2. If we use transformer engine >= 1.7
+          (Flash and fused attention supported with attn mask dimension [b,1,1,s]).
+          Unfused path will use attn mask dimension [b,1,s,s] with attn mask type arbitrary.
+          Default if you dont set any NVTE_ATTN flag will just use unfused path.
 
         Args:
             transformer_layer_spec (ModuleSpec): _description_
@@ -172,19 +182,31 @@ class BertModel(LanguageModule):
                     assert (
                         transformer_layer_spec.submodules.self_attention.params['attn_mask_type']
                         == AttnMaskType.arbitrary
-                    ), "Set env variable NVTE_FLASH_ATTN to 1 or NVTE_FUSED_ATTN to 1 to use a more optimized attention kernal. Currently using unfused attention path. If you want to proceed with this path set AttnMaskType in module spec to be arbitrary"
+                    ), (
+                        "Set env variable NVTE_FLASH_ATTN to 1 or NVTE_FUSED_ATTN to 1 to use a "
+                        "more optimized attention kernal. Currently using unfused attention path. "
+                        "If you want to proceed with this path set AttnMaskType in module spec to "
+                        "be arbitrary"
+                    )
                 else:
                     attn_mask_dimensions = "b11s"
             else:
                 assert os.getenv('NVTE_ALLOW_NONDETERMINISTIC_ALGO') == '0' or (
                     os.getenv('NVTE_FLASH_ATTN') == '0' and os.getenv('NVTE_FUSED_ATTN') == '0'
-                ), "Flash and fused attention is not supported with transformer engine version < 1.7. Set NVTE_FLASH_ATTN=0 and NVTE_FUSED_ATTN=0 or upgrade transformer engine >= 1.7 or set NVTE_ALLOW_NONDETERMINISTIC_ALGO=0"
+                ), (
+                    "Flash and fused attention is not supported with "
+                    "transformer engine version < 1.7. "
+                    "Set NVTE_FLASH_ATTN=0 and NVTE_FUSED_ATTN=0 or upgrade "
+                    "transformer engine >= 1.7 or set NVTE_ALLOW_NONDETERMINISTIC_ALGO=0"
+                )
         return attn_mask_dimensions
 
     def bert_extended_attention_mask(self, attention_mask: Tensor) -> Tensor:
         """Creates the extended attention mask
 
-        Converts the attention mask of dimension [batch size, 1, seq len] to [batch size, 1, seq len, seq len] or [batch size, 1, 1, seq_len] and makes it binary
+        Converts the attention mask of dimension
+        [batch size, 1, seq len] to [batch size, 1, seq len, seq len]
+        or [batch size, 1, 1, seq_len] and makes it binary
 
         Args:
             attention_mask (Tensor): The input attention mask
@@ -212,6 +234,17 @@ class BertModel(LanguageModule):
         return extended_attention_mask
 
     def bert_position_ids(self, token_ids):
+        """
+        Generate position IDs for a given sequence of token IDs, as an arange of integers.
+
+        Args:
+            token_ids (Tensor): The input token list
+
+        Returns:
+            torch.Tensor: A tensor of shape (batch_size, seq_length) containing the position IDs
+                        for the input token IDs.
+        """
+
         # Create position ids
         seq_length = token_ids.size(1)
         position_ids = torch.arange(seq_length, dtype=torch.long, device=token_ids.device)
