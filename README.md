@@ -11,9 +11,12 @@ Megatron-LM & Megatron-Core
 <div align="left">
 
 # Latest News
+
 - **[2024/7]** Megatron-Core v0.7 improves scalability and training resiliency and adds support for multimodal training ([blog](https://developer.nvidia.com/blog/train-generative-ai-models-more-efficiently-with-new-nvidia-megatron-core-functionalities/)). 
 - **[2024/6]** Megatron-Core added supports for Mamba-based models. Check out our paper [An Empirical Study of Mamba-based Language Models](https://arxiv.org/pdf/2406.07887) and [code example](https://github.com/NVIDIA/Megatron-LM/tree/ssm/examples/mamba).
 - **[2024/1 Announcement]** NVIDIA has released the core capabilities in **Megatron-LM** into [**Megatron-Core**](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core) in this repository. Megatron-Core expands upon Megatron-LM's GPU-optimized techniques with more cutting-edge innovations on system-level optimizations, featuring composable and modular APIs. Explore the [Megatron-Core intro](#megatron-core) for more details.
+
+
 
 # Table of Contents
    * [Megatron Overview](#megatron-overview)
@@ -270,11 +273,11 @@ In this repo, we provide an end-to-end reproduction guide to implement Retro and
 - **Instruction tuning**, where we provide an open-source instruction tuning dataset and the training recipe for instruction tuning on Retro.
 - **Downstream task evaluation**, where we provide the text generation and evaluation scripts for zero-shot question answering tasks.
 
-Please see [tools/retro/README.md](tools/retro/README.md) for a detailed overview.
+See [tools/retro/README.md](tools/retro/README.md) for a detailed overview.
 
 ## Mamba-based Language Models
 
-Please see [examples/mamba](./examples/mamba) for details.
+See [examples/mamba](./examples/mamba) for details.
 
 <!--
 ## REALM Pipeline
