@@ -39,6 +39,7 @@ from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
 from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
@@ -270,11 +271,22 @@ def pretrain(
     # Track E2E metrics on pretrain start
     one_logger_utils.on_pretrain_start()
 
+    # Context used for persisting some state between checkpoint saves.
+    if args.non_persistent_ckpt_type == 'local':
+        raise RuntimeError('LocalCheckpointManagers are not yet integrated')
+        checkpointing_context = {
+            'local_checkpoint_manager': BasicLocalCheckpointManager(
+                args.non_persistent_local_ckpt_dir
+            )
+        }
+    else:
+        checkpointing_context = {}
+
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     app_metrics['app_build_optimizer_start_time'] = one_logger_utils.get_timestamp_in_ms()
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider, model_type)
+        model_provider, model_type, checkpointing_context=checkpointing_context)
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate '
@@ -309,9 +321,6 @@ def pretrain(
     one_logger_utils.track_config_flags(args.train_iters, args.skip_train, args.do_train,
                                         args.do_valid, args.do_test, args.dataloader_type,
                                         args.retro_project_dir, args.retro_cyclic_train_iters)
-
-    # Context used for persisting some state between checkpoint saves.
-    checkpointing_context = {}
 
     if args.enable_ft_package and ft_integration.get_rank_monitor_client() is not None:
         ft_integration.get_rank_monitor_client().init_workload_monitoring()
@@ -509,14 +518,17 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     if wrap_with_ddp:
         config = get_model_config(model[0])
-        ddp_config = DistributedDataParallelConfig(
-            grad_reduce_in_fp32=args.accumulate_allreduce_grads_in_fp32,
-            overlap_grad_reduce=args.overlap_grad_reduce,
-            use_distributed_optimizer=args.use_distributed_optimizer,
-            check_for_nan_in_grad=args.check_for_nan_in_loss_and_grad,
-            bucket_size=args.ddp_bucket_size,
-            average_in_collective=args.ddp_average_in_collective,
-            fp8_param_gather=args.fp8_param_gather)
+
+        kwargs = {}
+        for f in dataclasses.fields(DistributedDataParallelConfig):
+            if hasattr(args, f.name):
+                kwargs[f.name] = getattr(args, f.name)
+        kwargs['grad_reduce_in_fp32'] = args.accumulate_allreduce_grads_in_fp32
+        kwargs['check_for_nan_in_grad'] = args.check_for_nan_in_loss_and_grad
+        kwargs['bucket_size'] = args.ddp_bucket_size
+        kwargs['average_in_collective'] = args.ddp_average_in_collective
+        ddp_config = DistributedDataParallelConfig(**kwargs)
+
         overlap_param_gather_with_optimizer_step = getattr(args, 'overlap_param_gather_with_optimizer_step', False)
         model = [DDP(config,
                      ddp_config,
@@ -594,7 +606,8 @@ def setup_model_and_optimizer(model_provider_func,
                               model_type,
                               no_wd_decay_cond=None,
                               scale_lr_cond=None,
-                              lr_mult=1.0):
+                              lr_mult=1.0,
+                              checkpointing_context=None):
     """Setup model and optimizer."""
     args = get_args()
     timers = get_timers()
@@ -613,7 +626,32 @@ def setup_model_and_optimizer(model_provider_func,
                                        scale_lr_cond, lr_mult)
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
-    if args.load is not None or args.pretrained_checkpoint is not None:
+    if args.moe_use_upcycling:
+        assert not os.path.exists(
+            args.save
+        ), ("The upcycling destination directory already exists. "
+            "Please check if --moe-use-upcycling is mistakenly enabled. "
+            "Upcycling should only be set for the first run when converting the dense model. "
+            "All subsequent runs should remove this flag. ")
+        num_experts = args.num_experts
+        args.num_experts = None
+        dense_model_for_upcycling = get_model(model_provider_func, model_type)
+        args.num_experts = num_experts
+        _, args.num_floating_point_operations_so_far = upcycling_utils.load_and_upcycle_model(
+            load_checkpoint,
+            unwrapped_model,
+            dense_model_for_upcycling,
+            load_kwargs = {'model': dense_model_for_upcycling, 'optimizer': None, 'opt_param_scheduler': None}
+        )
+        args.iteration = 0
+        save_checkpoint(args.iteration, model, None, None, args.num_floating_point_operations_so_far)
+        torch.distributed.barrier()
+        del dense_model_for_upcycling
+        if (args.fp16 or args.bf16) and optimizer is not None:
+            optimizer.reload_model_params()
+        print_rank_0(f'Upcycled checkpoint saved to {args.save}')
+
+    if (args.load is not None or args.pretrained_checkpoint is not None) and not args.moe_use_upcycling:
         one_logger and one_logger.log_metrics({
             'load_checkpoint_start_time': one_logger_utils.get_timestamp_in_ms()
         })
@@ -621,8 +659,7 @@ def setup_model_and_optimizer(model_provider_func,
 
         args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
                 model, optimizer, opt_param_scheduler,
-                ft_client=ft_integration.get_rank_monitor_client())
-
+                ft_client=ft_integration.get_rank_monitor_client(), checkpointing_context=checkpointing_context)
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics({
@@ -656,7 +693,6 @@ def setup_model_and_optimizer(model_provider_func,
         exit()
 
     return model, optimizer, opt_param_scheduler
-
 
 
 def train_step(forward_step_func, data_iterator,
@@ -1017,7 +1053,6 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
 
     # Stop timer to get accurate train interval time and exclude checkpointing duration
     timers('interval-time').stop()
-
     # Extra barrier is added to make sure all ranks report the max time.
     timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
     timers(timer_key, log_level=0).start(barrier=True)
@@ -1025,7 +1060,6 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
 
     # Log E2E metrics before save-checkpoint
     one_logger_utils.track_e2e_metrics()
-
     if args.use_distributed_optimizer and args.overlap_param_gather:
         optimizer.disable_pre_hook()
     save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
@@ -1097,8 +1131,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             if len(model) == 1:
                 config.grad_sync_func = config.grad_sync_func[0]
     if args.overlap_param_gather and args.align_param_gather:
-        config.param_sync_func = [functools.partial(optimizer.start_param_sync, model_index)
-                                  for model_index in range(len(model))]
+        config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
     config.finalize_model_grads_func = finalize_model_grads
@@ -1337,6 +1370,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler,
                                      num_floating_point_operations_so_far,
+                                     checkpointing_context,
                                      non_persistent_ckpt=True, train_data_iterator=train_data_iterator)
             saved_checkpoint = True
             timers('interval-time', log_level=0).start(barrier=True)

@@ -1,9 +1,11 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
+from importlib.metadata import version
 from typing import Callable, Optional, Tuple
 
 import torch.nn.functional as F
+from pkg_resources import packaging
 
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import init_method_normal, scaled_init_method_normal
@@ -227,6 +229,9 @@ class TransformerConfig(ModelParallelConfig):
 
     fp8_multi_head_attention: bool = False
     """When set to True, use the FP8 implementation of Multi Head Attention."""
+
+    tp_only_amax_red: bool = False
+    """When set to True, reduce the FP8 AMAX only in the TP or TP-CP domain"""
 
     ####################
     # MoE related
@@ -472,3 +477,15 @@ class TransformerConfig(ModelParallelConfig):
                     f'ffn_hidden_size: {self.ffn_hidden_size} must be divisible by '
                     f'extended_tp_size {extended_tp_size}'
                 )
+
+        if self.num_moe_experts and self.fp8:
+            # TE version below 1.7.0 will raise Error when handle zeros tokens for expert
+            te_version = packaging.version.Version(version("transformer-engine"))
+            if te_version < packaging.version.Version("1.7.0.dev0"):
+                raise ValueError(
+                    "Only transformer-engine>=1.7.0 supports MoE FP8 training, "
+                    f"but your version is {te_version}."
+                )
+
+            if self.moe_grouped_gemm:
+                raise ValueError("Grouped GEMM of MoE not support fp8 for now.")

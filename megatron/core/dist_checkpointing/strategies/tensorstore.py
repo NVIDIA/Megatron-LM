@@ -13,19 +13,22 @@ import torch
 from ..core import CheckpointingException
 from ..dict_utils import dict_list_map_inplace
 from ..mapping import ShardedStateDict, ShardedTensor
-from .base import LoadShardedStrategy, StrategyAction, default_strategies
-from .zarr import (
-    load_zarr_based_sharded_metadata,
-    numpy_to_torch_dtype_dict,
-    postprocess_numpy_array,
-)
-
-_import_trigger = None
+from .base import LoadShardedStrategy, StrategyAction, register_default_strategy
+from .zarr import load_zarr_based_sharded_metadata, postprocess_numpy_array
 
 logger = getLogger(__name__)
 
 
+def register_default_tensorstore_strategies():
+    """Register default strategies leveraging tensorstore."""
+    register_default_strategy(
+        StrategyAction.LOAD_SHARDED, 'zarr', 1, TensorStoreLoadShardedStrategy()
+    )
+
+
 class TensorStoreLoadShardedStrategy(LoadShardedStrategy):
+    """Load strategy for Zarr backend using `tensorstore` for loading."""
+
     def __init__(self, load_directly_on_device: bool = False):
         super().__init__()
         self.load_directly_on_device = load_directly_on_device
@@ -58,6 +61,8 @@ class TensorStoreLoadShardedStrategy(LoadShardedStrategy):
 
 
 def merge_global_slice_with_shape(global_slice, actual_shape, key):
+    """Intersects the global slice with the actual shape (prevent overflow)."""
+
     def _merge_slice(dim_slice, dim_size):
         if isinstance(dim_slice, slice):
             assert (
@@ -121,8 +126,3 @@ def open_ts_array(arr_path: Path):
     except Exception as e:
         raise CheckpointingException(f'Array {arr_path} could not be loaded. Error: {e}') from e
     return arr
-
-
-default_strategies[StrategyAction.LOAD_SHARDED.value][
-    ('zarr', 1)
-] = TensorStoreLoadShardedStrategy()

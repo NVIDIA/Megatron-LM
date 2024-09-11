@@ -3,7 +3,6 @@
 """ Strategies using Zarr as an underlying format. """
 import logging
 import os
-import threading
 from functools import partial
 from logging import getLogger
 from pathlib import Path
@@ -16,7 +15,12 @@ import zarr
 from ..core import CheckpointingException
 from ..dict_utils import dict_list_map_inplace, nested_values
 from ..mapping import ShardedStateDict, ShardedTensor, is_main_replica
-from .base import LoadShardedStrategy, SaveShardedStrategy, StrategyAction, default_strategies
+from .base import (
+    LoadShardedStrategy,
+    SaveShardedStrategy,
+    StrategyAction,
+    register_default_strategy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +42,8 @@ torch_to_numpy_dtype_dict = {v: k for k, v in numpy_to_torch_dtype_dict.items()}
 
 
 try:
-    import tensorstore
+    # Register a bfloat16 type with this import
+    import tensorstore  # pylint: disable=unused-import
 
     HAS_BFLOAT16 = True
     numpy_to_torch_dtype_dict[np.dtype('bfloat16')] = torch.bfloat16
@@ -46,12 +51,19 @@ try:
 except ImportError:
     HAS_BFLOAT16 = False
 
-_import_trigger = None
-
 logger = getLogger(__name__)
 
 
+def register_default_zarr_strategies():
+    """Register default strategies related to Zarr backend."""
+    register_default_strategy(
+        StrategyAction.SAVE_SHARDED, 'zarr', 1, ZarrSaveShardedStrategy('zarr', 1)
+    )
+
+
 class ZarrSaveShardedStrategy(SaveShardedStrategy):
+    """Save strategy for Zarr backend."""
+
     def __init__(self, backend: str, version: int):
         super().__init__(backend, version)
         logger.warning(
@@ -74,11 +86,13 @@ def _create_or_open_zarr_arrays(
 
     For a sharded tensors that:
     a) is main replica and represents the first chunk (all offsets 0), creates the Zarr array
-    b) is main replica but not the first chunk, opens the arrays created in (a) (possibly by other process)
+    b) is main replica but not the first chunk,
+        opens the arrays created in (a) (possibly by other process)
     c) otherwise, sets the corresponding array to None since it won't be used
 
     Args:
-        sharded_tensors (List[ShardedTensor]): sharded tensors from a given rank that will be saved to checkpoint
+        sharded_tensors (List[ShardedTensor]): sharded tensors from a given rank
+            that will be saved to checkpoint
         checkpoint_dir (Path): checkpoint in which the arrays will be created
     """
     arrays = []
@@ -159,6 +173,8 @@ def _create_zarr_array(sharded_tensor: ShardedTensor, checkpoint_dir: Path):
 
 
 class ZarrLoadShardedStrategy(LoadShardedStrategy):
+    """Load strategy for the Zarr backend."""
+
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         dict_list_map_inplace(
             partial(_load_from_array, checkpoint_dir=checkpoint_dir), sharded_state_dict
@@ -210,6 +226,7 @@ def _open_zarr_array_verbose(path: Path, mode: str, **open_kwargs):
 
 
 def postprocess_numpy_array(loaded_array, sharded_tensor, apply_flattened_range=True):
+    """Turn numpy array to torch tensor."""
     x = loaded_array
     if HAS_BFLOAT16 and x.dtype == np.dtype('bfloat16'):
         x = x.astype(np.dtype('float32'))
@@ -237,10 +254,12 @@ def postprocess_numpy_array(loaded_array, sharded_tensor, apply_flattened_range=
 
 
 def flatten_range(sharded_tensor, x):
+    """Apply flattened range to a tensor."""
     return x.flatten()[sharded_tensor.flattened_range]
 
 
 def pad_to_expected_shape(x: torch.Tensor, expected_sharded_ten: ShardedTensor):
+    """Pad tensor to the expected shape."""
     pad_args = []
     assert len(x.shape) == len(expected_sharded_ten.local_shape)
     # Reversed iteration order because F.pad expects so
@@ -252,9 +271,10 @@ def pad_to_expected_shape(x: torch.Tensor, expected_sharded_ten: ShardedTensor):
         if x_sh == exp_sh:
             pad_args.extend((0, 0))
         elif x_sh > exp_sh:
-            assert (
-                False
-            ), f'Expected shape ({exp_sh}) smaller than actual ({x_sh}) for {repr(expected_sharded_ten)}'
+            assert False, (
+                f'Expected shape ({exp_sh}) smaller than actual ({x_sh})'
+                f' for {repr(expected_sharded_ten)}'
+            )
         else:
             pad_args.extend((0, exp_sh - x_sh))
     # TODO: behavior control with envvar is for testing purposes only, remove it
@@ -299,9 +319,3 @@ def load_zarr_based_sharded_metadata(
             tuple(1 for _ in arr_shape),
         )
     return sharded_state_dict
-
-
-# default_strategies[StrategyAction.LOAD_SHARDED.value][('zarr', 1)] = ZarrLoadShardedStrategy()
-default_strategies[StrategyAction.SAVE_SHARDED.value][('zarr', 1)] = ZarrSaveShardedStrategy(
-    'zarr', 1
-)

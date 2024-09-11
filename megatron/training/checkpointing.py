@@ -2,6 +2,7 @@
 
 """Input/output checkpointing."""
 
+from enum import Enum, auto
 from logging import getLogger
 import os
 import random
@@ -18,6 +19,10 @@ import torch
 from megatron.core import mpu, tensor_parallel, dist_checkpointing
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.dist_checkpointing.serialization import get_default_load_sharded_strategy
+from megatron.core.dist_checkpointing.state_dict_transformation import (
+    prepare_state_dict_for_save,
+    recreate_state_dict_after_load,
+)
 from megatron.core.dist_checkpointing.strategies.fully_parallel import \
     FullyParallelSaveStrategyWrapper, FullyParallelLoadStrategyWrapper
 from megatron.core.num_microbatches_calculator import update_num_microbatches
@@ -291,6 +296,10 @@ def get_rng_state(use_dist_ckpt: bool = False):
 
     return rng_state_list
 
+class CheckpointType(Enum):
+    LEGACY = auto()
+    LOCAL = auto()
+    GLOBAL = auto()
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
@@ -321,33 +330,50 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     # Handle non_persistent_ckpt flag. Besides overwriting `args.save` and
     # `args.use_dist_ckpt`, non-persistent global ckpt requires no additional logic
-    use_dist_ckpt = args.use_dist_ckpt or non_persistent_ckpt
+    ckpt_type = CheckpointType.GLOBAL if args.use_dist_ckpt else CheckpointType.LEGACY
     save_dir = args.save
     if non_persistent_ckpt:
-        save_dir = (
-            args.non_persistent_global_ckpt_dir
-            if args.non_persistent_global_ckpt_dir
-            else os.path.join(save_dir, _NON_PERSISTENT_CKPT_SUBDIR)
-        )
-        # TODO Can we ensure the previous checkpoint is saved? We don't want to allow two saves in parallel.
-        cleanup_old_non_persistent_checkpoint(save_dir, leave_ckpt_num=1, do_async=args.async_save)
+        if args.non_persistent_ckpt_type == 'global':
+            ckpt_type = CheckpointType.GLOBAL
+            save_dir = (
+                args.non_persistent_global_ckpt_dir
+                if args.non_persistent_global_ckpt_dir
+                else os.path.join(save_dir, _NON_PERSISTENT_CKPT_SUBDIR)
+            )
+            # TODO Can we ensure the previous checkpoint is saved? We don't want to allow two saves in parallel.
+            cleanup_old_non_persistent_checkpoint(
+                save_dir, leave_ckpt_num=1, do_async=args.async_save
+            )
+        elif args.non_persistent_ckpt_type == 'local':
+            raise RuntimeError('LocalCheckpointManagers are not yet integrated')
+            ckpt_type = CheckpointType.LOCAL
+            save_dir = checkpointing_context['local_checkpoint_manager'].local_ckpt_dir
+        else:
+            assert False, 'Please use local or global non-persistent checkpoints' \
+                f'(got: {args.non_persistent_ckpt_type})'
 
-    ckpt_format = args.ckpt_format if use_dist_ckpt else 'torch'
+    ckpt_format = args.ckpt_format if ckpt_type == CheckpointType.GLOBAL else 'torch'
     print_rank_0('saving checkpoint at iteration {:7d} to {} in {} format'.format(
         iteration, save_dir, ckpt_format))
 
     # Collect rng state across data parallel ranks.
-    rng_state = get_rng_state(use_dist_ckpt)
+    rng_state = get_rng_state(ckpt_type != CheckpointType.LEGACY)
 
     # Checkpoint name.
+    return_base_dir = (ckpt_type != CheckpointType.LEGACY)
     checkpoint_name = get_checkpoint_name(save_dir, iteration, release=False, pipeline_parallel=pipeline_parallel,
-        tensor_rank=tensor_rank, pipeline_rank=pipeline_rank, expert_parallel=expert_parallel, expert_rank=expert_rank, return_base_dir=use_dist_ckpt)
+        tensor_rank=tensor_rank, pipeline_rank=pipeline_rank, expert_parallel=expert_parallel, expert_rank=expert_rank, return_base_dir=return_base_dir)
 
     # Save dataloader state if the dataloader supports it (currently only Megatron Energon).
     save_dataloader_state(train_data_iterator, iteration, getattr(args, "dataloader_save", None))
 
     # Save distributed optimizer's custom parameter state.
-    if args.use_distributed_optimizer and not args.no_save_optim and optimizer is not None and not use_dist_ckpt:
+    if (
+        args.use_distributed_optimizer
+        and not args.no_save_optim
+        and optimizer is not None
+        and ckpt_type == CheckpointType.LEGACY
+    ):
         optim_checkpoint_name = \
             get_distributed_optimizer_checkpoint_name(checkpoint_name)
         ensure_directory_exists(optim_checkpoint_name)
@@ -355,9 +381,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     async_save_request = None
     if args.async_save:
-        if not args.use_dist_ckpt:
+        if ckpt_type == CheckpointType.LEGACY:
             raise NotImplementedError('Async checkpoint save not implemented for legacy checkpoints')
-        elif args.ckpt_format != 'torch_dist':
+        elif ckpt_type == CheckpointType.GLOBAL and args.ckpt_format != 'torch_dist':
             raise NotImplementedError(f'Async checkpoint save not implemented for {args.ckpt_format} distributed checkpoint format')
 
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -365,24 +391,28 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     # Collect args, model, RNG.
     if not torch.distributed.is_initialized() \
             or mpu.get_data_modulo_expert_parallel_rank(with_context_parallel=True) == 0 \
-            or use_dist_ckpt:
+            or ckpt_type != CheckpointType.LEGACY:
         optim_sd_kwargs = {}
-        if use_dist_ckpt and args.use_distributed_optimizer:
+        if ckpt_type != CheckpointType.LEGACY and args.use_distributed_optimizer:
             optim_sd_kwargs['sharding_type'] = ('fully_sharded_model_space'
                                                 if args.ckpt_fully_parallel_save
                                                 else 'dp_zero_gather_scatter')
             print_rank_0(f'Storing distributed optimizer sharded state of type {optim_sd_kwargs["sharding_type"]}')
-        state_dict = generate_state_dict(args, model, optimizer, opt_param_scheduler, rng_state,
-                                         use_dist_ckpt, iteration, optim_sd_kwargs=optim_sd_kwargs)
+        state_dict = generate_state_dict(
+            args,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            rng_state,
+            ckpt_type != CheckpointType.LEGACY,
+            iteration,
+            optim_sd_kwargs=optim_sd_kwargs,
+        )
 
         if args.enable_ft_package and ft_client is not None:
             state_dict["ft_state"] = ft_client.state_dict()
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
-        if use_dist_ckpt:
-            if non_persistent_ckpt and args.non_persistent_ckpt_type != 'global':
-                raise NotImplementedError(
-                    'Local and online checkpoints are not yet supported, please use global non-persistent checkpoints'
-                )
+        if ckpt_type == CheckpointType.GLOBAL:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 # TODO Handle non-empty directories (e.g., after a crash during saving).
                 ensure_directory_exists(checkpoint_name, check_parent=False)
@@ -414,9 +444,18 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             if has_nvidia_modelopt:
                 save_modelopt_state(model, state_dict)
 
-            # Save.
-            ensure_directory_exists(checkpoint_name)
-            torch.save(state_dict, checkpoint_name)
+            if ckpt_type == CheckpointType.LOCAL:
+                state_dict_for_save = prepare_state_dict_for_save(
+                    state_dict, algo=args.non_persistent_local_ckpt_algo
+                )
+                async_save_request = checkpointing_context['local_checkpoint_manager'].save(
+                    state_dict_for_save, iteration, is_async=bool(args.async_save)
+                )
+            else:
+                assert ckpt_type == CheckpointType.LEGACY
+                # Save.
+                ensure_directory_exists(checkpoint_name)
+                torch.save(state_dict, checkpoint_name)
     start_misc = time()
     if not args.async_save:
         assert async_save_request is None
@@ -426,17 +465,25 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     # And update the latest iteration
     if not torch.distributed.is_initialized() \
-       or torch.distributed.get_rank() == 0:
+            or torch.distributed.get_rank() == 0:
         tracker_filename = get_checkpoint_tracker_filename(save_dir)
 
-        def iter_finalize_fn():
-            with open(tracker_filename, 'w') as f:
-                f.write(str(iteration))
-            print_rank_0('  successfully saved checkpoint from iteration {:7d} to {}'
-                         .format(iteration, args.save))
-            if args.log_progress and args.async_save:
-                append_to_progress_log(f'Saved async checkpoint\tIteration: {iteration}',
-                                       barrier=False)
+        if ckpt_type == CheckpointType.LOCAL:
+            def iter_finalize_fn():
+                print_rank_0('  successfully saved local checkpoint from iteration {:7d}'
+                             .format(iteration))
+                if args.log_progress and args.async_save:
+                    append_to_progress_log(f'Saved async local checkpoint\tIteration: {iteration}',
+                                           barrier=False)
+        else:
+            def iter_finalize_fn():
+                with open(tracker_filename, 'w') as f:
+                    f.write(str(iteration))
+                print_rank_0('  successfully saved checkpoint from iteration {:7d} to {}'
+                             .format(iteration, args.save))
+                if args.log_progress and args.async_save:
+                    append_to_progress_log(f'Saved async checkpoint\tIteration: {iteration}',
+                                           barrier=False)
 
         if args.async_save:
             assert async_save_request is not None
@@ -458,7 +505,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     if args.async_save:
         schedule_async_save(async_save_request)
         print_rank_0('  scheduled an async checkpoint save at iteration {:7d} to {}' \
-                     .format(iteration, args.save))
+                     .format(iteration, save_dir))
 
     # Wait so everyone is done (not necessary)
     if torch.distributed.is_initialized():
@@ -641,13 +688,15 @@ def fix_query_key_value_ordering(model, checkpoint_version):
                     print_rank_0(f"Invalid checkpoint version {checkpoint_version}.")
                     sys.exit()
                 param.data.copy_(fixed_param)
-        print_rank_0(" succesfully fixed query-key-values ordering for"
+        print_rank_0(" successfully fixed query-key-values ordering for"
                      " checkpoint version {}".format(checkpoint_version))
 
 
-def _get_non_persistent_iteration(non_persistent_dir, args):
-    if args.non_persistent_ckpt_type == "global":
-        tracker_filename = get_checkpoint_tracker_filename(non_persistent_dir)
+def _get_non_persistent_iteration(non_persistent_global_dir, args, checkpointing_context=None):
+    if args.non_persistent_ckpt_type is None:
+        return -1
+    elif args.non_persistent_ckpt_type == "global":
+        tracker_filename = get_checkpoint_tracker_filename(non_persistent_global_dir)
         if os.path.isfile(tracker_filename):
             iteration, release = read_metadata(tracker_filename)
             if release:
@@ -657,39 +706,48 @@ def _get_non_persistent_iteration(non_persistent_dir, args):
             print_rank_0('WARNING: could not find the metadata file {}'.format(tracker_filename))
             print_rank_0('    will not load any non-persistent checkpoint')
         return iteration
-    elif args.non_persistent_ckpt_type is None:
-        return -1
+    elif args.non_persistent_ckpt_type == "local":
+        raise RuntimeError('LocalCheckpointManagers are not yet integrated')
+        return checkpointing_context['local_checkpoint_manager'].get_latest_checkpoint_iteration()
     else:
-        raise NotImplementedError(
-            'Local and online checkpoints are not yet supported, please use global non-persistent checkpoints'
-        )
+        assert False, 'Please use local or global non-persistent checkpoints' \
+            f'(got: {args.non_persistent_ckpt_type})'
 
 
 def _load_non_persistent_base_checkpoint(
-    non_persistent_dir, args, rank0, sharded_state_dict, non_persistent_iteration
+    non_persistent_global_dir,
+    args,
+    rank0,
+    sharded_state_dict,
+    non_persistent_iteration,
+    checkpointing_context=None,
 ):
     """ Load the base state_dict from a non-persistent distributed checkpoint.
     Depending on the non_persistent_ckpt_type, different logic may be required.
     """
     assert args.non_persistent_ckpt_type is not None
     if args.non_persistent_ckpt_type == "global":
-        checkpoint_name = get_checkpoint_name(
-            non_persistent_dir, non_persistent_iteration, False, return_base_dir=True
-        )
-        # "non_persistent" checkpoint is only used for distributed checkpoints
-        # Skipping the assert to avoid unnecessary disk access.
-        # assert dist_checkpointing.check_is_distributed_checkpoint(checkpoint_name)
         if not rank0:
             print_rank_0(
                 f'Loading from a non-persistent checkpoint (non-persistent iter {non_persistent_iteration})'
             )
         return _load_global_dist_base_checkpoint(
-            non_persistent_dir, args, rank0, sharded_state_dict, non_persistent_iteration, False
+            non_persistent_global_dir, args, rank0, sharded_state_dict, non_persistent_iteration, False
         )
+    elif args.non_persistent_ckpt_type == "local":
+        raise RuntimeError('LocalCheckpointManagers are not yet integrated')
+        intermediate_state_dict, checkpoint_name = checkpointing_context[
+            'local_checkpoint_manager'
+        ].load()
+        state_dict = recreate_state_dict_after_load(
+            sharded_state_dict,
+            intermediate_state_dict,
+            algo=args.non_persistent_local_ckpt_algo,
+        )
+        return state_dict, checkpoint_name, False, CheckpointType.LOCAL
     else:
-        raise NotImplementedError(
-            'Local and online checkpoints are not yet supported, please use global non-persistent checkpoints'
-        )
+        assert False, 'Please use local or global non-persistent checkpoints' \
+            f'(got: {args.non_persistent_ckpt_type})'
 
 
 def _load_global_dist_base_checkpoint(
@@ -699,7 +757,7 @@ def _load_global_dist_base_checkpoint(
     if rank0:
         checkpoint_name = find_checkpoint_rank_0(load_dir, iteration, release)
         state_dict = dist_checkpointing.load_common_state_dict(checkpoint_name)
-        return state_dict, checkpoint_name, release
+        return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
     if sharded_state_dict is None:
         assert not args.auto_detect_ckpt_format and not args.use_dist_ckpt, (
@@ -718,32 +776,44 @@ def _load_global_dist_base_checkpoint(
             load_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
         )
     state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name, load_strategy, strict=args.dist_ckpt_strictness)
-    return state_dict, checkpoint_name, release
+    return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
 
 def _load_base_checkpoint(
-    load_dir, args, rank0=False, sharded_state_dict=None
+    load_dir,
+    args,
+    rank0=False,
+    sharded_state_dict=None,
+    checkpointing_context=None,
 ):
     """ Load the base state_dict from the given directory
 
     If rank0 is true, just loads rank 0 checkpoint, ignoring arguments.
     """
     # Try to load non-persistent checkpoint first
-    non_persistent_dir = (
+    non_persistent_global_dir = (
         args.non_persistent_global_ckpt_dir
-        if args.non_persistent_global_ckpt_dir
+        if args.non_persistent_global_ckpt_dir or load_dir is None
         else os.path.join(load_dir, _NON_PERSISTENT_CKPT_SUBDIR)
     )
-    non_persistent_iteration = _get_non_persistent_iteration(non_persistent_dir, args)
-    tracker_filename = get_checkpoint_tracker_filename(load_dir)
-    if os.path.isfile(tracker_filename):
-        iteration, release = read_metadata(tracker_filename)
-    else:
-        iteration, release = -1, False
+    non_persistent_iteration = _get_non_persistent_iteration(
+        non_persistent_global_dir, args, checkpointing_context
+    )
+    iteration, release = -1, False
+    tracker_filename = 'because load directory is not defined'
+    if load_dir is not None:
+        tracker_filename = get_checkpoint_tracker_filename(load_dir)
+        if os.path.isfile(tracker_filename):
+            iteration, release = read_metadata(tracker_filename)
     if non_persistent_iteration != -1:  # there is a non-persistent checkpoint
         if non_persistent_iteration >= iteration:
             return _load_non_persistent_base_checkpoint(
-                non_persistent_dir, args, rank0, sharded_state_dict, non_persistent_iteration
+                non_persistent_global_dir,
+                args,
+                rank0,
+                sharded_state_dict,
+                non_persistent_iteration,
+                checkpointing_context,
             )
         else:
             print_rank_0('WARNING: non-persistent checkpoints are older than persistent checkpoint')
@@ -761,7 +831,7 @@ def _load_base_checkpoint(
                 torch.distributed.barrier()
             sys.exit()
 
-        return None, "", False
+        return None, "", False, None
 
     # Determine the type of the checkpoint
     checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
@@ -780,7 +850,6 @@ def _load_base_checkpoint(
         return _load_global_dist_base_checkpoint(
             load_dir, args, rank0, sharded_state_dict, iteration, release
         )
-
     # Handle global legacy checkpoint
     if rank0:
         checkpoint_name = find_checkpoint_rank_0(load_dir, iteration, release)
@@ -808,10 +877,12 @@ def _load_base_checkpoint(
         print(e)
         sys.exit()
 
-    return state_dict, checkpoint_name, release
+    return state_dict, checkpoint_name, release, CheckpointType.LEGACY
 
 
-def load_args_from_checkpoint(args, load_arg='load'):
+def load_args_from_checkpoint(
+    args, load_arg='load', checkpointing_context=None
+):
     """Set required arguments from the checkpoint specified in the
     arguments.
 
@@ -830,8 +901,11 @@ def load_args_from_checkpoint(args, load_arg='load'):
         print_rank_0('No load directory specified, using provided arguments.')
         return args
 
-    state_dict, checkpoint_name, release = _load_base_checkpoint(
-        load_dir, args, rank0=True
+    state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
+        load_dir,
+        args,
+        rank0=True,
+        checkpointing_context=checkpointing_context,
     )
 
     # Args.
@@ -916,7 +990,7 @@ def fix_fp8_params_lose_precision_when_loading_dist_ckpt(state_dict):
 
 
 def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
-                    ft_client=None):
+                    ft_client=None, checkpointing_context=None):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
         :attr:`state_dict` of the checkpoint match the names of
@@ -945,17 +1019,21 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         or args.use_dist_ckpt
         or args.non_persistent_save_interval is not None
     ):
-        state_dict, checkpoint_name, release = _load_base_checkpoint(
-            load_dir, args, rank0=True
+        state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
+            load_dir,
+            args,
+            rank0=True,
+            checkpointing_context=checkpointing_context,
         )
-
         if args.enable_ft_package and ft_client is not None and state_dict is not None:
             if 'ft_state' in state_dict:
                 ft_client.load_state_dict(state_dict['ft_state'])
             else:
                 print_rank_0("ft_state is not present in state_dict")
-
-        is_dist_ckpt = dist_checkpointing.check_is_distributed_checkpoint(checkpoint_name)
+        is_dist_ckpt = (
+            ckpt_type == CheckpointType.LOCAL
+            or dist_checkpointing.check_is_distributed_checkpoint(checkpoint_name)
+        )
         if is_dist_ckpt:
             ckpt_tp_pp = (
                 state_dict['args'].tensor_model_parallel_size,
@@ -1008,8 +1086,9 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
             # When "--fp8-param-gather" is disabled, this function doesn't modify anything.
             fix_fp8_params_lose_precision_when_loading_dist_ckpt(load_kwargs['sharded_state_dict'])
 
-    state_dict, checkpoint_name, release = _load_base_checkpoint(
-        load_dir, args, rank0=False, **load_kwargs
+    state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
+        load_dir, args, rank0=False, checkpointing_context=checkpointing_context,
+        **load_kwargs
     )
 
     if args.enable_ft_package and ft_client is not None and state_dict is not None:
@@ -1060,10 +1139,12 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
 
     # [ModelOpt]: loading modelopt_state (sharded or not)
     if has_nvidia_modelopt:
-        if args.use_dist_ckpt:
-            restore_sharded_modelopt_state(model, checkpoint_name)
-        else:
+        if ckpt_type == CheckpointType.LOCAL:
+            raise NotImplementedError('Local checkpointing does not support model opt')
+        if not args.use_dist_ckpt:
             restore_modelopt_state(model, state_dict)
+        else:
+            restore_sharded_modelopt_state(model, checkpoint_name)
 
     # Model.
     strict = False if args.retro_add_retriever else strict

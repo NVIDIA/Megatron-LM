@@ -1,13 +1,52 @@
-.publish_common:
+.publish_common_freeze:
   stage: functional_tests
   rules:
-    - if: $CI_COMMIT_BRANCH =~ /^core_r/ && $PUBLISH == "yes"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $PUBLISH == "yes" && $PUBLISH_SCOPE == "code-freeze"
+      when: manual
+    - when: never
+  
+.publish_common_release:
+  stage: functional_tests
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^core_r/ && $PUBLISH == "yes" && $PUBLISH_SCOPE == "release"
       when: manual
     - when: never
 
+create-release-branch:
+  extends: [.publish_common_freeze]
+  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
+  needs: [build_image]
+  tags: [mcore-docker-node-small]
+  variables:
+    GIT_STRATEGY: "clone"
+  script:
+    - git fetch origin $CI_DEFAULT_BRANCH
+    - git config --global user.email "mcore-bot@nvidia.com"
+    - git config --global user.name "Mcore Bot"
+    - git remote set-url origin "https://gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
+    - sed -i "/^PRE_RELEASE/c\PRE_RELEASE = ''" megatron/core/package_info.py 
+    - VERSION=$(python -c "from megatron import core; print(core.__version__)")
+    - git switch --force-create core_r$VERSION origin/$CI_DEFAULT_BRANCH
+    - git push -u origin core_r$VERSION --force
+    - |
+      MESSAGE='{
+        "blocks": [
+          {
+            "type": "section",
+            "text": {
+              "type": "mrkdwn",
+              "text": "Releasebot 🤖: Megatron Core has been frozen 🎉 to branch `core_r$VERSION`"
+            }
+          }
+        ]
+      }'
+
+      curl -X POST -H "Content-type: application/json" --data "$MESSAGE" ${MCORE_NOTIFICATION_HOOK_MAIN}
+
 publish-wheel:
-  extends: [.publish_common]
+  extends: [.publish_common_release]
   image: quay.io/pypa/manylinux_2_28_x86_64  
+  tags: [mcore-docker-node-small]
   script:
     - export TWINE_USERNAME
     - export TWINE_PASSWORT
@@ -18,7 +57,8 @@ publish-wheel:
     - twine upload --repository pypi wheelhouse/*
 
 create-gh-release:
-  extends: [.publish_common]
+  extends: [.publish_common_release]
+  tags: [mcore-docker-node-small]
   image:
     name: registry.gitlab.com/gitlab-ci-utils/curl-jq
     entrypoint: [""]

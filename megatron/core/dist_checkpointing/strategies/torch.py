@@ -44,7 +44,12 @@ from ..mapping import (
     is_main_replica,
 )
 from .async_utils import AsyncRequest
-from .base import AsyncSaveShardedStrategy, LoadShardedStrategy, StrategyAction, default_strategies
+from .base import (
+    AsyncSaveShardedStrategy,
+    LoadShardedStrategy,
+    StrategyAction,
+    register_default_strategy,
+)
 from .filesystem_async import FileSystemWriterAsync
 from .resharding import (
     TensorReformulationMetadata,
@@ -64,7 +69,16 @@ try:
 except ImportError:
     HAVE_TE = False
 
-_import_trigger = None
+
+def register_default_torch_strategies():
+    """Register default strategies related to PyT Distributed backend."""
+    register_default_strategy(
+        StrategyAction.LOAD_SHARDED, 'torch_dist', 1, TorchDistLoadShardedStrategy()
+    )
+    register_default_strategy(
+        StrategyAction.SAVE_SHARDED, 'torch_dist', 1, TorchDistSaveShardedStrategy('torch_dist', 1)
+    )
+
 
 logger = getLogger(__name__)
 
@@ -818,11 +832,3 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
 
     def check_version_compatibility(self, loaded_version):
         pass  # TODO
-
-
-default_strategies[StrategyAction.LOAD_SHARDED.value][
-    ('torch_dist', 1)
-] = TorchDistLoadShardedStrategy()
-default_strategies[StrategyAction.SAVE_SHARDED.value][('torch_dist', 1)] = (
-    TorchDistSaveShardedStrategy('torch_dist', 1)
-)

@@ -287,9 +287,11 @@ def validate_args(args, defaults={}):
         args.virtual_pipeline_model_parallel_size = None
         # Overlap P2P communication is disabled if not using the interleaved schedule.
         args.overlap_p2p_comm = False
+        args.align_param_gather = False
         if args.rank == 0:
-            print('WARNING: Setting args.overlap_p2p_comm to False since non-interleaved '
-                  'schedule does not support overlapping p2p communication')
+            print('WARNING: Setting args.overlap_p2p_comm and args.align_param_gather to False '
+                  'since non-interleaved schedule does not support overlapping p2p communication '
+                  'and aligned param AG')
 
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer, \
@@ -308,10 +310,6 @@ def validate_args(args, defaults={}):
             '--overlap-param-gather-with-optimizer-step only supported with interleaved pipeline parallelism'
         assert not args.use_dist_ckpt, \
             '--overlap-param-gather-with-optimizer-step not supported with distributed checkpointing yet'
-
-    if args.align_param_gather:
-        assert args.virtual_pipeline_model_parallel_size is not None, \
-            '--align-param-gather only supported with interleaved pipeline parallelism'
 
     if args.fp8_param_gather:
         assert args.use_distributed_optimizer, \
@@ -619,6 +617,16 @@ def validate_args(args, defaults={}):
     if args.dist_ckpt_format_deprecated and args.rank == 0:
         print('--dist-ckpt-format is deprecated and has no effect.'
               ' Use --ckpt-format to select the checkpoint format.')
+
+    # MoE upcycling check
+    if args.moe_use_upcycling:
+        assert args.save is not None, "When using upcycling, the --save option must be specified."
+        if not args.no_load_optim:
+            args.no_load_optim = True
+            print('Warning: disabling --no-load-optim for upcycling.')
+        if not args.no_load_rng:
+            args.no_load_rng = True
+            print('Warning: disabling --no-load-rng for upcycling.')
 
     # Print arguments.
     _print_args("arguments", args)
@@ -1379,6 +1387,11 @@ def _add_checkpointing_args(parser):
                            'None - No non-persistent checkpointing (default option).')
     group.add_argument('--non-persistent-global-ckpt-dir', type=str, default=None,
                        help='Directory containing global non-persistent model checkpoints.')
+    group.add_argument('--non-persistent-local-ckpt-dir', type=str, default=None,
+                       help='Directory containing local non-persistent model checkpoints.')
+    group.add_argument('--non-persistent-local-ckpt-algo', type=str, default='fully_parallel',
+                       choices=['fully_parallel', 'atomic'],
+                       help='Algorithm for local non-persistent checkpointing.')
     group.add_argument('--finetune', action='store_true',
                        help='Load model for finetuning. Do not load optimizer '
                        'or rng state from checkpoint and set iteration to 0. '
@@ -1544,9 +1557,10 @@ def _add_distributed_args(parser):
                        default=False, help='If set, overlap param all-gather in distributed optimizer.')
     group.add_argument('--overlap-param-gather-with-optimizer-step', action='store_true',
                        default=False, help='If set, overlap param all-gather of first bucket with optimizer step.')
-    group.add_argument('--align-param-gather', action='store_true', default=False,
-                       help='If set, all PP stages will launch param all-gathers simultaneously. '
-                       'Otherwise, each PP stage will independently launch as needed.')
+    group.add_argument('--no-align-param-gather', action='store_false',
+                       help='If not set, all PP stages will launch param all-gathers simultaneously. '
+                       'Otherwise, each PP stage will independently launch as needed.',
+                       dest='align_param_gather')
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
                        help='If not set, use scatter/gather to optimize communication of tensors in pipeline.',
                        dest='scatter_gather_tensors_in_pipeline')
@@ -1882,6 +1896,9 @@ def _add_moe_args(parser):
                        help='Enable checkpointing for moe_layer, should be used when memory is not sufficient.')
     group.add_argument('--moe-extended-tp', action='store_true',
                        help='Alternative to expert parallelism, all experts are sharded across TPXEP domain.')
+    group.add_argument('--moe-use-upcycling', action='store_true',
+                       help='Load a checkpoint of a dense model, convert it into an MoE model, and save the converted model to the path specified by --save. '
+                       'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.')
 
     return parser
 

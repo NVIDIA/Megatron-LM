@@ -29,7 +29,6 @@ class TestNonPersistentSaveAndLoad:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(('tp,pp'), [(2, 4)])
-    @pytest.mark.skip(reason="Tests are flaky and need to be debugged")
     def test_basic_save_load_scenarios(self, tmp_path_dist_ckpt, tp, pp):
         Utils.initialize_model_parallel(tp, pp)
         num_floating_point_operations_so_far = 0
@@ -107,7 +106,7 @@ class TestNonPersistentSaveAndLoad:
             for ckpt_a in ckpt_dirs:
                 for ckpt_b in ckpt_dirs:
                     for filename in os.listdir(os.path.join(non_persistent_ckpt_dir, ckpt_a)):
-                        if filename != "common.pt":
+                        if filename != "common.pt" and filename != ".metadata":
                             assert filecmp.cmp(
                                 os.path.join(non_persistent_ckpt_dir, ckpt_a, filename),
                                 os.path.join(non_persistent_ckpt_dir, ckpt_b, filename),
@@ -118,7 +117,6 @@ class TestNonPersistentSaveAndLoad:
 
 class TestLegacySaveAndLoad:
     @pytest.mark.parametrize(('tp,pp'), [(2, 4)])
-    @pytest.mark.skip(reason="Tests are flaky and need to be debugged")
     def test_basic_save_load_scenario(self, tmp_path_dist_ckpt, tp, pp):
         Utils.initialize_model_parallel(tp, pp)
         num_floating_point_operations_so_far = 0

@@ -17,6 +17,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_global_ranks,
     get_context_parallel_group,
+    get_tensor_and_expert_parallel_world_size,
     get_tensor_model_parallel_group,
 )
 from megatron.core.tensor_parallel import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
@@ -111,6 +112,7 @@ class TELinear(te.pytorch.Linear):
         skip_bias_add: bool,
         skip_weight_param_allocation: bool,
         tp_comm_buffer_name: str = None,
+        is_expert: bool = False,
     ):
         self.config = config
 
@@ -143,24 +145,56 @@ class TELinear(te.pytorch.Linear):
                         if hasattr(self.config, "tp_comm_overlap_rs")
                         else self.config.tp_comm_split_rs or self.config.tp_comm_atomic_rs
                     )
+                    # Disable ub overlap for experts.
+                    if is_expert:
+                        extra_kwargs["ub_overlap_ag"] = False
+                        extra_kwargs["ub_overlap_rs"] = False
                 else:
                     extra_kwargs["ub_split_ag"] = self.config.tp_comm_split_ag
                     extra_kwargs["ub_atomic_gemm_ag"] = self.config.tp_comm_atomic_ag
                     extra_kwargs["ub_split_rs"] = self.config.tp_comm_split_rs
                     extra_kwargs["ub_atomic_gemm_rs"] = self.config.tp_comm_atomic_rs
+                    # Disable ub overlap for experts.
+                    if is_expert:
+                        extra_kwargs["ub_split_ag"] = False
+                        extra_kwargs["ub_atomic_gemm_ag"] = False
+                        extra_kwargs["ub_split_rs"] = False
+                        extra_kwargs["ub_atomic_gemm_rs"] = False
                 if _te_version > packaging.version.Version("1.0.0"):
                     assert (
                         tp_comm_buffer_name is not None
                     ), "Buffer name should be set to configure communication overlap settings"
                     extra_kwargs["ub_name"] = tp_comm_buffer_name
 
+        self.expert_parallel = self.config.expert_model_parallel_size > 1
+        if is_expert and self.expert_parallel:
+            rng_tracker_name = get_expert_parallel_rng_tracker_name()
+        else:
+            rng_tracker_name = None
+        if _te_version >= packaging.version.Version("1.7.0.dev"):
+            extra_kwargs["rng_tracker_name"] = rng_tracker_name
+
+        # Disable communications in TE when using SP or EP by making TE agnostic of model parallel.
+        tp_size = self.config.tensor_model_parallel_size
+        tp_group = get_tensor_model_parallel_group(check_initialized=False)
+        if is_expert and (self.config.sequence_parallel or self.expert_parallel):
+            if self.config.moe_extended_tp:
+                tp_size = get_tensor_and_expert_parallel_world_size()
+            if parallel_mode == "column":
+                output_size = divide(output_size, tp_size)
+            elif parallel_mode == "row":
+                input_size = divide(input_size, tp_size)
+            parallel_mode = None
+            tp_size = 1
+            tp_group = None
+
         super().__init__(
             in_features=input_size,
             out_features=output_size,
             sequence_parallel=self.config.sequence_parallel,
             fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
-            tp_group=get_tensor_model_parallel_group(check_initialized=False),
-            tp_size=self.config.tensor_model_parallel_size,
+            tp_group=tp_group,
+            tp_size=tp_size,
             get_rng_state_tracker=(
                 get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
             ),
@@ -170,6 +204,9 @@ class TELinear(te.pytorch.Linear):
             parallel_mode=parallel_mode,
             **extra_kwargs,
         )
+
+        for param in self.parameters():
+            setattr(param, 'allreduce', not (is_expert and self.expert_parallel))
 
     def forward(self, x):
         """Forward."""
@@ -337,9 +374,6 @@ class TEColumnParallelLinear(TELinear):
         if gather_output:
             raise ValueError('Transformer Engine linear layers do not support gather_output = True')
 
-        if is_expert:
-            raise ValueError('Transformer Engine linear layers do not yet support MoE')
-
         super().__init__(
             input_size=input_size,
             output_size=output_size,
@@ -348,6 +382,7 @@ class TEColumnParallelLinear(TELinear):
             init_method=condition_init_method(config, init_method),
             bias=bias,
             skip_bias_add=skip_bias_add,
+            is_expert=is_expert,
             skip_weight_param_allocation=skip_weight_param_allocation,
             tp_comm_buffer_name=tp_comm_buffer_name,
         )
@@ -384,9 +419,6 @@ class TERowParallelLinear(TELinear):
                 "Transformer Engine linear layers do not support input_is_parallel = False"
             )
 
-        if is_expert:
-            raise ValueError('Transformer Engine linear layers do not yet support MoE')
-
         super().__init__(
             input_size=input_size,
             output_size=output_size,
@@ -396,6 +428,7 @@ class TERowParallelLinear(TELinear):
             bias=bias,
             skip_bias_add=skip_bias_add,
             skip_weight_param_allocation=False,  # We don't currently use this for row parallel layers # pylint: disable=line-too-long
+            is_expert=is_expert,
             tp_comm_buffer_name=tp_comm_buffer_name,
         )
 

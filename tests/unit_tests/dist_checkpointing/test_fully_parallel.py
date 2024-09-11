@@ -13,6 +13,7 @@ from megatron.core.dist_checkpointing.dict_utils import (
     map_reduce,
     nested_values,
 )
+from megatron.core.dist_checkpointing.exchange_utils import _get_empty_tensor_for_exchange
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, is_main_replica
 from megatron.core.dist_checkpointing.strategies.base import (
     LoadShardedStrategy,
@@ -289,13 +290,14 @@ class TestFullyParallelSaveAndLoad:
 
         mem_alloc = []
 
-        class ParallelLoadWithMemUsage(FullyParallelLoadStrategyWrapper):
-            def _get_empty_tensor_for_exchange(self, *args, **kwargs) -> torch.Tensor:
-                ret = super()._get_empty_tensor_for_exchange(*args, **kwargs)
-                mem_alloc.append(torch.cuda.memory_allocated())
-                return ret
+        real_get_empty_tensor_for_exchange = _get_empty_tensor_for_exchange
 
-        load_strategy = ParallelLoadWithMemUsage(mock_strategy)
+        def mock_get_empty_tensor_for_exchange(*args, **kwargs) -> torch.Tensor:
+            ret = real_get_empty_tensor_for_exchange(*args, **kwargs)
+            mem_alloc.append(torch.cuda.memory_allocated())
+            return ret
+
+        load_strategy = FullyParallelLoadStrategyWrapper(mock_strategy)
         torch.distributed.barrier()
 
         # Each tensor is 4MB, 40MB in total.
@@ -311,7 +313,10 @@ class TestFullyParallelSaveAndLoad:
 
         mem_alloc_start = torch.cuda.memory_allocated()
 
-        with TempNamedDir(tmp_path_dist_ckpt / 'mock_dir') as ckpt_dir_A:
+        with mock.patch(
+            'megatron.core.dist_checkpointing.exchange_utils._get_empty_tensor_for_exchange',
+            new=mock_get_empty_tensor_for_exchange,
+        ), TempNamedDir(tmp_path_dist_ckpt / 'mock_dir') as ckpt_dir_A:
             _ = load_strategy.load(sharded_state_dict, ckpt_dir_A)
 
         # Each rank is expected to do 7 * 10 empty allocations

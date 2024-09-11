@@ -90,7 +90,7 @@ unit_tests:
   parallel:
     matrix:
       - TAG: latest
-      - TAG: 033d8b0de5561ee27fb69ae301010f9cfd4c2ca3
+      - TAG: 655a663df2e9c3d8991e676e0163a5822da249a7
   tags: [8xL40S]
   variables:
     GIT_STRATEGY: clone
@@ -105,6 +105,10 @@ unit_tests:
   script:
     - |
       cd /opt/megatron-lm
+      if [[ $UNIT_TEST_REPEAT -eq 0 ]]; then
+        exit 0
+      fi
+
       for i in $(seq $UNIT_TEST_REPEAT); do
         SEED=$((RANDOM % 9000 + 1000));
         SKIPPED=()

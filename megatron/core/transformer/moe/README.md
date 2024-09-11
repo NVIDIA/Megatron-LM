@@ -61,6 +61,7 @@ Megatron-Core offers rich parallelism mappings, combining Expert Parallelism wit
 | --moe-token-drop-policy | The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped. |
 | --moe-layer-recompute | Enable activation checkpointing for moe_layer, should be used when memory is not sufficient. |
 | --moe-extended-tp | (Experimental) Alternative parallelization strategy for expert parallelism. Instead of distributing experts across *expert_model_parallel_size*, each expert is sharded along extendended tensor parallel domain (tensor_model_paralle_size * expert_model_parallel_size). It avoids the load balancing problem with MOE training. Only available with `--moe-token-dispatcher-type allgather`. |
+| --moe-use-upcycling | Load the dense model checkpoint, convert it into an MoE model at runtime and start training. The converted model will be saved to the path specified by `--save` before training begins. Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.|
 
 
 ## Usage
@@ -116,6 +117,12 @@ Besides these limitations, Distributed Checkpointing is fully functional.
 Usage
 - `--use-dist-ckpt` The main argument, it will attempt to save and load using distributed checkpointing.
 - `--auto-detect-ckpt-format` With this, it can load both distributed checkpointing and legacy checkpointing.
+
+### Upcycling
+
+Use `--moe-use-upcycling` to enable the upcycling feature, which will load the dense model from the directory specified by `--load`, convert it into an MoE model at runtime and start training. The converted model will be saved to the path specified by `--save` before training begins. Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.
+
+The MoE model structure is defined through script arguments. All MoE-related arguments (such as `--num-experts`) can be customized; however, other model structure arguments must be consistent with those of the dense model.
 
 ## MoE training example:
 <details>

@@ -6,11 +6,8 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.distributed import (
-    DistributedDataParallelConfig,
-    ParamAndGradBuffer,
-    partition_buckets,
-)
+from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 from tests.unit_tests.test_utilities import TestModel, Utils
 
 
@@ -42,7 +39,7 @@ def get_model_and_buffers(
         param_to_name[param] = name
     param_indices = list(range(len(params)))
 
-    param_and_grad_buffer = ParamAndGradBuffer(
+    param_and_grad_buffer = _ParamAndGradBuffer(
         ddp_config,
         param_dtype=torch.bfloat16,
         grad_dtype=torch.float32,
@@ -57,7 +54,7 @@ def get_model_and_buffers(
     return model, param_and_grad_buffer
 
 
-@pytest.mark.parametrize("bucket_size", [None, 9999, 10000, 10001, 19999, 20000])
+@pytest.mark.parametrize("bucket_size", [None, 9000, 9025, 9050, 18000, 18050, 20000])
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("shared_embedding", [False, True])
