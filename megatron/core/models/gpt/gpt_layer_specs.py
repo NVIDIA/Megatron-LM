@@ -9,7 +9,8 @@ from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
-from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
@@ -167,9 +168,19 @@ def _get_mlp_module_spec(
 
         return ModuleSpec(
             module=MoELayer,
-            submodules=(
-                MLPSubmodules(linear_fc1=linear_fc1, linear_fc2=linear_fc2)
-                if not moe_grouped_gemm or use_te_grouped_gemm
-                else None
+            submodules=MoESubmodules(
+                experts=(
+                    MLPSubmodules(linear_fc1=linear_fc1, linear_fc2=linear_fc2)
+                    if not moe_grouped_gemm or use_te_grouped_gemm
+                    else None
+                ),
+                shared_experts=ModuleSpec(
+                    module=SharedExpertMLP,
+                    params={"gate": False},
+                    submodules=MLPSubmodules(
+                        linear_fc1=TEColumnParallelLinear if use_te else ColumnParallelLinear,
+                        linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
+                    ),
+                ),
             ),
         )

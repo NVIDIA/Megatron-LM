@@ -49,11 +49,15 @@ def initialize_expert_layer(seed, glu=True, moe_grouped_gemm=False, **config_kwa
     )
     if moe_grouped_gemm:
         model = TEGroupedMLP(
-            num_local_experts, transformer_config, transformer_layer_spec.submodules.mlp.submodules
+            num_local_experts,
+            transformer_config,
+            transformer_layer_spec.submodules.mlp.submodules.experts,
         )
     else:
         model = SequentialMLP(
-            num_local_experts, transformer_config, transformer_layer_spec.submodules.mlp.submodules
+            num_local_experts,
+            transformer_config,
+            transformer_layer_spec.submodules.mlp.submodules.experts,
         )
     return model
 
