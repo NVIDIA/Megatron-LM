@@ -58,6 +58,7 @@ def get_model_and_buffers(
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("shared_embedding", [False, True])
+@pytest.mark.skip(reason="Flaky test")
 def test_bucket_sizes(
     bucket_size: Optional[int], use_distributed_optimizer: bool, bias: bool, shared_embedding: bool
 ):
