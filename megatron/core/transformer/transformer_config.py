@@ -236,6 +236,16 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # MoE related
     ####################
+    moe_shared_expert_intermediate_size: int = None
+    """Shared expert total ffn hidden size.
+    It should be equal to 'num_shared_experts * ffn_size_of_each_shared_expert' if
+    there are multiple shared experts.
+    None means no shared expert."""
+
+    moe_shared_expert_overlap: bool = False
+    """Enable overlapping between shared expert computations and dispatcher communications.
+    Without this, the shared epxerts execute after the routed experts."""
+
     moe_router_load_balancing_type: str = "aux_loss"
     """Determines the load balancing strategy for the router. "aux_loss" corresponds to the load
     balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing
@@ -352,6 +362,20 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError('num_moe_experts must be non-negative.')
+
+        if self.moe_shared_expert_intermediate_size is not None:
+            if self.moe_shared_expert_intermediate_size <= 0:
+                raise ValueError(
+                    f'moe_shared_expert_intermediate_size must be '
+                    f'num_shared_experts * ffn_size_of_each_shared_expert, '
+                    f'but got {self.moe_shared_expert_intermediate_size}'
+                )
+            if self.moe_shared_expert_overlap and self.moe_token_dispatcher_type not in [
+                "alltoall"
+            ]:
+                raise ValueError(
+                    f'moe_shared_expert_overlap only works with alltoall token dispatcher.'
+                )
 
         if self.moe_expert_capacity_factor is not None:
             if self.moe_token_dispatcher_type not in ["alltoall", "alltoall_seq"]:

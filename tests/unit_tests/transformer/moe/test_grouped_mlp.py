@@ -85,7 +85,10 @@ class TestParallelGroupedMLP:
         ## Grouped GEMM
         _set_random_seed(seed_=123, data_parallel_random_init=False)
         tf_config.moe_grouped_gemm = True
-        self.grouped_mlp = MoELayer(tf_config)
+        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            self.num_experts, moe_grouped_gemm=True
+        )
+        self.grouped_mlp = MoELayer(tf_config, transformer_layer_spec.submodules.mlp.submodules)
         self.grouped_mlp = Float16Module(self.grouped_mlp, self.args).module
         print("done intializing for grouped gemm")
 
