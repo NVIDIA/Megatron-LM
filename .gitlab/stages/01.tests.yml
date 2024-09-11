@@ -90,7 +90,7 @@ unit_tests:
   parallel:
     matrix:
       - TAG: latest
-      - TAG: 0bb840767d0643c2d0df7192d754ec7db3a18412
+      - TAG: 8fc755388a03bae05cb740857008b8916e01a63c
   tags: [8xL40S]
   variables:
     GIT_STRATEGY: clone
