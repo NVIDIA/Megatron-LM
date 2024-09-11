@@ -234,10 +234,6 @@ class Tokenizer:
         sentence = Tokenizer.tokenizer.tokenize(sentence)
         return sentence
 
-    def pad(self, content, seq_len=1024):
-        out = np.pad(content, pad_width=(0,max(0,seq_len-len(content))), mode='constant', constant_values=self.eod_token)
-
-        return out
 
 class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]):
     """A simple task encoder for captioning."""
@@ -253,8 +249,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
 
         self.tokenizer = Tokenizer()
         self.manual_prompts = json.load(open(self.args.prompt_path))
-        self.seq_len = self.args.decoder_seq_length - self.args.seq_length
-        self.max_seq_len = self.seq_len
+        self.seq_len = self.args.dataloader_seq_length
 
         self.txt_to_token_dict = {}
 
@@ -321,9 +316,6 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
         prompt_len = len(tokenizer_image_token(self.args, cur_prompt, self.tokenizer))
         target[:prompt_len] = IGNORE_INDEX
 
-        input_ids = self.tokenizer.pad(input_ids, self.max_seq_len+1) # pad with EOD
-        target = self.tokenizer.pad(target, self.max_seq_len+1) #, pad_value=IGNORE_INDEX) # pad with ignore_index. this will be used to create loss_mask
-
         return ImageTaskSample(
             __key__=sample.__key__,
             __subflavors__=sample.__subflavors__,
@@ -366,9 +358,6 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
 
         prompt_len = len(tokenizer_image_token(self.args, sample.context, self.tokenizer, has_image=has_image))
         target[:prompt_len] = IGNORE_INDEX
-
-        input_ids = self.tokenizer.pad(input_ids, self.max_seq_len+1) # pad with EOD
-        target = self.tokenizer.pad(target, self.max_seq_len+1) #, pad_value=IGNORE_INDEX) # pad with ignore_index. this will be used to create loss_mask
 
         return ImageTaskSample(
             __key__=sample.__key__,
@@ -495,20 +484,15 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
             elif conv.sep_style == conversation_lib.SeparatorStyle.LLAMA_2:
                 raise NotImplementedError("this tokenizer is not supported yet with this data type")
 
-            if cur_len < self.max_seq_len:
-                if cur_len != total_len:
-                    target[:] = IGNORE_INDEX
+            if cur_len != total_len:
+                target[:] = IGNORE_INDEX
 
-                    raise Exception(
-                        f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}. Something is wrong, please fix!"
-                    )
+                raise Exception(
+                    f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}. Something is wrong, please fix!"
+                )
 
         else:
             return NotImplementedError
-
-        # pad to max_seq_len
-        input_ids = self.tokenizer.pad(input_ids, self.max_seq_len+1) # pad with EOD
-        target = self.tokenizer.pad(target, self.max_seq_len+1)
 
         return ImageTaskSample(
             __key__=sample.__key__,
@@ -527,37 +511,37 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
             sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles, self.args.use_thumbnail, augment,
         )
         num_tiles = [len(imgs)]
+        has_image = True
+
+        if "<image>" not in sample.context:
+            sample.context = "<image>" + sample.context
 
         if sample.context[-1:] != "\n":
             sample.context = sample.context + "\n"
 
-        question_token = self.tokenizer(sample.context)
         if isinstance(sample.answers, list):
             answer_list = sample.answers
             weight_list = np.array(sample.answer_weights).astype(np.float32)
             weight_list = weight_list / np.sum(weight_list)
             answer_idx = np.random.choice(weight_list.shape[0], 1, p=weight_list)[0]
             answer = answer_list[answer_idx]
-            answer_token = self.tokenizer(answer)
         else:
-            answer_token = self.tokenizer(sample.answers)
+            answer = sample.answers
 
-        prompt_len = len(question_token)
+        conversation = sample.context + answer
+        text = np.array(tokenizer_image_token(self.args, conversation, self.tokenizer, has_image=has_image))
 
-        seq_len = self.max_seq_len + 4
+        prompt_len = len(tokenizer_image_token(self.args, sample.context, self.tokenizer, has_image=has_image))
 
-        text_sample = np.concatenate([[IMAGE_TOKEN_INDEX], question_token, answer_token])
-        text_sample = self.tokenizer.pad(text_sample, seq_len)
-
-        target = text_sample.copy()
-        target[:max(0, prompt_len - 1)] = IGNORE_INDEX
+        target = text.copy()
+        target[:prompt_len] = IGNORE_INDEX
 
         return ImageTaskSample(
             __key__=sample.__key__,
             __subflavors__=sample.__subflavors__,
             imgs=imgs,
             num_tiles=num_tiles,
-            text=text_sample,
+            text=text,
             prompt_len=prompt_len,
             target=target,
         )
@@ -607,10 +591,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
 
         text_sample = self.tokenizer(text)
         prompt_len = len(cur_prompt)
-        seq_len = self.seq_len + 4
         text_sample = np.concatenate([cur_prompt, text_sample])
-        text_sample = self.tokenizer.pad(text_sample, seq_len=seq_len)
-        text_sample = text_sample[:seq_len]
 
         return ImageTaskSample(
             __key__=sample.__key__,
@@ -634,14 +615,31 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
         if len(num_tiles) == 0:
             num_tiles = torch.tensor([[0]], dtype=torch.int)
 
+        # If the user hasn't defined a target sequence length, then use the max along the sample lengths.
+        max_seq_len = self.seq_len
+        if not max_seq_len:
+            max_seq_len = max(len(s.text) for s in samples)
+
+        text_mat = np.full((len(samples), max_seq_len), self.tokenizer.eod_token, dtype=np.int64)
+        # +1 to accommodate shift to left by one later.
+        target_mat = np.full((len(samples), max_seq_len + 1), self.tokenizer.eod_token, dtype=np.int64)
+
+        for i, s in enumerate(samples):
+            # If the sample/target length exceeds the target sequence length, then truncate.
+            text_len = min(max_seq_len, len(s.text))
+            target_len = min(max_seq_len+1, len(s.target))
+
+            text_mat[i, :text_len] = np.array(s.text)[:text_len]
+            target_mat[i, :target_len] = np.array(s.target)[:target_len]
+
         batch = ImageTaskBatch(
             __keys__=[s.__key__ for s in samples],
             __subflavors__=[s.__subflavors__ for s in samples],
             imgs=imgs,
             num_tiles=num_tiles,
-            text=torch.from_numpy(np.stack([s.text for s in samples], axis=0).astype(np.int64)),
+            text=torch.from_numpy(text_mat),
             prompt_len=torch.from_numpy(np.array([s.prompt_len for s in samples], dtype=np.int64)),
-            target=torch.from_numpy(np.stack([s.target for s in samples], axis=0).astype(np.int64)),
+            target=torch.from_numpy(target_mat),
         )
 
         return batch

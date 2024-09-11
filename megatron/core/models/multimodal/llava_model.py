@@ -9,7 +9,7 @@ import torch
 from megatron.core import InferenceParams
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.models.gpt import GPTModel
-from megatron.core.models.vision.clip_vit_model import CLIPViTModel, get_image_sequence_length
+from megatron.core.models.vision.clip_vit_model import CLIPViTModel, get_num_image_embeddings
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -117,6 +117,9 @@ class LLaVAModel(MegatronModule):
                 self.language_model.share_embeddings_and_output_weights
             )
             self._language_max_sequence_length = language_max_sequence_length
+            self._language_is_pipeline_parallel = (
+                language_transformer_config.pipeline_model_parallel_size > 1
+            )
 
         class_token_len = 1
         if self.add_encoder:
@@ -149,8 +152,8 @@ class LLaVAModel(MegatronModule):
                     partial(_load_state_dict_hook_ignore_param_names, vision_projection_param_names)
                 )
 
-        self._img_seq_len = get_image_sequence_length(
-            img_h, img_w, patch_dim, not drop_vision_class_token, class_token_len
+        self._img_seq_len = get_num_image_embeddings(
+            img_h, img_w, patch_dim, drop_vision_class_token, class_token_len
         )
 
     def shared_embedding_or_output_weight(self):
@@ -283,6 +286,13 @@ class LLaVAModel(MegatronModule):
             # plus text sequence length.
             seq_lens = num_image_tiles_batch * img_seq_len - num_images_per_sample + text_seq_len
             max_seq_len = seq_lens.max()
+            # Pipeline parallel expects fixed input size. Check if we need to pad.
+            if (
+                self._language_is_pipeline_parallel
+                and max_seq_len < self._language_max_sequence_length
+            ):
+                max_seq_len = self._language_max_sequence_length
+
             batch_indices, non_image_indices = torch.where(input_ids != image_token_index)
 
             # New position ids for the text tokens, shifted by the image sequence length.
@@ -394,13 +404,15 @@ class LLaVAModel(MegatronModule):
             final_embedding = final_embedding.transpose(1, 0).contiguous()
 
         # Truncate if exceeding the language model's max sequence length.
-        if (
+        truncate_embedding = (
             final_embedding is not None
             and final_embedding.shape[0] > self._language_max_sequence_length
-        ):
+        )
+        if truncate_embedding:
             final_embedding = final_embedding[: self._language_max_sequence_length]
 
-        if has_labels and final_labels.shape[1] > self._language_max_sequence_length:
+        truncate_labels = has_labels and final_labels.shape[1] > self._language_max_sequence_length
+        if truncate_labels:
             final_labels = final_labels[:, : self._language_max_sequence_length]
             final_loss_mask = final_loss_mask[:, : self._language_max_sequence_length]
 

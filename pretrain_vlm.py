@@ -2,6 +2,7 @@
 """Pretrain vision language model."""
 from copy import deepcopy
 from functools import partial
+import warnings
 
 import torch
 
@@ -9,6 +10,7 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.multimodal_dataset import MockMultimodalDataset, MultimodalDatasetConfig
 from megatron.core.enums import ModelType
+from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.core.models.multimodal.llava_model import LLaVAModel, IMAGE_TOKEN_INDEX
 from megatron.core.models.multimodal.llava_spec import (
     decoder_model_with_transformer_engine_default_spec,
@@ -22,17 +24,6 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from pretrain_gpt import loss_func
-
-
-def get_num_image_tokens():
-    args = get_args()
-    add_class_token = not args.disable_vision_class_token
-
-    num_patches_per_dim_h = args.img_h // args.patch_dim
-    num_patches_per_dim_w = args.img_w // args.patch_dim
-    num_patches = num_patches_per_dim_h * num_patches_per_dim_w
-    num_image_tokens = num_patches + (1 if add_class_token else 0)
-    return num_image_tokens
 
 
 def model_provider(
@@ -56,9 +47,20 @@ def model_provider(
     """
     args = get_args()
 
-    num_image_tokens = get_num_image_tokens()
-    args.decoder_seq_length = args.seq_length + num_image_tokens
-    args.seq_length = num_image_tokens
+    num_image_embeddings = get_num_image_embeddings(
+        args.img_h, args.img_w, args.patch_dim, args.disable_vision_class_token, 1
+    )
+    old_seq_length = args.seq_length
+    # decoder_seq_length denotes the language model sequence length.
+    args.decoder_seq_length = args.seq_length + num_image_embeddings
+
+    # seq_length and encoder_seq_length denote the vision model sequence length. Override if the user provided something else.
+    args.seq_length = args.encoder_seq_length = num_image_embeddings
+    if torch.distributed.get_rank() == 0 and old_seq_length != args.seq_length:
+        warnings.warn(
+            f"Changed seq_length and encoder_seq_length (vision model sequence length) from {old_seq_length} to num_image_tokens ({num_image_embeddings})"
+        )
+
     args.max_position_embeddings = max(args.max_position_embeddings, args.decoder_seq_length)
 
     print_rank_0('building a multimodal model ...')
@@ -108,6 +110,9 @@ def model_provider(
             )
 
     vision_projection_modules = deepcopy(language_transformer_layer_spec.submodules.mlp.submodules)
+
+    if args.virtual_pipeline_model_parallel_size:
+        raise NotImplementedError("virtual pipeline model parallelism is not supported yet.")
 
     model = LLaVAModel(
         language_transformer_config=language_transformer_config,

@@ -17,6 +17,7 @@ from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.parallel_state import get_tensor_model_parallel_rank
 from config import get_language_model_config, get_vision_model_config, get_vision_projection_config
+from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from layer_specs import get_layer_spec, get_mlp_module_spec, get_layer_spec_te
 from megatron.training import pretrain
@@ -45,17 +46,19 @@ def model_provider(
 
     print_rank_0('building a multimodal model ...')
 
-    num_image_tokens = get_num_image_embeddings()
-
+    num_image_embeddings = get_num_image_embeddings(args.img_h, args.img_w, args.patch_dim, args.disable_vision_class_token, 1)
     old_seq_length = args.seq_length
-    args.decoder_seq_length = args.seq_length + num_image_tokens
-    args.seq_length = num_image_tokens
-    if torch.distributed.get_rank() == 0:
-        warnings.warn("Changed decoder_seq_length to num_image_tokens ({num_image_tokens}) + user-specified seq_length ({old_seq_length}).")
+    args.seq_length = args.encoder_seq_length = num_image_embeddings
+    if torch.distributed.get_rank() == 0 and old_seq_length != args.seq_length:
+        warnings.warn(f"Changed seq_length and encoder_seq_length (vision model sequence length) from {old_seq_length} to num_image_tokens ({num_image_embeddings})")
 
+    max_num_image_embeddings = (args.max_num_tiles + int(args.use_thumbnail)) * num_image_embeddings
+
+    assert args.decoder_seq_length is not None, "Please provide --decoder-seq-length to set the language model sequence length"
+    assert args.decoder_seq_length > max_num_image_embeddings, "Language model sequence length must be greater than the maximum number of image embeddings"
     if args.decoder_seq_length > args.max_position_embeddings:
         args.max_position_embeddings = args.decoder_seq_length
-        warnings.warn("Expanded max_position_embeddings to {args.max_position_embeddings} to accommodate the full sequence of vit output + llm output.")
+        warnings.warn(f"Expanded max_position_embeddings to {args.max_position_embeddings} to accommodate the maximum language model sequence length")
 
     base_config = core_transformer_config_from_args(get_args())
     base_config.language_model_type = args.language_model_type
@@ -86,7 +89,7 @@ def model_provider(
     vision_projection_config = get_vision_projection_config(vision_projection_config, language_config.hidden_size)
 
     if args.encoder_pipeline_model_parallel_size > 0:
-        assert args.encoder_pipeline_model_parallel_size == 1, "ViT can only live on 1 pipeline stage."
+        assert args.encoder_pipeline_model_parallel_size == 1, "vision model and projection can only live on 1 pipeline stage."
         vision_config.pipeline_model_parallel_size = args.encoder_pipeline_model_parallel_size
         vision_projection_config.pipeline_model_parallel_size = args.encoder_pipeline_model_parallel_size
         if args.encoder_tensor_model_parallel_size > 0:
@@ -99,7 +102,7 @@ def model_provider(
         language_transformer_config=language_config,
         language_transformer_layer_spec=language_transformer_layer_spec,
         language_vocab_size=args.padded_vocab_size,
-        language_max_sequence_length=args.max_position_embeddings,
+        language_max_sequence_length=args.decoder_seq_length,
         vision_transformer_config=vision_config,
         vision_transformer_layer_spec=vision_transformer_layer_spec,
         drop_vision_class_token=args.disable_vision_class_token,
@@ -163,9 +166,9 @@ def get_batch(data_iterator):
 
     torch.cuda.nvtx.range_push("index tokens")
     tokenizer = get_tokenizer()
-    text_length = args.decoder_seq_length - args.seq_length
+    text_length = tokens_.shape[1]
     tokens = tokens_[:, :text_length].contiguous()
-    labels = tokens_[:, 1:text_length+1].contiguous()
+    labels = target[:, 1:text_length+1].contiguous()
 
     assert tokens.shape == labels.shape, f"tokens: {tokens.shape} != labels: {labels.shape}"
     torch.cuda.nvtx.range_pop()
@@ -186,25 +189,6 @@ def get_batch(data_iterator):
     torch.cuda.nvtx.range_pop()
 
     return tokens, labels, loss_mask, attention_mask, position_ids, imgs, num_tiles
-
-
-def get_num_image_embeddings():
-    """Get the number of image embeddings per tile."""
-    args = get_args()
-
-    add_class_token = not args.disable_vision_class_token
-
-    num_patches_per_dim_h = args.img_h // args.patch_dim
-    num_patches_per_dim_w = args.img_w // args.patch_dim
-    num_patches = num_patches_per_dim_h * num_patches_per_dim_w
-    num_image_embeddings_per_tile = num_patches + (1 if add_class_token else 0)
-
-    max_num_image_embeddings = (args.max_num_tiles + int(args.use_thumbnail)) * num_image_embeddings_per_tile
-
-    if max_num_image_embeddings > args.max_position_embeddings:
-        raise RuntimeError(f"Too many image embeddings {max_num_image_embeddings} for language model max embedding size {args.max_position_embeddings}")
-
-    return num_image_embeddings_per_tile
 
 
 def get_ltor_masks_and_position_ids(data,
@@ -242,9 +226,12 @@ def get_ltor_masks_and_position_ids(data,
             loss_mask[data == eod_token] = 0.0
 
         if question_length is not None:
-            for b in range(micro_batch_size):
-                loss_mask[b, :max(0, question_length[b].item() - 1)] = 0.0
-
+            # Create a mask based on question_length
+            question_length_mask = torch.arange(loss_mask.size(1), device=loss_mask.device)[None, :] < question_length[:, None]
+            # Invert the mask (1 where we want to keep the loss, 0 where we want to zero it out)
+            inverted_mask = ~question_length_mask
+            # Apply the mask to loss_mask
+            loss_mask = loss_mask * inverted_mask.float()
 
     # Position ids.
     position_ids = torch.arange(seq_length, dtype=torch.long,
@@ -253,15 +240,6 @@ def get_ltor_masks_and_position_ids(data,
     # We need to clone as the ids will be modifed based on batch index.
     if reset_position_ids:
         position_ids = position_ids.clone()
-
-
-    if question_length is not None:
-        # Create a mask based on question_length
-        question_length_mask = torch.arange(loss_mask.size(1), device=loss_mask.device)[None, :] < question_length[:, None]
-        # Invert the mask (1 where we want to keep the loss, 0 where we want to zero it out)
-        inverted_mask = ~question_length_mask
-        # Apply the mask to loss_mask
-        loss_mask = loss_mask * inverted_mask.float()
 
     if reset_position_ids or reset_attention_mask:
         # Loop through the batches:
@@ -357,6 +335,7 @@ def add_multimodal_extra_args(parser):
     group.add_argument("--use-tiling", action="store_true", default=False, help="Use input image tiling")
     group.add_argument("--max-num-tiles", type=int, default=1, help="Maximum number of image tiles")
     group.add_argument("--use-thumbnail", action="store_true", default=False, help="Add image thumbnail as a tile")
+    group.add_argument("--dataloader-seq-length", type=int, help="Make dataloader to produce sequences of specific length.")
 
     return parser
 
