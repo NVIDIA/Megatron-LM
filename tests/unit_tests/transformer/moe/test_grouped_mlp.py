@@ -95,6 +95,7 @@ class TestParallelGroupedMLP:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     def test_constructor(self):
         assert isinstance(self.sequential_mlp, MoELayer)
         assert isinstance(self.grouped_mlp, MoELayer)
@@ -133,6 +134,7 @@ class TestParallelGroupedMLP:
                 self.grouped_mlp.experts.weight1.shape == self.grouped_mlp.experts.weight2.t().shape
             )
 
+    @pytest.mark.internal
     def test_weight_init_value_the_same(self):
         gmm_w1 = self.grouped_mlp.experts.weight1.view(self.num_experts, -1, self.hidden_size)
         gmm_w2 = self.grouped_mlp.experts.weight2.view(self.num_experts, self.hidden_size, -1)
@@ -156,6 +158,7 @@ class TestParallelGroupedMLP:
             assert torch.equal(gmm_expert2_fc2, smm_expert2_fc2)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8,
         reason='GroupedGEMM kernels are not supported on this device.',
@@ -178,6 +181,7 @@ class TestParallelGroupedMLP:
         # assert torch.equal(output_smm, output_gmm)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8,
         reason='GroupedGEMM kernels are not supported on this device.',
@@ -196,6 +200,7 @@ class TestParallelGroupedMLP:
             assert str(e) == "Input batch_sizes should not be all zeros!"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8,
         reason='GroupedGEMM kernels are not supported on this device.',
@@ -277,6 +282,7 @@ class TestTEGroupedMLP:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     def test_constructor(self):
         assert isinstance(self.sequential_mlp, MoELayer)
         assert isinstance(self.grouped_mlp, MoELayer)
@@ -311,6 +317,7 @@ class TestTEGroupedMLP:
             )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     def test_gpu_forward_backward(self):
         self.sequential_mlp.cuda()
         self.grouped_mlp.cuda()
@@ -353,6 +360,7 @@ class TestTEGroupedMLP:
             torch.testing.assert_close(smm_result, gmm_result)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     def test_gpu_forward_backward_with_no_tokens_allocated(self):
         """Test the case when no token is allocated for groupedGEMM kernels."""
         self.grouped_mlp.cuda()
