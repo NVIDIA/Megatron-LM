@@ -89,10 +89,9 @@ class CLIPViTModel(VisionModule):
         self.model_type = ModelType.encoder_or_decoder
 
         # Transformer layers.
-        # TODO: Follow-up changes will make pre and post_process configurable.
-        # They are needed for supporting pipeline parallelism.
-        # Note: a final layer norm and/or linear layer present in some implementations
-        # are omitted here. They can be added separately where needed.
+        # TODO: Make pre_process and post_process configurable.
+        # NOTE: a final layer norm and/or linear layer in some implementations are omitted here.
+        # They can be added separately where needed.
         self.decoder = TransformerBlock(
             config=transformer_config,
             spec=transformer_layer_spec,
@@ -137,8 +136,8 @@ class CLIPViTModel(VisionModule):
         x = x + self.position_embeddings(self.position_ids)
         x = self.ln_pre(x)
         x = x.permute(1, 0, 2)  # [b, s, h] -> [s, b, h]
+        # `permute` can make the tensor non-contiguous, breaking pipelining.
         x = x.contiguous()
-        # contiguous() call required as `permute` can sparsify the tensor and this breaks pipelining
 
         x = self.decoder(x, attention_mask)
         x = x.permute(1, 0, 2)  # [s, b, h] -> [b, s, h]
@@ -147,9 +146,13 @@ class CLIPViTModel(VisionModule):
         return x
 
 
-def get_image_sequence_length(img_h, img_w, patch_dim, add_class_token, class_token_len):
-    """Get image sequence length given image size, patch size, and class token."""
+def get_num_image_embeddings(img_h, img_w, patch_dim, disable_vision_class_token, class_token_len):
+    """Get the number of image embeddings per image tile."""
+    add_class_token = not disable_vision_class_token
+
     num_patches_per_dim_h = img_h // patch_dim
     num_patches_per_dim_w = img_w // patch_dim
     num_patches = num_patches_per_dim_h * num_patches_per_dim_w
-    return num_patches + (class_token_len if add_class_token else 0)
+    num_image_embeddings_per_tile = num_patches + (class_token_len if add_class_token else 0)
+
+    return num_image_embeddings_per_tile
