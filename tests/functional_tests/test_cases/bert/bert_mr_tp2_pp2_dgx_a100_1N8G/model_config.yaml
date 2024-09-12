@@ -3,6 +3,7 @@ ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Tree
   CUBLAS_WORKSPACE_CONFIG: :4096:8
+  N_REPEATS: 5
 MODEL_ARGS:
   --num-layers: 24
   --hidden-size: 1024
@@ -36,11 +37,11 @@ MODEL_ARGS:
   --tensor-model-parallel-size: 2
   --pipeline-model-parallel-size: 2
   --use-legacy-models: true
-  --transformer-impl: local  
+  --transformer-impl: local
   --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --data-cache-path: ${DATA_CACHE_PATH}
-  --fp16: true  
+  --fp16: true
   --apply-query-key-layer-scaling: true
   --ckpt-format: torch
 TEST_TYPE: regular

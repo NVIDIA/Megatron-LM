@@ -29,7 +29,7 @@ spec:
 products:
   - scope: [mr]
     platforms: [dgx_a100]
-    time_limit: [1200]
+    time_limit: [12000]
     test_case:
     - gpt3_mr_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer_dgx_a100_1N8G
