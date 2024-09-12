@@ -3,6 +3,7 @@ ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Tree
   CUBLAS_WORKSPACE_CONFIG: :4096:8
+  N_REPEATS: 5
 MODEL_ARGS:
   --num-layers: 24
   --hidden-size: 1024
@@ -37,13 +38,13 @@ MODEL_ARGS:
   --pipeline-model-parallel-size: 4
   --num-layers-per-virtual-pipeline-stage: 2
   --use-legacy-models: true
-  --transformer-impl: local  
-  --deterministic-mode: true  
-  --use-checkpoint-args: true  
+  --transformer-impl: local
+  --deterministic-mode: true
+  --use-checkpoint-args: true
   --use-checkpoint-opt_param-scheduler: true
   --no-gradient-accumulation-fusion: true
   --data-cache-path: ${DATA_CACHE_PATH}
-  --fp16: true  
+  --fp16: true
   --apply-query-key-layer-scaling: true
   --ckpt-format: torch
 TEST_TYPE: ckpt-resume
