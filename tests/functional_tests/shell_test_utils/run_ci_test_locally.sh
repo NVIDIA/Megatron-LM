@@ -38,6 +38,7 @@ MANDATORY_VARS=(
     "CLUSTER"
     "DATASET"
     "WANDB_EXPERIMENT"
+    "GPUS_PER_NODE"
 )
 for mandatory_var in "${MANDATORY_VARS[@]}"; do
     if [[ -z "${!mandatory_var}" ]]; then
@@ -88,15 +89,15 @@ if [[ $(cat "${OUTPUT_PATH}/checkpoints/latest_checkpointed_iteration.txt" || ec
 fi
 
 # Fire of sbatch
-set +e
-sbatch -W <<EOF
-#!/bin/bash
+echo '#!/bin/bash' > sbatch.sh
 
-#SBATCH --nodes=$NODES
+if [[ $GPUS_PER_NODE != null ]]; then
+    echo '#SBATCH --gres=gpu:8' >> sbatch.sh
+fi
+echo "#SBATCH --nodes=$NODES
 #SBATCH --account $PPP
 #SBATCH --partition $PARTITION
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:8
 #SBATCH --time "04:00:00"
 #SBATCH --job-name=$PPP:mcore:release:$MODEL
 #SBATCH --dependency=singleton
@@ -109,11 +110,13 @@ echo "SLURM_JOB_ID=\$SLURM_JOB_ID" > "$SLURM_LOGS/\${SLURM_JOB_ID}.log"
 
 srun \
     --ntasks-per-node=1 \
-    --container-image="gitlab-master.nvidia.com/adlr/megatron-lm/mcore_ci:$IMAGE_TAG" \
-    --container-mounts="${DATA_PATH}:${DATA_PATH},${OUTPUT_PATH}:${OUTPUT_PATH}" \
+    --container-image='gitlab-master.nvidia.com/adlr/megatron-lm/mcore_ci:$IMAGE_TAG' \
+    --container-mounts='${DATA_PATH}:${DATA_PATH},${OUTPUT_PATH}:${OUTPUT_PATH}' \
     --container-workdir=/workspace/megatron-lm \
-    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${ARGUMENTS[@]}>>"$SLURM_LOGS/\${SLURM_JOB_ID}.log" 2>&1
-EOF
+    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${ARGUMENTS[@]}>>'$SLURM_LOGS/\${SLURM_JOB_ID}.log' 2>&1" >> sbatch.sh
+
+set +e
+sbatch -W sbatch.sh
 set -e
 done
 
