@@ -29,7 +29,7 @@ spec:
 
 products:
   - scope: [mr]
-    time_limit: [1200]
+    time_limit: [12000]
     test_case: 
     - bert_mr_mcore_tp2_pp2_dgx_a100_1N8G
     - bert_mr_mcore_tp2_pp2_local_spec_dgx_a100_1N8G

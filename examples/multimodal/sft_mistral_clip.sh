@@ -83,7 +83,8 @@ OPTIONS=" \
     --num-layers 32 \
     --hidden-size 4096 \
     --num-attention-heads 32 \
-    --seq-length 2048 \
+    --seq-length 576 \
+    --decoder-seq-length 2048 \
     --max-position-embeddings 4096 \
     --ffn-hidden-size 14336 \
     --train-iters 20000 \

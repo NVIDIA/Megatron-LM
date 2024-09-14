@@ -18,6 +18,7 @@ from megatron.core.transformer.moe.moe_utils import (
     sort_chunks_by_idxs,
     unpermute,
 )
+from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 """ We use the following notation throughout this file:
@@ -41,6 +42,7 @@ class MoETokenDispatcher:
         Initialize the MoE Token Dispatcher.
         """
         self.config = config
+        self.shared_experts: Optional[SharedExpertMLP] = None
 
     @abstractmethod
     def token_permutation(self, tokens: torch.Tensor, indices: torch.Tensor):
@@ -70,6 +72,10 @@ class MoETokenDispatcher:
             (torch.Tensor, torch.Tensor): Unpermuted activation and optional bias.
         """
         raise NotImplementedError("Restore function not implemented.")
+
+    def set_shared_experts(self, shared_experts):
+        """Set shared expert to the dispatcher."""
+        self.shared_experts = shared_experts
 
 
 class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
@@ -361,6 +367,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # and "no_sync".
         self.cuda_sync_point = "no_sync"
 
+        self.shared_experts = None
+
     def preprocess(self, indices: torch.Tensor) -> torch.Tensor:
         """
         Preprocess token indices for AlltoAll communication and token permutation. This method
@@ -491,6 +499,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
         tokens_per_expert = self.preprocess(indices)
 
+        if self.shared_experts is not None:
+            self.shared_experts.pre_forward_comm(hidden_states.view(self.hidden_shape))
+
         # Permutation 1: input to AlltoAll input
         self.hidden_shape_before_permute = hidden_states.shape
         if self.cuda_sync_point == "before_permutation_1":
@@ -511,6 +522,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.output_splits,
             self.input_splits,
         )
+        if self.shared_experts is not None:
+            self.shared_experts.linear_fc1_forward_and_act(global_input_tokens)
 
         if parallel_state.get_tensor_model_parallel_world_size() > 1:
             global_input_tokens = gather_from_sequence_parallel_region(
@@ -574,6 +587,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.input_splits,
             self.output_splits,
         )
+        if self.shared_experts is not None:
+            self.shared_experts.linear_fc2_forward(permutated_local_input_tokens)
+            self.shared_experts.post_forward_comm()
 
         # Unpermutation 1: Unsort input tokens to restore the original order.
         output = unpermute(
@@ -586,4 +602,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         # Reshape the output tensor
         output = output.view(self.hidden_shape)
+
+        # Add shared experts output
+        if self.shared_experts is not None:
+            shared_expert_output = self.shared_experts.get_output()
+            output += shared_expert_output
         return output, None

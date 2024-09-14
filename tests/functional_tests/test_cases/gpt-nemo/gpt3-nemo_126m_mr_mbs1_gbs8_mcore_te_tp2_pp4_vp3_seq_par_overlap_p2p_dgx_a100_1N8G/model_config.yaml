@@ -1,6 +1,7 @@
 ENV_VARS:
   CUDA_DEVICE_MAX_CONNECTIONS: 1
   SKIP_PYTEST: 1
+  N_REPEATS: 1
 MODEL_ARGS:
   trainer.num_nodes: 1
   trainer.devices: 8

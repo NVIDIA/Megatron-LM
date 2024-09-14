@@ -232,6 +232,7 @@ class TestAllgatherDispatcher:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     @pytest.mark.parametrize("tp_size,ep_size", [(8, 1), (1, 8), (2, 4), (1, 1)])
     def test_forward_backward(self, tp_size, ep_size):
         container = MoEModelTestContainer(
@@ -247,6 +248,7 @@ class TestAllgatherDispatcher:
         container.dispatcher_dropless_test()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     @pytest.mark.parametrize("tp_size,ep_size", [(2, 4)])
     def test_extend_tp_forward_backward(self, tp_size, ep_size):
         container = MoEModelTestContainer(

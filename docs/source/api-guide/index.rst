@@ -17,3 +17,4 @@ API Guide
    datasets
    num_microbatches_calculator
    optimizer_param_scheduler
+   encoder_decoder_parallelism

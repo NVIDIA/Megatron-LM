@@ -104,6 +104,11 @@ def num_floating_point_operations(args, batch_size):
     # MoE.
     num_experts_routed_to = 1 if args.num_experts is None else args.moe_router_topk
     gated_linear_multiplier = 3 / 2 if args.swiglu else 1
+    shared_expert_ffn_hidden_size = (
+        0
+        if args.moe_shared_expert_intermediate_size is None
+        else args.moe_shared_expert_intermediate_size
+    )
 
     # The 12x term below comes from the following factors; for more details, see
     # "APPENDIX: FLOATING-POINT OPERATIONS" in https://arxiv.org/abs/2104.04473.
@@ -137,6 +142,8 @@ def num_floating_point_operations(args, batch_size):
                 * num_experts_routed_to
                 * gated_linear_multiplier
             )
+            # Shared Experts.
+            + ((shared_expert_ffn_hidden_size / args.hidden_size) * gated_linear_multiplier)
             # Logit.
             + (args.padded_vocab_size / (2 * args.num_layers * args.hidden_size))
         )

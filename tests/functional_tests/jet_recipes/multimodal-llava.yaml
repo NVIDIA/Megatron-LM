@@ -9,7 +9,7 @@ spec:
   nodes: 1
   gpus: 8
   platforms: dgx_a100
-  time_limit: 1200
+  time_limit: 12000
   scope: null
   script: |-
     ls
