@@ -1,4 +1,4 @@
-.tests_common:
+.test_mr_rules:
   rules:
     - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
@@ -10,6 +10,7 @@ include:
   - template: Security/Secret-Detection.gitlab-ci.yml
 
 build_image:
+  extends: [.test_mr_rules]
   tags:
     - ${TAG}
   image: docker:26.1.4-dind
@@ -83,7 +84,7 @@ unit_tests:
   # This job runs both test suite of ToT and of a historic ref against
   # the current code. This is a form of backwards compatibility testing
   # and helps in providing stable interfaces.
-  extends: [.tests_common]
+  extends: [.test_mr_rules]
   image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
   needs: [build_image]
   timeout: 180m
@@ -129,6 +130,7 @@ unit_tests:
     - when: always
 
 docs_build_test:
+  extends: [.test_mr_rules]
   image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
   tags: [mcore-docker-node-small]
   needs: [build_image]
@@ -140,10 +142,9 @@ docs_build_test:
     - ./repo docs
 
 formatting:
-  extends: [.tests_common]
+  extends: [.test_mr_rules]
   image: ${LINTING_IMAGE}:${CI_PIPELINE_ID}
   tags: [mcore-docker-node-small]
-  stage: test
   needs: [build_image]
   script:
     - env
@@ -151,7 +152,7 @@ formatting:
     - CHECK_ONLY=true SKIP_DOCS=$([[ "$CI_MERGE_REQUEST_LABELS" == *"Skip docs"* ]] && echo "true" || echo "false") bash tools/autoformat.sh
 
 copyright:
-  extends: [.tests_common]
+  extends: [.test_mr_rules]
   tags: [mcore-docker-node-small]
   image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
   needs: [build_image]
@@ -160,13 +161,12 @@ copyright:
     - bash tools/copyright.sh
 
 secret_detection:
+  extends: [.test_mr_rules]
   tags: [mcore-docker-node-small]
   variables:
     GIT_DEPTH: 0
     SECRET_DETECTION_LOG_OPTIONS: ${CI_MERGE_REQUEST_DIFF_BASE_SHA}..${CI_COMMIT_SHA}
   allow_failure: false
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
   script:
     - apk add jq
     - /analyzer run
