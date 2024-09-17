@@ -1,6 +1,15 @@
 include:
   - template: Security/Secret-Detection.gitlab-ci.yml
 
+.pre_mr_rules:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+      allow_failure: true
+      when: always
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - when: never
+  stage: .pre
+
 mirror_to_github:
   rules:
     - if: '$CI_COMMIT_REF_PROTECTED == "true" && $CI_PIPELINE_SOURCE == "push"'
@@ -35,14 +44,11 @@ create_ci_branches:
     GIT_STRATEGY: "clone"
   script:
     - git remote set-url origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/adlr/megatron-lm.git"
-    - git switch --force-create $branch;
+    - git switch --force-create $branch
     - git push --force -u origin $branch
 
 label_merge_request:
-  rules: 
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - when: never
-  stage: .pre
+  extends: [.pre_mr_rules]
   image: golang:1.22
   tags:
     - mcore-docker-node-small
@@ -62,7 +68,7 @@ label_merge_request:
       curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}" --data-urlencode "add_labels=$LABELS" -X PUT
 
 clean_docker_node:
-  stage: .pre
+  extends: [.pre_mr_rules]
   image: docker:26.1.4-dind
   tags: 
     - ${node}
@@ -154,10 +160,7 @@ maybe_cherry_pick_commit:
   interruptible: false
 
 check_milestone:
-  rules: 
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - when: never
-  stage: .pre
+  extends: [.pre_mr_rules]
   image: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_ci:buildcache
   tags:
     - mcore-docker-node-small
