@@ -336,6 +336,7 @@ def add_multimodal_extra_args(parser):
     group.add_argument("--max-num-tiles", type=int, default=1, help="Maximum number of image tiles")
     group.add_argument("--use-thumbnail", action="store_true", default=False, help="Add image thumbnail as a tile")
     group.add_argument("--dataloader-seq-length", type=int, help="Make dataloader to produce sequences of specific length.")
+    group.add_argument("--num-frames", type=int, default=1, help="Number of frames to regularly sample from the video as input to the model.")
 
     return parser
 

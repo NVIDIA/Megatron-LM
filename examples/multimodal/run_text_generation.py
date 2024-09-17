@@ -7,6 +7,7 @@ import os
 import sys
 from collections import defaultdict
 from functools import partial
+import itertools
 
 # Add megatron to the path.
 sys.path.append(
@@ -16,6 +17,7 @@ sys.path.append(
 import datasets
 import numpy as np
 import torch
+from torchvision.io import read_video
 from dataset_helpers import tokenizer_image_token
 from image_processing import get_visual_transform
 from MMMU.eval.utils.data_utils import (
@@ -58,7 +60,7 @@ def add_text_generation_args(parser):
     group.add_argument(
         "--task",
         type=str,
-        choices=["captioning", "TextVQA", "VQAv2", "ChartQA", "MMMU"],
+        choices=["captioning", "TextVQA", "VQAv2", "ChartQA", "MMMU", "VideoMME"],
         help="Generation task to run",
     )
     group.add_argument(
@@ -82,7 +84,9 @@ def _get_partition_bounds(
     total_num_samples, num_samples_per_partition, num_partitions, partition_id
 ):
     if num_samples_per_partition == 0:
-        num_samples_per_partition = total_num_samples // num_partitions
+        samples_per_partition = [
+            int(x) for x in np.linspace(0, total_num_samples, num_partitions+1)]
+        return samples_per_partition[partition_id], samples_per_partition[partition_id+1] 
     return num_samples_per_partition * partition_id, num_samples_per_partition * (partition_id + 1)
 
 
@@ -98,6 +102,7 @@ def get_evaluation_dataset(
     num_samples_per_partition,
     num_partitions,
     partition_id,
+    num_frames,
 ):
     """Build evaluation dataset."""
     images = []
@@ -269,6 +274,62 @@ def get_evaluation_dataset(
 
             answers.append(sample['answer'])
             samples.append(sample)
+    elif task == "VideoMME":
+        ground_truth_original = json.load(open(gt_path))
+        ground_truth = []
+        for gt in ground_truth_original:
+            video_path = gt["url"]
+            video_path = video_path.replace("https://www.youtube.com/watch?v=", "")
+            video_path = video_path.replace("https://m.youtube.com/watch?v=", "")
+            video_path = os.path.join(input_image_path, video_path + ".mp4")
+            if not os.path.exists(video_path):
+                continue
+            gt["video_path"] = video_path
+            ground_truth.append(gt)
+        
+        ground_truth = sorted(ground_truth, key=lambda gt: gt["video_path"])
+        print_rank_0(f"Found {len(ground_truth)} videos to process.")
+
+        if num_partitions > 0:
+            start_idx, end_idx = _get_partition_bounds(
+                len(ground_truth), num_samples_per_partition,
+                num_partitions, partition_id
+            )
+            ground_truth = ground_truth[start_idx:end_idx]
+
+        # Run image preprocessing.
+        for idx, gt in enumerate(ground_truth):
+            print_rank_0(f"Processing input video: {idx} / {len(ground_truth)}")
+            video, _, _ = read_video(
+                gt["video_path"], start_pts=0, end_pts=None, pts_unit='sec')
+            video = video.numpy()
+            selected_frames = torch.linspace(
+                0, video.shape[0] - 1, num_frames).long()
+            video_frames = video[selected_frames]
+            if num_frames == 1:
+                video_frames = video_frames[None]
+
+            imgs = list(itertools.chain.from_iterable(
+                get_visual_transform(
+                    img, img_h, img_w, use_tiling, max_num_tiles,
+                    use_thumbnail, augment=False) for img in video_frames))
+
+            for question in gt["questions"]:
+                # Very hacky, but we essentially re-create gt holding only the
+                # question of interest. This is the make this generation script
+                # compatible with the Video MME evaluation script.
+                question_dict = {
+                    "video_id": gt["video_id"],
+                    "duration_category": gt["duration_category"],
+                    "video_category": gt["video_category"],
+                    "video_subcategory": gt["video_subcategory"],
+                    "url": gt["url"],
+                    "questions": [question]
+                }
+                images.append(imgs)
+                tile_counts.append(torch.tensor([len(imgs)], dtype=torch.int))
+                questions.append(question_dict)
+                sample_ids.append(question["question_id"])
     else:
         raise NotImplementedError("unsupported task")
 
@@ -278,7 +339,6 @@ def get_evaluation_dataset(
 def generate_samples(model):
     """Text generation using a trained vision language model."""
     args = get_args()
-
     images, tile_counts, samples, sample_ids, questions, answers = get_evaluation_dataset(
         args.task,
         args.input_image_path,
@@ -291,6 +351,7 @@ def generate_samples(model):
         args.num_samples_per_partition,
         args.num_partitions,
         args.partition_id,
+        args.num_frames
     )
 
     num_samples = len(sample_ids)
@@ -328,9 +389,15 @@ def generate_samples(model):
                     output_name = "answer"
                 elif args.task in ("MMMU"):
                     output_name = "text"
+                elif args.task == "VideoMME":
+                    output_name = "response"
+                    output = questions[idx]
 
                 generated = get_generated(prompt, args.prompt_format, generation)
-                output[output_name] = generated
+                if args.task == "VideoMME":
+                    output["questions"][0][output_name] = generated
+                else:
+                    output[output_name] = generated
 
                 if args.task == "captioning":
                     output["ground_truth"] = answers[sample_id]
@@ -456,6 +523,24 @@ def get_prompt(task, questions, idx, prompt_format):
             prompt = "<image>\n{}\nAnswer the question using a single word or phrase.".format(
                 question
             )
+    elif task == "VideoMME":
+        question = (
+            "Select the best answer to the following multiple-choice "
+            "question based on the video. Respond with only the letter "
+            "(A, B, C, or D) of the correct option.\n")
+        question += (questions[idx]["questions"][0]["question"] + "\n")
+        question += (questions[idx]["questions"][0]["choices"][0] + "\n")
+        question += (questions[idx]["questions"][0]["choices"][1] + "\n")
+        question += (questions[idx]["questions"][0]["choices"][2] + "\n")
+        question += (questions[idx]["questions"][0]["choices"][3] + "\n")
+
+        if prompt_format == "llama3":
+            prompt = "<|start_header_id|>system<|end_header_id|>\n\nAnswer the questions.<|eot_id|>{}<|start_header_id|>user<|end_header_id|>\n\n<image>\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+            prompt = prompt.format("", question)
+        elif prompt_format == "mistral":
+            prompt = "<image>\n{}".format(
+                question
+            )
 
     return prompt
 
@@ -470,6 +555,7 @@ def get_generated(prompt, prompt_format, prompt_and_generation):
         start += len("<s><unk><s> ")
 
     generated = prompt_and_generation[start:]
+    generated = generated.replace("<s> ", "")
     generated = generated.split("<|eot_id|>")[0]
     generated = generated.split("</s>")[0]
     generated = generated.strip()
