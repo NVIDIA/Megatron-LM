@@ -14,7 +14,8 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 CHECK_ONLY=${CHECK_ONLY:-false}
 SKIP_DOCS=${SKIP_DOCS:-false}
 
-CHANGED_FILES=$(git diff --name-only --diff-filter=d --merge-base origin/main megatron/core tests/ | grep '\.py$' || true)
+BASE_REF=${BASE_REF:-main}
+CHANGED_FILES=$(git diff --name-only --diff-filter=d --merge-base origin/${BASE_REF} megatron/core tests/ | grep '\.py$' || true)
 ADDITIONAL_ARGS=""
 ADDITIONAL_BLACK_ARGS=""
 ADDITIONAL_PYLINT_ARGS=""

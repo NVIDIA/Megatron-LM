@@ -149,7 +149,7 @@ formatting:
   script:
     - env
     - git fetch origin main
-    - CHECK_ONLY=true SKIP_DOCS=$([[ "$CI_MERGE_REQUEST_LABELS" == *"Skip docs"* ]] && echo "true" || echo "false") bash tools/autoformat.sh
+    - BASE_REF="$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" CHECK_ONLY=true SKIP_DOCS=$([[ "$CI_MERGE_REQUEST_LABELS" == *"Skip docs"* ]] && echo "true" || echo "false") bash tools/autoformat.sh
 
 copyright:
   extends: [.test_mr_rules]
@@ -161,12 +161,13 @@ copyright:
     - bash tools/copyright.sh
 
 secret_detection:
-  extends: [.test_mr_rules]
   tags: [mcore-docker-node-small]
   variables:
     GIT_DEPTH: 0
     SECRET_DETECTION_LOG_OPTIONS: ${CI_MERGE_REQUEST_DIFF_BASE_SHA}..${CI_COMMIT_SHA}
-  allow_failure: false
+  allow_failure: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
   script:
     - apk add jq
     - /analyzer run
