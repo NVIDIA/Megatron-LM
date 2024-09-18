@@ -20,13 +20,13 @@ import torch
 from torchvision.io import read_video
 from dataset_helpers import tokenizer_image_token
 from image_processing import get_visual_transform
-from MMMU.eval.utils.data_utils import (
+from MMMU.mmmu.utils.data_utils import (
     CAT_SHORT2LONG,
     construct_prompt,
     load_yaml,
     process_single_sample,
 )
-from MMMU.eval.utils.eval_utils import parse_multi_choice_response
+from MMMU.mmmu.utils.eval_utils import parse_multi_choice_response
 from PIL import Image
 from train import add_multimodal_extra_args, get_num_image_embeddings, model_provider
 
@@ -245,7 +245,7 @@ def get_evaluation_dataset(
         end_idx = min(len(dataset), end_idx)
 
         # Using the LLaVA config from the MMMU repo.
-        config = load_yaml("examples/multimodal/MMMU/eval/configs/llava1.5.yaml")
+        config = load_yaml("examples/multimodal/MMMU/mmmu/configs/llava1.5.yaml")
         for k, v in config.items():
             if isinstance(v, list):
                 assert len(v) == 1, "only one value supported."
@@ -353,7 +353,9 @@ def generate_samples(model):
         args.partition_id,
         args.num_frames
     )
-
+    num_img_embeddings_per_tile = get_num_image_embeddings(
+        args.img_h, args.img_w, args.patch_dim,
+        args.disable_vision_class_token, 1)
     num_samples = len(sample_ids)
     idx = 0
     while idx < num_samples:
@@ -363,7 +365,8 @@ def generate_samples(model):
 
         prompt = get_prompt(args.task, questions, idx, args.prompt_format)
 
-        forward_step = partial(VLMForwardStep, imgs, num_tiles)
+        forward_step = partial(
+            VLMForwardStep, num_img_embeddings_per_tile, imgs, num_tiles)
 
         if torch.distributed.get_rank() == 0:
             resp_sentences, _, _, _ = generate_and_post_process(
@@ -439,12 +442,14 @@ def generate_and_write_samples(model):
 class VLMForwardStep(ForwardStep):
     """Inference forward step for a multimodal model."""
 
-    def __init__(self, images, num_tiles, model, max_batch_size, max_sequence_length):
+    def __init__(self, num_img_embeddings_per_tile, images, num_tiles, model,
+                 max_batch_size, max_sequence_length):
         """Create multimodal forward step."""
         total_num_tiles = torch.sum(num_tiles).item()
-        num_img_embeddings = get_num_image_embeddings() * total_num_tiles
+        num_img_embeddings =  num_img_embeddings_per_tile * total_num_tiles
 
-        super().__init__(model, max_batch_size, max_sequence_length + num_img_embeddings)
+        super().__init__(
+            model, max_batch_size, max_sequence_length + num_img_embeddings)
         self._images = images
         self._num_tiles = num_tiles
 
