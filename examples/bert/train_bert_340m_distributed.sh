@@ -75,3 +75,4 @@ torchrun ${DISTRIBUTED_ARGS[@]} pretrain_bert.py \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${DATA_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]}
+    
