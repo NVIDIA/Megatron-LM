@@ -94,6 +94,16 @@ class OptimizerConfig:
     use_distributed_optimizer: bool = False
     """Distribute optimizer state over data-parallel replicas."""
 
+    overlap_grad_reduce: bool = False
+    """If true, overlap grad reduce-scatter with backward compute in distributed optimizer.
+    NOTE: This parameter will be deprecated in a future release. Use `overlap_grad_reduce`
+    in `megatron/core/distributed/distributed_data_parallel_config.py` instead."""
+
+    overlap_param_gather: bool = False
+    """If true, overlap param all-gather with forward compute in distributed optimizer.
+    NOTE: This parameter will be deprecated in a future release. Use `overlap_param_gather`
+    in `megatron/core/distributed/distributed_data_parallel_config.py` instead."""
+
     overlap_param_gather_with_optimizer_step: bool = False
     """If true, overlap param all-gather of first bucket with optimizer step."""
 
