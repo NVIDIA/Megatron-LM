@@ -134,19 +134,24 @@ def _gather_along_first_dim(input_, output_split_sizes=None):
         return input_
 
     xm = get_xla_model()
-    if xm:
-        output = xm.all_gather(input_.contiguous(), groups=get_tensor_model_parallel_groups())
-    else:
-        dim_size = list(input_.size())
-        if output_split_sizes is None:
-            dim_size[0] = dim_size[0] * world_size
+    dim_size = list(input_.size())
+    if output_split_sizes is None:
+        dim_size[0] = dim_size[0] * world_size
 
+        if xm:
+            output = xm.all_gather(input_.contiguous(), groups=get_tensor_model_parallel_groups())
+        else:
             output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
             torch.distributed.all_gather_into_tensor(
                 output, input_.contiguous(), group=get_tensor_model_parallel_group()
             )
+    else:
+        dim_size[0] = sum(output_split_sizes)
+
+        if xm:
+            output = xm.all_gather(input_.contiguous(), groups=get_tensor_model_parallel_groups())
+            output_tensor_list = list(torch.split(output, output_split_sizes, dim=0))
         else:
-            dim_size[0] = sum(output_split_sizes)
             output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
             output_tensor_list = list(torch.split(output, output_split_sizes, dim=0))
             torch.distributed.all_gather(
@@ -180,7 +185,8 @@ def _reduce_scatter_along_first_dim(input_, input_split_sizes=None):
         dim_size[0] = dim_size[0] // world_size
 
         if xm:
-            output = xm.reduce_scatter(xm.REDUCE_SUM, input_.contiguous(), groups=get_tensor_model_parallel_groups())
+            output = xm.reduce_scatter(xm.REDUCE_SUM, input_.contiguous(), 1.0, 0, world_size,
+                                       groups=get_tensor_model_parallel_groups())
         else:
             output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
             torch.distributed.reduce_scatter_tensor(
@@ -237,7 +243,8 @@ def _reduce_scatter_along_first_dim_moe(input_, use_global_buffer=False):
 
     xm = get_xla_model()
     if xm:
-        output = xm.reduce_scatter(xm.REDUCE_SUM, input, groups=get_tensor_and_expert_parallel_groups())
+        output = xm.reduce_scatter(xm.REDUCE_SUM, input_.contiguous(), 1.0, 0, world_size,
+                                   groups=get_tensor_and_expert_parallel_groups())
     else:
         if use_global_buffer:
             output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")

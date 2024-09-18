@@ -16,9 +16,10 @@ except ImportError:
     except ImportError:
         import warnings
 
-        warnings.warn(
-            f'Transformer Engine and Apex are not installed. Falling back to Torch optimizers.'
-        )
+        if torch.cuda.is_available():
+            warnings.warn(
+                f'Transformer Engine and Apex are not installed. Falling back to Torch optimizers.'
+            )
 
         ## apex's FusedAdam is a drop-in replacement for torch's AdamW
         ## see https://github.com/NVIDIA/apex/blob/7b73b12361068a10b0f44844534613f252a5ea75/apex/optimizers/fused_adam.py#L16

@@ -22,11 +22,13 @@ except ImportError:
     except ImportError:
         HAVE_APEX_OR_TE = False
         import warnings
-        warnings.warn(
-            f'Transformer Engine and Apex are not installed. '
-            'Falling back to local implementations of '
-            'multi_tensor_applier and multi_tensor_l2norm'
-        )
+
+        if torch.cuda.is_available():
+            warnings.warn(
+                f'Transformer Engine and Apex are not installed. '
+                'Falling back to local implementations of '
+                'multi_tensor_applier and multi_tensor_l2norm'
+            )
 
         from megatron.core.utils import (
             local_multi_tensor_l2_norm as multi_tensor_l2norm,

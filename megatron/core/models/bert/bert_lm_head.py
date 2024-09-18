@@ -17,8 +17,8 @@ except ImportError:
     import warnings
 
     from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
-
-    warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
+    if torch.cuda.is_available():
+        warnings.warn('Apex is not installed. Falling back to Torch LayerNorm')
     LNImpl = WrappedTorchLayerNorm
 
 

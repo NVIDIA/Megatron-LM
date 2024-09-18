@@ -7,6 +7,7 @@ import torch
 from pkg_resources import packaging
 
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_xla_model
 from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.serialization import (
@@ -121,13 +122,16 @@ class TestExpertLayerReconfiguration:
 
             save_strategy = get_default_save_sharded_strategy()
             if use_fpsl:
+                xm = get_xla_model()
                 save_strategy = FullyParallelSaveStrategyWrapper(
                     save_strategy,
-                    parallel_state.get_data_parallel_group(with_context_parallel=True),
-                    parallel_state.get_data_parallel_group_gloo(with_context_parallel=True),
+                    parallel_state.get_data_parallel_group(with_context_parallel=True) if xm is None else \
+                        parallel_state.get_data_parallel_group_gloo(with_context_parallel=True),
+                    parallel_state.get_default_process_group(),
                     True,
                 )
-            save(sharded_state_dict, ckpt_dir_A, save_strategy)
+            save(sharded_state_dict, ckpt_dir_A, save_strategy,
+                 process_group=parallel_state.get_default_process_group())
             Utils.destroy_model_parallel()
 
             # Load checkpoint A with different TP/PP/expert and save as checkpoint B
@@ -136,11 +140,11 @@ class TestExpertLayerReconfiguration:
             model_B = initialize_expert_layer(1, use_glu, moe_grouped_gemm)
             if use_fpsl:
                 load_strategy = get_default_load_sharded_strategy(ckpt_dir_A)
+                xm = get_xla_model()
                 load_strategy = FullyParallelLoadStrategyWrapper(
                     load_strategy,
-                    parallel_state.get_data_parallel_group(with_context_parallel=True),
-                    parallel_state.get_data_parallel_group_gloo(with_context_parallel=True),
-                    parallel_state.get_data_parallel_groups(with_context_parallel=True)
+                    parallel_state.get_data_parallel_group(with_context_parallel=True) if xm is None else \
+                        parallel_state.get_data_parallel_group_gloo(with_context_parallel=True)
                 )
             else:
                 load_strategy = None
@@ -148,9 +152,11 @@ class TestExpertLayerReconfiguration:
                 model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()),
                 ckpt_dir_A,
                 load_strategy,
+                process_group=parallel_state.get_default_process_group()
             )
             model_B.load_state_dict(state_dict)
-            save(model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_B)
+            save(model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_B,
+                 process_group=parallel_state.get_default_process_group())
             Utils.destroy_model_parallel()
 
             # Test both checkpoints are equal
@@ -211,7 +217,8 @@ class TestExpertLayerReconfiguration:
             sharded_state_dict = model_A.sharded_state_dict(sharded_offsets=get_pp_offsets())
 
             save_strategy = get_default_save_sharded_strategy()
-            save(sharded_state_dict, ckpt_dir_A, save_strategy)
+            save(sharded_state_dict, ckpt_dir_A, save_strategy,
+                 process_group=parallel_state.get_default_process_group())
             Utils.destroy_model_parallel()
 
             Utils.initialize_model_parallel(dest_tp, dest_pp, expert_model_parallel_size=dest_exp)
@@ -223,9 +230,11 @@ class TestExpertLayerReconfiguration:
                 model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()),
                 ckpt_dir_A,
                 load_strategy,
+                process_group=parallel_state.get_default_process_group()
             )
             model_B.load_state_dict(state_dict)
-            save(model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_B)
+            save(model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_B,
+                 process_group=parallel_state.get_default_process_group())
             Utils.destroy_model_parallel()
 
             # Test both checkpoints are equal

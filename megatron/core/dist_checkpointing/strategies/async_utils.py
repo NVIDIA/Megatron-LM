@@ -9,7 +9,9 @@ from collections import deque
 from time import time
 from typing import Callable, List, NamedTuple, Optional, Tuple
 
-from megatron.core.device_utils import get_current_device
+import torch.distributed
+
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 from torch import multiprocessing as mp
 
@@ -46,14 +48,14 @@ class AsyncRequest(NamedTuple):
             raise RuntimeError('Cannot add finalization functions to a frozen AsyncRequest')
         self.finalize_fns.append(fn)
 
-    def execute_sync(self) -> None:
+    def execute_sync(self, process_group: torch.distributed.ProcessGroup=None) -> None:
         """Helper to synchronously execute the request.
 
         This logic is equivalent to what should happen in case of the async call.
         """
         if self.async_fn is not None:
             self.async_fn(*self.async_fn_args)
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=process_group)
         for finalize_fn in self.finalize_fns:
             finalize_fn()
 
@@ -73,10 +75,11 @@ class DistributedAsyncCaller:
     Starts process asynchronously and allows checking if all processes on all ranks are done.
     """
 
-    def __init__(self):
+    def __init__(self, process_group: torch.distributed.ProcessGroup=None):
         self.process: Optional[mp.Process] = None
         self.start_time: Optional[float] = None
-
+        self.process_group = process_group
+        
     def schedule_async_call(self, async_fn: Optional[Callable], save_args: Tuple) -> None:
         """Spawn a process with `async_fn` as the target.
 
@@ -89,13 +92,14 @@ class DistributedAsyncCaller:
         """
         if async_fn is None:
             return  # nothing to do
-        start_sync = time()
+        
         if torch.cuda.is_available():
+            start_sync = time()
             torch.cuda.synchronize()
-        end_sync = time()
-        logger.debug(
-            f"rank: {torch.distributed.get_rank()}, takes {end_sync - start_sync} to finish D2H "
-        )
+            end_sync = time()
+            logger.debug(
+                f"rank: {torch.distributed.get_rank(group=self.process_group)}, takes {end_sync - start_sync} to finish D2H "
+            )
 
         ctx = mp.get_context('fork')
         self.start_time = time()
@@ -103,7 +107,7 @@ class DistributedAsyncCaller:
         self.process.start()
         init_time = time()
         logger.debug(
-            f"rank: {torch.distributed.get_rank()}, takes {init_time - self.start_time} to schedule async ckpt "
+            f"rank: {torch.distributed.get_rank(group=self.process_group)}, takes {init_time - self.start_time} to schedule async ckpt "
         )
 
     def is_current_async_call_done(self, blocking=False) -> bool:
@@ -123,16 +127,17 @@ class DistributedAsyncCaller:
         """
         # The following takes the same overhead as torch.distributed.barrier (single integer all-reduce)
         is_alive = int(self.process.is_alive()) if self.process is not None else 0
-        ten = torch.tensor([is_alive], dtype=torch.int, device=get_current_device())
+        cc_device = "cpu" if get_xla_model() else get_current_device()
+        ten = torch.tensor([is_alive], dtype=torch.int, device=cc_device)
         logger.debug(
-            f"rank: {torch.distributed.get_rank()}, DistributedAsyncCaller is_alive: {is_alive}"
+            f"rank: {torch.distributed.get_rank(group=self.process_group)}, DistributedAsyncCaller is_alive: {is_alive}"
         )
-        torch.distributed.all_reduce(ten)
+        torch.distributed.all_reduce(ten, group=self.process_group)
         if ten[0] > 0 and not blocking:
             return False
         else:
             if self.process is not None:
-                logger.debug(f"rank: {torch.distributed.get_rank()}, joining self.process")
+                logger.debug(f"rank: {torch.distributed.get_rank(group=self.process_group)}, joining self.process")
                 self.process.join()
                 self.process = None
 
@@ -165,10 +170,11 @@ class AsyncCallsQueue:
     active calls with `maybe_finalize_async_calls`.
     """
 
-    def __init__(self):
+    def __init__(self, process_group: torch.distributed.ProcessGroup=None):
         self.async_calls: deque[_ActiveAsyncRequest] = deque([])
         self.call_idx: int = -1
-
+        self.process_group = process_group
+        
     def schedule_async_request(self, async_request: AsyncRequest) -> int:
         """Start a new async call and add it to a queue of active async calls.
 
@@ -182,7 +188,7 @@ class AsyncCallsQueue:
                 This can help the user keep track of the async calls.
         """
         self.call_idx += 1
-        async_caller = DistributedAsyncCaller()
+        async_caller = DistributedAsyncCaller(process_group=self.process_group)
         async_request = async_request.freeze()
         async_caller.schedule_async_call(async_request.async_fn, async_request.async_fn_args)
         self.async_calls.append(_ActiveAsyncRequest(self.call_idx, async_caller, async_request))
@@ -209,8 +215,9 @@ class AsyncCallsQueue:
             call_idx, _, async_request = self.async_calls.popleft()
             for finalize_fn in async_request.finalize_fns:
                 finalize_fn()
-            ten = torch.tensor([call_idx], dtype=torch.int, device=get_current_device())
-            torch.distributed.all_reduce(ten, op=torch.distributed.ReduceOp.MAX)
+            cc_device = "cpu" if get_xla_model() else get_current_device()
+            ten = torch.tensor([call_idx], dtype=torch.int, device=cc_device)
+            torch.distributed.all_reduce(ten, op=torch.distributed.ReduceOp.MAX, group=self.process_group)
             assert (
                 ten.item() == call_idx
             ), 'Unmatched async calls. That probably means not all ranks are participating in async finalization'

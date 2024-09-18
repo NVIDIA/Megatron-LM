@@ -1,4 +1,5 @@
 import os
+from typing import Union
 import torch
 
 try:
@@ -85,22 +86,22 @@ def get_distributed_init_method() -> str:
     return init_method
 
 
-def get_current_rng_state():
+def get_current_rng_state() -> Union[torch.Tensor, int]:
     if torch.cuda.is_available():
         rng_state = torch.cuda.get_rng_state(device=get_current_device())
-    elif get_xla_model():
-        rng_state = get_xla_model().get_rng_state(device=get_current_device())
+    elif xm:
+        rng_state = xm.get_rng_state(device=get_current_device())
     else:
         rng_state = torch.get_rng_state()
 
     return rng_state
 
 
-def set_manual_seed(seed):
+def set_manual_seed(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
-    elif get_xla_model() is not None:
-        get_xla_model().set_rng_state(seed, device=get_current_device())
+    elif xm is not None:
+        xm.set_rng_state(seed, device=get_current_device())
     else:
         torch.manual_seed(seed)
 
@@ -109,9 +110,9 @@ def set_current_rng_state(new_state):
     if torch.cuda.is_available():
         new_state = new_state.type(torch.ByteTensor)
         torch.cuda.set_rng_state(new_state, device=get_current_device())
-    elif get_xla_model() is not None:
+    elif xm is not None:
         new_state = int(new_state)
-        get_xla_model().set_rng_state(new_state, device=get_current_device())
+        xm.set_rng_state(new_state, device=get_current_device())
     else:
         new_state = new_state.type(torch.ByteTensor)
         torch.set_rng_state(new_state)

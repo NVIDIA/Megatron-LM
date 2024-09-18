@@ -7,8 +7,11 @@ from collections import defaultdict
 from enum import Enum
 from pathlib import Path
 
+import torch
+
+from megatron.core import parallel_state
 from ..mapping import CheckpointingException, ShardedStateDict, StateDict
-from .async_utils import AsyncCallsQueue, AsyncRequest
+from .async_utils import  AsyncCallsQueue, AsyncRequest
 
 
 class StrategyAction(Enum):
@@ -17,11 +20,8 @@ class StrategyAction(Enum):
     SAVE_COMMON = 'save_common'
     SAVE_SHARDED = 'save_sharded'
 
-
 default_strategies = defaultdict(dict)
-
-async_calls = AsyncCallsQueue()
-
+async_calls = None
 
 def get_default_strategy(action: StrategyAction, backend: str, version: int):
     """Retrieves a default strategy for a given action, backend and version."""
@@ -181,5 +181,15 @@ class AsyncSaveShardedStrategy(SaveShardedStrategy):
         # multiprocessing routines  may cause issue when called on parent process
         # We keep this verbose call for now
         global async_calls
+        assert async_calls is not None, "async_calls is not inited"
         async_calls.schedule_async_request(async_request)
         async_calls.maybe_finalize_async_calls(blocking=True)
+
+    
+def init_async_calls(process_group: torch.distributed.ProcessGroup=None):
+    global async_calls
+    async_calls = AsyncCallsQueue(process_group=process_group)
+
+def deinit_async_calls():
+    global async_calls
+    async_calls = None

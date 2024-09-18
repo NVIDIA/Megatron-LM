@@ -9,7 +9,9 @@ from functools import partial
 from itertools import cycle
 from typing import Callable, List, Optional
 
-from .device_utils import get_current_device
+import torch.distributed
+
+from .device_utils import get_current_device, get_xla_model
 import torch
 from torch.distributed import ProcessGroup
 
@@ -98,6 +100,9 @@ _GLOBAL_MEMORY_BUFFER = None
 
 # MOE logging
 _MOE_LAYER_WISE_LOGGING_TRACKER = {}
+
+#  None for CUDA, and 'gloo' backend group with all ranks for XLA
+_DEFAULT_PROCESS_GROUP = None
 
 # Groups: list of lists of ranks
 _MODEL_PARALLEL_GROUPS = []
@@ -923,6 +928,11 @@ def initialize_model_parallel(
             _DATA_MODULO_EXPERT_PARALLEL_GROUP_WITH_CP = group
             _DATA_MODULO_EXPERT_PARALLEL_GROUP_WITH_CP_GLOO = group_gloo
 
+    global _DEFAULT_PROCESS_GROUP
+    if get_xla_model() is not None:
+        _DEFAULT_PROCESS_GROUP = torch.distributed.new_group(backend="gloo")
+
+   
     # Initialize global memory buffer
     # This isn't really "parallel state" but there isn't another good place to
     # put this. If we end up with a more generic initialization of megatron-core
@@ -1675,6 +1685,11 @@ def get_moe_layer_wise_logging_tracker():
     global _MOE_LAYER_WISE_LOGGING_TRACKER
     return _MOE_LAYER_WISE_LOGGING_TRACKER
 
+def get_default_process_group():
+    global _DEFAULT_PROCESS_GROUP
+    assert get_xla_model() is None or _DEFAULT_PROCESS_GROUP is not None, \
+        "_DEFAULT_PROCESS_GROUP is None for XLA" 
+    return _DEFAULT_PROCESS_GROUP
 
 def destroy_model_parallel():
     """Set the groups to none."""
@@ -1771,6 +1786,11 @@ def destroy_model_parallel():
 
     global _DATA_MODULO_EXPERT_PARALLEL_GROUP_WITH_CP_GLOO
     _DATA_MODULO_EXPERT_PARALLEL_GROUP_WITH_CP_GLOO = None
+
+    global _DEFAULT_PROCESS_GROUP
+    if _DEFAULT_PROCESS_GROUP is not None:
+        torch.distributed.destroy_process_group(_DEFAULT_PROCESS_GROUP)
+        _DEFAULT_PROCESS_GROUP = None
 
     global _MODEL_PARALLEL_GROUPS
     _MODEL_PARALLEL_GROUPS = []

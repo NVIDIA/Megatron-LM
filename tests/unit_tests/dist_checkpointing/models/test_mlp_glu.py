@@ -64,17 +64,20 @@ class TestParallelMLPWithGLU:
         ) as ckpt_dir_B:
             # Save checkpoint A
             mlp_A = initialize_mlp()
-            save(mlp_A.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_A)
+            save(mlp_A.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_A,
+                 process_group=parallel_state.get_default_process_group())
             Utils.destroy_model_parallel()
 
             # Load checkpoint A with different TP/PP and save as checkpoint B
             Utils.initialize_model_parallel(*dest_tp_pp)
             mlp_B = initialize_mlp()
             state_dict = load(
-                mlp_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_A
+                mlp_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_A,
+                process_group=parallel_state.get_default_process_group()
             )
             mlp_B.load_state_dict(state_dict)
-            save(mlp_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_B)
+            save(mlp_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_B,
+                 process_group=parallel_state.get_default_process_group())
             Utils.destroy_model_parallel()
 
             # Test both checkpoints are equal

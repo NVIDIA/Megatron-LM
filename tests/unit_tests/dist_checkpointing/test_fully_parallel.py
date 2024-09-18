@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_xla_model
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.dict_utils import (
     dict_list_map_outplace,
@@ -162,16 +163,17 @@ class TestFullyParallelSaveAndLoad:
                     'key_TP_repl2': [1],  # smallest tensor, last rank is the least occupied
                 }
 
-        parallelization_group = (
-            parallel_state.get_data_parallel_group(with_context_parallel=True)
-            if parallelization_along_dp
-            else None
-        )
-
-        parallelization_group_gloo = (
-            parallel_state.get_data_parallel_group_gloo(with_context_parallel=True)
-            if parallelization_along_dp
-            else None
+        xm = get_xla_model()
+        default_process_group = parallel_state.get_default_process_group()
+        if xm is None:
+            parallelization_group = (
+                parallel_state.get_data_parallel_group(with_context_parallel=True)
+                    if parallelization_along_dp else default_process_group
+            )
+        else:
+             parallelization_group = (
+                parallel_state.get_data_parallel_group_gloo(with_context_parallel=True)
+                    if parallelization_along_dp else default_process_group
         )
 
         dp_rank = torch.distributed.get_rank(parallelization_group)
@@ -182,9 +184,11 @@ class TestFullyParallelSaveAndLoad:
         # Run save and tests
         mock_strategy = MockSaveStrategy()
         save_strategy = FullyParallelSaveStrategyWrapper(
-            mock_strategy, parallelization_group, parallelization_group_gloo, do_cache_distribution=True
+            mock_strategy, parallelization_group=parallelization_group, 
+            process_group=default_process_group, do_cache_distribution=True
         )
-        with TempNamedDir(tmp_path_dist_ckpt / 'mock_dir') as ckpt_dir_A:
+        with TempNamedDir(tmp_path_dist_ckpt / 'mock_dir',
+                          process_group=default_process_group) as ckpt_dir_A:
             save_strategy.save(state_dict, ckpt_dir_A)
         key_to_saving_rank = dict(
             map_reduce(
@@ -250,21 +254,20 @@ class TestFullyParallelSaveAndLoad:
                 'key_TP_repl2': [3],  # smallest tensor, last rank is the least occupied
             }
 
-        parallelization_group = (
-            parallel_state.get_data_parallel_group(with_context_parallel=True)
-            if parallelization_along_dp
-            else None
-        )
-        parallelization_group_gloo = (
-            parallel_state.get_data_parallel_group_gloo(with_context_parallel=True)
-            if parallelization_along_dp
-            else None
-        )
-        parallelization_groups = (
-            parallel_state.get_data_parallel_groups(with_context_parallel=True)
-            if parallelization_along_dp
-            else None
-        )
+       
+        default_process_group = parallel_state.get_default_process_group()
+        xm = get_xla_model()
+        if xm is None:
+             parallelization_group = (
+                parallel_state.get_data_parallel_group(with_context_parallel=True)
+                    if parallelization_along_dp else default_process_group
+            )
+        else:
+            parallelization_group = (
+                parallel_state.get_data_parallel_group_gloo(with_context_parallel=True)
+                    if parallelization_along_dp else default_process_group
+            )
+        
         dp_rank = torch.distributed.get_rank(parallelization_group)
         expected_keys_saved_by_current_rank = {
             k for k, v in expected_key_to_saving_ranks.items() if dp_rank in v
@@ -275,11 +278,10 @@ class TestFullyParallelSaveAndLoad:
         load_strategy = FullyParallelLoadStrategyWrapper(
             strategy=mock_strategy, 
             parallelization_group=parallelization_group, 
-            parallelization_group_gloo=parallelization_group_gloo, 
-            parallelization_groups=parallelization_groups, 
             do_cache_distribution=True
         )
-        with TempNamedDir(tmp_path_dist_ckpt / 'mock_dir') as ckpt_dir_A:
+        with TempNamedDir(tmp_path_dist_ckpt / 'mock_dir',
+                          process_group=default_process_group) as ckpt_dir_A:
             loaded_state_dict = load_strategy.load(state_dict, ckpt_dir_A)
         key_to_saving_rank = dict(
             map_reduce(

@@ -4,6 +4,7 @@ import math
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_xla_model
 from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.serialization import (
@@ -26,13 +27,14 @@ def common_test_simple_sharded_state_dict_save_load(
     tp = 2
     pp = 4
     Utils.initialize_model_parallel(tp, pp)
+
     gpt_model = initialize_model_fn(
         1, src_layer_spec_fn, tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp
     )
     with TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model') as ckpt_dir:
         # Save
         sharded_state_dict = gpt_model.sharded_state_dict()
-        save(sharded_state_dict, ckpt_dir)
+        save(sharded_state_dict, ckpt_dir, process_group=parallel_state.get_default_process_group())
 
         # Load
         gpt_model = initialize_model_fn(
@@ -40,7 +42,8 @@ def common_test_simple_sharded_state_dict_save_load(
         )
         sharded_state_dict = gpt_model.sharded_state_dict()
         state_dict, missing_keys, unexpected_keys = load(
-            sharded_state_dict, ckpt_dir, strict=StrictHandling.RETURN_ALL
+            sharded_state_dict, ckpt_dir, strict=StrictHandling.RETURN_ALL,
+            process_group=parallel_state.get_default_process_group()
         )
         # Potential mismatch is because of extra states which is ok
         assert all('_extra_state' in k for k in missing_keys)
@@ -76,13 +79,16 @@ def common_test_parallel_reconfiguration_e2e(
         )
         save_strategy = get_default_save_sharded_strategy()
         if use_fpsl:
+            xm = get_xla_model()
             save_strategy = FullyParallelSaveStrategyWrapper(
                 save_strategy,
-                parallel_state.get_data_parallel_group(with_context_parallel=True),
-                parallel_state.get_data_parallel_group_gloo(with_context_parallel=True),
+                parallel_state.get_data_parallel_group(with_context_parallel=True) if xm is None else \
+                    parallel_state.get_data_parallel_group_gloo(with_context_parallel=True),
+                parallel_state.get_default_process_group(),
                 True,
             )
-        save(gpt_model_A.sharded_state_dict(), ckpt_dir_A, save_strategy)
+        save(gpt_model_A.sharded_state_dict(), ckpt_dir_A, save_strategy, 
+             process_group=parallel_state.get_default_process_group())
         regular_state_dict_A = gpt_model_A.state_dict()
         Utils.destroy_model_parallel()
 
@@ -97,7 +103,8 @@ def common_test_parallel_reconfiguration_e2e(
         )
         if use_fpsl:
             load_strategy = get_default_load_sharded_strategy(ckpt_dir_A)
-            load_strategy = FullyParallelLoadStrategyWrapper(load_strategy)
+            load_strategy = FullyParallelLoadStrategyWrapper(load_strategy,
+                                                             parallelization_group=parallel_state.get_default_process_group())
         else:
             load_strategy = None
         state_dict, missing_keys, unexpected_keys = load(
@@ -105,12 +112,14 @@ def common_test_parallel_reconfiguration_e2e(
             ckpt_dir_A,
             load_strategy,
             strict=StrictHandling.RETURN_ALL,
+            process_group=parallel_state.get_default_process_group()
         )
         # Potential mismatch is because of extra states which is ok
         assert all('_extra_state' in k for k in missing_keys)
         assert all('_extra_state' in k for k in unexpected_keys)
         gpt_model_B.load_state_dict(state_dict)
-        save(gpt_model_B.sharded_state_dict(), ckpt_dir_B)
+        save(gpt_model_B.sharded_state_dict(), ckpt_dir_B, 
+             process_group=parallel_state.get_default_process_group())
         regular_state_dict_B = gpt_model_A.state_dict()
         Utils.destroy_model_parallel()
 
@@ -145,11 +154,13 @@ def common_test_state_dict_comparison(initialize_model_fn, tmp_path_dist_ckpt):
         gpt_model_A = initialize_model_fn(
             1, tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp
         )
-        save(gpt_model_A.sharded_state_dict(), ckpt_dir_A)
+        save(gpt_model_A.sharded_state_dict(), ckpt_dir_A, 
+             process_group=parallel_state.get_default_process_group())
         gpt_model_B = initialize_model_fn(
             2, tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp
         )
-        save(gpt_model_B.sharded_state_dict(), ckpt_dir_B)
+        save(gpt_model_B.sharded_state_dict(), ckpt_dir_B, 
+             process_group=parallel_state.get_default_process_group())
 
         state_dict_A = load_plain_tensors(ckpt_dir_A)
         state_dict_A_dup = load_plain_tensors(ckpt_dir_A)
@@ -194,7 +205,8 @@ def common_test_vocab_size_padding_change(
             pipeline_model_parallel_size=src_tp_pp[1],
             vocab_size=get_test_vocab_size(),
         )
-        save(gpt_model_A.sharded_state_dict(), ckpt_dir_A)
+        save(gpt_model_A.sharded_state_dict(), ckpt_dir_A,
+             process_group=parallel_state.get_default_process_group())
         Utils.destroy_model_parallel()
 
         # Load checkpoint A with different TP/PP and save as checkpoint B
@@ -205,9 +217,11 @@ def common_test_vocab_size_padding_change(
             pipeline_model_parallel_size=dest_tp_pp[1],
             vocab_size=get_test_vocab_size(),
         )
-        state_dict = load(gpt_model_B.sharded_state_dict(), ckpt_dir_A)
+        state_dict = load(gpt_model_B.sharded_state_dict(), ckpt_dir_A,
+                          process_group=parallel_state.get_default_process_group())
         gpt_model_B.load_state_dict(state_dict)
-        save(gpt_model_B.sharded_state_dict(), ckpt_dir_B)
+        save(gpt_model_B.sharded_state_dict(), ckpt_dir_B,
+             process_group=parallel_state.get_default_process_group())
         Utils.destroy_model_parallel()
 
         # Test equality

@@ -218,11 +218,16 @@ class CheckpointFunction(torch.autograd.Function):
 
         # Divide hidden states across model parallel group and only keep
         # the chunk corresponding to the current rank.
+    
         if distribute_saved_activations:
             ctx.input_0_shape = args[0].data.shape
-            safely_set_viewless_tensor_data(
-                args[0], split_tensor_into_1d_equal_chunks(args[0].data, new_buffer=True)
-            )
+            split_tensor = split_tensor_into_1d_equal_chunks(args[0].data, new_buffer=True)
+            xm = get_xla_model()
+            if xm:
+                target_device = args[0].get_device()
+                if target_device != split_tensor.get_device():
+                    split_tensor = split_tensor.cpu() if target_device == -1 else split_tensor.to(device=target_device)
+            safely_set_viewless_tensor_data(args[0], split_tensor)
 
         # Store everything.
         ctx.save_for_backward(*args)

@@ -3,6 +3,7 @@
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
+import torch
 
 try:
     from megatron.core.transformer.custom_layers.transformer_engine import (
@@ -11,7 +12,8 @@ try:
 except ImportError:
     import warnings
 
-    warnings.warn(f'Transformer Engine is not installed. Falling back to Megatron Local')
+    if torch.cuda.is_available():
+        warnings.warn('Transformer Engine is not installed. Falling back to Megatron Local')
     
     from megatron.core.transformer.dot_product_attention import DotProductAttention
     from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm

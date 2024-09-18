@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
+import torch.distributed
 
+from megatron.core.device_utils import get_xla_model
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_load_config
 from megatron.core.dist_checkpointing.dict_utils import (
@@ -484,6 +486,7 @@ def _validate_objects_for_key(sharded_objects: List[ShardedObject]):
 
 def determine_global_metadata(
     sharded_state_dict: ShardedStateDict,
+    process_group: torch.distributed.ProcessGroup = None
 ) -> Tuple[_LocalMetadata, _GlobalMetadata]:
     """Exchanges local metadata with `all_gather_object` to determine global metadata.
 
@@ -495,9 +498,8 @@ def determine_global_metadata(
     """
     local_metadata = [ten.without_data() for ten in nested_values(sharded_state_dict)]
     global_metadata = [None] * torch.distributed.get_world_size()
-    torch.distributed.all_gather_object(global_metadata, local_metadata)
+    torch.distributed.all_gather_object(global_metadata, local_metadata, group=process_group)
     return local_metadata, global_metadata
-
 
 def validate_sharded_objects_handling(
     sharded_strategy: Union[SaveShardedStrategy, LoadShardedStrategy],

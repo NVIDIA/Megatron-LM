@@ -14,6 +14,8 @@ from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
 from torch.distributed.checkpoint.planner import SavePlan, SavePlanner
 from torch.distributed.checkpoint.utils import _DistWrapper, _get_failure_dict
 
+from megatron.core.device_utils import get_xla_model
+
 if TYPE_CHECKING:
     from .filesystem_async import FileSystemWriterAsync
 

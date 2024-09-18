@@ -9,11 +9,12 @@ import logging
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue, AsyncRequest
 from megatron.training import get_args
 from megatron.training.utils import print_rank_0
+from megatron.core import mpu
 
 logger = logging.getLogger(__name__)
 
 # Singleton manager of async calls
-_async_calls_queue = AsyncCallsQueue()
+_async_calls_queue = None
 
 
 def schedule_async_save(async_request: AsyncRequest):
@@ -36,6 +37,10 @@ def maybe_finalize_async_save(blocking: bool = False):
     args = get_args()
     if not args.async_save:
         return
+
+    global _async_calls_queue
+    if _async_calls_queue is None:
+        _async_calls_queue = AsyncCallsQueue(process_group=mpu.get_default_process_group())
 
     if blocking and _async_calls_queue.get_num_unfinalized_calls() > 0:
         print_rank_0('Unfinalized async checkpoint saves. Finalizing them synchronously now.')

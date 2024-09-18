@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from typing import Optional, Dict
 
-from megatron.core import dist_checkpointing
+from megatron.core import dist_checkpointing, parallel_state
 from megatron.training import get_args
 from megatron.training.checkpointing import _load_base_checkpoint, load_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
@@ -53,6 +53,7 @@ def load_modelopt_state(load_dir: Optional[str] = None) -> Dict:
             modelopt_state = restore_modelopt_state_metadata(
                 dist_checkpointing.load(
                     get_sharded_modelopt_state(args.num_layers), modelopt_state_dir,
+                    process_group=parallel_state.get_default_process_group()
                 )
             )
             return modelopt_state
@@ -127,7 +128,8 @@ def load_modelopt_checkpoint(
                 _remove_prefix_state_dict_pre_hook
             )
         unwrapped_model[0].load_state_dict(
-            dist_checkpointing.load(sharded_state_dict, sharded_load_dir)
+            dist_checkpointing.load(sharded_state_dict, sharded_load_dir, 
+                                    process_group=parallel_state.get_default_process_group())
         )
         # Set the attribute to True such that by-default we are storing the heterogenous arch.
         unwrapped_model[0].decoder.config.non_homogeneous_layers = True

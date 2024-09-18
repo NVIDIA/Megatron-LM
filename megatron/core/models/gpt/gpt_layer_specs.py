@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import torch
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
@@ -25,7 +26,8 @@ try:
     HAVE_TE = True
 except ImportError:
     import warnings
-    warnings.warn(f'Transformer Engine is not installed. Falling back to Megatron Local')
+    if torch.cuda.is_available():
+        warnings.warn('Transformer Engine is not installed. Falling back to Megatron Local')
     HAVE_TE = False
 
 try:
@@ -39,8 +41,8 @@ except ImportError:
     import warnings
 
     from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
-
-    warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
+    if torch.cuda.is_available():
+        warnings.warn('Apex is not installed. Falling back to Torch LayerNorm')
     LNImpl = WrappedTorchLayerNorm
 
 

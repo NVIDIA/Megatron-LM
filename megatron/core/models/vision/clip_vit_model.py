@@ -15,7 +15,8 @@ except ImportError:
     from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
     import warnings
 
-    warnings.warn(f'Transformer Engine is not installed. Falling back to Megatron Local')
+    if torch.cuda.is_available():
+        warnings.warn('Transformer Engine is not installed. Falling back to Megatron Local')
     
 
 from megatron.core.transformer.enums import ModelType

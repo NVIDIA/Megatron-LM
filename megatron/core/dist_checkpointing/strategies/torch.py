@@ -16,6 +16,7 @@ import numpy as np
 import torch
 from pkg_resources import packaging
 from torch.distributed import checkpoint
+import torch.distributed
 from torch.distributed._shard._utils import narrow_tensor_by_index
 from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed._shard.sharded_tensor import Shard, ShardedTensorMetadata, TensorProperties
@@ -41,7 +42,7 @@ from torch.distributed.checkpoint.planner import LoadItemType
 from torch.distributed.checkpoint.planner_helpers import _create_write_items
 from torch.futures import Future
 
-from megatron.core.device_utils import get_current_device_type
+from megatron.core.device_utils import get_current_device_type, get_xla_model
 
 from ..core import CheckpointingException
 from ..dict_utils import extract_matching_values, nested_values
@@ -78,7 +79,6 @@ except ImportError:
 _import_trigger = None
 
 logger = getLogger(__name__)
-
 
 def flatten_state_dict(
     state_dict: ShardedStateDict,
@@ -562,6 +562,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         keep_only_main_replica: bool = True,
         thread_count: int = 2,
         cached_metadata: bool = False,
+        process_group:  torch.distributed.ProcessGroup=None
     ):
         """Adds parameters specific to PyT Distributed format
         Args:
@@ -592,6 +593,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         # The knob to enable cached metadata communication in saving
         self.use_cached_ckpt_structure: bool = cached_metadata
 
+        self.process_group = process_group
+        
     def async_save(
         self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path
     ) -> AsyncRequest:
@@ -634,7 +637,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         ) = save_state_dict_async_plan(
             pyt_state_dict,
             writer,
-            None,
+            self.process_group,
             coordinator,
             planner=MCoreSavePlanner(dedup_replicated_tensors=not self.keep_only_main_replica),
             cached_ckpt_structure=args_cached_plans,
@@ -660,7 +663,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
 
         def finalize_fn():
             save_state_dict_async_finalize(*save_state_dict_ret)
-            torch.distributed.barrier()
+            torch.distributed.barrier(group=self.process_group)
 
         return AsyncRequest(save_fn, save_args, [finalize_fn])
 
@@ -693,6 +696,13 @@ def get_reformulation_metadata(
 
 class TorchDistLoadShardedStrategy(LoadShardedStrategy):
     """Basic load strategy for the PyT Distributed format."""
+
+    def __init__(
+        self,
+        process_group:  torch.distributed.ProcessGroup=None
+    ):
+        super().__init__()
+        self.process_group = process_group
 
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
         """Translates MCore ShardedTensors to PyT ShardedTensors and loads from PyT Distributed format.
@@ -728,6 +738,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             planner=MCoreLoadPlanner(
                 shapes_validation_sharded_tensors=flexible_shape_sharded_tensors
             ),
+            process_group=self.process_group
         )
         pyt_state_dict = cast(
             Dict[str, Union[TorchShardedTensor, List[io.BytesIO]]], pyt_state_dict
@@ -804,10 +815,19 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
     def check_version_compatibility(self, loaded_version):
         pass  # TODO
 
+def init_shard_default_strategies(process_group: torch.distributed.ProcessGroup=None):
+    global default_strategies
 
-default_strategies[StrategyAction.LOAD_SHARDED.value][
-    ('torch_dist', 1)
-] = TorchDistLoadShardedStrategy()
-default_strategies[StrategyAction.SAVE_SHARDED.value][('torch_dist', 1)] = (
-    TorchDistSaveShardedStrategy('torch_dist', 1)
-)
+    default_strategies[StrategyAction.LOAD_SHARDED.value][
+        ('torch_dist', 1)
+    ] = TorchDistLoadShardedStrategy(process_group=process_group)
+    default_strategies[StrategyAction.SAVE_SHARDED.value][('torch_dist', 1)] = (
+        TorchDistSaveShardedStrategy('torch_dist', 1, process_group=process_group)
+    )
+
+def deinit_shard_default_strategies():
+    global default_strategies
+    if default_strategies is not None:
+        del default_strategies[StrategyAction.LOAD_SHARDED.value][('torch_dist', 1)]
+        del default_strategies[StrategyAction.SAVE_SHARDED.value][('torch_dist', 1)]
+        

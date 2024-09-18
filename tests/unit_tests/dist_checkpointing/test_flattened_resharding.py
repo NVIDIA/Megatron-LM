@@ -36,17 +36,19 @@ class TestFlattenedResharding:
     def test_partition_change_save_load(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp):
         Utils.initialize_model_parallel(*src_tp_pp)
         with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_flattened_partition_change_save_load'
+            tmp_path_dist_ckpt / 'test_flattened_partition_change_save_load',
+            process_group=parallel_state.get_default_process_group()
         ) as ckpt_dir:
 
             state_dict = self._build_state_dict()
 
-            save(state_dict, ckpt_dir)
+            save(state_dict, ckpt_dir, process_group=parallel_state.get_default_process_group())
 
             # change TPxPP
             Utils.destroy_model_parallel()
             Utils.initialize_model_parallel(*dest_tp_pp)
-            loaded_state_dict = load(self._build_state_dict(random=True), ckpt_dir)
+            loaded_state_dict = load(self._build_state_dict(random=True), ckpt_dir,
+                                     process_group=parallel_state.get_default_process_group())
             expected_state_dict = {k: v.data for k, v in self._build_state_dict().items()}
 
             diffs = diff(expected_state_dict, loaded_state_dict)
@@ -78,13 +80,14 @@ class TestFlattenedResharding:
         self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, expected_ckpt_offsets_by_rank
     ):
         Utils.initialize_model_parallel(*src_tp_pp, order='tp-dp-pp')
-        with TempNamedDir(tmp_path_dist_ckpt / 'test_reformulate_nd_flattened_tensors') as ckpt_dir:
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_reformulate_nd_flattened_tensors',
+                          process_group=parallel_state.get_default_process_group()) as ckpt_dir:
 
             state_dict = self._build_state_dict()
 
             ckpt_local_shape = state_dict['sd_key_flat'].local_shape
 
-            save(state_dict, ckpt_dir)
+            save(state_dict, ckpt_dir, process_group=parallel_state.get_default_process_group())
 
             # change TPxPP
             Utils.destroy_model_parallel()
@@ -108,7 +111,8 @@ class TestFlattenedResharding:
 
             # We can even load the reformulated state dict with a high-level API
             loaded_state_dict = load(
-                reformulated_state_dict, ckpt_dir, validate_access_integrity=False
+                reformulated_state_dict, ckpt_dir, validate_access_integrity=False,
+                process_group=parallel_state.get_default_process_group()
             )
             loaded_state_dict = restore_nd_flattened_tensors_formulation(
                 loaded_state_dict, formulation_restore_data
@@ -122,11 +126,12 @@ class TestFlattenedResharding:
     @pytest.mark.parametrize(('src_tp_pp',), [((2, 4),), ((8, 1),), ((1, 1),), ((1, 4),)])
     def test_load_tensor_metadata(self, tmp_path_dist_ckpt, src_tp_pp):
         Utils.initialize_model_parallel(*src_tp_pp, order='tp-dp-pp')
-        with TempNamedDir(tmp_path_dist_ckpt / 'test_reformulate_nd_flattened_tensors') as ckpt_dir:
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_reformulate_nd_flattened_tensors',
+                          process_group=parallel_state.get_default_process_group()) as ckpt_dir:
 
             state_dict = self._build_state_dict()
 
-            save(state_dict, ckpt_dir)
+            save(state_dict, ckpt_dir, process_group=parallel_state.get_default_process_group())
 
             # change TPxPP
             Utils.destroy_model_parallel()
@@ -141,7 +146,8 @@ class TestFlattenedResharding:
 
             for sh_ten in sharded_metadata.values():
                 sh_ten.replica_id = Utils.rank
-            loaded_state_dict = load(sharded_metadata, ckpt_dir)
+            loaded_state_dict = load(sharded_metadata, ckpt_dir,
+                                     process_group=parallel_state.get_default_process_group())
             assert torch.all(
                 loaded_state_dict['unflat'] == torch.arange(8 * 5 * 40).reshape(8, 5, 40)
             )

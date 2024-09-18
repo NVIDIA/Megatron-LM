@@ -9,6 +9,7 @@ import torch
 from torch.distributed.checkpoint import CheckpointException as PyTCheckpointingException
 
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_xla_model
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
 from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_load_config
 from megatron.core.dist_checkpointing.dict_utils import diff
@@ -22,6 +23,7 @@ from megatron.core.dist_checkpointing.validation import StrictHandling
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
+xm = get_xla_model()
 
 class TestSerialization:
     def setup_method(self, method):
@@ -44,12 +46,15 @@ class TestSerialization:
 
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
         with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_single_process_save_load', sync=True
+            tmp_path_dist_ckpt / 'test_single_process_save_load', sync=True, 
+            process_group=parallel_state.get_default_process_group()
         ) as ckpt_dir:
-            save(sharded_state_dict, ckpt_dir)
-            torch.distributed.barrier()
-
+            save(sharded_state_dict, ckpt_dir, 
+                 process_group=parallel_state.get_default_process_group())
+            torch.distributed.barrier(group=parallel_state.get_default_process_group())
+            
             saved_config = maybe_load_config(ckpt_dir)
+            
             if saved_config.sharded_backend == 'zarr':
                 assert (ckpt_dir / 'keyA').is_dir()
                 assert (ckpt_dir / 'keyB').is_dir()
@@ -61,7 +66,9 @@ class TestSerialization:
                     'keyA', torch.ones(2, 4), replica_id=Utils.rank
                 )
             }
-            loaded_state_dict = load(load_ssd, ckpt_dir)
+             
+            loaded_state_dict = load(load_ssd, ckpt_dir, 
+                                     process_group=parallel_state.get_default_process_group())
 
             assert set(loaded_state_dict.keys()) == {'load_sd_keyA'}
             assert isinstance(loaded_state_dict['load_sd_keyA'], torch.Tensor)
@@ -69,6 +76,7 @@ class TestSerialization:
 
         Utils.destroy_model_parallel()
 
+    
     def test_multi_process_save(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(2, 4)
 
@@ -82,8 +90,11 @@ class TestSerialization:
         }
 
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
-        with TempNamedDir(tmp_path_dist_ckpt / 'test_multi_process_save', sync=True) as ckpt_dir:
-            save(state_dict, ckpt_dir)
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_multi_process_save', sync=True,
+            process_group=parallel_state.get_default_process_group()) as ckpt_dir:
+            save(state_dict, ckpt_dir, 
+                 process_group=parallel_state.get_default_process_group())
+            torch.distributed.barrier(group=parallel_state.get_default_process_group())
 
             saved_config = maybe_load_config(ckpt_dir)
             if saved_config.sharded_backend == 'zarr':
@@ -141,9 +152,12 @@ class TestSerialization:
 
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
         with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_partition_change_save_load', sync=True
+            tmp_path_dist_ckpt / 'test_partition_change_save_load', sync=True,
+            process_group=parallel_state.get_default_process_group()
         ) as ckpt_dir:
-            save(state_dict, ckpt_dir, strategy)
+            save(state_dict, ckpt_dir, strategy, 
+                 process_group=parallel_state.get_default_process_group())
+            torch.distributed.barrier(group=parallel_state.get_default_process_group())
 
             del ten_a, ten_b
 
@@ -156,7 +170,8 @@ class TestSerialization:
                     'keyB', torch.empty(ten_b_global_shape), replica_id=Utils.rank
                 ),
             }
-            loaded_state_dict = load(load_sd, ckpt_dir)
+            loaded_state_dict = load(load_sd, ckpt_dir,
+                                     process_group=parallel_state.get_default_process_group())
 
             ten_a = loaded_state_dict['sd_keyA']
             ten_b = loaded_state_dict['sd_keyB']
@@ -201,7 +216,8 @@ class TestSerialization:
                 ),
             }
 
-            loaded_state_dict = load(load_sd, ckpt_dir)
+            loaded_state_dict = load(load_sd, ckpt_dir,
+                                     process_group=parallel_state.get_default_process_group())
             ten_a = loaded_state_dict['sd_keyA']
             ten_b = loaded_state_dict['sd_keyB']
 
@@ -216,6 +232,8 @@ class TestSerialization:
             assert torch.all(
                 ten_b == torch.arange(80).unsqueeze(0).expand(5, 80) + Utils.rank // 2 * 100
             )
+            
+            
 
     def test_load_tensors_metadata(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(2, 4)
@@ -230,8 +248,10 @@ class TestSerialization:
         }
 
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
-        with TempNamedDir(tmp_path_dist_ckpt / 'test_load_tensors_metadata', sync=True) as ckpt_dir:
-            save(state_dict, ckpt_dir)
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_load_tensors_metadata', sync=True,
+                          process_group=parallel_state.get_default_process_group()) as ckpt_dir:
+            save(state_dict, ckpt_dir, process_group=parallel_state.get_default_process_group())
+            torch.distributed.barrier(group=parallel_state.get_default_process_group())
 
             del state_dict
             sharded_state_dict = load_tensors_metadata(ckpt_dir)
@@ -252,7 +272,8 @@ class TestSerialization:
             assert sharded_state_dict['keyB'].replica_id == 0
 
             # metadata dict can be loaded. We don't validate access because there are multiple replica_id=0
-            state_dict = load(sharded_state_dict, ckpt_dir, validate_access_integrity=False)
+            state_dict = load(sharded_state_dict, ckpt_dir, validate_access_integrity=False,
+                              process_group=parallel_state.get_default_process_group())
             assert torch.all(state_dict['keyA'] == torch.arange(10 * Utils.world_size))
 
         Utils.destroy_model_parallel()
@@ -289,11 +310,15 @@ class TestSerialization:
 
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
         with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_can_mix_sharded_tensors_and_factories', sync=True
+            tmp_path_dist_ckpt / 'test_can_mix_sharded_tensors_and_factories', sync=True,
+            process_group=parallel_state.get_default_process_group()
         ) as ckpt_dir:
-            save(get_sharded_state_dict(0), ckpt_dir)
-            loaded_state_dict = load(get_sharded_state_dict(10), ckpt_dir)
-
+            save(get_sharded_state_dict(0), ckpt_dir, 
+                 process_group=parallel_state.get_default_process_group())
+            torch.distributed.barrier(group=parallel_state.get_default_process_group())
+            loaded_state_dict = load(get_sharded_state_dict(10), ckpt_dir, 
+                                     process_group=parallel_state.get_default_process_group())
+    
         expected_sd = {
             'all': [
                 torch.arange(2),
@@ -316,28 +341,36 @@ class TestSerialization:
         # Non-existent directory
         non_ex_path = f'/tmp/non-existent-path/{ckpt_dir_name}'
         with pytest.raises(CheckpointingException) as exc_info:
-            load(state_dict, non_ex_path)
+            load(state_dict, non_ex_path,
+                 process_group=parallel_state.get_default_process_group())
         assert f'directory {non_ex_path} does not exist' in str(exc_info.value)
+        
 
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
-        with TempNamedDir(tmp_path_dist_ckpt / ckpt_dir_name, sync=True) as ckpt_dir:
+        with TempNamedDir(tmp_path_dist_ckpt / ckpt_dir_name, sync=True,
+                          process_group=parallel_state.get_default_process_group()) as ckpt_dir:
             # Empty directory - not a distributed checkpoint
             with pytest.raises(CheckpointingException) as exc_info:
-                load(state_dict, ckpt_dir)
+                load(state_dict, ckpt_dir, 
+                     process_group=parallel_state.get_default_process_group())
             assert f'is not a distributed checkpoint' in str(exc_info.value)
 
             # Missing Zarr arrays
-            torch.distributed.barrier()
-            save(state_dict, ckpt_dir)
+            save(state_dict, ckpt_dir, 
+                 process_group=parallel_state.get_default_process_group())
+            torch.distributed.barrier(group=parallel_state.get_default_process_group())
             sh_ten.key = 'different_key'
             with pytest.raises((CheckpointingException, PyTCheckpointingException)) as exc_info:
-                load(state_dict, ckpt_dir)
+                load(state_dict, ckpt_dir, 
+                     process_group=parallel_state.get_default_process_group())
             assert "different_key" in str(exc_info.value)
 
+    
     def test_sharded_object_serialization(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(1, 1)
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
-        with TempNamedDir(tmp_path_dist_ckpt / 'test_sh_obj', sync=True) as ckpt_dir:
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_sh_obj', sync=True,
+                          process_group=parallel_state.get_default_process_group()) as ckpt_dir:
             state = {'some': 'dict'}
             state_serialized = io.BytesIO()
             torch.save(state, state_serialized)
@@ -346,8 +379,9 @@ class TestSerialization:
                     'sh_obj_A', state_serialized, (1,), (0,), replica_id=Utils.rank
                 )
             }
-
-            save(state_dict, ckpt_dir)
+            save(state_dict, ckpt_dir, 
+                 process_group=parallel_state.get_default_process_group())
+            torch.distributed.barrier(group=parallel_state.get_default_process_group())
             del state, state_serialized, state_dict
             other_state = {'other': 'dictionary'}
             other_serialized = io.BytesIO()
@@ -357,7 +391,8 @@ class TestSerialization:
                     'sh_obj_A', other_serialized, (1,), (0,), replica_id=Utils.rank
                 )
             }
-            load_state_dict = load(state_dict, ckpt_dir)
+            load_state_dict = load(state_dict, ckpt_dir, 
+                                   process_group=parallel_state.get_default_process_group())
             assert 'other_key' in load_state_dict
             load_state_dict['other_key'].seek(0)
             loaded_state = torch.load(load_state_dict['other_key'])
@@ -384,8 +419,11 @@ class TestSerialization:
         assert state_dict['flexible'].global_shape == (2, 32)
 
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
-        with TempNamedDir(tmp_path_dist_ckpt / 'test_tensor_shape_mismatch', sync=True) as ckpt_dir:
-            save(state_dict, ckpt_dir)
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_tensor_shape_mismatch', sync=True,
+                          process_group=parallel_state.get_default_process_group()) as ckpt_dir:
+            save(state_dict, ckpt_dir, 
+                 process_group=parallel_state.get_default_process_group())
+            torch.distributed.barrier(group=parallel_state.get_default_process_group())
 
             pp_size = parallel_state.get_pipeline_model_parallel_world_size()
             pp_rank = parallel_state.get_pipeline_model_parallel_rank()
@@ -398,7 +436,8 @@ class TestSerialization:
                 )
             }
             with pytest.raises((CheckpointingException, PyTCheckpointingException)):
-                load(state_dict, ckpt_dir)
+                load(state_dict, ckpt_dir, 
+                     process_group=parallel_state.get_default_process_group())
 
             state_dict = {
                 'flexible': ShardedTensor.from_rank_offsets(
@@ -409,7 +448,8 @@ class TestSerialization:
                     allow_shape_mismatch=True,
                 )
             }
-            loaded_state_dict = load(state_dict, ckpt_dir)
+            loaded_state_dict = load(state_dict, ckpt_dir,
+                                     process_group=parallel_state.get_default_process_group())
             assert torch.all(
                 loaded_state_dict['flexible']
                 == torch.arange(7).unsqueeze(0).expand(2, 7) + pp_rank * 7
@@ -422,7 +462,7 @@ class TestSerialization:
                 )
             }
             with pytest.raises((CheckpointingException, PyTCheckpointingException)):
-                load(state_dict, ckpt_dir)
+                load(state_dict, ckpt_dir, process_group=parallel_state.get_default_process_group())
 
             state_dict = {
                 'flexible': ShardedTensor.from_rank_offsets(
@@ -433,7 +473,8 @@ class TestSerialization:
                     allow_shape_mismatch=True,
                 )
             }
-            loaded_state_dict = load(state_dict, ckpt_dir)
+            loaded_state_dict = load(state_dict, ckpt_dir,
+                                     process_group=parallel_state.get_default_process_group())
             expected_tensor = torch.arange(9).unsqueeze(0).expand(2, 9) + pp_rank * 9
 
             if pp_rank >= (32 // 9):
@@ -471,12 +512,16 @@ class TestNonStrictLoad:
     def test_unexpected_keys_handling_during_validation(
         self, caplog, tmp_path_dist_ckpt, validate_integrity, save_format
     ):
+        save_format = 'torch_dist' if xm else save_format # force to 'torch_dist' for XLA
         sharded_state_dict = self._get_base_state_dict()
         with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_unexpected_keys_raises_error_during_validation'
+            tmp_path_dist_ckpt / 'test_unexpected_keys_raises_error_during_validation',
+            sync=True, process_group=parallel_state.get_default_process_group()
         ) as ckpt_dir:
             save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, save_format, 1)
-            save(sharded_state_dict, ckpt_dir, save_strategy)
+            save(sharded_state_dict, ckpt_dir, save_strategy, 
+                 process_group=parallel_state.get_default_process_group())
+            torch.distributed.barrier(group=parallel_state.get_default_process_group())
 
             def load_with_flag(strict):
                 sharded_state_dict = self._get_base_state_dict()
@@ -491,6 +536,7 @@ class TestNonStrictLoad:
                     ckpt_dir,
                     validate_access_integrity=validate_integrity,
                     strict=strict,
+                    process_group=parallel_state.get_default_process_group()
                 )
 
             def test_error(error_msg):
@@ -545,12 +591,16 @@ class TestNonStrictLoad:
     def test_missing_keys_raises_error_during_validation(
         self, caplog, tmp_path_dist_ckpt, validate_integrity, save_format
     ):
+        save_format = 'torch_dist' if xm else save_format # force to 'torch_dist' for XLA
         sharded_state_dict = self._get_base_state_dict()
         with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_missing_keys_raises_error_during_validation'
+            tmp_path_dist_ckpt / 'test_missing_keys_raises_error_during_validation',
+            sync=True, process_group=parallel_state.get_default_process_group()
         ) as ckpt_dir:
             save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, save_format, 1)
-            save(sharded_state_dict, ckpt_dir, save_strategy)
+            save(sharded_state_dict, ckpt_dir, save_strategy, 
+                 process_group=parallel_state.get_default_process_group())
+            torch.distributed.barrier(group=parallel_state.get_default_process_group())
 
             def load_with_flag(strict):
                 sharded_state_dict = self._get_base_state_dict()
@@ -561,6 +611,7 @@ class TestNonStrictLoad:
                     ckpt_dir,
                     validate_access_integrity=validate_integrity,
                     strict=strict,
+                    process_group=parallel_state.get_default_process_group()
                 )
 
             def test_error(error_msg):
@@ -616,10 +667,14 @@ class TestNonStrictLoad:
     @pytest.mark.parametrize('save_format', ['zarr', 'torch_dist'])
     @pytest.mark.parametrize('validate_integrity', [True, False])
     def test_exact_load_handling(self, caplog, tmp_path_dist_ckpt, validate_integrity, save_format):
+        save_format = 'torch_dist' if xm else save_format # force to 'torch_dist' for XLA
         sharded_state_dict = self._get_base_state_dict()
-        with TempNamedDir(tmp_path_dist_ckpt / 'test_exact_load_handling') as ckpt_dir:
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_exact_load_handling', sync=True,
+                          process_group=parallel_state.get_default_process_group()) as ckpt_dir:
             save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, save_format, 1)
-            save(sharded_state_dict, ckpt_dir, save_strategy)
+            save(sharded_state_dict, ckpt_dir, save_strategy,
+                 process_group=parallel_state.get_default_process_group())
+            torch.distributed.barrier(group=parallel_state.get_default_process_group())
 
             def load_with_flag(strict):
                 sharded_state_dict = self._get_base_state_dict()
@@ -628,6 +683,7 @@ class TestNonStrictLoad:
                     ckpt_dir,
                     validate_access_integrity=validate_integrity,
                     strict=strict,
+                    process_group=parallel_state.get_default_process_group()
                 )
 
             for strict in (
@@ -661,12 +717,14 @@ class TestNonStrictLoad:
 
     @pytest.mark.parametrize('save_format', ['zarr', 'torch_dist'])
     def test_sharded_metadata(self, tmp_path_dist_ckpt, save_format):
-
+        save_format = 'torch_dist' if xm else save_format # force to 'torch_dist' for XLA
         sharded_state_dict = self._get_base_state_dict()
-        with TempNamedDir(tmp_path_dist_ckpt / 'test_exact_load_handling') as ckpt_dir:
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_exact_load_handling', sync=True,
+                          process_group=parallel_state.get_default_process_group()) as ckpt_dir:
             save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, save_format, 1)
-            save(sharded_state_dict, ckpt_dir, save_strategy)
-            torch.distributed.barrier()
+            save(sharded_state_dict, ckpt_dir, save_strategy, 
+                 process_group=parallel_state.get_default_process_group())
+            torch.distributed.barrier(group=parallel_state.get_default_process_group())
             sharded_metadata = load_sharded_metadata(ckpt_dir)
             assert set(sh_base.key for sh_base in sharded_metadata.values()) == {
                 'TenA',
@@ -683,7 +741,8 @@ class TestNonStrictLoad:
                 *(f'ObjB/shard_0.{i}_1.8' for i in range(8)),
             }
 
-            loaded_state_dict = load(sharded_metadata, ckpt_dir, validate_access_integrity=False)
+            loaded_state_dict = load(sharded_metadata, ckpt_dir, validate_access_integrity=False,
+                                     process_group=parallel_state.get_default_process_group())
 
             assert loaded_state_dict['ObjA/shard_0_1'] == list(range(10))
             for shard_idx in range(8):

@@ -451,6 +451,7 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
         if config.sequence_parallel:
             name = "mpu_" + str((i + 1) % 2)
             xm = get_xla_model()
+            handle = None
             if xm:
                 all_gather_buffer = xm.all_gather(input, groups=parallel_state.get_tensor_model_parallel_groups())
             else:
@@ -469,7 +470,7 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
         drain_idx = (i + 1) % 2
         input, all_gathered_input[i % 2], grad_output = None, None, None
 
-        if config.sequence_parallel:
+        if config.sequence_parallel and handle:
             handle.wait()
 
     grad_output = grad_output_buffer.pop(0)

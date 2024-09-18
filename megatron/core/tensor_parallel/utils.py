@@ -79,19 +79,15 @@ def gather_split_1d_tensor(tensor):
     Args:
         tensor: A Tensor or view of this rank's portion of the data.
     """
+    
     numel_gathered = torch.numel(tensor) * parallel_state.get_tensor_model_parallel_world_size()
-    gathered = torch.empty(
-        numel_gathered, dtype=tensor.dtype, device=get_current_device(), requires_grad=False
-    )
-    # TODO: This API is experimental in pytorch (as of Feb 2022) and
-    # this might break in future pytorch releases. We chose this API
-    # as opposed to torch.distributed.all_gather for efficiency reasons.
-    # This API calls directly NCCL all-gather versus the former does
-    # internal copies and can potentially cause slow down.
     xm = get_xla_model()
     if xm:
-        gathered = xm.all_gather(tensor, parallel_state.get_tensor_model_parallel_groups())
+        gathered = xm.all_gather(tensor, groups=parallel_state.get_tensor_model_parallel_groups()).view(numel_gathered)
     else:
+        gathered = torch.empty(
+            numel_gathered, dtype=tensor.dtype, device=get_current_device(), requires_grad=False
+        )
         torch.distributed.all_gather_into_tensor(
             gathered, tensor, group=parallel_state.get_tensor_model_parallel_group()
         )

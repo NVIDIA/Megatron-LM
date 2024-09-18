@@ -241,7 +241,7 @@ class Timers:
         # See the note above for why we are not using gather.
         xm = get_xla_model()
         if xm:
-            rank_name_to_time = xm.all_gather(rank_name_to_time[rank, :].view(-1))
+            rank_name_to_time = xm.all_gather(rank_name_to_time[rank, :].view(-1)).view(-1)
         else:
             torch.distributed.all_gather_into_tensor(
                 rank_name_to_time.view(-1), rank_name_to_time[rank, :].view(-1)

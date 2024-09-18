@@ -27,11 +27,11 @@ def initialize_distributed(tensor_model_parallel_size=1, pipeline_model_parallel
     parallel_state.destroy_model_parallel()
 
     # Torch setup for distributed training
-    local_rank = int(os.environ['LOCAL_RANK'])
-    local_world_size = get_local_device_count()
+    rank = int(os.environ['RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
     torch.distributed.init_process_group(backend=get_distributed_backend(), 
                                          init_nmethod=get_distributed_init_method(), 
-                                         world_size=local_world_size, rank=local_rank)
+                                         world_size=world_size, rank=rank)
 
     # Megatron core distributed training initialization
     parallel_state.initialize_model_parallel(tensor_model_parallel_size, pipeline_model_parallel_size)
@@ -109,11 +109,13 @@ def forward_step_func(data_iterator, model):
 
 def save_distributed_checkpoint(checkpoint_path, gpt_model):
     sharded_state_dict = gpt_model.sharded_state_dict(prefix='')
-    dist_checkpointing.save(sharded_state_dict=sharded_state_dict, checkpoint_dir=checkpoint_path)
+    dist_checkpointing.save(sharded_state_dict=sharded_state_dict, checkpoint_dir=checkpoint_path,
+                            process_group=parallel_state.get_default_process_group())
 
 def load_distributed_checkpoint(checkpoint_path, gpt_model):
     sharded_state_dict=gpt_model.sharded_state_dict(prefix='')
-    checkpoint = dist_checkpointing.load(sharded_state_dict=sharded_state_dict, checkpoint_dir=checkpoint_path)
+    checkpoint = dist_checkpointing.load(sharded_state_dict=sharded_state_dict, checkpoint_dir=checkpoint_path,
+                                         process_group=parallel_state.get_default_process_group())
     gpt_model.load_state_dict(checkpoint)
     return gpt_model
 

@@ -98,14 +98,15 @@ class TestT5Model:
         with TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model') as ckpt_dir:
             # Save
             sharded_state_dict = gpt_model.sharded_state_dict()
-            save(sharded_state_dict, ckpt_dir)
+            save(sharded_state_dict, ckpt_dir, process_group=ps.get_default_process_group())
 
             # Load
             gpt_model = initialize_t5_model(2, dst_encoder_spec_fn, dst_decoder_spec_fn)
             sharded_state_dict = gpt_model.sharded_state_dict()
 
             state_dict, missing_keys, unexpected_keys = load(
-                sharded_state_dict, ckpt_dir, strict=StrictHandling.RETURN_ALL
+                sharded_state_dict, ckpt_dir, strict=StrictHandling.RETURN_ALL,
+                process_group=ps.get_default_process_group()
             )
             # Potential mismatch is because of extra states which is ok
             assert all('_extra_state' in k for k in missing_keys)

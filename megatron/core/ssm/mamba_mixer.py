@@ -28,7 +28,7 @@ except ImportError:
 
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-except ImportError:
+except (ModuleNotFoundError, ImportError):
     causal_conv1d_fn = None
     causal_conv1d_update = None
 
@@ -38,12 +38,12 @@ try:
         mamba_chunk_scan_combined,
         mamba_split_conv1d_scan_combined,
     )
-except ImportError:
+except (ModuleNotFoundError, ImportError):
     raise ImportError("mamba-ssm is required by the Mamba model but cannot be imported")
 
 try:
     from einops import rearrange, repeat
-except ImportError:
+except (ModuleNotFoundError, ImportError):
     raise ImportError("einops is required by the Mamba model but cannot be imported")
 
 

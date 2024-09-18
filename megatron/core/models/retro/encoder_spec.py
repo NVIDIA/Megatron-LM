@@ -2,6 +2,7 @@
 
 """Specs for Retro encoder."""
 
+import torch
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -32,7 +33,8 @@ try:
 except ImportError:
     import warnings
 
-    warnings.warn(f'Transformer Engine is not installed. Falling back to Megatron Local')
+    if torch.cuda.is_available():
+        warnings.warn('Transformer Engine is not installed. Falling back to Megatron Local')
     
     HAVE_TE = False
 
@@ -47,8 +49,8 @@ except ImportError:
     import warnings
 
     from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
-
-    warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
+    if torch.cuda.is_available():
+        warnings.warn('Apex is not installed. Falling back to Torch LayerNorm')
     LNImpl = WrappedTorchLayerNorm
 
 

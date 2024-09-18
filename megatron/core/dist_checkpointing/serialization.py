@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Dict, Optional, Set, Tuple, Union
 
 import torch
+import torch.distributed
 
 from . import ShardedTensor
 from .core import CheckpointingConfig, save_config
@@ -60,6 +61,7 @@ def load(
     common_strategy: Union[LoadCommonStrategy, Tuple[str, int], None] = None,
     validate_access_integrity: bool = True,
     strict: Union[str, StrictHandling] = StrictHandling.ASSUME_OK_UNEXPECTED,
+    process_group: torch.distributed.ProcessGroup = None
 ) -> Union[StateDict, Tuple[StateDict, Set[str], Set[str]]]:
     """Loading entrypoint.
 
@@ -135,7 +137,8 @@ def load(
             str(checkpoint_dir), sharded_strategy, common_strategy
         )
     if validate_access_integrity or StrictHandling.requires_global_app_metadata(strict):
-        local_metadata, global_metadata = determine_global_metadata(sharded_state_dict)
+        local_metadata, global_metadata = determine_global_metadata(sharded_state_dict, 
+                                                                    process_group=process_group)
 
     sharded_state_dict, missing_keys, unexpected_keys = validate_integrity_and_strict_load(
         sharded_state_dict,
@@ -295,6 +298,7 @@ def save(
     common_strategy: Union[SaveCommonStrategy, Tuple[str, int], None] = None,
     validate_access_integrity: bool = True,
     async_sharded_save: bool = False,
+    process_group: torch.distributed.ProcessGroup = None
 ) -> Optional[AsyncRequest]:
     """Saving entrypoint.
 
@@ -372,7 +376,9 @@ def save(
     common_strategy.save_common(state_dict, checkpoint_dir)
 
     if validate_access_integrity:
-        validate_sharding_integrity(determine_global_metadata(sharded_state_dict)[1])
+        _, global_metadata = determine_global_metadata(sharded_state_dict, 
+                                                        process_group=process_group)
+        validate_sharding_integrity(global_metadata)
 
     if not sharded_strategy.can_handle_sharded_objects:
         validate_sharded_objects_handling(sharded_strategy, common_strategy)
@@ -387,7 +393,7 @@ def save(
                 CheckpointingConfig(sharded_strategy.backend, sharded_strategy.version),
                 checkpoint_dir,
             )
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=process_group)
 
     if not async_sharded_save:
         sharded_strategy.save(sharded_state_dict, checkpoint_dir)

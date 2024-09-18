@@ -10,7 +10,7 @@ import torch
 from torch.optim import Adam
 
 from megatron.core import parallel_state
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core.dist_checkpointing import ShardedTensor, save, load, \
     load_tensors_metadata, load_plain_tensors
 from megatron.core.dist_checkpointing.dict_utils import nested_values, diff
@@ -185,7 +185,8 @@ class TestDistributedOptimizer:
         Utils.initialize_model_parallel(*tp_pp)
 
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
-        with TempNamedDir(tmp_path_dist_ckpt / 'test_dp_sharding', sync=True) as ckpt_dir:
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_dp_sharding', sync=True,
+                          process_group=parallel_state.get_default_process_group()) as ckpt_dir:
             try:
                 Utils.set_world_size(src_world_size)
                 if Utils.rank >= 0:
@@ -196,10 +197,12 @@ class TestDistributedOptimizer:
 
                     save_strategy = get_default_save_sharded_strategy()
                     if use_fpsl:
+                        xm = get_xla_model()
                         save_strategy = FullyParallelSaveStrategyWrapper(
                             save_strategy,
-                            parallel_state.get_data_parallel_group(with_context_parallel=True),
-                            parallel_state.get_data_parallel_group_gloo(with_context_parallel=True),
+                            parallel_state.get_data_parallel_group(with_context_parallel=True) if xm is None else \
+                                parallel_state.get_data_parallel_group_gloo(with_context_parallel=True),
+                            parallel_state.get_default_process_group(),
                             True,
                         )
                     save(
@@ -208,6 +211,7 @@ class TestDistributedOptimizer:
                         ),
                         ckpt_dir,
                         save_strategy,
+                        process_group=parallel_state.get_default_process_group()
                     )
                     optim_param_state_A = optimizer_A.get_parameter_state_dp_zero()
                     Utils.destroy_model_parallel()
@@ -234,7 +238,8 @@ class TestDistributedOptimizer:
                     sharded_state_dict = optimizer_B.sharded_state_dict(
                         model[0].sharded_state_dict(), is_loading=True, sharding_type=sharding_type
                     )
-                    optim_state_dict = load(sharded_state_dict, ckpt_dir)
+                    optim_state_dict = load(sharded_state_dict, ckpt_dir,
+                                            process_group=parallel_state.get_default_process_group())
                     optimizer_B.load_state_dict(optim_state_dict)
                     optim_param_state_B = optimizer_B.get_parameter_state_dp_zero()
 
@@ -259,7 +264,8 @@ class TestDistributedOptimizer:
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
         Utils.initialize_model_parallel(*src_tp_pp)
         with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_finetune_doesnt_load_optimizer', sync=True
+            tmp_path_dist_ckpt / 'test_finetune_doesnt_load_optimizer', sync=True,
+            process_group=parallel_state.get_default_process_group()
         ) as ckpt_dir:
             mock_args = SimpleNamespace()
             with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
@@ -333,7 +339,8 @@ class TestDistributedOptimizer:
 
         Utils.initialize_model_parallel(tp, pp)
         with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_can_load_deprecated_bucket_space_format', sync=True
+            tmp_path_dist_ckpt / 'test_can_load_deprecated_bucket_space_format', sync=True,
+            process_group=parallel_state.get_default_process_group()
         ) as ckpt_dir:
             mock_args = SimpleNamespace()
             with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
@@ -363,7 +370,7 @@ class TestDistributedOptimizer:
 
                 flag = 0
                 key_list = []
-                torch.distributed.barrier()
+                torch.distributed.barrier(group=parallel_state.get_default_process_group())
                 if Utils.rank == 0:
                     sharded_metadata = load_tensors_metadata(ckpt_dir / 'iter_0000010')
                     key_list = list(sharded_metadata.keys())
@@ -399,10 +406,12 @@ class TestFP32Optimizer:
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
         Utils.initialize_model_parallel(*src_tp_pp)
         with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=True
+            tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=True,
+            process_group=parallel_state.get_default_process_group()
         ) as ckpt_dir_A:
             with TempNamedDir(
-                tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=True
+                tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=True,
+                process_group=parallel_state.get_default_process_group()
             ) as ckpt_dir_B:
 
                 model_A, optimizer_A = setup_model_and_optimizer(
@@ -413,7 +422,8 @@ class TestFP32Optimizer:
                     bf16=False,
                 )
 
-                save(optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()), ckpt_dir_A)
+                save(optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()), ckpt_dir_A,
+                     process_group=parallel_state.get_default_process_group())
                 Utils.destroy_model_parallel()
 
                 # Load checkpoint A with different TP/PP and save as checkpoint B
@@ -428,10 +438,12 @@ class TestFP32Optimizer:
                 load_sharded_state_dict = optimizer_B.sharded_state_dict(
                     model_B[0].sharded_state_dict()
                 )
-                state_dict = load(load_sharded_state_dict, ckpt_dir_A)
+                state_dict = load(load_sharded_state_dict, ckpt_dir_A,
+                                  process_group=parallel_state.get_default_process_group())
 
                 optimizer_B.load_state_dict(state_dict)
-                save(optimizer_B.sharded_state_dict(model_B[0].sharded_state_dict()), ckpt_dir_B)
+                save(optimizer_B.sharded_state_dict(model_B[0].sharded_state_dict()), ckpt_dir_B,
+                     process_group=parallel_state.get_default_process_group())
                 Utils.destroy_model_parallel()
 
                 # Test both checkpoints are equal
@@ -477,7 +489,8 @@ class TestOptimizerResharding:
                     seed=2, tp=src_tp_pp[0], pp=src_tp_pp[1], bf16=bf16, dist_opt=use_dist_opt
                 )
 
-                save(optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()), ckpt_dir_A)
+                save(optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()), ckpt_dir_A,
+                     process_group=parallel_state.get_default_process_group())
                 Utils.destroy_model_parallel()
 
                 # Load checkpoint A with different TP/PP and save as checkpoint B
@@ -488,10 +501,12 @@ class TestOptimizerResharding:
                 load_sharded_state_dict = optimizer_B.sharded_state_dict(
                     model_B[0].sharded_state_dict()
                 )
-                state_dict = load(load_sharded_state_dict, ckpt_dir_A)
+                state_dict = load(load_sharded_state_dict, ckpt_dir_A,
+                                  process_group=parallel_state.get_default_process_group())
 
                 optimizer_B.load_state_dict(state_dict)
-                save(optimizer_B.sharded_state_dict(model_B[0].sharded_state_dict()), ckpt_dir_B)
+                save(optimizer_B.sharded_state_dict(model_B[0].sharded_state_dict()), ckpt_dir_B,
+                     process_group=parallel_state.get_default_process_group())
                 Utils.destroy_model_parallel()
 
                 # Test both checkpoints are equal

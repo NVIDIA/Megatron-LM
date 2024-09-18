@@ -23,7 +23,8 @@ try:
     HAVE_TE = True
 except ImportError:
     import warnings
-    warnings.warn(f'Transfomer Engine is not installed. Falling back to Megatron Local')
+    if torch.cuda.is_available():
+        warnings.warn('Transfomer Engine is not installed. Falling back to Megatron Local')
     HAVE_TE = False
 
 try:
@@ -37,8 +38,8 @@ except ImportError:
     import warnings
 
     from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
-
-    warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
+    if torch.cuda.is_available():
+        warnings.warn('Apex is not installed. Falling back to Torch LayerNorm')
     LNImpl = WrappedTorchLayerNorm
 
 

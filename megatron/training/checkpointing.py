@@ -406,8 +406,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 if args.ckpt_assume_constant_structure and args.ckpt_format == 'torch_dist':
                     save_strategy.use_cached_ckpt_structure = args.ckpt_assume_constant_structure
                 if args.ckpt_fully_parallel_save:
-                    save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, mpu.get_data_parallel_group(with_context_parallel=True),
-                                                                     mpu.get_data_parallel_group_gloo(with_context_parallel=True),
+                    xm = get_xla_model()
+                    save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, mpu.get_data_parallel_group(with_context_parallel=True) if xm is None else \
+                                                                        mpu.get_data_parallel_group_gloo(with_context_parallel=True),
+                                                                     mpu.get_default_process_group(),
                                                                      args.ckpt_assume_constant_structure)
             # Store save strategy for future checkpoint saves
             if checkpointing_context is not None:
@@ -416,7 +418,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             logger.debug(f"rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt ")
             async_save_request = dist_checkpointing.save(state_dict, checkpoint_name, save_strategy,
                                                          async_sharded_save=args.async_save,
-                                                         validate_access_integrity=validate_sharding_integrity)
+                                                         validate_access_integrity=validate_sharding_integrity,
+                                                         process_group=mpu.get_default_process_group())
             # [ModelOpt]: save sharded modelopt_state
             if has_nvidia_modelopt:
                 save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))
@@ -433,7 +436,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         assert async_save_request is None
         # Wait so everyone is done (necessary)
         if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+            torch.distributed.barrier(group=mpu.get_default_process_group())
 
     # And update the latest iteration
     if not torch.distributed.is_initialized() \
@@ -473,7 +476,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     # Wait so everyone is done (not necessary)
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=mpu.get_default_process_group())
 
     end_misc = time()
     logger.debug(f"rank: {rank}, takes {end_misc - start_misc} to finalize ckpt save ")
@@ -725,13 +728,16 @@ def _load_global_dist_base_checkpoint(
     load_strategy = get_default_load_sharded_strategy(checkpoint_name)
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if args.ckpt_fully_parallel_load:
+        xm = get_xla_model()
+        parallelization_group = mpu.get_data_parallel_group(with_context_parallel=True) \
+            if xm is None else mpu.get_data_parallel_group_gloo(with_context_parallel=True) 
         load_strategy = FullyParallelLoadStrategyWrapper(
             strategy=load_strategy, 
-            parallelization_group=mpu.get_data_parallel_group(with_context_parallel=True),
-            parallelization_group_gloo=mpu.get_data_parallel_group_gloo(with_context_parallel=True),
-            parallelization_groups=mpu.get_data_parallel_groups(with_context_parallel=True)
+            parallelization_group=parallelization_group
         )
-    state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name, load_strategy, strict=args.dist_ckpt_strictness)
+    state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name, 
+                                         load_strategy, strict=args.dist_ckpt_strictness,
+                                         process_group=mpu.get_default_process_group())
     return state_dict, checkpoint_name, release
 
 
@@ -772,7 +778,7 @@ def _load_base_checkpoint(
         if args.exit_on_missing_checkpoint:
             print_rank_0(">> '--exit-on-missing-checkpoint' set ... exiting. <<")
             if torch.distributed.is_initialized():
-                torch.distributed.barrier()
+                torch.distributed.barrier(group=mpu.get_default_process_group())
             sys.exit()
 
         return None, "", False
@@ -1152,7 +1158,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
 
     # Some utilities want to load a checkpoint without distributed being initialized
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=mpu.get_default_process_group())
 
     print_rank_0(f'  successfully loaded checkpoint from {load_dir} '
                  f'[ t {mpu.get_tensor_model_parallel_rank()}, '
@@ -1198,7 +1204,7 @@ def load_biencoder_checkpoint(model, only_query_model=False,
 
     assert len(model) == 1
     model[0].load_state_dict(ret_state_dict)
-    torch.distributed.barrier()
+    torch.distributed.barrier(group=mpu.get_default_process_group())
 
     if mpu.get_data_parallel_rank() == 0:
         print(' successfully loaded {}'.format(checkpoint_name))

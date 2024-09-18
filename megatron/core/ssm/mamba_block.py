@@ -12,6 +12,7 @@ from functools import partial
 from typing import Union
 
 from torch import Tensor, nn
+import torch
 
 from megatron.core import parallel_state
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols as LayerSymbols
@@ -26,7 +27,8 @@ except ImportError:
     from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
     import warnings
 
-    warnings.warn(f'Transformer Engine is not installed. Falling back to Megatron Local')
+    if torch.cuda.is_available():
+        warnings.warn('Transformer Engine is not installed. Falling back to Megatron Local')
    
 
 from megatron.core.transformer.identity_op import IdentityOp

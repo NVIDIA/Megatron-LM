@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 
 from pkg_resources import packaging
+import torch
 
 from megatron.core.transformer import TransformerConfig
 
@@ -82,8 +83,8 @@ class RetroConfig(TransformerConfig):
                     )
         except PackageNotFoundError:
             import warnings
-
-            warnings.warn("transformer-engine package is not installled")
+            if torch.cuda.is_available():
+                warnings.warn("transformer-engine package is not installled")
 
         # Preprocessing split should be defined.
         assert self.retro_split_preprocessing is not None

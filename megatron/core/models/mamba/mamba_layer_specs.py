@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import torch
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.ssm.mamba_block import MambaStack, MambaStackSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
@@ -20,7 +21,8 @@ except ImportError:
     from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
     import warnings
 
-    warnings.warn(f'Transformer Engine is not installed. Falling back to Megatron Local')
+    if torch.cuda.is_available():
+        warnings.warn('Transformer Engine is not installed. Falling back to Megatron Local')
     
     HAVE_TE = False
 

@@ -27,7 +27,10 @@ class TestShardedTensor:
     # def teardown_method(self, method):
     #     Utils.destroy_model_parallel()
     
-    def test_from_rank_offsets_constructor(self, dtype=torch.float, device=get_current_device()):
+    def test_from_rank_offsets_constructor(self, dtype=torch.float, device=None):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+        if device is None:
+            device = get_current_device()
         data = torch.ones((1, 3, 7, 9), dtype=dtype, device=device)
         shape = data.shape
         rank_offsets = [(0, 0, 10), (2, 3, 6)]
@@ -39,8 +42,12 @@ class TestShardedTensor:
         assert sh_ten.global_shape == (shape[0] * 10, shape[1], shape[2] * 6, shape[3])
         assert sh_ten.global_offset == (0, 0, shape[2] * 3, 0)
         assert sh_ten.axis_fragmentations == (10, 1, 6, 1)
+        Utils.destroy_model_parallel()
 
-    def test_from_rank_offsets_flat_constructor(self, dtype=torch.float, device=get_current_device()):
+    def test_from_rank_offsets_flat_constructor(self, dtype=torch.float, device=None):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+        if device is None:
+            device = get_current_device()
         data = torch.arange(28, dtype=dtype, device=device).reshape((1, 4, 7))
         shape = data.shape
         rank_offsets = [(1, 0, 2), (2, 3, 5)]
@@ -59,8 +66,10 @@ class TestShardedTensor:
         assert sh_ten.axis_fragmentations == (1, 2, 5)
 
         assert torch.all(sh_ten.data == torch.arange(4, 9, device=device))
+        Utils.destroy_model_parallel()
 
     def test_metadata_integrity_violation(self):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
         data = torch.ones((1, 3, 7, 9), device='meta')
         rank_offsets = [(0, 0, 10), (2, 3, 6)]
         sh_ten = ShardedTensor.from_rank_offsets('keyA', data, *rank_offsets)
@@ -86,7 +95,7 @@ class TestShardedTensor:
         with pytest.raises(CheckpointingException):
             sh_ten.local_shape = (5,)
             sh_ten.validate_metadata_integrity()
-
+        Utils.destroy_model_parallel()
 
 class TestShardedTensorFactory:
     def test_build_and_merge(self):

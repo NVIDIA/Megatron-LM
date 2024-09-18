@@ -6,12 +6,14 @@ import pytest
 import torch
 
 from megatron.core import InferenceParams
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
-from megatron.core.models.mamba.mamba_model import MambaModel
+if torch.cuda.is_available():
+    from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+    from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 class TestMambaModel:
 
     def setup_method(self, method):
