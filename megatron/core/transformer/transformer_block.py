@@ -2,8 +2,10 @@
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+from importlib.metadata import version
 from typing import List, Optional, Union
 
+import packaging
 import torch
 from torch import Tensor
 
@@ -189,6 +191,8 @@ class TransformerBlock(MegatronModule):
         # Item `i` in the dictionary is a list of `N` CUDA graphs for layer 'i' where N is the
         # number of microbatches. Multiple CUDA graphs per layer is required to support
         # pipelining which requires running FWD graph of multiple microbatches before BWD graph.
+        # To enable CUDA graph, this dictionary should be populated in the model training script
+        # with the graphs returned by make_graphed_callables API before the first trainng step.
         self.cuda_graphs = {}
         self.current_microbatch = -1
 
@@ -357,6 +361,36 @@ class TransformerBlock(MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
+    def get_cuda_graph_optional_args(
+        self,
+        attention_mask: Tensor,
+        context: Tensor,
+        context_mask: Tensor,
+        rotary_pos_emb: Tensor,
+        inference_params: InferenceParams,
+        packed_seq_params: PackedSeqParams,
+    ):
+        """Get optional tensor arguments for CUDA graph."""
+
+        optional_inputs = {}
+        optional_inputs['is_first_microbatch'] = self.current_microbatch == 0
+        try:
+            import transformer_engine.pytorch as te
+
+            _te_version = packaging.version.Version(version("transformer-engine"))
+            if _te_version < packaging.version.Version("1.10.0"):
+                assert not any(
+                    [attention_mask, context, context_mask, rotary_pos_emb]
+                ), "Keyword Arguments not supported with CUDA graph."
+            else:
+                optional_inputs['attention_mask'] = attention_mask
+                optional_inputs['context'] = context
+                optional_inputs['context_mask'] = context_mask
+                optional_inputs['rotary_pos_emb'] = rotary_pos_emb
+        except ImportError:
+            raise RuntimeError("CUDAGraph requires TransformerEngine, but not installed")
+        return optional_inputs
+
     def forward(
         self,
         hidden_states: Tensor,
@@ -470,16 +504,25 @@ class TransformerBlock(MegatronModule):
                             )
                         else:
                             # CUDA graph replay for layer `l_no` and microbatch
-                            # `self.current_microbatch`
-                            # CUDA graph requires positional arguments with the exception
-                            # of is_first_microbatch.
-                            # Also CUDA graph accepts only Tensor inputs and outputs.
-                            # Hence, the arg list and returned list is limited to `hidden_states`.
-                            assert (len(self.cuda_graphs) > l_no) and (
-                                self.current_microbatch < len(self.cuda_graphs[l_no])
+                            # `self.current_microbatch`. TransformerEngine versions>=1.10
+                            # allow keyword arguments with CUDA graph. However, CUDA graph
+                            # acccepts only Tensor inputs and Tensor outputs. Hence,
+                            # `inference_params` and `packed_seq_params` are excluded from
+                            # input list while output is limited to `hidden_states`.
+                            cg_index = self.current_microbatch % len(self.cuda_graphs[l_no])
+                            assert not any(
+                                [inference_params, packed_seq_params]
+                            ), "CUDA graph accepts only Tensor inputs."
+                            optional_inputs = self.get_cuda_graph_optional_args(
+                                attention_mask,
+                                context,
+                                context_mask,
+                                rotary_pos_emb,
+                                inference_params,
+                                packed_seq_params,
                             )
-                            hidden_states = self.cuda_graphs[l_no][self.current_microbatch](
-                                hidden_states, is_first_microbatch=(self.current_microbatch == 0)
+                            hidden_states = self.cuda_graphs[l_no][cg_index](
+                                hidden_states, **optional_inputs
                             )
 
                     if (
