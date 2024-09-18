@@ -171,7 +171,7 @@ class TELinear(te.pytorch.Linear):
             rng_tracker_name = get_expert_parallel_rng_tracker_name()
         else:
             rng_tracker_name = None
-        if _te_version >= packaging.version.Version("1.7.0.dev"):
+        if _te_version >= packaging.version.Version("1.7.0"):
             extra_kwargs["rng_tracker_name"] = rng_tracker_name
 
         # Disable communications in TE when using SP or EP by making TE agnostic of model parallel.
