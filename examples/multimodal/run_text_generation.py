@@ -1,13 +1,13 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 """Generate text using a vision language model."""
 import glob
+import itertools
 import json
 import logging
 import os
 import sys
 from collections import defaultdict
 from functools import partial
-import itertools
 
 # Add megatron to the path.
 sys.path.append(
@@ -17,7 +17,8 @@ sys.path.append(
 import datasets
 import numpy as np
 import torch
-from torchvision.io import read_video
+import yaml
+from config import EvaluationConfig
 from dataset_helpers import tokenizer_image_token
 from image_processing import get_visual_transform
 from MMMU.mmmu.utils.data_utils import (
@@ -27,10 +28,13 @@ from MMMU.mmmu.utils.data_utils import (
     process_single_sample,
 )
 from MMMU.mmmu.utils.eval_utils import parse_multi_choice_response
+from model import model_provider
+from multimodal_args import add_multimodal_extra_args
 from PIL import Image
-from train import add_multimodal_extra_args, get_num_image_embeddings, model_provider
+from torchvision.io import read_video
 
 from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN_INDEX
+from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.inference.text_generation.api import generate_and_post_process
 from megatron.inference.text_generation.forward_step import ForwardStep
 from megatron.training import get_args, get_model, get_tokenizer, print_rank_0
@@ -48,14 +52,12 @@ def add_text_generation_args(parser):
     group.add_argument(
         "--out-seq-length", type=int, default=1024, help='Length of the output generated text.'
     )
-    group.add_argument("--output-path", type=str, required=True, help='Output file path')
-    group.add_argument('--input-image-path', type=str, required=True, help="Input image directory")
-    group.add_argument('--input-metadata-path', type=str, help="Input metadata path")
+    group.add_argument("--output-path", type=str, help='Output file path')
+    group.add_argument('--input-image-path', type=str, help="Input image directory")
     group.add_argument(
         '--num-partitions', type=int, default=0, help="Number of partitions for inputs."
     )
     group.add_argument('--partition-id', type=int, default=0, help="Partition index")
-    group.add_argument("--drop-vision-class-token", action="store_true", default=False)
     group.add_argument("--gt-path", type=str, help="Optional ground truth file")
     group.add_argument(
         "--task",
@@ -69,10 +71,11 @@ def add_text_generation_args(parser):
     group.add_argument(
         "--prompt-format",
         type=str,
-        required=True,
+        default="mistral",
         choices=["llama3", "mistral"],
         help="Prompting format to use",
     )
+    group.add_argument("--config-path", type=str, help="Config file to use.")
 
     # Add common multimodal arguments needed for e.g. building the model.
     parser = add_multimodal_extra_args(parser)
@@ -85,8 +88,9 @@ def _get_partition_bounds(
 ):
     if num_samples_per_partition == 0:
         samples_per_partition = [
-            int(x) for x in np.linspace(0, total_num_samples, num_partitions+1)]
-        return samples_per_partition[partition_id], samples_per_partition[partition_id+1] 
+            int(x) for x in np.linspace(0, total_num_samples, num_partitions + 1)
+        ]
+        return samples_per_partition[partition_id], samples_per_partition[partition_id + 1]
     return num_samples_per_partition * partition_id, num_samples_per_partition * (partition_id + 1)
 
 
@@ -286,33 +290,34 @@ def get_evaluation_dataset(
                 continue
             gt["video_path"] = video_path
             ground_truth.append(gt)
-        
+
         ground_truth = sorted(ground_truth, key=lambda gt: gt["video_path"])
         print_rank_0(f"Found {len(ground_truth)} videos to process.")
 
         if num_partitions > 0:
             start_idx, end_idx = _get_partition_bounds(
-                len(ground_truth), num_samples_per_partition,
-                num_partitions, partition_id
+                len(ground_truth), num_samples_per_partition, num_partitions, partition_id
             )
             ground_truth = ground_truth[start_idx:end_idx]
 
         # Run image preprocessing.
         for idx, gt in enumerate(ground_truth):
             print_rank_0(f"Processing input video: {idx} / {len(ground_truth)}")
-            video, _, _ = read_video(
-                gt["video_path"], start_pts=0, end_pts=None, pts_unit='sec')
+            video, _, _ = read_video(gt["video_path"], start_pts=0, end_pts=None, pts_unit='sec')
             video = video.numpy()
-            selected_frames = torch.linspace(
-                0, video.shape[0] - 1, num_frames).long()
+            selected_frames = torch.linspace(0, video.shape[0] - 1, num_frames).long()
             video_frames = video[selected_frames]
             if num_frames == 1:
                 video_frames = video_frames[None]
 
-            imgs = list(itertools.chain.from_iterable(
-                get_visual_transform(
-                    img, img_h, img_w, use_tiling, max_num_tiles,
-                    use_thumbnail, augment=False) for img in video_frames))
+            imgs = list(
+                itertools.chain.from_iterable(
+                    get_visual_transform(
+                        img, img_h, img_w, use_tiling, max_num_tiles, use_thumbnail, augment=False
+                    )
+                    for img in video_frames
+                )
+            )
 
             for question in gt["questions"]:
                 # Very hacky, but we essentially re-create gt holding only the
@@ -324,7 +329,7 @@ def get_evaluation_dataset(
                     "video_category": gt["video_category"],
                     "video_subcategory": gt["video_subcategory"],
                     "url": gt["url"],
-                    "questions": [question]
+                    "questions": [question],
                 }
                 images.append(imgs)
                 tile_counts.append(torch.tensor([len(imgs)], dtype=torch.int))
@@ -336,26 +341,30 @@ def get_evaluation_dataset(
     return images, tile_counts, samples, sample_ids, questions, answers
 
 
-def generate_samples(model):
+def generate_samples(model, config: EvaluationConfig):
     """Text generation using a trained vision language model."""
     args = get_args()
     images, tile_counts, samples, sample_ids, questions, answers = get_evaluation_dataset(
-        args.task,
-        args.input_image_path,
-        args.gt_path,
+        config.task,
+        config.input_image_path,
+        config.gt_path,
         args.img_h,
         args.img_w,
         args.use_tiling,
         args.max_num_tiles,
         args.use_thumbnail,
-        args.num_samples_per_partition,
-        args.num_partitions,
-        args.partition_id,
-        args.num_frames
+        config.num_samples_per_partition,
+        config.num_partitions,
+        config.partition_id,
+        args.num_frames,
+    )
+
+    num_image_embeddings_per_tile = get_num_image_embeddings(
+        args.img_h, args.img_w, args.patch_dim, args.disable_vision_class_token, 1
     )
     num_img_embeddings_per_tile = get_num_image_embeddings(
-        args.img_h, args.img_w, args.patch_dim,
-        args.disable_vision_class_token, 1)
+        args.img_h, args.img_w, args.patch_dim, args.disable_vision_class_token, 1
+    )
     num_samples = len(sample_ids)
     idx = 0
     while idx < num_samples:
@@ -363,21 +372,20 @@ def generate_samples(model):
         num_tiles = tile_counts[idx].cuda()
         sample_id = sample_ids[idx]
 
-        prompt = get_prompt(args.task, questions, idx, args.prompt_format)
+        prompt = get_prompt(config.task, questions, idx, config.prompt_format)
 
-        forward_step = partial(
-            VLMForwardStep, num_img_embeddings_per_tile, imgs, num_tiles)
+        forward_step = partial(VLMForwardStep, num_img_embeddings_per_tile, imgs, num_tiles)
 
         if torch.distributed.get_rank() == 0:
             resp_sentences, _, _, _ = generate_and_post_process(
                 model,
                 forward_step=forward_step,
                 prompts=[prompt],
-                tokens_to_generate=args.out_seq_length,
-                top_k_sampling=args.top_k,
-                top_p_sampling=args.top_p,
+                tokens_to_generate=config.out_seq_length,
+                top_k_sampling=config.top_k,
+                top_p_sampling=config.top_p,
                 add_BOS=False,
-                temperature=args.temperature,
+                temperature=config.temperature,
                 random_seed=args.seed,
                 detokenize_segments=False,
             )
@@ -386,29 +394,29 @@ def generate_samples(model):
                 output = {"sample_id": sample_id, "prompt": prompt}
 
                 output_name = ""
-                if args.task == "captioning":
+                if config.task == "captioning":
                     output_name = "caption"
-                elif args.task in ("TextVQA", "VQAv2", "ChartQA"):
+                elif config.task in ("TextVQA", "VQAv2", "ChartQA"):
                     output_name = "answer"
-                elif args.task in ("MMMU"):
+                elif config.task in ("MMMU"):
                     output_name = "text"
-                elif args.task == "VideoMME":
+                elif config.task == "VideoMME":
                     output_name = "response"
                     output = questions[idx]
 
-                generated = get_generated(prompt, args.prompt_format, generation)
-                if args.task == "VideoMME":
+                generated = get_generated(prompt, config.prompt_format, generation)
+                if config.task == "VideoMME":
                     output["questions"][0][output_name] = generated
                 else:
                     output[output_name] = generated
 
-                if args.task == "captioning":
+                if config.task == "captioning":
                     output["ground_truth"] = answers[sample_id]
-                elif args.task in ("TextVQA", "VQAv2"):
+                elif config.task in ("TextVQA", "VQAv2"):
                     output["gt_answer"] = [ans for ans in answers[idx]]
-                elif args.task == "ChartQA":
+                elif config.task == "ChartQA":
                     output["gt_answer"] = [answers[idx]]
-                elif args.task == "MMMU":
+                elif config.task == "MMMU":
                     sample = samples[idx]
 
                     prediction = generated
@@ -429,27 +437,63 @@ def generate_samples(model):
             idx += 1
 
 
-def generate_and_write_samples(model):
-    """Generate text and write to an output file."""
+def get_evaluation_config():
+    """Get evaluation config from a config file or command-line arguments."""
     args = get_args()
+    if args.config_path:
+        with open(args.config_path, "r") as f:
+            config_dict = yaml.safe_load(f)
 
-    for output in generate_samples(model):
+        config = EvaluationConfig(**config_dict)
+    else:
+        config = EvaluationConfig(
+            task=args.task,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            out_seq_length=args.out_seq_length,
+            output_path=args.output_path,
+            input_image_path=args.input_image_path,
+            gt_path=args.gt_path,
+            num_partitions=args.num_partitions,
+            partition_id=args.partition_id,
+            num_samples_per_partition=args.num_samples_per_partition,
+            prompt_format=args.prompt_format,
+        )
+
+    # Default output path if not defined...
+    if not config.output_path:
+        os.makedirs("generated", exist_ok=True)
+        config.output_path = "generated/" + args.language_model_type
+
+    return config
+
+
+def generate_and_write_samples(model, config):
+    """Generate text and write to an output file."""
+    for output in generate_samples(model, config):
         if torch.distributed.get_rank() == 0:
-            with open(args.output_path, 'a') as f:
+            with open(config.output_path, 'a') as f:
                 f.write(json.dumps(output) + "\n")
 
 
 class VLMForwardStep(ForwardStep):
     """Inference forward step for a multimodal model."""
 
-    def __init__(self, num_img_embeddings_per_tile, images, num_tiles, model,
-                 max_batch_size, max_sequence_length):
+    def __init__(
+        self,
+        num_img_embeddings_per_tile,
+        images,
+        num_tiles,
+        model,
+        max_batch_size,
+        max_sequence_length,
+    ):
         """Create multimodal forward step."""
         total_num_tiles = torch.sum(num_tiles).item()
-        num_img_embeddings =  num_img_embeddings_per_tile * total_num_tiles
+        num_img_embeddings = num_img_embeddings_per_tile * total_num_tiles
 
-        super().__init__(
-            model, max_batch_size, max_sequence_length + num_img_embeddings)
+        super().__init__(model, max_batch_size, max_sequence_length + num_img_embeddings)
         self._images = images
         self._num_tiles = num_tiles
 
@@ -461,6 +505,7 @@ class VLMForwardStep(ForwardStep):
             attention_mask=None,
             inference_params=self.inference_params,
             num_image_tiles=self._num_tiles,
+            runtime_gather_output=True,
         )
 
     def __call__(self, tokens, position_ids, attention_mask):
@@ -532,20 +577,19 @@ def get_prompt(task, questions, idx, prompt_format):
         question = (
             "Select the best answer to the following multiple-choice "
             "question based on the video. Respond with only the letter "
-            "(A, B, C, or D) of the correct option.\n")
-        question += (questions[idx]["questions"][0]["question"] + "\n")
-        question += (questions[idx]["questions"][0]["choices"][0] + "\n")
-        question += (questions[idx]["questions"][0]["choices"][1] + "\n")
-        question += (questions[idx]["questions"][0]["choices"][2] + "\n")
-        question += (questions[idx]["questions"][0]["choices"][3] + "\n")
+            "(A, B, C, or D) of the correct option.\n"
+        )
+        question += questions[idx]["questions"][0]["question"] + "\n"
+        question += questions[idx]["questions"][0]["choices"][0] + "\n"
+        question += questions[idx]["questions"][0]["choices"][1] + "\n"
+        question += questions[idx]["questions"][0]["choices"][2] + "\n"
+        question += questions[idx]["questions"][0]["choices"][3] + "\n"
 
         if prompt_format == "llama3":
             prompt = "<|start_header_id|>system<|end_header_id|>\n\nAnswer the questions.<|eot_id|>{}<|start_header_id|>user<|end_header_id|>\n\n<image>\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
             prompt = prompt.format("", question)
         elif prompt_format == "mistral":
-            prompt = "<image>\n{}".format(
-                question
-            )
+            prompt = "<image>\n{}".format(question)
 
     return prompt
 
@@ -617,9 +661,12 @@ def main():
         _ = load_checkpoint(model, None, None)
 
     model = model[0]
+
     model.eval()
 
-    generate_and_write_samples(model)
+    config = get_evaluation_config()
+
+    generate_and_write_samples(model, config)
 
 
 if __name__ == "__main__":

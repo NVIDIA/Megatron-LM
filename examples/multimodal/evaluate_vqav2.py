@@ -55,7 +55,7 @@ def compute_vqa_accuracy(result_file, use_chartqa_metric=False):
         # "We consider an answer to be correct if it is within 5% of the gold answer.
         #  For non-numeric answers, we still need an exact match to consider an answer to be correct."
         if use_chartqa_metric:
-            acc = 0.
+            acc = 0.0
             assert len(gt) == 1, "expected exactly one groundtruth answer."
             gt = gt[0]
 
@@ -74,13 +74,15 @@ def compute_vqa_accuracy(result_file, use_chartqa_metric=False):
             all_acc.append(acc)
 
     acc_avg = sum(all_acc) / len(all_acc) * 100
-    print(f"===== Accuracy {acc_avg:.2f}% =====")
+
+    return acc_avg
 
 
 def vqav2_eval(input_path):
     """Run VQAv2 evaluation."""
     result_file = merge_input_files(input_path)
-    compute_vqa_accuracy(result_file)
+    avg_acc = compute_vqa_accuracy(result_file)
+    return avg_acc
 
 
 if __name__ == "__main__":
@@ -88,4 +90,6 @@ if __name__ == "__main__":
     parser.add_argument('--input-path', type=str, help="Path to input file(s)")
     args = parser.parse_args()
 
-    vqav2_eval(args.input_path)
+    avg_acc = vqav2_eval(args.input_path)
+
+    print(f"===== VQAv2 Accuracy {avg_acc:.2f}% =====")

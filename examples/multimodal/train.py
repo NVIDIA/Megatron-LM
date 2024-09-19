@@ -1,131 +1,29 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain or SFT multimodal."""
-from copy import deepcopy
-from functools import partial
+import json
 import os
 import sys
-import warnings
+from functools import partial
 
 import torch
+import yaml
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir, os.path.pardir)))
 
-from megatron.training import get_args, get_timers, get_tokenizer, print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args
+from config import EvaluationConfig
+from dataloader_provider import train_valid_test_dataloaders_provider
+from evaluate_textvqa import textvqa_eval
+from model import model_provider
+from multimodal_args import add_multimodal_extra_args
+from run_text_generation import generate_samples, patch_tokenizer
+
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
-from megatron.core.parallel_state import get_tensor_model_parallel_rank
-from config import get_language_model_config, get_vision_model_config, get_vision_projection_config
-from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.core.models.multimodal.llava_model import LLaVAModel
-from layer_specs import get_layer_spec, get_mlp_module_spec, get_layer_spec_te
-from megatron.training import pretrain
-from dataloader_provider import train_valid_test_dataloaders_provider
-
-def model_provider(
-    pre_process=True, post_process=True, add_encoder=True, add_decoder=True,
-    parallel_output=True) -> LLaVAModel:
-    """Builds the model.
-
-    Args:
-        pre_process (bool): Include the embedding layer in the gpt decoder (used with pipeline parallelism). Defaults to True.
-        post_process (bool): Include an output layer and a layernorm in the gpt decoder (used with pipeline parallelism). Defaults to True.
-        add_encoder (bool): Construct the encoder module (used with pipeline parallelism). Defaults to True. When we use pipelining, the encoder
-            will live on only a subset of the pipeline stages (specifically, only the first stage).
-        add_decoder (bool): Construct the decoder module (used with pipeline parallelism). Defaults to True. When we use pipelining, the decoder
-            will live on only a subset of the pipeline stages (specifically, every stage after the first one).
-        parallel_output (bool): Enable parallel model output.
-
-    Returns:
-        model: A multimodal model.
-    """
-    args = get_args()
-
-    use_te = args.use_te
-
-    print_rank_0('building a multimodal model ...')
-
-    num_image_embeddings = get_num_image_embeddings(args.img_h, args.img_w, args.patch_dim, args.disable_vision_class_token, 1)
-    old_seq_length = args.seq_length
-    args.seq_length = args.encoder_seq_length = num_image_embeddings
-    if torch.distributed.get_rank() == 0 and old_seq_length != args.seq_length:
-        warnings.warn(f"Changed seq_length and encoder_seq_length (vision model sequence length) from {old_seq_length} to num_image_tokens ({num_image_embeddings})")
-
-    max_num_image_embeddings = (args.max_num_tiles + int(args.use_thumbnail)) * num_image_embeddings
-
-    assert args.decoder_seq_length is not None, "Please provide --decoder-seq-length to set the language model sequence length"
-    assert args.decoder_seq_length > max_num_image_embeddings, "Language model sequence length must be greater than the maximum number of image embeddings"
-    if args.decoder_seq_length > args.max_position_embeddings:
-        args.max_position_embeddings = args.decoder_seq_length
-        warnings.warn(f"Expanded max_position_embeddings to {args.max_position_embeddings} to accommodate the maximum language model sequence length")
-
-    base_config = core_transformer_config_from_args(get_args())
-    base_config.language_model_type = args.language_model_type
-    base_config.vision_model_type = args.vision_model_type
-    base_config.calculate_per_token_loss = True
-
-    language_config = deepcopy(base_config)
-    language_config = get_language_model_config(language_config)
-
-    if use_te:
-        language_transformer_layer_spec = get_layer_spec_te(is_vit=False)   # TENorm detects LayerNorm/RMS automatically.
-    else:
-        language_transformer_layer_spec = get_layer_spec(is_vit=False, normalization=language_config.normalization)
-
-    vision_config = deepcopy(base_config)
-    vision_config = get_vision_model_config(vision_config, apply_query_key_layer_scaling=args.apply_query_key_layer_scaling)
-
-    vision_model_type = args.vision_model_type
-    if vision_model_type == "clip":
-        if use_te:
-            vision_transformer_layer_spec = get_layer_spec_te(is_vit=True)  # TENorm detects LayerNorm/RMS automatically.
-        else:
-            vision_transformer_layer_spec = get_layer_spec(is_vit=True, normalization=vision_config.normalization)
-    else:
-        raise RuntimeError("unsupported vision model type", vision_model_type)
-
-    vision_projection_config = deepcopy(base_config)
-    vision_projection_config = get_vision_projection_config(vision_projection_config, language_config.hidden_size)
-
-    if args.encoder_pipeline_model_parallel_size > 0:
-        assert args.encoder_pipeline_model_parallel_size == 1, "vision model and projection can only live on 1 pipeline stage."
-        vision_config.pipeline_model_parallel_size = args.encoder_pipeline_model_parallel_size
-        vision_projection_config.pipeline_model_parallel_size = args.encoder_pipeline_model_parallel_size
-        if args.encoder_tensor_model_parallel_size > 0:
-            vision_config.tensor_model_parallel_size = args.encoder_tensor_model_parallel_size
-            vision_projection_config.tensor_model_parallel_size = args.encoder_tensor_model_parallel_size
-
-    vision_projection_layer_spec = get_mlp_module_spec(use_te=use_te).submodules
-
-    model = LLaVAModel(
-        language_transformer_config=language_config,
-        language_transformer_layer_spec=language_transformer_layer_spec,
-        language_vocab_size=args.padded_vocab_size,
-        language_max_sequence_length=args.decoder_seq_length,
-        vision_transformer_config=vision_config,
-        vision_transformer_layer_spec=vision_transformer_layer_spec,
-        drop_vision_class_token=args.disable_vision_class_token,
-        vision_projection_config=vision_projection_config,
-        vision_projection_layer_spec=vision_projection_layer_spec,
-        vision_projection_type="mlp",
-        allow_missing_vision_projection_checkpoint=args.allow_missing_vision_projection_checkpoint,
-        parallel_output=parallel_output,
-        language_position_embedding_type=args.position_embedding_type,
-        language_rotary_percent=args.rotary_percent,
-        pre_process=pre_process,
-        post_process=post_process,
-        add_encoder=add_encoder,
-        add_decoder=add_decoder,
-        img_h=args.img_h,
-        img_w=args.img_w,
-        patch_dim=args.patch_dim,
-        language_rotary_base=args.rotary_base,
-    )
-
-    model.freeze(freeze_language_model=args.freeze_LM, freeze_vision_model=args.freeze_ViT, freeze_vision_projection=False)
-
-    return model
+from megatron.core.parallel_state import get_tensor_model_parallel_rank
+from megatron.training import get_args, get_timers, get_tokenizer, pretrain
+from megatron.training.utils import is_last_rank
 
 
 def get_batch(data_iterator):
@@ -314,32 +212,6 @@ def forward_step(data_iterator, model: LLaVAModel):
 
     return output_tensor, partial(loss_func, loss_mask)
 
-def add_multimodal_extra_args(parser):
-    """Extra arguments."""
-    group = parser.add_argument_group(title='multimodal arguments')
-    group.add_argument('--valid-path', nargs='*', default=None,
-                       help='Path to the training dataset. Accepted format:'
-                       '1) a single data path, 2) multiple datasets in the'
-                       'form: dataset1-weight dataset1-path dataset2-weight '
-                       'dataset2-path ...')
-    group.add_argument('--dataset-config', type=str, default=None)
-    group.add_argument("--prompt-path", type=str, default=None)
-    group.add_argument('--freeze-LM', action='store_true', default=False)
-    group.add_argument('--freeze-ViT', action='store_true', default=False)
-    group.add_argument('--language-model-type', type=str, required=True)
-    group.add_argument('--vision-model-type', type=str, default="clip")
-    group.add_argument("--disable-vision-class-token", action="store_true", default=False)
-    group.add_argument("--allow-missing-vision-projection-checkpoint", action="store_true", default=False)
-    group.add_argument("--use-te", action="store_true", default=False)
-    group.add_argument("--dataloader-save", type=str, default=None, help="Energon dataloader state save path")
-    group.add_argument("--use-tiling", action="store_true", default=False, help="Use input image tiling")
-    group.add_argument("--max-num-tiles", type=int, default=1, help="Maximum number of image tiles")
-    group.add_argument("--use-thumbnail", action="store_true", default=False, help="Add image thumbnail as a tile")
-    group.add_argument("--dataloader-seq-length", type=int, help="Make dataloader to produce sequences of specific length.")
-    group.add_argument("--num-frames", type=int, default=1, help="Number of frames to regularly sample from the video as input to the model.")
-
-    return parser
-
 
 def llava_embedding_ranks(pp_ranks):
     """LLava's embedding ranks consist of the decoder's first and last ranks (ie, the ViT has no embeddings).
@@ -375,6 +247,64 @@ def llava_position_embedding_ranks(pp_ranks):
         return [pp_ranks[epp]]
 
 
+
+def run_online_eval(model):
+    """Run an evaluation benchmark during training."""
+    args = get_args()
+
+    # Online evaluation config is not defined. Do nothing.
+    if not args.online_evaluation_config:
+        return []
+
+    with open(args.online_evaluation_config, "r") as f:
+        config_dict = yaml.safe_load(f)
+
+    config = EvaluationConfig(**config_dict)
+
+    patch_tokenizer(args)
+
+    # The inference code assumes the first rank is the leader.
+    # Tensorboard writer is on the last rank.
+    # We must write to a storage space that all ranks see.
+    output_dir = os.path.join(args.save, "online_eval")
+    os.makedirs(output_dir, exist_ok=True)
+    config.output_path = os.path.join(output_dir, f"{config.task}.jsonl")
+
+    if torch.distributed.get_rank() == 0:
+        output_file = open(config.output_path, "w")
+
+    with torch.no_grad():
+        for output in generate_samples(model[0].module, config):
+            if torch.distributed.get_rank() == 0:
+                output_file.write(json.dumps(output) + "\n")
+
+    if torch.distributed.get_rank() == 0:
+        output_file.close()
+
+    # Make sure the first rank is done writing so that the last rank can run eval.
+    torch.distributed.barrier()
+
+    if not is_last_rank():
+        return []
+
+    if config.task.lower() == "textvqa":
+        avg_acc = textvqa_eval(config.output_path)
+
+        return [{"textvqa accuracy": avg_acc}]
+    else:
+        raise NotImplementedError(f"online evaluation of {config.task} not implemented yet")
+
+
+def write_online_eval_to_tensorboard(data, iteration, writer):
+    """Write online evaluation data to Tensorboard."""
+    if not writer:
+        return
+
+    for item in data:
+        for k, v in item.items():
+            writer.add_scalar(k, v, iteration)
+
+
 if __name__ == "__main__":
     train_valid_test_dataloaders_provider.is_distributed = True
 
@@ -385,6 +315,8 @@ if __name__ == "__main__":
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
         extra_args_provider=add_multimodal_extra_args,
+        process_non_loss_data_func=write_online_eval_to_tensorboard,
         get_embedding_ranks=llava_embedding_ranks,
         get_position_embedding_ranks=llava_position_embedding_ranks,
+        non_loss_data_func=run_online_eval
     )
