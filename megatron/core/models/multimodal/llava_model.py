@@ -429,6 +429,7 @@ class LLaVAModel(MegatronModule):
         inference_params: Optional[InferenceParams] = None,
         num_image_tiles: Optional[List[int]] = None,
         image_token_index: Optional[int] = IMAGE_TOKEN_INDEX,
+        runtime_gather_output: Optional[bool] = None,
     ) -> torch.Tensor:
         """Forward function of the LLaVA model.
 
@@ -445,6 +446,8 @@ class LLaVAModel(MegatronModule):
             inference_params (InferenceParams): Inference-time parameters including KV cache.
             num_image_tiles (list of int): Number of tiles per image. Default 1 tile per image.
             image_token_index (int): ID for input images.
+            runtime_gather_output (bool): Gather output at runtime. Default None means
+                `parallel_output` arg in the constructor will be used.
 
         Returns:
             output (torch.Tensor): Loss of shape [b, s] if labels are provided,
@@ -528,6 +531,7 @@ class LLaVAModel(MegatronModule):
             decoder_input=combined_embeddings,
             labels=new_labels,
             inference_params=inference_params,
+            runtime_gather_output=runtime_gather_output,
         )
 
         if labels is None or loss_mask is None:

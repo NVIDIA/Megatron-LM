@@ -185,12 +185,17 @@ class GPTModel(LanguageModule):
         inference_params: InferenceParams = None,
         packed_seq_params: PackedSeqParams = None,
         extra_block_kwargs: dict = None,
+        runtime_gather_output: Optional[bool] = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoeder and finally into the post
         processing layer (optional).
 
         It either returns the Loss values if labels are given  or the final hidden units
+
+        Args:
+            runtime_gather_output (bool): Gather output at runtime. Default None means
+                `parallel_output` arg in the constructor will be used.
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -230,7 +235,9 @@ class GPTModel(LanguageModule):
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
-        logits, _ = self.output_layer(hidden_states, weight=output_weight)
+        logits, _ = self.output_layer(
+            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+        )
 
         if has_config_logger_enabled(self.config):
             payload = OrderedDict(
