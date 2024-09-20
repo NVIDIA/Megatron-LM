@@ -35,48 +35,44 @@ build_image:
   variables:
     STAGE: main
   script:
+    - apk add bash
     - |
-      set -x
-      env
-      eval "IMAGE=\$$IMAGE"
+      bash -c '
+        set -x
+        env
+        eval "IMAGE=\$$IMAGE"
 
-      docker system prune -a --filter "until=24h" -f || true
+        docker system prune -a --filter "until=24h" -f || true
+        
+        docker buildx create --name container --driver=docker-container
+      
+        ADDITIONAL_PARAMS=()
 
-      if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
-        ADDITIONAL_PARAMS="--pull"
-      fi
+        if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
+          ADDITIONAL_PARAMS+=("--pull")
+          ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:main")
+        fi
 
-      docker pull ${IMAGE}:${CI_PIPELINE_ID} || true
-      docker pull ${IMAGE}:${CI_MERGE_REQUEST_IID:-noop} || true
-      docker pull ${IMAGE}:buildcache || true
+        if [[ "$CI_COMMIT_BRANCH" == "ci-nightly-a100" ]]; then
+          ADDITIONAL_PARAMS+=("-t ${IMAGE}:nightly")
+        fi
 
-      docker build \
-        --secret id=JET_INDEX_URLS \
-        --target $STAGE \
-        -f $FILE \
-        -t ${IMAGE}:${CI_PIPELINE_ID} \
-        -t ${IMAGE}:${CI_MERGE_REQUEST_IID:-noop} \
-        --build-arg CACHEBUST=$(cat /proc/sys/kernel/random/uuid) \
-        --cache-to type=inline \
-        --cache-from type=registry,ref=${IMAGE}:buildcache \
-        --cache-from type=registry,ref=${IMAGE}:${CI_PIPELINE_ID} \
-        --cache-from type=registry,ref=${IMAGE}:${CI_MERGE_REQUEST_IID:-noop} \
-        --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
-        ${ADDITIONAL_PARAMS} .
-
-      docker push ${IMAGE}:${CI_PIPELINE_ID}
-      docker push ${IMAGE}:${CI_MERGE_REQUEST_IID:-noop}
-
-      if [[ "$CI_COMMIT_BRANCH" == "ci-nightly-a100" ]]; then
-        docker tag ${IMAGE}:${CI_PIPELINE_ID} ${IMAGE}:nightly
-        docker push ${IMAGE}:nightly
-      fi
-
-      if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
-        docker tag ${IMAGE}:${CI_PIPELINE_ID} ${IMAGE}:buildcache
-        docker push ${IMAGE}:buildcache
-      fi
-
+        DOCKER_BUILDKIT=1 docker build \
+          --secret id=JET_INDEX_URLS \
+          --target $STAGE \
+          -f $FILE \
+          -t ${IMAGE}:${CI_PIPELINE_ID} \
+          --builder=container \
+          --build-arg CACHEBUST=$(cat /proc/sys/kernel/random/uuid) \
+          --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_PIPELINE_ID} \
+          --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID:-noop} \
+          --cache-from type=registry,ref=${IMAGE}-buildcache:main \
+          --cache-from type=registry,ref=${IMAGE}-buildcache:${CI_PIPELINE_ID} \
+          --cache-from type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID:-noop} \
+          --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
+          --push \
+          ${ADDITIONAL_PARAMS[@]} .
+        '
   retry:
     max: 2
 
