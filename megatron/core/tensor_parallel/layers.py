@@ -286,6 +286,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     @staticmethod
     @custom_bwd
     def backward(ctx, grad_output):
+        args = get_args()
         input, weight = ctx.saved_tensors
         use_bias = ctx.use_bias
 
@@ -367,9 +368,13 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         #     grad_weight = None
         # else:
         #     grad_weight = grad_output.t().matmul(total_input)
-        from megatron.core.tensor_parallel.weight_grad_store import WeightGradStore
-        WeightGradStore.put(total_input, grad_output, weight, gradientUpdateFunction)
-        grad_weight = None
+        if args.enable_zbh1_pipeline:
+            from megatron.core.tensor_parallel.weight_grad_store import WeightGradStore
+            WeightGradStore.put(total_input, grad_output, weight, gradientUpdateFunction)
+            grad_weight = None
+        else:
+            grad_weight = grad_output.t().matmul(total_input)
+
         grad_bias = grad_output.sum(dim=0) if use_bias else None
 
         if ctx.sequence_parallel:
