@@ -4,8 +4,8 @@ export NCCL_IB_SL=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NVTE_APPLY_QK_LAYER_SCALING=0
 
-INPUT_METADATA_PATH="placeholder"
 GROUNDTRUTH_PATH="placeholder"
+NUM_FRAMES=1
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -14,8 +14,8 @@ while [[ $# -gt 0 ]]; do
             shift
             shift
             ;;
-        --input-metadata-path)
-            INPUT_METADATA_PATH="$2"
+        --num-frames)
+            NUM_FRAMES="$2"
             shift
             shift
             ;;
@@ -57,7 +57,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Please modify these as needed.
-NUM_PARTITIONS=100
+NUM_PARTITIONS=0
 START=0
 END=0
 
@@ -96,7 +96,7 @@ do
         --bf16 \
         --micro-batch-size 1 \
         --seq-length 2048 \
-        --out-seq-length 700 \
+        --out-seq-length 12 \
         --temperature 1.0 \
         --img-h 336 \
         --img-w 336 \
@@ -106,12 +106,12 @@ do
         --no-load-rng \
         --no-load-optim \
         --input-image-path ${INPUT_IMAGE_PATH} \
-        --input-metadata-path ${INPUT_METADATA_PATH} \
         --num-partitions ${NUM_PARTITIONS} \
         --partition-id ${PARTITION_ID} \
         --output-path ${OUTPUT_PATH}-${TASK}-${PARTITION_ID}.jsonl \
         --gt-path ${GROUNDTRUTH_PATH} \
         --task ${TASK} \
         --disable-vision-class-token \
-        --prompt-format mistral
+        --prompt-format mistral \
+        --num-frames ${NUM_FRAMES}
 done

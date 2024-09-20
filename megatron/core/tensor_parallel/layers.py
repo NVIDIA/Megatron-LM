@@ -69,6 +69,8 @@ def set_tensor_model_parallel_attributes(tensor, is_parallel, dim, stride):
 
 
 def set_defaults_if_not_set_tensor_model_parallel_attributes(tensor):
+    """Set default model parallel attributes if not set explicitly already."""
+
     def maybe_set(attribute, value):
         if not hasattr(tensor, attribute):
             setattr(tensor, attribute, value)
@@ -78,6 +80,8 @@ def set_defaults_if_not_set_tensor_model_parallel_attributes(tensor):
 
 
 def copy_tensor_model_parallel_attributes(destination_tensor, source_tensor):
+    """Copy model parallel attributes from one tensor to another."""
+
     def maybe_copy(attribute):
         if hasattr(source_tensor, attribute):
             setattr(destination_tensor, attribute, getattr(source_tensor, attribute))
@@ -219,6 +223,11 @@ class VocabParallelEmbedding(torch.nn.Module):
                 _initialize_affine_weight_gpu(self.weight, init_method, partition_dim=0, stride=1)
 
     def forward(self, input_):
+        """Forward.
+
+        Args:
+            input_ (torch.Tensor): Input tensor.
+        """
         if self.tensor_model_parallel_size > 1:
             # Build the mask.
             input_mask = (input_ < self.vocab_start_index) | (input_ >= self.vocab_end_index)
@@ -278,6 +287,7 @@ class LinearWithFrozenWeight(torch.autograd.Function):
     @staticmethod
     @custom_fwd
     def forward(ctx, input, weight, bias, allreduce_dgrad):
+        """Forward with frozen weight."""
         ctx.save_for_backward(weight)
         ctx.allreduce_dgrad = allreduce_dgrad
         output = torch.matmul(input, weight.t())
@@ -288,6 +298,7 @@ class LinearWithFrozenWeight(torch.autograd.Function):
     @staticmethod
     @custom_bwd
     def backward(ctx, grad_output):
+        """Backward with frozen weight."""
         (weight,) = ctx.saved_tensors
         grad_input = grad_output.matmul(weight)
 
@@ -389,6 +400,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         grad_output_buffer,
         wgrad_deferral_limit,
     ):
+        """Forward."""
         ctx.save_for_backward(input, weight)
         ctx.use_bias = bias is not None
         ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
@@ -418,6 +430,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     @staticmethod
     @custom_bwd
     def backward(ctx, grad_output):
+        """Backward."""
         input, weight = ctx.saved_tensors
         use_bias = ctx.use_bias
         grad_output_buffer = ctx.grad_output_buffer
@@ -847,7 +860,12 @@ class ColumnParallelLinear(torch.nn.Module):
             )
         )
 
-    def forward(self, input_: torch.Tensor, weight: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        input_: torch.Tensor,
+        weight: Optional[torch.Tensor] = None,
+        runtime_gather_output: Optional[bool] = None,
+    ):
         """Forward of ColumnParallelLinear
 
         Args:
@@ -855,6 +873,8 @@ class ColumnParallelLinear(torch.nn.Module):
                 3D tensor whose order of dimension is [sequence, batch, hidden]
             weight (optional):
                 weight tensor to use, compulsory when skip_weight_param_allocation is True.
+            runtime_gather_output (bool): Gather output at runtime. Default None means
+                `gather_output` arg in the constructor will be used.
 
         Returns:
             - output
@@ -927,7 +947,13 @@ class ColumnParallelLinear(torch.nn.Module):
             ),
             allreduce_dgrad=allreduce_dgrad,
         )
-        if self.gather_output:
+
+        gather_output = self.gather_output
+        # Use the runtime gather output if it's set explicitly.
+        if runtime_gather_output is not None:
+            gather_output = runtime_gather_output
+
+        if gather_output:
             # All-gather across the partitions.
             assert not self.sequence_parallel
             output = gather_from_tensor_model_parallel_region(output_parallel)

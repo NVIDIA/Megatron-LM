@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 import dataclasses
+import itertools
 import json
 import random
 import re
@@ -272,7 +273,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
             else:
                 yield self.encode_vqa(sample)
         elif isinstance(sample, SimilarityInterleavedSample):
-            if "llava" in sample.__key__:
+            if "llava" or "video" in sample.__key__:
                 yield self.encode_llava_sft(sample)
             else:
                 raise NotImplementedError('Sample format not supported')
@@ -374,12 +375,28 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
         augment = sample.__subflavors__['augmentation'] if 'augmentation' in sample.__subflavors__ else False
         use_chat_format = sample.__subflavors__['use_chat_format'] if 'use_chat_format' in sample.__subflavors__ else False
         has_image = sample.__subflavors__['has_image'] if 'has_image' in sample.__subflavors__ else False
+        has_video = sample.__subflavors__['has_video'] if 'has_video' in sample.__subflavors__ else False
+        has_visual_data = has_image or has_video
         conv_format = sample.__subflavors__['conv_format'] if 'conv_format' in sample.__subflavors__ else "mistral"
 
         if has_image:
             imgs = get_visual_transform(
                 sample.images[0], self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles, self.args.use_thumbnail, augment,
             )
+            num_tiles = [len(imgs)]
+        elif has_video:
+            # Grab the selected frames of the video as a tensor with shape
+            # fhwc: (num_frames, height, width, num_channels).
+            video_fhwc = sample.images[0].permute(0, 2, 3, 1)
+            selected_frames = torch.linspace(
+                0, video_fhwc.shape[0] - 1, self.args.num_frames).long()
+            video_frame_fhwc = video_fhwc[selected_frames]
+            imgs = []
+            for video_frame_hwc in video_frame_fhwc:
+                imgs += get_visual_transform(
+                    video_frame_hwc, self.img_h, self.img_w,
+                    self.args.use_tiling, self.args.max_num_tiles,
+                    self.args.use_thumbnail, augment=False)
             num_tiles = [len(imgs)]
         else:
             imgs = num_tiles = []
@@ -406,7 +423,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
             conversation = conv.get_prompt()
 
             ### Tokenize conversations
-            input_ids = tokenizer_image_token(self.args, conversation, self.tokenizer, has_image)
+            input_ids = tokenizer_image_token(self.args, conversation, self.tokenizer, has_visual_data)
 
             input_ids = torch.LongTensor(input_ids)
             target = input_ids.clone()
@@ -437,8 +454,8 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
                         break
                     parts[0] += sep
 
-                    round_len = len(tokenizer_image_token(self.args, rou, self.tokenizer, has_image))
-                    instruction_len = len(tokenizer_image_token(self.args, parts[0], self.tokenizer, has_image))
+                    round_len = len(tokenizer_image_token(self.args, rou, self.tokenizer, has_visual_data))
+                    instruction_len = len(tokenizer_image_token(self.args, parts[0], self.tokenizer, has_visual_data))
 
                     if conv_format == 'llama3_sft' and i > 0:
                         round_len -= 1
@@ -472,8 +489,8 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
                         break
                     parts[0] += sep
 
-                    round_len = len(tokenizer_image_token(self.args, rou, self.tokenizer, has_image))
-                    instruction_len = len(tokenizer_image_token(self.args, parts[0], self.tokenizer, has_image)) - 2
+                    round_len = len(tokenizer_image_token(self.args, rou, self.tokenizer, has_visual_data))
+                    instruction_len = len(tokenizer_image_token(self.args, parts[0], self.tokenizer, has_visual_data)) - 2
 
                     target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
 
@@ -506,10 +523,25 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
 
     def encode_vqa(self, sample: VQASample):
         augment = sample.__subflavors__['augmentation'] if 'augmentation' in sample.__subflavors__ else False
+        has_video = sample.__subflavors__['has_video'] if 'has_video' in sample.__subflavors__ else False
 
-        imgs = get_visual_transform(
-            sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles, self.args.use_thumbnail, augment,
-        )
+        if has_video:
+            # Grab the selected frames of the video as a tensor with shape
+            # fhwc: (num_frames, height, width, num_channels).
+            video_fhwc = sample.image.permute(0, 2, 3, 1)
+            selected_frames = torch.linspace(
+                0, video_fhwc.shape[0] - 1, self.args.num_frames).long()
+            video_frame_fhwc = video_fhwc[selected_frames]
+            imgs = []
+            for video_frame_hwc in video_frame_fhwc:
+                imgs += get_visual_transform(
+                    video_frame_hwc, self.img_h, self.img_w,
+                    self.args.use_tiling, self.args.max_num_tiles,
+                    self.args.use_thumbnail, augment=False)
+        else:
+            imgs = get_visual_transform(
+                sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles, self.args.use_thumbnail, augment,
+            )
         num_tiles = [len(imgs)]
         has_image = True
 

@@ -1,4 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+from dataclasses import dataclass
+
 import torch
 
 from megatron.training.activations import quick_gelu, squared_relu
@@ -107,3 +109,26 @@ def get_vision_projection_config(config, hidden_size):
         config.activation_func = torch.nn.functional.gelu
 
     return config
+
+
+@dataclass
+class EvaluationConfig:
+    """Evaluation related configuration."""
+    task: str
+
+    temperature: float = 1.0
+    top_p: float = 0.0
+    top_k: int = 0
+
+    out_seq_length: int = 32
+
+    output_path: str = ""
+
+    input_image_path: str = ""
+    gt_path: str = ""
+
+    num_partitions: int = 1
+    partition_id: int = 0
+    num_samples_per_partition: int = 0
+
+    prompt_format: str = "mistral"

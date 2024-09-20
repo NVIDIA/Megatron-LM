@@ -178,27 +178,18 @@ class BertModel(LanguageModule):
         attn_mask_dimensions = "b1ss"
         if transformer_layer_spec == bert_layer_with_transformer_engine_spec:
             if get_te_version() >= packaging.version.Version("1.7.0"):
+                # pylint: disable=line-too-long
                 if os.getenv('NVTE_FLASH_ATTN') == '0' and os.getenv('NVTE_FUSED_ATTN') == '0':
                     assert (
                         transformer_layer_spec.submodules.self_attention.params['attn_mask_type']
                         == AttnMaskType.arbitrary
-                    ), (
-                        "Set env variable NVTE_FLASH_ATTN to 1 or NVTE_FUSED_ATTN to 1 to use a "
-                        "more optimized attention kernal. Currently using unfused attention path. "
-                        "If you want to proceed with this path set AttnMaskType in module spec to "
-                        "be arbitrary"
-                    )
+                    ), "Both NVTE_FLASH_ATTN and NVTE_FUSED_ATTN env flag set to 0. Either unset both of them or set one of them to 1 to use a more optimized attention kernal. Currently using unfused attention path. If you want to proceed with this path set AttnMaskType in module spec to be arbitrary"
                 else:
                     attn_mask_dimensions = "b11s"
             else:
-                assert os.getenv('NVTE_ALLOW_NONDETERMINISTIC_ALGO') == '0' or (
+                assert (
                     os.getenv('NVTE_FLASH_ATTN') == '0' and os.getenv('NVTE_FUSED_ATTN') == '0'
-                ), (
-                    "Flash and fused attention is not supported with "
-                    "transformer engine version < 1.7. "
-                    "Set NVTE_FLASH_ATTN=0 and NVTE_FUSED_ATTN=0 or upgrade "
-                    "transformer engine >= 1.7 or set NVTE_ALLOW_NONDETERMINISTIC_ALGO=0"
-                )
+                ), "Flash and fused attention is not supported with transformer engine version < 1.7. Set NVTE_FLASH_ATTN=0 and NVTE_FUSED_ATTN=0 or upgrade transformer engine >= 1.7"
         return attn_mask_dimensions
 
     def bert_extended_attention_mask(self, attention_mask: Tensor) -> Tensor:
@@ -234,17 +225,7 @@ class BertModel(LanguageModule):
         return extended_attention_mask
 
     def bert_position_ids(self, token_ids):
-        """
-        Generate position IDs for a given sequence of token IDs, as an arange of integers.
-
-        Args:
-            token_ids (Tensor): The input token list
-
-        Returns:
-            torch.Tensor: A tensor of shape (batch_size, seq_length) containing the position IDs
-                        for the input token IDs.
-        """
-
+        """Position ids for bert model"""
         # Create position ids
         seq_length = token_ids.size(1)
         position_ids = torch.arange(seq_length, dtype=torch.long, device=token_ids.device)
