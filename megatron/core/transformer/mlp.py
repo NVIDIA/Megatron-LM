@@ -27,6 +27,7 @@ from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 class MLPSubmodules:
     linear_fc1: Union[ModuleSpec, type] = None
     linear_fc2: Union[ModuleSpec, type] = None
+    swiglu_fc2: Union[ModuleSpec, type] = None
 
 
 class MLP(MegatronModule):
@@ -92,43 +93,60 @@ class MLP(MegatronModule):
             tp_comm_buffer_name='fc2',
         )
 
+        self.swiglu_fc2 = build_module(
+            submodules.swiglu_fc2,
+            self.config.ffn_hidden_size,
+            self.config.hidden_size,
+            config=self.config,
+            init_method=self.config.output_layer_init_method,
+            bias=self.config.add_bias_linear,
+            skip_bias_add=True,
+            is_expert=is_expert,
+            tp_comm_buffer_name='fc2', 
+        )
+
+
     def forward(self, hidden_states):
 
         # [s, b, 4 * h/p]
+
         intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
-
-        if self.config.bias_activation_fusion:
-            if self.activation_func == F.gelu:
-                if self.config.gated_linear_unit:
-                    intermediate_parallel = bias_geglu_impl(intermediate_parallel, bias_parallel)
-                else:
-                    assert self.config.add_bias_linear is True
-                    intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
-            elif self.activation_func == F.silu and self.config.gated_linear_unit:
-                intermediate_parallel = bias_swiglu_impl(
-                    intermediate_parallel,
-                    bias_parallel,
-                    self.config.activation_func_fp8_input_store,
-                )
-            else:
-                raise ValueError("Only support fusion of gelu and swiglu")
+        activation_is_swiglu = self.activation_func == F.silu and self.config.gated_linear_unit 
+        if activation_is_swiglu and not self.config.tp_comm_overlap:
+            output = self.swiglu_fc2(intermediate_parallel)
+            return output, None 
         else:
-            if bias_parallel is not None:
-                intermediate_parallel = intermediate_parallel + bias_parallel
-            if self.config.gated_linear_unit:
-
-                def glu(x):
-                    x = torch.chunk(x, 2, dim=-1)
-                    return self.config.activation_func(x[0]) * x[1]
-
-                intermediate_parallel = glu(intermediate_parallel)
+            if self.config.bias_activation_fusion:
+                if self.activation_func == F.gelu:
+                    if self.config.gated_linear_unit:
+                        intermediate_parallel = bias_geglu_impl(intermediate_parallel, bias_parallel)
+                    else:
+                        assert self.config.add_bias_linear is True
+                        intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+                elif self.activation_func == F.silu and self.config.gated_linear_unit:
+                    intermediate_parallel = bias_swiglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        self.config.activation_func_fp8_input_store,
+                    )
+                else:
+                    raise ValueError("Only support fusion of gelu and swiglu")
             else:
-                intermediate_parallel = self.activation_func(intermediate_parallel)
+                if bias_parallel is not None:
+                    intermediate_parallel = intermediate_parallel + bias_parallel
+                if self.config.gated_linear_unit:
 
-        # [s, b, h]
-        output, output_bias = self.linear_fc2(intermediate_parallel)
+                    def glu(x):
+                        x = torch.chunk(x, 2, dim=-1)
+                        return self.config.activation_func(x[0]) * x[1]
 
-        return output, output_bias
+                    intermediate_parallel = glu(intermediate_parallel)
+                else:
+                    intermediate_parallel = self.activation_func(intermediate_parallel)
+
+            # [s, b, h]
+            output, output_bias = self.linear_fc2(intermediate_parallel)
+            return output, output_bias
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None

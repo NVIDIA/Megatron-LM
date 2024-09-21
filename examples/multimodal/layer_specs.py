@@ -14,6 +14,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayer, Transf
 try:
     from megatron.core.transformer.custom_layers.transformer_engine import (
         TEColumnParallelLinear,
+        TESwigluLinear,
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
         TENorm,
@@ -107,6 +108,7 @@ def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
         submodules=MLPSubmodules(
             linear_fc1=TEColumnParallelLinear if use_te else ColumnParallelLinear,
             linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
+            swiglu_fc2=TESwigluLinear if use_te else RowParallelLinear,
         ),
     )
 
