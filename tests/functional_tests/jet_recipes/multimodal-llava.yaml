@@ -13,7 +13,7 @@ spec:
   scope: null
   script: |-
     ls
-    cd /workspace/megatron-lm
+    cd /opt/megatron-lm
 
     ARGUMENTS=(
         "DATA_PATH=''"
