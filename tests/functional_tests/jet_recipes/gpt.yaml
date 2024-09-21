@@ -12,7 +12,7 @@ spec:
     /workspace/data/gpt3_data: text/the_pile/shard00
   script: |-
     ls
-    cd /workspace/megatron-lm
+    cd /opt/megatron-lm
 
     ARGUMENTS=(
         "DATA_PATH=/workspace/data/gpt3_data"
