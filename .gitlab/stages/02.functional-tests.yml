@@ -64,6 +64,7 @@ jet-generate:
 jet-trigger:
   stage: functional_tests
   needs: [jet-generate]
+  extends: [.jet_common]
   trigger:
     include:
       - artifact: jet-trigger-job.yaml
