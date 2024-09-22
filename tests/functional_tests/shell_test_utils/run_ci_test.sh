@@ -4,11 +4,11 @@ set -exo pipefail
 
 echo "------ARGUMENTS LIST --------"
 for ARGUMENT in "$@"; do
+    echo $ARGUMENT
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
 
     KEY_LENGTH=${#KEY}
-    VALUE="${ARGUMENT:$KEY_LENGTH+1}"
-
+    VALUE=$(eval echo ${ARGUMENT:$KEY_LENGTH+1})
     export "$KEY"="$VALUE"
     echo "$KEY=$VALUE"
 done
