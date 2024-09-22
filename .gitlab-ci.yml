@@ -58,29 +58,22 @@ variables:
       - "mr"
       - "nightly"
       - "weekly"
+      - "pre-release"
+      - "release"
     description: "Testsuite to run (only for FUNCTIONAL_TEST=yes)"
-  FUNCTIONAL_TEST_CLUSTER:
+  FUNCTIONAL_TEST_CLUSTER_A100:
     value: "dgxa100_dracooci"
     options:
       - "dgxa100_dracooci"
       - "dgxa100_dracooci-ord"
+    description: 'Cluster for A100 workloads'
+  FUNCTIONAL_TEST_CLUSTER_H100:
+    value: "dgxh100_eos"
+    options:
       - "dgxh100_eos"
-    description: '"dgxa100_dracooci" for OCI-IAD, "dgxh100_eos" for EOS'
-  CONVERGENCE_TEST:
-    value: "no"
-    options:
-      - "yes"
-      - "no"
-    description: To run a convergence test
-  CONVERGENCE_TEST_SCOPE:
-    value: "release"
-    options:
-      - "release"
-      - "pre-release"
-    description: "Test suite to run (only for CONVERGENCE_TEST=yes)"
-  CONVERGENCE_TEST_RUN_NAME:
-    value: "pre-release-$$CI_PIPELINE_ID"
-    description: "Run directory of convergence test"
+    description: 'Cluster for H100 workloads'
+  FUNCTIONAL_TEST_NAME:
+    description: "Name of functional test run (only for pre-release and release)"
   PUBLISH: 
     value: "no"
     options: 
@@ -105,5 +98,4 @@ include:
   - .gitlab/stages/00.pre.yml
   - .gitlab/stages/01.tests.yml
   - .gitlab/stages/02.functional-tests.yml
-  - .gitlab/stages/03.convergence-tests.yml
-  - .gitlab/stages/04.publish.yml
+  - .gitlab/stages/03.publish.yml

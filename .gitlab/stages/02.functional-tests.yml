@@ -16,91 +16,65 @@ include:
     ref: main
     file: downstreams.yml
 
-jet-configure:
-  image:
-    name: mikefarah/yq:4.35.2
-    entrypoint: [""]
-  extends: [.jet_common, .jet-configure]
-  tags: [mcore-docker-node-small]
-  script:
-    - set -x
-    - |
-      if [[ "$CI_PIPELINE_SOURCE" == "merge_request_event" && "$CI_MERGE_REQUEST_LABELS" == "*H100*" ]]; then
-        FUNCTIONAL_TEST_CLUSTER=$DEFAULT_H100_CLUSTER
-      fi
-    - |
-      JET_CUSTOM_FILTER="type == 'basic'"
-
-      if [[ $FUNCTIONAL_TEST_CLUSTER == dgxh100_eos ]]; then
-        JET_CI_BRANCH=mcore/eos
-        PLATFORM=dgx_h100
-      elif [[ $FUNCTIONAL_TEST_CLUSTER == dgxa100_dracooci ]]; then
-        JET_CI_BRANCH=mcore/draco-oci
-        PLATFORM=dgx_a100
-      elif [[ $FUNCTIONAL_TEST_CLUSTER == dgxa100_dracooci-ord ]]; then
-        JET_CI_BRANCH=mcore/draco-oci-ord
-        PLATFORM=dgx_a100
-      fi
-
-      # Add platform
-      JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and '$PLATFORM' in spec.platforms"
-
-      # Add scope
-      JET_CUSTOM_FILTER="$JET_CUSTOM_FILTER and '$FUNCTIONAL_TEST_SCOPE' in spec.scope"
-
-      if [[ "$JET_CUSTOM_FILTER" == "type == 'basic'" ]]; then
-        JET_CUSTOM_FILTER="False"
-      fi
-
-      echo "JET_CI_BRANCH=$JET_CI_BRANCH" | tee -a jet.env
-      echo "JET_CUSTOM_FILTER=$JET_CUSTOM_FILTER" | tee -a jet.env
-
-    - |
-      IMAGE=${CI_MCORE_IMAGE}:${CI_PIPELINE_ID} yq '. |=
-        (
-          select(.spec.name == "mcore-pyt")
-          | .spec.source.image = env(IMAGE)
-        )
-      ' -i tests/functional_tests/jet_recipes/_build-pyt.yaml
-
-      IMAGE=${CI_NEMO_IMAGE}:${CI_PIPELINE_ID} yq '. |=
-        (
-          select(.spec.name == "mcore-nemo")
-          | .spec.source.image = env(IMAGE)
-        )
-      ' -i tests/functional_tests/jet_recipes/_build-pyt.yaml
-  artifacts:
-    reports:
-      dotenv: jet.env
-    paths:
-      - tests/functional_tests/jet_recipes
-  retry:
-    max: 2
-    when: job_execution_timeout
-
 jet-build:
   extends: [build_image, .jet_common]
   variables:
     STAGE: jet
 
+jet-generate:
+  needs: [jet-build]
+  extends: [.jet_common]
+  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
+  tags: [mcore-docker-node-small]
+  before_script:
+    - git rm -r tests/functional_tests/local_recipes || true
+    - git submodule add --force https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/ADLR/megatron-lm-convergence-tests.git tests/functional_tests/local_recipes
+    - ls tests/functional_tests/local_recipes
+  script: 
+    - set -x
+    - |
+      A100_CLUSTER=$([[ "$FUNCTIONAL_TEST_CLUSTER_A100" != "" ]] && echo $FUNCTIONAL_TEST_CLUSTER_A100 || echo $DEFAULT_A100_CLUSTER)
+      H100_CLUSTER=$([[ "$FUNCTIONAL_TEST_CLUSTER_H100" != "" ]] && echo $FUNCTIONAL_TEST_CLUSTER_H100 || echo $DEFAULT_H100_CLUSTER)
+    - |
+      if [[ "$FUNCTIONAL_TEST_SCOPE" == "release" || "$FUNCTIONAL_TEST_SCOPE" == "pre-release" ]]; then
+        RELEASE_ARGS=(
+          "--run-name"
+          $FUNCTIONAL_TEST_NAME
+          "--wandb-experiment"
+          "test"
+        )
+      else
+        RELEASE_ARGS=()
+      fi
+
+    - |
+      python tests/functional_tests/python_test_utils/jet/generate_jet_trigger_job.py \
+        --scope $FUNCTIONAL_TEST_SCOPE \
+        --a100-cluster $A100_CLUSTER \
+        --h100-cluster $H100_CLUSTER \
+        --container-tag ${CI_PIPELINE_ID} \
+        --container-image ${CI_MCORE_IMAGE} \
+        --output-path "jet-trigger-job.yaml" \
+        ${RELEASE_ARGS[@]}
+  artifacts:
+    paths:
+      - jet-trigger-job.yaml
+      - tests/functional_tests/local_recipes
+
 jet-trigger:
-  extends: [.jet_common, .jet-trigger]
-  needs: [jet-configure, jet-build]
+  stage: functional_tests
+  needs: [jet-generate]
   trigger:
-    project: dl/jet/ci
-    branch: $JET_CI_BRANCH
+    include:
+      - artifact: jet-trigger-job.yaml
+        job: jet-generate
     strategy: depend
   variables:
-    JET_WORKLOADS_FILTER: '$JET_CUSTOM_FILTER'
-    JET_CUSTOM_CONFIG: |
-      retrier:
-        enabled: true
-        max_retries: 2
-        retry_on: ['1.2', '1.2.*'] # All infra related issues
-        waiting_time: 60
-        environment: jet-auto-retrier
-      builds: 
-        jet_flavour: # An empty mapping will disable building the JET flavor 
+    RO_API_TOKEN: $PAT
+    CONTAINER_TAG: $CI_PIPELINE_ID
+    CI_MCORE_IMAGE: $CI_MCORE_IMAGE
+    GITLAB_ENDPOINT: $GITLAB_ENDPOINT
+    PARENT_PIPELINE_ID: $CI_PIPELINE_ID
   inherit:
     variables: true
       
