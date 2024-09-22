@@ -104,7 +104,8 @@ maybe_cherry_pick_commit:
       MR=$(curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${MR_ID}")
 
       LABELS=$(echo -E $MR | jq '.labels | join(",")' | tr -d '"')
-      AUTHOR=$(echo -E $MR | jq '.assignee.id')
+      AUTHOR_ID=$(echo -E $MR | jq '.assignee.id')
+      AUTHOR_NAME=$(echo -E $MR | jq '.assignee.username')
       TITLE=$(echo -E $MR | jq '.title')
       TARGET_BRANCHES=$(echo "$LABELS" | grep -o 'core_[^,]*')
 
@@ -139,7 +140,8 @@ maybe_cherry_pick_commit:
             -d "target_branch=$RELEASE_BRANCH" \
             -d "title=Cherry pick \`$TITLE ($MR_ID)\` into \`$RELEASE_BRANCH\`" \
             -d "labels=cherry-pick" \
-            -d "assignee_id=$AUTHOR_ID"
+            -d "reviewer_ids=$AUTHOR_ID" \
+            -d "description=[🤖]: Hi @$AUTHOR_NAME 👋,<br><br>we've cherry picked \`$TITLE ($MR_ID)\` into \`$RELEASE_BRANCH\` for you! 🚀<br><br>Please review and approve this cherry pick by your convenience\!"
 
         else
           URL=https://${GITLAB_ENDPOINT}/ADLR/megatron-lm/-/merge_requests/$MR_ID
