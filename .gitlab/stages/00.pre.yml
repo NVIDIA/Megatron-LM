@@ -101,8 +101,11 @@ maybe_cherry_pick_commit:
     - git config --global user.email "mcore-bot@nvidia.com"
     - git config --global user.name "Mcore Bot"
     - |
-      LABELS=$(curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${MR_ID}" | jq '.labels | join(",")' | tr -d '"')
-      
+      MR=$(curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${MR_ID}")
+
+      LABELS=$(echo -E $MR | jq '.labels | join(",")' | tr -d '"')
+      AUTHOR=$(echo -E $MR | jq '.assignee.id')
+      TITLE=$(echo -E $MR | jq '.title')
       TARGET_BRANCHES=$(echo "$LABELS" | grep -o 'core_[^,]*')
 
       if [[ $TARGET_BRANCHES == "" ]]; then
@@ -134,8 +137,9 @@ maybe_cherry_pick_commit:
             --url https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests \
             -d "source_branch=cherry-pick-$MR_ID-$RELEASE_BRANCH" \
             -d "target_branch=$RELEASE_BRANCH" \
-            -d "title=Cherry-pick $MR_ID into $RELEASE_BRANCH" \
-            -d "labels=cherry-pick"
+            -d "title=Cherry pick \`$TITLE ($MR_ID)\` into \`$RELEASE_BRANCH\`" \
+            -d "labels=cherry-pick" \
+            -d "assignee_id=$AUTHOR_ID"
 
         else
           URL=https://${GITLAB_ENDPOINT}/ADLR/megatron-lm/-/merge_requests/$MR_ID
