@@ -13,11 +13,11 @@ spec:
   scope: null
   script: |-
     ls
-    cd /workspace/megatron-lm
+    cd /opt/megatron-lm
 
     ARGUMENTS=(
-        "DATA_PATH=''"
-        "DATA_CACHE_PATH=''"
+        "DATA_PATH='-'"
+        "DATA_CACHE_PATH='-'"
         "OUTPUT_PATH={assets_dir}"
         "TENSORBOARD_PATH={assets_dir}/tensorboard"
         "CHECKPOINT_PATH=/workspace/checkpoints"

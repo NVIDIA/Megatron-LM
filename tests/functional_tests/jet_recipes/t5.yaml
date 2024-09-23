@@ -13,7 +13,7 @@ spec:
     /workspace/data/t5_data: text/the_pile/t5_shard00
   script: |-
     ls
-    cd /workspace/megatron-lm
+    cd /opt/megatron-lm
 
     ARGUMENTS=(
         "DATA_PATH=/workspace/data/t5_data"
