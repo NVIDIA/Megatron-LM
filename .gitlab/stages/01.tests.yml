@@ -125,6 +125,28 @@ unit_tests:
       allow_failure: true
     - when: always
 
+unit-tests-results-notify:
+  extends: [.test_mr_rules]
+  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
+  needs: [unit_tests]
+  tags:
+    - mcore-docker-node-small
+  script:
+    - env
+    - export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
+    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
+    - export GITLAB_ENDPOINT
+    - export DATE=$(date +"%Y-%m-%d")
+    - bash tests/functional_tests/shell_test_utils/notify_unit_tests.sh ${CI_PIPELINE_ID}
+  artifacts:
+    when: always
+    paths:
+      - scripts
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == "ci-unit-test-extended"
+      when: always
+    - when: never
+
 docs_build_test:
   extends: [.test_mr_rules]
   image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
