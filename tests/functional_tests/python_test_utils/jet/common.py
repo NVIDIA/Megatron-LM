@@ -86,9 +86,26 @@ def filter_by_scope(
     return workload_manifests
 
 
+def filter_by_model(
+    workload_manifests: List[jetclient.JETWorkloadManifest], model: str
+) -> List[jetclient.JETWorkloadManifest]:
+    """Returns all workload with matching model."""
+    workload_manifests = list(
+        workload_manifest
+        for workload_manifest in workload_manifests
+        if workload_manifest.spec.model == model
+    )
+
+    if len(workload_manifests) == 0:
+        raise ValueError("No test_case found!")
+
+    return workload_manifests
+
+
 def load_workloads(
     container_tag: str,
     scope: Optional[str] = None,
+    model: Optional[str] = None,
     test_case: Optional[str] = None,
     container_image: Optional[str] = None,
 ) -> List[jetclient.JETWorkloadManifest]:
@@ -105,6 +122,9 @@ def load_workloads(
 
     if scope:
         workloads = filter_by_scope(workload_manifests=workloads, scope=scope)
+
+    if model:
+        workloads = filter_by_model(workload_manifests=workloads, model=model)
 
     if test_case:
         workloads = [filter_by_test_case(workload_manifests=workloads, test_case=test_case)]

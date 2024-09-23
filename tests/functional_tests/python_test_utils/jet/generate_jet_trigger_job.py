@@ -47,6 +47,7 @@ def main(
             raise ValueError(f"Platform {test_case.spec.platforms} unknown")
 
         script = [
+            "export PYTHONPATH=$(pwd); "
             "python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py",
             f"--model {test_case.spec.model}",
             f"--test-case {test_case.spec.test_case}",
