@@ -104,10 +104,10 @@ maybe_cherry_pick_commit:
       MR=$(curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${MR_ID}")
 
       LABELS=$(echo -E $MR | jq '.labels | join(",")' | tr -d '"')
-      AUTHOR_ID=$(echo -E $MR | jq '.author.id')
-      AUTHOR_NAME=$(echo -E $MR | jq '.author.username')
-      TITLE=$(echo -E $MR | jq '.title')
-      MILESTONE_ID=$(echo -E $MR | jq '.milestone.id')
+      AUTHOR_ID=$(echo -E $MR | jq '.author.id' | tr -d '"')
+      AUTHOR_NAME=$(echo -E $MR | jq '.author.username' | tr -d '"')
+      TITLE=$(echo -E $MR | jq '.title' | tr -d '"')
+      MILESTONE_ID=$(echo -E $MR | jq '.milestone.id' | tr -d '"')
       TARGET_BRANCHES=$(echo "$LABELS" | grep -o 'core_[^,]*')
 
       if [[ $TARGET_BRANCHES == "" ]]; then
