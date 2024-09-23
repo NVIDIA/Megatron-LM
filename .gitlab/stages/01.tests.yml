@@ -21,6 +21,10 @@ build_image:
         FILE: Dockerfile.ci
         BASE_IMAGE: nvcr.io/nvidia/pytorch:24.01-py3
         TAG: mcore-docker-node-large
+      - IMAGE: CI_MCORE_DEV_IMAGE
+        FILE: Dockerfile.ci.dev
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:24.01-py3
+        TAG: mcore-docker-node-large
       - IMAGE: CI_NEMO_IMAGE
         FILE: Dockerfile.ci
         BASE_IMAGE: nvcr.io/nvidian/nemo:nightly

@@ -55,6 +55,7 @@ jet-generate:
         --h100-cluster $H100_CLUSTER \
         --container-tag ${CI_PIPELINE_ID} \
         --container-image ${CI_MCORE_IMAGE} \
+        --container-image-dev ${CI_MCORE_DEV_IMAGE} \
         --output-path "jet-trigger-job.yaml" \
         ${RELEASE_ARGS[@]}
   artifacts:
