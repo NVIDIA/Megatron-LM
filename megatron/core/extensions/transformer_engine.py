@@ -459,6 +459,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         attn_mask_type: AttnMaskType,
         attention_type: str,
         attention_dropout: float = None,
+        softmax_scale: float = None,
+        k_channels: int = None,
+        v_channels: int = None,
     ):
         self.config = config
         self.te_forward_mask_type = False
@@ -522,9 +525,20 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             )
             extra_kwargs['window_size'] = config.window_size
 
+        if _te_version >= packaging.version.Version("1.10.0"):
+            # TE 1.10.0 introduces the ability to set the different k and v channels
+            kv_channels = (
+                (k_channels, v_channels)
+                if k_channels is not None and v_channels is not None
+                else self.config.kv_channels
+            )
+            extra_kwargs['softmax_scale'] = softmax_scale
+        else:
+            kv_channels = self.config.kv_channels
+
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
-            kv_channels=self.config.kv_channels,
+            kv_channels=kv_channels,
             attention_dropout=(
                 self.config.attention_dropout if attention_dropout is None else attention_dropout
             ),
