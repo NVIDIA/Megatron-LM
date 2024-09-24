@@ -169,7 +169,7 @@ def _p2p_ops(
     reqs = []
     rank = get_pipeline_model_parallel_rank()
     even_send_odd_recv_group = group
-    if get_pipeline_model_parallel_world_size() == 2:
+    if get_pipeline_model_parallel_world_size() == 2 and torch.distributed.get_backend(group) is not 'ucc':
         # Use the global process group for one of the two p2p communications
         # to allow the overlap of the independent communications.
         # Using the global process group is compatible because the pipeline-parallel

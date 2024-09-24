@@ -354,6 +354,7 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     virtual_pipeline_model_parallel_size: Optional[int] = None,
     pipeline_model_parallel_split_rank: Optional[int] = None,
+    pipeline_model_parallel_comm_backend: Optional[str] = "nccl",
     use_sharp: bool = False,
     context_parallel_size: int = 1,
     expert_model_parallel_size: int = 1,
@@ -741,10 +742,28 @@ def initialize_model_parallel(
     global _POSITION_EMBEDDING_GROUP
     global _POSITION_EMBEDDING_GLOBAL_RANKS
     assert _POSITION_EMBEDDING_GROUP is None, 'position embedding group is already initialized'
+    if pipeline_model_parallel_comm_backend == 'ucc':
+        # Setting up required environment variables for ucc backend
+        os.environ['TORCH_UCC_BLOCKING_WAIT'] = os.environ['TORCH_UCC_BLOCKING_WAIT'] if "TORCH_UCC_BLOCKING_WAIT" in os.environ else 'none'
+        os.environ['UCC_EC_CUDA_STREAM_TASK_MODE'] = os.environ['UCC_EC_CUDA_STREAM_TASK_MODE'] if "UCC_EC_CUDA_STREAM_TASK_MODE" in os.environ else 'driver'
+        os.environ['UCX_TLS'] = os.environ['UCX_TLS'] if "UCX_TLS" in os.environ else 'ib,cuda_copy' #cuda_ipc will be later supported
+        os.environ['NSYS_UCP_COMM_PARAMS'] = '1'
+        os.environ['UCX_MEMTYPE_REG_WHOLE_ALLOC_TYPES'] = 'unknown'
+        os.environ['UCX_RNDV_THRESH'] = '0'
+        os.environ['UCX_NET_DEVICES'] = 'all'
+        os.environ['UCC_CL_BASIC_TLS'] = '^sharp,nccl'
+        
     for ranks in generator_wrapper('pp'):
-        group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('pp', nccl_comm_cfgs)
-        )
+        if pipeline_model_parallel_comm_backend == 'ucc':
+            group = torch.distributed.new_group(
+                ranks, timeout=timeout, backend='ucc'
+            )
+        elif pipeline_model_parallel_comm_backend == 'nccl': 
+            group = torch.distributed.new_group(
+                ranks, timeout=timeout, pg_options=get_nccl_options('pp', nccl_comm_cfgs)
+            )
+        else:
+            assert False, f'"{pipeline_model_parallel_comm_backend}" backend for PP communication is currently not supported'
         if rank in ranks:
             if _PIPELINE_MODEL_PARALLEL_GROUP is None:
                 _PIPELINE_MODEL_PARALLEL_GROUP = group
