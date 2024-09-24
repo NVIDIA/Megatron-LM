@@ -17,7 +17,7 @@ from megatron.core.models.retro.utils import (
     get_config_path as get_retro_config_path,
     get_gpt_data_dir as get_retro_data_dir,
 )
-from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer import TransformerConfig, MLATransformerConfig
 from megatron.training.activations import squared_relu
 from megatron.training.utils import update_use_dist_ckpt
 
@@ -42,6 +42,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_biencoder_args(parser)
     parser = _add_vision_args(parser)
     parser = _add_moe_args(parser)
+    parser = _add_mla_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_straggler_detector_args(parser)
     parser = _add_inference_args(parser)
@@ -655,9 +656,12 @@ def _check_arg_is_not_none(args, arg):
 
 
 def core_transformer_config_from_args(args, config_class=None):
-
+    
     # Config class.
     config_class = config_class or TransformerConfig
+
+    if args.multi_latent_attention:
+        config_class = MLATransformerConfig
 
     # Translate args to core transformer configuration
     kw_args = {}
@@ -877,7 +881,9 @@ def _add_network_size_args(parser):
                        help='Disable BERT binary head.',
                        dest='bert_binary_head')
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
-                       help='Untie embeddings and output weights.'),
+                       help='Untie embeddings and output weights.')
+    group.add_argument('--multi-latent-attention', action='store_true',
+                       help='Use multi-latent attention for model.')
     return parser
 
 
@@ -1908,6 +1914,23 @@ def _add_moe_args(parser):
     group.add_argument('--moe-use-upcycling', action='store_true',
                        help='Load a checkpoint of a dense model, convert it into an MoE model, and save the converted model to the path specified by --save. '
                        'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.')
+
+    return parser
+
+def _add_mla_args(parser):
+    group = parser.add_argument_group(title="mla")
+    group.add_argument('--q-lora-rank', type=int, default=None,
+                       help="Rank of Query tensor's low rank representation.")
+    group.add_argument('--kv-lora-rank', type=int, default=32,
+                       help="Rank of Key and Value tensors' low rank representation.")
+    group.add_argument('--qk-head-dim', type=int, default=128,
+                       help="Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim")
+    group.add_argument('--qk-pos-emb-head-dim', type=int, default=64,
+                       help="Dimension of the position embedding in the QK projection.")
+    group.add_argument('--v-head-dim', type=int, default=128,
+                       help="Dimension of the head in the V projection.")
+    group.add_argument('--rotary-scaling-factor', type=float, default=1.0,
+                       help="Rotary scaling factor for the rotary embeddings.")
 
     return parser
 

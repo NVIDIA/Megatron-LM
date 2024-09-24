@@ -6,7 +6,7 @@ from typing import Union
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.models.common.embeddings.rotary_pos_embedding import apply_rotary_pos_emb
+from megatron.core.models.common.embeddings import apply_rotary_pos_emb
 from megatron.core.parallel_state import (
     get_data_parallel_group,
     get_data_parallel_rank,
@@ -146,14 +146,14 @@ class Attention(MegatronModule, ABC):
 
         return hidden_states
 
-    def _allocate_memory(self, inference_max_sequence_length, batch_size, dtype):
+    def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
         """Allocate memory to store kv cache during inference."""
 
         return torch.empty(
             inference_max_sequence_length,
             batch_size,
             self.num_query_groups_per_partition,
-            self.hidden_size_per_attention_head,
+            dim,
             dtype=dtype,
             device=torch.cuda.current_device(),
         )
@@ -178,10 +178,10 @@ class Attention(MegatronModule, ABC):
             inf_max_seq_length = inference_params.max_sequence_length
             inf_max_batch_size = inference_params.max_batch_size
             inference_key_memory = self._allocate_memory(
-                inf_max_seq_length, inf_max_batch_size, key.dtype
+                inf_max_seq_length, inf_max_batch_size, key.shape[-1], key.dtype
             )
             inference_value_memory = self._allocate_memory(
-                inf_max_seq_length, inf_max_batch_size, value.dtype
+                inf_max_seq_length, inf_max_batch_size, value.shape[-1], value.dtype
             )
             inference_params.key_value_memory_dict[self.layer_number] = (
                 inference_key_memory,
