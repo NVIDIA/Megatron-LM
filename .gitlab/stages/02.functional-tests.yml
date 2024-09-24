@@ -41,19 +41,21 @@ jet-generate:
           "--run-name"
           $FUNCTIONAL_TEST_NAME
           "--wandb-experiment"
-          "test"
+          $(echo $FUNCTIONAL_TEST_NAME | tr '/' '-')
         )
       else
         RELEASE_ARGS=()
       fi
 
     - |
+      export PYTHONPATH=$(pwd)
       python tests/functional_tests/python_test_utils/jet/generate_jet_trigger_job.py \
         --scope $FUNCTIONAL_TEST_SCOPE \
         --a100-cluster $A100_CLUSTER \
         --h100-cluster $H100_CLUSTER \
         --container-tag ${CI_PIPELINE_ID} \
         --container-image ${CI_MCORE_IMAGE} \
+        --container-image-dev ${CI_MCORE_DEV_IMAGE} \
         --output-path "jet-trigger-job.yaml" \
         ${RELEASE_ARGS[@]}
   artifacts:
