@@ -102,7 +102,7 @@ class GPTModel(LanguageModule):
                 position_embedding_type=position_embedding_type,
             )
 
-        if self.position_embedding_type == 'rope':
+        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             self.rotary_pos_emb = RotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
@@ -212,7 +212,7 @@ class GPTModel(LanguageModule):
 
         # Rotary positional embeddings (embedding is None for PP intermediate devices)
         rotary_pos_emb = None
-        if self.position_embedding_type == 'rope':
+        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                 inference_params, self.decoder, decoder_input, self.config
             )
