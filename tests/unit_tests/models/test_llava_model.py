@@ -18,16 +18,22 @@ class TestLLaVAModel:
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
 
+        self.language_hidden_size = 64
+        self.language_num_attention_heads = 4
+
         language_config = TransformerConfig(
-            num_layers=3, hidden_size=128, num_attention_heads=8, use_cpu_initialization=False
+            num_layers=3,
+            hidden_size=self.language_hidden_size,
+            num_attention_heads=self.language_num_attention_heads,
+            use_cpu_initialization=False,
         )
         vision_config = TransformerConfig(
-            num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=False
+            num_layers=2, hidden_size=16, num_attention_heads=2, use_cpu_initialization=False
         )
         vision_projection_config = TransformerConfig(
             num_layers=2,
-            hidden_size=128,
-            ffn_hidden_size=72,
+            hidden_size=self.language_hidden_size,
+            ffn_hidden_size=32,
             num_attention_heads=1,
             use_cpu_initialization=False,
         )
@@ -39,7 +45,7 @@ class TestLLaVAModel:
         self.model = LLaVAModel(
             language_transformer_config=language_config,
             language_transformer_layer_spec=language_layer_spec,
-            language_vocab_size=2048,
+            language_vocab_size=8192,
             language_max_sequence_length=4096,
             vision_transformer_config=vision_config,
             vision_transformer_layer_spec=vision_layer_spec,
@@ -60,7 +66,7 @@ class TestLLaVAModel:
         assert isinstance(self.model, LLaVAModel)
 
         num_weights = sum([p.numel() for p in self.model.parameters()])
-        assert num_weights == 1832520
+        assert num_weights == 1488736
 
     @pytest.mark.internal
     def test_set_input_tensor(self):
@@ -73,12 +79,18 @@ class TestLLaVAModel:
     def test_preprocess_data(self):
         self.model.cuda()
 
-        image_embedding_value = torch.tensor(123.0)
+        hidden_size = 72
+
         # 3 images with 1 tile and 2 image with 2 tiles = 7 tiles.
-        image_embeddings = image_embedding_value * torch.ones((577, 7, 128)).cuda()
+        image_embeddings = (
+            1e-5
+            * torch.arange(577 * 7 * hidden_size, dtype=torch.float)
+            .reshape(577, 7, hidden_size)
+            .cuda()
+        )
 
         image_token_index = -200
-        input_ids = torch.arange(0, 1024, dtype=torch.int).expand(5, 1024).cuda()
+        input_ids = torch.arange(1024).expand(5, 1024).cuda()
         input_ids[0, 0] = image_token_index  # image before text
         input_ids[1, 100] = image_token_index  # image in between
         input_ids[2, -1] = image_token_index  # image at the end
@@ -86,8 +98,14 @@ class TestLLaVAModel:
         input_ids[4, 50] = image_token_index  # two images in between
         input_ids[4, 150] = image_token_index
 
-        language_embedding_value = torch.tensor(999.0)
-        language_embeddings = language_embedding_value * torch.ones((5, 1024, 128)).cuda()
+        # Offset by 1000 to distinguish from image embeddings.
+        language_embeddings = (
+            1000.0
+            + 1e-5
+            * torch.arange(5 * 1024 * hidden_size, dtype=torch.float)
+            .reshape(5, 1024, hidden_size)
+            .cuda()
+        )
 
         # Labels are input_ids shifted to left by one.
         labels = torch.arange(1, 1025, dtype=torch.int).expand(5, 1024).cuda()
@@ -121,14 +139,14 @@ class TestLLaVAModel:
         # The fifth sample has 2 images with 3 tiles and 1024 text tokens.
         max_seq_len = 3 * img_seq_len - 2 + 1024
 
-        assert embeddings.shape == torch.Size((max_seq_len, 5, 128))
+        assert embeddings.shape == torch.Size((max_seq_len, 5, hidden_size))
         assert labels.shape == torch.Size((5, max_seq_len))
         assert loss_mask.shape == labels.shape
 
         # First sample where image is before text (index 0).
-        expected_embeddings = torch.empty(max_seq_len).cuda()
-        expected_embeddings[:577] = image_embedding_value
-        expected_embeddings[577:1600] = language_embedding_value
+        expected_embeddings = torch.empty(max_seq_len, hidden_size).cuda()
+        expected_embeddings[:577] = image_embeddings[:, 0]
+        expected_embeddings[577:1600] = language_embeddings[0, 1:]
         expected_embeddings[1600:] = 0  # padding
 
         expected_labels = torch.empty(max_seq_len, dtype=torch.int).cuda()
@@ -144,15 +162,16 @@ class TestLLaVAModel:
         expected_loss_mask[696:1600] = 1
         expected_loss_mask[1600:] = 0
 
-        assert torch.allclose(embeddings[:, 0], expected_embeddings.unsqueeze(1))
+        assert torch.allclose(embeddings[:, 0], expected_embeddings)
         assert torch.allclose(labels[0], expected_labels)
         assert torch.allclose(loss_mask[0], expected_loss_mask)
 
         # Second sample where image is in between (index 100). The image has 2 tiles.
-        expected_embeddings = torch.empty(max_seq_len).cuda()
-        expected_embeddings[:100] = language_embedding_value
-        expected_embeddings[100:1254] = image_embedding_value
-        expected_embeddings[1254:2177] = language_embedding_value
+        expected_embeddings = torch.empty(max_seq_len, hidden_size).cuda()
+        expected_embeddings[:100] = language_embeddings[1, :100]
+        expected_embeddings[100:677] = image_embeddings[:, 1]
+        expected_embeddings[677:1254] = image_embeddings[:, 2]
+        expected_embeddings[1254:2177] = language_embeddings[1, 101:]
         expected_embeddings[2177:] = 0  # padding
 
         expected_labels = torch.empty(max_seq_len, dtype=torch.int).cuda()
@@ -172,14 +191,14 @@ class TestLLaVAModel:
         expected_loss_mask[1273:2177] = 1
         expected_loss_mask[2177:] = 0  # padding
 
-        assert torch.allclose(embeddings[:, 1], expected_embeddings.unsqueeze(1))
+        assert torch.allclose(embeddings[:, 1], expected_embeddings)
         assert torch.allclose(labels[1], expected_labels)
         assert torch.allclose(loss_mask[1], expected_loss_mask)
 
         # Third sample where image is at the end.
-        expected_embeddings = torch.empty(max_seq_len).cuda()
-        expected_embeddings[:1023] = language_embedding_value
-        expected_embeddings[1023:1600] = image_embedding_value
+        expected_embeddings = torch.empty(max_seq_len, hidden_size).cuda()
+        expected_embeddings[:1023] = language_embeddings[2, :1023]
+        expected_embeddings[1023:1600] = image_embeddings[:, 3]
         expected_embeddings[1600:] = 0  # padding
 
         expected_labels = torch.empty(max_seq_len, dtype=torch.int).cuda()
@@ -195,13 +214,13 @@ class TestLLaVAModel:
         expected_loss_mask[1023:1600] = 0
         expected_loss_mask[1600:] = 0  # padding
 
-        assert torch.allclose(embeddings[:, 2], expected_embeddings.unsqueeze(1))
+        assert torch.allclose(embeddings[:, 2], expected_embeddings)
         assert torch.allclose(labels[2], expected_labels)
         assert torch.allclose(loss_mask[2], expected_loss_mask)
 
         # Fourth sample where there is no image.
-        expected_embeddings = torch.empty(max_seq_len).cuda()
-        expected_embeddings[:1024] = language_embedding_value
+        expected_embeddings = torch.empty(max_seq_len, hidden_size).cuda()
+        expected_embeddings[:1024] = language_embeddings[3]
         expected_embeddings[1024:] = 0  # padding
 
         expected_labels = torch.empty(max_seq_len, dtype=torch.int).cuda()
@@ -212,17 +231,18 @@ class TestLLaVAModel:
         expected_loss_mask[:1024] = 1
         expected_loss_mask[1024:] = 0  # padding
 
-        assert torch.allclose(embeddings[:, 3], expected_embeddings.unsqueeze(1))
+        assert torch.allclose(embeddings[:, 3], expected_embeddings)
         assert torch.allclose(labels[3], expected_labels)
         assert torch.allclose(loss_mask[3], expected_loss_mask)
 
-        # Fifth sample has two images in between. The first image has two tiles.
-        expected_embeddings = torch.empty(max_seq_len).cuda()
-        expected_embeddings[:50] = language_embedding_value
-        expected_embeddings[50:1204] = image_embedding_value  # two tiles
-        expected_embeddings[1204:1303] = language_embedding_value
-        expected_embeddings[1303:1880] = image_embedding_value
-        expected_embeddings[1880:] = language_embedding_value
+        # Fifth sample has two images in between (indices 50 and 150). The first image has two tiles.
+        expected_embeddings = torch.empty(max_seq_len, hidden_size).cuda()
+        expected_embeddings[:50] = language_embeddings[4, :50]
+        expected_embeddings[50:627] = image_embeddings[:, 4]  # two tiles
+        expected_embeddings[627:1204] = image_embeddings[:, 5]
+        expected_embeddings[1204:1303] = language_embeddings[4, 51:150]
+        expected_embeddings[1303:1880] = image_embeddings[:, 6]
+        expected_embeddings[1880:] = language_embeddings[4, 151:]
 
         expected_labels = torch.empty(max_seq_len, dtype=torch.int).cuda()
         expected_labels[:49] = torch.arange(1, 50)
@@ -238,7 +258,7 @@ class TestLLaVAModel:
         expected_loss_mask[1302:1880] = 0
         expected_loss_mask[1880:] = 1
 
-        assert torch.allclose(embeddings[:, 4], expected_embeddings.unsqueeze(1))
+        assert torch.allclose(embeddings[:, 4], expected_embeddings)
         assert torch.allclose(labels[4], expected_labels)
         assert torch.allclose(loss_mask[4], expected_loss_mask)
 
@@ -309,7 +329,7 @@ class TestLLaVAModel:
             loss_mask=None,
             num_image_tiles=num_image_tiles,
         )
-        assert logits.shape == torch.Size((5, max_seq_len, 2048))
+        assert logits.shape == torch.Size((5, max_seq_len, 8192))
 
         # Try without labels and with inference params.
         inference_params = InferenceParams(5, max_seq_len)
@@ -323,7 +343,7 @@ class TestLLaVAModel:
             num_image_tiles=num_image_tiles,
             inference_params=inference_params,
         )
-        assert logits.shape == torch.Size((5, max_seq_len, 2048))
+        assert logits.shape == torch.Size((5, max_seq_len, 8192))
 
         # Check KV cache got populated correctly.
         kv_dict = inference_params.key_value_memory_dict
@@ -332,7 +352,11 @@ class TestLLaVAModel:
         for layer_no in range(1, 4):  # 3 layers in the model.
             layer_kv = kv_dict[layer_no]
             # Expected shape is [sequence_len, batch_size, num_heads, hidden_size_per_head]
-            assert layer_kv[0].shape == layer_kv[1].shape == torch.Size((max_seq_len, 5, 8, 16))
+            assert (
+                layer_kv[0].shape
+                == layer_kv[1].shape
+                == torch.Size((max_seq_len, 5, self.language_num_attention_heads, 16))
+            )
 
     @pytest.mark.internal
     def test_save_load(self, tmp_path):

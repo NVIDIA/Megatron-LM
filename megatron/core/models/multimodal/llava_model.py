@@ -351,7 +351,9 @@ class LLaVAModel(MegatronModule):
             ]
 
             # Put image embeddings to image positions.
-            final_embedding[images_mask] = image_embeddings.reshape(-1, embed_dim).contiguous()
+            final_embedding[images_mask] = (
+                image_embeddings.permute(1, 0, 2).reshape(-1, embed_dim).contiguous()
+            )
 
         # Create the final labels and loss mask (if this is the last language model stage).
         final_labels, final_loss_mask = None, None
@@ -466,7 +468,9 @@ class LLaVAModel(MegatronModule):
             image_embeddings = None
         elif self.add_encoder and not has_images:
             # If no images provided, use an empty image embeddings tensor.
-            image_embeddings = torch.tensor([], dtype=images.dtype, device=images.device)
+            image_embeddings = torch.tensor([], dtype=images.dtype, device=images.device).reshape(
+                0, 0, 0
+            )
         elif self.add_encoder and has_images:
             image_embeddings = self.vision_model(images)  # [num_tiles, img_seq_len, h_vision]
             if self._drop_vision_class_token:
