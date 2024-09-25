@@ -137,6 +137,12 @@ def model_provider(
         patch_dim=args.patch_dim,
     )
 
+    model.freeze(
+        freeze_language_model=args.freeze_LM,
+        freeze_vision_model=args.freeze_ViT,
+        freeze_vision_projection=False,
+    )
+
     return model
 
 
@@ -270,7 +276,18 @@ def forward_step(data_iterator, model: LLaVAModel):
 def add_vlm_extra_args(parser):
     """Extra arguments."""
     group = parser.add_argument_group(title='vision language model specific arguments')
-    group.add_argument("--disable-vision-class-token", action="store_true", default=False)
+    group.add_argument(
+        '--freeze-LM', action='store_true', default=False, help="Freeze language model weights"
+    )
+    group.add_argument(
+        '--freeze-ViT', action='store_true', default=False, help="Freeze vision model (ViT) weights"
+    )
+    group.add_argument(
+        "--disable-vision-class-token",
+        action="store_true",
+        default=False,
+        help="Drop vision model class token",
+    )
     return parser
 
 
