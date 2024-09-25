@@ -5,7 +5,7 @@ from importlib.metadata import version
 from typing import Callable, Optional, Tuple
 
 import torch.nn.functional as F
-from pkg_resources import packaging
+from pkg_resources.extern import packaging
 
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import init_method_normal, scaled_init_method_normal
