@@ -122,6 +122,8 @@ if __name__ == "__main__":
 
     assert len(model) == 1, "Above condition should have caught this"
     model = model[0]
+    model.eval()
+
     if mpu.is_pipeline_first_stage() and mpu.get_tensor_model_parallel_rank() == 0:
         server = MegatronServer(model)
         server.run("0.0.0.0",port=args.port)

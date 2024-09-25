@@ -13,11 +13,11 @@ import torch.nn.functional as F
 from megatron import core
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
+from megatron.legacy.model.enums import AttnMaskType, LayerType, AttnType
+from megatron.legacy.model.fused_softmax import FusedScaleMaskSoftmax
+from megatron.legacy.model.fused_bias_gelu import bias_gelu_impl
+from megatron.core.models.common.embeddings import apply_rotary_pos_emb
 from megatron.core.jit import jit_fuser
-from megatron.core.models.common.embeddings.rotary_pos_embedding import (
-    RotaryEmbedding,
-    apply_rotary_pos_emb,
-)
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.parallel_state import (
     get_tensor_and_expert_parallel_group,
