@@ -63,7 +63,7 @@ def get_cu_seqlens(token_ids: torch.Tensor, delim_bos: Optional[int], delim_eos:
     
     """
     dim_b = token_ids.shape[0]
-    dim_s = token_ids.shape[0]
+    dim_s = token_ids.shape[1]
 
     # We deliminate documents with the bos token
     if delim_bos is not None:
