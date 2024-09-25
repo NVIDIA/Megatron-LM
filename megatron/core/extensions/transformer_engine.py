@@ -105,7 +105,6 @@ class TESwigluLinear(te_ops.Sequential):
         init_method: Callable,
         bias: bool,
         skip_bias_add: bool,
-        tp_comm_buffer_name: str = None,
         is_expert: bool = False,
     ):
 
@@ -160,10 +159,16 @@ class TESwigluLinear(te_ops.Sequential):
                     get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
                 ),
                 bias=bias,
-                dtype = torch.bfloat16,
+                dtype=torch.bfloat16,
             )
         )
-
+    
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Sharding along axis 0, bias sharded"""
+        state_dict = self.state_dict(prefix='', keep_vars=True)
+        return make_sharded_tensors_for_checkpoint(
+            state_dict, prefix, {'weight': 0, 'bias': 0}, sharded_offsets
+        )
 
 class TELinear(te.pytorch.Linear):
     """
