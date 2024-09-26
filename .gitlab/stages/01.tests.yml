@@ -85,13 +85,17 @@ unit_tests:
   # the current code. This is a form of backwards compatibility testing
   # and helps in providing stable interfaces.
   extends: [.test_mr_rules]
-  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
+  image: ${IMAGE}:${CI_PIPELINE_ID}
   needs: [build_image]
   timeout: 180m
   parallel:
     matrix:
       - TAG: latest
+        IMAGE: ${CI_MCORE_IMAGE}
+      # - TAG: latest
+      #   IMAGE: ${CI_MCORE_DEV_IMAGE}
       - TAG: 63be779b4608403f956aa1ef6c9013ab78db3eeb
+        IMAGE: ${CI_MCORE_IMAGE}
   tags: [8xL40S]
   variables:
     GIT_STRATEGY: clone
@@ -112,11 +116,14 @@ unit_tests:
 
       for i in $(seq $UNIT_TEST_REPEAT); do
         SEED=$((RANDOM % 9000 + 1000));
-        SKIPPED=()
+        ARGS=()
         if [[ $TAG != latest ]]; then
-          SKIPPED+=(-m "not internal")
+          ARGS+=(-m "not internal")
         fi
-        timeout ${UNIT_TEST_TIMEOUT}m torchrun --nproc_per_node=8 -m pytest --random-order --random-order-seed ${SEED} -xvs --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail "${SKIPPED[@]}" tests/unit_tests
+        if [[ $IMAGE == ${CI_MCORE_DEV_IMAGE} ]]; then
+          ARGS+=(-m "experimental")
+        fi
+        timeout ${UNIT_TEST_TIMEOUT}m torchrun --nproc_per_node=8 -m pytest --random-order --random-order-seed ${SEED} -xvs --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail "${ARGS[@]}" tests/unit_tests
       done
   artifacts:
     paths:
