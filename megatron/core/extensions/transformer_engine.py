@@ -8,6 +8,7 @@ from typing import Callable
 
 import torch
 import transformer_engine as te
+import transformer_engine.pytorch.ops as te_ops
 from pkg_resources import packaging
 from torch import Tensor
 
@@ -89,6 +90,86 @@ class TENorm:
             raise Exception('Only LayerNorm and RMSNorm are curently supported')
 
         return instance
+
+class TESwigluLinear(te_ops.Sequential):
+    """
+    Wrapper for Transformer-Engine's SwiGLU + Linear layer.
+
+    """
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        config: ModelParallelConfig,
+        init_method: Callable,
+        bias: bool,
+        skip_bias_add: bool,
+        is_expert: bool = False,
+    ):
+
+        self.config = config
+        parallel_mode="row"
+
+        # TE returns a zero length Tensor when bias=False and
+        # return_bias=True, but we prefer None.  So in that case we
+        # tell TE to not return the bias, and return None
+        # ourselves. This way our forward always returns two values
+        # and we don't have to deal with the zero length Tensor.
+        self.te_return_bias = skip_bias_add and bias
+        self.is_first_microbatch = True
+        self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
+
+        extra_kwargs = _get_extra_te_kwargs(config)
+
+        rng_tracker_name = None
+        if _te_version >= packaging.version.Version("1.7.0.dev"):
+            extra_kwargs["rng_tracker_name"] = rng_tracker_name
+
+        self.expert_parallel = self.config.expert_model_parallel_size > 1
+        if is_expert and self.expert_parallel:
+            rng_tracker_name = get_expert_parallel_rng_tracker_name()
+        else:
+            rng_tracker_name = None
+        if _te_version >= packaging.version.Version("1.7.0.dev"):
+            extra_kwargs["rng_tracker_name"] = rng_tracker_name
+
+        # Disable communications in TE when using SP or EP by making TE agnostic of model parallel.
+        tp_size = self.config.tensor_model_parallel_size
+        tp_group = get_tensor_model_parallel_group(check_initialized=False)
+        if is_expert and (self.config.sequence_parallel or self.expert_parallel):
+            if self.config.moe_extended_tp:
+                tp_size = get_tensor_and_expert_parallel_world_size()
+            if parallel_mode == "column":
+                output_size = divide(output_size, tp_size)
+            elif parallel_mode == "row":
+                input_size = divide(input_size, tp_size)
+            parallel_mode = None
+            tp_size = 1
+            tp_group = None
+
+        super().__init__(
+            te_ops.SwiGLU(),
+            te_ops.Linear(
+                in_features=input_size,
+                out_features=output_size,
+                sequence_parallel=self.config.sequence_parallel,
+                tensor_parallel_group=tp_group,
+                rng_state_tracker_function=(
+                    get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+                ),
+                bias=bias,
+                dtype=torch.bfloat16,
+            )
+        )
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Sharding along axis 0, bias sharded"""
+        state_dict = self.state_dict(prefix='', keep_vars=True)
+        return make_sharded_tensors_for_checkpoint(
+            state_dict, prefix, {'weight': 0, 'bias': 0}, sharded_offsets
+        )
+
 
 
 class TELinear(te.pytorch.Linear):

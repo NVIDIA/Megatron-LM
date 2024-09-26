@@ -27,6 +27,7 @@ from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 class MLPSubmodules:
     linear_fc1: Union[ModuleSpec, type] = None
     linear_fc2: Union[ModuleSpec, type] = None
+    swiglu_fc2: Union[ModuleSpec, type] = None
 
 
 class MLP(MegatronModule):
@@ -59,6 +60,8 @@ class MLP(MegatronModule):
 
         self.input_size = input_size if input_size != None else self.config.hidden_size
 
+        self.fuse_swiglu_fc2 = True
+
         # If this is a gated linear unit we double the output width, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = self.config.ffn_hidden_size
         if self.config.gated_linear_unit:
@@ -77,25 +80,44 @@ class MLP(MegatronModule):
             tp_comm_buffer_name='fc1',
         )
 
-        self.activation_func = self.config.activation_func
+        self.activation_is_swiglu = self.config.activation_func == F.silu and self.config.gated_linear_unit
+        self.use_fused_swiglu = self.activation_is_swiglu and self.config.tensor_model_parallel_size == 1 and self.fuse_swiglu_fc2
 
-        self.linear_fc2 = build_module(
-            submodules.linear_fc2,
-            self.config.ffn_hidden_size,
-            self.config.hidden_size,
-            config=self.config,
-            init_method=self.config.output_layer_init_method,
-            bias=self.config.add_bias_linear,
-            input_is_parallel=True,
-            skip_bias_add=True,
-            is_expert=is_expert,
-            tp_comm_buffer_name='fc2',
-        )
+        if self.use_fused_swiglu:
+            self.swiglu_fc2 = build_module(
+                submodules.swiglu_fc2,
+                self.config.ffn_hidden_size,
+                self.config.hidden_size,
+                config=self.config,
+                init_method=self.config.output_layer_init_method,
+                bias=self.config.add_bias_linear,
+                skip_bias_add=True,
+                is_expert=is_expert,
+            )
+        else:
+            self.activation_func = self.config.activation_func
+
+            self.linear_fc2 = build_module(
+                submodules.linear_fc2,
+                self.config.ffn_hidden_size,
+                self.config.hidden_size,
+                config=self.config,
+                init_method=self.config.output_layer_init_method,
+                bias=self.config.add_bias_linear,
+                input_is_parallel=True,
+                skip_bias_add=True,
+                is_expert=is_expert,
+                tp_comm_buffer_name='fc2',
+            )
 
     def forward(self, hidden_states):
 
         # [s, b, 4 * h/p]
         intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
+
+        if self.use_fused_swiglu:
+            output = self.swiglu_fc2(intermediate_parallel)
+            return output, None
 
         if self.config.bias_activation_fusion:
             if self.activation_func == F.gelu:
