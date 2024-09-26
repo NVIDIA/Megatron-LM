@@ -128,6 +128,7 @@ def model_provider(
         parallel_output=parallel_output,
         language_position_embedding_type=args.position_embedding_type,
         language_rotary_percent=args.rotary_percent,
+        language_rope_scaling=args.use_rope_scaling,
         pre_process=pre_process,
         post_process=post_process,
         add_encoder=add_encoder,
