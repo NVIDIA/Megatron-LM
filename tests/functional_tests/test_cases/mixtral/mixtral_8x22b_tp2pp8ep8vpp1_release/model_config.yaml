@@ -88,6 +88,7 @@ MODEL_ARGS:
   --auto-detect-ckpt-format: true
   --load: ${LOAD_PATH}
   --save: ${OUTPUT_PATH}/checkpoints
+  --no-ckpt-fully-parallel-save: true
   --save-interval: 500
 
   # Add initialization args
