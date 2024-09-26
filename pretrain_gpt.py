@@ -105,7 +105,8 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
                 share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
                 position_embedding_type=args.position_embedding_type,
                 rotary_percent=args.rotary_percent,
-                rotary_base=args.rotary_base
+                rotary_base=args.rotary_base,
+                rope_scaling=args.use_rope_scaling
             )
 
     return model

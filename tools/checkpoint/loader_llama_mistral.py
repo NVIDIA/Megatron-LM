@@ -385,15 +385,10 @@ def load_checkpoint_to_model(args):
     '''Set model params.'''
 
     from pretrain_gpt import model_provider
-    if "llama" in args.model_size or "yi" in args.model_size:
-        from transformers import LlamaForCausalLM as ModelForCausalLM
-    elif "mistral" in args.model_size:
-        from transformers import MistralForCausalLM as ModelForCausalLM
-    else:
-        raise AttributeError(f"args.model_size={args.model_size} not supported")
+    from transformers import AutoModelForCausalLM
 
     # Load Huggingface model.
-    hf_model = ModelForCausalLM.from_pretrained(args.load, torch_dtype=args.params_dtype, low_cpu_mem_usage=True, device_map="cpu")
+    hf_model = AutoModelForCausalLM.from_pretrained(args.load, torch_dtype=args.params_dtype, low_cpu_mem_usage=True, device_map="cpu")
 
     # Init Megatron model.
     model = model_provider(True, True).to(args.params_dtype)

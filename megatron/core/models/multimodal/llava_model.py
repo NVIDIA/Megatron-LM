@@ -76,6 +76,7 @@ class LLaVAModel(MegatronModule):
         img_w: int = 336,
         patch_dim: int = 14,
         language_rotary_base: int = 10000,
+        language_rope_scaling: bool = False,
     ) -> None:
         super().__init__(config=language_transformer_config)
 
@@ -112,6 +113,7 @@ class LLaVAModel(MegatronModule):
                 pre_process=self.pre_process,
                 post_process=self.post_process,
                 rotary_base=language_rotary_base,
+                rope_scaling=language_rope_scaling,
             )
             self.share_embeddings_and_output_weights = (
                 self.language_model.share_embeddings_and_output_weights
