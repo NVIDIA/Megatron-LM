@@ -94,6 +94,7 @@ class GPTModel(LanguageModule):
         # These 2 attributes are needed for TensorRT-LLM export.
         self.max_position_embeddings = max_sequence_length
         self.rotary_percent = rotary_percent
+        self.rotary_base = rotary_base
 
         if self.pre_process:
             self.embedding = LanguageModelEmbedding(
