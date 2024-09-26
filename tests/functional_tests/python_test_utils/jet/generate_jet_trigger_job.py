@@ -81,7 +81,10 @@ def main(
 
         if run_name is not None and wandb_experiment is not None:
             script.append(f"--run-name {run_name}")
-            script.append(f"--wandb-experiment {wandb_experiment}")
+            test_case.spec.model
+            script.append(
+                f"--wandb-experiment {wandb_experiment}-{test_case.spec.model}-{test_case.spec.test_case}"
+            )
 
         gitlab_pipeline[test_case.spec.test_case] = {
             "stage": "functional_tests",
