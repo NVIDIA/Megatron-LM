@@ -1,10 +1,9 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 import os
-from importlib.metadata import version
-from typing import Dict, Literal, Optional
+import warnings
+from typing import Literal, Optional
 
 import torch
-from pkg_resources import packaging
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
@@ -21,10 +20,14 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import get_linear_layer
+from megatron.core.utils import get_te_version as _get_te_version
+from megatron.core.utils import is_te_min_version
 
 
 def get_te_version():
-    return packaging.version.Version(version("transformer-engine"))
+    """Included for backwards compatibility."""
+    warnings.warn("`get_te_version` will be deprecated in a future release")
+    return _get_te_version()
 
 
 class BertModel(LanguageModule):
@@ -167,18 +170,27 @@ class BertModel(LanguageModule):
         """
         attn_mask_dimensions = "b1ss"
         if transformer_layer_spec == bert_layer_with_transformer_engine_spec:
-            if get_te_version() >= packaging.version.Version("1.7.0"):
+            if is_te_min_version("1.7.0"):
                 if os.getenv('NVTE_FLASH_ATTN') == '0' and os.getenv('NVTE_FUSED_ATTN') == '0':
                     assert (
                         transformer_layer_spec.submodules.self_attention.params['attn_mask_type']
                         == AttnMaskType.arbitrary
-                    ), "Set env variable NVTE_FLASH_ATTN to 1 or NVTE_FUSED_ATTN to 1 to use a more optimized attention kernal. Currently using unfused attention path. If you want to proceed with this path set AttnMaskType in module spec to be arbitrary"
+                    ), (
+                        "Set env variable NVTE_FLASH_ATTN to 1 or NVTE_FUSED_ATTN to 1 to use a "
+                        "more optimized attention kernal. Currently using unfused attention path. "
+                        "If you want to proceed with this path set AttnMaskType in module spec to "
+                        "be arbitrary"
+                    )
                 else:
                     attn_mask_dimensions = "b11s"
             else:
                 assert os.getenv('NVTE_ALLOW_NONDETERMINISTIC_ALGO') == '0' or (
                     os.getenv('NVTE_FLASH_ATTN') == '0' and os.getenv('NVTE_FUSED_ATTN') == '0'
-                ), "Flash and fused attention is not supported with transformer engine version < 1.7. Set NVTE_FLASH_ATTN=0 and NVTE_FUSED_ATTN=0 or upgrade transformer engine >= 1.7 or set NVTE_ALLOW_NONDETERMINISTIC_ALGO=0"
+                ), (
+                    "Flash and fused attention is not supported with transformer engine version "
+                    "< 1.7. Set NVTE_FLASH_ATTN=0 and NVTE_FUSED_ATTN=0 or upgrade transformer "
+                    "engine >= 1.7 or set NVTE_ALLOW_NONDETERMINISTIC_ALGO=0"
+                )
         return attn_mask_dimensions
 
     def bert_extended_attention_mask(self, attention_mask: Tensor) -> Tensor:

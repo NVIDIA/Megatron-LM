@@ -16,7 +16,7 @@ from megatron.core.parallel_state import (
     get_expert_model_parallel_rank,
     get_tensor_model_parallel_rank,
 )
-from megatron.core.utils import safely_set_viewless_tensor_data
+from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_data
 
 from .utils import gather_split_1d_tensor, split_tensor_into_1d_equal_chunks
 
@@ -175,6 +175,8 @@ def initialize_rng_tracker(use_te_rng_tracker: bool = False):
         return
 
     if use_te_rng_tracker:
+        if not is_te_min_version("1.5.0"):
+            raise RuntimeError("use_te_rng_tracker requires TransformerEngine version >= 1.5")
         from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
 
         _CUDA_RNG_STATE_TRACKER = TECudaRNGStatesTracker()
