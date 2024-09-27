@@ -23,6 +23,8 @@ def resolve_cluster_config(cluster: str) -> str:
         return "mcore/draco-oci"
     if cluster == "dgxa100_dracooci-ord":
         return "mcore/draco-oci-ord"
+    if cluster == "dgxh100_coreweave":
+        return "mcore/coreweave"
     raise ValueError(f"Unknown cluster {cluster} provided.")
 
 
@@ -54,14 +56,6 @@ def launch_and_wait_for_completion(
         ),
         config_id=resolve_cluster_config(cluster),
         custom_config={
-            "retrier": {
-                "enabled": True,
-                "max_retries": 2,
-                "retry_on": ['1.2', '1.2.*'],
-                "waiting_time": 60,
-                "environment": "jet-auto-retrier",
-            },
-            "builds": {"jet_flavour": None},
             "launchers": {cluster: {"account": account}},
             "executors": {
                 "jet-ci": {
