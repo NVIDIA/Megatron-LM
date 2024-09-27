@@ -522,6 +522,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         else:
             kv_channels = self.config.kv_channels
 
+        if config.cp_comm_type is not None:
+            extra_kwargs['cp_comm_type'] = config.cp_comm_type
+
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
             kv_channels=kv_channels,
