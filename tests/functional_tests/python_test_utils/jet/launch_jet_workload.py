@@ -195,6 +195,8 @@ def main(
             success = pipeline.get_status() == PipelineStatus.SUCCESS
             sys.exit(int(not success))  # invert for exit 0
 
+    sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

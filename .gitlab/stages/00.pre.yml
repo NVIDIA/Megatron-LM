@@ -76,9 +76,10 @@ clean_docker_node:
     matrix:
       - node: 8xL40S
       - node: mcore-docker-node-small
+      - node: mcore-docker-node-jet
   script:
     - export DOCKER_HOST='unix:///var/run/docker.sock'
-    - docker system prune -a --filter "until=48h" -f || true
+    - docker system prune -a --filter "until=36h" -f || true
 
 maybe_cherry_pick_commit:
   rules:

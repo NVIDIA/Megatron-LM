@@ -1,14 +1,12 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
-from importlib.metadata import version
 from typing import Callable, Optional, Tuple
 
 import torch.nn.functional as F
-from pkg_resources.extern import packaging
 
 from ..model_parallel_config import ModelParallelConfig
-from ..utils import init_method_normal, scaled_init_method_normal
+from ..utils import get_te_version, init_method_normal, is_te_min_version, scaled_init_method_normal
 
 
 @dataclass
@@ -507,11 +505,10 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.num_moe_experts and self.fp8:
             # TE version below 1.7.0 will raise Error when handle zeros tokens for expert
-            te_version = packaging.version.Version(version("transformer-engine"))
-            if te_version < packaging.version.Version("1.7.0.dev0"):
+            if not is_te_min_version("1.7.0.dev0"):
                 raise ValueError(
                     "Only transformer-engine>=1.7.0 supports MoE FP8 training, "
-                    f"but your version is {te_version}."
+                    f"but your version is {get_te_version()}."
                 )
 
             if self.moe_grouped_gemm:

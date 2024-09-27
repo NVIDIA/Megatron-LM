@@ -15,15 +15,44 @@ import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from functools import reduce
+from importlib.metadata import version
 from types import TracebackType
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
+from packaging.version import Version as PkgVersion
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 
 logger = logging.getLogger(__name__)
+
+
+_te_version = None
+
+
+def get_te_version():
+    """Get TE version from __version__; if not available use pip's. Use caching."""
+
+    def get_te_version_str():
+        import transformer_engine as te
+
+        if hasattr(te, '__version__'):
+            return str(te.__version__)
+        else:
+            return version("transformer-engine")
+
+    global _te_version
+    if _te_version is None:
+        _te_version = PkgVersion(get_te_version_str())
+    return _te_version
+
+
+def is_te_min_version(version, check_equality=True):
+    """Check if minimum version of `transformer-engine` is installed."""
+    if check_equality:
+        return get_te_version() >= PkgVersion(version)
+    return get_te_version() > PkgVersion(version)
 
 
 def ensure_divisibility(numerator, denominator):

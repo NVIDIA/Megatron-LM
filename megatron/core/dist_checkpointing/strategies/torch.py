@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union, cast
 
 import torch
-from pkg_resources.extern import packaging
+from packaging.version import Version as PkgVersion
 from torch.distributed import checkpoint
 from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed._shard.sharded_tensor import Shard, ShardedTensorMetadata, TensorProperties
@@ -448,8 +448,9 @@ class MCoreSavePlanner(DefaultSavePlanner):
         nd_flattened_global_shapes: Optional[Dict[str, Tuple[int, ...]]] = None,
         **kwargs,
     ) -> None:
-        # `dedup_replicated_tensors` was deprecated in 2.3 - avoids tons of warnings during saving
-        if packaging.version.Version(torch.__version__) <= packaging.version.Version("2.2"):
+        # `dedup_replicated_tensors` was deprecated in 2.3; this check avoids warnings
+        # during saving.
+        if PkgVersion(torch.__version__) <= PkgVersion("2.2"):
             kwargs['dedup_replicated_tensors'] = dedup_replicated_tensors
         super().__init__(*args, **kwargs)
         self.nd_flattened_global_shapes = nd_flattened_global_shapes or {}

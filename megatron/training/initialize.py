@@ -4,8 +4,6 @@
 import logging
 import random
 import os
-import packaging
-import packaging.version
 import time
 
 import numpy as np
