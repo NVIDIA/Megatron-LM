@@ -6,26 +6,13 @@ from importlib.metadata import version
 import pytest
 import torch
 import transformer_engine as te
-from pkg_resources import packaging
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
-
-
-def get_te_version():
-    def get_te_version_str():
-        if hasattr(te, '__version__'):
-            return str(te.__version__)
-        else:
-            return version("transformer-engine")
-
-    return packaging.version.Version(get_te_version_str())
-
-
-_te_version = get_te_version()
 
 
 class TestParallelMLAAttention:
@@ -68,7 +55,7 @@ class TestParallelMLAAttention:
         pass
 
     def test_gpu_forward(self):
-        if _te_version >= packaging.version.Version("1.10.0"):
+        if is_te_min_version("1.10.0"):
 
             # use flash attention for hopper, future may support fused attention for ampere
             os.environ['NVTE_FUSED_ATTN'] = "0"
@@ -97,7 +84,7 @@ class TestParallelMLAAttention:
             assert bias.shape[0] == config.hidden_size
 
     def test_fused_rope_gpu_forward(self):
-        if _te_version >= packaging.version.Version("1.10.0"):
+        if is_te_min_version("1.10.0"):
             # use flash attention for hopper, future may support fused attention for ampere
             os.environ['NVTE_FUSED_ATTN'] = "0"
             os.environ['NVTE_FLASH_ATTN'] = "1"
@@ -131,7 +118,7 @@ class TestParallelMLAAttention:
             self.parallel_attention.config.apply_rope_fusion = False
 
     def test_checkpointed_gpu_forward(self):
-        if _te_version >= packaging.version.Version("1.10.0"):
+        if is_te_min_version("1.10.0"):
             # use flash attention for hopper, future may support fused attention for ampere
             os.environ['NVTE_FUSED_ATTN'] = "0"
             os.environ['NVTE_FLASH_ATTN'] = "1"
