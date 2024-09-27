@@ -2,10 +2,8 @@
 
 from contextlib import nullcontext
 from dataclasses import dataclass
-from importlib.metadata import version
 from typing import List, Optional, Union
 
-import packaging
 import torch
 from torch import Tensor
 
@@ -19,7 +17,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import BaseTransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import make_viewless_tensor
+from megatron.core.utils import is_te_min_version, make_viewless_tensor
 
 try:
     from megatron.core.extensions.transformer_engine import (
@@ -375,10 +373,9 @@ class TransformerBlock(MegatronModule):
         optional_inputs = {}
         optional_inputs['is_first_microbatch'] = self.current_microbatch == 0
         try:
-            import transformer_engine.pytorch as te
+            import transformer_engine.pytorch as te  # pylint: disable=unused-import
 
-            _te_version = packaging.version.Version(version("transformer-engine"))
-            if _te_version < packaging.version.Version("1.10.0"):
+            if is_te_min_version("1.10.0", check_equality=False):
                 assert not any(
                     [attention_mask, context, context_mask, rotary_pos_emb]
                 ), "Keyword Arguments not supported with CUDA graph."

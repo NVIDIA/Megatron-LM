@@ -5,16 +5,15 @@ from importlib.metadata import version
 
 import pytest
 import torch
-from pkg_resources import packaging
+from packaging.version import Version as PkgVersion
 from pytest_mock import mocker
 
 from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec
 from megatron.core.models.bert.bert_model import BertModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
-
-_te_version = packaging.version.Version(version("transformer-engine"))
 
 
 class TestBertModel:
@@ -113,10 +112,7 @@ class TestBertModelAssertions:
         )
 
         with pytest.raises(Exception) as exc_info:
-            mocker.patch(
-                "megatron.core.models.bert.bert_model.get_te_version",
-                return_value=packaging.version.Version("1.4"),
-            )
+            mocker.patch("megatron.core.utils.get_te_version", return_value=PkgVersion("1.4"))
             self.bert_model = BertModel(
                 config=transformer_config,
                 num_tokentypes=0,
@@ -125,9 +121,9 @@ class TestBertModelAssertions:
                 max_sequence_length=4,
             )
 
-        assert (
-            str(exc_info.value)
-            == "Flash and fused attention is not supported with transformer engine version < 1.7. Set NVTE_FLASH_ATTN=0 and NVTE_FUSED_ATTN=0 or upgrade transformer engine >= 1.7"
+        assert str(exc_info.value) == (
+            "Flash and fused attention is not supported with transformer engine version < 1.7. "
+            "Set NVTE_FLASH_ATTN=0 and NVTE_FUSED_ATTN=0 or upgrade transformer engine >= 1.7"
         )
 
     @pytest.mark.internal
@@ -150,10 +146,7 @@ class TestBertModelAssertions:
         )
 
         with pytest.raises(Exception) as exc_info:
-            mocker.patch(
-                "megatron.core.models.bert.bert_model.get_te_version",
-                return_value=packaging.version.Version("1.7"),
-            )
+            mocker.patch("megatron.core.utils.get_te_version", return_value=PkgVersion("1.7"))
             self.bert_model = BertModel(
                 config=transformer_config,
                 num_tokentypes=0,
@@ -162,9 +155,10 @@ class TestBertModelAssertions:
                 max_sequence_length=4,
             )
 
-        assert (
-            str(exc_info.value)
-            == "Both NVTE_FLASH_ATTN and NVTE_FUSED_ATTN env flag set to 0. Either unset both of them or set one of them to 1 to use a more optimized attention kernal. Currently using unfused attention path. If you want to proceed with this path set AttnMaskType in module spec to be arbitrary"
+        assert str(exc_info.value) == (
+            "Both NVTE_FLASH_ATTN and NVTE_FUSED_ATTN env flag set to 0. Either unset both of them or set "
+            "one of them to 1 to use a more optimized attention kernel. Currently using unfused attention "
+            "path. If you want to proceed with this path set AttnMaskType in module spec to be arbitrary"
         )
 
     @pytest.mark.internal
@@ -186,15 +180,28 @@ class TestBertModelAssertions:
             pipeline_dtype=torch.bfloat16,
         )
 
-        mocker.patch(
-            "megatron.core.models.bert.bert_model.get_te_version",
-            return_value=packaging.version.Version("1.7"),
-        )
-        self.bert_model = BertModel(
-            config=transformer_config,
-            num_tokentypes=0,
-            transformer_layer_spec=bert_layer_with_transformer_engine_spec,
-            vocab_size=100,
-            max_sequence_length=4,
-        )
+        if is_te_min_version("1.7"):  # If TE version >= 1.7, no exception should be raised
+            self.bert_model = BertModel(
+                config=transformer_config,
+                num_tokentypes=0,
+                transformer_layer_spec=bert_layer_with_transformer_engine_spec,
+                vocab_size=100,
+                max_sequence_length=4,
+            )
+        else:  # If TE version < 1.7, an exception should be raised in other files
+            with pytest.raises(Exception) as exc_info:
+                mocker.patch("megatron.core.utils.get_te_version", return_value=PkgVersion("1.7"))
+                self.bert_model = BertModel(
+                    config=transformer_config,
+                    num_tokentypes=0,
+                    transformer_layer_spec=bert_layer_with_transformer_engine_spec,
+                    vocab_size=100,
+                    max_sequence_length=4,
+                )
+            assert str(exc_info.value) == (
+                "Linear.__init__() got an unexpected keyword argument 'rng_tracker_name' when "
+                "instantiating TERowParallelLinear when instantiating SelfAttention when "
+                "instantiating TransformerLayer"
+            )
+
         Utils.destroy_model_parallel()
