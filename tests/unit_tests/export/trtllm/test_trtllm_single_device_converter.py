@@ -10,7 +10,7 @@ from megatron.core.export.trtllm.trtllm_weights_converter.single_device_trtllm_m
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-class TestTRTLLMCPUConverter:
+class TestTRTLLMSingleDeviceConverter:
     def test_get_model_weights_converter(self, mocker):
 
         export_config = ExportConfig(inference_tp_size=2)
