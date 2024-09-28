@@ -17,7 +17,7 @@ _SEQUENCE_LENGTH = 64
 _VOCAB_SIZE = 256
 
 
-class TestTRTLLMGPUConverter:
+class TestTRTLLMDistributedGPUConverter:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(2, 1)

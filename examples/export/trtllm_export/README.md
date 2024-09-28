@@ -13,7 +13,7 @@ This guide will walk you through how you can use the megatron core export for ex
 #### 1. Quick Start
 This will walk you through the flow of converting an mcore gpt model to trtllm format using single device mode. The file can be found at [gpt_single_device_cpu_export.py](./single_device_export/gpt_single_device_cpu_export.py)
 
-NOTE: For faster performance, if your entire model will fit into gpu memory, pre transfer the model state dict to gpu and then call the get_trtllm_pretrained_config_and_model_weights function. Default behaviour is to transfer one layer at a time to cuda and convert if available, else do cpu conversion.
+NOTE: For faster performance, if your entire model will fit into gpu memory, pre transfer the model state dict to gpu and then call the get_trtllm_pretrained_config_and_model_weights function.
 
 <br>
 
