@@ -267,10 +267,10 @@ def _load_checkpoint(queue, args):
 
                 # Get non-parallel tensors from tp_rank 0
                 layer = models[0].language_model.encoder.layers[layer_num]
-                message["input norm weight"] = layer.input_norm.weight.data
+                message["input norm weight"] = layer.input_norm.weight.data if margs.transformer_impl == 'local' else layer.self_attention.layernorm_qkv.layer_norm_weight.data
                 if norm_has_bias:
                     message["input norm bias"] = layer.input_norm.bias.data
-                message["post norm weight"] = layer.post_attention_norm.weight.data
+                message["post norm weight"] = layer.post_attention_norm.weight.data if margs.transformer_impl == 'local' else layer.layernorm_mlp.layer_norm_weight.data
                 if norm_has_bias:
                     message["post norm bias"] = layer.post_attention_norm.bias.data
                 if md.linear_bias:
@@ -286,10 +286,10 @@ def _load_checkpoint(queue, args):
                 mlp_l1_weight = []
                 for tp_rank, model in enumerate(models):
                     layer = model.language_model.encoder.layers[layer_num]
-                    qkv_weight.append(layer.self_attention.query_key_value.weight.data)
-                    dense_weight.append(layer.self_attention.dense.weight.data)
-                    mlp_l0_weight.append(layer.mlp.dense_h_to_4h.weight.data)
-                    mlp_l1_weight.append(layer.mlp.dense_4h_to_h.weight.data)
+                    qkv_weight.append(layer.self_attention.query_key_value.weight.data if margs.transformer_impl == 'local' else layer.self_attention.layernorm_qkv.weight.data)
+                    dense_weight.append(layer.self_attention.dense.weight.data if margs.transformer_impl == 'local' else layer.self_attention.proj.weight.data)
+                    mlp_l0_weight.append(layer.mlp.dense_h_to_4h.weight.data if margs.transformer_impl == 'local' else layer.layernorm_mlp.fc1_weight.data)
+                    mlp_l1_weight.append(layer.mlp.dense_4h_to_h.weight.data if margs.transformer_impl == 'local' else layer.layernorm_mlp.fc2_weight.data)
                     if md.linear_bias:
                         qkv_bias.append(layer.self_attention.query_key_value.bias.data)
                         mlp_l0_bias.append(layer.mlp.dense_h_to_4h.bias.data)
