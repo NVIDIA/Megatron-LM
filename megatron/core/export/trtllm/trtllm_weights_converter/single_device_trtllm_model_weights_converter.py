@@ -78,15 +78,6 @@ class SingleDeviceTRTLLMModelWeightsConverter:
             val = val.to(self.storage_type).detach().contiguous()
             self.trtllm_model_weights[layer_name] = val
 
-    def _transfer_tensor_to_cuda_if_available(self, val: torch.tensor):
-        """Transfer to cuda device if available
-
-        This function transfers the tensor to cuda and returns it
-        """
-        if torch.cuda.is_available() and not val.is_cuda:
-            val = val.cuda()
-        return val
-
     def _convert_transformer_layer(self, layer_name: str, val: torch.Tensor):
         """Convert Transformer layers to TRTLLM weights
 
@@ -127,8 +118,6 @@ class SingleDeviceTRTLLMModelWeightsConverter:
                     val.to(self.storage_type).detach().contiguous()
                 )
 
-        val = self._transfer_tensor_to_cuda_if_available(val)
-
         if val.ndim == 2:
             val = val.T
 
@@ -142,6 +131,14 @@ class SingleDeviceTRTLLMModelWeightsConverter:
             or layer_name.endswith(suffix(TRTLLMLayers.mlp_projection_bias))
             or layer_name.endswith(suffix(TRTLLMLayers.mlp_router_weight))
         ):
+            # Same as layernorm1p in NeMo
+            if (
+                self.transformer_config.layernorm_zero_centered_gamma
+                and self.transformer_config.normalization == "LayerNorm"
+                and 'layernorm.weight' in layer_name
+            ):
+                val = val + 1.0
+
             _add_to_trtllm_model_weights(val=val, layer_name=layer_name, split_type=None)
 
         elif layer_name.endswith(
@@ -295,7 +292,6 @@ class SingleDeviceTRTLLMModelWeightsConverter:
                 layer_name == TRTLLMLayers.vocab_embedding.value
                 and self.export_config.use_parallel_embedding
             ):
-                val = self._transfer_tensor_to_cuda_if_available(val)
                 val = model_state_dict[TRTLLMLayers.vocab_embedding.value]
                 vocab_size = val.shape[0]
                 if vocab_size % self.export_config.inference_tp_size != 0:

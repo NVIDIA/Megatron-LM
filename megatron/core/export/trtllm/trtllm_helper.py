@@ -187,9 +187,7 @@ class TRTLLMHelper:
 
         This function returns the trtllm model weights as a list.
         There are two modes for conversion. The default is to use a single device cpu/gpu for conversion.
-        In the single device mode, we use cuda device automatically if available, if not we convert on CPU.
         NOTE: For faster performance, if your entire model will fit in memory, pre transfer the model state dict to cuda device and then call this function.
-        Default behaviour is to transfer one layer at a time to cuda and convert if available, else do cpu conversion.
         For on device conversion it returns weights which will be used on the device itself.
         Same thing happens with the pretrained config
 
@@ -206,10 +204,6 @@ class TRTLLMHelper:
         Returns:
             Two lists . First list of trtllm converted model weights(Either on device, or a list of weights for each gpu) and the trtllm_model_configs.
         """
-        assert not (
-            self.share_embeddings_and_output_weights and not export_config.use_parallel_embedding
-        ), "Found share_embeddings_and_output_weights is True in the model. So set export_config.use_embedding_sharing to True"
-
         if on_device_distributed_conversion:
             assert (vocab_size is not None, "Need to pass in vocab_size for on device")
             assert (
@@ -231,6 +225,9 @@ class TRTLLMHelper:
             return [trtllm_model_weights_on_device], [trtllm_model_config]
 
         else:
+            assert not (
+                self.share_embeddings_and_output_weights and not export_config.use_embedding_sharing
+            ), "Found share_embeddings_and_output_weights is True in the model. So set export_config.use_embedding_sharing to True"
             assert (
                 vocab_size is None
             ), "Vocab size is inferred from the input layer for cpu conversion. So leave it as None"
@@ -281,6 +278,7 @@ class TRTLLMHelper:
             inference_pp_size=distributed_trtllm_model_weights_converter.inference_pp_size,
             inference_tp_size=distributed_trtllm_model_weights_converter.inference_tp_size,
             use_parallel_embedding=True,
+            use_embedding_sharing=self.share_embeddings_and_output_weights,
         )
 
         world_size = export_config.inference_tp_size * export_config.inference_pp_size
