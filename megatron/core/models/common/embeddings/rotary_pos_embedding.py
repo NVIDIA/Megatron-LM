@@ -15,7 +15,13 @@ import torch
 from torch import Tensor, nn
 
 from megatron.core import parallel_state
-from megatron.core.models.common.embeddings.rope_utils import get_pos_emb_on_this_cp_rank
+from megatron.core.models.common.embeddings.rope_utils import (  # for backward compatibility; pylint: disable=unused-import
+    _apply_rotary_pos_emb_bshd,
+    _apply_rotary_pos_emb_thd,
+    _rotate_half,
+    apply_rotary_pos_emb,
+    get_pos_emb_on_this_cp_rank,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -136,8 +142,8 @@ class RotaryEmbedding(nn.Module):
         # emb [seq_length, .., dim]
         emb = emb[:, None, None, :]
         if parallel_state.get_context_parallel_world_size() > 1:
-            # slice rotary_pos_emb along sequence dimension
-            # and select the parition of the current CP rank
+            # slice rotary_pos_emb along sequence dimension and select the parition of the current
+            # CP rank
             emb = get_pos_emb_on_this_cp_rank(emb, 0)
         return emb
 
@@ -156,9 +162,9 @@ class RotaryEmbedding(nn.Module):
 
         Args:
             inference_params : Used during Inference time
-            transformer (TransformerBlock): The transformer block
-                (decoder/encoder) used by the model
-            transformer_input (Tensor): _description_
+            transformer (TransformerBlock): The transformer block (decoder/encoder) used
+                by the model
+            transformer_input (Tensor): Input tensor to the transformer
             transformer_config (TransformerConfig): Transformer config used by the model
 
         Returns:

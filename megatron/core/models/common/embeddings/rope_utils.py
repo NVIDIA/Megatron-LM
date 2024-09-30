@@ -160,7 +160,7 @@ def apply_rotary_pos_emb(
             )
             apply_rotary_pos_emb.printed_fused_warning = True
 
-    if config.multi_latent_attention and config.rotary_interleaved:
+    if getattr(config, "multi_latent_attention", False) and config.rotary_interleaved:
         logger.warning(
             "rotary_interleaved is not supported with multi_latent_attention, setting it to False"
         )
