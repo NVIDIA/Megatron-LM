@@ -25,7 +25,8 @@ from tests.unit_tests.test_utilities import Utils
 def initialize_bert_model(
     seed, layer_spec_fn=bert_layer_with_transformer_engine_spec, vocab_size=128, **config_kwargs
 ):
-    os.environ['NVTE_ALLOW_NONDETERMINISTIC_ALGO'] = '0'
+    os.environ['NVTE_FLASH_ATTN'] = '0'
+    os.environ['NVTE_FUSED_ATTN'] = '0'
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
 
@@ -114,6 +115,7 @@ class TestBERTModelReconfiguration:
             (False, (1, 8), (2, 1), bert_layer_local_spec, bert_layer_with_transformer_engine_spec),
         ],
     )
+    @pytest.mark.internal
     def test_parallel_reconfiguration_e2e(
         self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, src_layer_spec, dst_layer_spec, use_fpsl
     ):
@@ -130,6 +132,7 @@ class TestBERTModelReconfiguration:
             use_fpsl,
         )
 
+    @pytest.mark.internal
     def test_state_dict_comparison(self, tmp_path_dist_ckpt):
         common_test_state_dict_comparison(initialize_bert_model, tmp_path_dist_ckpt)
 
@@ -143,6 +146,7 @@ class TestBERTModelReconfiguration:
             (17, (1, 1), (1, 8)),
         ],
     )
+    @pytest.mark.internal
     def test_vocab_size_padding_change(
         self, tmp_path_dist_ckpt, vocab_size_base, src_tp_pp, dest_tp_pp
     ):
