@@ -161,6 +161,7 @@ class TestGroupedMLPReconfiguration:
             ('grouped', (2, 1, 4), (1, 1, 8), True),
         ],
     )
+    @pytest.mark.internal
     def test_sequential_grouped_mlp_interchangeable(
         self, tmp_path_dist_ckpt, src_tp_pp_exp, dest_tp_pp_exp, use_glu, src_module
     ):
