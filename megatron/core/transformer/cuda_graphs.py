@@ -6,6 +6,8 @@ from enum import Enum
 
 import torch
 
+from megatron.core.transformer.module import MegatronModule
+
 try:
     from transformer_engine.pytorch import make_graphed_callables
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
@@ -233,11 +235,16 @@ class CudaGraphManager(torch.nn.Module):
                 break
 
         if runner is None:
-            runner = self.create_cudagraph_module(megatron_module, args, kwargs)
-            self.cudagraph_runners.append(runner)
-            logging.getLogger(__name__).info(
-                f"Creating cudagraph; now have {len(self.cudagraph_runners)}"
-            )
+            if self.training and torch.is_grad_enabled():
+                runner = self.create_cudagraph_module(megatron_module, args, kwargs)
+                self.cudagraph_runners.append(runner)
+                logging.getLogger(__name__).info(
+                    f"Creating cudagraph; now have {len(self.cudagraph_runners)}"
+                )
+            else:
+                # No cudagraphs were found in inference mode, so fallback to eager since
+                # tensor.requires_grad is needed to correctly trace the backward graph.
+                return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
 
         tensor_args, tensor_kwargs = self.get_tensor_args(args, kwargs)
         out = runner(tensor_args, tensor_kwargs, is_first_microbatch=self.is_first_microbatch)
