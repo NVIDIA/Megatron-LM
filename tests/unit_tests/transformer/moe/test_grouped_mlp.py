@@ -88,6 +88,7 @@ class TestParallelGroupedMLP:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     def test_constructor(self):
         assert isinstance(self.sequential_mlp, MoELayer)
         assert isinstance(self.grouped_mlp, MoELayer)
@@ -126,6 +127,7 @@ class TestParallelGroupedMLP:
                 self.grouped_mlp.experts.weight1.shape == self.grouped_mlp.experts.weight2.t().shape
             )
 
+    @pytest.mark.internal
     def test_weight_init_value_the_same(self):
         gmm_w1 = self.grouped_mlp.experts.weight1.view(self.num_experts, -1, self.hidden_size)
         gmm_w2 = self.grouped_mlp.experts.weight2.view(self.num_experts, self.hidden_size, -1)
@@ -153,6 +155,7 @@ class TestParallelGroupedMLP:
         not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8,
         reason='GroupedGEMM kernels are not supported on this device.',
     )
+    @pytest.mark.internal
     def test_gpu_forward(self):
         self.sequential_mlp.cuda()
         self.grouped_mlp.cuda()
@@ -194,6 +197,7 @@ class TestParallelGroupedMLP:
         not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8,
         reason='GroupedGEMM kernels are not supported on this device.',
     )
+    @pytest.mark.internal
     def test_gradient_with_no_tokens_allocated(self):
         """Test that when no token is passed in, the parameters of the grouped MLP will also have gradients."""
         self.grouped_mlp.cuda()
@@ -271,6 +275,7 @@ class TestTEGroupedMLP:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     def test_constructor(self):
         assert isinstance(self.sequential_mlp, MoELayer)
         assert isinstance(self.grouped_mlp, MoELayer)
