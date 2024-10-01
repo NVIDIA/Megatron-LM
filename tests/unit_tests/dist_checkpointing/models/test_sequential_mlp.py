@@ -92,6 +92,7 @@ class TestExpertLayerReconfiguration:
         ],
     )
     @pytest.mark.parametrize("moe_grouped_gemm", moe_grouped_gemm_options)
+    @pytest.mark.internal
     def test_parallel_reconfiguration_e2e(
         self, tmp_path_dist_ckpt, src_tp_pp_exp, dest_tp_pp_exp, use_glu, use_fpsl, moe_grouped_gemm
     ):
