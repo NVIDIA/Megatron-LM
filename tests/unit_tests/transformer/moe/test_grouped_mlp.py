@@ -175,6 +175,7 @@ class TestParallelGroupedMLP:
         not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8,
         reason='GroupedGEMM kernels are not supported on this device.',
     )
+    @pytest.mark.internal
     def test_gpu_forward_with_no_tokens_allocated(self):
         """Test the case when no token is allocated for groupedGEMM kernels."""
         w1 = self.grouped_mlp.experts.weight1.view(self.num_experts, -1, self.hidden_size)
