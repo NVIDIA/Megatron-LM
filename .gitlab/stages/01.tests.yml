@@ -94,7 +94,7 @@ unit_tests:
         IMAGE: ${CI_MCORE_IMAGE}
       # - TAG: latest
       #   IMAGE: ${CI_MCORE_DEV_IMAGE}
-      - TAG: 63be779b4608403f956aa1ef6c9013ab78db3eeb
+      - TAG: core_r0.9.0
         IMAGE: ${CI_MCORE_IMAGE}
   tags: [8xL40S]
   variables:
@@ -132,8 +132,6 @@ unit_tests:
     - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
       when: always
-    - if: '$TAG != "latest"'
-      allow_failure: true
     - when: always
 
 unit-tests-results-notify:
