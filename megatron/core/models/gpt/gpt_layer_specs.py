@@ -36,10 +36,10 @@ except ImportError:
 try:
     import apex  # pylint: disable=unused-import
 
-    from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+    from megatron.core.fusions.fused_layer_norm import FusedApexNorm
 
     HAVE_APEX = True
-    LNImpl = FusedLayerNorm
+    LNImpl = FusedApexNorm
 except ImportError:
     import warnings
 
@@ -110,9 +110,10 @@ def get_gpt_layer_with_transformer_engine_spec(
                         core_attention=TEDotProductAttention,
                         linear_proj=TERowParallelLinear,
                         # TENorm significantly harms convergence when used
-                        # for QKLayerNorm; we instead use the Apex implementation.
-                        q_layernorm=FusedLayerNorm if qk_layernorm else IdentityOp,
-                        k_layernorm=FusedLayerNorm if qk_layernorm else IdentityOp,
+                        # for QKLayerNorm; we instead use the Apex implementation (or pytorch
+                    # one if Apex is not installed).
+                        q_layernorm=LNImpl if qk_layernorm else IdentityOp,
+                        k_layernorm=LNImpl if qk_layernorm else IdentityOp,
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
