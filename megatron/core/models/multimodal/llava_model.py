@@ -125,6 +125,16 @@ class LLaVAModel(MegatronModule):
 
         class_token_len = 1
         if self.add_encoder:
+            self._drop_vision_class_token = drop_vision_class_token
+            add_class_token = True
+            if vision_transformer_config.vision_model_type == "siglip":
+                class_token_len = 0
+                add_class_token = False
+                error_msg = (
+                    "Siglip does not support vision class token, "
+                    "set disable-vision-class-token to False."
+                )
+                assert not self._drop_vision_class_token, error_msg
             self.vision_model = CLIPViTModel(
                 vision_transformer_config,
                 vision_transformer_layer_spec,
@@ -132,8 +142,9 @@ class LLaVAModel(MegatronModule):
                 img_w=img_w,
                 class_token_len=class_token_len,
                 patch_dim=patch_dim,
+                model_subtype=vision_transformer_config.vision_model_type,
+                add_class_token=add_class_token,
             )
-            self._drop_vision_class_token = drop_vision_class_token
             # Map (intermediate) vision model outputs to the language model input dimension.
             self.vision_projection = MultimodalProjector(
                 vision_projection_config,
@@ -155,7 +166,12 @@ class LLaVAModel(MegatronModule):
                 )
 
         self._img_seq_len = get_num_image_embeddings(
-            img_h, img_w, patch_dim, drop_vision_class_token, class_token_len
+            img_h,
+            img_w,
+            patch_dim,
+            vision_transformer_config.vision_model_type,
+            drop_vision_class_token,
+            class_token_len,
         )
 
     def shared_embedding_or_output_weight(self):
