@@ -1290,12 +1290,12 @@ def forward_backward_pipelining_without_interleaving(
     if isinstance(model, list):
         assert (
             len(model) == 1
-        ), "non-interleaved pipeline parallelism does not support model chunking"
+        ), "non-interleaved pipeline-parallel schedule does not support model chunking"
         model = model[0]
     if isinstance(data_iterator, list):
         assert (
             len(data_iterator) == 1
-        ), "non-pipeline-parallel schedule does not support model chunking"
+        ), "non-interleaved pipeline-parallel schedule does not support model chunking"
         data_iterator = data_iterator[0]
 
     config = get_model_config(model)
