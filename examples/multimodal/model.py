@@ -36,7 +36,8 @@ def model_provider(
     print_rank_0('building a multimodal model ...')
 
     num_image_embeddings = get_num_image_embeddings(
-        args.img_h, args.img_w, args.patch_dim, args.disable_vision_class_token, 1
+        args.img_h, args.img_w, args.patch_dim, args.vision_model_type,
+        args.disable_vision_class_token, 1
     )
     old_seq_length = args.seq_length
     args.seq_length = args.encoder_seq_length = num_image_embeddings
@@ -82,7 +83,7 @@ def model_provider(
     )
 
     vision_model_type = args.vision_model_type
-    if vision_model_type == "clip":
+    if vision_model_type in ["clip", "siglip"]:
         if use_te:
             vision_transformer_layer_spec = get_layer_spec_te(
                 is_vit=True
