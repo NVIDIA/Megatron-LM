@@ -74,7 +74,7 @@ cd ../..
 
 Now launch the PTQ + TensorRT-LLM export script,
 ```sh
-bash examples/inference/quantization/ptq_trtllm_minitron_8b ./Minitron-8B-Base None
+bash examples/export/ptq_and_trtllm_export/ptq_trtllm_minitron_8b ./Minitron-8B-Base None
 ```
 By default, `cnn_dailymail` is used for calibration. The `GPTModel` will have quantizers for simulating the
 quantization effect. The checkpoint will be saved optionally (with quantizers as additional states) and can
@@ -104,12 +104,12 @@ export trtllm_options=" \
     --checkpoint_dir /tmp/trtllm_ckpt \
     --output_dir /tmp/trtllm_engine \
     --max_input_len 2048 \
-    --max_output_len 512 \
+    --max_seq_len 512 \
     --max_batch_size 8 "
 
 trtllm-build ${trtllm_options}
 
-python examples/inference/quantization/trtllm_text_generation.py --tokenizer nvidia/Minitron-8B-Base
+python examples/export/ptq_and_trtllm_export/trtllm_text_generation.py --tokenizer nvidia/Minitron-8B-Base
 ```
 
 ### mistral-12B FP8 Quantization and TensorRT-LLM Deployment
@@ -139,7 +139,7 @@ huggingface-cli login
 Now launch the PTQ + TensorRT-LLM checkpoint export script,
 
 ```sh
-bash examples/inference/quantization/ptq_trtllm_mistral_12b.sh ./Mistral-NeMo-12B-Base None
+bash examples/export/ptq_and_trtllm_export/ptq_trtllm_mistral_12b.sh ./Mistral-NeMo-12B-Base None
 ```
 
 Then build TensorRT engine and run text generation example using the newly built TensorRT engine
@@ -149,12 +149,12 @@ export trtllm_options=" \
     --checkpoint_dir /tmp/trtllm_ckpt \
     --output_dir /tmp/trtllm_engine \
     --max_input_len 2048 \
-    --max_output_len 512 \
+    --max_seq_len 512 \
     --max_batch_size 8 "
 
 trtllm-build ${trtllm_options}
 
-python examples/inference/quantization/trtllm_text_generation.py --tokenizer mistralai/Mistral-Nemo-Base-2407
+python examples/export/ptq_and_trtllm_export/trtllm_text_generation.py --tokenizer mistralai/Mistral-Nemo-Base-2407
 ```
 
 
@@ -165,7 +165,7 @@ python examples/inference/quantization/trtllm_text_generation.py --tokenizer mis
 > that we support.
 
 ```sh
-bash examples/inference/quantization/ptq_trtllm_llama_7b.sh ${CHECKPOINT_DIR}
+bash examples/export/ptq_and_trtllm_export/ptq_trtllm_llama_7b.sh ${CHECKPOINT_DIR}
 ```
 
 The script expect `${CHECKPOINT_DIR}` to have the following structure:
@@ -184,8 +184,23 @@ The script expect `${CHECKPOINT_DIR}` to have the following structure:
 In short, other than the converted llama megatron checkpoint, also put the Hugging Face checkpoint inside as
 the source of the tokenizer.
 
+Then build TensorRT engine and run text generation example using the newly built TensorRT engine
+
+```sh
+export trtllm_options=" \
+    --checkpoint_dir /tmp/trtllm_ckpt \
+    --output_dir /tmp/trtllm_engine \
+    --max_input_len 2048 \
+    --max_seq_len 512 \
+    --max_batch_size 8 "
+
+trtllm-build ${trtllm_options}
+
+python examples/export/ptq_and_trtllm_export/trtllm_text_generation.py --tokenizer meta-llama/Llama-2-7b
+```
+
 ### llama3-8b / llama3.1-8b INT8 SmoothQuant and TensorRT-LLM Deployment
-> **NOTE:** For llama3.1, the missing rope_scaling parameter will be fixed in modelopt-0.17 and trtllm-0.12.
+> **NOTE:** For llama3.1, the missing rope_scaling parameter will be fixed in modelopt-0.19 and trtllm-0.13.
 
 > **NOTE:** There are two ways to acquire the checkpoint. Users can follow
 > the instruction in `docs/llama2.md` to convert the checkpoint to megatron legacy `GPTModel` format and
@@ -199,16 +214,23 @@ If users choose to download the model from NGC, first extract the sharded checkp
 tar -xvf 8b_pre_trained_bf16.nemo
 ```
 
+> **NOTE:** You need a token generated from huggingface.co/settings/tokens and access to meta-llama/Llama-3.1-8B or meta-llama/Llama-3-8B on huggingface
+
+```sh
+pip install -U "huggingface_hub[cli]"
+huggingface-cli login
+```
+
 Now launch the PTQ + TensorRT-LLM checkpoint export script for llama-3,
 
 ```sh
-bash examples/inference/quantization/ptq_trtllm_llama3_8b.sh ./llama-3-8b-nemo_v1.0 None
+bash examples/export/ptq_and_trtllm_export/ptq_trtllm_llama3_8b.sh ./llama-3-8b-nemo_v1.0 None
 ```
 
 or llama-3.1
 
 ```sh
-bash examples/inference/quantization/ptq_trtllm_llama3_1_8b.sh ./llama-3_1-8b-nemo_v1.0 None
+bash examples/export/ptq_and_trtllm_export/ptq_trtllm_llama3_1_8b.sh ./llama-3_1-8b-nemo_v1.0 None
 ```
 
 Then build TensorRT engine and run text generation example using the newly built TensorRT engine
@@ -218,14 +240,14 @@ export trtllm_options=" \
     --checkpoint_dir /tmp/trtllm_ckpt \
     --output_dir /tmp/trtllm_engine \
     --max_input_len 2048 \
-    --max_output_len 512 \
+    --max_seq_len 512 \
     --max_batch_size 8 "
 
 trtllm-build ${trtllm_options}
 
-python examples/inference/quantization/trtllm_text_generation.py --tokenizer meta-llama/Meta-Llama-3-8B
+python examples/export/ptq_and_trtllm_export/trtllm_text_generation.py --tokenizer meta-llama/Meta-Llama-3-8B
 # For llama-3
 
-python examples/inference/quantization/trtllm_text_generation.py --tokenizer meta-llama/Meta-Llama-3.1-8B
+python examples/export/ptq_and_trtllm_export/trtllm_text_generation.py --tokenizer meta-llama/Meta-Llama-3.1-8B
 #For llama-3.1
 ```

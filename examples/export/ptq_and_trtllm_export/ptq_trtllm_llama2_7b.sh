@@ -66,7 +66,7 @@ options=" \
     --tokenizer-model ${TOKENIZER_MODEL} \
     --save-interval 1000000 \
     --use-dist-ckpt \
-    --load ${CHECKPOINT_LOAD_DIR}
+    --load ${CHECKPOINT_LOAD_DIR} \
     --fp16"
 
 # Precompile CUDA extentions
@@ -76,7 +76,5 @@ python -c "import modelopt.torch.quantization.extensions as ext; print(ext.cuda_
 launch_config="--nproc_per_node=${TP}"
 
 # Launch multi-process with torchrun
-torchrun ${launch_config} examples/inference/quantization/text_generation_ptq.py ${options} ${additional_options}
+torchrun ${launch_config} examples/export/ptq_and_trtllm_export/text_generation_ptq.py ${options} ${additional_options}
 
-# This script is using mpi4py which will fork multiple processes.
-python examples/inference/quantization/trtllm_text_generation.py ${trtllm_options}
