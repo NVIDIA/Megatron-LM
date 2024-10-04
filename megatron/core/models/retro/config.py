@@ -3,7 +3,6 @@
 """Configuration dataclass for a RetroModel."""
 
 import os
-import types
 from dataclasses import dataclass
 
 from megatron.core.transformer import TransformerConfig
@@ -58,6 +57,7 @@ class RetroConfig(TransformerConfig):
     retro_verify_neighbor_count: bool = True
     """Verify that len(GPT dataset) == len(saved neighbors)."""
 
+    # pylint: disable=line-too-long
     def __post_init__(self) -> None:
         """Validate Retro config."""
 
