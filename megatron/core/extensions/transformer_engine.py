@@ -566,6 +566,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             packed_seq_kwargs.pop("max_seqlen_q", None)
             packed_seq_kwargs.pop("max_seqlen_kv", None)
 
+        if get_te_version() < PkgVersion("1.8.0"):
+            # TE 1.8.0 introduces cu_seqlens_padded which is the cu_seqlens with paddings counted
+            # in each individual sequence in THD format dataset
+            # These two arguments did not exist prior to 1.8.0
+            packed_seq_kwargs.pop("cu_seqlens_q_padded", None)
+            packed_seq_kwargs.pop("cu_seqlens_kv_padded", None)
+
         if self.config.apply_rope_fusion and qkv_format == 'bshd':
             query, key, value = [x.transpose(0, 1).contiguous() for x in (query, key, value)]
             # In PyTorch, the following two tensors are in fact the same:
