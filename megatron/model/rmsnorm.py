@@ -9,7 +9,7 @@ from torch.nn.parameter import Parameter
 
 # Taken from facebookresearch/llama
 class RMSNorm(torch.nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, sequence_parallel=False):
         super().__init__()
         self.eps = eps
         init_device = None
@@ -19,7 +19,8 @@ class RMSNorm(torch.nn.Module):
                                 device=init_device,
                                 dtype=get_args().params_dtype))
         init.ones_(self.weight)
-        setattr(self.weight, 'sequence_parallel', sequence_parallel)
+        self.sequence_parallel = sequence_parallel
+        setattr(self.weight, 'sequence_parallel', self.sequence_parallel)
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
