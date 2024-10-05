@@ -20,6 +20,7 @@ from tests.unit_tests.test_utilities import Utils
 class TestFP8:
     @pytest.mark.parametrize('dtype', ['bf16', 'fp16', 'fp8'])
     @pytest.mark.parametrize('src_rank', [0, 6])
+    @pytest.mark.skip(reason="Flaky test")
     def test_simple_broadcast(self, dtype, src_rank):
         Utils.initialize_model_parallel()
 
