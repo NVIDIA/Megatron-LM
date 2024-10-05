@@ -41,12 +41,6 @@ done
 cat $TRAINING_PARAMS_PATH | envsubst >$TRAINING_PARAMS_PATH.tmp
 mv $TRAINING_PARAMS_PATH.tmp $TRAINING_PARAMS_PATH
 
-# Run before script
-SCRIPT=$(cat $TRAINING_PARAMS_PATH | yq '.BEFORE_SCRIPT')
-if [[ "$SCRIPT" != null ]]; then
-    eval "$SCRIPT"
-fi;
-
 # Pull env vars to export
 ENV_VARS=$(yq '... comments="" | .ENV_VARS | to_entries | .[] | [.key + "=" + .value] | join(" ")' $TRAINING_PARAMS_PATH)
 for ARGUMENT in $ENV_VARS; do
@@ -58,6 +52,12 @@ for ARGUMENT in $ENV_VARS; do
     export "$KEY"="$VALUE"
     echo "$KEY=$VALUE"
 done
+
+# Run before script
+SCRIPT=$(cat $TRAINING_PARAMS_PATH | yq '.BEFORE_SCRIPT')
+if [[ "$SCRIPT" != null ]]; then
+    eval "$SCRIPT"
+fi;
 
 # Exit earlier to leave time for properly saving checkpoint
 if [[ $(echo "$TRAINING_SCRIPT_PATH" | tr '[:upper:]' '[:lower:]') == *nemo* ]]; then
