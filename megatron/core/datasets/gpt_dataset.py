@@ -698,8 +698,6 @@ class MockGPTLowLevelDataset:
 
     def __init__(self, tokenizer: MegatronTokenizer) -> None:
         self.tokenizer = tokenizer
-        if self.tokenizer.eod < self.max_sequence_length:
-            self.max_sequence_length = self.tokenizer.eod
         rng = numpy.random.default_rng(seed=self.seed)
         self.sequence_lengths = rng.integers(
             low=1, high=self.max_sequence_length, size=self.size, dtype=numpy.int32
@@ -710,7 +708,9 @@ class MockGPTLowLevelDataset:
 
     def __getitem__(self, idx: int) -> numpy.number:
         length = self.sequence_lengths[idx]
-        sample = numpy.int64(numpy.arange(length - 1) + 1)
+        sample = numpy.int64(
+            numpy.concatenate([numpy.arange(length - 1) + 1, [self.tokenizer.eod]])
+        )
         return sample
 
     def get(self, idx: int, offset: int = 0, length: Optional[int] = None) -> numpy.ndarray:
