@@ -265,6 +265,14 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
 
         torch.distributed.init_process_group(**init_process_group_kwargs)
 
+        # 创建一个张量并填充数据，同时将其移动到 GPU
+        tensor = torch.tensor(1.0, dtype=torch.double, device='cuda')
+        print(f"Rank has data: {tensor.item()}")
+
+        # 执行 all_reduce 操作
+        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MIN)
+        print(f"Rank after all_reduce: {tensor.item()}")
+
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
     if device_count > 0:
