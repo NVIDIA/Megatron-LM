@@ -1160,6 +1160,9 @@ def _add_training_args(parser):
     group.add_argument('--disable-tp-comm-bulk-wgrad', action='store_false',
                        help='Disables the Reduce-Scatter overlap with bprop weight gradient GEMM.',
                        dest='tp_comm_bulk_wgrad')
+    group.add_argument('--tp-comm-bootstrap-backend', default='nccl', type=str,
+                       choices=['nccl', 'mpi', 'gloo'],
+                       help='Set the bootstrapping backend of Tensor parallel communications.')
     group.add_argument('--use-cpu-initialization', action='store_true',
                        default=None,
                        help='If set, initialize weights on the CPU. This eliminates init differences based on tensor parallelism.')

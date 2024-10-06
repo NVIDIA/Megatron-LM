@@ -46,10 +46,12 @@ def model_provider(
         model (megatron.core.models.multimodal.llava_model.LLaVAModel): A multimodal model
     """
     args = get_args()
+    vision_model_type = "clip"
 
     num_image_embeddings = get_num_image_embeddings(
-        args.img_h, args.img_w, args.patch_dim, args.disable_vision_class_token, 1
+        args.img_h, args.img_w, args.patch_dim, vision_model_type, args.disable_vision_class_token, 1
     )
+
     old_seq_length = args.seq_length
     # decoder_seq_length denotes the language model sequence length.
     args.decoder_seq_length = args.seq_length + num_image_embeddings
@@ -87,6 +89,7 @@ def model_provider(
     vision_transformer_config.num_layers = args.encoder_num_layers
     vision_transformer_config.first_pipeline_num_layers = None
     vision_transformer_config.last_pipeline_num_layers = None
+    vision_transformer_config.vision_model_type = vision_model_type
 
     vision_projection_type = "mlp"
     vision_projection_config = deepcopy(language_transformer_config)

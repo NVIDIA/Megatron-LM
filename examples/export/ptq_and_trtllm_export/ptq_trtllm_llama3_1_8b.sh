@@ -63,9 +63,10 @@ options=" \
     --tokenizer-type HuggingFaceTokenizer \
     --tokenizer-model meta-llama/Meta-Llama-3.1-8B \
     --save-interval 1000000 \
+    --use-rope-scaling \
     --use-dist-ckpt \
-    --load ${CHECKPOINT_LOAD_DIR}
-    --rotary-base 500000
+    --load ${CHECKPOINT_LOAD_DIR} \
+    --rotary-base 500000 \
     --fp16"
 
 # Precompile CUDA extentions
@@ -75,4 +76,4 @@ python -c "import modelopt.torch.quantization.extensions as ext; print(ext.cuda_
 launch_config="--nproc_per_node=${TP}"
 
 # Launch multi-process with torchrun
-torchrun ${launch_config} examples/inference/quantization/text_generation_ptq.py ${options} ${additional_options}
+torchrun ${launch_config} examples/export/ptq_and_trtllm_export/text_generation_ptq.py ${options} ${additional_options}
