@@ -15,8 +15,8 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 
 CHECKPOINT_PATH=/workspace/checkpoints/gpt345m #<Specify path>
 TENSORBOARD_LOGS_PATH=/workspace/logs #<Specify path>
-VOCAB_FILE=/workspace/dataset/gpt2-vocab.json #<Specify path to file>/gpt2-vocab.json
-MERGE_FILE=/workspace/dataset/gpt2-merges.txt #<Specify path to file>/gpt2-merges.txt
+VOCAB_FILE=/workspace/Megatron-LM/gpt2-vocab.json #<Specify path to file>/gpt2-vocab.json
+MERGE_FILE=/workspace/Megatron-LM/gpt2-merges.txt #<Specify path to file>/gpt2-merges.txt
 DATA_PATH=/workspace/Me/my-gpt2_text_document #<Specify path and file prefix>_text_document
 
 DISTRIBUTED_ARGS=(
