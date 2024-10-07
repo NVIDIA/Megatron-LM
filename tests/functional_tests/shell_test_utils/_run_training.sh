@@ -43,7 +43,7 @@ mv $TRAINING_PARAMS_PATH.tmp $TRAINING_PARAMS_PATH
 
 # Pull env vars to export
 ENV_VARS=$(yq '... comments="" | .ENV_VARS | to_entries | .[] | [.key + "=" + .value] | join(" ")' $TRAINING_PARAMS_PATH)
-for ARGUMENT in $ENV_VARS; do
+while IFS= read -r ARGUMENT; do
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
 
     KEY_LENGTH=${#KEY}
@@ -51,7 +51,7 @@ for ARGUMENT in $ENV_VARS; do
 
     export "$KEY"="$VALUE"
     echo "$KEY=$VALUE"
-done
+done <<< "$ENV_VARS"
 
 # Run before script
 SCRIPT=$(cat $TRAINING_PARAMS_PATH | yq '.BEFORE_SCRIPT')
