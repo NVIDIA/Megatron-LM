@@ -28,6 +28,7 @@ from megatron.core.utils import (
 )
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
+from megatron.training.checkpointing import checkpoint_exists
 from megatron.legacy.model import Float16Module
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
@@ -642,7 +643,8 @@ def setup_model_and_optimizer(model_provider_func,
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     if args.moe_use_upcycling:
-        assert not os.path.exists(
+        torch.distributed.barrier()
+        assert not checkpoint_exists(
             args.save
         ), ("The upcycling destination directory already exists. "
             "Please check if --moe-use-upcycling is mistakenly enabled. "
@@ -650,15 +652,18 @@ def setup_model_and_optimizer(model_provider_func,
             "All subsequent runs should remove this flag. ")
         num_experts = args.num_experts
         args.num_experts = None
+        expert_model_parallel_size = args.expert_model_parallel_size
+        args.expert_model_parallel_size = 1
         dense_model_for_upcycling = get_model(model_provider_func, model_type)
         args.num_experts = num_experts
+        args.expert_model_parallel_size = expert_model_parallel_size
         _, args.num_floating_point_operations_so_far = upcycling_utils.load_and_upcycle_model(
             load_checkpoint,
             unwrapped_model,
             dense_model_for_upcycling,
             load_kwargs = {'model': dense_model_for_upcycling, 'optimizer': None, 'opt_param_scheduler': None}
         )
-        args.iteration = 0
+        args.iteration = 1
         save_checkpoint(args.iteration, model, None, None, args.num_floating_point_operations_so_far)
         torch.distributed.barrier()
         del dense_model_for_upcycling
