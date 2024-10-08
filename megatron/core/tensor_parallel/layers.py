@@ -49,6 +49,12 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
 }
 
 
+@torch.compile
+def foo(x, y):
+    out = F.embedding(x, y)
+    return out
+
+
 def param_is_not_tensor_parallel_duplicate(param):
     """Returns true if the passed-in parameter is not a duplicate parameter
     on another TP rank."""
@@ -217,6 +223,12 @@ class VocabParallelEmbedding(torch.nn.Module):
             )
             if config.perform_initialization:
                 _initialize_affine_weight_gpu(self.weight, init_method, partition_dim=0, stride=1)
+    '''
+    @torch.compile
+    def foo(self, x, y):
+        out = F.embedding(x, y)
+        return out
+    '''
 
     def forward(self, input_):
         if self.tensor_model_parallel_size > 1:
@@ -232,7 +244,8 @@ class VocabParallelEmbedding(torch.nn.Module):
             output_parallel = self.weight[masked_input]
         else:
             # F.embedding currently has a non-deterministic backward function
-            output_parallel = F.embedding(masked_input, self.weight)
+            #output_parallel = torch.compile(F.embedding(masked_input, self.weight))
+            output_parallel = foo(masked_input, self.weight)
         # Mask the output embedding.
         if self.tensor_model_parallel_size > 1:
             output_parallel[input_mask, :] = 0.0
