@@ -57,6 +57,7 @@ class TestAuxLoss:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     @pytest.mark.parametrize(
         "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
     )
@@ -75,6 +76,7 @@ class TestAuxLoss:
         container.aux_loss_test(self.input, self.baseline_grad)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     @pytest.mark.parametrize(
         "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
     )

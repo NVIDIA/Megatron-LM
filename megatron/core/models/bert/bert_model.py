@@ -1,16 +1,14 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 import os
-from importlib.metadata import version
-from typing import Dict, Literal, Optional
+import warnings
+from typing import Literal, Optional
 
 import torch
-from pkg_resources import packaging
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec
+from megatron.core.models.bert.bert_layer_specs import bert_layer_local_spec
 from megatron.core.models.bert.bert_lm_head import BertLMHead
 from megatron.core.models.bert.pooler import Pooler
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
@@ -21,10 +19,14 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import get_linear_layer
+from megatron.core.utils import get_te_version as _get_te_version
+from megatron.core.utils import is_te_min_version
 
 
 def get_te_version():
-    return packaging.version.Version(version("transformer-engine"))
+    """Included for backwards compatibility."""
+    warnings.warn("`get_te_version` will be deprecated in a future release")
+    return _get_te_version()
 
 
 class BertModel(LanguageModule):
@@ -32,16 +34,19 @@ class BertModel(LanguageModule):
 
     Args:
         config (TransformerConfig): transformer config
-        num_tokentypes (int) : Set to 2 when args.bert_binary_head is True, and 0 otherwise. Defaults to 0.
+        num_tokentypes (int) : Set to 2 when args.bert_binary_head is True, and 0 otherwise.
+            Defaults to 0.
         transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers
         vocab_size (int): vocabulary size
         max_sequence_length (int): maximum size of sequence. This is used for positional embedding
         pre_process (bool): Include embedding layer (used with pipeline parallelism)
         post_process (bool): Include an output layer (used with pipeline parallelism)
-        parallel_output (bool): Do not gather the outputs, keep them split across tensor parallel ranks
-        share_embeddings_and_output_weights (bool): When True, input embeddings and output logit weights are shared. Defaults to False.
-        position_embedding_type (string): Position embedding type. Options ['learned_absolute', 'rope'].
-            Defaults is 'learned_absolute'.
+        parallel_output (bool): Do not gather the outputs, keep them split across tensor parallel
+            ranks
+        share_embeddings_and_output_weights (bool): When True, input embeddings and output logit
+            weights are shared. Defaults to False.
+        position_embedding_type (string): Position embedding type.
+            Options ['learned_absolute', 'rope']. Defaults is 'learned_absolute'.
         rotary_percent (float): Percent of rotary dimension to use for rotary position embeddings.
             Defaults to 1.0 (100%). Ignored unless position_embedding_type is 'rope'.
     """
@@ -88,9 +93,7 @@ class BertModel(LanguageModule):
         # megatron core pipelining currently depends on model type
         self.model_type = ModelType.encoder_or_decoder
 
-        self.attn_mask_dimensions = self._santiy_check_attention_and_get_attn_mask_dimension(
-            transformer_layer_spec
-        )
+        self.attn_mask_dimensions = self._sanity_check_attention_and_get_attn_mask_dimension()
 
         # Embeddings.
         if self.pre_process:
@@ -149,42 +152,79 @@ class BertModel(LanguageModule):
         if self.pre_process or self.post_process:
             self.setup_embeddings_and_output_layer()
 
-    def _santiy_check_attention_and_get_attn_mask_dimension(
-        self, transformer_layer_spec: ModuleSpec
-    ) -> str:
+    # pylint: disable=line-too-long
+    def _sanity_check_attention_and_get_attn_mask_dimension(self) -> str:
         """We do some checks and return attention mask dimensions for self attention
 
-        Transformer engine library underwent a lot of change. So we need to change dimensions of the attention mask depending on the TE version. We also santiy check some arguments.
+        Transformer engine library underwent a lot of change. So we need to change dimensions of
+        the attention mask depending on the TE version. We also santiy check some arguments.
+
         1. If we use local version of attention dimension of the mask is [b,1,s,s]
-        2. If we use transformer engine < 1.7 (Flash and Fused attention not supported. We use unfused path). Attn mask dimension is  [b,1,s,s]
-        2. If we use transformer engine >= 1.7 (Flash and fused attention supported with attn mask dimension [b,1,1,s]). Unfused path will use attn mask dimension [b,1,s,s] with attn mask type arbitrary. Default if you dont set any NVTE_ATTN flag will just use unfused path.
+        2. If we use transformer engine > 1.10 we support all 3 backends with padding mask and [b,1,s,s]
+        3. If we use transformer engine >= 1.7 but less than 1.10
+          a ) Flash and Fused attention uses padding mask with [b,1,1,s]
+          b ) Unfused attention works with arbitrary mask with [b,1,s,s]
+        4. If we use transformer engine < 1.7
+          Flash and fused attention is not supported. Unfused attention will work with padding mask [b,1,s,s]
+
+        Default if you dont set any NVTE_ATTN flag will it will just use the fused path for transformer engine version >= 1.7 and unfused path for other
 
         Args:
-            transformer_layer_spec (ModuleSpec): _description_
+            transformer_layer_spec (ModuleSpec): The transformer layer spec
 
         Returns:
-            str: _description_
+            str: A string showing the format of the attn mask dimensions
         """
-        attn_mask_dimensions = "b1ss"
-        if transformer_layer_spec == bert_layer_with_transformer_engine_spec:
-            if get_te_version() >= packaging.version.Version("1.7.0"):
-                if os.getenv('NVTE_FLASH_ATTN') == '0' and os.getenv('NVTE_FUSED_ATTN') == '0':
-                    assert (
-                        transformer_layer_spec.submodules.self_attention.params['attn_mask_type']
-                        == AttnMaskType.arbitrary
-                    ), "Set env variable NVTE_FLASH_ATTN to 1 or NVTE_FUSED_ATTN to 1 to use a more optimized attention kernal. Currently using unfused attention path. If you want to proceed with this path set AttnMaskType in module spec to be arbitrary"
-                else:
+        attn_mask_dimensions = None
+        # For local layer spec we just use b1ss
+        if self.transformer_layer_spec == bert_layer_local_spec:
+            attn_mask_dimensions = "b1ss"
+        else:
+            attn_mask_type = self.transformer_layer_spec.submodules.self_attention.params[
+                'attn_mask_type'
+            ]
+            flash_attention_enabled = os.getenv('NVTE_FLASH_ATTN') == '1'
+            fused_attention_enabled = os.getenv('NVTE_FUSED_ATTN') == '1'
+            # For TE >= 1.10 (We always use padding mask and use b11s)
+            if is_te_min_version("1.10.0"):
+                attn_mask_dimensions = "b11s"
+                if attn_mask_type != AttnMaskType.padding:
+                    warnings.warn(
+                        f'For TE versions >= 1.10 , flash/fused/unfused support padding mask. Setting attention mask from {attn_mask_type} to padding'
+                    )
+                    self.transformer_layer_spec.submodules.self_attention.params[
+                        'attn_mask_type'
+                    ] = AttnMaskType.padding
+            # For 1.7 >= TE < 1.10 flash and fused path use padding mask with b11s and unfused path uses arbitrary mask with b1ss
+            elif is_te_min_version("1.7.0"):
+                if flash_attention_enabled or fused_attention_enabled:
                     attn_mask_dimensions = "b11s"
+                else:
+                    if attn_mask_type != AttnMaskType.arbitrary:
+                        warnings.warn(
+                            f'For TE versions >= 1.7 but < 1.10 , unfused path supports only arbitrary mask. Setting attention mask from {attn_mask_type} to arbitray'
+                        )
+                        self.transformer_layer_spec.submodules.self_attention.params[
+                            'attn_mask_type'
+                        ] = AttnMaskType.arbitrary
+                    attn_mask_dimensions = "b1ss"
+            # For TE < 1.7 we only support unfused attention with b1ss and padding mask
             else:
-                assert os.getenv('NVTE_ALLOW_NONDETERMINISTIC_ALGO') == '0' or (
-                    os.getenv('NVTE_FLASH_ATTN') == '0' and os.getenv('NVTE_FUSED_ATTN') == '0'
-                ), "Flash and fused attention is not supported with transformer engine version < 1.7. Set NVTE_FLASH_ATTN=0 and NVTE_FUSED_ATTN=0 or upgrade transformer engine >= 1.7 or set NVTE_ALLOW_NONDETERMINISTIC_ALGO=0"
+                attn_mask_dimensions = "b1ss"
+                assert not flash_attention_enabled and not fused_attention_enabled, (
+                    "Flash and fused attention is not supported with transformer engine version "
+                    "< 1.7. Set NVTE_FLASH_ATTN=0 and NVTE_FUSED_ATTN=0 or upgrade transformer "
+                    "engine >= 1.7"
+                )
+
         return attn_mask_dimensions
 
     def bert_extended_attention_mask(self, attention_mask: Tensor) -> Tensor:
         """Creates the extended attention mask
 
-        Converts the attention mask of dimension [batch size, 1, seq len] to [batch size, 1, seq len, seq len] or [batch size, 1, 1, seq_len] and makes it binary
+        Converts the attention mask of dimension
+        [batch size, 1, seq len] to [batch size, 1, seq len, seq len]
+        or [batch size, 1, 1, seq_len] and makes it binary
 
         Args:
             attention_mask (Tensor): The input attention mask
@@ -212,6 +252,7 @@ class BertModel(LanguageModule):
         return extended_attention_mask
 
     def bert_position_ids(self, token_ids):
+        """Position ids for bert model"""
         # Create position ids
         seq_length = token_ids.size(1)
         position_ids = torch.arange(seq_length, dtype=torch.long, device=token_ids.device)

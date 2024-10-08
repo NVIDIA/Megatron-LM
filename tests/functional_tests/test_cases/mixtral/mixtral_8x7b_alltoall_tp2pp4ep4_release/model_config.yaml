@@ -17,7 +17,8 @@ MODEL_ARGS:
   --use-distributed-optimizer: true
   --overlap-grad-reduce: true
   --overlap-param-gather: true
-
+  --no-ckpt-fully-parallel-save: true
+  
   # Training args
   --use-mcore-models: true
   --sequence-parallel: true
@@ -32,7 +33,7 @@ MODEL_ARGS:
   --transformer-impl: transformer_engine
 
   # Data args
-  --data-cache-path: ${OUTPUT_PATH}/cache
+  --data-cache-path: ${DATA_CACHE_PATH}
   --tokenizer-type: GPTSentencePieceTokenizer
   --tokenizer-model: ${DATA_PATH}/utils/nemotron_2_256k.model 
   --data-path: $DATA_BLEND
@@ -95,7 +96,6 @@ MODEL_ARGS:
 
   # Add logging args
   --log-timers-to-tensorboard: true
-  --log-batch-size-to-tensorboard: true
   --log-memory-to-tensorboard: true
   --log-num-zeros-in-grad: true
   --log-params-norm: true
@@ -104,7 +104,7 @@ MODEL_ARGS:
   --log-interval: 1
   --tensorboard-dir: ${OUTPUT_PATH}/tensorboard
   --wandb-project: megatron-core-release-runs
-  --wandb-exp-name: ${MCORE_RELEASE_NUM}_mixtral-8x7b-TP2PP4EP4-MBS1GBS1024-alltoall-nvllm8t
+  --wandb-exp-name: ${WANDB_EXPERIMENT}
 
   # Add mixed precision args
   --bf16: true

@@ -94,11 +94,8 @@ class OptimizerConfig:
     use_distributed_optimizer: bool = False
     """Distribute optimizer state over data-parallel replicas."""
 
-    overlap_grad_reduce: bool = False
-    """If true, overlap grad reduce-scatter with backward compute in distributed optimizer."""
-
-    overlap_param_gather: bool = False
-    """If true, overlap param all-gather with forward compute in distributed optimizer."""
+    overlap_param_gather_with_optimizer_step: bool = False
+    """If true, overlap param all-gather of first bucket with optimizer step."""
 
     ################
     # Miscellaneous

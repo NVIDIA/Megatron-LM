@@ -4,7 +4,7 @@ import os
 import torch
 from dataset_helpers import TaskEncoder, print_error_handler
 
-from megatron.core import mpu
+from megatron.core import parallel_state
 from megatron.energon import (
     LimitDataset,
     RepeatDataset,
@@ -15,6 +15,7 @@ from megatron.energon import (
     get_val_datasets,
 )
 from megatron.core.num_microbatches_calculator import get_num_microbatches
+from megatron.core.parallel_state import get_tensor_model_parallel_rank
 from megatron.training import get_args, print_rank_0
 from megatron.training.checkpointing import get_checkpoint_name
 
@@ -62,14 +63,17 @@ def datasets_provider(worker_config=None):
 
 def train_valid_test_dataloaders_provider(train_val_test_num_samples):
     """Build multimodal train, validation and test dataloaders."""
+    if get_tensor_model_parallel_rank() != 0:
+        return None, None, None
+
     args = get_args()
 
     worker_debug_path = None
     worker_log_level = 0
 
-    rank = mpu.get_data_parallel_rank()
-    world_size = mpu.get_data_parallel_world_size()
-    data_parallel_group = mpu.get_data_parallel_group()
+    rank = parallel_state.get_data_parallel_rank()
+    world_size = parallel_state.get_data_parallel_world_size()
+    data_parallel_group = parallel_state.get_data_parallel_group()
 
     worker_config = WorkerConfig(
         rank=rank,
@@ -84,7 +88,7 @@ def train_valid_test_dataloaders_provider(train_val_test_num_samples):
     train_dataloader = get_savable_loader(train_ds, worker_config=worker_config)
     if args.load is not None:
         if getattr(args, "dataloader_save", None):
-            dp_rank = mpu.get_data_parallel_rank()
+            dp_rank = parallel_state.get_data_parallel_rank()
             data_save_name = get_checkpoint_name(
                 args.dataloader_save,
                 args.iteration,

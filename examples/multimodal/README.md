@@ -115,6 +115,8 @@ examples/multimodal/text_generation_mistral_clip.sh --input-image-path /path/to/
     --model-path /path/to/model.pt --tokenizer-path /path/to/tokenizer.model --gt-path /path/to/groundtruth/file --task generation-task-name
 ```
 
+where `--task generation-task-name` is the name of the evaluation benchmark such as `captioning` or `MMMU`.
+
 ### After pretraining
 
 #### COCO captioning

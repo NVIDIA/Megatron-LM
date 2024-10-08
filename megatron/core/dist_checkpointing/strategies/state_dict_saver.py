@@ -84,7 +84,9 @@ def save_state_dict_async_plan(
     def local_step():
         nonlocal local_plan
         assert planner is not None
-        planner.set_up_planner(state_dict, dist_wrapper.is_coordinator)
+        # PyTorch 2.4 introduced additional `metadata` argument,
+        # we have to reference `is_coordinator` args by name
+        planner.set_up_planner(state_dict, is_coordinator=dist_wrapper.is_coordinator)
         storage_writer.set_up_storage_writer(dist_wrapper.is_coordinator)
         if not validated_cache_reuse and local_plan is None:
             local_plan = planner.create_local_plan()

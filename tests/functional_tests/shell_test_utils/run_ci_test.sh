@@ -1,14 +1,14 @@
 #!/bin/bash
 
-set -euxo pipefail
+set -exo pipefail
 
 echo "------ARGUMENTS LIST --------"
 for ARGUMENT in "$@"; do
+    echo $ARGUMENT
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
 
     KEY_LENGTH=${#KEY}
-    VALUE="${ARGUMENT:$KEY_LENGTH+1}"
-
+    VALUE=$(eval echo ${ARGUMENT:$KEY_LENGTH+1})
     export "$KEY"="$VALUE"
     echo "$KEY=$VALUE"
 done
@@ -17,7 +17,7 @@ echo "---------------------------------"
 # Check that mandatory vars are set
 MANDATORY_VARS=(
     "TRAINING_SCRIPT_PATH"
-    "TRAINING_PARAMS_PATH"
+    "TEST_CASE_PATH"
     "OUTPUT_PATH"
     "TENSORBOARD_PATH"
     "CHECKPOINT_PATH"
@@ -30,6 +30,9 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
         exit 1
     fi
 done
+
+export TRAINING_PARAMS_PATH=$TEST_CASE_PATH/model_config.yaml
+export GOLDEN_VALUES_PATH=$TEST_CASE_PATH/golden_values.json
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT_DIR=$(realpath $SCRIPT_DIR/../../../)
@@ -46,15 +49,19 @@ N_REPEATS=$(cat $TRAINING_PARAMS_PATH \
 
 for i in $(seq 1 $N_REPEATS);
 do
-    rm -rf $CHECKPOINT_PATH/*
+    if [[ $i -gt 1 ]]; then
+        rm -rf $CHECKPOINT_PATH/*
+    fi
 
     # Training
+    export RUN_NUMBER=1
     bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
 
     # Maybe checkpoint resume training
     if [[ "$TEST_TYPE" == "ckpt-resume" ]]; then 
         rm -rf $CHECKPOINT_PATH/iter_0000100; 
         echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt;
+        export RUN_NUMBER=2
         bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
     fi
 

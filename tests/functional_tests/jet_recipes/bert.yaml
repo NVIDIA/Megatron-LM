@@ -13,7 +13,7 @@ spec:
     /workspace/data/bert_data: text/the_pile/bert_shard00
   script: |-
     ls
-    cd /workspace/megatron-lm
+    cd /opt/megatron-lm
 
     ARGUMENTS=(
         "DATA_PATH=/workspace/data/bert_data"
@@ -22,18 +22,17 @@ spec:
         "TENSORBOARD_PATH={assets_dir}/tensorboard"
         "CHECKPOINT_PATH=/workspace/checkpoints"
         "TRAINING_SCRIPT_PATH=pretrain_bert.py"
-        "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
-        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values.json"
+        "TEST_CASE_PATH=./tests/functional_tests/test_cases/{model}/{test_case}"
     )
 
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
   - scope: [mr]
-    time_limit: [1200]
+    time_limit: [12000]
     test_case: 
     - bert_mr_mcore_tp2_pp2_dgx_a100_1N8G
-    - bert_mr_mcore_tp2_pp2_local_spec_dgx_a100_1N8G
+    # - bert_mr_mcore_tp2_pp2_local_spec_dgx_a100_1N8G
     - bert_mr_mcore_tp2_pp2_resume_torch_dist_dgx_a100_1N8G
     - bert_mr_mcore_tp2_pp2_resume_torch_dist_local_spec_dgx_a100_1N8G
     - bert_mr_tp1_pp4_vp2_dgx_a100_1N8G

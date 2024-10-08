@@ -2,7 +2,7 @@ import argparse
 import glob
 import json
 
-from open_flamingo.eval.vqa_metric import compute_vqa_accuracy
+from open_flamingo.eval.vqa_metric import VQAEval
 
 
 def merge_input_files(input_path):
@@ -28,14 +28,68 @@ def merge_input_files(input_path):
     return output_file_path
 
 
+def is_number(n: str):
+    try:
+        float(n)
+        return True
+    except ValueError:
+        return False
+
+
+def compute_vqa_accuracy(result_file, use_chartqa_metric=False):
+    """Compute VQA accuracy."""
+    merged_results = json.load(open(result_file))
+
+    vqa = VQAEval(vqa=None, vqaRes=None)
+    all_acc = []
+    for res in merged_results:
+        pred = res["answer"]
+        pred = vqa.processPunctuation(pred)
+        pred = vqa.processDigitArticle(pred)
+
+        gt = res["gt_answer"]
+        gt = [vqa.processPunctuation(ans) for ans in gt]
+        gt = [vqa.processDigitArticle(ans) for ans in gt]
+
+        # ChartQA uses relaxed accuracy:
+        # "We consider an answer to be correct if it is within 5% of the gold answer.
+        #  For non-numeric answers, we still need an exact match to consider an answer to be correct."
+        if use_chartqa_metric:
+            acc = 0.0
+            assert len(gt) == 1, "expected exactly one groundtruth answer."
+            gt = gt[0]
+
+            if is_number(pred) and is_number(gt):
+                pred = float(pred)
+                gt = float(gt)
+                if pred >= (gt * 0.95) and pred <= (gt * 1.05):
+                    acc = 1.0
+            elif pred == gt:
+                acc = 1.0
+
+            all_acc.append(acc)
+        else:
+            num_match = sum([pred == ans for ans in gt])
+            acc = min(1.0, num_match / 3.0)
+            all_acc.append(acc)
+
+    acc_avg = sum(all_acc) / len(all_acc) * 100
+
+    return acc_avg
+
+
+def vqav2_eval(input_path):
+    """Run VQAv2 evaluation."""
+    result_file = merge_input_files(input_path)
+    avg_acc = compute_vqa_accuracy(result_file)
+    return avg_acc
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--input-path', type=str, help="Path to input file(s)")
-    parser.add_argument('--groundtruth-path', type=str, help="Path to groundtruth file")
-    parser.add_argument('--question-path', type=str, help="Path to questions file")
     args = parser.parse_args()
 
-    result_file = merge_input_files(args.input_path)
+    avg_acc = vqav2_eval(args.input_path)
 
-    accuracy = compute_vqa_accuracy(result_file, args.question_path, args.groundtruth_path)
-    print(accuracy)
+    print(f"===== VQAv2 Accuracy {avg_acc:.2f}% =====")

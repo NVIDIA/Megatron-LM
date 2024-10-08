@@ -1,10 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-from importlib.metadata import version
-
 import pytest
 import torch
-from pkg_resources import packaging
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import load, load_plain_tensors, save
@@ -21,10 +18,9 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
-
-_te_version = packaging.version.Version(version("transformer-engine"))
 
 
 def initialize_expert_layer(seed, glu=True, moe_grouped_gemm=False, **config_kwargs):
@@ -49,11 +45,15 @@ def initialize_expert_layer(seed, glu=True, moe_grouped_gemm=False, **config_kwa
     )
     if moe_grouped_gemm:
         model = TEGroupedMLP(
-            num_local_experts, transformer_config, transformer_layer_spec.submodules.mlp.submodules
+            num_local_experts,
+            transformer_config,
+            transformer_layer_spec.submodules.mlp.submodules.experts,
         )
     else:
         model = SequentialMLP(
-            num_local_experts, transformer_config, transformer_layer_spec.submodules.mlp.submodules
+            num_local_experts,
+            transformer_config,
+            transformer_layer_spec.submodules.mlp.submodules.experts,
         )
     return model
 
@@ -65,7 +65,7 @@ def get_pp_offsets():
 
 
 moe_grouped_gemm_options = [False]
-if _te_version >= packaging.version.Version("1.9.0.dev0"):
+if is_te_min_version("1.9.0.dev0"):
     moe_grouped_gemm_options.append(True)
 
 
@@ -151,7 +151,7 @@ class TestExpertLayerReconfiguration:
             assert not any(map(bool, diffs)), diffs
 
     @pytest.mark.skipif(
-        _te_version < packaging.version.Version("1.9.0.dev0"),
+        not is_te_min_version("1.9.0.dev0"),
         reason="TE Grouped MLP is only supported in TE 1.9.0.dev0 and later.",
     )
     @pytest.mark.parametrize(

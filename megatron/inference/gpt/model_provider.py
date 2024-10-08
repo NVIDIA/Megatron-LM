@@ -64,6 +64,7 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
         "position_embedding_type": args.position_embedding_type,
         "rotary_percent": args.rotary_percent,
         "rotary_base": args.rotary_base,
+        "rope_scaling": args.use_rope_scaling,
     }
 
     model = model_type(**model_kwargs)

@@ -32,7 +32,8 @@ def generate_and_post_process(model,
                               stop_on_eol=False,
                               prevent_newline_after_colon=False,
                               random_seed=-1,
-                              return_logits=False):
+                              return_logits=False,
+                              detokenize_segments=True):
     """Run inference and post-process outputs, i.e., detokenize,
     move to cpu and convert to list."""
 
@@ -58,7 +59,7 @@ def generate_and_post_process(model,
     # Only post-process on first stage.
     if mpu.is_pipeline_first_stage():
         tokens, prompts_plus_generations, prompts_plus_generations_segments = \
-            detokenize_generations(tokens, lengths, True)
+            detokenize_generations(tokens, lengths, detokenize_segments)
 
         if return_output_log_probs:
             output_log_probs = output_log_probs.cpu().numpy().tolist()
@@ -163,7 +164,8 @@ def beam_search_and_post_process(model,
                                  stop_token=50256,
                                  num_return_gen=1,
                                  length_penalty=1,
-                                 prevent_newline_after_colon=False):
+                                 prevent_newline_after_colon=False,
+                                 detokenize_segments=True):
     """Run beam search and post-process outputs, i.e., detokenize,
     move to cpu and convert to list."""
 
@@ -181,7 +183,7 @@ def beam_search_and_post_process(model,
     # Only post-process on first stage.
     if mpu.is_pipeline_first_stage():
         lengths = tokens.size(1)*torch.ones(beam_size, dtype=torch.int64, device=torch.cuda.current_device())
-        tokens, prompts_plus_generations, prompts_plus_generations_segments = detokenize_generations(tokens, lengths, True)
+        tokens, prompts_plus_generations, prompts_plus_generations_segments = detokenize_generations(tokens, lengths, detokenize_segments)
         scores = scores.cpu().numpy().tolist()
         return prompts_plus_generations, prompts_plus_generations_segments, scores
 

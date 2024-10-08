@@ -32,7 +32,7 @@ MODEL_ARGS:
   --transformer-impl: transformer_engine
 
   # Data args
-  --data-cache-path: ${OUTPUT_PATH}/cache
+  --data-cache-path: ${DATA_CACHE_PATH}
   --tokenizer-type: GPTSentencePieceTokenizer
   --tokenizer-model: ${DATA_PATH}/utils/nemotron_2_256k.model
   --data-path: $DATA_BLEND
@@ -94,7 +94,7 @@ MODEL_ARGS:
   --log-interval: 100
   --tensorboard-dir: ${OUTPUT_PATH}/tensorboard
   --wandb-project: megatron-core-release-runs
-  --wandb-exp-name: ${MCORE_RELEASE_NUM}_gpt3-15b-8t
+  --wandb-exp-name: ${WANDB_EXPERIMENT}
 
   # Add mixed precision args
   --bf16: true

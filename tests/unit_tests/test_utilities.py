@@ -4,17 +4,25 @@ from datetime import timedelta
 import torch
 from torch._C._distributed_c10d import PrefixStore
 from torch.distributed import rendezvous
-from torch.distributed.distributed_c10d import _store_based_barrier
 
 import megatron.core.parallel_state as ps
 
 
 class TestModel(torch.nn.Module):
-    def __init__(self, input_dim: int, output_dim: int, num_layers: int, bias: bool):
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        num_layers: int,
+        bias: bool,
+        shared_embedding: bool = False,
+    ):
         super().__init__()
         self.layers = torch.nn.ModuleList(
             [torch.nn.Linear(input_dim, output_dim, bias) for _ in range(num_layers)]
         )
+        if shared_embedding:
+            self.layers[-1].weight.shared_embedding = True
 
 
 class Utils:
@@ -28,7 +36,8 @@ class Utils:
     def initialize_distributed():
         if not torch.distributed.is_initialized() and Utils.rank >= 0:
             print(
-                f'Initializing torch.distributed with rank: {Utils.rank}, world_size: {Utils.world_size}'
+                f'Initializing torch.distributed with rank: {Utils.rank}, '
+                f'world_size: {Utils.world_size}'
             )
             torch.cuda.set_device(Utils.rank % torch.cuda.device_count())
             init_method = 'tcp://'

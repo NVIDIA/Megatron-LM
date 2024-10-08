@@ -4,7 +4,6 @@
 
 import logging
 import os
-from itertools import product
 from pathlib import Path
 
 import torch
@@ -13,29 +12,38 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict, StateDict
 from megatron.core.dist_checkpointing.strategies.base import (
     SaveCommonStrategy,
     StrategyAction,
-    default_strategies,
+    register_default_strategy,
 )
 
 from ..dict_utils import dict_list_map_inplace, nested_values
 from ..mapping import CheckpointingException, ShardedObject, is_main_replica
 from ..strategies.base import LoadCommonStrategy
 
-_import_trigger = None
-
 COMMON_STATE_FNAME = 'common.pt'
 
 logger = logging.getLogger(__name__)
 
 
+def register_default_common_strategies():
+    """Register default common strategies."""
+    register_default_strategy(StrategyAction.LOAD_COMMON, 'torch', 1, TorchCommonLoadStrategy())
+    register_default_strategy(
+        StrategyAction.SAVE_COMMON, 'torch', 1, TorchCommonSaveStrategy('torch', 1)
+    )
+
+
 class TorchCommonSaveStrategy(SaveCommonStrategy):
+    """Common save strategy leveraging native torch save/load."""
+
     def save_common(self, common_state_dict: StateDict, checkpoint_dir: Path):
+        """Save common part of the state dict."""
         if torch.distributed.get_rank() == 0:
             torch.save(common_state_dict, checkpoint_dir / COMMON_STATE_FNAME)
 
     def save_sharded_objects(
         self, sharded_objects_state_dict: ShardedStateDict, checkpoint_dir: Path
     ):
-
+        """Save sharded objects from the state dict."""
         for sh_obj in nested_values(sharded_objects_state_dict):
             if is_main_replica(sh_obj.replica_id):
                 save_path = checkpoint_dir / f'{sh_obj.unique_key}.pt'
@@ -43,10 +51,13 @@ class TorchCommonSaveStrategy(SaveCommonStrategy):
                 torch.save(sh_obj.data, save_path)
 
     def can_handle_sharded_objects(self):
+        """This strategy can handle ShardedObjects."""
         return True
 
 
 class TorchCommonLoadStrategy(LoadCommonStrategy):
+    """Common load strategy leveraging native torch save/load."""
+
     def load_common(self, checkpoint_dir: Path):
         """Load common (non-sharded) objects state dict from the checkpoint.
 
@@ -68,10 +79,12 @@ class TorchCommonLoadStrategy(LoadCommonStrategy):
     def load_sharded_objects(
         self, sharded_objects_state_dict: ShardedStateDict, checkpoint_dir: Path
     ):
-        """Replaces all ShardedObject from a given state dict with values loaded from the checkpoint.
+        """Replaces all ShardedObject from a given state dict with values loaded from the
+        checkpoint.
 
         Args:
-            sharded_objects_state_dict (ShardedStateDict): sharded state dict defining what objects should be loaded.
+            sharded_objects_state_dict (ShardedStateDict):
+                sharded state dict defining what objects should be loaded.
             checkpoint_dir (Path): checkpoint directory
 
         Returns:
@@ -99,7 +112,8 @@ class TorchCommonLoadStrategy(LoadCommonStrategy):
                     else:
                         ckpt_files = [f.name for f in checkpoint_dir.iterdir()]
                         logger.debug(
-                            f'{err_msg}. Object {sh_obj.key} directory does not exist. Checkpoint directory content: {ckpt_files}'
+                            f'{err_msg}. Object {sh_obj.key} directory does not exist. Checkpoint'
+                            f' directory content: {ckpt_files}'
                         )
                     raise CheckpointingException(err_msg) from e
             return loaded_obj
@@ -119,7 +133,8 @@ class TorchCommonLoadStrategy(LoadCommonStrategy):
                 full_key = f'{subdir.name}/{shard_file.stem}'
                 sh_objs.append(ShardedObject.empty_from_unique_key(full_key))
 
-            # This is a backward-compatibility fix, where the last global shape is missing in the name
+            # This is a backward-compatibility fix, where the last global shape is missing in the
+            # name
             if sh_objs[0].global_shape[-1] < 0:
                 max_last_offset = max(map(lambda sh_obj: sh_obj.global_offset[-1], sh_objs))
                 for sh_obj in sh_objs:
@@ -132,6 +147,7 @@ class TorchCommonLoadStrategy(LoadCommonStrategy):
 
     @property
     def can_handle_sharded_objects(self):
+        """This strategy can handle ShardedObjects."""
         return True
 
     def check_backend_compatibility(self, loaded_version):
@@ -139,9 +155,3 @@ class TorchCommonLoadStrategy(LoadCommonStrategy):
 
     def check_version_compatibility(self, loaded_version):
         pass
-
-
-default_strategies[StrategyAction.LOAD_COMMON.value][('torch', 1)] = TorchCommonLoadStrategy()
-default_strategies[StrategyAction.SAVE_COMMON.value][('torch', 1)] = TorchCommonSaveStrategy(
-    'torch', 1
-)

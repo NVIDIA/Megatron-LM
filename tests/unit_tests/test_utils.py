@@ -89,6 +89,28 @@ def test_check_param_hashes_across_dp_replicas():
     _deinit_distributed()
 
 
+def test_cross_check_param_hashes_across_dp_replicas():
+    world = int(os.getenv('WORLD_SIZE', '1'))
+    rank = int(os.getenv('RANK', '0'))
+
+    # Setup.
+    _init_distributed(world, rank)
+    Utils.initialize_model_parallel()
+    model = torch.nn.Linear(100, 100, bias=False)
+
+    # First check case where all replicas agree.
+    model.weight.data.fill_(1.0)
+    assert util.check_param_hashes_across_dp_replicas([model], True)
+
+    # Now check case where replica 0 disagrees with all other replicas.
+    if rank == 0:
+        model.weight.data.fill_(0.0)
+    assert not util.check_param_hashes_across_dp_replicas([model], True)
+
+    # Teardown.
+    _deinit_distributed()
+
+
 def test_straggler_detector():
     world = int(os.getenv('WORLD_SIZE', '1'))
     rank = int(os.getenv('RANK', '0'))

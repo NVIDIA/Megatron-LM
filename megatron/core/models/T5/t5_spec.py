@@ -12,15 +12,11 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_block import (
-    TransformerBlockSubmodules,
-    get_num_layers_to_build,
-)
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
 try:
-    from megatron.core.transformer.custom_layers.transformer_engine import (
+    from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
@@ -33,7 +29,7 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    import apex
+    import apex  # pylint: disable=unused-import
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 
@@ -56,7 +52,7 @@ def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
         submodules=TransformerLayerSubmodules(
             self_attention=ModuleSpec(
                 module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.padding},
+                params={"attn_mask_type": AttnMaskType.arbitrary},
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=TELayerNormColumnParallelLinear,
                     core_attention=TEDotProductAttention,
@@ -98,6 +94,7 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
             pre_cross_attn_layernorm=TENorm,
             cross_attention=ModuleSpec(
                 module=CrossAttention,
+                params={"attn_mask_type": AttnMaskType.arbitrary},
                 submodules=CrossAttentionSubmodules(
                     linear_q=TEColumnParallelLinear,
                     linear_kv=TEColumnParallelLinear,
@@ -126,7 +123,7 @@ def encoder_model_with_local_spec() -> ModuleSpec:
             input_layernorm=LNImpl,
             self_attention=ModuleSpec(
                 module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.padding},
+                params={"attn_mask_type": AttnMaskType.arbitrary},
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=ColumnParallelLinear,
                     core_attention=DotProductAttention,
@@ -174,6 +171,7 @@ def decoder_model_with_local_spec() -> ModuleSpec:
             pre_cross_attn_layernorm=LNImpl,
             cross_attention=ModuleSpec(
                 module=CrossAttention,
+                params={"attn_mask_type": AttnMaskType.arbitrary},
                 submodules=CrossAttentionSubmodules(
                     linear_q=ColumnParallelLinear,
                     linear_kv=ColumnParallelLinear,

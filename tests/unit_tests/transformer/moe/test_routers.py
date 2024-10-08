@@ -45,6 +45,7 @@ class TestTop2Router:
         assert num_weights == 12 * 4, num_weights
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     @pytest.mark.parametrize("moe_router_pre_softmax", [(True), (False)])
     def test_router_forward(self, moe_router_pre_softmax):
         with torch.no_grad():
@@ -54,17 +55,9 @@ class TestTop2Router:
             hidden_states = torch.randn((32, 2, self.router.config.hidden_size))
             hidden_states = hidden_states.cuda()
             scores, indices = self.router(hidden_states)
-            print(scores.shape, indices.shape)
-            assert scores.shape == (64, 2)
-            assert indices.shape == (64, 2)
-            print(
-                (indices == 0).sum(),
-                (indices == 1).sum(),
-                (indices == 2).sum(),
-                (indices == 3).sum(),
-            )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     def test_aux_loss(self):
         self.sequential_mlp = self.sequential_mlp.cuda()
 

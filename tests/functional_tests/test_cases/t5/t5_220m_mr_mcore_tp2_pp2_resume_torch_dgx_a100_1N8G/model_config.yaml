@@ -3,6 +3,7 @@ ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: ^NVLS
   CUBLAS_WORKSPACE_CONFIG: :4096:8
+  N_REPEATS: 5
 MODEL_ARGS:
   --encoder-num-layers: 12
   --decoder-num-layers: 12

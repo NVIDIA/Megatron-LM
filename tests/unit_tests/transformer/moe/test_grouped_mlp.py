@@ -1,17 +1,15 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-from importlib.metadata import version
-
 import pytest
 import torch
 import torch.nn.functional as F
-from pkg_resources import packaging
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 from megatron.legacy.model import Float16Module
 from megatron.training.arguments import parse_args
 from megatron.training.initialize import _set_random_seed
@@ -20,8 +18,6 @@ from tests.unit_tests.test_utilities import Utils
 DEVICE_CAPABILITY = None
 if torch.cuda.is_available():
     DEVICE_CAPABILITY = torch.cuda.get_device_capability()
-
-_te_version = packaging.version.Version(version("transformer-engine"))
 
 
 class TestParallelGroupedMLP:
@@ -85,13 +81,17 @@ class TestParallelGroupedMLP:
         ## Grouped GEMM
         _set_random_seed(seed_=123, data_parallel_random_init=False)
         tf_config.moe_grouped_gemm = True
-        self.grouped_mlp = MoELayer(tf_config)
+        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            self.num_experts, moe_grouped_gemm=True
+        )
+        self.grouped_mlp = MoELayer(tf_config, transformer_layer_spec.submodules.mlp.submodules)
         self.grouped_mlp = Float16Module(self.grouped_mlp, self.args).module
         print("done intializing for grouped gemm")
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     def test_constructor(self):
         assert isinstance(self.sequential_mlp, MoELayer)
         assert isinstance(self.grouped_mlp, MoELayer)
@@ -130,6 +130,7 @@ class TestParallelGroupedMLP:
                 self.grouped_mlp.experts.weight1.shape == self.grouped_mlp.experts.weight2.t().shape
             )
 
+    @pytest.mark.internal
     def test_weight_init_value_the_same(self):
         gmm_w1 = self.grouped_mlp.experts.weight1.view(self.num_experts, -1, self.hidden_size)
         gmm_w2 = self.grouped_mlp.experts.weight2.view(self.num_experts, self.hidden_size, -1)
@@ -153,6 +154,7 @@ class TestParallelGroupedMLP:
             assert torch.equal(gmm_expert2_fc2, smm_expert2_fc2)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8,
         reason='GroupedGEMM kernels are not supported on this device.',
@@ -175,6 +177,7 @@ class TestParallelGroupedMLP:
         # assert torch.equal(output_smm, output_gmm)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8,
         reason='GroupedGEMM kernels are not supported on this device.',
@@ -193,6 +196,7 @@ class TestParallelGroupedMLP:
             assert str(e) == "Input batch_sizes should not be all zeros!"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8,
         reason='GroupedGEMM kernels are not supported on this device.',
@@ -210,7 +214,7 @@ class TestParallelGroupedMLP:
 
 
 @pytest.mark.skipif(
-    _te_version < packaging.version.Version("1.9.0.dev0"),
+    not is_te_min_version("1.9.0.dev0"),
     reason="TE Grouped MLP is only supported in TE 1.9.0.dev0 and later.",
 )
 class TestTEGroupedMLP:
@@ -274,6 +278,7 @@ class TestTEGroupedMLP:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     def test_constructor(self):
         assert isinstance(self.sequential_mlp, MoELayer)
         assert isinstance(self.grouped_mlp, MoELayer)
@@ -308,6 +313,7 @@ class TestTEGroupedMLP:
             )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     def test_gpu_forward_backward(self):
         self.sequential_mlp.cuda()
         self.grouped_mlp.cuda()
@@ -350,6 +356,7 @@ class TestTEGroupedMLP:
             torch.testing.assert_close(smm_result, gmm_result)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     def test_gpu_forward_backward_with_no_tokens_allocated(self):
         """Test the case when no token is allocated for groupedGEMM kernels."""
         self.grouped_mlp.cuda()

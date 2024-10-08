@@ -1,33 +1,46 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Transformer."""
-from contextlib import nullcontext
-import os
 import math
+import os
+from contextlib import nullcontext
+from typing import Optional
+
 import numpy as np
 import torch
 import torch.nn.functional as F
-from typing import Optional
 
 from megatron import core
-from megatron.training import get_timers, get_args
-from .module import MegatronModule
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.legacy.model.enums import AttnMaskType, LayerType, AttnType
 from megatron.legacy.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.legacy.model.fused_bias_gelu import bias_gelu_impl
-from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding, apply_rotary_pos_emb
+from megatron.core.models.common.embeddings import apply_rotary_pos_emb
+from megatron.core.jit import jit_fuser
 from megatron.core.num_microbatches_calculator import get_num_microbatches
-from megatron.legacy.model.utils import attention_mask_func, openai_gelu, erf_gelu, get_norm
+from megatron.core.parallel_state import (
+    get_tensor_and_expert_parallel_group,
+    get_tensor_model_parallel_group,
+)
 from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region_to_moe,
-    reduce_scatter_to_sequence_parallel_region_from_moe,
     get_cuda_rng_tracker,
-    get_data_parallel_rng_tracker_name
+    get_data_parallel_rng_tracker_name,
+    reduce_scatter_to_sequence_parallel_region_from_moe,
 )
-from megatron.core.parallel_state import get_tensor_model_parallel_group, get_tensor_and_expert_parallel_group
-from megatron.core.jit import jit_fuser
+from megatron.legacy.model.enums import AttnMaskType, AttnType, LayerType
+from megatron.legacy.model.fused_bias_gelu import bias_gelu_impl
+from megatron.legacy.model.fused_softmax import FusedScaleMaskSoftmax
+from megatron.legacy.model.utils import (
+    attention_mask_func,
+    erf_gelu,
+    get_norm,
+    openai_gelu,
+)
+from megatron.training import get_args, get_timers
+
+from .module import MegatronModule
 
 try:
     from einops import rearrange
@@ -38,7 +51,9 @@ try:
     from flash_attn.flash_attn_interface import flash_attn_unpadded_func
 except ImportError:
     try:
-        from flash_attn.flash_attn_interface import flash_attn_varlen_func as flash_attn_unpadded_func
+        from flash_attn.flash_attn_interface import (
+            flash_attn_varlen_func as flash_attn_unpadded_func,
+        )
     except ImportError:
         flash_attn_unpadded_func = None
 
@@ -1392,20 +1407,16 @@ class ParallelTransformer(MegatronModule):
         if self.transformer_impl == 'transformer_engine':
             global transformer_engine
             import transformer_engine
-            from importlib.metadata import version
-            from pkg_resources import packaging
 
-            te_version = packaging.version.Version(version("transformer-engine"))
-            if te_version >= packaging.version.Version("0.8.0"):
+            if core.utils.is_te_min_version("0.8.0"):
                 self.transformer_engine_v_0_8 = True
-            if te_version >= packaging.version.Version("0.10.0"):
+            if core.utils.is_te_min_version("0.10.0"):
                 self.transformer_engine_v_0_10 = True
-            if te_version >= packaging.version.Version("0.11.0"):
+            if core.utils.is_te_min_version("0.11.0"):
                 self.transformer_engine_v_0_11 = True
 
-            del version, packaging
-
-            assert not args.squared_relu, "TransformerEngine does not support squared relu activation."
+            assert not args.squared_relu, ("TransformerEngine does not support squared "
+                                           "relu activation.")
 
         self.use_fp8 = args.fp8 is not None
         self.fp8_recipe = None
@@ -1413,7 +1424,7 @@ class ParallelTransformer(MegatronModule):
         if self.use_fp8:
             assert args.transformer_impl == 'transformer_engine', \
                 'transformer-engine required for fp8 training and inference'
-            self.fp8_group = mpu.get_amax_reduction_group()
+            self.fp8_group = mpu.get_amax_reduction_group(tp_only_amax_red=config.tp_only_amax_red)
             if args.fp8 == "e4m3":
                 fp8_format = transformer_engine.common.recipe.Format.E4M3
             elif args.fp8 == "hybrid":

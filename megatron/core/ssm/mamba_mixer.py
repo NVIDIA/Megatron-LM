@@ -7,18 +7,24 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
-from dataclasses import dataclass
-from typing import Union
+from dataclasses import dataclass, replace
+from typing import List, Optional, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from megatron.core.dist_checkpointing import ShardedTensor
+from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.parallel_state import get_tensor_model_parallel_world_size
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import (
+    make_sharded_tensors_for_checkpoint,
+    sharded_state_dict_default,
+)
 
 try:
     from mamba_ssm.ops.triton.selective_state_update import selective_state_update
@@ -46,13 +52,58 @@ except ImportError:
     raise ImportError("einops is required by the Mamba model but cannot be imported")
 
 
+class ExtendedRMSNorm(RMSNormGated):
+    """
+    RMSNormGated with sharded state dict.
+    """
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Sharding along axis 0, bias not sharded"""
+        state_dict = self.state_dict(prefix='', keep_vars=True)
+        return make_sharded_tensors_for_checkpoint(
+            state_dict, prefix, {'weight': 0}, sharded_offsets
+        )
+
+
 @dataclass
 class MambaMixerSubmodules:
+    """
+    Contains the module specs for the input and output linear layers.
+    """
+
     in_proj: Union[ModuleSpec, type] = None
     out_proj: Union[ModuleSpec, type] = None
 
 
 class MambaMixer(MegatronModule):
+    """
+    Args:
+        config: The config of the model.
+        submodules: Contains the module specs for the input and output linear layers.
+        d_model: The hidden size of the model.
+        d_state: The state size of the SSM.
+        d_conv: The number of channels in the causal convolution.
+        conv_init: The initialization range for the causal convolution weights.
+        expand: The expansion factor for the SSM.
+        headdim: The hidden size of each attention head.
+        ngroups: The number of attention heads.
+        A_init_range: The initialization range for the attention weights.
+        D_has_hdim: Whether the D parameter has the same number of dimensions as the hidden
+            state.
+        rmsnorm: Whether to use root mean square normalization.
+        norm_before_gate: Whether to apply normalization before the gating mechanism.
+        dt_min: The minimum value of the dt parameter.
+        dt_max: The maximum value of the dt parameter.
+        dt_init: The initialization value of the dt parameter.
+        dt_scale: The scaling factor for the dt parameter.
+        dt_init_floor: The minimum value of the dt parameter after initialization.
+        bias: Whether to use bias in the linear layers.
+        conv_bias: Whether to use bias in the causal convolution.
+        chunk_size: The chunk size for the fused kernel.
+        use_mem_eff_path: Whether to use the memory-efficient path for the Mamba model.
+        layer_number: The layer number of this Mamba layer.
+    """
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -117,7 +168,7 @@ class MambaMixer(MegatronModule):
         self.in_proj = build_module(
             submodules.in_proj,
             self.d_model,
-            self.d_inner * 2 + 2 * self.ngroups * self.d_state + self.nheads,
+            self.d_inner * 2 + 2 * self.ngroups * self.d_state + self.nheads,  # AB CD E
             config=self.config,
             init_method=self.config.init_method,
             gather_output=False,
@@ -127,8 +178,9 @@ class MambaMixer(MegatronModule):
             tp_comm_buffer_name='fc1',
         )
 
-        conv_dim = self.d_inner_local + 2 * self.ngroups_local * self.d_state
+        conv_dim = self.d_inner_local + 2 * self.ngroups_local * self.d_state  # A CD
         with get_cuda_rng_tracker().fork():
+            # weight dim: [conv_dim, conv_dim, d_conv]
             self.conv1d = nn.Conv1d(
                 in_channels=conv_dim,
                 out_channels=conv_dim,
@@ -161,9 +213,12 @@ class MambaMixer(MegatronModule):
             inv_dt = dt + torch.log(-torch.expm1(-dt))
             with torch.no_grad():
                 self.dt_bias = nn.Parameter(inv_dt)
-            # Our initialization would set all Linear.bias to zero, need to mark this one as _no_reinit
+            # Our initialization would set all Linear.bias to zero,
+            # need to mark this one as _no_reinit
             self.dt_bias._no_reinit = True
-            # Just to be explicit. Without this we already don't put wd on dt_bias because of the check
+            # Just to be explicit. Without this we already don't
+            # put wd on dt_bias because of the check
+
             # name.endswith("bias") in param_grouping.py
             self.dt_bias._no_weight_decay = True
 
@@ -188,7 +243,7 @@ class MambaMixer(MegatronModule):
 
         if self.rmsnorm:
             assert RMSNormGated is not None
-            self.norm = RMSNormGated(
+            self.norm = ExtendedRMSNorm(
                 self.d_inner_local,
                 eps=1e-5,
                 group_size=self.d_inner_local // self.ngroups_local,
@@ -350,6 +405,9 @@ class MambaMixer(MegatronModule):
         return out, out_bias
 
     def step(self, hidden_states, conv_state, ssm_state):
+        """
+        Performs inference step for decoding
+        """
         # assert self.ngroups_local == 1, "Only support ngroups=1 for inference for now"
         dtype = hidden_states.dtype
         assert hidden_states.shape[0] == 1, "Only support decoding with 1 token at a time for now"
@@ -474,6 +532,9 @@ class MambaMixer(MegatronModule):
         return out.unsqueeze(0), out_bias, conv_state, ssm_state
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
+        """
+        allocate inference cache
+        """
         device = self.out_proj.weight.device
         conv_dtype = self.conv1d.weight.dtype if dtype is None else dtype
         conv_state = torch.zeros(
@@ -517,3 +578,141 @@ class MambaMixer(MegatronModule):
                 conv_state.zero_()
                 ssm_state.zero_()
         return conv_state, ssm_state
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        sharded_state_dict = {}
+        # Parameters
+        self._save_to_state_dict(sharded_state_dict, '', keep_vars=True)
+        sharded_state_dict = make_sharded_tensors_for_checkpoint(
+            sharded_state_dict,
+            prefix,
+            tensor_parallel_layers_axis_map={
+                'A_log': 0,
+                'dt_bias': 0,
+                'D': 0,
+            },  # parameters sharded across TP
+            sharded_offsets=sharded_offsets,
+        )
+        # Submodules
+        for name, module in self.named_children():
+            if name == 'conv1d':
+                # Add TP sharding for Conv1d
+                module_sd = module.state_dict(prefix='', keep_vars=True)
+                module_sharded_sd = make_sharded_tensors_for_checkpoint(
+                    module_sd, f'{prefix}{name}.', {f'weight': 0, f'bias': 0}, sharded_offsets
+                )
+
+            else:
+                module_sharded_sd = sharded_state_dict_default(
+                    module, f'{prefix}{name}.', sharded_offsets, metadata
+                )
+
+            sharded_state_dict.update(module_sharded_sd)
+
+        # At this point the TP sharding is correctly defined fo each tensor, but some of the tensors
+        # must be additionally split into separate parts
+        # in_proj
+        in_proj_dim = (
+            self.d_inner_local * 2 + 2 * self.ngroups_local * self.d_state + self.nheads_local
+        )
+        assert sharded_state_dict[f'{prefix}in_proj.weight'].data.size(0) == in_proj_dim, (
+            in_proj_dim,
+            sharded_state_dict[f'{prefix}in_proj.weight'],
+        )
+
+        sharded_state_dict[f'{prefix}in_proj.weight'] = _split_tensor_factory(
+            sharded_state_dict[f'{prefix}in_proj.weight'],
+            [
+                self.d_inner_local,
+                self.d_inner_local,
+                self.ngroups_local * self.d_state,
+                self.ngroups_local * self.d_state,
+                self.nheads_local,
+            ],
+            ['z', 'x', 'B', 'C', 'dt'],
+            0,
+        )
+
+        conv_dim = self.d_inner_local + 2 * self.ngroups_local * self.d_state
+        assert sharded_state_dict[f'{prefix}conv1d.weight'].data.size(0) == conv_dim, (
+            conv_dim,
+            sharded_state_dict[f'{prefix}conv1d.weight'],
+        )
+        assert sharded_state_dict[f'{prefix}conv1d.bias'].data.size(0) == conv_dim, (
+            conv_dim,
+            sharded_state_dict[f'{prefix}conv1d.bias'],
+        )
+
+        for conv_layer_name in ['conv1d.weight', 'conv1d.bias']:
+            sharded_state_dict[f'{prefix}{conv_layer_name}'] = _split_tensor_factory(
+                sharded_state_dict[f'{prefix}{conv_layer_name}'],
+                [
+                    self.d_inner_local,
+                    self.ngroups_local * self.d_state,
+                    self.ngroups_local * self.d_state,
+                ],
+                ['x', 'B', 'C'],
+                0,
+            )
+
+        return sharded_state_dict
+
+
+def _split_tensor_factory(
+    orig_sh_ten: ShardedTensor, split_sections: List[int], split_names: List[str], split_dim: int
+) -> ShardedTensorFactory:
+    """Builds a factory that splits a given ShardedTensor into several independent chunks."""
+    assert isinstance(orig_sh_ten, ShardedTensor), type(orig_sh_ten)
+    orig_sh_ten_no_data = orig_sh_ten.without_data()  # remove `data` reference
+
+    if sum(split_sections) != orig_sh_ten_no_data.local_shape[split_dim]:
+        raise ValueError(
+            f'Split sections must cover the whole dimension size, '
+            f'got {split_sections=} vs dimensions size '
+            f'{orig_sh_ten_no_data.local_shape[split_dim]}'
+        )
+
+    assert not isinstance(
+        split_sections, int
+    ), 'Splitting into predefined section sizes is supported (`split_sections` must be a list)'
+    assert len(split_sections) == len(split_names), (len(split_sections), len(split_names))
+
+    @torch.no_grad()
+    def sh_ten_build_fn(
+        key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
+    ):
+        factory_sh_ten = replace(
+            orig_sh_ten_no_data,
+            key=key,
+            data=t,
+            dtype=t.dtype,
+            replica_id=replica_id,
+            flattened_range=flattened_range,
+        )
+
+        chunk_sh_tens = []
+        split_start = 0
+        for split_size, split_name in zip(split_sections, split_names):
+            split_chunks = factory_sh_ten.narrow(split_dim, split_start, split_size)
+            for sh_ten in split_chunks:
+                sh_ten.key = f'{sh_ten.key}.{split_name}'
+            chunk_sh_tens.extend(split_chunks)
+            split_start += split_size
+
+        assert split_start == orig_sh_ten_no_data.local_shape[split_dim], (
+            split_start,
+            orig_sh_ten_no_data.local_shape[split_dim],
+        )
+        assert sum(sh_ten.data.numel() for sh_ten in chunk_sh_tens) == t.numel(), (
+            chunk_sh_tens,
+            t.shape,
+        )
+        return chunk_sh_tens
+
+    @torch.no_grad()
+    def sh_ten_merge_fn(sub_state_dict):
+        return torch.cat(sub_state_dict)
+
+    return ShardedTensorFactory(
+        orig_sh_ten.key, orig_sh_ten.data, sh_ten_build_fn, sh_ten_merge_fn, orig_sh_ten.replica_id
+    )

@@ -1,6 +1,6 @@
 set -euxo pipefail
 
-collect_jet_jobs () {
+collect_jobs () {
   PAGE=1
   PER_PAGE=100
   RESULTS="[]"
@@ -11,7 +11,7 @@ collect_jet_jobs () {
                   -s \
                   --globoff \
                   --header "PRIVATE-TOKEN: $RO_API_TOKEN" \
-                  "https://${GITLAB_ENDPOINT}/api/v4/projects/70847/pipelines/${JET_PIPELINE_ID}/jobs?page=$PAGE&per_page=$PER_PAGE"
+                  "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/pipelines/${DOWNSTREAM_PIPELINE_ID}/jobs?page=$PAGE&per_page=$PER_PAGE"
               )
     # Combine the results
     RESULTS=$(jq -s '.[0] + .[1]' <<< "$RESULTS $RESPONSE")
@@ -85,31 +85,16 @@ if [[ $DOWNSTREAM_PIPELINE_ID == null ]]; then
 
 else
     set +x
-    JET_PIPELINE_JSON=$(curl \
-                        --fail \
-                        --silent \
-                        --header "PRIVATE-TOKEN: ${RO_API_TOKEN}" \
-                        "https://${GITLAB_ENDPOINT}/api/v4/projects/70847/pipelines/${DOWNSTREAM_PIPELINE_ID}/bridges?per_page=100"
-                        )
+    JOBS=$(echo "$(collect_jobs)" | jq '[.[] | {id, name, status}]')
+    echo $JOBS
     set -x
-    JET_PIPELINE_ID=$(jq '.[0].downstream_pipeline.id' <<< "$JET_PIPELINE_JSON")
 
-    set +x
-    JET_LOGS=$(echo "$(collect_jet_jobs)" \
-                | jq '[
-                    .[] 
-                    | select(.name | startswith("build/") | not)
-                    | select(.name | contains("3 logs_after") | not)
-                    | select(.name | contains("1 logs_before") | not)
-                ]'
-            ) 
-
-    FAILED_JET_LOGS=$(echo "$JET_LOGS" \
+    FAILED_JOBS=$(echo "$JOBS" \
                 | jq --arg GITLAB_ENDPOINT "$GITLAB_ENDPOINT" '[
                     .[] 
                     | select(.status != "success")
                     | {
-                        "name": (.name[6:] | split(" ")[0]),
+                        name,
                         id,
                         "url": ("https://" + $GITLAB_ENDPOINT + "/dl/jet/ci/-/jobs/" + (.id | tostring)),
                     }
@@ -117,61 +102,80 @@ else
             ) 
     set -x
 
-    for row in $(echo "${FAILED_JET_LOGS}" | jq -r '.[] | @base64'); do
+    for row in $(echo "${FAILED_JOBS}" | jq -r '.[] | @base64'); do
         _jq() {
         echo ${row} | base64 --decode | jq -r ${1}
         }
         JOB_ID=$(_jq '.id')
-        SLURM_FAILURE=$(jet \
-                                -c -df json -th logs query --raw \
-                                -c "obj_status.s_message" \
-                                --eq obj_ci.l_job_id "$JOB_ID" \
-                            | jq '.[0].obj_status.s_message' \
-                            | tr -d '"'
-                        )
-        FAILED_JET_LOGS=$(echo "$FAILED_JET_LOGS" \
-                            | jq \
-                                --argjson JOB_ID "$JOB_ID" \
-                                --arg SLURM_FAILURE "$SLURM_FAILURE" '
-                                    .[] |= ((select(.id==$JOB_ID) += {
-                                        "slurm_failure_reason": $SLURM_FAILURE}))
-                            ')
+        FULL_LOG=$(curl \
+            --location \
+            --header "PRIVATE-TOKEN: ${RO_API_TOKEN}" \
+            "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/jobs/${JOB_ID}/trace")
+        
+        if [[ "$FULL_LOG" == *exception* ]]; then 
+            LAST_EXCEPTION_POS=$(echo "$FULL_LOG" | grep -o -b 'exception' | tail -1 | cut -d: -f1)
+            SHORT_LOG=${FULL_LOG:$LAST_EXCEPTION_POS-500:499}
+        else
+            SHORT_LOG=${FULL_LOG: -1000}
+        fi
+
+        FAILED_JOBS=$(echo "$FAILED_JOBS" \
+                    | jq \
+                        --argjson JOB_ID "$JOB_ID" \
+                        --arg SLURM_FAILURE "$SHORT_LOG" '
+                            .[] |= ((select(.id==$JOB_ID) += {
+                                "slurm_failure_reason": $SLURM_FAILURE}))
+                    ')
     done
 
-    echo "$JET_LOGS" | jq 'length'
-    BLOCKS=$(echo -e "$FAILED_JET_LOGS" \
-                | jq --arg DATE "$DATE" --arg CONTEXT "$CONTEXT" --arg URL "$PIPELINE_URL" '
-                    [
-                        {                
-                            "type": "section",
-                            "text": {            
-                                "type": "mrkdwn",
-                                "text": ("<" + $URL + "|Report of " + $DATE + " (" + $CONTEXT + ")>:")
+    NUM_FAILED=$(echo "$FAILED_JOBS" | jq 'length')
+    NUM_TOTAL=$(echo "$JOBS" | jq 'length')
+
+    if [[ $NUM_FAILED -eq 0 ]]; then
+        BLOCKS='[
+            {                
+                "type": "section",
+                "text": {            
+                    "type": "mrkdwn",
+                    "text": ":doge3d: <'$PIPELINE_URL'|Report of '$DATE' ('$CONTEXT')>: All '$NUM_TOTAL' passed"
+                }
+            }
+        ]'
+    else
+        BLOCKS=$(echo "$FAILED_JOBS" \
+                    | jq --arg DATE "$DATE" --arg CONTEXT "$CONTEXT" --arg URL "$PIPELINE_URL" --arg NUM_FAILED "$NUM_FAILED" --arg NUM_TOTAL "$NUM_TOTAL" '
+                        [
+                            {                
+                                "type": "section",
+                                "text": {            
+                                    "type": "mrkdwn",
+                                    "text": (":doctorge: <" + $URL + "|Report of " + $DATE + " (" + $CONTEXT + ")>: " + $NUM_FAILED + " of " + $NUM_TOTAL + " failed")
+                                }
                             }
-                        }
-                    ] + [
-                        .[] 
-                        | {                
-                            "type": "section",
-                            "text": {            
-                                "type": "mrkdwn",
-                                "text": (                               
-                                    "• Job: <" +.url + "|" + .name + ">"
-                                    + "\n    SLURM failure reason: \n```" + .slurm_failure_reason[-2000:] + "```"
-                                    
-                                )
+                        ] + [
+                            .[] 
+                            | {                
+                                "type": "section",
+                                "text": {            
+                                    "type": "mrkdwn",
+                                    "text": (                               
+                                        "• Job: <" +.url + "|" + .name + ">"
+                                        + "\n    SLURM failure reason: \n```" + .slurm_failure_reason + "```"
+                                        
+                                    )
+                                }
                             }
-                        }
-                    ] + [
-                        {                
-                            "type": "section",
-                            "text": {            
-                                "type": "mrkdwn",
-                                "text": ("===============================================")
+                        ] + [
+                            {                
+                                "type": "section",
+                                "text": {            
+                                    "type": "mrkdwn",
+                                    "text": ("===============================================")
+                                }
                             }
-                        }
-                    ]'
-    )
+                        ]'
+        )
+    fi
 
     for row in $(echo "${BLOCKS}" | jq -r '.[] | @base64'); do
         _jq() {
