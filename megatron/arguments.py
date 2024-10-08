@@ -1570,5 +1570,11 @@ def _add_profiler_args(parser):
      type=str,
      default='2,3',
      help="Which steps to profile. Format: <start step>,<end step>")
+    
+    group.add_argument("--profile-ranks",
+     type=int,
+     nargs='+',
+     default=None,
+     help="Which ranks to profile. Format: 0 1 2 3")
 
     return parser
