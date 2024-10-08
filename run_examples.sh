@@ -1,0 +1,7 @@
+bash ../scripts/megatron/debug_train_70b_custom.sh ENABLE_MOCK_DATA=0 ENABLE_ROPE=1 DUMMY_RUN=0 ADD_TASK=0 MODEL_SIZE=70 ENABLE_PROFILING=0 TP=8 PP=1 BS=8 MBS=2 TOTAL_ITERS=20 LABEL="rope_en_fused" 
+
+
+#bash ../scripts/megatron/debug_train_70b_custom.sh ENABLE_MOCK_DATA=0 ENABLE_ROPE=0 DUMMY_RUN=0 ADD_TASK=0 MODEL_SIZE=70 ENABLE_PROFILING=0 TP=8 PP=1 BS=8 MBS=2 TOTAL_ITERS=20 LABEL="rope_disabled" 
+
+
+#bash ../scripts/megatron/debug_train_70b_custom.sh ENABLE_MOCK_DATA=0 ENABLE_ROPE=1 DUMMY_RUN=0 ADD_TASK=0 MODEL_SIZE=70 ENABLE_PROFILING=1 TP=8 PP=1 BS=8 MBS=2 TOTAL_ITERS=20 LABEL="rope_en_fused_profile" 
