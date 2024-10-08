@@ -259,6 +259,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     Returns:
         Instance of MegatronOptimizer.
     """
+    cpu_offload = False
     if config.optimizer == 'adam':
         optimizer = Adam(
             param_groups,
@@ -283,6 +284,21 @@ def _get_megatron_optimizer_based_on_param_groups(
             momentum=config.sgd_momentum,
         )
         init_state_fn = None
+    elif config.optimizer == 'hybridadam' :
+        assert config.use_distributed_optimizer, \
+            "Currently HybridAdam must be wrapped with OffloadDistributedOptimizer!"
+        from .offload_distrib_optimizer import OffloadDistributedOptimizer
+        from .hybrid_adam import HybridAdam        
+        optimizer = HybridAdam(
+            param_groups,
+            lr=config.lr,
+            weight_decay=config.weight_decay,
+            betas=(config.adam_beta1, config.adam_beta2),
+            eps=config.adam_eps,
+        )
+        init_state_fn = None
+        
+        cpu_offload = True
     else:
         raise Exception('{} optimizer is not supported.'.format(config.optimizer))
 
@@ -318,14 +334,23 @@ def _get_megatron_optimizer_based_on_param_groups(
 
         optimizer_args = [optimizer, config, grad_scaler, init_state_fn]
         if config.use_distributed_optimizer:
-            optimizer = DistributedOptimizer(
-                *optimizer_args,
-                model_chunks=model_chunks,
-                per_model_buffers=per_model_buffers,
-                data_parallel_group=data_parallel_group,
-                data_parallel_group_gloo=data_parallel_group_gloo,
-                data_parallel_group_idx=data_parallel_group_idx,
-            )
+            if cpu_offload:
+                optimizer = OffloadDistributedOptimizer(
+                    *optimizer_args,
+                    per_model_buffers=per_model_buffers,
+                    data_parallel_group=data_parallel_group,
+                    data_parallel_group_gloo=data_parallel_group_gloo,
+                    data_parallel_group_idx=data_parallel_group_idx,
+                )
+            else:
+                optimizer = DistributedOptimizer(
+                    *optimizer_args,
+                    model_chunks=model_chunks,
+                    per_model_buffers=per_model_buffers,
+                    data_parallel_group=data_parallel_group,
+                    data_parallel_group_gloo=data_parallel_group_gloo,
+                    data_parallel_group_idx=data_parallel_group_idx,
+                )
         else:
             optimizer = Float16OptimizerWithFloat16Params(*optimizer_args)
             setattr(optimizer, 'model_parallel_group', model_parallel_group)
@@ -441,5 +466,7 @@ def get_megatron_optimizer(
 
     if len(optimizers) == 1:
         return optimizers[0]
-
+    if config.optimizer == 'hybridadam':
+        from .offload_chained_optimizer import ChainedOffloadOptimizer
+        return ChainedOffloadOptimizer(optimizers)
     return ChainedOptimizer(optimizers)

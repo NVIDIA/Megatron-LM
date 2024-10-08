@@ -39,6 +39,7 @@ from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
 from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+from megatron.training.memstats_collector import MemStatsCollector
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
 from megatron.core.parallel_state import (
@@ -709,9 +710,13 @@ def setup_model_and_optimizer(model_provider_func,
 
     return model, optimizer, opt_param_scheduler
 
+def __get_param_buffer_size(buffer) -> int:
+    grad_type = buffer.grad_dtype
+    param_dtype = buffer.param_dtype
+    return (grad_type.itemsize + param_dtype.itemsize) * buffer.numel
 
 def train_step(forward_step_func, data_iterator,
-               model, optimizer, opt_param_scheduler, config):
+               model, optimizer, opt_param_scheduler, config, memory_stats_collector = None):
     """Single training step."""
     args = get_args()
     timers = get_timers()
@@ -720,6 +725,19 @@ def train_step(forward_step_func, data_iterator,
     for model_chunk in model:
         model_chunk.zero_grad_buffer()
     optimizer.zero_grad()
+
+    if memory_stats_collector is not None:
+        model_buffer_param = sum(
+            __get_param_buffer_size(buffer)
+            for model_chunk in model
+            for buffer in model_chunk.buffers
+        )
+
+        memory_stats_collector.record_model_data_volume(
+            model_buffer_param,
+            optimizer.chunk_manager.total_mem['cuda'] if hasattr(optimizer, 'chunk_manager') else 0,
+        )
+
 
     # Forward pass.
     forward_backward_func = get_forward_backward_func()
@@ -744,8 +762,21 @@ def train_step(forward_step_func, data_iterator,
 
     # Update parameters.
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    if hasattr(optimizer, 'chunk_manager') and memory_stats_collector is not None:
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step(
+            memory_stats_collector._memstats
+        )
+    else:
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     timers('optimizer').stop()
+
+    if memory_stats_collector is not None:
+        memory_stats_collector.record_model_data_volume(
+            model_buffer_param,
+            optimizer.chunk_manager.total_mem['cuda'] if hasattr(optimizer, 'chunk_manager') else 0,
+        )
+
+        memory_stats_collector.sample_overall_data()
 
     # Vision momentum.
     if getattr(args, 'vision_pretraining', False) and args.vision_pretraining_type == "dino":
@@ -1164,6 +1195,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         gc.disable()
         gc.collect()
 
+    memory_stats_collector = None
+    if args.optimizer == 'hybridadam':
+        memory_stats_collector = MemStatsCollector()
+        memory_stats_collector.start_collection()
+
     # Singleton Initialization
     if args.log_straggler:
         global stimer
@@ -1244,7 +1280,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                        model,
                        optimizer,
                        opt_param_scheduler,
-                       config)
+                       config,
+                       memory_stats_collector)
         iteration += 1
         batch_size = mpu.get_data_parallel_world_size() * \
                      args.micro_batch_size * \

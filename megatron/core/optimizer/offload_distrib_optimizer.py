@@ -27,7 +27,14 @@ from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import MegatronGradScaler
 from .hybrid_adam import HybridAdam
 from .optimizer_config import OptimizerConfig
-
+from ..utils import is_float8tensor
+try:
+    # This will be used when "--fp8-param-gather" is enabled.
+    # When BF16/FP16 parameters don't exist, we need to cast the FP32 main parameters to
+    # FP8 directly in the optimizer.
+    from transformer_engine.pytorch.cpp_extensions import cast_to_fp8
+except:
+    pass
 __all__ = ['OffloadDistributedOptimizer']
 
 
@@ -103,7 +110,24 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
                     shard_model_param = model_param.detach().view(-1)[
                         param_range.start : param_range.end
                     ]
-                    shard_main_param = shard_model_param.clone().float()
+
+                    # If we use FP8 params to initialize FP32 main params (compared to using the
+                    # bf16/fp16 params to initialize the main params), there will be a loss of
+                    # precision at the beginning of training (this problem will not occur if the
+                    # training is long enough or if the main params are loaded from a checkpoint).
+                    if is_float8tensor(model_param) and hasattr(
+                        model_param, 'get_high_precision_init_val'
+                    ):
+                        shard_main_param = (
+                            model_param.get_high_precision_init_val()
+                            .view(-1)[param_range.start : param_range.end]
+                            .clone()
+                            .to(shard_model_param.device)
+                            .float()
+                        )
+                        model_param.clear_high_precision_init_val()
+                    else:
+                        shard_main_param = shard_model_param.clone().float()
                     self.chunk_manager.register_tensor(
                         shard_main_param, 'shard_fp32_from_float16_params'
                     )
@@ -420,7 +444,27 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
                     shard_model_param = model_param_buffer.view(-1)[
                         world_range.start : world_range.end
                     ]
-                    shard_model_param.data.copy_(shard_main_param)
+
+                    if is_float8tensor(model_param):
+                        # 1. When "--fp8-param-gather" is disabled, the main param is first cast to
+                        #    BF16/FP16, and then cast to FP8, so the amax_history is calculated
+                        #    using BF16/FP16 param.
+                        # 2. When "--fp8-param-gather" is enabled, we can cast the FP32 main param
+                        #    to FP8 directly, which results in slightly different results with
+                        #    higher speed. In theory, this does not affect convergence.
+                        # TODO: The following code maintains the logic of the point-1 above. It can
+                        # be deleted if it is not necessary.
+                        shard_main_param = shard_main_param.to(model_param.dtype)
+
+                        cast_to_fp8(
+                            shard_main_param.view(1, -1),
+                            model_param._fp8_meta['scaling_fwd'],
+                            model_param._fp8_meta_index,
+                            model_param._fp8_dtype,
+                            out=shard_model_param.view(1, -1),
+                        )
+                    else:
+                        shard_model_param.data.copy_(shard_main_param)
 
         # Copy shard groups to model groups.
         copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
