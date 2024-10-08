@@ -4,8 +4,6 @@
 import logging
 import random
 import os
-import packaging
-import packaging.version
 import time
 
 import numpy as np
@@ -24,6 +22,7 @@ from megatron.training.global_vars import set_global_variables
 from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
+from megatron.core.utils import get_te_version, is_te_min_version
 
 logger = logging.getLogger(__name__)
 
@@ -213,12 +212,21 @@ def _initialize_tp_communicators():
 
     input_shape = [(args.seq_length * args.micro_batch_size) // args.context_parallel_size , args.hidden_size]
 
-    #We create a MPI process group, which is needed to bootstrap the pipelined
-    #tensor-model-parallel communication overlap
-    torch.distributed.new_group(backend='mpi')
-
-    te_module.base.initialize_ub(shape = input_shape, tp_size = args.tensor_model_parallel_size,
-                                 use_fp8 = (args.fp8 is not None) , ub_cfgs = ub_cfgs,)
+    if is_te_min_version("1.9.0"):
+        # The process group with the target bootstrap backend is created in Transformer Engine.
+        te_module.base.initialize_ub(shape = input_shape, tp_size = args.tensor_model_parallel_size,
+                                     use_fp8 = (args.fp8 is not None) , ub_cfgs = ub_cfgs,
+                                     bootstrap_backend = args.tp_comm_bootstrap_backend)
+    else:
+        if args.tp_comm_bootstrap_backend != 'mpi':
+            warnings.warn(
+                f"Transformer Engine v{get_te_version()} supports only MPI bootstrap backend."
+            )
+        # Create a MPI process group to help with TP communication overlap bootstrap.
+        torch.distributed.new_group(backend='mpi')
+    
+        te_module.base.initialize_ub(shape = input_shape, tp_size = args.tensor_model_parallel_size,
+                                     use_fp8 = (args.fp8 is not None) , ub_cfgs = ub_cfgs)
 
 def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
     """Initialize torch.distributed and core model parallel."""

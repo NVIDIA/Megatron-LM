@@ -16,8 +16,8 @@ spec:
     cd /opt/NeMo
   
     ARGUMENTS=(
-        "DATA_PATH=''"
-        "DATA_CACHE_PATH=''"
+        "DATA_PATH='-'"
+        "DATA_CACHE_PATH='-'"
         "OUTPUT_PATH={assets_dir}"
         "TENSORBOARD_PATH={assets_dir}/tensorboard"
         "CHECKPOINT_PATH=/workspace/checkpoints"

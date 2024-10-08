@@ -37,7 +37,6 @@ fi
 CHECKPOINT_DIR="${WORKSPACE}/${LOAD_NAME}/checkpoints"
 
 DATA_TRAIN="${SOURCE}/examples/multimodal/sft_dataset.yaml"
-DATA_VALID="${SOURCE}/examples/multimodal/sft_dataset.yaml"
 
 DEBUG=0
 if [[ $DEBUG -eq 1 ]]; then
@@ -101,7 +100,6 @@ OPTIONS=" \
     --tokenizer-type HuggingFaceTokenizer \
     --tokenizer-model ${WORKSPACE}/${TOKENIZER_MODEL} \
     --data-path ${DATA_TRAIN} \
-    --valid-path ${DATA_VALID} \
     --prompt-path ${SOURCE}/examples/multimodal/manual_prompts.json \
     --save-interval 500 \
     --save ${FINETUNE_DIR} \

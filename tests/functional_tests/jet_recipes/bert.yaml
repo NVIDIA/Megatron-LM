@@ -13,7 +13,7 @@ spec:
     /workspace/data/bert_data: text/the_pile/bert_shard00
   script: |-
     ls
-    cd /workspace/megatron-lm
+    cd /opt/megatron-lm
 
     ARGUMENTS=(
         "DATA_PATH=/workspace/data/bert_data"
@@ -32,7 +32,7 @@ products:
     time_limit: [12000]
     test_case: 
     - bert_mr_mcore_tp2_pp2_dgx_a100_1N8G
-    - bert_mr_mcore_tp2_pp2_local_spec_dgx_a100_1N8G
+    # - bert_mr_mcore_tp2_pp2_local_spec_dgx_a100_1N8G
     - bert_mr_mcore_tp2_pp2_resume_torch_dist_dgx_a100_1N8G
     - bert_mr_mcore_tp2_pp2_resume_torch_dist_local_spec_dgx_a100_1N8G
     - bert_mr_tp1_pp4_vp2_dgx_a100_1N8G

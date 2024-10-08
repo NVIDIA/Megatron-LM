@@ -56,7 +56,40 @@ def _covert_to_moe_state_dict(state_dict, moe_model):
         router_key = mlp_weight_key.replace('mlp.linear_fc1.weight', 'mlp.router.weight')
         new_state_dict[router_key] = moe_state_dict[router_key].data.data.clone()
 
-    if mlp.config.moe_grouped_gemm:
+    use_te_grouped_gemm = 'decoder.layers.0.mlp.experts.linear_fc1.weight0' in moe_state_dict
+
+    if mlp.config.moe_grouped_gemm and use_te_grouped_gemm:
+        for mlp_weight_key in mlp_fc1_weight_keys:
+            weight_tensor = new_state_dict.pop(mlp_weight_key)
+            for expert_i in range(mlp.num_local_experts):
+                new_key = mlp_weight_key.replace(
+                    'mlp.linear_fc1.weight', f'mlp.experts.linear_fc1.weight{expert_i}'
+                )
+                new_state_dict[new_key] = weight_tensor.clone()
+
+        for mlp_weight_key in mlp_fc2_weight_keys:
+            weight_tensor = new_state_dict.pop(mlp_weight_key)
+            for expert_i in range(mlp.num_local_experts):
+                new_key = mlp_weight_key.replace(
+                    'mlp.linear_fc2.weight', f'mlp.experts.linear_fc2.weight{expert_i}'
+                )
+                new_state_dict[new_key] = weight_tensor.clone()
+
+        for extra_state_key in mlp_fc1_extra_state_keys:
+            new_state_dict.pop(extra_state_key)
+            new_key = extra_state_key.replace(
+                'mlp.linear_fc1._extra_state', 'mlp.experts.linear_fc1._extra_state'
+            )
+            new_state_dict[new_key] = None
+
+        for extra_state_key in mlp_fc2_extra_state_keys:
+            new_state_dict.pop(extra_state_key)
+            new_key = extra_state_key.replace(
+                'mlp.linear_fc2._extra_state', 'mlp.experts.linear_fc2._extra_state'
+            )
+            new_state_dict[new_key] = None
+
+    elif mlp.config.moe_grouped_gemm:
         for mlp_weight_key in mlp_fc1_weight_keys:
             weight_tensor = new_state_dict.pop(mlp_weight_key)
             shape = weight_tensor.shape
@@ -76,6 +109,7 @@ def _covert_to_moe_state_dict(state_dict, moe_model):
             )
             new_key = mlp_weight_key.replace('mlp.linear_fc2.weight', 'mlp.experts.weight2')
             new_state_dict[new_key] = weight_tensor
+
     else:
 
         def covert_to_experts(keys):
