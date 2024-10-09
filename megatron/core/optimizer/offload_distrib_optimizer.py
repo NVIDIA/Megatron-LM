@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from typing import *
-from megatron.training.memory_tracer import MemStats
+from megatron.training.memstats_collector import MemStats
 
 from .. import tensor_parallel
 from ..distributed import ParamAndGradBuffer

@@ -19,9 +19,17 @@ import time
 import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Callable, List
+from typing import Callable, List, Union
 
-from torch.utils.cpp_extension import CppExtension
+from torch.utils.cpp_extension import CppExtension, CUDA_HOME, CUDAExtension
+
+from ._utils import (
+    check_system_pytorch_cuda_match, 
+    set_cuda_arch_list, 
+    append_nvcc_threads, 
+    check_pytorch_version
+)
+
 
 class _Extension(ABC):
     def __init__(self, name: str, support_aot: bool, support_jit: bool, priority: int = 1):
@@ -88,7 +96,7 @@ class _Extension(ABC):
         """
 
     @abstractmethod
-    def build_aot(self) -> "CppExtension":
+    def build_aot(self) -> Union["CppExtension", "CUDAExtension"]:
         pass
 
     @abstractmethod
@@ -231,7 +239,112 @@ class _CppExtension(_Extension):
 
         return op_kernel
 
-class CpuAdamX86Extension(_CppExtension):
+
+class _CudaExtension(_CppExtension):
+    @abstractmethod
+    def nvcc_flags(self) -> List[str]:
+        """
+        This function should return a list of nvcc compilation flags for extensions.
+        """
+        return ["-DCOLOSSAL_WITH_CUDA"]
+
+    def is_available(self) -> bool:
+        # cuda extension can only be built if cuda is available
+        try:
+            import torch
+
+            # torch.cuda.is_available requires a device to exist, allow building with cuda extension on build nodes without a device
+            # but where cuda is actually available.
+            cuda_available = torch.cuda.is_available() or bool(os.environ.get("FORCE_CUDA", 0))
+        except:
+            cuda_available = False
+        return cuda_available
+
+    def assert_compatible(self) -> None:
+        from torch.utils.cpp_extension import CUDA_HOME
+
+        if not CUDA_HOME:
+            raise AssertionError(
+                "[extension] CUDA_HOME is not found. You need to export CUDA_HOME environment variable or install CUDA Toolkit first in order to build/load CUDA extensions"
+            )
+        check_system_pytorch_cuda_match(CUDA_HOME)
+        check_pytorch_version(MIN_PYTORCH_VERSION_MAJOR, MIN_PYTORCH_VERSION_MINOR)
+
+    def get_cuda_home_include(self):
+        """
+        return include path inside the cuda home.
+        """
+        from torch.utils.cpp_extension import CUDA_HOME
+
+        if CUDA_HOME is None:
+            raise RuntimeError(
+                "CUDA_HOME is None, please set CUDA_HOME to compile C++/CUDA kernels in ColossalAI."
+            )
+        cuda_include = os.path.join(CUDA_HOME, "include")
+        return cuda_include
+
+    def include_dirs(self) -> List[str]:
+        """
+        This function should return a list of include files for extensions.
+        """
+        return super().include_dirs() + [self.get_cuda_home_include()]
+
+    def build_jit(self) -> None:
+        from torch.utils.cpp_extension import CUDA_HOME, load
+
+        set_cuda_arch_list(CUDA_HOME)
+
+        # get build dir
+        build_directory = _Extension.get_jit_extension_folder_path("cuda")
+        build_directory = Path(build_directory)
+        build_directory.mkdir(parents=True, exist_ok=True)
+
+        # check if the kernel has been built
+        compiled_before = False
+        kernel_file_path = build_directory.joinpath(f"{self.name}.o")
+        if kernel_file_path.exists():
+            compiled_before = True
+
+        # load the kernel
+        if compiled_before:
+            print(f"[extension] Loading the JIT-built {self.name} kernel during runtime now")
+        else:
+            print(f"[extension] Compiling the JIT {self.name} kernel during runtime now")
+
+        build_start = time.time()
+        op_kernel = load(
+            name=self.name,
+            sources=self.strip_empty_entries(self.sources_files()),
+            extra_include_paths=self.strip_empty_entries(self.include_dirs()),
+            extra_cflags=self.cxx_flags(),
+            extra_cuda_cflags=self.nvcc_flags(),
+            extra_ldflags=[],
+            build_directory=str(build_directory),
+        )
+        build_duration = time.time() - build_start
+
+        if compiled_before:
+            print(f"[extension] Time taken to load {self.name} op: {build_duration} seconds")
+        else:
+            print(f"[extension] Time taken to compile {self.name} op: {build_duration} seconds")
+
+        return op_kernel
+
+    def build_aot(self) -> "CUDAExtension":
+
+        set_cuda_arch_list(CUDA_HOME)
+        return CUDAExtension(
+            name=self.prebuilt_import_path,
+            sources=self.strip_empty_entries(self.sources_files()),
+            include_dirs=self.strip_empty_entries(self.include_dirs()),
+            extra_compile_args={
+                "cxx": self.strip_empty_entries(self.cxx_flags()),
+                "nvcc": self.strip_empty_entries(self.nvcc_flags()),
+            },
+        )
+
+
+class CpuAdamX86Extension(_CudaExtension):
     def __init__(self):
         super().__init__(name="cpu_adam_x86")
 
@@ -256,6 +369,8 @@ class CpuAdamX86Extension(_CppExtension):
         extra_cxx_flags = [
             "-std=c++14",
             "-std=c++17",
+            "-lcudart",
+            "-lcublas",
             "-g",
             "-Wno-reorder",
             "-fopenmp",
@@ -264,7 +379,21 @@ class CpuAdamX86Extension(_CppExtension):
         return ["-O3"] + self.version_dependent_macros + extra_cxx_flags
 
     def nvcc_flags(self):
-        return []
+        extra_cuda_flags = [
+            "-std=c++14",
+            "-std=c++17",
+            "-U__CUDA_NO_HALF_OPERATORS__",
+            "-U__CUDA_NO_HALF_CONVERSIONS__",
+            "-U__CUDA_NO_HALF2_OPERATORS__",
+            "-DTHRUST_IGNORE_CUB_VERSION_CHECK",
+        ]
+        ret = (
+            ["-O3", "--use_fast_math"]
+            + self.version_dependent_macros
+            + extra_cuda_flags
+            + super().nvcc_flags()
+        )
+        return append_nvcc_threads(ret)
 
 
 class CpuAdamArmExtension(_CppExtension):
@@ -303,6 +432,7 @@ class CpuAdamArmExtension(_CppExtension):
 
     def nvcc_flags(self):
         return []
+
 
 
 class KernelLoader:
