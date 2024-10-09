@@ -74,6 +74,8 @@ if ! [ -f "$TOKENIZER_MODEL" ]; then
 wget -O $TOKENIZER_MODEL https://huggingface.co/NousResearch/Llama-2-7b-chat-hf/resolve/main/tokenizer.model
 fi
 
+if ! [ "$ENABLE_MOCK_DATA" -eq 1 ]; then
+exit
 # Prepare the dataset
 echo 'import argparse
 from pathlib import Path
@@ -100,7 +102,7 @@ DATA_PATH=${DATA_DIR}/bookcorpus_text_sentence
  else
    echo "Dataset file already exist."
  fi
-
+fi
 
 MAX_POSITION_EMBEDDINGS=32768
 
