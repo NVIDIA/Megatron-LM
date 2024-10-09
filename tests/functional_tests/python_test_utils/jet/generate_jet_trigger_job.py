@@ -102,7 +102,7 @@ def main(
             "timeout": "7 days",
             "needs": [{"pipeline": '$PARENT_PIPELINE_ID', "job": "jet-generate"}],
             "script": [" ".join(script)],
-            "artifacts": {"paths": ["results/"]},
+            "artifacts": {"paths": ["results/"], "when": "always"},
         }
 
     with open(output_path, 'w') as outfile:
