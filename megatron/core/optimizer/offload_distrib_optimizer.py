@@ -26,6 +26,7 @@ from .clip_grads import get_grad_norm_fp32
 from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import MegatronGradScaler
 from .hybrid_adam import HybridAdam
+from ..transformer.module import MegatronModule
 from .optimizer_config import OptimizerConfig
 from ..utils import is_float8tensor
 try:
@@ -223,6 +224,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
         config: OptimizerConfig,
         grad_scaler: MegatronGradScaler,
         init_state_fn: Optional[Callable],
+        model_chunks: List[MegatronModule],
         per_model_buffers: Dict[int, List[ParamAndGradBuffer]],
         data_parallel_group: torch.distributed.ProcessGroup,
         data_parallel_group_gloo: torch.distributed.ProcessGroup,
@@ -247,6 +249,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
             config,
             grad_scaler,
             init_state_fn,
+            model_chunks,
             per_model_buffers,
             data_parallel_group,
             data_parallel_group_gloo,

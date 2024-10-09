@@ -97,6 +97,22 @@ class OptimizerConfig:
     overlap_param_gather_with_optimizer_step: bool = False
     """If true, overlap param all-gather of first bucket with optimizer step."""
 
+    #######################
+    # Optimizer Offloading
+    #######################
+
+    optimizer_offload_policy: str = 'static'
+    """CPU Offload Policy used by OffloadDistributedOptimizer, valid if base optimizer is HybridAdam"""
+
+    optimizer_offload_fraction: float = 0.0
+    """CPU Offload Fraction used by static offload policy, valid if base optimizer is HybridAdam"""
+
+    optimizer_offload_chunk_size: int = 0
+    """Chunk Size used by CPU offload Chunk Manager (bytes), automatically search if value is 0 (default)"""
+
+    optimizer_offload_auto_threshold: int = 2048 * 1024**2
+    """threshold for auto optimizer offload (bytes) should be larger if OOM"""
+    
     ################
     # Miscellaneous
     ################
