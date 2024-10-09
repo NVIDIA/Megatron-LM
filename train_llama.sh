@@ -25,6 +25,7 @@ USE_FLASH_ATTN="${USE_FLASH_ATTN:-1}"
 NO_TRAINING="${NO_TRAINING:-0}" # NO_TRAINING=1: for computing metrics only
 ENABLE_PROFILING="${ENABLE_PROFILING:-0}"
 ENABLE_ROPE="${ENABLE_ROPE:-1}"
+ENABLE_ROPE_TE="${ENABLE_ROPE_TE:-1}"
 ENABLE_MOCK_DATA="${ENABLE_MOCK_DATA:-1}"
 DUMMY_RUN="${DUMMY_RUN:-0}"
 ADD_TASK="${ADD_TASK:-0}"
@@ -241,6 +242,10 @@ fi
 
 if [ "$ENABLE_ROPE" -eq 1 ]; then
 EXTRA_ARGS="$EXTRA_ARGS --position-embedding-type rope"
+fi
+
+if [ "$ENABLE_ROPE_TE" -eq 1 ]; then
+EXTRA_ARGS="$EXTRA_ARGS --use-te-fused-rope"
 fi
 
 if [ "$NO_TORCH_COMPILE" -eq 1 ]; then

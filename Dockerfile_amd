@@ -1,6 +1,6 @@
-#ARG BASE_DOCKER=rocm/pytorch:latest
+ARG BASE_DOCKER=rocm/pytorch:latest
 #ARG BASE_DOCKER=rocm/pytorch-private:exec_dashboard_nightly
-ARG BASE_DOCKER=rocm/pytorch-private:20240920_exec_dashboard_nightly
+#ARG BASE_DOCKER=rocm/pytorch-private:20240920_exec_dashboard_nightly
 FROM $BASE_DOCKER
 ENV WORKSPACE_DIR=/workspace
 ENV STAGE_DIR=/workspace/installs
