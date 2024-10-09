@@ -215,10 +215,11 @@ def _initialize_tp_communicators():
 
     #We create a MPI process group, which is needed to bootstrap the pipelined
     #tensor-model-parallel communication overlap
-    torch.distributed.new_group(backend='mpi')
+    # torch.distributed.new_group(backend='mpi')
 
     te_module.base.initialize_ub(shape = input_shape, tp_size = args.tensor_model_parallel_size,
-                                 use_fp8 = (args.fp8 is not None) , ub_cfgs = ub_cfgs,)
+                                 use_fp8 = (args.fp8 is not None) , ub_cfgs = ub_cfgs, bootstrap_backend=args.distributed_backend)
+
 
 def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
     """Initialize torch.distributed and core model parallel."""
