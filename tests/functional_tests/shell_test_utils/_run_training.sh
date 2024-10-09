@@ -38,7 +38,7 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
 done
 
 # Envsubst model_params
-cat $TRAINING_PARAMS_PATH | envsubst >$TRAINING_PARAMS_PATH.tmp
+cat $TRAINING_PARAMS_PATH | envsubst "$(env | cut -d= -f1 | sed -e 's/^/$/')" >$TRAINING_PARAMS_PATH.tmp
 mv $TRAINING_PARAMS_PATH.tmp $TRAINING_PARAMS_PATH
 
 # Pull env vars to export
