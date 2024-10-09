@@ -760,6 +760,9 @@ def train_step(forward_step_func, data_iterator,
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
+    if memory_stats_collector is not None:
+        memory_stats_collector.sample_overall_data()
+        
     # Update parameters.
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if hasattr(optimizer, 'chunk_manager') and memory_stats_collector is not None:
