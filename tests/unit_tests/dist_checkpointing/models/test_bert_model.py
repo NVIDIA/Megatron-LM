@@ -61,7 +61,6 @@ def initialize_bert_model(
 
 class TestBertModel:
 
-    
     @pytest.mark.parametrize(
         'src_layer_spec', [bert_layer_with_transformer_engine_spec, bert_layer_local_spec]
     )
