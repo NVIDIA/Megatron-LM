@@ -622,11 +622,9 @@ def get_evaluation_dataloader(
     return dataloader
 
 
-def generate_samples(model, config: EvaluationConfig):
+def generate_samples(model, config: EvaluationConfig, print_output):
     """Text generation using a trained vision language model."""
     args = get_args()
-
-    rank = torch.distributed.get_rank()
 
     dataloader = get_evaluation_dataloader(
         config.task,
@@ -645,7 +643,7 @@ def generate_samples(model, config: EvaluationConfig):
     )
 
     num_img_embeddings_per_tile = get_num_image_embeddings(
-        args.img_h, args.img_w, args.patch_dim, args.disable_vision_class_token, 1
+        args.img_h, args.img_w, args.patch_dim, args.vision_model_type, args.disable_vision_class_token, 1
     )
 
     for idx, (imgs, num_tiles, sample_id, question, answers, metadata) in enumerate(dataloader):
@@ -656,7 +654,7 @@ def generate_samples(model, config: EvaluationConfig):
 
         forward_step = partial(VLMForwardStep, num_img_embeddings_per_tile, imgs, num_tiles)
 
-        if rank == 0:
+        if is_first_rank():
             resp_sentences, _, _, _ = generate_and_post_process(
                 model,
                 forward_step=forward_step,
@@ -668,6 +666,7 @@ def generate_samples(model, config: EvaluationConfig):
                 temperature=config.temperature,
                 random_seed=args.seed,
                 detokenize_segments=False,
+                data_parallel=True,
             )
 
             for prompt, generation in zip([prompt], resp_sentences):
@@ -708,12 +707,15 @@ def generate_samples(model, config: EvaluationConfig):
 
                     output["prediction"] = prediction
 
-                print_rank_0(output)
+                if print_output:
+                    print(output)
 
                 yield output
                 idx += 1
         else:
-            generate_and_post_process(model, forward_step=forward_step, detokenize_segments=False)
+            generate_and_post_process(
+                model, forward_step=forward_step, detokenize_segments=False, data_parallel=True
+            )
 
             idx += 1
 
@@ -750,18 +752,36 @@ def get_evaluation_config():
     return config
 
 
-def generate_and_write_samples(model, config):
-    """Generate text and write to an output file."""
-    rank = torch.distributed.get_rank()
+def is_first_rank():
+    return (
+        parallel_state.is_pipeline_first_stage(ignore_virtual=True)
+        and parallel_state.get_tensor_model_parallel_rank() == 0
+    )
 
-    if rank == 0:
-        output_file = open(config.output_path, "w")
+
+def get_output_path(config, dp_rank):
+    return (
+        f"{config.output_path}-{config.task}-dprank={dp_rank}-partition={config.partition_id}.jsonl"
+    )
+
+
+def generate_and_write_samples(model, config, print_output=True):
+    """Generate text and write to an output file."""
+    dp_rank = parallel_state.get_data_parallel_rank()
+
+    if is_first_rank():
+        output_path = get_output_path(config, dp_rank)
+        output_file = open(output_path, "w")
         print(f"output path: {output_file.name}")
 
-    for output in generate_samples(model, config):
-        if rank == 0:
-            output_file.write(json.dumps(output) + "\n")
-            output_file.flush()
+    with torch.no_grad():
+        for output in generate_samples(model, config, print_output):
+            if is_first_rank():
+                output_file.write(json.dumps(output) + "\n")
+                output_file.flush()
+
+    if is_first_rank():
+        output_file.close()
 
 
 class VLMForwardStep(ForwardStep):
