@@ -246,8 +246,8 @@ class HybridAdam(Adam):
                 if device.type == 'cpu':
                     # NOTE: CPU Adam
                     if p_grad.dtype == torch.bfloat16:
-                        bias_correction1 = 1 - beta1 ** state["step"]
-                        bias_correction2 = 1 - beta2 ** state["step"]
+                        bias_correction1 = 1 - beta1 ** group["step"]
+                        bias_correction2 = 1 - beta2 ** group["step"]
                         self._torch_adam_update(
                             p.data,
                             p.grad.data,
@@ -264,7 +264,7 @@ class HybridAdam(Adam):
                         )
                     else:
                         self.cpu_adam_op.step(
-                            state["step"],
+                            group["step"],
                             group["lr"],
                             beta1,
                             beta2,

@@ -89,7 +89,7 @@ class SyncCudaMemoryMonitor:
             int: max GPU memory
         """
         torch.cuda.synchronize()
-        self.time_stamps.append(time())
+        self.time_stamps.append(time.time())
         max_usage = torch.cuda.max_memory_allocated()
         self.mem_stats.append(max_usage)
         return max_usage

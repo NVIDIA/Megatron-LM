@@ -320,7 +320,6 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
                 state["exp_avg"] = exp_avg[p]
                 # gradient variances
                 state["exp_avg_sq"] = exp_avg_sq[p]
-                self.optimizer._post_state_init(p)
 
         if self.policy == 'static':
             # NOTE: select partial chunks to GPU
@@ -360,15 +359,6 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
         ):
             for group in groups:
                 _zero_grad_group_helper(group, set_to_none=set_to_none)
-
-        # If overlapping param all-gather with forward compute, launch all-gather
-        # for first accessed bucket here before forward compute is initiated.
-        # The all-gather for the next bucket will be launched in the forward
-        # pre-hook when this all-gather finishes (to ensure that the communication
-        # kernels don't head-of-line block the compute kernels since we run with
-        # CUDA_DEVICE_MAX_CONNECTIONS=1 to support sequence parallelism).
-        if self.overlap_param_gather:
-            self._dispatch_gather_model_params(all_gather_handle_index=0)
 
     def _get_model_and_main_params_data_float32(self):
         """
@@ -642,7 +632,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
         total_norm = get_grad_norm_fp32(
             grads_for_norm, model_parallel_group=self.get_model_parallel_group()
         )
-        from .optimizer import (
+        from .clip_grads import (
             multi_tensor_applier,
             multi_tensor_scale_impl,
         )
