@@ -82,4 +82,3 @@ WORKDIR $WORKSPACE_DIR/Megatron-LM
 # record configuration for posterity
 RUN pip list
 
-RUN cd  $WORKSPACE_DIR

@@ -76,7 +76,6 @@ wget -O $TOKENIZER_MODEL https://huggingface.co/NousResearch/Llama-2-7b-chat-hf/
 fi
 
 if ! [ "$ENABLE_MOCK_DATA" -eq 1 ]; then
-exit
 # Prepare the dataset
 echo 'import argparse
 from pathlib import Path
