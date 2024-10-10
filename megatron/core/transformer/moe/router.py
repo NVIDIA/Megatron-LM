@@ -74,7 +74,8 @@ class Router(ABC, MegatronModule):
             logits (torch.Tensor): Logits tensor.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Tuple of tensors representing max probs and the indices.
+            Tuple[torch.Tensor, torch.Tensor]:
+                Tuple of tensors representing max probs and the indices.
         """
         raise NotImplementedError("Routing function not implemented.")
 
@@ -155,6 +156,7 @@ class TopKRouter(Router):
             pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             drop_policy=self.config.moe_token_drop_policy,
             use_pre_softmax=self.config.moe_router_pre_softmax,
+            deterministic_mode=self.config.deterministic_mode,
         )
 
         if self.training:
@@ -172,8 +174,10 @@ class TopKRouter(Router):
         """Applies auxiliary loss to the MoE layer.
 
         Args:
-            probs (torch.Tensor): The probs output by the router for each token. [num_tokens, num_experts]
-            num_local_tokens_per_expert (torch.Tensor): The number of tokens per expert. [num_experts]
+            probs (torch.Tensor):
+                The probs output by the router for each token. [num_tokens, num_experts]
+            num_local_tokens_per_expert (torch.Tensor):
+                The number of tokens per expert. [num_experts]
             activation (torch.Tensor): The activation tensor to attach the gradient function to.
 
         Returns:
@@ -279,6 +283,7 @@ class TopKRouter(Router):
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
                 drop_policy=self.config.moe_token_drop_policy,
                 use_pre_softmax=self.config.moe_router_pre_softmax,
+                deterministic_mode=self.config.deterministic_mode,
             )
         else:
             raise ValueError(f"Unsupported MoE routing type: {self.routing_type}")

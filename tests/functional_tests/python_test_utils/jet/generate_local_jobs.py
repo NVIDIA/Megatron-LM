@@ -1,3 +1,10 @@
+"""Generate launch scripts for local execution.
+
+This script allows to generate pre-filled launch scripts that allow for local execution of Megatron-LM functional tests inside containerized enviroments (i.e. Slurm enroot or Docker).
+
+This script will generate scripts into `$(pwd)/test_cases`.
+"""
+
 import pathlib
 from typing import Optional
 
@@ -22,7 +29,13 @@ def load_script(config_path: str) -> str:
 @click.option(
     "--test-case", required=False, type=str, help="Returns a single test-case with matching name."
 )
-@click.option("--output-path", required=True, type=str, help="Path to write jobs to")
+@click.option(
+    "--output-path",
+    required=True,
+    type=str,
+    help="Directory where the functional test will write its artifacts to (Tensorboard logs)",
+    default="/opt/megatron-lm",
+)
 def main(model: Optional[str], scope: Optional[str], test_case: Optional[str], output_path: str):
     workloads = common.load_workloads(
         container_image='none', scope=scope, model=model, test_case=test_case, container_tag='none'
@@ -32,10 +45,10 @@ def main(model: Optional[str], scope: Optional[str], test_case: Optional[str], o
         if workload.type == "build":
             continue
         magic_values = dict(workload.spec)
-        magic_values["assets_dir"] = "."
+        magic_values["assets_dir"] = output_path
 
         file_path = (
-            pathlib.Path(output_path)
+            pathlib.Path.cwd()
             / "test_cases"
             / workload.spec.model
             / f"{workload.spec.test_case}.sh"

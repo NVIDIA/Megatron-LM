@@ -23,6 +23,8 @@ def resolve_cluster_config(cluster: str) -> str:
         return "mcore/draco-oci"
     if cluster == "dgxa100_dracooci-ord":
         return "mcore/draco-oci-ord"
+    if cluster == "dgxh100_coreweave":
+        return "mcore/coreweave"
     raise ValueError(f"Unknown cluster {cluster} provided.")
 
 
@@ -54,14 +56,6 @@ def launch_and_wait_for_completion(
         ),
         config_id=resolve_cluster_config(cluster),
         custom_config={
-            "retrier": {
-                "enabled": True,
-                "max_retries": 2,
-                "retry_on": ['1.2', '1.2.*'],
-                "waiting_time": 60,
-                "environment": "jet-auto-retrier",
-            },
-            "builds": {"jet_flavour": None},
             "launchers": {cluster: {"account": account}},
             "executors": {
                 "jet-ci": {
@@ -90,6 +84,22 @@ def launch_and_wait_for_completion(
     pipeline.wait(max_wait_time=60 * 60 * 24 * 7)
     print(f"Pipeline terminated; status: {pipeline.get_status()}")
     return pipeline
+
+
+def download_job_assets(job: jetclient.JETJob, iteration: int = 0) -> List[str]:
+    logs = job.get_logs()
+    if not logs:
+        return [""]
+
+    assets_base_path = BASE_PATH / ".." / ".." / ".." / ".." / "results" / f"iteration={iteration}"
+
+    for restart_idx, log in enumerate(logs):
+        assets = log.get_assets()
+        assets_path = assets_base_path / f"restart={restart_idx}"
+        assets_path.mkdir(parents=True, exist_ok=True)
+        for log_filename in assets.keys():
+            with open(assets_path / log_filename, "w") as fh:
+                assets[log_filename].download(pathlib.Path(fh.name))
 
 
 def download_job_logs(job: jetclient.JETJob) -> List[str]:
@@ -163,6 +173,7 @@ def main(
         sys.exit(1)
 
     n_attempts = 0
+    n_iteration = 0
     while True and n_attempts < 3:
         pipeline = launch_and_wait_for_completion(
             test_case=test_case,
@@ -174,11 +185,13 @@ def main(
             wandb_experiment=wandb_experiment,
         )
 
-        logs = download_job_logs(
-            job=[job for job in pipeline.get_jobs() if job.name.startswith("basic")][0]
-        )
+        main_job = [job for job in pipeline.get_jobs() if job.name.startswith("basic")][0]
+
+        logs = download_job_logs(job=main_job)
         concat_logs = "\n".join(logs)
         print(f"Logs:\n{concat_logs}")
+
+        download_job_assets(job=main_job, iteration=n_iteration)
 
         if test_type != "release":
             success = pipeline.get_status() == PipelineStatus.SUCCESS
@@ -192,8 +205,11 @@ def main(
 
         current_iteration, total_iterations = parsed_result
         if current_iteration == total_iterations:
+
             success = pipeline.get_status() == PipelineStatus.SUCCESS
             sys.exit(int(not success))  # invert for exit 0
+        n_iteration += 1
+    sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -13,11 +13,11 @@ import torch.nn.functional as F
 from megatron import core
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
+from megatron.legacy.model.enums import AttnMaskType, LayerType, AttnType
+from megatron.legacy.model.fused_softmax import FusedScaleMaskSoftmax
+from megatron.legacy.model.fused_bias_gelu import bias_gelu_impl
+from megatron.core.models.common.embeddings import apply_rotary_pos_emb
 from megatron.core.jit import jit_fuser
-from megatron.core.models.common.embeddings.rotary_pos_embedding import (
-    RotaryEmbedding,
-    apply_rotary_pos_emb,
-)
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.parallel_state import (
     get_tensor_and_expert_parallel_group,
@@ -1406,20 +1406,14 @@ class ParallelTransformer(MegatronModule):
         self.transformer_engine_v_0_8 = False
         if self.transformer_impl == 'transformer_engine':
             global transformer_engine
-            from importlib.metadata import version
-
             import transformer_engine
-            from pkg_resources import packaging
 
-            te_version = packaging.version.Version(version("transformer-engine"))
-            if te_version >= packaging.version.Version("0.8.0"):
+            if core.utils.is_te_min_version("0.8.0"):
                 self.transformer_engine_v_0_8 = True
-            if te_version >= packaging.version.Version("0.10.0"):
+            if core.utils.is_te_min_version("0.10.0"):
                 self.transformer_engine_v_0_10 = True
-            if te_version >= packaging.version.Version("0.11.0"):
+            if core.utils.is_te_min_version("0.11.0"):
                 self.transformer_engine_v_0_11 = True
-
-            del version, packaging
 
             assert not args.squared_relu, ("TransformerEngine does not support squared "
                                            "relu activation.")

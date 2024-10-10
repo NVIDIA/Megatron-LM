@@ -76,6 +76,7 @@ class LLaVAModel(MegatronModule):
         img_w: int = 336,
         patch_dim: int = 14,
         language_rotary_base: int = 10000,
+        language_rope_scaling: bool = False,
     ) -> None:
         super().__init__(config=language_transformer_config)
 
@@ -112,6 +113,7 @@ class LLaVAModel(MegatronModule):
                 pre_process=self.pre_process,
                 post_process=self.post_process,
                 rotary_base=language_rotary_base,
+                rope_scaling=language_rope_scaling,
             )
             self.share_embeddings_and_output_weights = (
                 self.language_model.share_embeddings_and_output_weights
@@ -123,6 +125,16 @@ class LLaVAModel(MegatronModule):
 
         class_token_len = 1
         if self.add_encoder:
+            self._drop_vision_class_token = drop_vision_class_token
+            add_class_token = True
+            if vision_transformer_config.vision_model_type == "siglip":
+                class_token_len = 0
+                add_class_token = False
+                error_msg = (
+                    "Siglip does not support vision class token, "
+                    "set disable-vision-class-token to False."
+                )
+                assert not self._drop_vision_class_token, error_msg
             self.vision_model = CLIPViTModel(
                 vision_transformer_config,
                 vision_transformer_layer_spec,
@@ -130,8 +142,9 @@ class LLaVAModel(MegatronModule):
                 img_w=img_w,
                 class_token_len=class_token_len,
                 patch_dim=patch_dim,
+                model_subtype=vision_transformer_config.vision_model_type,
+                add_class_token=add_class_token,
             )
-            self._drop_vision_class_token = drop_vision_class_token
             # Map (intermediate) vision model outputs to the language model input dimension.
             self.vision_projection = MultimodalProjector(
                 vision_projection_config,
@@ -153,7 +166,12 @@ class LLaVAModel(MegatronModule):
                 )
 
         self._img_seq_len = get_num_image_embeddings(
-            img_h, img_w, patch_dim, drop_vision_class_token, class_token_len
+            img_h,
+            img_w,
+            patch_dim,
+            vision_transformer_config.vision_model_type,
+            drop_vision_class_token,
+            class_token_len,
         )
 
     def shared_embedding_or_output_weight(self):
@@ -351,7 +369,9 @@ class LLaVAModel(MegatronModule):
             ]
 
             # Put image embeddings to image positions.
-            final_embedding[images_mask] = image_embeddings.reshape(-1, embed_dim).contiguous()
+            final_embedding[images_mask] = (
+                image_embeddings.permute(1, 0, 2).reshape(-1, embed_dim).contiguous()
+            )
 
         # Create the final labels and loss mask (if this is the last language model stage).
         final_labels, final_loss_mask = None, None
@@ -466,7 +486,9 @@ class LLaVAModel(MegatronModule):
             image_embeddings = None
         elif self.add_encoder and not has_images:
             # If no images provided, use an empty image embeddings tensor.
-            image_embeddings = torch.tensor([], dtype=images.dtype, device=images.device)
+            image_embeddings = torch.tensor([], dtype=images.dtype, device=images.device).reshape(
+                0, 0, 0
+            )
         elif self.add_encoder and has_images:
             image_embeddings = self.vision_model(images)  # [num_tiles, img_seq_len, h_vision]
             if self._drop_vision_class_token:

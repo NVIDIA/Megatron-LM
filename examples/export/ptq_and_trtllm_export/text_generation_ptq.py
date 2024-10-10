@@ -6,12 +6,11 @@ import os
 import sys
 from pathlib import Path
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../")))
 
 import modelopt.torch.quantization as mtq
 import torch
 from datasets import load_dataset
-from modelopt.torch.utils.distributed import set_data_parallel_group, set_tensor_parallel_group
 from tqdm import tqdm
 
 # [ModelOpt]: changing the default model provider to the ModelOpt version
@@ -178,10 +177,6 @@ if __name__ == "__main__":
     ptq_forward_loop_func = custom_prompt_forward_loop_func
     if args.calib_dataset is not None:
         ptq_forward_loop_func = hf_dataset_forword_loop_func
-
-    # Setting data parallel and tensor parallel group
-    set_data_parallel_group(mpu.get_data_parallel_group())
-    set_tensor_parallel_group(mpu.get_tensor_model_parallel_group())
 
     if args.export_quant_cfg in QUANT_CFG_CHOICES:
         mtq_config = QUANT_CFG_CHOICES[args.export_quant_cfg]

@@ -37,13 +37,18 @@ def main(
     run_name: Optional[str] = None,
     wandb_experiment: Optional[str] = None,
 ):
+    test_cases = [
+        test_case
+        for test_case in common.load_workloads(scope=scope, container_tag=container_tag)
+        if test_case.type != "build"
+    ]
 
-    gitlab_pipeline = {"stages": ["functional_tests"], "default": {"interruptible": True}}
+    gitlab_pipeline = {
+        "stages": list(set([test_case.spec.model for test_case in test_cases])),
+        "default": {"interruptible": True},
+    }
 
-    for test_case in common.load_workloads(scope=scope, container_tag=container_tag):
-        if test_case.type == "build":
-            continue
-
+    for test_case in test_cases:
         if test_case.spec.platforms == "dgx_a100":
             cluster = a100_cluster
         elif test_case.spec.platforms == "dgx_h100":
@@ -81,10 +86,13 @@ def main(
 
         if run_name is not None and wandb_experiment is not None:
             script.append(f"--run-name {run_name}")
-            script.append(f"--wandb-experiment {wandb_experiment}")
+            test_case.spec.model
+            script.append(
+                f"--wandb-experiment {wandb_experiment}-{test_case.spec.model}-{test_case.spec.test_case}"
+            )
 
         gitlab_pipeline[test_case.spec.test_case] = {
-            "stage": "functional_tests",
+            "stage": f"{test_case.spec.model}",
             "image": f"{container_image}:{container_tag}",
             "tags": ["mcore-docker-node-jet"],
             "rules": [
@@ -94,6 +102,7 @@ def main(
             "timeout": "7 days",
             "needs": [{"pipeline": '$PARENT_PIPELINE_ID', "job": "jet-generate"}],
             "script": [" ".join(script)],
+            "artifacts": {"paths": ["results/"], "when": "always"},
         }
 
     with open(output_path, 'w') as outfile:
