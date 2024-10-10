@@ -1,23 +1,13 @@
 import argparse
-import glob
 import json
-import os
 
+from evaluate_mmmu import get_input_output_paths
 from evaluate_vqav2 import compute_vqa_accuracy
 
 
 def merge_input_files(input_path):
     """Merge input files to a format compatible with the evaluator."""
-    # Single input file.
-    if os.path.exists(input_path):
-        input_file_paths = [input_path]
-        output_file_path = input_path.replace(".jsonl", "-merged.json")
-    # Directory of partitioned input files.
-    else:
-        pattern = input_path + "-TextVQA-[0-9].*jsonl"
-        input_file_paths = glob.glob(pattern)
-
-        output_file_path = input_path + "-TextVQA-merged.json"
+    input_file_paths, output_file_path = get_input_output_paths(input_path, task="TextVQA")
 
     results = []
 
@@ -32,6 +22,9 @@ def merge_input_files(input_path):
                         "gt_answer": res["gt_answer"],
                     }
                 )
+
+    # Make order deterministic.
+    # results = sorted(results, key=lambda d: d["question_id"])
 
     with open(output_file_path, "w") as output_file:
         json.dump(results, output_file)

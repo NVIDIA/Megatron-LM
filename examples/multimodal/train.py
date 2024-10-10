@@ -1,6 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain or SFT multimodal."""
-import json
 import os
 import sys
 from functools import partial
@@ -11,12 +10,9 @@ import yaml
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir, os.path.pardir)))
 
-from config import EvaluationConfig
 from dataloader_provider import train_valid_test_dataloaders_provider
-from evaluate_textvqa import textvqa_eval
 from model import model_provider
 from multimodal_args import add_multimodal_extra_args
-from run_text_generation import generate_samples, patch_tokenizer
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
@@ -256,6 +252,9 @@ def run_online_eval(model):
     if not args.online_evaluation_config:
         return []
 
+    from config import EvaluationConfig
+    from run_text_generation import generate_and_write_samples, patch_tokenizer
+
     with open(args.online_evaluation_config, "r") as f:
         config_dict = yaml.safe_load(f)
 
@@ -268,18 +267,10 @@ def run_online_eval(model):
     # We must write to a storage space that all ranks see.
     output_dir = os.path.join(args.save, "online_eval")
     os.makedirs(output_dir, exist_ok=True)
-    config.output_path = os.path.join(output_dir, f"{config.task}.jsonl")
+    config.output_path = os.path.join(output_dir, args.language_model_type)
 
-    if torch.distributed.get_rank() == 0:
-        output_file = open(config.output_path, "w")
-
-    with torch.no_grad():
-        for output in generate_samples(model[0].module, config):
-            if torch.distributed.get_rank() == 0:
-                output_file.write(json.dumps(output) + "\n")
-
-    if torch.distributed.get_rank() == 0:
-        output_file.close()
+    # The actual generation.
+    generate_and_write_samples(model[0].module, config, print_output=False)
 
     # Make sure the first rank is done writing so that the last rank can run eval.
     torch.distributed.barrier()
@@ -287,10 +278,12 @@ def run_online_eval(model):
     if not is_last_rank():
         return []
 
-    if config.task.lower() == "textvqa":
+    # Run evaluation.
+    if config.task == "TextVQA":
+        from evaluate_textvqa import textvqa_eval
         avg_acc = textvqa_eval(config.output_path)
 
-        return [{"textvqa accuracy": avg_acc}]
+        return [{"TextVQA accuracy": avg_acc}]
     else:
         raise NotImplementedError(f"online evaluation of {config.task} not implemented yet")
 
