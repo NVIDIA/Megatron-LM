@@ -36,6 +36,7 @@ pytest-cov \
 pytest_mock \
 pytest-random-order \
 sentencepiece \
+tiktoken \
 wrapt \
 zarr \
 wandb \
