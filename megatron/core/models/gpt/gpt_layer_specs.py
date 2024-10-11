@@ -23,7 +23,8 @@ try:
         TENorm,
         TERowParallelGroupedLinear,
         TERowParallelLinear,
-        TESwigluLinear
+        TESwigluLinear,
+        TESequentialLinear
     )
 
     HAVE_TE = True
@@ -151,6 +152,7 @@ def _get_mlp_module_spec(
             submodules=MLPSubmodules(
                 linear_fc1=TELayerNormColumnParallelLinear if use_te else ColumnParallelLinear,
                 linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
+                seq_linear_fc1=TESequentialLinear if use_te else ColumnParallelLinear,
                 swiglu_fc2=TESwigluLinear if use_te else RowParallelLinear,
             ),
         )
