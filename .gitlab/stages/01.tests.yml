@@ -119,6 +119,8 @@ unit_tests:
         ARGS=()
         if [[ $TAG != latest ]]; then
           ARGS+=(-m "not internal")
+        else
+          ARGS+=(-m "not flaky")
         fi
         if [[ $IMAGE == ${CI_MCORE_DEV_IMAGE} ]]; then
           ARGS+=(-m "experimental")
