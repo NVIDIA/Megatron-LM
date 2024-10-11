@@ -31,7 +31,7 @@ MODEL_ARGS:
   --transformer-impl: transformer_engine
 
   # Data args
-  --data-cache-path: ${OUTPUT_PATH}/cache
+  --data-cache-path: ${DATA_CACHE_PATH}
   --tokenizer-type: Llama2Tokenizer
   --tokenizer-model: ${DATA_PATH}/tokenizer.model
   --data-path: ${DATA_BLEND}
@@ -89,6 +89,7 @@ MODEL_ARGS:
   --auto-detect-ckpt-format: true
   --load: ${LOAD_PATH}
   --save: ${OUTPUT_PATH}/checkpoints
+  --no-ckpt-fully-parallel-save: true
   --save-interval: 500
 
   # Add initialization args

@@ -89,7 +89,7 @@ class _LocalClientError(Exception):
 setattr(exceptions, "ClientError", _LocalClientError)
 
 
-@pytest.mark.skip(reason="Tests are flaky and need to be debugged")
+@pytest.mark.flaky
 def test_bin_reader():
     with tempfile.TemporaryDirectory() as temp_dir:
         # set the default nltk data path

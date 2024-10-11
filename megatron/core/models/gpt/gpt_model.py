@@ -69,6 +69,7 @@ class GPTModel(LanguageModule):
         position_embedding_type: Literal['learned_absolute', 'rope', 'none'] = 'learned_absolute',
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
+        rope_scaling: bool = False,
         seq_len_interpolation_factor: Optional[float] = None,
     ) -> None:
         super().__init__(config=config)
@@ -90,9 +91,11 @@ class GPTModel(LanguageModule):
         # TODO: remove this dependency ?
         self.model_type = ModelType.encoder_or_decoder
 
-        # These 2 attributes are needed for TensorRT-LLM export.
+        # These 4 attributes are needed for TensorRT-LLM export.
         self.max_position_embeddings = max_sequence_length
         self.rotary_percent = rotary_percent
+        self.rotary_base = rotary_base
+        self.rotary_scaling = rope_scaling
 
         if self.pre_process:
             self.embedding = LanguageModelEmbedding(
@@ -102,13 +105,14 @@ class GPTModel(LanguageModule):
                 position_embedding_type=position_embedding_type,
             )
 
-        if self.position_embedding_type == 'rope':
+        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             self.rotary_pos_emb = RotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
                 rotary_interleaved=self.config.rotary_interleaved,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
+                rope_scaling=rope_scaling,
                 use_cpu_initialization=self.config.use_cpu_initialization,
             )
 
@@ -185,12 +189,17 @@ class GPTModel(LanguageModule):
         inference_params: InferenceParams = None,
         packed_seq_params: PackedSeqParams = None,
         extra_block_kwargs: dict = None,
+        runtime_gather_output: Optional[bool] = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoeder and finally into the post
         processing layer (optional).
 
         It either returns the Loss values if labels are given  or the final hidden units
+
+        Args:
+            runtime_gather_output (bool): Gather output at runtime. Default None means
+                `parallel_output` arg in the constructor will be used.
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -207,7 +216,7 @@ class GPTModel(LanguageModule):
 
         # Rotary positional embeddings (embedding is None for PP intermediate devices)
         rotary_pos_emb = None
-        if self.position_embedding_type == 'rope':
+        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                 inference_params, self.decoder, decoder_input, self.config
             )
@@ -230,7 +239,9 @@ class GPTModel(LanguageModule):
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
-        logits, _ = self.output_layer(hidden_states, weight=output_weight)
+        logits, _ = self.output_layer(
+            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+        )
 
         if has_config_logger_enabled(self.config):
             payload = OrderedDict(

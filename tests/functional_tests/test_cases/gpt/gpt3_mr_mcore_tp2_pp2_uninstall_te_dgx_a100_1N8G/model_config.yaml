@@ -4,9 +4,8 @@ ENV_VARS:
   NCCL_ALGO: Tree
   CUBLAS_WORKSPACE_CONFIG: :4096:8
   SKIP_PYTEST: 1
-BEFORE_SCRIPT:
-  pip uninstall -y transformer_engine
-  pip uninstall -y Apex ## TODO: remove once Apex dependency has been removed completely
+  N_REPEATS: 1
+BEFORE_SCRIPT: pip uninstall -y transformer_engine pip uninstall -y Apex ## TODO: remove once Apex dependency has been removed completely
 MODEL_ARGS:
   --num-layers: 12
   --hidden-size: 512
@@ -48,7 +47,7 @@ MODEL_ARGS:
   --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --use-mcore-models: true
-  --ckpt-format: torch_dist 
+  --ckpt-format: torch_dist
   --data-cache-path: ${DATA_CACHE_PATH}
   --fp16: true
   --apply-query-key-layer-scaling: true

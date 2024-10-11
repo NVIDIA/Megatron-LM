@@ -1,7 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 from importlib.metadata import version
 
-import packaging
 import pytest
 import torch
 
@@ -16,9 +15,8 @@ from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.experts import SequentialMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
-
-te_version = packaging.version.Version(version("transformer-engine"))
 
 
 class TestParallelSequentialMLP:
@@ -117,7 +115,7 @@ class TestTEParallelSequentialMLP:
         )
 
     @pytest.mark.skipif(
-        te_version < packaging.version.Version("1.7.0"),
+        not is_te_min_version("1.7.0"),
         reason="Transformer Engine under v1.7.0 doesn't support MoE training.",
     )
     @pytest.mark.internal
@@ -133,7 +131,7 @@ class TestTEParallelSequentialMLP:
             )
 
     @pytest.mark.skipif(
-        te_version < packaging.version.Version("1.7.0"),
+        not is_te_min_version("1.7.0"),
         reason="Transformer Engine under v1.7.0 doesn't support MoE training.",
     )
     @pytest.mark.internal
@@ -155,7 +153,7 @@ class TestTEParallelSequentialMLP:
         assert torch.equal(output_local, output_te)
 
     @pytest.mark.skipif(
-        te_version < packaging.version.Version("1.7.0"),
+        not is_te_min_version("1.7.0"),
         reason="Transformer Engine under v1.7.0 doesn't support MoE training.",
     )
     @pytest.mark.internal
@@ -179,7 +177,7 @@ class TestTEParallelSequentialMLP:
         assert torch.equal(output_local, output_te)
 
     @pytest.mark.skipif(
-        te_version < packaging.version.Version("1.7.0"),
+        not is_te_min_version("1.7.0"),
         reason="Transformer Engine under v1.7.0 doesn't support MoE training.",
     )
     @pytest.mark.internal
