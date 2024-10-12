@@ -215,20 +215,21 @@ class GPTDataset(MegatronDataset):
             loss_mask = torch.zeros_like(loss_mask)
 
         # ais packed param
-        packed_seq_params = None
+        packed_seq_params = torch.tensor([False], dtype=torch.bool)
         if self.config.reset_attention_mask and self.config.create_attention_mask \
             and self.config.reset_position_ids:
             reset_points = torch.where(position_ids[1:] < position_ids[:-1])[0] + 1
-            cu_seqlens = torch.cat([torch.tensor([0]), reset_points, torch.tensor([len(position_ids)])]).cuda()
+            cu_seqlens = torch.cat([torch.tensor([0]), reset_points, torch.tensor([len(position_ids)])]).to(torch.int32)
             seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
             max_seqlen, _ = seqlens.max(dim=0, keepdim=True)
-            packed_seq_params = PackedSeqParams(
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_kv=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_kv=max_seqlen,
-                qkv_format='thd',
-            )
+
+            packed_seq_params = {
+                "cu_seqlens_q": cu_seqlens,
+                "cu_seqlens_kv": cu_seqlens,
+                "max_seqlen_q": max_seqlen,
+                "max_seqlen_kv": max_seqlen,
+                "qkv_format": 'thd',
+            }
 
         if self.config.create_attention_mask:
             return {

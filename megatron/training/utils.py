@@ -4,7 +4,7 @@
 import os
 import sys
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass
 
 import torch
 import torch.nn.functional as F
@@ -311,10 +311,10 @@ def get_batch_on_this_tp_rank(data_iterator):
            torch.distributed.broadcast(item, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group())
     
     def _broadcast_class(item):
-        if item is not None and item is isinstance(dataclass):
-            padded_tensors = F.pad(item.cu_seqlens_q, (0, args.seq_length - item.cu_seqlens_q.size(1)))
+        if item and is_dataclass(item):
+            padded_tensors = F.pad(item.cu_seqlens_q, (0, args.seq_length - item.cu_seqlens_q.size(0)))
             _broadcast(padded_tensors)
-            _broadcast(item.max_seqlen)
+            _broadcast(item.max_seqlen_q)
 
 
     if mpu.get_tensor_model_parallel_rank() == 0:
@@ -324,13 +324,21 @@ def get_batch_on_this_tp_rank(data_iterator):
        else:
            data = None
 
+    if data["packed_seq_params"]:
+       data["packed_seq_params"] = PackedSeqParams(**data["packed_seq_params"])
+       data["packed_seq_params"].cu_seqlens_q = data["packed_seq_params"].cu_seqlens_q.cuda().squeeze(0)
+       data["packed_seq_params"].cu_seqlens_kv = data["packed_seq_params"].cu_seqlens_kv.cuda().squeeze(0)
+       data["packed_seq_params"].max_seqlen_q = data["packed_seq_params"].max_seqlen_q.cuda().squeeze(0)
+       data["packed_seq_params"].max_seqlen_kv = data["packed_seq_params"].max_seqlen_kv.cuda().squeeze(0)
+       data["packed_seq_params"].qkv_format = 'thd'
+
        batch = {
            'tokens': data["tokens"].cuda(non_blocking = True),
            'labels': data["labels"].cuda(non_blocking = True),
            'loss_mask': data["loss_mask"].cuda(non_blocking = True),
            'attention_mask': None if "attention_mask" not in data else data["attention_mask"].cuda(non_blocking = True),
            'position_ids': data["position_ids"].cuda(non_blocking = True),
-           'packed_seq_params': data["packed_seq_params"]
+           'packed_seq_params': data["packed_seq_params"] if data["packed_seq_params"] else None
        }
 
        if args.pipeline_model_parallel_size == 1:
