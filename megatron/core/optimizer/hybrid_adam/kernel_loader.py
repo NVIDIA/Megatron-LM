@@ -54,13 +54,13 @@ class _Extension(ABC):
     def get_jit_extension_folder_path(name):
         """
         Kernels which are compiled during runtime will be stored in the same cache folder for reuse.
-        The folder is in the path ~/.cache/megatron_patch/torch_extensions/<cache-folder>.
+        The folder is in the path ~/.cache/megatron/torch_extensions/<cache-folder>.
         The name of the <cache-folder> follows a common format:
             torch<torch_version_major>.<torch_version_minor>_<device_name><device_version>-<hash>
 
-        The <hash> suffix is the hash value of the path of the `megatron_patch` file.
+        The <hash> suffix is the hash value of the path of the `megatron` file.
         """
-        import megatron_patch
+        import megatron
         import torch
         from torch.version import cuda
 
@@ -75,11 +75,11 @@ class _Extension(ABC):
         device_version = cuda if name == 'cuda' else ''
 
         # use colossalai's file path as hash
-        hash_suffix = hashlib.sha256(megatron_patch.__file__.encode()).hexdigest()
+        hash_suffix = hashlib.sha256(megatron.__file__.encode()).hexdigest()
 
         # concat
         home_directory = os.path.expanduser("~")
-        extension_directory = f".cache/megatron_patch/torch_extensions/torch{torch_version_major}.{torch_version_minor}_{device_name}-{device_version}-{hash_suffix}"
+        extension_directory = f".cache/megatron/torch_extensions/torch{torch_version_major}.{torch_version_minor}_{device_name}-{device_version}-{hash_suffix}"
         cache_directory = os.path.join(home_directory, extension_directory)
         return cache_directory
 
@@ -124,7 +124,7 @@ class _CppExtension(_Extension):
         self.cached_op = None
 
         # build-related variables
-        self.prebuilt_module_path = "megatron_patch._C"
+        self.prebuilt_module_path = "megatron._C"
         self.prebuilt_import_path = f"{self.prebuilt_module_path}.{self.name}"
         self.version_dependent_macros = ["-DVERSION_GE_1_1", "-DVERSION_GE_1_3", "-DVERSION_GE_1_5"]
 
