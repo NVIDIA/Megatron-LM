@@ -19,7 +19,7 @@ def add_arguments(parser):
 
     # TODO(jbarker): Need assertion to make sure *exactly* one of these is used
     parser.add_argument('--model-size', type=str, required=True,
-                        choices=['llama2-7B', 'llama2-13B', 'llama2-70B', 'llama2-7Bf', 'llama2-13Bf', 'llama2-70Bf', 'llama3-8B', 'llama3-70B', 'llama3-8Bf', 'llama3-70Bf', 'mistral-7B', 'mistral-7Bf', 'yi-34B'],
+                        choices=['llama2-7B', 'llama2-13B', 'llama2-70B', 'llama2-7Bf', 'llama2-13Bf', 'llama2-70Bf', 'llama3-8B', 'llama3-70B', 'llama3-8Bf', 'llama3-70Bf', 'mistral-7B', 'mistral-7Bf', 'yi-34B', 'qwen2-7B'],
                         help='Model size can be `llama2-7B`, `llama2-13B`, `llama2-70B`, `llama3-8B`, `llama3-70B`, `mistral-7B` (for pretrained models), '
                         'and `llama2-7Bf`, `llama2-13Bf`, `llama2-70Bf`, `llama3-8Bf`, `llama3-70bf` and `mistral-7Bf` (for chat-finetuned models).')
     parser.add_argument('--checkpoint-type', type=str, required=True,
@@ -59,6 +59,7 @@ NUM_SHARDS = {
     "mistral-7B": 1,
     "mistral-7Bf": 1,
     "yi-34B": 8,
+    "qwen2-7B": 1,
 }
 
 
@@ -87,6 +88,8 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
         from transformers import LlamaConfig as ModelConfig
     elif "mistral" in model_size:
         from transformers import MistralConfig as ModelConfig
+    elif "qwen" in model_size:
+        from transformers import Qwen2Config as ModelConfig
 
     # for backward compatibility, before you needed the repo to be called `my_repo/model_size`
     if not os.path.isfile(os.path.join(input_base_path, "params.json")):
@@ -111,7 +114,7 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
 
     if "llama2" in model_size:
         tokenizer_class = LlamaTokenizer if LlamaTokenizerFast is None else LlamaTokenizerFast
-    elif model_size in ["llama3", "mistral"]:
+    elif model_size in ["llama3", "mistral", "qwen"]:
         tokenizer_class = transformers.AutoTokenizer.from_pretrained
     else:
         raise AttributeError(f"model_size={model_size} not supported")
@@ -126,6 +129,9 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
         elif "mistral" in model_size:
             tokenizer = tokenizer_class.from_file(tokenizer_path)
             vocab_size = 32768
+        elif "qwen" in model_size:
+            tokenizer = tokenizer_class(tokenizer_path)
+            vocab_size = 152064
         else:
             raise AttributeError(f"model_size={model_size} is not supported")
 
@@ -162,7 +168,7 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
             # Unsharded
             q_proj = loaded[f"layers.{layer_i}.attention.wq.weight"]
             k_proj = loaded[f"layers.{layer_i}.attention.wk.weight"]
-            if ("llama2" in model_size) or ("mistral" in model_size):
+            if ("llama2" in model_size) or ("mistral" in model_size) or ("qwen" in model_size):
                 q_proj = permute(q_proj)
                 k_proj = permute(k_proj)
             state_dict = {
@@ -353,6 +359,13 @@ def set_attn_state(args, layer, hf_layer):
         hf_attn.k_proj.weight.reshape((ng, dim, -1)),
         hf_attn.v_proj.weight.reshape((ng, dim, -1)),
     ], dim=1).reshape((-1, args.hidden_size)))
+    if args.add_qkv_bias:
+        attn.query_key_value.bias.data.copy_(torch.cat([
+            hf_attn.q_proj.bias.reshape((ng, dim*nh//ng)),
+            hf_attn.k_proj.bias.reshape((ng, dim)),
+            hf_attn.v_proj.bias.reshape((ng, dim)),
+        ], dim=1).reshape((-1)))
+
     attn.dense.weight.data.copy_(hf_attn.o_proj.weight)
 
 
@@ -458,6 +471,9 @@ def _load_checkpoint(queue, args):
         margs.tokenizer_type = "HuggingFaceTokenizer"
     elif "mistral" in args.model_size:
         margs.tokenizer_type = "HuggingFaceTokenizer"
+    elif "qwen" in args.model_size:
+        margs.tokenizer_type = "HuggingFaceTokenizer"
+        margs.add_qkv_bias = True
 
     # Arguments do sanity checks on the world size, but we don't care,
     # so trick it into thinking we are plenty of processes.
@@ -530,6 +546,7 @@ def _load_checkpoint(queue, args):
     md.output_layer = margs.untie_embeddings_and_output_weights
     md.position_embedding_type = margs.position_embedding_type
     md.linear_bias = margs.add_bias_linear
+    md.qkv_bias = margs.add_qkv_bias
     md.norm_has_bias = False
     md.swiglu = margs.swiglu
     md.previous_tensor_parallel_size = margs.tensor_model_parallel_size
@@ -543,7 +560,8 @@ def _load_checkpoint(queue, args):
 
     # Get true (non-padded) vocab size
     tokenizer = transformers.AutoTokenizer.from_pretrained(margs.tokenizer_model)
-    md.true_vocab_size = tokenizer._tokenizer.get_vocab_size(with_added_tokens=True)
+    md.true_vocab_size = None
+
 
     # Get first pipe stage.
     mpu.set_tensor_model_parallel_rank(0)
@@ -594,6 +612,8 @@ def _load_checkpoint(queue, args):
         if md.linear_bias:
             qkv_bias.append(layer.self_attention.query_key_value.bias.data)
             mlp_l0_bias.append(layer.mlp.dense_h_to_4h.bias.data)
+        if md.qkv_bias:
+            qkv_bias.append(layer.self_attention.query_key_value.bias.data)
 
         # Handle gated linear units.
         if md.swiglu:
@@ -618,6 +638,8 @@ def _load_checkpoint(queue, args):
                 message["mlp l0 bias V"] = torch.cat([b[1] for b in mlp_l0_bias],dim=0)
             else:
                 message["mlp l0 bias"] = torch.cat(mlp_l0_bias, dim=0)
+        if md.qkv_bias:
+            message["qkv bias"] = torch.cat(qkv_bias, dim=0)
 
         queue_put(f"transformer layer {layer_num}", message)
 
