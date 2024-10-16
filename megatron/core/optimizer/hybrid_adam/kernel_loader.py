@@ -60,7 +60,6 @@ class _Extension(ABC):
 
         The <hash> suffix is the hash value of the path of the `megatron` file.
         """
-        import megatron
         import torch
         from torch.version import cuda
 
@@ -75,7 +74,7 @@ class _Extension(ABC):
         device_version = cuda if name == 'cuda' else ''
 
         # use colossalai's file path as hash
-        hash_suffix = hashlib.sha256(megatron.__file__.encode()).hexdigest()
+        hash_suffix = hashlib.sha256(__file__.encode()).hexdigest()
 
         # concat
         home_directory = os.path.expanduser("~")
