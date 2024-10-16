@@ -37,6 +37,16 @@ def flatten_workload(
     return workload_manifests
 
 
+def set_build_dependency(
+    workload_manifests: List[jetclient.JETWorkloadManifest],
+) -> List[jetclient.JETWorkloadManifest]:
+    for workload_manifest in workload_manifests:
+        workload_manifest.spec.build = workload_manifest.spec.build.format(
+            **dict(workload_manifest.spec)
+        )
+    return workload_manifests
+
+
 def load_config(config_path: str) -> jetclient.JETWorkloadManifest:
     """Loads and parses a yaml file into a JETWorkloadManifest"""
     with open(config_path) as stream:
@@ -48,7 +58,9 @@ def load_config(config_path: str) -> jetclient.JETWorkloadManifest:
 
 def load_and_flatten(config_path: str) -> List[jetclient.JETWorkloadManifest]:
     """Wrapper function for doing all the fun at once."""
-    return flatten_workload(flatten_products(load_config(config_path=config_path)))
+    return set_build_dependency(
+        flatten_workload(flatten_products(load_config(config_path=config_path)))
+    )
 
 
 def filter_by_test_case(
@@ -86,6 +98,24 @@ def filter_by_scope(
     return workload_manifests
 
 
+def filter_by_environment(
+    workload_manifests: List[jetclient.JETWorkloadManifest], environment: str
+) -> List[jetclient.JETWorkloadManifest]:
+    workload_manifests = list(
+        workload_manifest
+        for workload_manifest in workload_manifests
+        if (
+            hasattr(workload_manifest.spec, "environment")
+            and workload_manifest.spec.environment == environment
+        )
+    )
+
+    if len(workload_manifests) == 0:
+        raise ValueError("No test_case found!")
+
+    return workload_manifests
+
+
 def filter_by_model(
     workload_manifests: List[jetclient.JETWorkloadManifest], model: str
 ) -> List[jetclient.JETWorkloadManifest]:
@@ -104,6 +134,7 @@ def filter_by_model(
 
 def load_workloads(
     container_tag: str,
+    environment: Optional[str] = None,
     scope: Optional[str] = None,
     model: Optional[str] = None,
     test_case: Optional[str] = None,
@@ -122,6 +153,9 @@ def load_workloads(
 
     if scope:
         workloads = filter_by_scope(workload_manifests=workloads, scope=scope)
+
+    if environment:
+        workloads = filter_by_environment(workload_manifests=workloads, environment=environment)
 
     if model:
         workloads = filter_by_model(workload_manifests=workloads, model=model)

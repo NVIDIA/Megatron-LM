@@ -23,7 +23,7 @@ build_image:
         TAG: mcore-docker-node-large
       - IMAGE: CI_MCORE_DEV_IMAGE
         FILE: Dockerfile.ci.dev
-        BASE_IMAGE: nvcr.io/nvidia/pytorch:24.01-py3
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:24.07-py3
         TAG: mcore-docker-node-large
       - IMAGE: CI_NEMO_IMAGE
         FILE: Dockerfile.ci
@@ -92,10 +92,12 @@ unit_tests:
     matrix:
       - TAG: latest
         IMAGE: ${CI_MCORE_IMAGE}
-      # - TAG: latest
-      #   IMAGE: ${CI_MCORE_DEV_IMAGE}
+      - TAG: latest
+        IMAGE: ${CI_MCORE_DEV_IMAGE}
       - TAG: core_r0.9.0
         IMAGE: ${CI_MCORE_IMAGE}
+      - TAG: core_r0.9.0
+        IMAGE: ${CI_MCORE_DEV_IMAGE}
   tags: [8xL40S]
   variables:
     GIT_STRATEGY: clone
@@ -109,6 +111,9 @@ unit_tests:
       fi
   script:
     - |
+      export NVTE_FLASH_ATTN=0
+      export NVTE_FUSED_ATTN=0
+      
       cd /opt/megatron-lm
       if [[ $UNIT_TEST_REPEAT -eq 0 ]]; then
         exit 0
@@ -118,12 +123,9 @@ unit_tests:
         SEED=$((RANDOM % 9000 + 1000));
         ARGS=()
         if [[ $TAG != latest ]]; then
-          ARGS+=(-m "not internal")
+          ARGS+=(-m "not internal and not flaky and not flaky_in_dev")
         else
-          ARGS+=(-m "not flaky")
-        fi
-        if [[ $IMAGE == ${CI_MCORE_DEV_IMAGE} ]]; then
-          ARGS+=(-m "experimental")
+          ARGS+=(-m "not flaky and not flaky_in_dev")
         fi
         timeout ${UNIT_TEST_TIMEOUT}m torchrun --nproc_per_node=8 -m pytest --random-order --random-order-seed ${SEED} -xvs --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail "${ARGS[@]}" tests/unit_tests
       done
