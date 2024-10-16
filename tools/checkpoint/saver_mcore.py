@@ -3,10 +3,11 @@
 import os
 import sys
 import torch
+from importlib.metadata import version
+from pkg_resources import packaging
 
 from setter import ModelSetter
 from utils import get_mcore_transformer_block_key, print_memory_usage
-from megatron.core.utils import get_te_version, is_te_min_version
 
 
 class MCoreSetter(ModelSetter):
@@ -28,6 +29,7 @@ class MCoreSetter(ModelSetter):
         word=None,
         pos=None,
     ):
+        print(f"=============================== model.embedding.word_embeddings.weight.shape, {model.embedding.word_embeddings.weight.shape}")
         cls.set_tensor(model.embedding.word_embeddings.weight, word)
         if pos is not None:
             cls.set_tensor(model.embedding.position_embeddings.weight, pos)
@@ -287,8 +289,9 @@ def add_arguments(parser):
 def save_checkpoint(queue, args):
 
     # Transformer engine >= 0.12.0, for CPU initialization.
-    assert is_te_min_version("0.12.0"), \
-        "transformer engine version: %s (>=0.12.0 required)." % get_te_version()
+    te_version = packaging.version.Version(version("transformer-engine"))
+    assert te_version >= packaging.version.Version("0.12.0"), \
+        "transformer engine version: %s (>=0.12.0 required)." % te_version
 
     # Search in directory above this
     sys.path.append(os.path.abspath(
@@ -402,6 +405,8 @@ def save_checkpoint(queue, args):
         sys.argv.append('--untie-embeddings-and-output-weights')
     if not md.linear_bias:
         sys.argv.append('--disable-bias-linear')
+    if md.qkv_bias:
+        sys.argv.append('--add-qkv-bias')
 
     if md.model_type == 'BERT' and not md.bert_binary_head:
         sys.argv.append('--bert-no-binary-head')
@@ -499,6 +504,7 @@ def save_checkpoint(queue, args):
         pos_embed = embeddings_msg.pop("position embeddings")
     orig_word_embed = embeddings_msg.pop("word embeddings")
     check_message(embeddings_msg)
+
 
     # Deal with padding
     def pad_weight(orig_word_embed, true_vocab_size):
@@ -638,6 +644,8 @@ def save_checkpoint(queue, args):
                     mlp_l0_bias = torch.cat((mlp_l0_bias_W, mlp_l0_bias_V), dim=-1)
                 else:
                     mlp_l0_bias = chunk_bias(msg.pop("mlp l0 bias"), 'column', args.target_tensor_parallel_size, args.target_expert_parallel_size)
+            if md.qkv_bias:
+                qkv_bias = chunk_bias(msg.pop("qkv bias"), 'column', args.target_tensor_parallel_size)
 
             # Save them to the model
             for ep_rank in range(args.target_expert_parallel_size):
@@ -677,6 +685,9 @@ def save_checkpoint(queue, args):
                                 "mlp_fc1_bias" : mlp_l0_bias[tp_rank],
                                 "mlp_fc2_bias" : mlp_l1_bias
                             })
+                    if md.qkv_bias:
+                        params_dict.update({"self_attn_qkv_bias" : qkv_bias[tp_rank]})
+
                     if margs.num_experts:
                         params_dict.update({
                             "router_weight":  router
