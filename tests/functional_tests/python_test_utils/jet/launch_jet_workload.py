@@ -41,6 +41,7 @@ def register_pipeline_terminator(pipeline: jetclient.JETPipeline):
 
 def launch_and_wait_for_completion(
     test_case: str,
+    environment: str,
     container_image: str,
     container_tag: str,
     cluster: str,
@@ -52,7 +53,10 @@ def launch_and_wait_for_completion(
         customer='mcore', gitlab_ci_token=os.getenv("RO_API_TOKEN"), env="prod"
     ).workloads.submit(
         workloads=common.load_workloads(
-            test_case=test_case, container_image=container_image, container_tag=container_tag
+            test_case=test_case,
+            container_image=container_image,
+            container_tag=container_tag,
+            environment=environment,
         ),
         config_id=resolve_cluster_config(cluster),
         custom_config={
@@ -127,6 +131,9 @@ def parse_iterations_from_logs(logs: List[str]) -> Optional[Tuple[int, int]]:
 @click.option("--model", required=True, type=str, help="Model")
 @click.option("--test-case", required=True, type=str, help="Test case")
 @click.option(
+    "--environment", required=True, type=click.Choice(['dev', 'lts']), help="Pytorch LTS or DEV"
+)
+@click.option(
     "--account",
     required=False,
     type=str,
@@ -148,6 +155,7 @@ def parse_iterations_from_logs(logs: List[str]) -> Optional[Tuple[int, int]]:
 def main(
     model: str,
     test_case: str,
+    environment: str,
     account: str,
     cluster: str,
     container_tag: str,
@@ -177,6 +185,7 @@ def main(
     while True and n_attempts < 3:
         pipeline = launch_and_wait_for_completion(
             test_case=test_case,
+            environment=environment,
             container_image=container_image,
             container_tag=container_tag,
             cluster=cluster,

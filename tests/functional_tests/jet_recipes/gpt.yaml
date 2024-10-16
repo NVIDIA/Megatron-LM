@@ -5,7 +5,7 @@ loggers: [stdout]
 spec:
   name: "{test_case}"
   model: gpt
-  build: mcore-pyt
+  build: mcore-pyt-{environment}
   nodes: 1
   gpus: 8
   artifacts:
@@ -21,13 +21,15 @@ spec:
         "TENSORBOARD_PATH={assets_dir}/tensorboard"
         "CHECKPOINT_PATH=/workspace/checkpoints"
         "TRAINING_SCRIPT_PATH=pretrain_gpt.py"
-        "TEST_CASE_PATH=./tests/functional_tests/test_cases/{model}/{test_case}"
+        "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}.json"
     )
 
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  - scope: [mr]
+  - environment: [lts, dev]
+    scope: [mr]
     platforms: [dgx_a100]
     time_limit: [12000]
     test_case:
@@ -104,7 +106,8 @@ products:
     - gpt3_mr_tp1_pp4_vp1_dgx_a100_1N8G
     - gpt3_mr_tp1_pp4_vp1_resume_torch_dgx_a100_1N8G
     - gpt3_mr_tp2_pp2_dgx_a100_1N8G
-  - scope: [nightly]
+  - environment: [lts, dev]
+    scope: [nightly]
     platforms: [dgx_a100]
     time_limit: [12000]
     test_case:
@@ -136,7 +139,8 @@ products:
     - gpt3_345m_nightly_dgx_a100_1N8G_tp4_pp1
     - gpt3_345m_nightly_dgx_a100_1N8G_tp4_pp1_overlap_grad_reduce
     - gpt3_345m_nightly_dgx_a100_1N8G_tp4_pp1_resume_torch
-  - scope: [weekly]
+  - environment: [lts, dev]
+    scope: [weekly]
     platforms: [dgx_h100]
     time_limit: [9000]
     test_case:

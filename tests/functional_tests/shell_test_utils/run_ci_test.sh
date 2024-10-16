@@ -17,7 +17,8 @@ echo "---------------------------------"
 # Check that mandatory vars are set
 MANDATORY_VARS=(
     "TRAINING_SCRIPT_PATH"
-    "TEST_CASE_PATH"
+    "TRAINING_PARAMS_PATH"
+    "GOLDEN_VALUES_PATH"
     "OUTPUT_PATH"
     "TENSORBOARD_PATH"
     "CHECKPOINT_PATH"
@@ -30,9 +31,6 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
         exit 1
     fi
 done
-
-export TRAINING_PARAMS_PATH=$TEST_CASE_PATH/model_config.yaml
-export GOLDEN_VALUES_PATH=$TEST_CASE_PATH/golden_values.json
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT_DIR=$(realpath $SCRIPT_DIR/../../../)
