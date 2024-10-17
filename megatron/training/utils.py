@@ -184,8 +184,8 @@ def get_ltor_masks_and_position_ids(data,
         att_mask_batch = micro_batch_size
     else:
         att_mask_batch = 1
-    attention_mask = torch.tril(torch.ones(
-        (att_mask_batch, seq_length, seq_length), device=data.device)).view(
+    attention_mask = torch.ones(
+        (att_mask_batch, seq_length, seq_length), device=data.device).tril_().view(
             att_mask_batch, 1, seq_length, seq_length)
 
     # Loss mask.
