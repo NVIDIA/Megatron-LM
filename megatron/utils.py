@@ -281,6 +281,7 @@ def throughput_calculator(model, args, iteration_time, total_iterations):
     num_layers = args.num_layers
     vocab_size = args.padded_vocab_size
     gqa = args.num_attention_heads // args.num_key_value_heads
+    num_experts_routed_to = args.topk
     ffn_multiplier = 3 if args.swiglu else 2
     macs_per_flops = 2
 
@@ -294,7 +295,7 @@ def throughput_calculator(model, args, iteration_time, total_iterations):
 
     pre_and_post_mha_gemm_macs = batch_size * num_layers * (1 + (2 // gqa) + 1) * (hidden_size**2) * seq_len
     mha_bgemm_macs = batch_size * num_layers * 2 * head_dim * num_attention_heads * (seq_len**2)
-    ffn_gemm_macs = batch_size * num_layers * ffn_multiplier * ffn_hidden_size * hidden_size * seq_len
+    ffn_gemm_macs = batch_size * num_layers * ffn_multiplier * ffn_hidden_size * hidden_size * seq_len * num_experts_routed_to
     logit_lmhead_gemm_macs = batch_size * vocab_size * hidden_size * seq_len
 
     fwd_macs = pre_and_post_mha_gemm_macs + mha_bgemm_macs + ffn_gemm_macs + logit_lmhead_gemm_macs
