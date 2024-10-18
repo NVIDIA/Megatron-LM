@@ -366,6 +366,7 @@ class MLASelfAttention(MultiLatentAttention):
         query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
 
         # key: [s, b, n, 192]
+        k_pos_emb = k_pos_emb.repeat_interleave(self.num_attention_heads_per_partition, dim=2)
         key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
 
         query = query.contiguous()
