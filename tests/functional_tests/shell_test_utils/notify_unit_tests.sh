@@ -48,7 +48,7 @@ if [[ ${ret_code:-0} -ne 0 ]]; then
     exit 1
 fi
 
-UNIT_TESTS_JOBS=$(echo -E $PIPELINE_JSON | jq '[.[] | select(.name | startswith("unit_tests"))]')
+UNIT_TESTS_JOBS=$(echo -E $PIPELINE_JSON | jq '[.[] | select(.name | startswith("test:unit_tests_"))]')
 
 if [[ $UNIT_TESTS_JOBS == null ]]; then
     FAILED_JOBS=$(curl \
