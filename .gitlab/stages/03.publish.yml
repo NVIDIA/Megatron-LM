@@ -14,8 +14,8 @@
 
 create-release-branch:
   extends: [.publish_common_freeze]
-  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
-  needs: [build_image]
+  image: ${CI_MCORE_LTS_IMAGE}:${CI_PIPELINE_ID}
+  needs: [test:build_image]
   tags: [mcore-docker-node-small]
   variables:
     GIT_STRATEGY: "clone"

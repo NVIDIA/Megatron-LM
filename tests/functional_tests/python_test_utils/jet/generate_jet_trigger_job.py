@@ -84,7 +84,7 @@ def main(
                 {"if": '$CI_MERGE_REQUEST_ID'},
             ],
             "timeout": "7 days",
-            "needs": [{"pipeline": '$PARENT_PIPELINE_ID', "job": "jet-generate"}],
+            "needs": [{"pipeline": '$PARENT_PIPELINE_ID', "job": "functional:configure"}],
             "script": [" ".join(script)],
             "artifacts": {"paths": ["results/"], "when": "always"},
         }

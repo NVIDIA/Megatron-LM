@@ -1,4 +1,4 @@
-.test_mr_rules:
+.test_rules:
   rules:
     - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
@@ -9,16 +9,15 @@
 include:
   - template: Security/Secret-Detection.gitlab-ci.yml
 
-build_image:
-  extends: [.test_mr_rules]
+test:build_image:
+  extends: [.test_rules, .dind_rules]
   tags:
     - ${TAG}
-  image: docker:26.1.4-dind
   timeout: 45m
   parallel:
     matrix:
-      - IMAGE: CI_MCORE_IMAGE
-        FILE: Dockerfile.ci
+      - IMAGE: CI_MCORE_LTS_IMAGE
+        FILE: Dockerfile.ci.lts
         BASE_IMAGE: nvcr.io/nvidia/pytorch:24.01-py3
         TAG: mcore-docker-node-large
       - IMAGE: CI_MCORE_DEV_IMAGE
@@ -26,16 +25,13 @@ build_image:
         BASE_IMAGE: nvcr.io/nvidia/pytorch:24.07-py3
         TAG: mcore-docker-node-large
       - IMAGE: CI_NEMO_IMAGE
-        FILE: Dockerfile.ci
+        FILE: Dockerfile.ci.lts
         BASE_IMAGE: nvcr.io/nvidian/nemo:nightly
         TAG: mcore-docker-node-large
       - IMAGE: LINTING_IMAGE
         FILE: Dockerfile.linting
         BASE_IMAGE: python:3.10
         TAG: mcore-docker-node-small
-  before_script:
-    - echo "$NGC_API_KEY" | docker login nvcr.io -u '$oauthtoken' --password-stdin
-    - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
   variables:
     STAGE: main
   script:
@@ -45,8 +41,6 @@ build_image:
         set -x
         env
         eval "IMAGE=\$$IMAGE"
-
-        docker system prune -a --filter "until=24h" -f || true
         
         docker buildx create --name container --driver=docker-container
       
@@ -61,6 +55,12 @@ build_image:
           ADDITIONAL_PARAMS+=("-t ${IMAGE}:nightly")
         fi
 
+        if [[ "$CI_PIPELINE_SOURCE" == "merge_request_event" ]]; then
+          MCORE_REF=$(echo ${CI_MERGE_REQUEST_REF_PATH} | sed 's/head$/merge/')
+        else
+          MCORE_REF=$CI_COMMIT_SHA
+        fi
+
         DOCKER_BUILDKIT=1 docker build \
           --secret id=JET_INDEX_URLS \
           --target $STAGE \
@@ -68,6 +68,9 @@ build_image:
           -t ${IMAGE}:${CI_PIPELINE_ID} \
           --builder=container \
           --build-arg CACHEBUST=$(cat /proc/sys/kernel/random/uuid) \
+          --build-arg MCORE_REPO=${CI_REPOSITORY_URL} \
+          --build-arg MCORE_REF=${MCORE_REF} \
+          --build-arg MCORE_BACKWARDS_REF="core_r0.9.0" \
           --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_PIPELINE_ID} \
           --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID:-noop} \
           --cache-from type=registry,ref=${IMAGE}-buildcache:main \
@@ -80,55 +83,37 @@ build_image:
   retry:
     max: 2
 
-unit_tests:
-  # This job runs both test suite of ToT and of a historic ref against
-  # the current code. This is a form of backwards compatibility testing
-  # and helps in providing stable interfaces.
-  extends: [.test_mr_rules]
-  image: ${IMAGE}:${CI_PIPELINE_ID}
-  needs: [build_image]
+.unit_tests:
+  extends: [.test_rules, .dind_rules]
+  needs: [test:build_image]
   timeout: 180m
-  parallel:
-    matrix:
-      - TAG: latest
-        IMAGE: ${CI_MCORE_IMAGE}
-      - TAG: latest
-        IMAGE: ${CI_MCORE_DEV_IMAGE}
-      - TAG: core_r0.9.0
-        IMAGE: ${CI_MCORE_IMAGE}
-      - TAG: core_r0.9.0
-        IMAGE: ${CI_MCORE_DEV_IMAGE}
   tags: [8xL40S]
   variables:
-    GIT_STRATEGY: clone
-    GIT_DEPTH: 0
-  before_script:
-    - |
-      if [[ $TAG != latest ]]; then
-        git checkout $TAG
-        rm -rf /opt/megatron-lm/tests
-        cp -r tests/ /opt/megatron-lm
-      fi
+    GIT_STRATEGY: none
   script:
+    - if [ $UNIT_TEST_REPEAT -eq 0 ]; then exit 0; fi;
+    - docker run --name mcore_ci_${CI_PIPELINE_ID} -d --rm -e TAG -e UNIT_TEST_REPEAT -e UNIT_TEST_TIMEOUT --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 ${IMAGE}:${CI_PIPELINE_ID} bash -c "sleep $(( ${UNIT_TEST_TIMEOUT} * 60 + 60 ))"
     - |
-      export NVTE_FLASH_ATTN=0
-      export NVTE_FUSED_ATTN=0
-      
-      cd /opt/megatron-lm
-      if [[ $UNIT_TEST_REPEAT -eq 0 ]]; then
-        exit 0
-      fi
+      docker exec mcore_ci_${CI_PIPELINE_ID} bash -c '
+        set -e
+        
+        MCORE_DIR=$([[ "$TAG" == "latest" ]] && echo "" || echo "-$TAG/")
 
-      for i in $(seq $UNIT_TEST_REPEAT); do
-        SEED=$((RANDOM % 9000 + 1000));
-        ARGS=()
-        if [[ $TAG != latest ]]; then
-          ARGS+=(-m "not internal and not flaky and not flaky_in_dev")
-        else
-          ARGS+=(-m "not flaky and not flaky_in_dev")
-        fi
-        timeout ${UNIT_TEST_TIMEOUT}m torchrun --nproc_per_node=8 -m pytest --random-order --random-order-seed ${SEED} -xvs --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail "${ARGS[@]}" tests/unit_tests
-      done
+        cd /opt/megatron-lm$MCORE_DIR;
+
+        for i in $(seq $UNIT_TEST_REPEAT); do
+          SEED=$((RANDOM % 9000 + 1000));
+          ARGS=()
+          if [[ $TAG != latest ]]; then
+            ARGS+=(-m "not internal and not flaky and not flaky_in_dev")
+          else
+            ARGS+=(-m "not flaky and not flaky_in_dev")
+          fi
+          timeout ${UNIT_TEST_TIMEOUT}m torchrun --nproc_per_node=8 -m pytest --random-order --random-order-seed ${SEED} -xvs --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail "${ARGS[@]}" tests/unit_tests
+        done
+      '
+  after_script:
+    - docker container stop mcore_ci_${CI_PIPELINE_ID} || true
   artifacts:
     paths:
       - coverage
@@ -138,10 +123,38 @@ unit_tests:
       when: always
     - when: always
 
-unit-tests-results-notify:
-  extends: [.test_mr_rules]
-  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
-  needs: [unit_tests]
+test:pyt(LTS)_mcore(latest):
+  extends: [.unit_tests]
+  variables:
+    TAG: latest
+    IMAGE: ${CI_MCORE_LTS_IMAGE}
+
+test:pyt(LTS)_mcore(0.9.0):
+  extends: [.unit_tests]
+  variables:
+    TAG: core_r0.9.0
+    IMAGE: ${CI_MCORE_LTS_IMAGE}
+
+test:pyt(DEV)_mcore(latest):
+  extends: [.unit_tests]
+  variables:
+    TAG: latest
+    IMAGE: ${CI_MCORE_DEV_IMAGE}
+
+test:pyt(DEV)_mcore(0.9.0):
+  extends: [.unit_tests]
+  variables:
+    TAG: core_r0.9.0
+    IMAGE: ${CI_MCORE_DEV_IMAGE}
+
+test:notify:
+  extends: [.test_rules]
+  image: ${CI_MCORE_LTS_IMAGE}:${CI_PIPELINE_ID}
+  needs:
+    - test:pyt(LTS)_mcore(latest)
+    - test:pyt(DEV)_mcore(latest)
+    - test:pyt(LTS)_mcore(0.9.0)
+    - test:pyt(DEV)_mcore(0.9.0)
   tags:
     - mcore-docker-node-small
   script:
@@ -160,11 +173,11 @@ unit-tests-results-notify:
       when: always
     - when: never
 
-docs_build_test:
-  extends: [.test_mr_rules]
-  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
+test:docs_build:
+  extends: [.test_rules]
+  image: ${CI_MCORE_LTS_IMAGE}:${CI_PIPELINE_ID}
   tags: [mcore-docker-node-small]
-  needs: [build_image]
+  needs: [test:build_image]
   script:
     - cd ..
     - rm -rf documentation && git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/nemo-megatron-core-tme/documentation.git
@@ -172,27 +185,28 @@ docs_build_test:
     - cd documentation/
     - ./repo docs
 
-formatting:
-  extends: [.test_mr_rules]
+test:formatting:
+  extends: [.test_rules]
   image: ${LINTING_IMAGE}:${CI_PIPELINE_ID}
   tags: [mcore-docker-node-small]
-  needs: [build_image]
+  needs: [test:build_image]
   script:
     - env
     - git fetch origin main
     - BASE_REF="$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" CHECK_ONLY=true SKIP_DOCS=$([[ "$CI_MERGE_REQUEST_LABELS" == *"Skip docs"* ]] && echo "true" || echo "false") bash tools/autoformat.sh
 
-copyright:
-  extends: [.test_mr_rules]
+test:copyright:
+  extends: [.test_rules]
   tags: [mcore-docker-node-small]
-  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
-  needs: [build_image]
+  image: ${CI_MCORE_LTS_IMAGE}:${CI_PIPELINE_ID}
+  needs: [test:build_image]
   script:
     - git fetch origin main
     - bash tools/copyright.sh
 
-secret_detection:
+test:secret_detection:
   tags: [mcore-docker-node-small]
+  extends: ".secret-analyzer"
   variables:
     GIT_DEPTH: 0
     SECRET_DETECTION_LOG_OPTIONS: ${CI_MERGE_REQUEST_DIFF_BASE_SHA}..${CI_COMMIT_SHA}
