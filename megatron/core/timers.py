@@ -110,8 +110,7 @@ class Timer(TimerBase):
         self._started = False
 
     def reset(self):
-        """Reset timer.
-        """
+        """Reset timer."""
         # Don't reset _active_time
         self._elapsed = 0.0
         self._started = False
@@ -145,14 +144,13 @@ class Timer(TimerBase):
 
 
 class Timers:
-    """Class for a group of Timers.
-    """
+    """Class for a group of Timers."""
 
     def __init__(self, log_level, log_option):
         """Initialize group of timers.
 
         Args:
-            log_level (int): Log level to control what timers are enabled.            
+            log_level (int): Log level to control what timers are enabled.
             log_option (str): Setting for logging statistics over ranks for all the timers. Allowed: ['max', 'minmax', 'all'].
         """
         self._log_level = log_level
@@ -351,7 +349,7 @@ class Timers:
         barrier: bool = False,
     ):
         """logs the timers passed in names to stdout. Example usage is to log average per step value for timer 'foo',
-          this function can be called with normalizer factor set to logging interval. 
+          this function can be called with normalizer factor set to logging interval.
 
         Args:
             names (List[str]): Names of the timers to log.

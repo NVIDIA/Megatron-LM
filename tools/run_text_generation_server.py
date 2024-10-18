@@ -23,6 +23,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
 )
 
+from contextlib import nullcontext
 import torch
 from typing import Union
 import megatron
@@ -66,9 +67,9 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             transformer_layer_spec = import_module(args.spec)
         else:
             if use_te:
-                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm)
+                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm, args.qk_layernorm)
             else:
-                transformer_layer_spec = get_gpt_layer_local_spec(args.num_experts, args.moe_grouped_gemm)
+                transformer_layer_spec = get_gpt_layer_local_spec(args.num_experts, args.moe_grouped_gemm, args.qk_layernorm)
 
         model = GPTModel(
             config=config,
@@ -81,7 +82,9 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             parallel_output=False,
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
-            rotary_percent=args.rotary_percent
+            rotary_percent=args.rotary_percent,
+            rotary_base=args.rotary_base,
+            rope_scaling=args.use_rope_scaling
         )
 
     return model
@@ -106,14 +109,22 @@ if __name__ == "__main__":
     print_rank_0("WARNING: Forcing exit_on_missing_checkpoint to True for text "
                  "generation.")
     args.exit_on_missing_checkpoint = True
+
     # Set up model and load checkpoint
-    model = get_model(model_provider, wrap_with_ddp=False)
+    load_context = nullcontext()
+    if args.fp8:
+        from transformer_engine.pytorch.fp8 import fp8_model_init
+        load_context = fp8_model_init()
+    with load_context:
+        model = get_model(model_provider, wrap_with_ddp=False)
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None)
 
     assert len(model) == 1, "Above condition should have caught this"
     model = model[0]
+    model.eval()
+
     if mpu.is_pipeline_first_stage() and mpu.get_tensor_model_parallel_rank() == 0:
         server = MegatronServer(model)
         server.run("0.0.0.0",port=args.port)

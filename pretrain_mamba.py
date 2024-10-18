@@ -75,7 +75,9 @@ def model_provider(pre_process=True, post_process=True) -> MambaModel:
         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
         parallel_output=True,
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-        position_embedding_type=args.position_embedding_type
+        position_embedding_type=args.position_embedding_type,
+        rotary_percent=args.rotary_percent,
+        rotary_base=args.rotary_base
     )
 
     for l in range(model.decoder.num_layers_per_pipeline_rank):
@@ -186,6 +188,7 @@ def core_gpt_dataset_config_from_args(args):
             get_blend_from_list(args.valid_data_path),
             get_blend_from_list(args.test_data_path)
         ],
+        renormalize_blend_weights=args.renormalize_blend_weights,
         split=args.split,
         num_dataset_builder_threads=args.num_dataset_builder_threads,
         path_to_cache=args.data_cache_path,

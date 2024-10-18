@@ -1,0 +1,31 @@
+CI:
+- .gitlab-ci.yml
+- Dockerfile.ci
+- jet-tests.yml
+
+Datasets:
+- megatron/core/datasets/**
+
+BERT:
+- megatron/core/models/bert/**
+
+GPT:
+- megatron/core/models/gpt/**
+
+RETRO:
+- megatron/core/models/retro/**
+
+Dist-Ckpt:
+- megatron/core/dist_checkpointing
+
+Dist-Opt:
+- megatron/core/optimizer/distrib_optimizer 
+
+Inference:
+- megatron/core/inference
+
+MoE:
+- megatron/core/transformer/moe
+
+Tests:
+- tests/**

@@ -27,7 +27,6 @@ from .utils import get_index_dir
 
 
 class Index(abc.ABC):
-
     """Abstract base class for indexes.
 
     *Note* : While currently only Faiss-based classes are implemented, in the
@@ -60,7 +59,7 @@ class Index(abc.ABC):
             File path to empty index (i.e., this index has had index.train() called, but not yet index.add()).
         """
         return os.path.join(
-            get_index_dir(config), "empty_%.3f.faissindex" % config.retro_index_train_load_fraction,
+            get_index_dir(config), "empty_%.3f.faissindex" % config.retro_index_train_load_fraction
         )
 
     def get_empty_index(self, config: RetroPreprocessingConfig) -> faiss.Index:
@@ -86,7 +85,7 @@ class Index(abc.ABC):
         return os.path.join(
             get_index_dir(config),
             "added_%.3f_%.3f.faissindex"
-            % (config.retro_index_train_load_fraction, config.retro_index_add_load_fraction,),
+            % (config.retro_index_train_load_fraction, config.retro_index_add_load_fraction),
         )
 
     def get_added_index(self, config: RetroPreprocessingConfig) -> faiss.Index:

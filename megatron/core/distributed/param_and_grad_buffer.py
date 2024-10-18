@@ -3,18 +3,24 @@
 import logging
 import math
 import os
+import warnings
 from enum import Enum
 from typing import Dict, List, Optional
 
 import torch
+from torch.distributed import _coalescing_manager
 
-from ..utils import log_on_each_pipeline_stage
+from ..utils import is_float8tensor, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 
 logger = logging.getLogger(__name__)
 
 
 class BufferType(Enum):
+    """
+    Enumeration for buffer type.
+    """
+
     PARAM = 1
     GRAD = 2
 
@@ -31,163 +37,291 @@ def shard_buffer(buffer: torch.Tensor, data_parallel_world_size: int):
     return sharded_buffer
 
 
-class Bucket:
+class _ParamAndGradBucket:
     """
-    Bucket to keep track of a subset of the model's gradients. Provides functionality to register
-    when params in the bucket have grads ready to be synced; an asynchronous communication call
-    is automatically launched when _all_ params in the bucket have grads ready.
+    Bucket to keep track of a subset of the model's parameters and gradients.
 
     Args:
-        ddp_config: DistributedDataParallel config object.
         params: List of parameters whose gradients are collated in this bucket.
-        param_data: View in larger ParamAndGradBuffer.param_data that this bucket is responsible for.
-        grad_data: View in larger ParamAndGradBuffer.grad_data that this bucket is responsible for.
+        param_data: View in ParamAndGradBuffer.param_data that this bucket is responsible for.
+        grad_data: View in ParamAndGradBuffer.grad_data that this bucket is responsible for.
         offset: Offset of this bucket's view in the larger ParamAndGradBuffer.
         numel_unpadded: Number of unpadded elements in bucket.
-        data_parallel_group: Data-parallel process group.
-        data_parallel_world_size: World size using the data-parallel group group.
         gradient_scaling_factor: This factor is utilized to scale gradients prior to their
             communication. Its application is twofold: it facilitates the averaging of gradients
             and the scaling of gradients in the context of the Mixture of Experts (MoE) model.
+        bucket_id: Index of bucket in buffer.
     """
 
     def __init__(
         self,
-        ddp_config: DistributedDataParallelConfig,
         params: List[torch.nn.Parameter],
         param_data: Optional[torch.Tensor],
         grad_data: torch.Tensor,
         offset: int,
         numel_unpadded: int,
-        data_parallel_group: torch.distributed.ProcessGroup,
-        data_parallel_world_size: int,
         gradient_scaling_factor: float,
+        bucket_id: int,
     ):
-        self.ddp_config = ddp_config
-
-        # State for bookkeeping: params is the set of parameters this bucket is
-        # responsible for, params_with_grad is the set of parameters with grads
-        # available. When overlap_grad_reduce is True, communication (all-reduce
-        # or reduce-scatter) is issued when params_with_grad equals params.
         self.params_list = params
         self.params = set(params)
-        self.params_with_grad = set()
+        # Make sure there are no duplicate params.
+        assert len(self.params_list) == len(self.params)
         self.param_data = param_data
         self.grad_data = grad_data
         # The distributed optimizer needs to keep track of this bucket's offset
         # within the full grad_buffer.
         self.offset = offset
         self.numel_unpadded = numel_unpadded
+        self.gradient_scaling_factor = gradient_scaling_factor
+        self.bucket_id = bucket_id
+
+
+class _ParamAndGradBucketGroup:
+    """
+    Put multiple buckets into a group so that their communications can be aggregated together.
+    Provides functionality to register when params in the bucket group have grads ready to be
+    synced; an asynchronous communication call is automatically launched when _all_ params in
+    the bucket group have grads ready.
+
+    Args:
+        buckets: A list of buckets.
+        ddp_config: DistributedDataParallel config object.
+        data_parallel_group: Data-parallel process group.
+        data_parallel_world_size: World size using the data-parallel group group.
+    """
+
+    def __init__(
+        self,
+        buckets: List[_ParamAndGradBucket],
+        ddp_config: DistributedDataParallelConfig,
+        data_parallel_group: torch.distributed.ProcessGroup,
+        data_parallel_world_size: int,
+    ):
+        self.buckets = buckets
+        self.ddp_config = ddp_config
         self.data_parallel_group = data_parallel_group
         self.data_parallel_world_size = data_parallel_world_size
         self.data_parallel_rank = torch.distributed.get_rank(group=data_parallel_group)
-        self.gradient_scaling_factor = gradient_scaling_factor
+
+        # State for bookkeeping: params is the set of parameters this bucket group is
+        # responsible for, params_with_grad is the set of parameters with grads
+        # available. When overlap_grad_reduce is True, communication (all-reduce
+        # or reduce-scatter) is issued when params_with_grad equals params.
+        self.param_to_bucket = {}
+        self.params = set()
+        for bucket in self.buckets:
+            for param in bucket.params_list:
+                self.param_to_bucket[param] = bucket
+                self.params.add(param)
+
+        self.next_param_gather_bucket_group = None
 
         self.reset()
+        self.param_gather_handle = None
+        self.param_gather_dispatched = False
+        self.grad_reduce_handle = None
 
     def reset(self):
         """
-        Reset metadata in bucket in preparation for the next iteration of training.
+        Reset metadata in bucket group in preparation for the next iteration of training.
         """
         self.params_with_grad = set()
-        self.communication_handle = None
-        self.is_communication_outstanding = False
+        self.is_last_microbatch = True
+
+    def check_for_nan_in_grad(self):
+        """
+        Make sure norm of grads in bucket are not NaN prior to data-parallel
+        all-reduce / reduce-scatter.
+        """
+        global_rank = torch.distributed.get_rank()
+        norm_is_nan = self.buckets[0].grad_data.norm(p=2).isnan()
+        for i in range(1, len(self.buckets)):
+            norm_is_nan.logical_or_(self.buckets[i].grad_data.norm(p=2).isnan())
+        assert not norm_is_nan, (
+            f'Rank {global_rank}: found NaN in local grad norm in '
+            f'backward pass before data-parallel communication collective. '
+            f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
+        )
+
+    def start_param_sync(self, force_sync: bool = False):
+        """
+        Initiates all necessary param all-gathers for this bucket.
+
+        When ddp_config.overlap_param_gather is set to True, dispatches an asynchronous
+        communication call (unless force_sync is True). When ddp_config.overlap_param_gather
+        is set to False, makes synchronous call.
+
+        Args:
+            force_sync (bool, optional): force synchronous collective regardless of
+                other settings if true.
+        """
+        assert self.ddp_config.use_distributed_optimizer
+
+        if force_sync:
+            if self.param_gather_handle is not None:
+                self.param_gather_handle.wait()
+                self.param_gather_handle = None
+                return
+        else:
+            assert self.param_gather_handle is None
+
+        async_op = self.ddp_config.overlap_param_gather and not force_sync
+        # Coalesce communication kernels across buckets in the bucket group.
+        with _coalescing_manager(self.data_parallel_group, async_ops=async_op) as cm:
+            for bucket in self.buckets:
+                local_data_view = shard_buffer(bucket.param_data, self.data_parallel_world_size)[
+                    self.data_parallel_rank
+                ]
+                torch.distributed._all_gather_base(
+                    bucket.param_data,
+                    local_data_view,
+                    group=self.data_parallel_group,
+                    async_op=async_op,
+                )
+        if async_op:
+            self.param_gather_handle = cm
+        else:
+            # When using `_coalescing_manager`, even if a synchronous op (async_op=False) is used,
+            # `cm` is not None, which is different from when `_coalescing_manager` is not used in
+            # which case the torch.distributed._all_gather_base() will return None. In order to
+            # maintain consistency with prior code, we need to manually set communication handle to
+            # None.
+            self.param_gather_handle = None
+        self.param_gather_dispatched = True
+
+    def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
+        """
+        Finishes param sync communication operation for this bucket. Dispatches
+        next bucket's param sync if available, unless skip_next_bucket_dispatch
+        is True.
+
+        When ddp_config.overlap_param_gather is set to True, waits for asynchronous
+        communication call to complete (and dispatches one if one is not already
+        outstanding). Throws assertion error if ddp_config.overlap_param_gather is set to
+        False.
+
+        Args:
+            skip_next_bucket_dispatch (bool, optional): if true, dispatch next
+                bucket's communication if available.
+        """
+        assert self.ddp_config.use_distributed_optimizer
+        assert self.ddp_config.overlap_param_gather
+
+        # If current bucket's param AG has not been dispatched, dispatch it now (e.g., first
+        # AG bucket in first model chunk if ddp_config.align_param_gather is False).
+        if not self.param_gather_dispatched:
+            self.start_param_sync()
+
+        if self.param_gather_handle is not None:
+            self.param_gather_handle.wait()
+            self.param_gather_handle = None
+            # Dispatch next bucket's asynchronous param AG.
+            if self.next_param_gather_bucket_group is not None and not skip_next_bucket_dispatch:
+                self.next_param_gather_bucket_group.start_param_sync()
 
     def start_grad_sync(self):
         """
-        Initiates grad sync (all-reduce or reduce-scatter) communication operation
-        for this bucket.
+        Initiates grad sync (all-reduce or reduce-scatter) communication operations
+        for all buckets in the bucket group.
 
-        When overlap_grad_reduce is set to True, dispatches an asynchronous
-        communication call. When overlap_grad_reduce is set to False, makes
+        When ddp_config.overlap_grad_reduce is set to True, dispatches an asynchronous
+        communication call. When ddp_config.overlap_grad_reduce is set to False, makes
         synchronous call.
         """
         assert (
-            self.communication_handle is None and not self.is_communication_outstanding
+            self.grad_reduce_handle is None
         ), 'Should not have multiple communication calls outstanding at once'
 
-        # Make sure norm of grads in bucket are not NaN
-        # prior to data-parallel all-reduce / reduce-scatter.
         if self.ddp_config.check_for_nan_in_grad:
-            global_rank = torch.distributed.get_rank()
-            norm = self.grad_data.norm(p=2)
-            assert not norm.isnan(), (
-                f'Rank {global_rank}: found NaN in local grad norm in '
-                f'backward pass before data-parallel communication collective. '
-                f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
-            )
+            self.check_for_nan_in_grad()
 
         # gradient_scaling_factor already takes into account whether we are computing
         # an average or sum in the data-parallel collective.
-        if self.gradient_scaling_factor != 1.0:
-            self.grad_data *= self.gradient_scaling_factor
+        for bucket in self.buckets:
+            if bucket.gradient_scaling_factor != 1.0:
+                bucket.grad_data *= bucket.gradient_scaling_factor
 
         # Decide reduce_op.
         reduce_op = torch.distributed.ReduceOp.SUM
         if self.ddp_config.average_in_collective:
             reduce_op = torch.distributed.ReduceOp.AVG
 
-        # Use async_op only when overlap_grad_reduce is True.
-        if self.ddp_config.use_distributed_optimizer:
-            local_data_view = shard_buffer(self.grad_data, self.data_parallel_world_size)[
-                self.data_parallel_rank
-            ]
-            self.communication_handle = torch.distributed._reduce_scatter_base(
-                local_data_view,
-                self.grad_data,
-                op=reduce_op,
-                group=self.data_parallel_group,
-                async_op=self.ddp_config.overlap_grad_reduce,
-            )
+        # Use async communications only when overlap_grad_reduce is True.
+        async_op = self.ddp_config.overlap_grad_reduce
+        # Coalesce communication kernels across buckets in the bucket group.
+        with _coalescing_manager(self.data_parallel_group, async_ops=async_op) as cm:
+            for bucket in self.buckets:
+                if self.ddp_config.use_distributed_optimizer:
+                    local_data_view = shard_buffer(bucket.grad_data, self.data_parallel_world_size)[
+                        self.data_parallel_rank
+                    ]
+                    torch.distributed._reduce_scatter_base(
+                        local_data_view,
+                        bucket.grad_data,
+                        op=reduce_op,
+                        group=self.data_parallel_group,
+                        async_op=async_op,
+                    )
+                else:
+                    torch.distributed.all_reduce(
+                        bucket.grad_data,
+                        op=reduce_op,
+                        group=self.data_parallel_group,
+                        async_op=async_op,
+                    )
+        if async_op:
+            self.grad_reduce_handle = cm
         else:
-            self.communication_handle = torch.distributed.all_reduce(
-                self.grad_data,
-                op=reduce_op,
-                group=self.data_parallel_group,
-                async_op=self.ddp_config.overlap_grad_reduce,
-            )
-        if self.ddp_config.overlap_grad_reduce:
-            self.is_communication_outstanding = True
-        else:
-            self.is_communication_outstanding = False
+            # When using `_coalescing_manager`, even if a synchronous op (async_op=False) is used,
+            # `cm` is not None, which is different from when `_coalescing_manager` is not used in
+            # which case the torch.distributed._reduce_scatter_base() will return None. In order to
+            # maintain consistency with prior code, we need to manually set communication handle to
+            # None.
+            self.grad_reduce_handle = None
 
     def finish_grad_sync(self):
         """
-        Finishes grad sync (all-reduce or reduce-scatter) communication operation
-        for this bucket.
+        Finishes grad sync (all-reduce or reduce-scatter) communication operations
+        for all buckets in the bucket group.
 
-        When overlap_grad_reduce is set to True, waits for asynchronous communication
-        call to complete. When overlap_grad_reduce is set to False, makes synchronous call.
+        When ddp_config.overlap_grad_reduce is set to True, waits for asynchronous
+        communication call to complete. When ddp_config.overlap_grad_reduce is set to False,
+        makes synchronous call.
         """
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
+        self.param_gather_dispatched = False
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync()
             return
-        assert self.communication_handle is not None and self.is_communication_outstanding, (
+        assert self.grad_reduce_handle is not None, (
             f'Communication call has not been issued for this bucket '
             f'({len(self.params_with_grad)}/{len(self.params)} params have grad available)'
         )
-        self.communication_handle.wait()
+        self.grad_reduce_handle.wait()
+        self.grad_reduce_handle = None
 
     def register_grad_ready(self, param: torch.nn.Parameter):
         """
         Registers grads for the passed-in param to be "ready" for grad sync.
 
         When the number of microbatches is greater than 1, we only want to register
-        grads as ready when processing the last microbatch and overlap_grad_reduce is True.
+        grads as ready when processing the last microbatch and ddp_config.overlap_grad_reduce
+        is True.
         """
-        assert param in self.params, 'Param is not in the bucket'
-        assert param not in self.params_with_grad, 'Cannot set grad twice'
         assert (
             self.ddp_config.overlap_grad_reduce
-        ), 'register_grad_ready() should be called only when overlapping grad reduce'
-        self.params_with_grad.add(param)
-        # If all params in bucket have grads available, issue communication call.
-        if len(self.params_with_grad) == len(self.params):
-            self.start_grad_sync()
+        ), 'register_grad_ready() should only be called when overlap_grad_reduce is True'
+        if self.is_last_microbatch:
+            assert param in self.param_to_bucket, 'Param is not in the bucket group'
+            assert param not in self.params_with_grad, 'Cannot set grad twice'
+            self.params_with_grad.add(param)
+            # If all params in bucket group have grads available, issue communication call.
+            if len(self.params_with_grad) == len(self.params):
+                self.start_grad_sync()
 
 
-class ParamAndGradBuffer:
+class _ParamAndGradBuffer:
     """
     Groups parameters and gradients into a contiguous buffer, and then breaks the buffer into
     buckets with roughly `bucket_size` parameters each.
@@ -204,6 +338,9 @@ class ParamAndGradBuffer:
         gradient_scaling_factor: This factor is utilized to scale gradients prior to their
             communication. Its application is twofold: it facilitates the averaging of gradients
             and the scaling of gradients in the context of the Mixture of Experts (MoE) model.
+        param_indices: The index of each param among the params with same dtype, if a param is fp8,
+            use its "fake" high precision dtype to determine which params have same dtype with it.
+            These indices are needed when loading a non-native-fp8 checkpoint in native-fp8 mode.
     """
 
     def __init__(
@@ -216,8 +353,11 @@ class ParamAndGradBuffer:
         bucket_size: int,
         param_to_name: Dict[torch.nn.Parameter, str],
         gradient_scaling_factor: float,
+        param_indices: List[int],
     ):
         self.ddp_config = ddp_config
+        self.params = params
+        self.param_indices = param_indices
 
         # Check that params are unique.
         unique_params = set()
@@ -234,7 +374,6 @@ class ParamAndGradBuffer:
             group=self.data_parallel_group
         )
         self.gradient_scaling_factor = gradient_scaling_factor
-        self.is_last_microbatch = True
 
         # Data structures to store underlying buckets and relevant indexing data.
         self.buckets = []
@@ -269,84 +408,84 @@ class ParamAndGradBuffer:
         # First, figure out how many elements should be in the underlying buffer storage.
         # Note that if we need to split the buffer into smaller buckets, each of these
         # might need to be padded as well (if using the distributed optimizer).
-        data_start_index = 0
-        bucket_data_start_index = data_start_index
+        param_start_index = 0
+        bucket_start_index = param_start_index
         bucket_params = set()
         self.bucket_indices = []
         per_bucket_numel_unpadded = []
         bucket_id = 0
 
-        def _create_new_bucket(data_end_index: int) -> int:
+        def _update_bucket_metadata(param_end_index: int) -> int:
             """
-            Create the bucket_id'th bucket with collected bucket_params, starting at
-            bucket_data_start_index.
+            Record metadata for the bucket starting at bucket_start_index and ending with the
+            passed-in param_end_index. Returns the bucket's end_index.
             """
-            nonlocal bucket_data_start_index, bucket_params, bucket_id
-            per_bucket_numel_unpadded.append(data_end_index - bucket_data_start_index)
-            data_end_index = _pad_end_of_bucket_if_needed(data_end_index)
-            # Update bucket metadata.
-            self.bucket_indices.append((bucket_data_start_index, data_end_index))
-            bucket_data_start_index = data_end_index
-            # Re-set bucket_params and increment bucket_id for next bucket.
+            nonlocal bucket_start_index, bucket_params, bucket_id
+            per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
+            bucket_end_index = _pad_end_of_bucket_if_needed(param_end_index)
+
+            # Record metadata of new bucket.
+            self.bucket_indices.append((bucket_start_index, bucket_end_index))
+            bucket_start_index = bucket_end_index
+
+            # Prepare for next bucket.
             bucket_params = set()
             bucket_id += 1
-            # Return the potentially padded data_end_index.
-            return data_end_index
+
+            # Return the potentially padded bucket_end_index.
+            return bucket_end_index
+
+        def _does_param_require_new_bucket(param):
+            """
+            Split shared embedding parameters into separate bucket if using distributed
+            optimizer that makes use of reduce-scatters instead of all-reduces.
+            This ensures that the first and last pipeline stage partition optimizer state
+            for the shared embedding parameters the same way across DP replicas, allowing
+            the DP reduce-scatter to be before the embedding all-reduce.
+            """
+            return (
+                getattr(param, "shared_embedding", False)
+                and self.ddp_config.use_distributed_optimizer
+            )
 
         for param in params[::-1]:
-            # Iterate through parameters in reverse order to roughly follow backprop order,
-            # and skip parameters that don't require gradients.
-            if not param.requires_grad:
-                continue
+            # Iterate through parameters in reverse order to roughly follow backprop order.
+
             this_numel = param.data.nelement()
-            data_start_index = _pad_start_of_param_if_needed(data_start_index)
-            data_end_index = data_start_index + this_numel
+            param_start_index = _pad_start_of_param_if_needed(param_start_index)
 
-            def _does_param_require_new_bucket(param):
-                """
-                Split shared embedding parameters into separate bucket if using distributed
-                optimizer that makes use of reduce-scatters instead of all-reduces.
-                This ensures that the first and last pipeline stage partition optimizer state
-                for the shared embedding parameters the same way across DP replicas, allowing
-                the DP reduce-scatter to be before the embedding all-reduce.
-                """
-                return (
-                    getattr(param, "shared_embedding", False)
-                    and self.ddp_config.use_distributed_optimizer
-                )
-
-            # Create bucket with already collected parameters if current param needs its own bucket.
-            if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
+            # Create bucket with collected parameters if current param needs its own bucket.
+            if _does_param_require_new_bucket(param):
                 # We are creating a bucket for the already accumulated parameters, whose params
-                # end at the current data_start_index.
+                # end at the current param_start_index.
                 if self.ddp_config.use_distributed_optimizer:
-                    # data_start_index should already be padded.
-                    assert data_start_index % self.data_parallel_world_size == 0
-                _create_new_bucket(data_start_index)
+                    # Make sure new bucket is appropriately padded.
+                    if param_start_index % self.data_parallel_world_size != 0:
+                        param_start_index = _pad_end_of_bucket_if_needed(param_start_index)
+                if len(bucket_params) > 0:
+                    bucket_end_index = _update_bucket_metadata(param_start_index)
 
-            self.param_index_map[param] = (
-                data_start_index,
-                data_end_index,
-                bucket_id,
-            )
+            param_end_index = param_start_index + this_numel
+            self.param_index_map[param] = (param_start_index, param_end_index, bucket_id)
             bucket_params.add(param)
 
-            # If we have enough elements already or the current param is part of the shared embedding
-            # layer and needs a separate bucket, form a new bucket.
+            # If we have enough elements already or the current param is part of the shared
+            # embedding layer and needs a separate bucket, form a new bucket.
             if (
-                bucket_size is not None
-                and (data_end_index - bucket_data_start_index) >= bucket_size
+                bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size
             ) or _does_param_require_new_bucket(param):
-                data_end_index = _create_new_bucket(data_end_index)
-            data_start_index = data_end_index
+                bucket_end_index = _update_bucket_metadata(param_end_index)
+                param_start_index = bucket_end_index
+            else:
+                param_start_index = param_end_index
 
         # Add remaining params to a new bucket.
         if len(bucket_params) > 0:
-            data_end_index = _create_new_bucket(data_end_index)
+            bucket_end_index = _update_bucket_metadata(param_end_index)
 
         # Next, create underlying storage for buffer (with numel elements that includes
         # padding as necessary).
-        self.numel = data_end_index
+        self.numel = bucket_end_index
         self.numel_unpadded = sum(per_bucket_numel_unpadded)
         assert self.numel_unpadded <= self.numel
         if self.ddp_config.use_distributed_optimizer:
@@ -371,53 +510,59 @@ class ParamAndGradBuffer:
         )
 
         # Finally, map param.data and param.main_grad fields to buffers.
-        bucket_params = set()
-        bucket_data_start_index = 0
+        bucket_params = []
+        bucket_start_index = 0
         cur_bucket_id = 0
         for param in params[::-1]:
-            if not param.requires_grad:
-                continue
-            data_start_index, data_end_index, bucket_id = self.param_index_map[param]
+            param_start_index, param_end_index, bucket_id = self.param_index_map[param]
 
             # Assign param.data to appropriate segment of self.param_data.
             if self.param_data is not None:
                 old_param_data = param.data
-                param.data = self._get(
-                    param.data.shape, data_start_index, buffer_type=BufferType.PARAM
+                new_param_data = self._get(
+                    param.data.shape, param_start_index, buffer_type=BufferType.PARAM
                 )
+                if is_float8tensor(param):
+                    param._data = new_param_data
+                else:
+                    param.data = new_param_data
                 assert old_param_data._base is None
                 # Copy tensor values (from initialization or checkpoint).
                 param.data.detach().copy_(old_param_data)
                 del old_param_data
 
             param.main_grad = self._get(
-                param.data.shape, data_start_index, buffer_type=BufferType.GRAD
+                param.data.shape, param_start_index, buffer_type=BufferType.GRAD
             )
             if bucket_id != cur_bucket_id:
-                bucket_data_end_index = _pad_end_of_bucket_if_needed(data_start_index)
-                self._set_bucket(
-                    bucket_params=bucket_params,
-                    start_index=bucket_data_start_index,
-                    end_index=bucket_data_end_index,
-                    numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
-                    bucket_id=cur_bucket_id,
+                bucket_end_index = _pad_end_of_bucket_if_needed(param_start_index)
+                self.buckets.append(
+                    self._new_bucket(
+                        bucket_params=bucket_params,
+                        start_index=bucket_start_index,
+                        end_index=bucket_end_index,
+                        numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
+                        bucket_id=cur_bucket_id,
+                    )
                 )
-                bucket_data_start_index = bucket_data_end_index
-                bucket_params = set()
+                bucket_start_index = bucket_end_index
+                bucket_params = []
                 assert cur_bucket_id + 1 == len(self.buckets)
                 assert bucket_id == cur_bucket_id + 1
                 cur_bucket_id = bucket_id
-            bucket_params.add(param)
+            bucket_params.append(param)
 
         # Add remaining params to a new bucket.
         if len(bucket_params) > 0:
-            bucket_data_end_index = _pad_end_of_bucket_if_needed(data_end_index)
-            self._set_bucket(
-                bucket_params=bucket_params,
-                start_index=bucket_data_start_index,
-                end_index=bucket_data_end_index,
-                numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
-                bucket_id=cur_bucket_id,
+            bucket_end_index = _pad_end_of_bucket_if_needed(param_end_index)
+            self.buckets.append(
+                self._new_bucket(
+                    bucket_params=bucket_params,
+                    start_index=bucket_start_index,
+                    end_index=bucket_end_index,
+                    numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
+                    bucket_id=cur_bucket_id,
+                )
             )
 
         # Log buckets for all PP stages.
@@ -455,17 +600,16 @@ class ParamAndGradBuffer:
         buffer_tensor = buffer_tensor.view(shape)
         return buffer_tensor
 
-    def _set_bucket(
+    def _new_bucket(
         self,
         bucket_params: List[torch.nn.Parameter],
         start_index: int,
         end_index: int,
         numel_unpadded: int,
         bucket_id: int,
-    ):
+    ) -> _ParamAndGradBucket:
         """
-        Helper function to create new bucket, add it to list of buckets, and
-        also update param->bucket mapping.
+        Helper function that creates a new bucket. Also updates param->bucket mapping.
         """
 
         # Assert that indices are correctly padded (if needed), and that bucket
@@ -484,66 +628,142 @@ class ParamAndGradBuffer:
         bucketed_grad_data = self._get(
             torch.Size([end_index - start_index]), start_index, buffer_type=BufferType.GRAD
         )
-        bucket = Bucket(
-            ddp_config=self.ddp_config,
+        bucket = _ParamAndGradBucket(
             params=bucket_params,
             param_data=bucketed_param_data,
             grad_data=bucketed_grad_data,
             offset=start_index,
             numel_unpadded=numel_unpadded,
-            data_parallel_group=self.data_parallel_group,
-            data_parallel_world_size=self.data_parallel_world_size,
             gradient_scaling_factor=self.gradient_scaling_factor,
+            bucket_id=bucket_id,
         )
-        self.buckets.append(bucket)
         for bucket_param in bucket_params:
             assert bucket_param not in self.param_to_bucket
             self.param_to_bucket[bucket_param] = bucket
 
+        return bucket
+
     def reset(self):
         """
-        Zero out the underlying grad_buffer and reset all buckets in preparation for the next
-        iteration of training.
+        Zero out the underlying grad_buffer.
         """
         self.grad_data.zero_()
-        for bucket in self.buckets:
-            bucket.reset()
-        self.is_last_microbatch = True
 
-    def start_grad_sync(self):
-        """
-        Initiates grad sync (all-reduce or reduce-scatter) communication operations
-        for all buckets in the grad buffer.
 
-        When overlap_grad_reduce is set to True, dispatches asynchronous communication
-        calls. When overlap_grad_reduce is set to False, calls synchronous
-        communication ops.
-        """
-        for bucket in self.buckets:
-            bucket.start_grad_sync()
+def partition_buckets(
+    buffers: List[_ParamAndGradBuffer], force_single_bucket_group: bool = False
+) -> List[_ParamAndGradBucketGroup]:
+    """
+    Automatically regroup the buckets of input buffers and return a list of bucket groups.
 
-    def finish_grad_sync(self):
-        """
-        Finishes grad sync (all-reduce or reduce-scatter) communication operations
-        for all buckets in the grad buffer.
+    In some scenarios, we need to put buckets from different buffers into a group so that their
+    communication can be aggregated.
 
-        When overlap_grad_reduce is set to True, waits for asynchronous communication
-        calls to complete. When overlap_grad_reduce is set to False, calls synchronous
-        communication ops.
-        """
-        for bucket in self.buckets:
-            bucket.finish_grad_sync()
+    For example, when there are both fp8 weights and bf16 biases in the model and virtual
+    pipeline parallelism is enabled, each model chunk will have an fp8 bucket and a bf16 bucket,
+    which doubles the number of communication kernels, and because of the use of
+    CUDA_DEVICE_MAX_CONNECTIONS=1, having multiple back-to-back communications will prevent the
+    overlap of communication kernels with computation kernels.
 
-    def register_grad_ready(self, param: torch.nn.Parameter):
-        """
-        Registers grads for the passed-in param to be "ready" for grad sync.
+    The grouping strategy is:
+    1. If force_single_bucket_group is True, put all buckets across all buffers into a single
+       bucket group.
+    2. If force_single_bucket_group is False, when there is no fp8 buffer in the input buffers,
+       let each bucket group have only one bucket.
+    3. If force_single_bucket_group is False, when using fp8 params, merge all non-fp8 buckets
+       into the last fp8 bucket group.
+       - Since the non-fp8 parameters (typically the biases of various layers) are relatively
+         small, they are likely to be grouped into a single non-fp8 bucket.
+       - The fp8 buckets start from the end of the model, i.e., the first bucket corresponds to
+         the end of the model, while the last bucket corresponds to the beginning.
+       - If we combine the non-fp8 bucket with the first fp8 bucket, we cannot initiate the
+         reduce-scatter to synchronize gradients after the backward pass at the end of the model
+         has completed. This is because we need to wait for the non-fp8 params from the beginning
+         layers to obtain their gradients.
+       - Combining the non-fp8 bucket with the last fp8 bucket can help avoid this issue.
 
-        When the number of microbatches is greater than 1, we only want to register
-        grads as ready when processing the last microbatch and overlap_grad_reduce is True.
-        """
-        assert (
-            self.ddp_config.overlap_grad_reduce
-        ), 'register_grad_ready() should only be called when overlap_grad_reduce is True'
-        if self.is_last_microbatch:
-            bucket = self.param_to_bucket[param]
-            bucket.register_grad_ready(param)
+    Args:
+        buffers (list): list of input buffers.
+        single_bucket_group_per_buffer (bool, optional): force group all buckets in each buffer
+            into a single bucket group.
+    """
+
+    if len(buffers) == 0:
+        return []
+
+    dtype_to_buffer_map = {}
+    for buffer in buffers:
+        dtype = buffer.param_dtype
+        # Make sure that the param_dtype of any two buffers is different.
+        assert dtype not in dtype_to_buffer_map
+        dtype_to_buffer_map[dtype] = buffer
+
+    # Case 1: Put all buckets into a single bucket group if force_single_bucket_group is True.
+    if force_single_bucket_group:
+        buckets = []
+        ddp_config = buffers[0].ddp_config
+        data_parallel_group = buffers[0].data_parallel_group
+        data_parallel_world_size = buffers[0].data_parallel_world_size
+        for buffer in buffers:
+            assert ddp_config == buffer.ddp_config
+            assert data_parallel_group == buffer.data_parallel_group
+            assert data_parallel_world_size == buffer.data_parallel_world_size
+            buckets.extend(buffer.buckets)
+
+        bucket_group = _ParamAndGradBucketGroup(
+            buckets, ddp_config, data_parallel_group, data_parallel_world_size
+        )
+        return [bucket_group]
+
+    if torch.uint8 not in dtype_to_buffer_map:
+        # Case 2: When there is no fp8 buffer in the input buffers, let each bucket group have
+        #         only one bucket.
+        bucket_groups = []
+        for buffer in buffers:
+            for bucket in buffer.buckets:
+                bucket_groups.append(
+                    _ParamAndGradBucketGroup(
+                        [bucket],
+                        buffer.ddp_config,
+                        buffer.data_parallel_group,
+                        buffer.data_parallel_world_size,
+                    )
+                )
+        return bucket_groups
+    else:
+        # Case 3: When using fp8 params, merge all non-fp8 buckets into the last fp8 bucket group.
+        non_fp8_buckets = []
+        for buffer in buffers:
+            if buffer.param_dtype != torch.uint8:
+                for bucket in buffer.buckets:
+                    non_fp8_buckets.append(bucket)
+
+        bucket_groups = []
+        fp8_buffer = dtype_to_buffer_map[torch.uint8]
+        for bucket in fp8_buffer.buckets:
+            if len(bucket_groups) == len(fp8_buffer.buckets) - 1:
+                # The last bucket group.
+                group_buckets = [bucket] + non_fp8_buckets
+            else:
+                # The first N-1 bucket groups.
+                group_buckets = [bucket]
+            bucket_groups.append(
+                _ParamAndGradBucketGroup(
+                    group_buckets,
+                    buffer.ddp_config,
+                    buffer.data_parallel_group,
+                    buffer.data_parallel_world_size,
+                )
+            )
+        return bucket_groups
+
+
+# For backwards compatibility. ParamAndGradBuffer will be deprecated in future release.
+# _ParamAndGradBuffer is not intended to be consumed directly by external code.
+class ParamAndGradBuffer(_ParamAndGradBuffer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        warnings.warn(
+            "`ParamAndGradBuffer` will be deprecated in a future release, and is not "
+            "intended to be used by external code."
+        )

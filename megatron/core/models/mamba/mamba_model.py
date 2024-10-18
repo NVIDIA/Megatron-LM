@@ -5,6 +5,7 @@ from typing import Literal, Optional
 from torch import Tensor
 
 from megatron.core import InferenceParams, tensor_parallel
+from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
@@ -20,19 +21,34 @@ class MambaModel(LanguageModule):
         config (TransformerConfig): Transformer config
         mamba_stack_spec (ModuleSpec): Specifies the modules to use for the various layer types
         vocab_size (int): Vocabulary size
-        max_sequence_length (int): maximum size of sequence. This is used for positional embedding
-        pre_process (bool, optional): Include embedding layer (used with pipeline parallelism). Defaults to True.
-        hybrid_attention_ratio (float, optional): The target ratio of attention layers to total layers
+        max_sequence_length (int): maximum size of sequence.
+            This is used for positional embedding
+        pre_process (bool, optional): Include embedding layer
+            (used with pipeline parallelism). Defaults to True.
+        mamba_ssm_ngroups (int, optional): Specifies the number of groups to use.
+            The default value is 8, as in the NVIDIA Mamba2 (pure and hybrid) 8b.
+            However, in the original Mamba2 paper, the checkpoints use a setting of 1.
+            Defaults to 8.
+        hybrid_attention_ratio (float, optional): The target ratio of attention
+            layers to total layers
         hybrid_mlp_ratio (float, optional): The target ratio of mlp layers to total layers
         hybrid_override_pattern (str, optional): The hybrid layer pattern to override with
-        post_process (bool, optional): Include an output layer (used with pipeline parallelism). Defaults to True.
+        post_process (bool, optional): Include an output layer (used with pipeline parallelism).
+            Defaults to True.
         fp16_lm_cross_entropy (bool, optional): Defaults to False.
-        parallel_output (bool, optional): Do not gather the outputs, keep them split across tensor parallel ranks. Defaults to True.
-        share_embeddings_and_output_weights (bool, optional): When True, input embeddings and output logit weights are shared. Defaults to False.
-        position_embedding_type (Literal[learned_absolute,rope,none], optional):  Position embedding type. Defaults to 'none'.
-        rotary_percent (float, optional): Percent of rotary dimension to use for rotary position embeddings. Ignored unless position_embedding_type is 'rope'. Defaults to 1.0.
-        rotary_base (int, optional): Base period for rotary position embeddings. Ignored unless position_embedding_type is 'rope'. Defaults to 10000.
-        seq_len_interpolation_factor (Optional[float], optional): scale of linearly interpolating RoPE for longer sequences. The value must be a float larger than 1.0. Defaults to None.
+        parallel_output (bool, optional): Do not gather the outputs, keep them split across tensor
+            parallel ranks. Defaults to True.
+        share_embeddings_and_output_weights (bool, optional): When True, input embeddings and
+            output logit weights are shared. Defaults to False.
+        position_embedding_type (Literal[learned_absolute,rope,none], optional):  Position
+            embedding type. Defaults to 'none'.
+        rotary_percent (float, optional): Percent of rotary dimension to use for rotary position
+            embeddings. Ignored unless position_embedding_type is 'rope'. Defaults to 1.0.
+        rotary_base (int, optional): Base period for rotary position embeddings. Ignored unless
+            position_embedding_type is 'rope'. Defaults to 10000.
+        seq_len_interpolation_factor (Optional[float], optional): scale of linearly
+            interpolating RoPE for longer sequences. The value must be a float larger than 1.0.
+             Defaults to None.
     """
 
     def __init__(
@@ -41,6 +57,7 @@ class MambaModel(LanguageModule):
         mamba_stack_spec: ModuleSpec,
         vocab_size: int,
         max_sequence_length: int,
+        mamba_ssm_ngroups: int = 8,
         pre_process: bool = True,
         hybrid_attention_ratio: float = 0.0,
         hybrid_mlp_ratio: float = 0.0,
@@ -57,9 +74,13 @@ class MambaModel(LanguageModule):
     ) -> None:
         super().__init__(config=config)
 
+        if has_config_logger_enabled(config):
+            log_config_to_disk(config, locals(), prefix=type(self).__name__)
+
         self.mamba_stack_spec: ModuleSpec = mamba_stack_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
+        self.mamba_ssm_ngroups = mamba_ssm_ngroups
         self.pre_process = pre_process
         self.hybrid_attention_ratio = hybrid_attention_ratio
         self.hybrid_mlp_ratio = hybrid_mlp_ratio
@@ -88,11 +109,13 @@ class MambaModel(LanguageModule):
                 rotary_percent=rotary_percent,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
+                use_cpu_initialization=self.config.use_cpu_initialization,
             )
 
         self.decoder = build_module(
             mamba_stack_spec,
             self.config,
+            mamba_ssm_ngroups=self.mamba_ssm_ngroups,
             pre_process=self.pre_process,
             hybrid_attention_ratio=self.hybrid_attention_ratio,
             hybrid_mlp_ratio=self.hybrid_mlp_ratio,

@@ -80,8 +80,7 @@ class VocabParallelCrossEntropy:
 
     @staticmethod
     def prepare_gradient_calculation_operands(
-        softmax: torch.Tensor,
-        target_mask: torch.Tensor,
+        softmax: torch.Tensor, target_mask: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
         # All the inputs have softmax as thier gradient.
@@ -133,14 +132,10 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         world_size = get_tensor_model_parallel_world_size()
         vocab_start_index, vocab_end_index = get_vocab_range(partition_vocab_size, rank, world_size)
 
-        (
-            target_mask,
-            masked_target_1d,
-            predicted_logits,
-            sum_exp_logits,
-            exp_logits,
-        ) = VocabParallelCrossEntropy.calculate_predicted_logits(
-            vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
+        (target_mask, masked_target_1d, predicted_logits, sum_exp_logits, exp_logits) = (
+            VocabParallelCrossEntropy.calculate_predicted_logits(
+                vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
+            )
         )
 
         # All reduce is needed to get the chunks from other GPUs.
@@ -193,12 +188,9 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         softmax, target_mask, masked_target_1d = ctx.saved_tensors
         label_smoothing, vocab_size = ctx.label_smoothing, ctx.vocab_size
 
-        (
-            grad_2d,
-            arange_1d,
-            softmax_update,
-            grad_input,
-        ) = VocabParallelCrossEntropy.prepare_gradient_calculation_operands(softmax, target_mask)
+        (grad_2d, arange_1d, softmax_update, grad_input) = (
+            VocabParallelCrossEntropy.prepare_gradient_calculation_operands(softmax, target_mask)
+        )
 
         if label_smoothing > 0:
             smoothing = label_smoothing * vocab_size / (vocab_size - 1)

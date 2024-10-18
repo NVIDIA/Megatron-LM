@@ -111,7 +111,7 @@ def calculate_correct_answers(name, model, dataloader,
     def correct_answers_forward_step(batch, model):
         try:
             batch_ = next(batch)
-        except BaseException:
+        except Exception:
             batch_ = batch
         tokens, types, labels, attention_mask = process_batch(batch_)
 

@@ -17,7 +17,6 @@ from megatron.core.transformer.module import MegatronModule
 
 
 class RetroEncoderCrossAttention(BaseRetroCrossAttention):
-
     """Retro encoder's cross attention operator.
 
     See this paper for more details: https://arxiv.org/abs/2112.04426.
@@ -96,14 +95,13 @@ class RetroEncoderCrossAttention(BaseRetroCrossAttention):
             residual = chunked_output
 
             # Collect tensors.
-            attention_output_tuples.append((attention_output, attention_bias, residual,))
+            attention_output_tuples.append((attention_output, attention_bias, residual))
 
         # Output. (List[Tuple[( [ r, bs*l, d ], [ d ] )]])
         return attention_output_tuples
 
 
 class RetroEncoderBiasDropoutAdd(MegatronModule):
-
     """Retro encoder's bias-dropout-add operator.
 
     This operator applies bias-dropout-add individually on each neighboring
@@ -113,9 +111,7 @@ class RetroEncoderBiasDropoutAdd(MegatronModule):
         config (RetroConfig): Retro config.
     """
 
-    def __init__(
-        self, config: RetroConfig,
-    ):
+    def __init__(self, config: RetroConfig):
         super().__init__(config=config)
         self.retro_num_neighbors = config.retro_num_neighbors
 
@@ -186,7 +182,6 @@ class RetroEncoderBiasDropoutAdd(MegatronModule):
 
 
 class RetroEncoderLayerNorm(MegatronModule):
-
     """Retro encoder's layernorm operator.
 
     This operator applies layernorm individually on each neighboring chunk that
@@ -198,9 +193,7 @@ class RetroEncoderLayerNorm(MegatronModule):
         submodules (Type): Layer norm class. (Named 'submodules' to fit external interface.)
     """
 
-    def __init__(
-        self, config: RetroConfig, submodules: Type, **kwargs: dict,
-    ):
+    def __init__(self, config: RetroConfig, submodules: Type, **kwargs: dict):
         super().__init__(config=config)
         norm_class = submodules
         self.norm = norm_class(config=config, **kwargs)
@@ -211,7 +204,7 @@ class RetroEncoderLayerNorm(MegatronModule):
 
         Args:
             input (Tensor): Input chunks, concatenated into a single tensor.
-        
+
         Returns:
             Output of the layer norm.
         """

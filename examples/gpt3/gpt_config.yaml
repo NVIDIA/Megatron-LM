@@ -215,9 +215,9 @@ fp16_lm_cross_entropy: False
 distributed_backend: nccl
 distributed_timeout_minutes: 10
 overlap_grad_reduce: False
-delay_grad_reduce: True
+align_grad_reduce: True
 overlap_param_gather: False
-delay_param_gather: False
+align_param_gather: False
 scatter_gather_tensors_in_pipeline: True
 local_rank: null
 lazy_mpu_init: null
@@ -285,9 +285,6 @@ timing_log_option: minmax
 tensorboard_log_interval: 1
 tensorboard_queue_size: 1000
 log_timers_to_tensorboard: False
-log_batch_size_to_tensorboard: False
-log_learning_rate_to_tensorboard: True
-log_learning_rate_to_tensorboard: True
 log_validation_ppl_to_tensorboard: False
 log_memory_to_tensorboard: False
 log_world_size_to_tensorboard: False
@@ -295,9 +292,8 @@ log_loss_scale_to_tensorboard: True
 wandb_project: ''
 wandb_exp_name: ''
 wandb_save_dir: ''
-enable_one_logger: False
-one_logger_project: e2e-tracking
-one_logger_entity: hwinf_dcm
+enable_one_logger: True
+one_logger_project: megatron-lm
 one_logger_run_name: null
 log_interval: 100
 tensorboard_dir: null

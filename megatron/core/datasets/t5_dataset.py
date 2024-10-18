@@ -30,8 +30,7 @@ class T5MaskedWordPieceDatasetConfig(MaskedWordPieceDatasetConfig):
     """The sequence length for the decoder"""
 
     def __post_init__(self) -> None:
-        """Do asserts and set fields post init
-        """
+        """Do asserts and set fields post init"""
         super().__post_init__()
 
         self.sequence_length_encoder = self.sequence_length
@@ -85,23 +84,21 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
         """
         return super(
             T5MaskedWordPieceDataset, T5MaskedWordPieceDataset
-        )._key_config_attributes() + ["sequence_length_decoder",]
+        )._key_config_attributes() + ["sequence_length_decoder"]
 
     def __getitem__(self, idx: int) -> Dict[str, Union[int, numpy.ndarray]]:
         """Abstract method implementation
- 
+
         Args:
             idx (int): The index into the dataset
 
         Returns:
-            Dict[str, Union[int, numpy.ndarray]]: The 
+            Dict[str, Union[int, numpy.ndarray]]: The
         """
         idx_beg, idx_end, target_sequence_length = self.sample_index[idx]
         sample = [self.dataset[i] for i in range(idx_beg, idx_end)]
 
-        numpy_random_state = numpy.random.RandomState(
-            seed=(self.config.random_seed + idx) % 2 ** 32
-        )
+        numpy_random_state = numpy.random.RandomState(seed=(self.config.random_seed + idx) % 2**32)
 
         assert target_sequence_length <= self.config.sequence_length
 
@@ -113,7 +110,7 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
         tokens = tokens[:target_sequence_length]
 
         # Masking
-        (tokens, _, _, _, masked_spans,) = self._create_masked_lm_predictions(
+        (tokens, _, _, _, masked_spans) = self._create_masked_lm_predictions(
             tokens, target_sequence_length, numpy_random_state
         )
 

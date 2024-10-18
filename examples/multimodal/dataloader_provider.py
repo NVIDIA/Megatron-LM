@@ -1,8 +1,10 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+import os
+
 import torch
 from dataset_helpers import TaskEncoder, print_error_handler
 
-from megatron.core import mpu
+from megatron.core import parallel_state
 from megatron.energon import (
     LimitDataset,
     RepeatDataset,
@@ -12,7 +14,9 @@ from megatron.energon import (
     get_train_dataset,
     get_val_datasets,
 )
-from megatron.training import get_args, get_num_microbatches, print_rank_0
+from megatron.core.num_microbatches_calculator import get_num_microbatches
+from megatron.core.parallel_state import get_tensor_model_parallel_rank
+from megatron.training import get_args, print_rank_0
 from megatron.training.checkpointing import get_checkpoint_name
 
 
@@ -59,14 +63,17 @@ def datasets_provider(worker_config=None):
 
 def train_valid_test_dataloaders_provider(train_val_test_num_samples):
     """Build multimodal train, validation and test dataloaders."""
+    if get_tensor_model_parallel_rank() != 0:
+        return None, None, None
+
     args = get_args()
 
     worker_debug_path = None
     worker_log_level = 0
 
-    rank = mpu.get_data_parallel_rank()
-    world_size = mpu.get_data_parallel_world_size()
-    data_parallel_group = mpu.get_data_parallel_group()
+    rank = parallel_state.get_data_parallel_rank()
+    world_size = parallel_state.get_data_parallel_world_size()
+    data_parallel_group = parallel_state.get_data_parallel_group()
 
     worker_config = WorkerConfig(
         rank=rank,
@@ -80,49 +87,44 @@ def train_valid_test_dataloaders_provider(train_val_test_num_samples):
 
     train_dataloader = get_savable_loader(train_ds, worker_config=worker_config)
     if args.load is not None:
-        if hasattr(args, "dataloader_path"):
-            dp_rank = (
-                mpu.get_data_parallel_rank()
-                if torch.distributed.is_initialized()
-                else 0
-            )
+        if getattr(args, "dataloader_save", None):
+            dp_rank = parallel_state.get_data_parallel_rank()
             data_save_name = get_checkpoint_name(
-                args.dataloader_path,
+                args.dataloader_save,
                 args.iteration,
-                save_basename=f"train_dataloader_dprank{dp_rank:03d}.pt",
+                basename=f"train_dataloader_dprank{dp_rank:03d}.pt",
             )
-            try:
-                dataset_state_dict = torch.load(
-                    data_save_name, map_location="cpu"
-                )
-                if (
-                    "dataset_state_dict" in dataset_state_dict.keys()
-                    and dataset_state_dict["train_data_path"]
-                    != args.train_data_path
-                ):
-                    print_rank_0(
-                        f"Not restoring dataset state from {data_save_name}, path to dataset changed from {dataset_state_dict['train_data_path']} to {args.train_data_path}"
-                    )
-                else:
-                    train_dataloader.restore_state_rank(
-                        dataset_state_dict["dataloader_state_dict"]
-                    )
-                    print_rank_0(
-                        f"restoring dataset state from {data_save_name}"
-                    )
-            except Exception as e:
-                print_rank_0(
-                    "loading dataloader checkpoint failed. Skipping. " + str(e)
-                )
+            if os.path.exists(data_save_name):
+                try:
+                    dataset_state_dict = torch.load(data_save_name, map_location="cpu")
+                    train_dataloader.restore_state_rank(dataset_state_dict["dataloader_state_dict"])
+                    print_rank_0(f"restored dataset state from {data_save_name}")
+                except Exception as e:
+                    print_rank_0("loading dataloader checkpoint failed. Skipping. " + str(e))
 
     valid_dataloader = [
-        iter(cyclic_iter(get_loader(valid_ds, worker_config=worker_config)))
+        EnergonDataloader(get_loader(valid_ds, worker_config=worker_config))
         for valid_ds in valid_ds1
     ]
     test_dataloader = None
 
-    return iter(cyclic_iter(train_dataloader)), valid_dataloader, iter(cyclic_iter(test_dataloader))
+    return EnergonDataloader(train_dataloader), valid_dataloader, EnergonDataloader(test_dataloader)
 
+
+class EnergonDataloader:
+    """A wrapper to use Megatron Energon dataloader with the Megatron-LM training loop."""
+    def __init__(self, dataloader):
+        self._dataloader = dataloader
+        self._iter = iter(cyclic_iter(dataloader))
+
+    def __next__(self):
+        return self._iter.__next__()
+
+    def __iter__(self):
+        return self._iter.__iter__()
+
+    def save_state(self):
+        return self._dataloader.save_state_rank()
 
 
 def cyclic_iter(iter):

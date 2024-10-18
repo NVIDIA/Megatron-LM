@@ -1,0 +1,1706 @@
+default:
+  interruptible: true
+gpt3_mr_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer_no_mmap_bin_files_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer_no_mmap_bin_files_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp1_resume_torch_dist_uniform_full_recompute_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp1_resume_torch_dist_uniform_full_recompute_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp1_uniform_full_recompute_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp1_uniform_full_recompute_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_reshard_2x1x4_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_reshard_2x1x4_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings_interleaved_no_fusion_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings_interleaved_no_fusion_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp2_rope_embeddings_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp2_rope_embeddings_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp2_rope_embeddings_interleaved_no_fusion_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp2_rope_embeddings_interleaved_no_fusion_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp4_disable_bias_linear_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp4_disable_bias_linear_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_disable_bias_linear_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_disable_bias_linear_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_sequence_parallel_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_sequence_parallel_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_swiglu_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_swiglu_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_untie_embeddings_and_outputs_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_untie_embeddings_and_outputs_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp4_sequence_parallel_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp4_sequence_parallel_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp4_swiglu_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp4_swiglu_dgx_a100_1N8G --container-tag
+    18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp4_untie_embeddings_and_outputs_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp4_untie_embeddings_and_outputs_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp4_vp1_calculate_per_token_loss_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp4_vp1_calculate_per_token_loss_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp4_vp1_decoupled_lr_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp4_vp1_decoupled_lr_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp4_vp1_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp4_vp1_dgx_a100_1N8G --container-tag
+    18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_untied_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_untied_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_decoupled_lr_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_decoupled_lr_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_calculate_per_token_loss_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_calculate_per_token_loss_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_untied_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_untied_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp1_pp4_vp1_uneven_pipeline_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp1_pp4_vp1_uneven_pipeline_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp1_cp2_nondeterministic_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp1_cp2_nondeterministic_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_groupedGEMM_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_groupedGEMM_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_top2router_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_top2router_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_groupedGEMM_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_groupedGEMM_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_top2router_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_top2router_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp2_cp2_nondeterministic_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp2_cp2_nondeterministic_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp2_cross_entropy_loss_fusion_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp2_cross_entropy_loss_fusion_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp2_ddp_average_in_collective_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp2_ddp_average_in_collective_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp2_defer_embedding_wgrad_compute_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp2_defer_embedding_wgrad_compute_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp2_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp2_dgx_a100_1N8G --container-tag
+    18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp2_no_create_attention_mask_in_dataloader_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp2_no_create_attention_mask_in_dataloader_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp2_no_mmap_bin_files_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp2_no_mmap_bin_files_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_cross_entropy_loss_fusion_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_cross_entropy_loss_fusion_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_ddp_average_in_collective_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_ddp_average_in_collective_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_defer_embedding_wgrad_compute_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_defer_embedding_wgrad_compute_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_no_create_attention_mask_in_dataloader_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_no_create_attention_mask_in_dataloader_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_no_mmap_bin_files_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_no_mmap_bin_files_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_reshard_1x4xNone_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_reshard_1x4xNone_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp4_pp1_qk_layernorm_test_mode_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp4_pp1_qk_layernorm_test_mode_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp4_pp1_resume_torch_dist_qk_layernorm_test_mode_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp4_pp1_resume_torch_dist_qk_layernorm_test_mode_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_te_tp4_pp2_resume_torch_dist_reshard_8x1xNone_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_te_tp4_pp2_resume_torch_dist_reshard_8x1xNone_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_tp2_pp2_resume_torch_dist_uninstall_te_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_tp2_pp2_resume_torch_dist_uninstall_te_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_mcore_tp2_pp2_uninstall_te_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_mcore_tp2_pp2_uninstall_te_dgx_a100_1N8G --container-tag
+    18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_te_tp2_pp2_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_te_tp2_pp2_dgx_a100_1N8G --container-tag 18650190
+    --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_te_tp2_pp2_resume_torch_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_te_tp2_pp2_resume_torch_dgx_a100_1N8G --container-tag
+    18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_tp1_pp4_vp1_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_tp1_pp4_vp1_dgx_a100_1N8G --container-tag 18650190
+    --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_tp1_pp4_vp1_resume_torch_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_tp1_pp4_vp1_resume_torch_dgx_a100_1N8G --container-tag
+    18650190 --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+gpt3_mr_tp2_pp2_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model gpt --test-case gpt3_mr_tp2_pp2_dgx_a100_1N8G --container-tag 18650190
+    --cluster dgxa100_dracooci
+  stage: gpt
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+multimodal_llava_mr_mcore_te_tp1_pp1_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model multimodal-llava --test-case multimodal_llava_mr_mcore_te_tp1_pp1_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: multimodal-llava
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+multimodal_llava_mr_mcore_te_tp2_pp3_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model multimodal-llava --test-case multimodal_llava_mr_mcore_te_tp2_pp3_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: multimodal-llava
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+multimodal_llava_mr_mcore_te_tp4_pp1_etp3_dgx_a100_1N7G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model multimodal-llava --test-case multimodal_llava_mr_mcore_te_tp4_pp1_etp3_dgx_a100_1N7G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: multimodal-llava
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+multimodal_llava_mr_mcore_te_tp4_pp1_resume_torch_etp3_dgx_a100_1N7G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model multimodal-llava --test-case multimodal_llava_mr_mcore_te_tp4_pp1_resume_torch_etp3_dgx_a100_1N7G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: multimodal-llava
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+stages:
+- gpt
+- t5
+- multimodal-llava
+t5_220m_mr_mcore_te_tp2_pp2_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model t5 --test-case t5_220m_mr_mcore_te_tp2_pp2_dgx_a100_1N8G --container-tag
+    18650190 --cluster dgxa100_dracooci
+  stage: t5
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+t5_220m_mr_mcore_te_tp2_pp2_resume_torch_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model t5 --test-case t5_220m_mr_mcore_te_tp2_pp2_resume_torch_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: t5
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+t5_220m_mr_mcore_te_tp4_pp1_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model t5 --test-case t5_220m_mr_mcore_te_tp4_pp1_dgx_a100_1N8G --container-tag
+    18650190 --cluster dgxa100_dracooci
+  stage: t5
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+t5_220m_mr_mcore_te_tp4_pp1_resume_torch_dist_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model t5 --test-case t5_220m_mr_mcore_te_tp4_pp1_resume_torch_dist_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: t5
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+t5_220m_mr_mcore_tp2_pp2_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model t5 --test-case t5_220m_mr_mcore_tp2_pp2_dgx_a100_1N8G --container-tag
+    18650190 --cluster dgxa100_dracooci
+  stage: t5
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+t5_220m_mr_mcore_tp2_pp2_resume_torch_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model t5 --test-case t5_220m_mr_mcore_tp2_pp2_resume_torch_dgx_a100_1N8G --container-tag
+    18650190 --cluster dgxa100_dracooci
+  stage: t5
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+t5_220m_mr_mcore_tp4_pp1_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model t5 --test-case t5_220m_mr_mcore_tp4_pp1_dgx_a100_1N8G --container-tag
+    18650190 --cluster dgxa100_dracooci
+  stage: t5
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days
+t5_220m_mr_mcore_tp4_pp1_resume_torch_dist_dgx_a100_1N8G:
+  artifacts:
+    paths:
+    - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_ci:18650190
+  needs:
+  - job: jet-generate
+    pipeline: $PARENT_PIPELINE_ID
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+  - if: $CI_MERGE_REQUEST_ID
+  script:
+  - export PYTHONPATH=$(pwd); python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py
+    --model t5 --test-case t5_220m_mr_mcore_tp4_pp1_resume_torch_dist_dgx_a100_1N8G
+    --container-tag 18650190 --cluster dgxa100_dracooci
+  stage: t5
+  tags:
+  - mcore-docker-node-jet
+  timeout: 7 days

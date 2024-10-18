@@ -100,7 +100,7 @@ def get_batch(data_iterator):
         try:
             data = next(data_iterator)
 
-        except BaseException:
+        except Exception:
             data = data_iterator
             raise ValueError("error with data_iterator")
     else:

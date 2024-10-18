@@ -17,7 +17,7 @@ from megatron.core.datasets.indexed_dataset import IndexedDataset
 
 class DBDataset(torch.utils.data.Dataset):
     """Dataset for iterating chunks.
-    
+
     Args:
         db_path (str): Path of HDF5-format chunk database.
         indexed_datasets (List[IndexedDataset]): Indexed datasets used to build database.
@@ -85,10 +85,7 @@ class DBDataset(torch.utils.data.Dataset):
             token_ids = token_ids.tolist()
             token_ids += [self.eod_token_id] * (self.max_chunk_length - chunk_length)
 
-        return {
-            "doc_id": doc_id,
-            "text": np.array(token_ids, dtype=np.int64),
-        }
+        return {"doc_id": doc_id, "text": np.array(token_ids, dtype=np.int64)}
 
     def load_doc_tuples(self) -> None:
         """Load the dataset & document ids.

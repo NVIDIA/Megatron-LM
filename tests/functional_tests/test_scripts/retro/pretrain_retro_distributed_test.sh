@@ -58,7 +58,7 @@ else
 fi
 set +x
 # Runs the "345M" parameter model
-DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
+DISTRIBUTED_ARGS="--max-restarts 3 --nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 
 build_args() {
   ARGS=" \
@@ -150,8 +150,9 @@ echo "$command" > $SCRIPTS_DIR/pretrain_retro_distributed_command.sh
 eval $command
 
 echo "Saving test results to $TENSORBOARD_DIR"
-PYTHONPATH=$PWD python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $TENSORBOARD_DIR "$JOB_NAME" | \
-    tee ${TENSORBOARD_DIR}/results.json
+PYTHONPATH=$PWD python3 ./tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \ 
+  --logs-dir $TENSORBOARD_DIR \
+  --output-path ${TENSORBOARD_DIR}/results.json
 
 if [[ $SKIP_PYTEST != 1 ]]; then
     echo "-----------------------------------------------------------------------------"

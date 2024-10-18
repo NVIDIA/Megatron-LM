@@ -6,13 +6,12 @@ import os
 import sys
 import torch
 
-from megatron.training import dist_signal_handler
 from megatron.core import Timers
+from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator
+from megatron.training import dist_signal_handler
 from megatron.training.tokenizer import build_tokenizer
-from .microbatches import build_num_microbatches_calculator
 
 _GLOBAL_ARGS = None
-_GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
 _GLOBAL_TOKENIZER = None
 _GLOBAL_TENSORBOARD_WRITER = None
 _GLOBAL_WANDB_WRITER = None
@@ -25,19 +24,6 @@ def get_args():
     """Return arguments."""
     _ensure_var_is_initialized(_GLOBAL_ARGS, 'args')
     return _GLOBAL_ARGS
-
-
-def get_num_microbatches():
-    return _GLOBAL_NUM_MICROBATCHES_CALCULATOR.get()
-
-
-def get_current_global_batch_size():
-    return _GLOBAL_NUM_MICROBATCHES_CALCULATOR.get_current_global_batch_size()
-
-
-def update_num_microbatches(consumed_samples, consistency_check=True):
-    _GLOBAL_NUM_MICROBATCHES_CALCULATOR.update(consumed_samples,
-                                               consistency_check)
 
 
 def get_tokenizer():
@@ -95,7 +81,14 @@ def set_global_variables(args, build_tokenizer=True):
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
     set_args(args)
 
-    _build_num_microbatches_calculator(args)
+    init_num_microbatches_calculator(
+        args.rank,
+        args.rampup_batch_size,
+        args.global_batch_size,
+        args.micro_batch_size,
+        args.data_parallel_size,
+        args.decrease_batch_size_if_needed,
+    )
     if build_tokenizer:
         _ = _build_tokenizer(args)
     _set_tensorboard_writer(args)
@@ -111,16 +104,6 @@ def set_global_variables(args, build_tokenizer=True):
 def set_args(args):
     global _GLOBAL_ARGS
     _GLOBAL_ARGS = args
-
-
-def _build_num_microbatches_calculator(args):
-
-    global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
-    _ensure_var_is_not_initialized(_GLOBAL_NUM_MICROBATCHES_CALCULATOR,
-                                   'num microbatches calculator')
-
-    _GLOBAL_NUM_MICROBATCHES_CALCULATOR = build_num_microbatches_calculator(
-        args)
 
 
 def _build_tokenizer(args):
@@ -186,20 +169,24 @@ def _set_one_logger(args):
     _ensure_var_is_not_initialized(_GLOBAL_ONE_LOGGER, 'one logger')
 
     if args.enable_one_logger and args.rank == (args.world_size - 1):
+        if args.one_logger_async or getattr(args, 'wandb_project', ''):
+            one_logger_async = True
+        else:
+            one_logger_async = False
         try:
-            from one_logger.core import OneLogger
+            from one_logger import OneLogger
             config = {
                'project': args.one_logger_project,
-               'entity': args.one_logger_entity,
-               'name': args.one_logger_run_name
+               'name': args.one_logger_run_name,
+               'async': one_logger_async,
             }
             one_logger = OneLogger(config=config)
             _GLOBAL_ONE_LOGGER = one_logger
-        except BaseException:
+        except Exception:
             print('WARNING: one_logger package is required to enable e2e metrics '
-                  'tracking. Try pip install '
-                  '--index-url=https://sc-hw-artf.nvidia.com/api/pypi/hwinf-ml-pypi/simple'
-                  ' one_logger to install it')
+                  'tracking. please go to '
+                  'https://confluence.nvidia.com/display/MLWFO/Package+Repositories'
+                  ' for details to install it')
 
 def _set_adlr_autoresume(args):
     """Initialize ADLR autoresume."""
@@ -212,7 +199,7 @@ def _set_adlr_autoresume(args):
         sys.path.append(os.environ.get('SUBMIT_SCRIPTS', '.'))
         try:
             from userlib.auto_resume import AutoResume
-        except BaseException:
+        except ImportError:
             print('ADLR autoresume is not available, exiting ...')
             sys.exit()
 
@@ -235,4 +222,27 @@ def _ensure_var_is_not_initialized(var, name):
     """Make sure the input variable is not None."""
     assert var is None, '{} is already initialized.'.format(name)
 
+def destroy_global_vars():
+    global _GLOBAL_ARGS
+    _GLOBAL_ARGS = None
 
+    global _GLOBAL_TOKENIZER
+    _GLOBAL_TOKENIZER = None
+
+    global _GLOBAL_TENSORBOARD_WRITER
+    _GLOBAL_TENSORBOARD_WRITER = None
+
+    global _GLOBAL_WANDB_WRITER
+    _GLOBAL_WANDB_WRITER = None
+
+    global _GLOBAL_ONE_LOGGER
+    _GLOBAL_ONE_LOGGER = None
+
+    global _GLOBAL_ADLR_AUTORESUME
+    _GLOBAL_ADLR_AUTORESUME = None
+
+    global _GLOBAL_TIMERS
+    _GLOBAL_TIMERS = None
+
+    global _GLOBAL_SIGNAL_HANDLER
+    _GLOBAL_SIGNAL_HANDLER = None

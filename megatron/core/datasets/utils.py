@@ -19,8 +19,7 @@ class Split(Enum):
 
 
 def compile_helpers():
-    """Compile C++ helper functions at runtime. Make sure this is invoked on a single process.
-    """
+    """Compile C++ helper functions at runtime. Make sure this is invoked on a single process."""
     import os
     import subprocess
 
@@ -51,7 +50,7 @@ def get_blend_from_list(
     blend: Optional[List[str]],
 ) -> Optional[Tuple[List[str], Optional[List[float]]]]:
     """Get the megatron.core.datasets.blended_megatron_dataset_config.BlendedMegatronDatasetConfig blend from the blend list
-    
+
     Args:
         blend (Optional[List[str]]): The blend list, which can be either (1) a list of prefixes, e.g. ["path/to/dataset_1_prefix", "path/to/dataset_2_prefix"], or (2) a flattened, zipped list of weights and prefixes, e.g. ["30", "path/to/dataset_1_prefix", "70", "path/to/dataset_2_prefix"]
 

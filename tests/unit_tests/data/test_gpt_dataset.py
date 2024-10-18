@@ -2,31 +2,17 @@
 # Compile megatron.core.datasets.helpers dependencies before BlendedDataset import
 ##
 
-import torch
-
-from megatron.core.datasets.utils import compile_helpers
-from tests.unit_tests.test_utilities import Utils
-
-if torch.distributed.is_available():
-    Utils.initialize_distributed()
-    if torch.distributed.get_rank() == 0:
-        compile_helpers()
-    torch.distributed.barrier()
-else:
-    compile_helpers()
-
-##
-# Done
-##
-
 import random
-from types import SimpleNamespace
 
 import numpy
+import pytest
+import torch
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
+from megatron.core.datasets.utils import compile_helpers
 from megatron.training.tokenizer.tokenizer import _NullTokenizer
+from tests.unit_tests.test_utilities import Utils
 
 _MOCK_VOCAB_SIZE = 8192
 
@@ -40,7 +26,16 @@ def sample_N(dataset, N, randomize):
     return samples
 
 
+@pytest.mark.flaky
 def test_mock_gpt_dataset():
+    if torch.distributed.is_available():
+        Utils.initialize_distributed()
+        if torch.distributed.get_rank() == 0:
+            compile_helpers()
+        torch.distributed.barrier()
+    else:
+        compile_helpers()
+
     tokenizer = _NullTokenizer(vocab_size=_MOCK_VOCAB_SIZE)
 
     config = GPTDatasetConfig(
@@ -103,7 +98,7 @@ def test_mock_gpt_dataset():
     assert torch.all(sample['labels'][argmax + 1 :] == 0)
     assert not torch.any(
         sample['loss_mask'][
-            torch.logical_and(sample['labels'] == tokenizer.eod, sample['labels'] == 0,)
+            torch.logical_and(sample['labels'] == tokenizer.eod, sample['labels'] == 0)
         ]
     )
 

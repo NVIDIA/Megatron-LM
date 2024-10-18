@@ -1,3 +1,4 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 class InferenceParams:
     """Inference parameters that are passed to the main model in order
     to efficienly calculate and store the context during inference."""
@@ -25,3 +26,6 @@ class InferenceParams:
                 new_inference_key_memory,
                 new_inference_value_memory,
             )
+
+    def __str__(self):
+        return f"InferenceParams(max_seq_len = {self.max_sequence_length}, max_batch_size = {self.max_batch_size}, sequence_len_offset = {self.sequence_len_offset}, batch_size_offset = {self.batch_size_offset}, key_value_memory_dict = {self.key_value_memory_dict.keys()})"

@@ -1,3 +1,4 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import json
 from abc import ABC, abstractmethod
 from collections import OrderedDict
@@ -56,25 +57,37 @@ class MegatronTokenizer(ABC):
         """
         raise NotImplementedError("{} has no method 'detokenize'".format(type(self).__name__))
 
+    def offsets(self, ids: list[int], text: str) -> list[int]:
+        """Convert embedding ids to text offsets
+
+        Args:
+            ids (list[int]): The ids to convert
+            text (str): The text to convert
+
+        Returns:
+            list[int]: The converted offsets
+
+        Raises:
+            NotImplementedError: Non-abstract, optional method
+        """
+        raise NotImplementedError("{} has no method 'offsets'".format(type(self).__name__))
+
     @property
     @abstractmethod
     def vocab(self):
-        """Dictionary from vocab text token to id token
-        """
+        """Dictionary from vocab text token to id token"""
         pass
 
     @property
     @abstractmethod
     def inv_vocab(self):
-        """Dictionary from vocab id token to text token
-        """
+        """Dictionary from vocab id token to text token"""
         pass
 
     @property
     @abstractmethod
     def vocab_size(self):
-        """The vocabulary size
-        """
+        """The vocabulary size"""
         pass
 
     @property

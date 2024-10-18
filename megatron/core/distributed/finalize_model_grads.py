@@ -15,25 +15,20 @@ def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: Transf
     All-reduce word embedding grads.
 
     Reduce grads across first and last stages to ensure that word_embeddings parameters stay in
-    sync. This should only run for models that support pipelined model parallelism (BERT and GPT).
+    sync.
     """
 
     if (
         parallel_state.is_rank_in_embedding_group(ignore_virtual=True)
-        and parallel_state.get_pipeline_model_parallel_world_size() > 1
+        and torch.distributed.get_world_size(parallel_state.get_embedding_group()) > 1
     ):
         if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
             model_module = model[0]
         elif parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             model_module = model[-1]
-        else:  # We do not support the interleaved schedule for T5 yet.
+        else:  # We do not support an interleaved schedule for models with encoders yet.
             model_module = model[0]
 
-        # Look for module with 'pre_process' attribute to get around the fact that DDP and
-        # other wrapper classes inherit from non-core MegatronModule that has
-        # 'share_embeddings_and_output_weights' and 'shared_embedding_or_output_weight'
-        # attributes already, causing get_attr_wrapped_model() to not unwrap anything here.
-        # TODO: Clean this up once the wrapper classes inherit from core MegatronModule.
         model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
         if model_module.share_embeddings_and_output_weights:
             weight = model_module.shared_embedding_or_output_weight()
@@ -43,19 +38,23 @@ def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: Transf
 
 def _allreduce_position_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig):
     """
-    All-reduce position_embeddings grad across first (encoder) and split (decoder) stages to
-    ensure that position embeddings parameters stay in sync. This should only run for T5 models
-    with pipeline parallelism.
+    All-reduce position_embeddings grad across encoder and decoder stages to ensure that position
+    embeddings parameters stay in sync.
     """
     if (
         parallel_state.is_rank_in_position_embedding_group()
-        and parallel_state.get_pipeline_model_parallel_world_size() > 1
-        and config.pipeline_model_parallel_split_rank is not None
+        and torch.distributed.get_world_size(parallel_state.get_position_embedding_group()) > 1
     ):
-        model_module = model[0]
-        grad = get_attr_wrapped_model(
-            model_module, 'language_model.embedding.position_embeddings.weight.main_grad'
-        )
+        if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+            model_module = model[0]
+        elif parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+            model_module = model[-1]
+        else:  # We do not support an interleaved schedule for models with encoders yet.
+            model_module = model[0]
+
+        model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
+        assert hasattr(model_module, 'position_embeddings')
+        grad = model_module.position_embeddings.weight.main_grad
         torch.distributed.all_reduce(grad, group=parallel_state.get_position_embedding_group())
 
 
@@ -136,13 +135,25 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
     # if we are using by the number of tokens, then we use that as a divisor. this number
     # will be the total number of non-padded tokens in the global batch.
     if num_tokens is not None:
+
         # the number of tokens is only present on the last stage, so broadcast it
         # to the other ranks in the pipeline parallel group.
-        torch.distributed.broadcast(
-            num_tokens,
-            src=parallel_state.get_pipeline_model_parallel_last_rank(),
-            group=parallel_state.get_pipeline_model_parallel_group(),
-        )
+        last_rank = parallel_state.get_pipeline_model_parallel_last_rank()
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+
+        if not isinstance(last_rank, list):
+            assert not isinstance(last_rank, list)
+            last_rank = [last_rank]
+            assert not isinstance(pp_group, list)
+            pp_group = [pp_group]
+
+        # need to do a broadcast for every pp group, even though num_tokens should be the same.
+        num_tokens_list = []
+        for lr, group in zip(last_rank, pp_group):
+            torch.distributed.broadcast(num_tokens, src=lr, group=group)
+            num_tokens_list.append(torch.clone(num_tokens))
+        assert all(x.item() == num_tokens_list[0] for x in num_tokens_list)
+
         # all-reduce across DP ranks.
         torch.distributed.all_reduce(num_tokens, group=parallel_state.get_data_parallel_group())
         for model_chunk in model:

@@ -2,21 +2,38 @@
 
 """Megatron optimizer."""
 
+import copy
 import math
+import warnings
 from abc import ABC, abstractmethod
 from itertools import chain
 from logging import getLogger
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
 try:
-    from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_scale
+    from transformer_engine.pytorch.optimizers import multi_tensor_applier
 except ImportError:
-    from apex.multi_tensor_apply import multi_tensor_applier
-    from amp_C import multi_tensor_scale
+    try:
+        from apex.multi_tensor_apply import multi_tensor_applier
+    except ImportError:
+        from megatron.core.utils import local_multi_tensor_applier
+
+        multi_tensor_applier = local_multi_tensor_applier
+    try:
+        import amp_C
+
+        l2_norm_impl = amp_C.multi_tensor_l2norm
+        multi_tensor_scale_impl = amp_C.multi_tensor_scale
+    except ImportError:
+        from megatron.core.utils import local_multi_tensor_l2_norm, local_multi_tensor_scale
+
+        l2_norm_impl = local_multi_tensor_l2_norm
+        multi_tensor_scale_impl = local_multi_tensor_scale
 
 from .. import parallel_state, tensor_parallel
+from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..dist_checkpointing.optimizer import (
     get_param_id_to_sharded_param_map,
@@ -61,7 +78,7 @@ def _multi_tensor_copy_this_to_that(
     if overflow_buf:
         overflow_buf.fill_(0)
         # Scaling with factor `1.0` is equivalent to copy.
-        multi_tensor_applier(multi_tensor_scale, overflow_buf, [this, that], 1.0)
+        multi_tensor_applier(multi_tensor_scale_impl, overflow_buf, [this, that], 1.0)
     else:
         for this_, that_ in zip(this, that):
             that_.copy_(this_)
@@ -138,15 +155,15 @@ class MegatronOptimizer(ABC):
 
     @torch.no_grad()
     def get_grad_norm(self):
+        """Compute and return grad norm."""
         grads_for_norm = self.get_main_grads_for_grad_norm()
         total_norm = get_grad_norm_fp32(
-            grads_for_norm,
-            model_parallel_group=self.get_model_parallel_group(),
+            grads_for_norm, model_parallel_group=self.get_model_parallel_group()
         )
         return total_norm
 
     def clip_grad_norm(self, clip_grad: float) -> float:
-        """Compute grad norm."""
+        """Compute and return grad norm, also clip grads."""
         params = self.get_parameters()
         grads_for_norm = self.get_main_grads_for_grad_norm()
         grad_norm = get_grad_norm_fp32(
@@ -162,6 +179,7 @@ class MegatronOptimizer(ABC):
 
     @abstractmethod
     def zero_grad(self, set_to_none: bool = True):
+        """Zero gradients and prepare for next forward pass."""
         pass
 
     @abstractmethod
@@ -176,9 +194,9 @@ class MegatronOptimizer(ABC):
         """Simple scaling."""
         return self.get_loss_scale() * loss
 
-    def finish_param_sync(self, model_index: int):
+    def start_param_sync(self, model_index: int, *unused):
         """
-        Finish parameter synchronization for all optimizers.
+        Start parameter synchronization for all optimizers.
         This is a no-op for all non-distributed optimizers.
         """
         pass
@@ -194,10 +212,12 @@ class MegatronOptimizer(ABC):
 
     @abstractmethod
     def state_dict(self):
+        """Return state_dict."""
         pass
 
     @abstractmethod
     def load_state_dict(self, state_dict):
+        """Load pass-in `state_dict`."""
         pass
 
     # Promote state so it can be retrieved or set via
@@ -234,11 +254,31 @@ class MegatronOptimizer(ABC):
 
         Args:
             model_sharded_state_dict (ShardedStateDict): sharded state dict of the model
-            is_loading (bool, optional): flag indicating whether the state dict will be used to save or load the optimizer state.
-                Defaults to False.
+            is_loading (bool, optional): flag indicating whether the state dict will be
+                used to save or load the optimizer state. Defaults to False.
 
         Returns: optimizer sharded state dict
         """
+
+    @staticmethod
+    def _extract_common_per_param_step(state_dict) -> Union[int, torch.Tensor]:
+        common_step = None
+        for param_idx, param_state in state_dict['state'].items():
+            param_step = param_state.get('step', None)
+            if param_step is not None:
+                if common_step is None:
+                    common_step = param_step
+                elif common_step != param_step:
+                    raise ValueError(
+                        "The optimizer step differs per parameter. Mcore only supports "
+                        "optimizers whose step is shared across all parameters."
+                    )
+        return common_step
+
+    @staticmethod
+    def _restore_common_per_param_step(state_dict: Dict, step: Union[int, torch.Tensor]):
+        for param_idx, param_state in state_dict['state'].items():
+            param_state['step'] = copy.deepcopy(step)
 
 
 class MixedPrecisionOptimizer(MegatronOptimizer):
@@ -262,12 +302,10 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         grad_scaler: Optional[MegatronGradScaler],
         init_state_fn: Callable,
     ):
+        if has_config_logger_enabled(config):
+            log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
-        super().__init__(
-            optimizer,
-            config,
-            init_state_fn,
-        )
+        super().__init__(optimizer, config, init_state_fn)
         self.grad_scaler = grad_scaler
 
         # None grad scaler is only supported for bf16.
@@ -439,12 +477,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         init_state_fn: Callable,
     ):
 
-        super().__init__(
-            optimizer,
-            config,
-            grad_scaler,
-            init_state_fn,
-        )
+        super().__init__(optimizer, config, grad_scaler, init_state_fn)
 
         # Handle main parameters.
 
@@ -584,6 +617,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
     def sharded_state_dict(
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
     ):
+
         if is_loading:
             self.init_state_fn(self.optimizer)
 
@@ -611,16 +645,30 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             )
         ]
 
+        step = self._extract_common_per_param_step(state_dict['optimizer'])
+
         # Convert regular optimizer state
-        optim_state_to_sharding_state(state_dict['optimizer'], id_to_sharded_param_map)
+        # all optimizer parameters passed to optim_state_to_sharding_state are
+        # expected to have the same shape as the model parameters,
+        # so we save the step separately and ignore it here
+        optim_state_to_sharding_state(
+            state_dict['optimizer'], id_to_sharded_param_map, exclude_keys="step"
+        )
+        # save step as a shared step among all parameters. Separate per-parameter
+        # steps are not supported
+        state_dict['optimizer']['state']['common_step'] = step
         return state_dict
 
     def load_state_dict(self, state_dict):
+        pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
         # Optimizer.
         optimizer_key = 'optimizer'
         if optimizer_key not in state_dict:
             optimizer_key = 'optimizer_state_dict'
             logger.info('***WARNING*** loading optimizer from ' 'an old checkpoint ...')
+        if 'common_step' in state_dict[optimizer_key]['state']:
+            common_step = state_dict[optimizer_key]['state'].pop('common_step')
+            self._restore_common_per_param_step(state_dict[optimizer_key], common_step)
         self.optimizer.load_state_dict(state_dict[optimizer_key])
 
         # Grad scaler.
@@ -660,17 +708,12 @@ class FP32Optimizer(MegatronOptimizer):
     """
 
     def __init__(
-        self,
-        optimizer: torch.optim.Optimizer,
-        config: OptimizerConfig,
-        init_state_fn: Callable,
+        self, optimizer: torch.optim.Optimizer, config: OptimizerConfig, init_state_fn: Callable
     ):
+        if has_config_logger_enabled(config):
+            log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
-        super(FP32Optimizer, self).__init__(
-            optimizer,
-            config,
-            init_state_fn,
-        )
+        super(FP32Optimizer, self).__init__(optimizer, config, init_state_fn)
 
         self._scale = torch.tensor([1.0], dtype=torch.float, device='cuda')
 
@@ -759,6 +802,10 @@ class FP32Optimizer(MegatronOptimizer):
         return self.optimizer.state_dict()
 
     def load_state_dict(self, state_dict):
+        pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
+        if 'common_step' in state_dict['state']:
+            common_step = state_dict['state'].pop('common_step')
+            self._restore_common_per_param_step(state_dict, common_step)
         self.optimizer.load_state_dict(state_dict)
 
     def sharded_state_dict(
@@ -771,8 +818,15 @@ class FP32Optimizer(MegatronOptimizer):
         id_to_sharded_param_map = get_param_id_to_sharded_param_map(
             model_sharded_state_dict, self.get_parameters()
         )
-        optim_state_to_sharding_state(state_dict, id_to_sharded_param_map)
+        step = self._extract_common_per_param_step(state_dict)
 
+        # all optimizer parameters passed to optim_state_to_sharding_state are
+        # expected to have the same shape as the model parameters,
+        # so we save the step separately and ignore it here
+        optim_state_to_sharding_state(state_dict, id_to_sharded_param_map, exclude_keys="step")
+        # save step as a shared step among all parameters. Separate per-parameter
+        # steps are not supported
+        state_dict['state']['common_step'] = step
         return state_dict
 
 
@@ -808,6 +862,7 @@ class ProxyDict:
                 yield (idx, inner_key)
 
     def items(self):
+        """Return generator over underlying items."""
         for idx, inner_dict in enumerate(self._inner_dicts):
             for inner_key, value in inner_dict.items():
                 yield (idx, inner_key), value
@@ -824,10 +879,19 @@ class ChainedOptimizer(MegatronOptimizer):
     """
 
     def __init__(self, chained_optimizers: List[MegatronOptimizer]):
+        self.model_chunks = []
+        self.config = getattr(chained_optimizers[0], 'config', None)
+        for optimizer in chained_optimizers:
+            if hasattr(optimizer, 'model_chunks'):
+                for model_chunk in optimizer.model_chunks:
+                    if model_chunk not in self.model_chunks:
+                        self.model_chunks.append(model_chunk)
+            assert self.config == getattr(optimizer, 'config', None)
         self.chained_optimizers = chained_optimizers
 
     @property
     def param_groups(self) -> List[dict]:
+        """Get param_groups aggregated over underlying optimizers."""
         param_groups = []
         for optimizer in self.chained_optimizers:
             param_groups += optimizer.param_groups
@@ -891,34 +955,32 @@ class ChainedOptimizer(MegatronOptimizer):
     def step_with_ready_grads(self) -> bool:
         """Step the optimizer with ready gradients, return successful."""
         success = True
-        for optimizer in self.chained_optimizers:
+        for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
             success &= optimizer.step_with_ready_grads()
+            if self.config.overlap_param_gather_with_optimizer_step and optimizer_idx == 0:
+                assert success
+                assert len(optimizer.model_chunks) == 1
+                optimizer.model_chunks[0].start_param_sync(force_dispatch=True)
 
         return success
 
     def disable_pre_hook(self):
-        for optimizer in self.chained_optimizers:
-            if (
-                not optimizer.config.use_distributed_optimizer
-                or not optimizer.config.overlap_param_gather
-            ):
-                raise ValueError(
-                    "disable_pre_hook should only be called with 'use_distributed_optimizer' "
-                    "and 'overlap_param_gather' both enabled."
-                )
-            optimizer.disable_pre_hook()
+        """Disable pre-hooks for underlying distributed optimizers."""
+        warnings.warn(
+            "`ChainedOptimizer.disable_pre_hook` will be deprecated in a future release. "
+            "Use `DistributedDataParallel.disable_forward_pre_hook` directly."
+        )
+        for model_chunk in self.model_chunks:
+            model_chunk.disable_forward_pre_hook()
 
     def enable_pre_hook(self):
-        for optimizer in self.chained_optimizers:
-            if (
-                not optimizer.config.use_distributed_optimizer
-                or not optimizer.config.overlap_param_gather
-            ):
-                raise ValueError(
-                    "enable_pre_hook should only be called with 'use_distributed_optimizer' "
-                    "and 'overlap_param_gather' both enabled."
-                )
-            optimizer.enable_pre_hook()
+        """Enable pre-hooks for underlying distributed optimizers."""
+        warnings.warn(
+            "`ChainedOptimizer.enable_pre_hook` will be deprecated in a future release. "
+            "Use `DistributedDataParallel.enable_forward_pre_hook` directly."
+        )
+        for model_chunk in self.model_chunks:
+            model_chunk.enable_forward_pre_hook()
 
     @torch.no_grad()
     def step(self):
@@ -979,7 +1041,7 @@ class ChainedOptimizer(MegatronOptimizer):
         if save_states:
             torch.save(states, filename)
 
-    def load_parameter_state(self, filename: str):
+    def load_parameter_state(self, filename: str, *, update_legacy_format: bool = False):
         """Load the distributed parameter states of all optimizers from a file.
 
         Args:
@@ -995,9 +1057,11 @@ class ChainedOptimizer(MegatronOptimizer):
                 states = torch.load(filename)
 
             state_dict = states[idx] if states else None
-            optimizer.load_parameter_state_from_dp_zero(state_dict)
+            optimizer.load_parameter_state_from_dp_zero(
+                state_dict, update_legacy_format=update_legacy_format
+            )
 
-    def finish_param_sync(self, model_index: int):
-        """Finish parameter synchronization for all optimizers."""
+    def start_param_sync(self, model_index: int, *unused):
+        """Start parameter synchronization for all optimizers."""
         for optimizer in self.chained_optimizers:
-            optimizer.finish_param_sync(model_index)
+            optimizer.start_param_sync(model_index, *unused)

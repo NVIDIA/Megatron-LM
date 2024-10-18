@@ -6,7 +6,8 @@ from functools import partial
 import sys
 import torch
 
-from megatron.training import get_args, get_num_microbatches
+from megatron.training import get_args
+from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.training import print_rank_0
 from megatron.training import get_timers
 from megatron.core import mpu
@@ -57,7 +58,7 @@ def _cross_entropy_forward_step(batch, model):
     timers('batch-generator', log_level=2).start()
     try:
         batch_ = next(batch)
-    except BaseException:
+    except Exception:
         batch_ = batch
     tokens, types, labels, attention_mask = process_batch(batch_)
     timers('batch-generator').stop()

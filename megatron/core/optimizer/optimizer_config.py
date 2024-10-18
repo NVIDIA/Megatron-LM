@@ -55,7 +55,7 @@ class OptimizerConfig:
        dynamic loss scaling is used.
     """
 
-    initial_loss_scale: float = 2 ** 32
+    initial_loss_scale: float = 2**32
     """Initial loss-scale for dynamic loss scaling."""
 
     min_loss_scale: float = 1.0
@@ -94,11 +94,8 @@ class OptimizerConfig:
     use_distributed_optimizer: bool = False
     """Distribute optimizer state over data-parallel replicas."""
 
-    overlap_grad_reduce: bool = False
-    """If true, overlap grad reduce-scatter with backward compute in distributed optimizer."""
-
-    overlap_param_gather: bool = False
-    """If true, overlap param all-gather with forward compute in distributed optimizer."""
+    overlap_param_gather_with_optimizer_step: bool = False
+    """If true, overlap param all-gather of first bucket with optimizer step."""
 
     ################
     # Miscellaneous
@@ -114,3 +111,6 @@ class OptimizerConfig:
 
     timers: Callable = None
     """Function to get timers."""
+
+    config_logger_dir: str = ""
+    """When non-empty, dumps entry-point configs to config_logger_dir"""

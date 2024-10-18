@@ -1,18 +1,15 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 import argparse
-import glob
 import json
 
+from evaluate_mmmu import get_input_output_paths
 from pycocoevalcap.eval import COCOEvalCap
 from pycocotools.coco import COCO
 
 
 def convert_to_coco_format(input_path):
     """Convert input files to COCO compatible format."""
-    output_file_path = input_path + "-captioning-merged.json"
-
-    pattern = input_path + "-captioning-[0-9].*jsonl"
-    input_file_paths = glob.glob(pattern)
+    input_file_paths, output_file_path = get_input_output_paths(input_path, task="captioning")
 
     captions = []
 
@@ -27,7 +24,7 @@ def convert_to_coco_format(input_path):
                 captions.append({"image_id": question_id, "caption": caption})
 
     with open(output_file_path, "w") as output_file:
-        json.dump(captions, output_file)
+        json.dump(captions, output_file, indent=4)
 
     return output_file_path
 
@@ -41,12 +38,13 @@ def coco_captioning_eval(input_path, groundtruth_file):
     coco_eval = COCOEvalCap(coco, coco_result)
 
     # Evaluate on the input subset of images.
-    coco_eval.params['image_id'] = coco_result.getImgIds()
+    coco_eval.params["image_id"] = coco_result.getImgIds()
 
     coco_eval.evaluate()
 
+    print("========== COCO captioning scores ==========")
     for metric, score in coco_eval.eval.items():
-        print(metric, score)
+        print(f"{metric} {score * 100:.3f}")
 
 
 if __name__ == "__main__":

@@ -37,7 +37,6 @@ fi
 CHECKPOINT_DIR="${WORKSPACE}/${LOAD_NAME}/checkpoints"
 
 DATA_TRAIN="${SOURCE}/examples/multimodal/sft_dataset.yaml"
-DATA_VALID="${SOURCE}/examples/multimodal/sft_dataset.yaml"
 
 DEBUG=0
 if [[ $DEBUG -eq 1 ]]; then
@@ -57,7 +56,6 @@ else
 fi
 
 OPTIONS=" \
-    --img-embedding-idx 1 \
     --apply-layernorm-1p \
     --attention-softmax-in-fp32 \
     --use-checkpoint-args \
@@ -84,7 +82,8 @@ OPTIONS=" \
     --num-layers 32 \
     --hidden-size 4096 \
     --num-attention-heads 32 \
-    --seq-length 2048 \
+    --seq-length 576 \
+    --decoder-seq-length 2048 \
     --max-position-embeddings 4096 \
     --ffn-hidden-size 14336 \
     --train-iters 20000 \
@@ -98,15 +97,15 @@ OPTIONS=" \
     --log-interval ${LI} \
     --eval-iters 10 \
     --eval-interval 500 \
-    --tokenizer-type MistralTokenizer \
+    --tokenizer-type HuggingFaceTokenizer \
     --tokenizer-model ${WORKSPACE}/${TOKENIZER_MODEL} \
     --data-path ${DATA_TRAIN} \
-    --valid-path ${DATA_VALID} \
     --prompt-path ${SOURCE}/examples/multimodal/manual_prompts.json \
     --save-interval 500 \
     --save ${FINETUNE_DIR} \
     --load ${FINETUNE_DIR} \
     --pretrained-checkpoint ${CHECKPOINT_DIR} \
+    --dataloader-save ${FINETUNE_DIR}/dataloader \
     --split 100,0,0 \
     --clip-grad 0.5 \
     --weight-decay 0.1 \

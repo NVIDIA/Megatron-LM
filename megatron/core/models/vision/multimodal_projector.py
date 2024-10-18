@@ -1,8 +1,10 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from megatron.core import tensor_parallel
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import make_viewless_tensor
 
 
 class MultimodalProjector(MegatronModule):
@@ -54,5 +56,12 @@ class MultimodalProjector(MegatronModule):
 
         if encoder_output_bias is not None:
             encoder_output = encoder_output + encoder_output_bias
+
+        # the encoder produces "viewed" tensor. This will result in schedule.py's
+        # deallocate_output_tensor() throwing an error, so a viewless tensor is
+        # created to prevent this.
+        encoder_output = make_viewless_tensor(
+            inp=encoder_output, requires_grad=True, keep_graph=True
+        )
 
         return encoder_output

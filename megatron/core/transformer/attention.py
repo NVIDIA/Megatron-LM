@@ -1,14 +1,12 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from importlib.metadata import version
 from typing import Union
 
 import torch
-from pkg_resources import packaging
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.models.common.embeddings.rotary_pos_embedding import apply_rotary_pos_emb
+from megatron.core.models.common.embeddings import apply_rotary_pos_emb
 from megatron.core.parallel_state import (
     get_data_parallel_group,
     get_data_parallel_rank,
@@ -17,16 +15,21 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from megatron.core.transformer.custom_layers.transformer_engine import SplitAlongDim
-from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import divide
 
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
+
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+    from megatron.core.transformer.custom_layers.transformer_engine import SplitAlongDim
+except ImportError:
+    HAVE_TE = False
+    SplitAlongDim = None
 
 
 @dataclass
@@ -138,26 +141,19 @@ class Attention(MegatronModule, ABC):
             attn_mask_type = self.attn_mask_type
         attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
         hidden_states = tensor_parallel.checkpoint(
-            custom_forward,
-            False,
-            query,
-            key,
-            value,
-            attention_mask,
-            rotary_pos_emb,
-            attn_mask_type,
+            custom_forward, False, query, key, value, attention_mask, rotary_pos_emb, attn_mask_type
         )
 
         return hidden_states
 
-    def _allocate_memory(self, inference_max_sequence_length, batch_size, dtype):
+    def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
         """Allocate memory to store kv cache during inference."""
 
         return torch.empty(
             inference_max_sequence_length,
             batch_size,
             self.num_query_groups_per_partition,
-            self.hidden_size_per_attention_head,
+            dim,
             dtype=dtype,
             device=torch.cuda.current_device(),
         )
@@ -178,26 +174,28 @@ class Attention(MegatronModule, ABC):
         # =================================================
         # Pre-allocate memory for key-values for inference.
         # =================================================
-        is_first_step = False
         if self.layer_number not in inference_params.key_value_memory_dict:
             inf_max_seq_length = inference_params.max_sequence_length
             inf_max_batch_size = inference_params.max_batch_size
             inference_key_memory = self._allocate_memory(
-                inf_max_seq_length, inf_max_batch_size, key.dtype
+                inf_max_seq_length, inf_max_batch_size, key.shape[-1], key.dtype
             )
             inference_value_memory = self._allocate_memory(
-                inf_max_seq_length, inf_max_batch_size, value.dtype
+                inf_max_seq_length, inf_max_batch_size, value.shape[-1], value.dtype
             )
             inference_params.key_value_memory_dict[self.layer_number] = (
                 inference_key_memory,
                 inference_value_memory,
             )
-            is_first_step = True
         else:
             # Get the pre-allocated buffers for this layer
             inference_key_memory, inference_value_memory = inference_params.key_value_memory_dict[
                 self.layer_number
             ]
+
+        if inference_params.sequence_len_offset > 0:
+            # This should mean that we are past the prompt forward_step
+            # and so we need to turn off masking
             attn_mask_type = AttnMaskType.no_mask
 
         batch_start = inference_params.batch_size_offset
@@ -213,24 +211,13 @@ class Attention(MegatronModule, ABC):
         value = inference_value_memory[:sequence_end, batch_start:batch_end, ...]
 
         # adjust the key rotary positional embedding
-        if rotary_pos_emb is not None:
-            q_pos_emb, k_pos_emb = rotary_pos_emb
-            # need to cross check this condition during inference
-            # if not set_inference_key_value_memory:
-            if not is_first_step:
-                # In inference, we compute one token at a time.
-                # Select the correct positional embedding
-                # (only the last token in the sequence)
-                q_pos_emb = q_pos_emb[sequence_end - 1 : sequence_end]
-            else:
-                # In the first forward pass of inference,
-                # we use the entire provided prefix.
-                # q_pos_emb here has the rope embeddings of the entire
-                # prefix + to-be-generated output so
-                # we slice to just the prefix.
-                q_pos_emb = q_pos_emb[:sequence_end, :, :, :]
-            k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
-            rotary_pos_emb = (q_pos_emb, k_pos_emb)
+        if rotary_pos_emb is None:
+            return key, value, rotary_pos_emb, attn_mask_type
+
+        q_pos_emb, k_pos_emb = rotary_pos_emb
+        q_pos_emb = q_pos_emb[sequence_start:sequence_end, :, :, :]
+        k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
+        rotary_pos_emb = (q_pos_emb, k_pos_emb)
 
         return key, value, rotary_pos_emb, attn_mask_type
 
@@ -287,11 +274,9 @@ class Attention(MegatronModule, ABC):
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
             query = apply_rotary_pos_emb(
-                query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q,
+                query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q
             )
-            key = apply_rotary_pos_emb(
-                key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv,
-            )
+            key = apply_rotary_pos_emb(key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv)
 
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
@@ -397,11 +382,12 @@ class SelfAttention(Attention):
 
         This function makes sure that tensors across devices are the same during an experiment.
         This is often not guaranteed to be so because of silent hardware failures (eg, memory
-        corruption loading a checkpoint, network traffic corruption encountered during data transmission).
+        corruption loading a checkpoint, network traffic corruption encountered during
+        data transmission).
 
         (TODO) In the future, more tensors should be checked across the training run and
-        checked every X iterations. This is left for future work. Equality of tensors is probably not
-        required; transmitting hashes is sufficient."""
+        checked every X iterations. This is left for future work. Equality of tensors is probably
+        not required; transmitting hashes is sufficient."""
 
         if not self.config.qk_layernorm:
             return
@@ -424,9 +410,10 @@ class SelfAttention(Attention):
         def _compare(srcs, tgts, names, parallelism):
             assert len(srcs) == len(tgts) == len(names)
             for src, tgt, name in zip(srcs, tgts, names):
-                assert torch.all(
-                    src == tgt
-                ), f"Discrepancy between {name} in {parallelism} ranks {i} and {rank}. Diff: {torch.norm(src - tgt)}"
+                assert torch.all(src == tgt), (
+                    f"Discrepancy between {name} in {parallelism} ranks {i} and {rank}. "
+                    f"Diff: {torch.norm(src - tgt)}"
+                )
 
         for i, dp in enumerate(dp_list):
             q_w, q_b, k_w, k_b = torch.unbind(dp)
@@ -490,12 +477,14 @@ class SelfAttention(Attention):
 
         if SplitAlongDim is not None:
 
-            # [sq, b, ng, (np/ng + 2) * hn] --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
-            (query, key, value) = SplitAlongDim(mixed_qkv, 3, split_arg_list,)
+            # [sq, b, ng, (np/ng + 2) * hn]
+            # --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
+            (query, key, value) = SplitAlongDim(mixed_qkv, 3, split_arg_list)
         else:
 
-            # [sq, b, ng, (np/ng + 2) * hn] --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
-            (query, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3,)
+            # [sq, b, ng, (np/ng + 2) * hn]
+            # --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
+            (query, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3)
 
         # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
@@ -535,9 +524,7 @@ class CrossAttention(Attention):
         )
 
         if self.config.num_query_groups != self.config.num_attention_heads:
-            raise ValueError(
-                f"Group query attention is not currently supported in cross attention."
-            )
+            raise ValueError("Group query attention is not currently supported in cross attention.")
         assert self.query_projection_size == self.kv_projection_size
 
         self.linear_q = build_module(

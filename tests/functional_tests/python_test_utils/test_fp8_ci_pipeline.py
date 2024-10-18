@@ -6,7 +6,7 @@ import pytest
 import scipy.stats as ss
 from scipy.integrate import trapezoid
 
-from .common import TypeOfTest, read_tb_logs_as_list
+from .common import read_tb_logs_as_list
 
 LOGS_DIR = os.getenv("LOGS_DIR")
 EXPECTED_METRICS_FILE = os.getenv("EXPECTED_METRICS_FILE")
@@ -37,21 +37,17 @@ class TestFP8CIPipeline:
         expected_list = np.array(expected["values"])
         actual_list = self._get_actual(loss_type)
         actual_list_sliced = np.array(
-            actual_list[
-                expected["start_step"] : expected["end_step"] : expected[
-                    "step_interval"
-                ]
-            ]
+            actual_list[expected["start_step"] : expected["end_step"] : expected["step_interval"]]
         )
 
         max_diff_index = np.argmax(np.abs(actual_list_sliced - expected_list))
-        max_diff = np.abs(
-            actual_list_sliced[max_diff_index] - expected_list[max_diff_index]
-        )
+        max_diff = np.abs(actual_list_sliced[max_diff_index] - expected_list[max_diff_index])
 
         print(
-            f"[INFO - margin]: maximum absolute difference for {loss_type} is {max_diff} at index {max_diff_index}, "
-            f"Actual: {actual_list_sliced[max_diff_index]}, Expected: {expected_list[max_diff_index]}"
+            "[INFO - margin]: "
+            f"maximum absolute difference for {loss_type} is {max_diff} at index {max_diff_index}, "
+            f"Actual: {actual_list_sliced[max_diff_index]}, "
+            f"Expected: {expected_list[max_diff_index]}"
         )
         assert np.allclose(
             actual_list_sliced, expected_list, rtol=1e-5, atol=self.margin_loss
@@ -62,11 +58,7 @@ class TestFP8CIPipeline:
         expected_list = np.array(expected["values"])
         actual_list = self._get_actual(loss_type)
         actual_list_sliced = np.array(
-            actual_list[
-                expected["start_step"] : expected["end_step"] : expected[
-                    "step_interval"
-                ]
-            ]
+            actual_list[expected["start_step"] : expected["end_step"] : expected["step_interval"]]
         )
 
         def compute_auc(y_values):
@@ -79,7 +71,8 @@ class TestFP8CIPipeline:
         diff = abs(baseline_area - current_area)
 
         print(
-            f"[INFO - AUC]: AUC diff: {diff * 100 / baseline_area} %, current: {current_area}, baseline: {baseline_area}"
+            f"[INFO - AUC]: AUC diff: {diff * 100 / baseline_area} %, current: {current_area}, "
+            f"baseline: {baseline_area}"
         )
         assert (baseline_area <= 0) or (diff <= self.auc_threshold * baseline_area)
 
@@ -88,11 +81,7 @@ class TestFP8CIPipeline:
         expected_list = np.array(expected["values"])
         actual_list = self._get_actual(loss_type)
         actual_list_sliced = np.array(
-            actual_list[
-                expected["start_step"] : expected["end_step"] : expected[
-                    "step_interval"
-                ]
-            ]
+            actual_list[expected["start_step"] : expected["end_step"] : expected["step_interval"]]
         )
         corr = ss.pearsonr(actual_list_sliced, expected_list).statistic
 
@@ -118,7 +107,7 @@ class TestFP8CIPipeline:
         iteration_time = read_tb_logs_as_list(LOGS_DIR)["iteration-time"]
         idx = len(iteration_time) // 3
         iteration_time_avg = sum(iteration_time[idx:]) / len(iteration_time[idx:])
-        assert (
-            expected_iteration_timing_avg
-            == pytest.approx(expected=iteration_time_avg, rel=self.margin_time)
-        ), f"The time per global step must be approximately {expected_iteration_timing_avg} but it is {iteration_time_avg}."
+        assert expected_iteration_timing_avg == pytest.approx(
+            expected=iteration_time_avg, rel=self.margin_time
+        ), f"The time per global step must be approximately {expected_iteration_timing_avg} but it \
+is {iteration_time_avg}."

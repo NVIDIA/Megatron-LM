@@ -2,7 +2,6 @@
 
 import pickle
 from copy import deepcopy
-
 from dataclasses import fields
 
 import torch
@@ -16,6 +15,12 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestCachedMetadata:
+    def setup_method(self, method):
+        pass
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
     def test_cached_metadata(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(2, 4)
 

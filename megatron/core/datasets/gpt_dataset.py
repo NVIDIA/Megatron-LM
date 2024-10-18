@@ -14,6 +14,7 @@ from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
 from megatron.core.datasets.utils import Split
+from megatron.core.datasets.utils_s3 import S3Config, is_s3_path
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -47,9 +48,11 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
        output tokens are both of the desired sequence length
     """
 
+    s3_cache_path: str = None
+    """Path for caching indices for s3 dataloading."""
+
     def __post_init__(self) -> None:
-        """Do asserts and set fields post init
-        """
+        """Do asserts and set fields post init"""
         super().__post_init__()
 
         assert self.tokenizer is not None
@@ -102,14 +105,12 @@ class GPTDataset(MegatronDataset):
 
         try:
             self._pad_token_id = self.config.tokenizer.pad
-        except:
+        except Exception:
             self._pad_token_id = _PAD_TOKEN_ID
 
-        (
-            self.document_index,
-            self.sample_index,
-            self.shuffle_index,
-        ) = self._build_document_sample_shuffle_indices()
+        (self.document_index, self.sample_index, self.shuffle_index) = (
+            self._build_document_sample_shuffle_indices()
+        )
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: IndexedDataset) -> int:
@@ -138,6 +139,13 @@ class GPTDataset(MegatronDataset):
         Returns:
             IndexedDataset: The underlying IndexedDataset
         """
+        if is_s3_path(dataset_path):
+            return IndexedDataset(
+                dataset_path,
+                multimodal=False,
+                mmap=config.mmap_bin_files,
+                s3_config=S3Config(path_to_idx_cache=config.s3_cache_path),
+            )
         return IndexedDataset(dataset_path, multimodal=False, mmap=config.mmap_bin_files)
 
     def __len__(self) -> int:
@@ -296,7 +304,7 @@ class GPTDataset(MegatronDataset):
         self,
     ) -> Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]:
         """Build the document index, the sample index, and the shuffle index
-        
+
         The document index:
             -- 1-D
             -- An ordered array of document ids
@@ -351,6 +359,7 @@ class GPTDataset(MegatronDataset):
                 logging.INFO,
                 f"Build and save the {type(self).__name__} {self.index_split.name} indices",
             )
+            self.built_anew_on_cache_miss = True
             t_beg = time.time()
 
             sequence_length = self.config.sequence_length
@@ -579,7 +588,7 @@ def _build_shuffle_index(
     num_samples: int, total_size: int, numpy_random_state: numpy.random.RandomState
 ) -> numpy.ndarray:
     """Build the range [0, size) and shuffle
-    
+
     Args:
         num_samples (int): The size of the first shuffle range [0, num_samples)
 
