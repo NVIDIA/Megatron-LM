@@ -38,18 +38,12 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
 done
 
 # Envsubst model_params
-cat $TRAINING_PARAMS_PATH | envsubst >$TRAINING_PARAMS_PATH.tmp
+cat $TRAINING_PARAMS_PATH | envsubst "$(env | cut -d= -f1 | sed -e 's/^/$/')" >$TRAINING_PARAMS_PATH.tmp
 mv $TRAINING_PARAMS_PATH.tmp $TRAINING_PARAMS_PATH
-
-# Run before script
-SCRIPT=$(cat $TRAINING_PARAMS_PATH | yq '.BEFORE_SCRIPT')
-if [[ "$SCRIPT" != null ]]; then
-    eval "$SCRIPT"
-fi;
 
 # Pull env vars to export
 ENV_VARS=$(yq '... comments="" | .ENV_VARS | to_entries | .[] | [.key + "=" + .value] | join(" ")' $TRAINING_PARAMS_PATH)
-for ARGUMENT in $ENV_VARS; do
+while IFS= read -r ARGUMENT; do
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
 
     KEY_LENGTH=${#KEY}
@@ -57,7 +51,13 @@ for ARGUMENT in $ENV_VARS; do
 
     export "$KEY"="$VALUE"
     echo "$KEY=$VALUE"
-done
+done <<< "$ENV_VARS"
+
+# Run before script
+SCRIPT=$(cat $TRAINING_PARAMS_PATH | yq '.BEFORE_SCRIPT')
+if [[ "$SCRIPT" != null ]]; then
+    eval "$SCRIPT"
+fi;
 
 # Exit earlier to leave time for properly saving checkpoint
 if [[ $(echo "$TRAINING_SCRIPT_PATH" | tr '[:upper:]' '[:lower:]') == *nemo* ]]; then

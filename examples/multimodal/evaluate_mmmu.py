@@ -1,15 +1,34 @@
 import argparse
 import glob
 import json
+import os
+import re
 import subprocess
+
+from run_text_generation import get_output_path
+from config import EvaluationConfig
+
+
+def get_input_output_paths(input_path, task):
+    """Get all input files and an output path for a merged file."""
+    # Single input file.
+    if os.path.exists(input_path):
+        input_file_paths = [input_path]
+        output_file_path = input_path.replace(".jsonl", "-merged.json")
+    # Select multiple partitions and dp ranks.
+    else:
+        cfg = EvaluationConfig(task=task, output_path=input_path, partition_id="*")
+        pattern = get_output_path(cfg, dp_rank="*")
+        input_file_paths = glob.glob(pattern)
+
+        output_file_path = input_path + f"-{task}-merged.json"
+
+    return input_file_paths, output_file_path
 
 
 def convert_to_mmmu_format(input_path):
     """Convert input files to MMMU compatible format."""
-    output_file_path = input_path + "-MMMU-merged.json"
-
-    pattern = input_path + "-MMMU-[0-9].*jsonl"
-    input_file_paths = glob.glob(pattern)
+    input_file_paths, output_file_path = get_input_output_paths(input_path, "MMMU")
 
     output = dict()
 
@@ -37,7 +56,7 @@ def mmmu_eval(input_path, groundtruth_path):
     output = subprocess.run(
         [
             "python",
-            "examples/multimodal/MMMU/eval/main_eval_only.py",
+            "examples/multimodal/MMMU/mmmu/main_eval_only.py",
             "--output_path",
             result_file,
             "--answer_path",
@@ -47,13 +66,18 @@ def mmmu_eval(input_path, groundtruth_path):
         text=True,
     )
 
+    print(output.stderr)
     print(output.stdout)
+
+    m = re.search("'Overall': {'num': \d, 'acc': (\d.\d+)}", output.stdout)
+
+    return float(m.group(1)) * 100.0
 
 
 def main():
     """Run MMMU evaluation."""
     # Using the validation groundtruth file from the MMMU repo by default. This assumes you have cloned the MMMU github repo here.
-    default_groundtruth_path = "examples/multimodal/MMMU/eval/answer_dict_val.json"
+    default_groundtruth_path = "examples/multimodal/MMMU/mmmu/answer_dict_val.json"
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-path", type=str, required=True, help="Path to input file(s)")
@@ -65,7 +89,9 @@ def main():
     )
     args = parser.parse_args()
 
-    mmmu_eval(args.input_path, args.groundtruth_path)
+    avg_acc = mmmu_eval(args.input_path, args.groundtruth_path)
+
+    print(f"MMMU average accuracy: {avg_acc:.2f}")
 
 
 if __name__ == "__main__":

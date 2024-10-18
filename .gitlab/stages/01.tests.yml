@@ -1,4 +1,4 @@
-.tests_common:
+.test_mr_rules:
   rules:
     - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
@@ -10,6 +10,7 @@ include:
   - template: Security/Secret-Detection.gitlab-ci.yml
 
 build_image:
+  extends: [.test_mr_rules]
   tags:
     - ${TAG}
   image: docker:26.1.4-dind
@@ -18,6 +19,10 @@ build_image:
     matrix:
       - IMAGE: CI_MCORE_IMAGE
         FILE: Dockerfile.ci
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:24.01-py3
+        TAG: mcore-docker-node-large
+      - IMAGE: CI_MCORE_DEV_IMAGE
+        FILE: Dockerfile.ci.dev
         BASE_IMAGE: nvcr.io/nvidia/pytorch:24.01-py3
         TAG: mcore-docker-node-large
       - IMAGE: CI_NEMO_IMAGE
@@ -34,48 +39,44 @@ build_image:
   variables:
     STAGE: main
   script:
+    - apk add bash
     - |
-      set -x
-      env
-      eval "IMAGE=\$$IMAGE"
+      bash -c '
+        set -x
+        env
+        eval "IMAGE=\$$IMAGE"
 
-      docker system prune -a --filter "until=24h" -f || true
+        docker system prune -a --filter "until=24h" -f || true
+        
+        docker buildx create --name container --driver=docker-container
+      
+        ADDITIONAL_PARAMS=()
 
-      if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
-        ADDITIONAL_PARAMS="--pull"
-      fi
+        if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
+          ADDITIONAL_PARAMS+=("--pull")
+          ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:main")
+        fi
 
-      docker pull ${IMAGE}:${CI_PIPELINE_ID} || true
-      docker pull ${IMAGE}:${CI_MERGE_REQUEST_IID:-noop} || true
-      docker pull ${IMAGE}:buildcache || true
+        if [[ "$CI_COMMIT_BRANCH" == "ci-nightly-a100" ]]; then
+          ADDITIONAL_PARAMS+=("-t ${IMAGE}:nightly")
+        fi
 
-      docker build \
-        --secret id=JET_INDEX_URLS \
-        --target $STAGE \
-        -f $FILE \
-        -t ${IMAGE}:${CI_PIPELINE_ID} \
-        -t ${IMAGE}:${CI_MERGE_REQUEST_IID:-noop} \
-        --build-arg CACHEBUST=$(cat /proc/sys/kernel/random/uuid) \
-        --cache-to type=inline \
-        --cache-from type=registry,ref=${IMAGE}:buildcache \
-        --cache-from type=registry,ref=${IMAGE}:${CI_PIPELINE_ID} \
-        --cache-from type=registry,ref=${IMAGE}:${CI_MERGE_REQUEST_IID:-noop} \
-        --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
-        ${ADDITIONAL_PARAMS} .
-
-      docker push ${IMAGE}:${CI_PIPELINE_ID}
-      docker push ${IMAGE}:${CI_MERGE_REQUEST_IID:-noop}
-
-      if [[ "$CI_COMMIT_BRANCH" == "ci-nightly-a100" ]]; then
-        docker tag ${IMAGE}:${CI_PIPELINE_ID} ${IMAGE}:nightly
-        docker push ${IMAGE}:nightly
-      fi
-
-      if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
-        docker tag ${IMAGE}:${CI_PIPELINE_ID} ${IMAGE}:buildcache
-        docker push ${IMAGE}:buildcache
-      fi
-
+        DOCKER_BUILDKIT=1 docker build \
+          --secret id=JET_INDEX_URLS \
+          --target $STAGE \
+          -f $FILE \
+          -t ${IMAGE}:${CI_PIPELINE_ID} \
+          --builder=container \
+          --build-arg CACHEBUST=$(cat /proc/sys/kernel/random/uuid) \
+          --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_PIPELINE_ID} \
+          --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID:-noop} \
+          --cache-from type=registry,ref=${IMAGE}-buildcache:main \
+          --cache-from type=registry,ref=${IMAGE}-buildcache:${CI_PIPELINE_ID} \
+          --cache-from type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID:-noop} \
+          --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
+          --push \
+          ${ADDITIONAL_PARAMS[@]} .
+        '
   retry:
     max: 2
 
@@ -83,14 +84,18 @@ unit_tests:
   # This job runs both test suite of ToT and of a historic ref against
   # the current code. This is a form of backwards compatibility testing
   # and helps in providing stable interfaces.
-  extends: [.tests_common]
-  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
+  extends: [.test_mr_rules]
+  image: ${IMAGE}:${CI_PIPELINE_ID}
   needs: [build_image]
   timeout: 180m
   parallel:
     matrix:
       - TAG: latest
-      - TAG: 0bb840767d0643c2d0df7192d754ec7db3a18412
+        IMAGE: ${CI_MCORE_IMAGE}
+      # - TAG: latest
+      #   IMAGE: ${CI_MCORE_DEV_IMAGE}
+      - TAG: core_r0.9.0
+        IMAGE: ${CI_MCORE_IMAGE}
   tags: [8xL40S]
   variables:
     GIT_STRATEGY: clone
@@ -111,11 +116,16 @@ unit_tests:
 
       for i in $(seq $UNIT_TEST_REPEAT); do
         SEED=$((RANDOM % 9000 + 1000));
-        SKIPPED=()
+        ARGS=()
         if [[ $TAG != latest ]]; then
-          SKIPPED+=(-m "not internal")
+          ARGS+=(-m "not internal")
+        else
+          ARGS+=(-m "not flaky")
         fi
-        timeout ${UNIT_TEST_TIMEOUT}m torchrun --nproc_per_node=8 -m pytest --random-order --random-order-seed ${SEED} -xvs --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail "${SKIPPED[@]}" tests/unit_tests
+        if [[ $IMAGE == ${CI_MCORE_DEV_IMAGE} ]]; then
+          ARGS+=(-m "experimental")
+        fi
+        timeout ${UNIT_TEST_TIMEOUT}m torchrun --nproc_per_node=8 -m pytest --random-order --random-order-seed ${SEED} -xvs --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail "${ARGS[@]}" tests/unit_tests
       done
   artifacts:
     paths:
@@ -124,11 +134,32 @@ unit_tests:
     - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
       when: always
-    - if: '$TAG != "latest"'
-      allow_failure: true
     - when: always
 
+unit-tests-results-notify:
+  extends: [.test_mr_rules]
+  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
+  needs: [unit_tests]
+  tags:
+    - mcore-docker-node-small
+  script:
+    - env
+    - export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
+    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
+    - export GITLAB_ENDPOINT
+    - export DATE=$(date +"%Y-%m-%d")
+    - bash tests/functional_tests/shell_test_utils/notify_unit_tests.sh ${CI_PIPELINE_ID}
+  artifacts:
+    when: always
+    paths:
+      - scripts
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == "ci-unit-test-extended"
+      when: always
+    - when: never
+
 docs_build_test:
+  extends: [.test_mr_rules]
   image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
   tags: [mcore-docker-node-small]
   needs: [build_image]
@@ -140,18 +171,17 @@ docs_build_test:
     - ./repo docs
 
 formatting:
-  extends: [.tests_common]
+  extends: [.test_mr_rules]
   image: ${LINTING_IMAGE}:${CI_PIPELINE_ID}
   tags: [mcore-docker-node-small]
-  stage: test
   needs: [build_image]
   script:
     - env
     - git fetch origin main
-    - CHECK_ONLY=true SKIP_DOCS=$([[ "$CI_MERGE_REQUEST_LABELS" == *"Skip docs"* ]] && echo "true" || echo "false") bash tools/autoformat.sh
+    - BASE_REF="$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" CHECK_ONLY=true SKIP_DOCS=$([[ "$CI_MERGE_REQUEST_LABELS" == *"Skip docs"* ]] && echo "true" || echo "false") bash tools/autoformat.sh
 
 copyright:
-  extends: [.tests_common]
+  extends: [.test_mr_rules]
   tags: [mcore-docker-node-small]
   image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
   needs: [build_image]
@@ -164,7 +194,7 @@ secret_detection:
   variables:
     GIT_DEPTH: 0
     SECRET_DETECTION_LOG_OPTIONS: ${CI_MERGE_REQUEST_DIFF_BASE_SHA}..${CI_COMMIT_SHA}
-  allow_failure: false
+  allow_failure: true
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
   script:

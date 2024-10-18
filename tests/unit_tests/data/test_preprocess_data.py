@@ -183,7 +183,7 @@ def gpt2_merge(odir):
     return path
 
 
-@pytest.mark.skip(reason="Tests are flaky and need to be debugged")
+@pytest.mark.flaky
 def test_preprocess_data_gpt():
     with tempfile.TemporaryDirectory() as temp_dir:
 
@@ -214,7 +214,7 @@ def bert_vocab(odir):
     return path
 
 
-@pytest.mark.skip(reason="Tests are flaky and need to be debugged")
+@pytest.mark.flaky
 def test_preprocess_data_bert():
     with tempfile.TemporaryDirectory() as temp_dir:
 
