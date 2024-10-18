@@ -60,8 +60,9 @@ class CLIPViTModel(VisionModule):
         self.img_h = img_h
         self.img_w = img_w
 
-        assert self.img_h % self.patch_dim == 0
-        assert self.img_w % self.patch_dim == 0
+        if model_subtype == "siglip":
+            assert self.img_h % self.patch_dim == 0
+            assert self.img_w % self.patch_dim == 0
         self.num_patches_per_dim_h = self.img_h // self.patch_dim
         self.num_patches_per_dim_w = self.img_w // self.patch_dim
         self.num_patches = self.num_patches_per_dim_h * self.num_patches_per_dim_w
@@ -161,6 +162,7 @@ class CLIPViTModel(VisionModule):
         x = x + self.position_embeddings(self.position_ids)
         if self.ln_pre:
             x = self.ln_pre(x)
+
         x = x.permute(1, 0, 2)  # [b, s, h] -> [s, b, h]
         # `permute` can make the tensor non-contiguous, breaking pipelining.
         x = x.contiguous()
