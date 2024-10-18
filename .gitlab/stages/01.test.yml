@@ -85,7 +85,12 @@ test:build_image:
 
 .unit_tests:
   extends: [.test_rules, .dind_rules]
-  needs: [test:build_image]
+  needs: 
+    - test:build_image
+    - test:docs_build
+    - test:formatting
+    - test:copyright
+    - test:secret_detection
   timeout: 180m
   tags: [8xL40S]
   variables:
