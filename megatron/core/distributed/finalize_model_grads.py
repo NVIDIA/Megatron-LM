@@ -142,7 +142,6 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
         pp_group = parallel_state.get_pipeline_model_parallel_group()
 
         if not isinstance(last_rank, list):
-            assert not isinstance(last_rank, list)
             last_rank = [last_rank]
             assert not isinstance(pp_group, list)
             pp_group = [pp_group]
