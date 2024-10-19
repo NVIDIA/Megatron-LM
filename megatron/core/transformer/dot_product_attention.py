@@ -41,6 +41,8 @@ class DotProductAttention(MegatronModule):
         attention_type: str,
         attention_dropout: float = None,
         softmax_scale: float = None,
+        k_channels: int = None,
+        v_channels: int = None,
     ):
         super().__init__(config=config)
 
