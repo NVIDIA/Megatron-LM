@@ -90,7 +90,6 @@ test:build_image:
     - test:docs_build
     - test:formatting
     - test:copyright
-    - test:secret_detection
   timeout: 180m
   tags: [8xL40S]
   variables:
@@ -218,6 +217,7 @@ test:secret_detection:
   allow_failure: true
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - when: never
   script:
     - apk add jq
     - /analyzer run
