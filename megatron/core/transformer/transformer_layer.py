@@ -112,9 +112,19 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             eps=self.config.layernorm_epsilon,
         )
 
+        attention_optional_kwargs = {}
+        if config.cp_comm_type is not None:
+            if isinstance(config.cp_comm_type, list):
+                attention_optional_kwargs["cp_comm_type"] = config.cp_comm_type[self.layer_number]
+            else:
+                attention_optional_kwargs["cp_comm_type"] = config.cp_comm_type
+
         # [Module 2: SelfAttention]
         self.self_attention = build_module(
-            submodules.self_attention, config=self.config, layer_number=layer_number
+            submodules.self_attention,
+            config=self.config,
+            layer_number=layer_number,
+            **attention_optional_kwargs,
         )
 
         # [Module 3: BiasDropoutFusion]
@@ -130,7 +140,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         # [Module 5: CrossAttention]
         self.cross_attention = build_module(
-            submodules.cross_attention, config=self.config, layer_number=layer_number
+            submodules.cross_attention,
+            config=self.config,
+            layer_number=layer_number,
+            **attention_optional_kwargs,
         )
 
         # [Module 6: BiasDropoutFusion]
