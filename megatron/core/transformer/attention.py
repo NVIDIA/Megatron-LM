@@ -34,6 +34,10 @@ except ImportError:
 
 @dataclass
 class SelfAttentionSubmodules:
+    """
+    Configuration class for specifying the submodules of a self-attention.
+    """
+
     linear_qkv: Union[ModuleSpec, type] = None
     core_attention: Union[ModuleSpec, type] = None
     linear_proj: Union[ModuleSpec, type] = None
@@ -43,6 +47,10 @@ class SelfAttentionSubmodules:
 
 @dataclass
 class CrossAttentionSubmodules:
+    """
+    Configuration class for specifying the submodules of a cross-attention.
+    """
+
     linear_q: Union[ModuleSpec, type] = None
     linear_kv: Union[ModuleSpec, type] = None
     core_attention: Union[ModuleSpec, type] = None
@@ -63,6 +71,7 @@ class Attention(MegatronModule, ABC):
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
+        cp_comm_type: str = None,
     ):
         super().__init__(config=config)
 
@@ -90,6 +99,7 @@ class Attention(MegatronModule, ABC):
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
             attention_type=self.attention_type,
+            cp_comm_type=cp_comm_type,
         )
 
         self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
@@ -237,6 +247,10 @@ class Attention(MegatronModule, ABC):
         rotary_pos_emb=None,
         packed_seq_params=None,
     ):
+        """
+        Perform a forward pass through the attention module.
+        """
+
         # hidden_states: [sq, b, h]
 
         # For self attention we just duplicate the rotary_pos_emb if it isn't already
@@ -335,6 +349,7 @@ class SelfAttention(Attention):
         submodules: SelfAttentionSubmodules,
         layer_number: int,
         attn_mask_type=AttnMaskType.padding,
+        cp_comm_type: str = None,
     ):
         super().__init__(
             config=config,
@@ -342,6 +357,7 @@ class SelfAttention(Attention):
             layer_number=layer_number,
             attn_mask_type=attn_mask_type,
             attention_type="self",
+            cp_comm_type=cp_comm_type,
         )
 
         self.linear_qkv = build_module(
@@ -514,6 +530,7 @@ class CrossAttention(Attention):
         submodules: CrossAttentionSubmodules,
         layer_number: int,
         attn_mask_type=AttnMaskType.padding,
+        cp_comm_type: str = None,
     ):
         super().__init__(
             config=config,
@@ -521,6 +538,7 @@ class CrossAttention(Attention):
             layer_number=layer_number,
             attn_mask_type=attn_mask_type,
             attention_type="cross",
+            cp_comm_type=cp_comm_type,
         )
 
         if self.config.num_query_groups != self.config.num_attention_heads:

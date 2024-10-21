@@ -545,6 +545,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         softmax_scale: float = None,
         k_channels: int = None,
         v_channels: int = None,
+        cp_comm_type: str = "p2p",
     ):
         self.config = config
         self.te_forward_mask_type = False
@@ -587,6 +588,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 check_initialized=False
             )
             extra_kwargs["cp_stream"] = TEDotProductAttention.cp_stream
+            if is_te_min_version("1.10.0"):
+                if cp_comm_type is None:
+                    extra_kwargs["cp_comm_type"] = "p2p"
+                else:
+                    extra_kwargs["cp_comm_type"] = cp_comm_type
         else:
             assert (
                 self.config.context_parallel_size == 1

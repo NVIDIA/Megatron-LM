@@ -41,6 +41,7 @@ class DotProductAttention(MegatronModule):
         attention_type: str,
         attention_dropout: float = None,
         softmax_scale: float = None,
+        cp_comm_type: str = None,
     ):
         super().__init__(config=config)
 
@@ -103,6 +104,7 @@ class DotProductAttention(MegatronModule):
         attn_mask_type: AttnMaskType = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
+        """Forward."""
         assert packed_seq_params is None, (
             "Packed sequence is not supported by DotProductAttention."
             "Please use TEDotProductAttention instead."
