@@ -3,10 +3,11 @@
 import os
 import sys
 import torch
+from importlib.metadata import version
+from pkg_resources import packaging
 
 from setter import ModelSetter
 from utils import get_mcore_transformer_block_key, print_memory_usage
-from megatron.core.utils import get_te_version, is_te_min_version
 
 
 class MCoreSetter(ModelSetter):
@@ -50,7 +51,7 @@ class MCoreSetter(ModelSetter):
         model,
         emb=None,
     ):
-        cls.set_tensor(model.embedding.word_embeddings.weight, emb)
+        cls.set_tensor(model.output_layer.weight, emb)
 
     @classmethod
     def set_output_layer(
@@ -287,8 +288,9 @@ def add_arguments(parser):
 def save_checkpoint(queue, args):
 
     # Transformer engine >= 0.12.0, for CPU initialization.
-    assert is_te_min_version("0.12.0"), \
-        "transformer engine version: %s (>=0.12.0 required)." % get_te_version()
+    te_version = packaging.version.Version(version("transformer-engine"))
+    assert te_version >= packaging.version.Version("0.12.0"), \
+        "transformer engine version: %s (>=0.12.0 required)." % te_version
 
     # Search in directory above this
     sys.path.append(os.path.abspath(
@@ -600,6 +602,7 @@ def save_checkpoint(queue, args):
     # ------------------
     total_layer_num = 0
     for pp_rank in range(args.target_pipeline_parallel_size):
+        mpu.set_pipeline_model_parallel_rank(pp_rank)
         # initial the first module in pp stage to get the layer_num, pooler, lm_head. binary_head
         get_local_model(pp_rank,0,0)
         for layer_id in range(len(setter.get_transformer_block(models[pp_rank][0][0]).layers)):
