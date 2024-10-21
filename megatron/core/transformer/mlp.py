@@ -21,7 +21,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
-
+from megatron.core.transformer.te_activation_func_utils import te_act_func
 
 @dataclass
 class MLPSubmodules:
@@ -112,6 +112,18 @@ class MLP(MegatronModule):
                 )
             else:
                 raise ValueError("Only support fusion of gelu and swiglu")
+        elif self.config.use_te_activation_func:
+            if bias_parallel is not None:
+                intermediate_parallel = intermediate_parallel + bias_parallel
+            if (self.activation_func, self.config.gated_linear_unit) in te_act_func:
+                te_act_impl = te_act_func[(self.activation_func, self.config.gated_linear_unit)]
+                intermediate_parallel = te_act_impl(intermediate_parallel)
+            else:
+                raise ValueError(
+                    f"{self.activation_func} with gated_linear_unit={self.config.gated_linear_unit}"
+                    " is not supported by TransformerEngine. Consider setting use_te_activation_func"
+                    " to False."
+                )
         else:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
