@@ -214,7 +214,7 @@ def pretrain(
         1) initialize Megatron.
         2) setup model, optimizer and lr schedule using the model_provider.
         3) call train_val_test_data_provider to get train/val/test datasets.
-        4) train the modle using the forward_step_func.
+        4) train the model using the forward_step_func.
 
     Args:
         train_valid_test_dataset_provider: a function that takes the size of
