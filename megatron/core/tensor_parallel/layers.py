@@ -5,11 +5,11 @@
 
 import os
 import warnings
+from functools import partial
 from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch.amp import custom_bwd, custom_fwd
 from torch.nn.parameter import Parameter
 
 from megatron.core.model_parallel_config import ModelParallelConfig
@@ -47,6 +47,13 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     'partition_dim': -1,
     'partition_stride': 1,
 }
+
+if torch.__version__ >= "2.4.0":
+    custom_fwd = partial(torch.amp.custom_fwd, device_type="cuda")
+    custom_bwd = partial(torch.amp.custom_bwd, device_type="cuda")
+else:
+    custom_fwd = torch.cuda.amp.custom_fwd
+    custom_bwd = torch.cuda.amp.custom_bwd
 
 
 def param_is_not_tensor_parallel_duplicate(param):
@@ -389,7 +396,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     """See linear_with_grad_accumulation_and_async_allreduce"""
 
     @staticmethod
-    @custom_fwd(device_type='cuda')
+    @custom_fwd
     def forward(
         ctx,
         input,
@@ -429,7 +436,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         return output
 
     @staticmethod
-    @custom_bwd(device_type='cuda')
+    @custom_bwd
     def backward(ctx, grad_output):
         """Backward."""
         input, weight = ctx.saved_tensors
