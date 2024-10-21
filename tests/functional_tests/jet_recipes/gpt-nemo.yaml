@@ -5,7 +5,7 @@ loggers: [stdout]
 spec:
   name: "{test_case}"
   model: gpt-nemo
-  build: mcore-nemo
+  build: mcore-nemo-dev
   nodes: 1
   gpus: 8
   platforms: dgx_a100
@@ -29,7 +29,7 @@ spec:
     bash /opt/megatron-lm/tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  - environment: [lts]
+  - environment: [dev]
     scope: [mr]
     test_case:
     - gpt3-nemo_126m_mr_mbs1_gbs8_mcore_te_tp2_pp4_vp3_seq_par_overlap_p2p_dgx_a100_1N8G

@@ -48,7 +48,28 @@ tensorstore==0.1.45 && \
 rm *.whl
 
 # Since megatron does not have any dependencies (and isn't a dependency to any other package), we can install it separately to make everything a bit quicker
-COPY . /opt/megatron-lm
+ARG MCORE_REPO
+ARG MCORE_REF
+ARG MCORE_BACKWARDS_REF
+RUN <<"EOF" bash -exu
+# Checkout latest
+cd /opt
+rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+git init
+git remote add origin ${MCORE_REPO}
+git fetch origin ${MCORE_REF}:MCORE_LATEST
+git checkout MCORE_LATEST
+
+# Checkout backwards-ref
+cd /opt
+rm -rf /opt/megatron-lm-$MCORE_BACKWARDS_REF; mkdir megatron-lm-$MCORE_BACKWARDS_REF; cd megatron-lm-$MCORE_BACKWARDS_REF
+git init
+git remote add origin ${MCORE_REPO}
+git fetch origin ${MCORE_BACKWARDS_REF}:MCORE_BACKWARDS_REF
+git checkout MCORE_BACKWARDS_REF
+rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
+EOF
+
 RUN pip install /opt/megatron-lm
 ENV PYTHONPATH="/opt/megatron-lm:$PYTHONPATH"
 

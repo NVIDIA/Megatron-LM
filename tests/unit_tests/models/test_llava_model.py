@@ -124,8 +124,9 @@ class TestLLaVAModel:
         num_image_tiles = torch.tensor([1, 2, 1, 2, 1], dtype=torch.int).cuda()
 
         use_inference_kv_cache = False
+        attention_mask = None
 
-        embeddings, labels, loss_mask = self.model._preprocess_data(
+        embeddings, labels, loss_mask, attention_mask = self.model._preprocess_data(
             image_embeddings,
             language_embeddings,
             input_ids,
@@ -134,6 +135,7 @@ class TestLLaVAModel:
             use_inference_kv_cache,
             image_token_index,
             num_image_tiles,
+            attention_mask,
         )
 
         img_seq_len = 577
