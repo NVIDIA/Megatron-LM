@@ -323,6 +323,9 @@ class TransformerConfig(ModelParallelConfig):
     config_logger_dir: str = ""
     """When non-empty, dumps entry-point configs to config_logger_dir"""
 
+    use_te_activation_func: bool = False
+    """Whether to use ffn activation functions implemented by TransformerEngine"""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -477,6 +480,20 @@ class TransformerConfig(ModelParallelConfig):
                     "When bias_activation_fusion is True, gated_linear_unit is False, "
                     "and activation function is gelu, add_bias_linear must also be True."
                 )
+            if self.use_te_activation_func:
+                raise ValueError(
+                    "bias_activation_fusion and use_te_activation_func cannot be both true. "
+                    "Set one of them to false"
+                )
+        
+        if self.use_te_activation_func:
+            if self.activation_func not in (F.gelu, F.silu, F.relu):
+                raise ValueError(
+                    "TransformerEngine only support gelu, geglu, silu, swiglu, relu, reglu. "
+                    "If you don't want to use TransformerEngine activation function, set "
+                    "use_te_activation_func to False"
+                )
+                
         if self.activation_func_fp8_input_store:
             if self.activation_func != F.silu or not self.gated_linear_unit:
                 raise ValueError("Storing activation input in FP8 is supported only for SwiGLU.")
