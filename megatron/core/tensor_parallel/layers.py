@@ -293,7 +293,7 @@ class LinearWithFrozenWeight(torch.autograd.Function):
     mathematically."""
 
     @staticmethod
-    @custom_fwd(device_type='cuda')
+    @custom_fwd
     def forward(ctx, input, weight, bias, allreduce_dgrad):
         """Forward with frozen weight."""
         ctx.save_for_backward(weight)
@@ -304,7 +304,7 @@ class LinearWithFrozenWeight(torch.autograd.Function):
         return output
 
     @staticmethod
-    @custom_bwd(device_type='cuda')
+    @custom_bwd
     def backward(ctx, grad_output):
         """Backward with frozen weight."""
         (weight,) = ctx.saved_tensors
