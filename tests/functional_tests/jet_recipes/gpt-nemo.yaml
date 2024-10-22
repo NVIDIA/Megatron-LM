@@ -5,7 +5,7 @@ loggers: [stdout]
 spec:
   name: "{test_case}"
   model: gpt-nemo
-  build: mcore-nemo-dev
+  build: mcore-nemo
   nodes: 1
   gpus: 8
   platforms: dgx_a100

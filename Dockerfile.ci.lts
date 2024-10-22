@@ -70,7 +70,7 @@ git checkout MCORE_BACKWARDS_REF
 rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
 EOF
 
-RUN pip install /opt/megatron-lm
+RUN pip install -e /opt/megatron-lm
 ENV PYTHONPATH="/opt/megatron-lm:$PYTHONPATH"
 
 ##### For NVIDIANS only #####

@@ -102,17 +102,17 @@ functional:run_lts:
   variables:
     ENVIRONMENT: lts
 
-# functional:run_dev:
-#   extends: [.run]
-#   variables:
-#     ENVIRONMENT: dev
+functional:run_dev:
+  extends: [.run]
+  variables:
+    ENVIRONMENT: dev
 
 .notify:
   extends: [.functional_tests_rules]
   image: ${GITLAB_ENDPOINT}:5005/dl/jet/api:latest
   needs: 
     - functional:run_lts
-    # - functional:run_dev
+    - functional:run_dev
   tags:
     - mcore-docker-node-small
   before_script:
