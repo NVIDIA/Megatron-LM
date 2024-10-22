@@ -219,7 +219,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                     )
                     last_pipeline_offset = (
                         0
-                        if self.config.first_pipeline_num_layers is None
+                        if self.config.last_pipeline_num_layers is None
                         else self.config.last_pipeline_num_layers
                     )
 
