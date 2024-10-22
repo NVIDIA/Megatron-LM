@@ -76,16 +76,6 @@ pre:label_merge_request:
       source labels
       curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}" --data-urlencode "add_labels=$LABELS" -X PUT
 
-pre:clean_docker_node:
-  extends: [.pre_rules, .dind_rules]
-  tags: 
-    - ${node}
-  parallel:
-    matrix:
-      - node: mcore-docker-node-small
-      - node: mcore-docker-node-large
-  script: ':'
-
 pre:maybe_cherry_pick_commit:
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
