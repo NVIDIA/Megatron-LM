@@ -160,7 +160,7 @@ pre:maybe_cherry_pick_commit:
                 "type": "section",
                 "text": {
                   "type": "mrkdwn",
-                  "text": ":alert: Cherrypick bot 🤖: Cherry-pick of <'$URL'|!'$MR_ID'> failed"
+                  "text": ":alert: Cherrypick bot 🤖: Cherry-pick of <'$URL'|!'$MR_ID'> failed\ncc $SLACK_ADMIN"
                 }
               }
             ]
