@@ -59,8 +59,7 @@ class VocabParallelCrossEntropy:
         predicted_logits = predicted_logits_1d.view_as(target)
         predicted_logits[target_mask] = 0.0
 
-        exp_logits = vocab_parallel_logits
-        torch.exp(vocab_parallel_logits, out=exp_logits)
+        exp_logits = torch.exp_(vocab_parallel_logits)
         sum_exp_logits = exp_logits.sum(dim=-1)
 
         return target_mask, masked_target_1d, predicted_logits, sum_exp_logits, exp_logits
