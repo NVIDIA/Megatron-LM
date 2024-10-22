@@ -695,6 +695,8 @@ def core_transformer_config_from_args(args, config_class=None):
     else:
         kw_args['num_query_groups'] = None
     kw_args['config_logger_dir'] = args.config_logger_dir
+    if args.disable_te_fused_rope:
+        kw_args['disable_te_fused_rope'] = args.disable_te_fused_rope
 
     # Return config.
     return config_class(**kw_args)
@@ -853,6 +855,8 @@ def _add_network_size_args(parser):
                        action='store_false',
                        help='Disable position embedding. Deprecated: use --position-embedding-type',
                        dest='add_position_embedding')
+    group.add_argument('--disable-te-fused-rope', action='store_true', default = False,
+                       help='Disable fused rope from transformer-engine: use --disable_te_fused_rope')
     group.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
                        help='Pad the vocab size to be divisible by this value.'
                        'This is added for computational efficieny reasons.')
