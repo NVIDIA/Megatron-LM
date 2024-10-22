@@ -2,9 +2,11 @@
 
 import importlib.util
 import subprocess
-
+import os
+import logging
 import setuptools
 from setuptools import Extension
+from setuptools.command.build_ext import build_ext
 
 spec = importlib.util.spec_from_file_location('package_info', 'megatron/core/package_info.py')
 package_info = importlib.util.module_from_spec(spec)
@@ -37,6 +39,19 @@ extra_compile_args = (
     .strip()
     .split()
 )
+
+###############################################################################
+
+class OptionalBuildExt(build_ext):
+    def build_extension(self, ext):
+        strict_mode = os.environ.get('MEGATRON_STRICT_EXTENSION_BUILD', '').lower() in ('1', 'true', 'yes')
+        try:
+            super().build_extension(ext)
+        except Exception as e:
+            if strict_mode:
+                raise
+            else:
+                logging.warning(f"Failed to build optional extension {ext.name}: {str(e)}")
 
 ###############################################################################
 
@@ -102,6 +117,7 @@ setuptools.setup(
             extra_compile_args=extra_compile_args,
         )
     ],
+    cmdclass={'build_ext': OptionalBuildExt},
     # Add in any packaged data.
     include_package_data=True,
     # PyPI package information.
