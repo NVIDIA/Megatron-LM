@@ -41,7 +41,7 @@ products:
     - bert_mr_tp1_pp4_vp2_resume_torch_dgx_a100_1N8G
     - bert_mr_tp2_pp2_dgx_a100_1N8G
     - bert_mr_tp2_pp2_resume_torch_dgx_a100_1N8G
-  - environment: [lts, dev]
+  - environment: [lts]
     scope: [nightly]
     time_limit: [12000]
     test_case:

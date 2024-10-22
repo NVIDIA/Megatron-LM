@@ -2,7 +2,7 @@ type: build
 format_version: 1
 maintainers: [maanug]
 spec:
-  name: mcore-nemo-lts
+  name: mcore-nemo
   platforms: [linux/amd64]
   source:
     # The image tag will be added via `jet-tests.yaml`
