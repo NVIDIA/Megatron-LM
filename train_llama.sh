@@ -25,7 +25,7 @@ USE_FLASH_ATTN="${USE_FLASH_ATTN:-1}"
 NO_TRAINING="${NO_TRAINING:-0}" # NO_TRAINING=1: for computing metrics only
 ENABLE_PROFILING="${ENABLE_PROFILING:-0}"
 ENABLE_ROPE="${ENABLE_ROPE:-1}"
-ENABLE_ROPE_TE="${ENABLE_ROPE_TE:-1}"
+DISABLE_ROPE_TE="${DISABLE_ROPE_TE:-0}"
 ENABLE_MOCK_DATA="${ENABLE_MOCK_DATA:-1}"
 DUMMY_RUN="${DUMMY_RUN:-0}"
 ADD_TASK="${ADD_TASK:-0}"
@@ -54,10 +54,7 @@ TOTAL_ITERS="${TOTAL_ITERS:-4}"
 SEQ_PARALLEL="${SEQ_PARALLEL:-1}" 
 CONTI_PARAMS="${CONTI_PARAMS:-0}"
 OPTIMIZER="${OPTIMIZER:-sgd}"
-TE_FP16="${TE_FP16:-1}"
-
-
-export CUDA_DEVICE_MAX_CONNECTIONS=1
+TE_BF16="${TE_BF16:-1}"
 
 EXPERIMENT_DIR="experiment"
 mkdir -p $EXPERIMENT_DIR
@@ -89,7 +86,7 @@ if __name__ == "__main__":
     out_dir = Path(args.out_dir)
     out_dir.mkdir(exist_ok=True, parents=True)
 
-    dataset = load_dataset("bookcorpus", split="train")
+    dataset = load_dataset("bookcorpus", split="train", trust_remote_code=True)
     dataset.to_json(out_dir / "bookcorpus_megatron.json")' > prepare_bookcorpus_megatron_dataset.py
 
 DATA_PATH=${DATA_DIR}/bookcorpus_text_sentence
@@ -106,8 +103,8 @@ fi
 
 MAX_POSITION_EMBEDDINGS=32768
 
-if [ "$TE_FP16" -eq 1 ]; then
-    TRAIN_LOG="${EXPERIMENT_DIR}/train_${MODEL_SIZE}B_iter${TOTAL_ITERS}_mbs${MBS}_bs${BS}_tp${TP}_pp${PP}_seq${SEQ_LENGTH}_optim_${OPTIMIZER}_nocompile${NO_TORCH_COMPILE}_fa_${USE_FLASH_ATTN}_seqpara_${SEQ_PARALLEL}_contiparam_${CONTI_PARAMS}_TE_FP16_${LABEL}.log"
+if [ "$TE_BF16" -eq 1 ]; then
+    TRAIN_LOG="${EXPERIMENT_DIR}/train_${MODEL_SIZE}B_iter${TOTAL_ITERS}_mbs${MBS}_bs${BS}_tp${TP}_pp${PP}_seq${SEQ_LENGTH}_optim_${OPTIMIZER}_nocompile${NO_TORCH_COMPILE}_fa_${USE_FLASH_ATTN}_seqpara_${SEQ_PARALLEL}_contiparam_${CONTI_PARAMS}_TE_BF16_${LABEL}.log"
 else
     TRAIN_LOG="${EXPERIMENT_DIR}/train_${MODEL_SIZE}B_iter${TOTAL_ITERS}_mbs${MBS}_bs${BS}_tp${TP}_pp${PP}_seq${SEQ_LENGTH}_optim_${OPTIMIZER}_nocompile${NO_TORCH_COMPILE}_fa_${USE_FLASH_ATTN}_seqpara_${SEQ_PARALLEL}_contiparam_${CONTI_PARAMS}_${LABEL}.log"
 fi
@@ -243,8 +240,8 @@ if [ "$ENABLE_ROPE" -eq 1 ]; then
 EXTRA_ARGS="$EXTRA_ARGS --position-embedding-type rope"
 fi
 
-if [ "$ENABLE_ROPE_TE" -eq 1 ]; then
-EXTRA_ARGS="$EXTRA_ARGS --use-te-fused-rope"
+if [ "$DISABLE_ROPE_TE" -eq 1 ]; then
+EXTRA_ARGS="$EXTRA_ARGS --disable-te-fused-rope"
 fi
 
 if [ "$NO_TORCH_COMPILE" -eq 1 ]; then
@@ -263,7 +260,7 @@ if [ "$CONTI_PARAMS" -eq 1 ]; then
 EXTRA_ARGS="$EXTRA_ARGS --use-contiguous-parameters-in-local-ddp"
 fi
 
-if [ "$TE_FP16" -eq 1 ]; then
+if [ "$TE_BF16" -eq 1 ]; then
 EXTRA_ARGS="$EXTRA_ARGS --transformer-impl=transformer_engine \
     --fp8-margin=0 \
     --fp8-interval=1 \
@@ -292,13 +289,13 @@ echo 'torchrun $DISTRIBUTED_ARGS pretrain_gpt.py \
 "
 fi
 
-if [ "$TEE_OUTPUT" -eq 0 ]; then 
+if [ "$TEE_OUTPUT" -eq 0 ]; then
     run_cmd="$run_cmd >& $TRAIN_LOG"
 else
     run_cmd="$run_cmd |& tee $TRAIN_LOG"
 fi
 
-if [ "$NO_TRAINING" -eq 0 ]; then 
+if [ "$NO_TRAINING" -eq 0 ]; then
     eval $run_cmd
 fi
 
@@ -333,10 +330,3 @@ TIME_PER_ITER=$(python mean_log_value.py tmp.txt 2>/dev/null | awk '{printf "%.6
 PERFORMANCE=$(awk -v bs="$BS" -v sl="$SEQ_LENGTH" -v tpi="$TIME_PER_ITER" -v ws="$WORLD_SIZE" 'BEGIN {printf "%.6f", bs * sl * 1000/ (tpi * ws)}')
 echo "tokens/GPU/s: $PERFORMANCE" |& tee -a $TRAIN_LOG
 rm tmp.txt
-
-echo '============================================================================================================'
-grep -Eo 'mem usages: [^|]*' $TRAIN_LOG | sed -E 's/.*mem usages: ([0-9\.]+).*/\1/' > tmp.txt
-echo "mem usages: $(python mean_log_value.py tmp.txt)" |& tee -a $TRAIN_LOG
-rm tmp.txt
-
-echo "Model, $MODEL_SIZE, BS , $BS, MBS $MBS, TP, $TP, PP, $PP, ROPE, $ENABLE_ROPE, mock, $ENABLE_MOCK_DATA, throughput(tflops), $THROUGHPUT , time_per_iter , $TIME_PER_ITER, token/sec, $PERFORMANCE, LABEL, $LABEL, ITERS, $TOTAL_ITERS " >> results.csv

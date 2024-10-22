@@ -1,6 +1,4 @@
 ARG BASE_DOCKER=rocm/pytorch:latest
-#ARG BASE_DOCKER=rocm/pytorch-private:exec_dashboard_nightly
-#ARG BASE_DOCKER=rocm/pytorch-private:20240920_exec_dashboard_nightly
 FROM $BASE_DOCKER
 ENV WORKSPACE_DIR=/workspace
 ENV STAGE_DIR=/workspace/installs
@@ -18,6 +16,7 @@ nltk \
 pytest \
 pytest-cov \
 pytest_mock \
+pytest-csv \
 pytest-random-order \
 sentencepiece \
 wrapt \
@@ -28,20 +27,12 @@ pytest_mock \
 pybind11 \
 wrapt \ 
 setuptools==69.5.1 \
-datasets
+datasets \
+tiktoken \
+pynvml
 
 RUN pip3 install "huggingface_hub[cli]" 
 RUN python3 -m nltk.downloader punkt_tab
-
- 
-##############################################################################
-# Apex
-##############################################################################
-#RUN git clone https://github.com/ROCm/apex.git ${STAGE_DIR}/apex 
-#WORKDIR ${STAGE_DIR}/apex
-#RUN python3 setup.py install --cpp_ext --cuda_ext
-#WORKDIR $WORKSPACE_DIR
-#RUN rm -rf ${STAGE_DIR}/apex
 
 
 # Install Causal-Conv1d and its dependencies
@@ -58,6 +49,7 @@ RUN git clone https://github.com/Dao-AILab/causal-conv1d causal-conv1d &&\
 WORKDIR ${STAGE_DIR}
 RUN git clone https://github.com/state-spaces/mamba mamba &&\
     cd mamba &&\
+    git checkout bc84fb1 &&\
     git show --oneline -s &&\
     pip install --no-build-isolation .
 
@@ -73,9 +65,8 @@ RUN git clone --recursive https://github.com/ROCmSoftwarePlatform/TransformerEng
 WORKDIR $WORKSPACE_DIR
 RUN git clone https://github.com/ROCm/Megatron-LM.git Megatron-LM &&\
     cd Megatron-LM &&\
-    git checkout rocm_megatron_lm_upstream &&\
+    git checkout rocm_dev &&\
     pip install -e .
-
 
 WORKDIR $WORKSPACE_DIR/Megatron-LM
 
