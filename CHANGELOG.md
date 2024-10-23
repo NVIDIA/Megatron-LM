@@ -1,5 +1,23 @@
 # Changelog
 
+## NVIDIA Megatron Core 0.9.0
+
+- Uneven pipeline parallelism
+  - Enable pipeline parallelism where first and last ranks have fewer transformer layers than the intermediate ranks
+- Per layer CUDAGraph support for GPT training with Transformer Engine modules
+- Enable different TP sizes for the vision encoder
+- Enable pipeline parallelism for T5 & Llava models
+- Support multi-tile multi-image input in Llava models
+- MoE
+  - FP8 support
+  - Runtime upcycling support
+  - Dispatcher implementation optimizations
+  - Shared expert support with overlapping optimizations
+    - Qwen Model support
+- Known Issues
+  - When using sequence parallel, during the transformer block forward pass, dropout is not using the appropriate rng context.
+
+
 ## NVIDIA Megatron Core 0.8.0
 
 - Multimodal
