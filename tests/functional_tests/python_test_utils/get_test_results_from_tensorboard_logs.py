@@ -11,8 +11,14 @@ from tests.functional_tests.python_test_utils import common
 @click.command()
 @click.option("--logs-dir", required=True, type=str, help="Path to Tensorboard logs")
 @click.option("--output-path", required=False, type=str, help="Path to write golden values")
-def collect_train_test_metrics(logs_dir: str, output_path: str):
-    summaries = common.read_tb_logs_as_list(logs_dir)
+@click.option(
+    "--is-convergence-test/--is-normal-test",
+    type=bool,
+    help="Tensorboard index to extract",
+    default=False,
+)
+def collect_train_test_metrics(logs_dir: str, output_path: str, is_convergence_test: bool):
+    summaries = common.read_tb_logs_as_list(logs_dir, index=-1 if is_convergence_test else 0)
 
     train_metrics = {
         metric_name: {
