@@ -1237,10 +1237,6 @@ def _add_training_args(parser):
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd', 'hybridadam'],
                        help='Optimizer function')
-    group.add_argument('--optimizer-offload-policy', type=str, default='static', choices=['static', 'auto'],)
-    group.add_argument('--optimizer-offload-fraction', type=float, default=0.0,)
-    group.add_argument('--optimizer-offload-chunk-size', type=int, default=0)
-    group.add_argument('--optimizer-offload-auto-threshold', type=int, default=2048 * 1024 ** 2)
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic', 'external'],
                        help='Single pass vs multiple pass data loader')
