@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import SGD, Adam
-from transformer_engine.pytorch.optimizers import FusedSGD, FusedAdam
+from transformer_engine.pytorch.optimizers import FusedAdam, FusedSGD
 
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 
@@ -38,9 +38,8 @@ def test_multi_device_hybrid_optimizer():
         lr=0.1,
     )
 
-    # Test the chained optimizer's state is a reference of the underlying optimizers' state
-    # 1. run step on optimizers, make sure there is state
-    assert len(hdo.state_dict()["state"]) == 0 # state is empty
+    # 1. run step on optimizer, make sure there is state generated
+    assert len(hdo.state_dict()["state"]) == 0  # state is empty
     input = torch.randn(1, 3, 32, 32).cuda()
     output = net(input)
     output.sum().backward()
@@ -49,8 +48,6 @@ def test_multi_device_hybrid_optimizer():
 
     print(hdo.state_dict())
 
-    # 2. check the state is a reference
+    # 2. check the state is on right device
     assert not hdo.state_dict()["state"][0]["exp_avg"].is_cuda
-    assert hdo.state_dict()["state"][len(net.parameters()) - 1]["exp_avg"].is_cuda
-
-    print(net.parameters())
+    assert hdo.state_dict()["state"][len(list(net.parameters())) - 1]["exp_avg"].is_cuda

@@ -2,7 +2,10 @@ import torch
 
 
 class HybridDeviceOptimizer(torch.optim.Optimizer):
-    def __init__(self, params, offload_ratio=0.5, cpu_optimizer_cls=None, gpu_optimizer_cls=None, **kwargs):
+    def __init__(
+        self, params, offload_ratio=0.5, cpu_optimizer_cls=None, gpu_optimizer_cls=None, **kwargs
+    ):
+        super(HybridDeviceOptimizer, self).__init__(params, defaults={})
         self.params = params.copy()
         self.offload_ratio = offload_ratio
 
@@ -11,9 +14,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             self.gpu_params,
             self.gpu_params_map_cpu_copy,
             self.cpu_copys_map_gpu_param,
-        ) = self._separate_parameters_updated_on_the_cpu_and_gpu()
-        self.cpu_optimizer = cpu_optimizer_cls(self.cpu_update_params, **kwargs)
-        self.gpu_optimizer = gpu_optimizer_cls(self.gpu_update_params, **kwargs)
+        ) = self._split_parameters_updated_on_the_cpu_and_gpu()
+        self.cpu_optimizer = cpu_optimizer_cls(self.cpu_params, **kwargs)
+        self.gpu_optimizer = gpu_optimizer_cls(self.gpu_params, **kwargs)
 
         self.register_grad_cpu_copy_hook()
         self.register_param_copy_back_gpu_hook()
@@ -43,22 +46,28 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         gpu_state_dict = self.gpu_optimizer.state_dict()
 
         state = cpu_state_dict["state"].copy()
-        state.extend({k+len(cpu_state_dict["state"]): v for k, v in gpu_state_dict["state"]})
+        state.update(
+            {k + len(cpu_state_dict["state"]): v for k, v in gpu_state_dict["state"].items()}
+        )
 
         param_groups = cpu_state_dict["param_groups"].copy()
+        cpu_params_num = sum([len(pg['params']) for pg in cpu_state_dict["param_groups"]])
         for param_group in gpu_state_dict["param_groups"]:
             pg_copy = param_group.copy()
-            pg_copy["params"] = [i+len(cpu_state_dict["param_groups"]['params']) for i in pg_copy["params"]]
+            pg_copy["params"] = [cpu_params_num + i for i in pg_copy["params"]]
             param_groups.append(pg_copy)
 
-        return {
-            "state": state,
-            "param_groups": param_groups,
-        }
+        return {"state": state, "param_groups": param_groups}
 
     def load_state_dict(self, state_dict):
-        cpu_state_dict = {"state": state_dict["state"][:len(self.cpu_update_params)], "param_groups": state_dict["param_groups"][:len(self.cpu_update_params)]}
-        gpu_state_dict = {"state": state_dict["state"][len(self.cpu_update_params):], "param_groups": state_dict["param_groups"][len(self.cpu_update_params):]}
+        cpu_state_dict = {
+            "state": state_dict["state"][: len(self.cpu_params)],
+            "param_groups": state_dict["param_groups"][: len(self.cpu_params)],
+        }
+        gpu_state_dict = {
+            "state": state_dict["state"][len(self.cpu_params) :],
+            "param_groups": state_dict["param_groups"][len(self.cpu_params) :],
+        }
         self.cpu_optimizer.load_state_dict(cpu_state_dict)
         self.gpu_optimizer.load_state_dict(gpu_state_dict)
 
@@ -67,12 +76,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
     def step(self, closure=None):
         self.cpu_optimizer.step(closure)
-        for param in self.cpu_update_params:
-
-            param.grad = param.grad.cuda()
         self.gpu_optimizer.step(closure)
 
-    def _separate_parameters_updated_on_the_cpu_and_gpu(self):
+    def _split_parameters_updated_on_the_cpu_and_gpu(self):
         total_params_numel = sum([p.numel() for p in self.params])
         offload_threshold = total_params_numel * self.offload_ratio
 
@@ -84,7 +90,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         for param in self.params:
             if offloaded_params_numel < offload_threshold:
                 assert param.is_cuda
-                param_cpu_copy = param.cpu()
+                param_cpu_copy = param.detach().cpu()
+                param_cpu_copy.requires_grad = True
                 gpu_params_map_cpu_copy[param] = param_cpu_copy
                 cpu_copys_map_gpu_param[param_cpu_copy] = param
                 cpu_params.append(param_cpu_copy)
