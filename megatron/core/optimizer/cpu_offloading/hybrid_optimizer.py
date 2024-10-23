@@ -6,44 +6,91 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.params = params.copy()
         self.offload_ratio = offload_ratio
 
-        self.cpu_update_params, self.gpu_update_params = self._separate_parameters_updated_on_the_cpu_and_gpu()
+        (
+            self.cpu_params,
+            self.gpu_params,
+            self.gpu_params_map_cpu_copy,
+            self.cpu_copys_map_gpu_param,
+        ) = self._separate_parameters_updated_on_the_cpu_and_gpu()
         self.cpu_optimizer = cpu_optimizer_cls(self.cpu_update_params, **kwargs)
         self.gpu_optimizer = gpu_optimizer_cls(self.gpu_update_params, **kwargs)
+
+        self.register_grad_cpu_copy_hook()
+        self.register_param_copy_back_gpu_hook()
+
+    def register_grad_cpu_copy_hook(self):
+        def grad_cpu_copy_hook_closure():
+            def grad_cpu_copy_hook(optimizer, args, kwargs):
+                for gpu_param, cpu_copy in self.gpu_params_map_cpu_copy.items():
+                    cpu_copy.grad = gpu_param.grad.cpu()
+
+            return grad_cpu_copy_hook
+
+        self.register_step_pre_hook(grad_cpu_copy_hook_closure())
+
+    def register_param_copy_back_gpu_hook(self):
+        def param_copy_back_gpu_hook_closure():
+            def param_copy_back_gpu_hook(optimizer, args, kwargs):
+                for cpu_copy, gpu_param in self.cpu_copys_map_gpu_param.items():
+                    gpu_param.data.copy_(cpu_copy.data)
+
+            return param_copy_back_gpu_hook
+
+        self.register_step_post_hook(param_copy_back_gpu_hook_closure())
 
     def state_dict(self):
         cpu_state_dict = self.cpu_optimizer.state_dict()
         gpu_state_dict = self.gpu_optimizer.state_dict()
+
+        state = cpu_state_dict["state"].copy()
+        state.extend({k+len(cpu_state_dict["state"]): v for k, v in gpu_state_dict["state"]})
+
+        param_groups = cpu_state_dict["param_groups"].copy()
+        for param_group in gpu_state_dict["param_groups"]:
+            pg_copy = param_group.copy()
+            pg_copy["params"] = [i+len(cpu_state_dict["param_groups"]['params']) for i in pg_copy["params"]]
+            param_groups.append(pg_copy)
+
         return {
-            "state": cpu_state_dict["state"] + gpu_state_dict["state"],
-            "param_groups": cpu_state_dict["param_groups"] + gpu_state_dict["param_groups"],
+            "state": state,
+            "param_groups": param_groups,
         }
-    
+
     def load_state_dict(self, state_dict):
         cpu_state_dict = {"state": state_dict["state"][:len(self.cpu_update_params)], "param_groups": state_dict["param_groups"][:len(self.cpu_update_params)]}
         gpu_state_dict = {"state": state_dict["state"][len(self.cpu_update_params):], "param_groups": state_dict["param_groups"][len(self.cpu_update_params):]}
         self.cpu_optimizer.load_state_dict(cpu_state_dict)
         self.gpu_optimizer.load_state_dict(gpu_state_dict)
-    
+
     def param_groups(self):
         return self.cpu_optimizer.param_groups + self.gpu_optimizer.param_groups
 
     def step(self, closure=None):
         self.cpu_optimizer.step(closure)
+        for param in self.cpu_update_params:
+
+            param.grad = param.grad.cuda()
         self.gpu_optimizer.step(closure)
 
     def _separate_parameters_updated_on_the_cpu_and_gpu(self):
         total_params_numel = sum([p.numel() for p in self.params])
         offload_threshold = total_params_numel * self.offload_ratio
 
-        cpu_update_params = []
-        gpu_update_params = []
+        cpu_params = []
+        gpu_params = []
+        gpu_params_map_cpu_copy = {}
+        cpu_copys_map_gpu_param = {}
         offloaded_params_numel = 0
         for param in self.params:
             if offloaded_params_numel < offload_threshold:
-                cpu_update_params.append(param)
+                assert param.is_cuda
+                param_cpu_copy = param.cpu()
+                gpu_params_map_cpu_copy[param] = param_cpu_copy
+                cpu_copys_map_gpu_param[param_cpu_copy] = param
+                cpu_params.append(param_cpu_copy)
             else:
-                gpu_update_params.append(param)
+                gpu_params.append(param)
 
             offloaded_params_numel += param.numel()
 
-        return cpu_update_params, gpu_update_params
+        return cpu_params, gpu_params, gpu_params_map_cpu_copy, cpu_copys_map_gpu_param

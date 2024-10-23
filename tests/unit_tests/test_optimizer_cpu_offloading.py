@@ -28,7 +28,7 @@ class Net(nn.Module):
 
 
 def test_multi_device_hybrid_optimizer():
-    net = Net()
+    net = Net().cuda()
 
     hdo = HybridDeviceOptimizer(
         list(net.parameters()),
@@ -36,18 +36,21 @@ def test_multi_device_hybrid_optimizer():
         cpu_optimizer_cls=Adam,
         gpu_optimizer_cls=FusedAdam,
         lr=0.1,
-        momentum=0.9,
     )
 
     # Test the chained optimizer's state is a reference of the underlying optimizers' state
     # 1. run step on optimizers, make sure there is state
-    assert len(hdo.state) == 0
-    input = torch.randn(1, 3, 32, 32)
+    assert len(hdo.state_dict()["state"]) == 0 # state is empty
+    input = torch.randn(1, 3, 32, 32).cuda()
     output = net(input)
     output.sum().backward()
     hdo.step()
-    assert len(hdo.state) != 0
+    assert len(hdo.state_dict()["state"]) != 0
+
+    print(hdo.state_dict())
 
     # 2. check the state is a reference
-    assert not list(hdo.state.values())[0]["exp_avg"].is_cuda
-    assert list(hdo.state.values())[-1]["exp_avg"].is_cuda
+    assert not hdo.state_dict()["state"][0]["exp_avg"].is_cuda
+    assert hdo.state_dict()["state"][len(net.parameters()) - 1]["exp_avg"].is_cuda
+
+    print(net.parameters())
