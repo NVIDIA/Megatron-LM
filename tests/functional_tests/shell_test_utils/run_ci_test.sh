@@ -65,9 +65,15 @@ do
 
     # Save run results
     export PYTHONPATH=$ROOT_DIR
+    if [[ "$TEST_TYPE" == "release" ]]; then
+        EXTRACT_ARGS=("--is-convergence-test")
+    else
+        EXTRACT_ARGS=("--is-normal-test")
+    fi
     python3 $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
         --logs-dir $TENSORBOARD_PATH \
-        --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH)
+        --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
+        "${EXTRACT_ARGS[@]}"
 
     # Maybe run tests
     if [[ ${SKIP_PYTEST:-0} != 1 ]]; then

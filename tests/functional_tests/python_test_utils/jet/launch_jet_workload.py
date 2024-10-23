@@ -120,11 +120,20 @@ def download_job_logs(job: jetclient.JETJob) -> List[str]:
             return fh.readlines()
 
 
-def parse_iterations_from_logs(logs: List[str]) -> Optional[Tuple[int, int]]:
+def parse_failed_job(logs: List[str]) -> Optional[bool]:
     for log_row in logs[::-1]:
-        match = re.search(r"iteration\s+(\d+)\s*/\s*(\d+)", log_row)
+        match = re.search(r"Job finished with status 'FAILED'", log_row)
         if match is not None:
-            return int(match.group(1)), int(match.group(2))
+            return True
+    return False
+
+
+def parse_finished_training(logs: List[str]) -> Optional[bool]:
+    for log_row in logs[::-1]:
+        match = re.search(r"after training is done", log_row)
+        if match is not None:
+            return True
+    return False
 
 
 @click.command()
@@ -206,15 +215,11 @@ def main(
             success = pipeline.get_status() == PipelineStatus.SUCCESS
             sys.exit(int(not success))  # invert for exit 0
 
-        parsed_result = parse_iterations_from_logs(logs=logs)
-        if not parsed_result:
-            print("Weird log, no iterations found")
+        if parse_failed_job(logs=logs):
             n_attempts += 1
             continue
 
-        current_iteration, total_iterations = parsed_result
-        if current_iteration == total_iterations:
-
+        if parse_finished_training(logs=logs):
             success = pipeline.get_status() == PipelineStatus.SUCCESS
             sys.exit(int(not success))  # invert for exit 0
         n_iteration += 1
