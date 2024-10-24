@@ -8,6 +8,7 @@
 publish-wheel:
   extends: [.publish_common]
   image: quay.io/pypa/manylinux_2_28_x86_64  
+  tags: [mcore-docker-node-small]
   script:
     - export TWINE_USERNAME
     - export TWINE_PASSWORT
@@ -22,6 +23,7 @@ create-gh-release:
   image:
     name: registry.gitlab.com/gitlab-ci-utils/curl-jq
     entrypoint: [""]
+  tags: [mcore-docker-node-small]
   script: 
     - |
       RELEASE_NUMBER=$(python -c "from megatron import core; print(core.__version__)")
