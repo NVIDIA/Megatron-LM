@@ -39,6 +39,10 @@ class ModelParallelConfig:
     context_parallel_size: int = 1
     """Splits network input along sequence dimension across GPU ranks."""
 
+    cp_comm_type: str = 'p2p'
+    """Inter-gpu communication type for context parallelism. Can be "p2p" or "all_gather" or "a2a".
+    """
+
     expert_model_parallel_size: int = 1
     """Distributes Moe Experts across sub data parallel dimension."""
 
