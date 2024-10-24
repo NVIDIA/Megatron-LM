@@ -17,6 +17,6 @@ products:
   - scope: [mr]
     environment: [lts, dev]
     platforms: [dgx_a100]
-    time_limit: [12000]
+    time_limit: [1800]
     test_case:
     - ckpt_converter

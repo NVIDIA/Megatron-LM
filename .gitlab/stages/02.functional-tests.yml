@@ -23,6 +23,7 @@ functional:clean_docker_node:
 
 functional:build_image:
   extends: [test:build_image, .functional_tests_rules]
+  needs: [test:build_image]
   variables:
     STAGE: jet
 

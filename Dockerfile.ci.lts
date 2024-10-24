@@ -57,16 +57,16 @@ cd /opt
 rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
 git init
 git remote add origin ${MCORE_REPO}
-git fetch origin ${MCORE_REF}:MCORE_LATEST
-git checkout MCORE_LATEST
+git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+git checkout $MCORE_REF
 
 # Checkout backwards-ref
 cd /opt
 rm -rf /opt/megatron-lm-$MCORE_BACKWARDS_REF; mkdir megatron-lm-$MCORE_BACKWARDS_REF; cd megatron-lm-$MCORE_BACKWARDS_REF
 git init
 git remote add origin ${MCORE_REPO}
-git fetch origin ${MCORE_BACKWARDS_REF}:MCORE_BACKWARDS_REF
-git checkout MCORE_BACKWARDS_REF
+git fetch origin $MCORE_BACKWARDS_REF
+git checkout $MCORE_BACKWARDS_REF
 rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
 EOF
 

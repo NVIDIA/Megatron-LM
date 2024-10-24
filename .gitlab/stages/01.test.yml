@@ -55,11 +55,7 @@ test:build_image:
           ADDITIONAL_PARAMS+=("-t ${IMAGE}:nightly")
         fi
 
-        if [[ "$CI_PIPELINE_SOURCE" == "merge_request_event" ]]; then
-          MCORE_REF=$(echo ${CI_MERGE_REQUEST_REF_PATH} | sed 's/head$/merge/')
-        else
-          MCORE_REF=$CI_COMMIT_SHA
-        fi
+        echo $(git rev-parse HEAD)
 
         DOCKER_BUILDKIT=1 docker build \
           --secret id=JET_INDEX_URLS \
@@ -69,7 +65,7 @@ test:build_image:
           --builder=container \
           --build-arg CACHEBUST=$(cat /proc/sys/kernel/random/uuid) \
           --build-arg MCORE_REPO=${CI_REPOSITORY_URL} \
-          --build-arg MCORE_REF=${MCORE_REF} \
+          --build-arg MCORE_REF=$CI_COMMIT_SHA \
           --build-arg MCORE_BACKWARDS_REF="core_r0.9.0" \
           --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_PIPELINE_ID} \
           --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID:-noop} \
@@ -122,11 +118,11 @@ test:build_image:
     paths:
       - coverage
   rules:
-    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true" && $UNIT_TEST_REPEAT != '0'
       allow_failure: true
       when: on_success
-    - when: on_success
-
+    - if: $UNIT_TEST_REPEAT != '0'
+      when: on_success
 
 test:pyt(LTS)_mcore(latest):
   extends: [.unit_tests]
