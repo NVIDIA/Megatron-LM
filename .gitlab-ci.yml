@@ -52,6 +52,12 @@ default:
   interruptible: true
 
 variables:
+  UNIT_TEST_TIMEOUT: 
+    value: "15"
+    description: Timeout (minutes) for Unit tests (all repeats)
+  UNIT_TEST_REPEAT:
+    value: "1"
+    description: "Number of repetitions"
   FUNCTIONAL_TEST: 
     value: "yes"
     options:
@@ -99,8 +105,6 @@ variables:
   CI_MCORE_DEV_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_ci_dev
   CI_NEMO_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/nemo_ci
   LINTING_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_linting
-  UNIT_TEST_TIMEOUT: 15
-  UNIT_TEST_REPEAT: 1
 
 include:
   - .gitlab/stages/00.pre.yml
