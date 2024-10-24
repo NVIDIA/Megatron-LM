@@ -16,6 +16,7 @@ from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
 from megatron.core.datasets.utils import Split
 from megatron.core.datasets.utils_s3 import S3Config, is_s3_path
 from megatron.core.utils import log_single_rank
+from megatron.core.packed_seq_params import PackedSeqParams
 
 logger = logging.getLogger(__name__)
 
@@ -213,6 +214,23 @@ class GPTDataset(MegatronDataset):
         if idx is None:
             loss_mask = torch.zeros_like(loss_mask)
 
+        # ais packed param
+        packed_seq_params = torch.tensor([False], dtype=torch.bool)
+        if self.config.reset_attention_mask and self.config.create_attention_mask \
+            and self.config.reset_position_ids:
+            reset_points = torch.where(position_ids[1:] < position_ids[:-1])[0] + 1
+            cu_seqlens = torch.cat([torch.tensor([0]), reset_points, torch.tensor([len(position_ids)])]).to(torch.int32)
+            seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+            max_seqlen, _ = seqlens.max(dim=0, keepdim=True)
+
+            packed_seq_params = {
+                "cu_seqlens_q": cu_seqlens,
+                "cu_seqlens_kv": cu_seqlens,
+                "max_seqlen_q": max_seqlen,
+                "max_seqlen_kv": max_seqlen,
+                "qkv_format": 'thd',
+            }
+
         if self.config.create_attention_mask:
             return {
                 "tokens": tokens,
@@ -220,6 +238,7 @@ class GPTDataset(MegatronDataset):
                 "attention_mask": attention_mask,
                 "loss_mask": loss_mask,
                 "position_ids": position_ids,
+                "packed_seq_params": packed_seq_params,
             }
         else:
             return {
@@ -646,7 +665,9 @@ def _get_ltor_masks_and_position_ids(
     """
     seq_length = data.numel()
 
-    if create_attention_mask:
+    if create_attention_mask and reset_attention_mask:
+        attention_mask = True
+    elif create_attention_mask:
         attention_mask = torch.tril(
             torch.ones((seq_length, seq_length), device=data.device)
         ).unsqueeze(0)
@@ -673,15 +694,23 @@ def _get_ltor_masks_and_position_ids(
 
         # Loop through EOD indices:
         prev_index = 0
+        mask_list = []
         for j in range(eod_index.numel()):
             i = eod_index[j]
             # Mask attention loss.
             if reset_attention_mask and attention_mask is not None:
-                attention_mask[0, (i + 1) :, : (i + 1)] = 0
+                small_mask = torch.tril(torch.ones((i + 1 - prev_index, i + 1 - prev_index), device=data.device, dtype=torch.int8))
+                mask_list.append(small_mask)
             # Reset positions.
             if reset_position_ids:
                 position_ids[(i + 1) :] -= i + 1 - prev_index
                 prev_index = i + 1
+        
+        if prev_index < seq_length:
+            small_mask = torch.tril(torch.ones((seq_length - prev_index, seq_length - prev_index), device=data.device, dtype=torch.int8))
+            mask_list.append(small_mask)
+
+        attention_mask = torch.block_diag(*mask_list).unsqueeze(0)
 
     if attention_mask is not None:
         # Convert attention mask to binary:
