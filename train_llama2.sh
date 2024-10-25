@@ -5,7 +5,6 @@
 export GPU_MAX_HW_QUEUES=2
 export TORCH_NCCL_HIGH_PRIORITY=1
 
-
 # parsing input arguments
 for ARGUMENT in "$@"
 do
@@ -20,7 +19,6 @@ done
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 TEE_OUTPUT="${TEE_OUTPUT:-1}"
-NO_TORCH_COMPILE="${NO_TORCH_COMPILE:-0}"
 USE_FLASH_ATTN="${USE_FLASH_ATTN:-1}"
 NO_TRAINING="${NO_TRAINING:-0}" # NO_TRAINING=1: for computing metrics only
 ENABLE_PROFILING="${ENABLE_PROFILING:-0}"
@@ -36,12 +34,11 @@ echo "NO_TRAINING=$NO_TRAINING"
 CWD=`pwd`
 GPUS_PER_NODE=`python -c "import torch; print(torch.cuda.device_count())"`
 
-
 # Change for multinode config
-MASTER_ADDR=localhost
-MASTER_PORT=23731
-NNODES=1
-NODE_RANK=0
+MASTER_ADDR=${MASTER_ADDR:-localhost}
+MASTER_PORT=${MASTER_PORT:-23731}
+NNODES=${NNODES:-1}
+NODE_RANK=${NODE_RANK:-0}
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
 MODEL_SIZE="${MODEL_SIZE:-70}"
@@ -103,11 +100,7 @@ fi
 
 MAX_POSITION_EMBEDDINGS=32768
 
-if [ "$TE_BF16" -eq 1 ]; then
-    TRAIN_LOG="${EXPERIMENT_DIR}/train_${MODEL_SIZE}B_iter${TOTAL_ITERS}_mbs${MBS}_bs${BS}_tp${TP}_pp${PP}_seq${SEQ_LENGTH}_optim_${OPTIMIZER}_nocompile${NO_TORCH_COMPILE}_fa_${USE_FLASH_ATTN}_seqpara_${SEQ_PARALLEL}_contiparam_${CONTI_PARAMS}_TE_BF16_${LABEL}.log"
-else
-    TRAIN_LOG="${EXPERIMENT_DIR}/train_${MODEL_SIZE}B_iter${TOTAL_ITERS}_mbs${MBS}_bs${BS}_tp${TP}_pp${PP}_seq${SEQ_LENGTH}_optim_${OPTIMIZER}_nocompile${NO_TORCH_COMPILE}_fa_${USE_FLASH_ATTN}_seqpara_${SEQ_PARALLEL}_contiparam_${CONTI_PARAMS}_${LABEL}.log"
-fi
+TRAIN_LOG="${TEMP_DIR}/train_${MODEL_SIZE}B_iter${TOTAL_ITERS}_mbs${MBS}_bs${BS}_tp${TP}_pp${PP}_seq${SEQ_LENGTH}_optim_${OPTIMIZER}_fa_${USE_FLASH_ATTN}_seqpara_${SEQ_PARALLEL}_contiparam_${CONTI_PARAMS}_te_bg16_${TE_BF16}_${LABEL}.log"
 
 echo $TRAIN_LOG
 
@@ -151,9 +144,7 @@ fi
 GROUP_SIZE=$(( ${NUM_HEADS} / ${NUM_KV_HEADS} ))
 NUM_GROUPS=$(( ${NUM_HEADS} / ${GROUP_SIZE} ))
 
-
-PROFILING_DIR="${EXPERIMENT_DIR}/perf_${MODEL_SIZE}B_iter${TOTAL_ITERS}_mbs${MBS}_bs${BS}_tp${TP}_pp${PP}_seq${SEQ_LENGTH}_optim_${OPTIMIZER}_nocompile${NO_TORCH_COMPILE}_fa_${USE_FLASH_ATTN}_seqpara_${SEQ_PARALLEL}_contiparam_${CONTI_PARAMS}"
-
+PROFILING_DIR="${EXPERIMENT_DIR}/perf_${MODEL_SIZE}B_iter${TOTAL_ITERS}_mbs${MBS}_bs${BS}_tp${TP}_pp${PP}_seq${SEQ_LENGTH}_optim_${OPTIMIZER}_fa_${USE_FLASH_ATTN}_seqpara_${SEQ_PARALLEL}_contiparam_${CONTI_PARAMS}"
 
 GPT_ARGS="
     --tensor-model-parallel-size ${TP} \
@@ -242,10 +233,6 @@ fi
 
 if [ "$DISABLE_ROPE_TE" -eq 1 ]; then
 EXTRA_ARGS="$EXTRA_ARGS --disable-te-fused-rope"
-fi
-
-if [ "$NO_TORCH_COMPILE" -eq 1 ]; then
-EXTRA_ARGS="$EXTRA_ARGS --no-torch-compile"
 fi
 
 if [ "$USE_FLASH_ATTN" -eq 1 ]; then
