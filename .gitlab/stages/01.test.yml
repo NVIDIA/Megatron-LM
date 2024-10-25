@@ -1,6 +1,6 @@
 .test_rules:
   rules:
-    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+    - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
       when: on_success
     - when: on_success
@@ -46,7 +46,7 @@ test:build_image:
       
         ADDITIONAL_PARAMS=()
 
-        if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
+        if [[ "$CI_COMMIT_BRANCH" == "ci-rebuild-mcore-nemo-image" ]]; then
           ADDITIONAL_PARAMS+=("--pull")
           ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:main")
         fi
@@ -118,10 +118,10 @@ test:build_image:
     paths:
       - coverage
   rules:
-    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true" && $UNIT_TEST_REPEAT != '0'
+    - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true" && $UNIT_TEST_REPEAT != '0'
       allow_failure: true
       when: on_success
-    - if: $UNIT_TEST_REPEAT != '0'
+    - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
       when: on_success
 
 test:pyt(LTS)_mcore(latest):
@@ -135,6 +135,8 @@ test:pyt(LTS)_mcore(0.9.0):
   variables:
     TAG: core_r0.9.0
     IMAGE: ${CI_MCORE_LTS_IMAGE}
+    UNIT_TEST_REPEAT: 1
+    UNIT_TEST_TIMEOUT: 15
 
 test:pyt(DEV)_mcore(latest):
   extends: [.unit_tests]
@@ -147,8 +149,10 @@ test:pyt(DEV)_mcore(0.9.0):
   variables:
     TAG: core_r0.9.0
     IMAGE: ${CI_MCORE_DEV_IMAGE}
+    UNIT_TEST_REPEAT: 1
+    UNIT_TEST_TIMEOUT: 15
 
-test:notify:
+test:notify_unit_tests:
   extends: [.test_rules]
   image: ${CI_MCORE_LTS_IMAGE}:${CI_PIPELINE_ID}
   needs:
@@ -229,4 +233,145 @@ test:secret_detection:
         echo "Atleast one vulnerability has been found"
         cat gl-secret-detection-report.json | jq '.'
         exit 1
+      fi
+
+test:pypi_build_wheel:
+  extends: [.test_rules]
+  image: 
+    name: quay.io/pypa/manylinux_2_28_x86_64  
+    entrypoint: [""]
+  tags: [mcore-docker-node-small]
+  variables:
+    PUBLISH_DRYRUN: "yes"
+  script:
+    - echo $PUBLISH_DRYRUN
+    - >
+      if [ "$PUBLISH_DRYRUN" = "yes" ]; then
+        sed -i "/^PATCH/c\PATCH = $((RANDOM % 9000 + 1000))" megatron/core/package_info.py 
+      fi
+    - /opt/python/cp310-cp310/bin/python -m build
+    - /opt/python/cp311-cp311/bin/python -m build
+    - auditwheel repair dist/*.whl
+  artifacts:
+    paths:
+      - megatron/core/package_info.py 
+      - wheelhouse/
+
+test:pypi_test_wheel:
+  extends: [.test_rules]
+  image: nvcr.io/nvidia/pytorch:24.01-py3
+  needs: [test:pypi_build_wheel]
+  tags: [mcore-docker-node-small]
+  variables:
+    PUBLISH_DRYRUN: "yes"
+  script:
+    - EXPECTED_RELEASE_NUMBER=$(python -c "from megatron import core; print(core.__version__)")
+    - rm -rf megatron
+    - pip install wheelhouse/*cp310*.whl
+
+    - RELEASE_NUMBER=$(python -c "from megatron import core; print(core.__version__)")
+    - >
+      echo "$EXPECTED_RELEASE_NUMBER" == "$RELEASE_NUMBER"
+    - test "$EXPECTED_RELEASE_NUMBER" == "$RELEASE_NUMBER"
+  artifacts:
+    paths:
+      - wheelhouse/
+
+test:pypi_push_wheel:
+  extends: [.test_rules]
+  image: python:3.10
+  tags: [mcore-docker-node-small]
+  needs: [test:pypi_test_wheel]
+  variables:
+    PUBLISH_DRYRUN: "yes"
+  script:
+    - >
+      if [ "$PUBLISH_DRYRUN" = "yes" ]; then
+        REPOSITORY=testpypi
+        export TWINE_USERNAME=$TWINE_TEST_USERNAME
+        export TWINE_PASSWORT=$TWINE_TEST_PASSWORD
+      else
+        REPOSITORY=pypi
+        export TWINE_USERNAME=$TWINE_PROD_USERNAME
+        export TWINE_PASSWORT=$TWINE_PROD_PASSWORD
+      fi
+    - pip install twine
+    - twine upload -u $TWINE_USERNAME -p $TWINE_PASSWORT --repository $REPOSITORY wheelhouse/*
+
+test:gh_release:
+  extends: [.test_rules]
+  tags: [mcore-docker-node-small]
+  image: nvcr.io/nvidia/pytorch:24.01-py3
+  variables:
+    PUBLISH_DRYRUN: "yes"
+  script: 
+    - RELEASE_NUMBER=$(python -c "from megatron import core; print(core.__version__)")
+    - NAME="NVIDIA Megatron Core $RELEASE_NUMBER"
+    - CHANGELOG=$(awk '/^## '"$NAME"'/{flag=1; next} /^## /{flag=0} flag' CHANGELOG.md)
+    - CHANGELOG=$(echo "$CHANGELOG" | sed '/./!d')
+    - >
+      PAYLOAD=$(jq -nc \
+                  --arg CI_COMMIT_BRANCH "$CI_COMMIT_BRANCH" \
+                  --arg NAME "$NAME" \
+                  --arg BODY "$CHANGELOG" \
+                  '{
+                      "tag_name": $CI_COMMIT_BRANCH,
+                      "target_commitish": $CI_COMMIT_BRANCH,
+                      "name": $NAME,
+                      "body": $BODY,
+                      "draft": false,
+                      "prerelease": false,
+                      "generate_release_notes": false
+                  }'
+              )
+    - >
+      CMD=$(echo curl -L \
+        -X POST \
+        -H "Accept: application/vnd.github+json" \
+        -H "Authorization: Bearer $GH_TOKEN" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        https://api.github.com/repos/NVIDIA/Megatron-LM/releases \
+        -d "$PAYLOAD"
+      )
+
+      if [[ "$PUBLISH_DRYRUN" == "yes" ]]; then
+        echo "$CMD"
+      else
+        eval "$CMD"
+      fi
+
+test:notify_release:
+  needs: [test:pypi_push_wheel, test:gh_release]
+  extends: [.test_rules]
+  image: nvcr.io/nvidia/pytorch:24.01-py3
+  tags: [mcore-docker-node-small]
+  variables:
+    PUBLISH_DRYRUN: "yes"
+  script:
+    - VERSION=$(python -c "from megatron import core; print(core.__version__)")
+    - URL="https://github.com/NVIDIA/Megatron-LM/releases/tag/core_r$VERSION"          
+    - >
+      MESSAGE='{
+          "blocks": [
+            {
+              "type": "section",
+              "text": {
+                "type": "mrkdwn",
+                    "text": "Releasebot 🤖: Megatron-Core released <'$URL'|core_r'$VERSION'> 🚀"
+              }
+            }
+          ]
+        }'
+    - echo "$MESSAGE"
+    - >
+      CMD=$(echo curl \
+        -X POST \
+        -H "Content-type: application/json" \
+        --data "$MESSAGE" ${MCORE_NOTIFICATION_HOOK_MAIN}
+      )
+
+      if [[ "$PUBLISH_DRYRUN" == "yes" ]]; then
+        echo "$CMD"
+      else
+        eval "$CMD"
       fi
