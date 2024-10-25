@@ -19,6 +19,7 @@ workflow:
         FUNCTIONAL_TEST_SCOPE: mr
         FUNCTIONAL_TEST_CLUSTER_A100: ""
         FUNCTIONAL_TEST_CLUSTER_H100: ""
+        PUBLISH: "no"
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run nightly/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
         UNIT_TEST_REPEAT: 5
@@ -27,6 +28,7 @@ workflow:
         FUNCTIONAL_TEST_SCOPE: nightly
         FUNCTIONAL_TEST_CLUSTER_A100: ""
         FUNCTIONAL_TEST_CLUSTER_H100: ""
+        PUBLISH: "no"
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run weekly/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
         UNIT_TEST_REPEAT: 5
@@ -35,9 +37,11 @@ workflow:
         FUNCTIONAL_TEST_SCOPE: weekly
         FUNCTIONAL_TEST_CLUSTER_A100: ""
         FUNCTIONAL_TEST_CLUSTER_H100: ""
+        PUBLISH: "no"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
         FUNCTIONAL_TEST: "no"
+        PUBLISH: "no"
     - when: never
   auto_cancel:
     on_new_commit: interruptible
@@ -45,19 +49,24 @@ workflow:
 stages:
   - test 
   - functional_tests
-  - convergence_tests
   - publish
 
 default:
   interruptible: true
 
 variables:
-  UNIT_TEST_TIMEOUT: 
-    value: "15"
-    description: Timeout (minutes) for Unit tests (all repeats)
+  UNIT_TEST:
+    value: "yes"
+    options:
+      - "yes"
+      - "no"
+    description: To run the funtional test suite
   UNIT_TEST_REPEAT:
     value: "1"
     description: "Number of repetitions"
+  UNIT_TEST_TIMEOUT: 
+    value: "15"
+    description: Timeout (minutes) for Unit tests (all repeats)
   FUNCTIONAL_TEST: 
     value: "yes"
     options:
