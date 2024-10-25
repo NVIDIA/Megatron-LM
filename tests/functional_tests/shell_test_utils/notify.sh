@@ -48,7 +48,7 @@ if [[ ${ret_code:-0} -ne 0 ]]; then
 fi
 
 # Fetch GitLab logs of JET downstream pipeline
-DOWNSTREAM_PIPELINE_ID=$(jq --arg environment "$ENVIRONMENT" '.[] |select(.name == "jet-trigger-" + $environment) | .downstream_pipeline.id' <<< "$PIPELINE_JSON")
+DOWNSTREAM_PIPELINE_ID=$(jq --arg environment "$ENVIRONMENT" '.[] |select(.name == "functional:run_" + $environment) | .downstream_pipeline.id' <<< "$PIPELINE_JSON")
 
 PIPELINE_URL=https://${GITLAB_ENDPOINT}/ADLR/megatron-lm/-/pipelines/$CI_PIPELINE_ID
 JOB_URL=https://${GITLAB_ENDPOINT}/ADLR/megatron-lm/-/jobs/
