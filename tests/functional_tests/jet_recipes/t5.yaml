@@ -36,14 +36,14 @@ products:
     - t5_220m_mr_mcore_te_tp4_pp1_dgx_a100_1N8G
     - t5_220m_mr_mcore_te_tp4_pp1_resume_torch_dist_dgx_a100_1N8G
     - t5_220m_mr_mcore_te_tp2_pp2_resume_torch_dgx_a100_1N8G
-    - t5_220m_mr_mcore_tp4_pp1_dgx_a100_1N8G
     - t5_220m_mr_mcore_tp4_pp1_resume_torch_dist_dgx_a100_1N8G
     - t5_220m_mr_mcore_tp2_pp2_resume_torch_dgx_a100_1N8G
-    - t5_220m_mr_mcore_tp2_pp2_dgx_a100_1N8G
   - environment: [lts]
     scope: [mr]
     time_limit: [1800]
     test_case:
+    - t5_220m_mr_mcore_tp4_pp1_dgx_a100_1N8G
+    - t5_220m_mr_mcore_tp2_pp2_dgx_a100_1N8G
     - t5_220m_mr_mcore_te_tp2_pp2_dgx_a100_1N8G
   - environment: [lts]
     scope: [weekly]
