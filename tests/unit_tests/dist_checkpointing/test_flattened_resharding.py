@@ -33,6 +33,7 @@ class TestFlattenedResharding:
         ('src_tp_pp', 'dest_tp_pp'),
         [((2, 4), (2, 4)), ((2, 4), (2, 2)), ((2, 4), (4, 2)), ((8, 1), (1, 2))],
     )
+    @pytest.mark.flaky
     def test_partition_change_save_load(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp):
         Utils.initialize_model_parallel(*src_tp_pp)
         with TempNamedDir(

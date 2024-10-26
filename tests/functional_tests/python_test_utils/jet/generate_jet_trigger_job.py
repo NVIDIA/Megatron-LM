@@ -12,6 +12,8 @@ BASE_PATH = pathlib.Path(__file__).parent.resolve()
 @click.command()
 @click.option("--scope", required=True, type=str, help="Test scope")
 @click.option("--environment", required=True, type=str, help="LTS or dev features")
+@click.option("--n-repeat", required=False, default=1, type=int)
+@click.option("--time-limit", required=False, default=1, type=int)
 @click.option("--a100-cluster", required=True, type=str, help="A100 Cluster to run on")
 @click.option("--h100-cluster", required=True, type=str, help="H100 Cluster to run on")
 @click.option("--output-path", required=True, type=str, help="Path to write GitLab job to")
@@ -29,6 +31,8 @@ BASE_PATH = pathlib.Path(__file__).parent.resolve()
 def main(
     scope: str,
     environment: str,
+    n_repeat: int,
+    time_limit: int,
     a100_cluster: str,
     h100_cluster: str,
     output_path: str,
@@ -63,6 +67,8 @@ def main(
             "python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py",
             f"--model {test_case.spec.model}",
             f"--environment {test_case.spec.environment}",
+            f"--n-repeat {n_repeat}",
+            f"--time-limit {time_limit}",
             f"--test-case {test_case.spec.test_case}",
             f"--container-tag {container_tag}",
             f"--cluster {cluster}",

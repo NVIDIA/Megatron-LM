@@ -42,6 +42,8 @@ def register_pipeline_terminator(pipeline: jetclient.JETPipeline):
 def launch_and_wait_for_completion(
     test_case: str,
     environment: str,
+    n_repeat: int,
+    time_limit: int,
     container_image: str,
     container_tag: str,
     cluster: str,
@@ -54,6 +56,8 @@ def launch_and_wait_for_completion(
     ).workloads.submit(
         workloads=common.load_workloads(
             test_case=test_case,
+            n_repeat=n_repeat,
+            time_limit=time_limit,
             container_image=container_image,
             container_tag=container_tag,
             environment=environment,
@@ -142,6 +146,8 @@ def parse_finished_training(logs: List[str]) -> Optional[bool]:
 @click.option(
     "--environment", required=True, type=click.Choice(['dev', 'lts']), help="Pytorch LTS or DEV"
 )
+@click.option("--n-repeat", required=False, default=1, type=int)
+@click.option("--time-limit", required=False, default=1800, type=int)
 @click.option(
     "--account",
     required=False,
@@ -165,6 +171,8 @@ def main(
     model: str,
     test_case: str,
     environment: str,
+    n_repeat: int,
+    time_limit: int,
     account: str,
     cluster: str,
     container_tag: str,
@@ -195,6 +203,8 @@ def main(
         pipeline = launch_and_wait_for_completion(
             test_case=test_case,
             environment=environment,
+            n_repeat=n_repeat,
+            time_limit=time_limit,
             container_image=container_image,
             container_tag=container_tag,
             cluster=cluster,

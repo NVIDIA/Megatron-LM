@@ -23,6 +23,7 @@ spec:
         "TRAINING_SCRIPT_PATH=pretrain_gpt.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}.json"
+        "N_REPEAT={n_repeat}"
     )
 
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
@@ -32,6 +33,7 @@ products:
     scope: [mr]
     platforms: [dgx_a100]
     time_limit: [1800]
+    n_repeat: [5]
     test_case:
     - gpt3_mr_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer_dgx_a100_1N8G
@@ -103,6 +105,7 @@ products:
     scope: [nightly]
     platforms: [dgx_a100]
     time_limit: [3600]
+    n_repeat: [5]
     test_case:
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_dist_optimizer_overlap_grad_reduce_param_gather
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather
@@ -136,6 +139,7 @@ products:
     scope: [mr]
     platforms: [dgx_a100]
     time_limit: [1800]
+    n_repeat: [5]
     test_case:
     - gpt3_mr_mcore_te_tp2_pp2_defer_embedding_wgrad_compute_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G
