@@ -134,6 +134,8 @@ def filter_by_model(
 
 def load_workloads(
     container_tag: str,
+    n_repeat: int = 1,
+    time_limit: int = 1800,
     environment: Optional[str] = None,
     scope: Optional[str] = None,
     model: Optional[str] = None,
@@ -171,4 +173,6 @@ def load_workloads(
                 container_image = container_image or build_workload.spec.source.image
                 build_workload.spec.source.image = f"{container_image}:{container_tag}"
                 workloads.append(build_workload)
+        workload.spec.n_repeat = n_repeat
+        workload.spec.time_limit = time_limit
     return workloads

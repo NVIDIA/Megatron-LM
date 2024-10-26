@@ -17,6 +17,8 @@ workflow:
         UNIT_TEST_TIMEOUT: 75
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: mr
+        FUNCTIONAL_TEST_REPEAT: 5
+        FUNCTIONAL_TEST_TIME_LIMIT: 1800,
         FUNCTIONAL_TEST_CLUSTER_A100: ""
         FUNCTIONAL_TEST_CLUSTER_H100: ""
         PUBLISH: "no"
@@ -26,6 +28,8 @@ workflow:
         UNIT_TEST_TIMEOUT: 75
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: nightly
+        FUNCTIONAL_TEST_REPEAT: 5
+        FUNCTIONAL_TEST_TIME_LIMIT: 1800,
         FUNCTIONAL_TEST_CLUSTER_A100: ""
         FUNCTIONAL_TEST_CLUSTER_H100: ""
         PUBLISH: "no"
@@ -35,6 +39,8 @@ workflow:
         UNIT_TEST_TIMEOUT: 75
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: weekly
+        FUNCTIONAL_TEST_REPEAT: 1,
+        FUNCTIONAL_TEST_TIME_LIMIT: 9000,
         FUNCTIONAL_TEST_CLUSTER_A100: ""
         FUNCTIONAL_TEST_CLUSTER_H100: ""
         PUBLISH: "no"
@@ -82,6 +88,12 @@ variables:
       - "pre-release"
       - "release"
     description: "Testsuite to run (only for FUNCTIONAL_TEST=yes)"
+  FUNCTIONAL_TEST_REPEAT:
+    value: "5"
+    description: "Number of repetitions per test"
+  FUNCTIONAL_TEST_TIME_LIMIT:
+    value: "1800"
+    description: "Timeout in seconds per test"
   FUNCTIONAL_TEST_CLUSTER_A100:
     value: "dgxa100_dracooci"
     options:
