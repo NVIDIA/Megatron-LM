@@ -94,6 +94,9 @@ variables:
   FUNCTIONAL_TEST_TIME_LIMIT:
     value: "1800"
     description: "Timeout in seconds per test"
+  FUNCTIONAL_TEST_CASES:
+    value: "all"
+    description: "Comma-separated list of test_cases to run. Use 'all' to run the full suite."
   FUNCTIONAL_TEST_CLUSTER_A100:
     value: "dgxa100_dracooci"
     options:
