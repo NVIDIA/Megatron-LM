@@ -18,7 +18,7 @@ except ImportError:
     try:
         from apex.optimizers import FusedAdam as Adam
     except ImportError:
-        from torch.optim import Adam
+        from torch.optim import AdamW as Adam
 
         HAVE_APEX_OR_TE = False
 
@@ -461,10 +461,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
-
-        assert (
-            HAVE_APEX_OR_TE
-        ), f'Please install Apex or Transformer Engine to use DistributedOptimizer.'
 
         super().__init__(optimizer, config, grad_scaler, init_state_fn)
         self.model_chunks = model_chunks
