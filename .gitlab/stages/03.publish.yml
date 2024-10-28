@@ -1,24 +1,28 @@
 .publish_common_freeze:
-  stage: functional_tests
+  stage: publish
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $PUBLISH == "yes" && $PUBLISH_SCOPE == "code-freeze"
       when: manual
     - when: never
   
 .publish_common_release:
-  stage: functional_tests
+  stage: publish
   rules:
     - if: $CI_COMMIT_BRANCH =~ /^core_r/ && $PUBLISH == "yes" && $PUBLISH_SCOPE == "release"
       when: manual
+    - if: $PUBLISH == "yes" && $PUBLISH_SCOPE == "release"
+      when: manual
+      variables:
+        PUBLISH_DRYRUN: "yes"
     - when: never
 
-create-release-branch:
+publish:release_branch:
   extends: [.publish_common_freeze]
-  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
-  needs: [build_image]
+  image: ${CI_MCORE_LTS_IMAGE}:${CI_PIPELINE_ID}
+  needs: [test:build_image]
   tags: [mcore-docker-node-small]
   variables:
-    GIT_STRATEGY: "clone"
+    GIT_STRATEGY: "none"
   script:
     - git fetch origin $CI_DEFAULT_BRANCH
     - git config --global user.email "mcore-bot@nvidia.com"
@@ -26,8 +30,8 @@ create-release-branch:
     - git remote set-url origin "https://gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
     - sed -i "/^PRE_RELEASE/c\PRE_RELEASE = ''" megatron/core/package_info.py 
     - VERSION=$(python -c "from megatron import core; print(core.__version__)")
-    - git switch --force-create core_r$VERSION origin/$CI_DEFAULT_BRANCH
-    - git push -u origin core_r$VERSION --force
+    - RELEASE_BRANCH=core_r$VERSION
+    - git switch --force-create $RELEASE_BRANCH origin/$CI_DEFAULT_BRANCH
     - |
       MESSAGE='{
         "blocks": [
@@ -35,61 +39,53 @@ create-release-branch:
             "type": "section",
             "text": {
               "type": "mrkdwn",
-              "text": "Releasebot 🤖: Megatron Core has been frozen 🎉 to branch `core_r$VERSION`"
+              "text": "Releasebot 🤖: Megatron Core has been frozen 🎉 to branch `'"$RELEASE_BRANCH"'`"
             }
           }
         ]
       }'
-
+    - >
       curl -X POST -H "Content-type: application/json" --data "$MESSAGE" ${MCORE_NOTIFICATION_HOOK_MAIN}
+    - git switch --force-create bot/chore/bump-version 
+    - git add megatron/core/package_info.py 
+    - >
+      git commit -m "chore: adjust version version"
+    - git push -u origin bot/chore/bump-version 
+    - >
+      curl \
+        --header "PRIVATE-TOKEN: $PAT" \
+        --url https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests \
+        -d "source_branch=bot/chore/bump-version" \
+        -d "target_branch=$RELEASE_BRANCH" \
+        -d "title=chore: Fix version of \`$RELEASE_BRANCH\`" \
+        -d "description=[🤖]: Hi @okoenig 👋,<br><br>we've adjusted the version number of \`$RELEASE_BRANCH\` for you! 🚀<br><br>Please review and approve this cherry pick by your convenience\!"
 
-publish-wheel:
-  extends: [.publish_common_release]
-  image: quay.io/pypa/manylinux_2_28_x86_64  
-  tags: [mcore-docker-node-small]
-  script:
-    - export TWINE_USERNAME
-    - export TWINE_PASSWORT
-    - /opt/python/cp311-cp311/bin/pip install twine
-    - /opt/python/cp310-cp310/bin/python -m build
-    - /opt/python/cp311-cp311/bin/python -m build
-    - auditwheel repair dist/*.whl
-    - twine upload --repository pypi wheelhouse/*
+publish:pypi_build_wheel:
+  extends: [test:pypi_build_wheel, .publish_common_release]
+  dependencies: []
+  variables:
+    PUBLISH_DRYRUN: "no"
+  
+publish:pypi_test_wheel:
+  extends: [test:pypi_test_wheel, .publish_common_release]
+  needs: [publish:pypi_build_wheel]
+  variables:
+    PUBLISH_DRYRUN: "no"
+  
+publish:pypi_push_wheel:
+  extends: [test:pypi_push_wheel, .publish_common_release]
+  needs: [publish:pypi_test_wheel]
+  variables:
+    PUBLISH_DRYRUN: "no"
 
-create-gh-release:
-  extends: [.publish_common_release]
-  tags: [mcore-docker-node-small]
-  image:
-    name: registry.gitlab.com/gitlab-ci-utils/curl-jq
-    entrypoint: [""]
-  script: 
-    - |
-      RELEASE_NUMBER=$(python -c "from megatron import core; print(core.__version__)")
-      NAME="NVIDIA Megatron Core $RELEASE_NUMBER"
-      CHANGELOG=$(awk '/^## '$NAME'/{flag=1; next} /^## /{flag=0} flag' CHANGELOG.md)
-      CHANGELOG=$(echo "$CHANGELOG" | sed '/./!d')
-
-      PAYLOAD=$(jq \
-                  -n \
-                  -c \
-                  --arg CI_COMMIT_BRANCH "$CI_COMMIT_BRANCH" \
-                  --arg NAME "$NAME" \
-                  --arg BODY "$CHANGELOG" \
-                  '{
-                    "tag_name": $CI_COMMIT_BRANCH,
-                    "target_commitish": $CI_COMMIT_BRANCH,
-                    "name": $NAME,
-                    "body": $BODY,
-                    "draft": false,
-                    "prerelease": false,
-                    "generate_release_notes": false
-                  }'
-               )
-
-      curl -L \
-        -X POST \
-        -H "Accept: application/vnd.github+json" \
-        -H "Authorization: Bearer $GH_TOKEN" \
-        -H "X-GitHub-Api-Version: 2022-11-28" \
-        https://api.github.com/repos/NVIDIA/Megatron-LM/releases \
-        -d $PAYLOAD
+publish:gh_release:
+  extends: [test:gh_release, .publish_common_release]
+  dependencies: []
+  variables:
+    PUBLISH_DRYRUN: "no"
+      
+publish:notify_release:
+  needs: [publish:pypi_push_wheel, publish:gh_release]
+  extends: [test:notify_release, .publish_common_release]
+  variables:
+    PUBLISH_DRYRUN: "no"

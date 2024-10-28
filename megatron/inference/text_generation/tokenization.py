@@ -25,28 +25,24 @@ def detokenize_generations(tokens_gpu_tensor,
     lengths = lengths_gpu_tensor.cpu().numpy().tolist()
     for sequence_tokens, length in zip(tokens, lengths):
         sequence_tokens = sequence_tokens[:length]
-        prompts_plus_generations.append(
-            tokenizer.detokenize(sequence_tokens))
+        detok_str = tokenizer.detokenize(sequence_tokens)
+        prompts_plus_generations.append(detok_str)
         if detokenize_segments:
-            words = []
-            for token in sequence_tokens:
-                if args.tokenizer_type in ['SentencePieceTokenizer',
-                                           'GPTSentencePieceTokenizer',
-                                           'HuggingFaceTokenizer',
-                                           'Llama2Tokenizer']:
-                    word = tokenizer.decoder[token]
-                elif args.tokenizer_type == 'TikTokenizer':
-                    word = tokenizer.detokenize([token])
-                elif args.tokenizer_type in ['Llama3Tokenizer', 'MistralTokenizer']:
-                    word = tokenizer.decode([token])
-                elif args.tokenizer_type == 'NullTokenizer':
-                    word = str(token)
-                else:
+            try:
+                offsets = tokenizer.offsets(sequence_tokens, detok_str)
+                words = [
+                    detok_str[start:end]
+                    for start, end in zip(offsets, offsets[1:] + [len(detok_str)])
+                ]
+            except NotImplementedError:
+                words = []
+                for token in sequence_tokens:
                     word = tokenizer.tokenizer.decoder[token]
-                    word = bytearray(
-                        [tokenizer.tokenizer.byte_decoder[c] for c in word]).decode(
-                            'utf-8', errors='replace')
-                words.append(word)
+                    word = bytearray([tokenizer.tokenizer.byte_decoder[c] for c in word]).decode(
+                        "utf-8", errors="replace"
+                    )
+                    words.append(word)
+
             prompts_plus_generations_segments.append(words)
 
     return tokens, prompts_plus_generations, prompts_plus_generations_segments

@@ -1,0 +1,377 @@
+.test_rules:
+  rules:
+    - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+      allow_failure: true
+      when: on_success
+    - when: on_success
+  stage: test
+
+include:
+  - template: Security/Secret-Detection.gitlab-ci.yml
+
+test:build_image:
+  extends: [.test_rules, .dind_rules]
+  tags:
+    - ${TAG}
+  timeout: 45m
+  parallel:
+    matrix:
+      - IMAGE: CI_MCORE_LTS_IMAGE
+        FILE: Dockerfile.ci.lts
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:24.01-py3
+        TAG: mcore-docker-node-large
+      - IMAGE: CI_MCORE_DEV_IMAGE
+        FILE: Dockerfile.ci.dev
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:24.07-py3
+        TAG: mcore-docker-node-large
+      - IMAGE: CI_NEMO_IMAGE
+        FILE: Dockerfile.ci.lts
+        BASE_IMAGE: nvcr.io/nvidian/nemo:nightly
+        TAG: mcore-docker-node-large
+      - IMAGE: LINTING_IMAGE
+        FILE: Dockerfile.linting
+        BASE_IMAGE: python:3.10
+        TAG: mcore-docker-node-small
+  variables:
+    STAGE: main
+  script:
+    - apk add bash
+    - |
+      bash -c '
+        set -x
+        env
+        eval "IMAGE=\$$IMAGE"
+        
+        docker buildx create --name container --driver=docker-container
+      
+        ADDITIONAL_PARAMS=()
+
+        if [[ "$CI_COMMIT_BRANCH" == "ci-rebuild-mcore-nemo-image" ]]; then
+          ADDITIONAL_PARAMS+=("--pull")
+          ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:main")
+        fi
+
+        if [[ "$CI_COMMIT_BRANCH" == "ci-nightly-a100" ]]; then
+          ADDITIONAL_PARAMS+=("-t ${IMAGE}:nightly")
+        fi
+
+        echo $(git rev-parse HEAD)
+
+        DOCKER_BUILDKIT=1 docker build \
+          --secret id=JET_INDEX_URLS \
+          --target $STAGE \
+          -f $FILE \
+          -t ${IMAGE}:${CI_PIPELINE_ID} \
+          --builder=container \
+          --build-arg CACHEBUST=$(cat /proc/sys/kernel/random/uuid) \
+          --build-arg MCORE_REPO=${CI_REPOSITORY_URL} \
+          --build-arg MCORE_REF=$CI_COMMIT_SHA \
+          --build-arg MCORE_BACKWARDS_REF="core_r0.9.0" \
+          --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_PIPELINE_ID} \
+          --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID:-noop} \
+          --cache-from type=registry,ref=${IMAGE}-buildcache:main \
+          --cache-from type=registry,ref=${IMAGE}-buildcache:${CI_PIPELINE_ID} \
+          --cache-from type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID:-noop} \
+          --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
+          --push \
+          ${ADDITIONAL_PARAMS[@]} .
+        '
+  retry:
+    max: 2
+
+.unit_tests:
+  extends: [.test_rules, .dind_rules]
+  needs: 
+    - test:build_image
+    - test:docs_build
+    - test:formatting
+    - test:copyright
+  timeout: 180m
+  tags: [8xL40S]
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - if [ $UNIT_TEST_REPEAT -eq 0 ]; then exit 0; fi;
+    - docker run --name mcore_ci_${CI_PIPELINE_ID} -d --rm -e TAG -e UNIT_TEST_REPEAT -e UNIT_TEST_TIMEOUT --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 ${IMAGE}:${CI_PIPELINE_ID} bash -c "sleep $(( ${UNIT_TEST_TIMEOUT} * 60 + 60 ))"
+    - |
+      docker exec mcore_ci_${CI_PIPELINE_ID} bash -c '
+        set -e
+        
+        MCORE_DIR=$([[ "$TAG" == "latest" ]] && echo "" || echo "-$TAG/")
+
+        cd /opt/megatron-lm$MCORE_DIR;
+
+        for i in $(seq $UNIT_TEST_REPEAT); do
+          SEED=$((RANDOM % 9000 + 1000));
+          ARGS=()
+          if [[ $TAG != latest ]]; then
+            ARGS+=(-m "not internal and not flaky and not flaky_in_dev")
+          else
+            ARGS+=(-m "not flaky and not flaky_in_dev")
+          fi
+          timeout ${UNIT_TEST_TIMEOUT}m torchrun --nproc_per_node=8 -m pytest --random-order --random-order-seed ${SEED} -xvs --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail "${ARGS[@]}" tests/unit_tests
+        done
+      '
+  after_script:
+    - docker container stop mcore_ci_${CI_PIPELINE_ID} || true
+  artifacts:
+    paths:
+      - coverage
+  rules:
+    - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true" && $UNIT_TEST_REPEAT != '0'
+      allow_failure: true
+      when: on_success
+    - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
+      when: on_success
+
+test:pyt(LTS)_mcore(latest):
+  extends: [.unit_tests]
+  variables:
+    TAG: latest
+    IMAGE: ${CI_MCORE_LTS_IMAGE}
+
+test:pyt(LTS)_mcore(0.9.0):
+  extends: [.unit_tests]
+  variables:
+    TAG: core_r0.9.0
+    IMAGE: ${CI_MCORE_LTS_IMAGE}
+    UNIT_TEST_REPEAT: 1
+    UNIT_TEST_TIMEOUT: 15
+
+test:pyt(DEV)_mcore(latest):
+  extends: [.unit_tests]
+  variables:
+    TAG: latest
+    IMAGE: ${CI_MCORE_DEV_IMAGE}
+
+test:pyt(DEV)_mcore(0.9.0):
+  extends: [.unit_tests]
+  variables:
+    TAG: core_r0.9.0
+    IMAGE: ${CI_MCORE_DEV_IMAGE}
+    UNIT_TEST_REPEAT: 1
+    UNIT_TEST_TIMEOUT: 15
+
+test:notify_unit_tests:
+  extends: [.test_rules]
+  image: ${CI_MCORE_LTS_IMAGE}:${CI_PIPELINE_ID}
+  needs:
+    - test:pyt(LTS)_mcore(latest)
+    - test:pyt(DEV)_mcore(latest)
+    - test:pyt(LTS)_mcore(0.9.0)
+    - test:pyt(DEV)_mcore(0.9.0)
+  tags:
+    - mcore-docker-node-small
+  script:
+    - env
+    - export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
+    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
+    - export GITLAB_ENDPOINT
+    - export DATE=$(date +"%Y-%m-%d")
+    - bash tests/functional_tests/shell_test_utils/notify_unit_tests.sh ${CI_PIPELINE_ID}
+  artifacts:
+    when: always
+    paths:
+      - scripts
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == "ci-unit-test-extended"
+      when: always
+    - when: never
+
+test:docs_build:
+  extends: [.test_rules]
+  image: ${CI_MCORE_LTS_IMAGE}:${CI_PIPELINE_ID}
+  tags: [mcore-docker-node-small]
+  needs: [test:build_image]
+  script:
+    - cd ..
+    - rm -rf documentation && git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/nemo-megatron-core-tme/documentation.git
+    - mv megatron-lm/ documentation/
+    - cd documentation/
+    - ./repo docs
+
+test:formatting:
+  extends: [.test_rules]
+  image: ${LINTING_IMAGE}:${CI_PIPELINE_ID}
+  tags: [mcore-docker-node-small]
+  needs: [test:build_image]
+  script:
+    - env
+    - git fetch origin main
+    - BASE_REF="$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" CHECK_ONLY=true SKIP_DOCS=$([[ "$CI_MERGE_REQUEST_LABELS" == *"Skip docs"* ]] && echo "true" || echo "false") bash tools/autoformat.sh
+
+test:copyright:
+  extends: [.test_rules]
+  tags: [mcore-docker-node-small]
+  image: ${CI_MCORE_LTS_IMAGE}:${CI_PIPELINE_ID}
+  needs: [test:build_image]
+  script:
+    - git fetch origin main
+    - bash tools/copyright.sh
+
+# Override from template
+secret_detection:
+  rules:
+    - when: never
+
+# Inherit and modify template
+test:secret_detection:
+  tags: [mcore-docker-node-small]
+  extends: [".secret-analyzer"]
+  variables:
+    GIT_DEPTH: 0
+    SECRET_DETECTION_LOG_OPTIONS: ${CI_MERGE_REQUEST_DIFF_BASE_SHA}..${CI_COMMIT_SHA}
+  allow_failure: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - when: never
+  script:
+    - apk add jq
+    - /analyzer run
+    - |
+      if [[ $(cat gl-secret-detection-report.json | jq '.vulnerabilities | length > 0') == true ]]; then
+        echo "Atleast one vulnerability has been found"
+        cat gl-secret-detection-report.json | jq '.'
+        exit 1
+      fi
+
+test:pypi_build_wheel:
+  extends: [.test_rules]
+  image: 
+    name: quay.io/pypa/manylinux_2_28_x86_64  
+    entrypoint: [""]
+  tags: [mcore-docker-node-small]
+  variables:
+    PUBLISH_DRYRUN: "yes"
+  script:
+    - echo $PUBLISH_DRYRUN
+    - >
+      if [ "$PUBLISH_DRYRUN" = "yes" ]; then
+        sed -i "/^PATCH/c\PATCH = $((RANDOM % 9000 + 1000))" megatron/core/package_info.py 
+      fi
+    - /opt/python/cp310-cp310/bin/python -m build
+    - /opt/python/cp311-cp311/bin/python -m build
+    - auditwheel repair dist/*.whl
+  artifacts:
+    paths:
+      - megatron/core/package_info.py 
+      - wheelhouse/
+
+test:pypi_test_wheel:
+  extends: [.test_rules]
+  image: nvcr.io/nvidia/pytorch:24.01-py3
+  needs: [test:pypi_build_wheel]
+  tags: [mcore-docker-node-small]
+  variables:
+    PUBLISH_DRYRUN: "yes"
+  script:
+    - EXPECTED_RELEASE_NUMBER=$(python -c "from megatron import core; print(core.__version__)")
+    - rm -rf megatron
+    - pip install wheelhouse/*cp310*.whl
+
+    - RELEASE_NUMBER=$(python -c "from megatron import core; print(core.__version__)")
+    - >
+      echo "$EXPECTED_RELEASE_NUMBER" == "$RELEASE_NUMBER"
+    - test "$EXPECTED_RELEASE_NUMBER" == "$RELEASE_NUMBER"
+  artifacts:
+    paths:
+      - wheelhouse/
+
+test:pypi_push_wheel:
+  extends: [.test_rules]
+  image: python:3.10
+  tags: [mcore-docker-node-small]
+  needs: [test:pypi_test_wheel]
+  variables:
+    PUBLISH_DRYRUN: "yes"
+  script:
+    - >
+      if [ "$PUBLISH_DRYRUN" = "yes" ]; then
+        REPOSITORY=testpypi
+        export TWINE_USERNAME=$TWINE_TEST_USERNAME
+        export TWINE_PASSWORT=$TWINE_TEST_PASSWORD
+      else
+        REPOSITORY=pypi
+        export TWINE_USERNAME=$TWINE_PROD_USERNAME
+        export TWINE_PASSWORT=$TWINE_PROD_PASSWORD
+      fi
+    - pip install twine
+    - twine upload -u $TWINE_USERNAME -p $TWINE_PASSWORT --repository $REPOSITORY wheelhouse/*
+
+test:gh_release:
+  extends: [.test_rules]
+  tags: [mcore-docker-node-small]
+  image: nvcr.io/nvidia/pytorch:24.01-py3
+  variables:
+    PUBLISH_DRYRUN: "yes"
+  script: 
+    - RELEASE_NUMBER=$(python -c "from megatron import core; print(core.__version__)")
+    - NAME="NVIDIA Megatron Core $RELEASE_NUMBER"
+    - CHANGELOG=$(awk '/^## '"$NAME"'/{flag=1; next} /^## /{flag=0} flag' CHANGELOG.md)
+    - CHANGELOG=$(echo "$CHANGELOG" | sed '/./!d')
+    - >
+      PAYLOAD=$(jq -nc \
+                  --arg CI_COMMIT_BRANCH "$CI_COMMIT_BRANCH" \
+                  --arg NAME "$NAME" \
+                  --arg BODY "$CHANGELOG" \
+                  '{
+                      "tag_name": $CI_COMMIT_BRANCH,
+                      "target_commitish": $CI_COMMIT_BRANCH,
+                      "name": $NAME,
+                      "body": $BODY,
+                      "draft": false,
+                      "prerelease": false,
+                      "generate_release_notes": false
+                  }'
+              )
+    - >
+      CMD=$(echo curl -L \
+        -X POST \
+        -H "Accept: application/vnd.github+json" \
+        -H "Authorization: Bearer $GH_TOKEN" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        https://api.github.com/repos/NVIDIA/Megatron-LM/releases \
+        -d "$PAYLOAD"
+      )
+
+      if [[ "$PUBLISH_DRYRUN" == "yes" ]]; then
+        echo "$CMD"
+      else
+        eval "$CMD"
+      fi
+
+test:notify_release:
+  needs: [test:pypi_push_wheel, test:gh_release]
+  extends: [.test_rules]
+  image: nvcr.io/nvidia/pytorch:24.01-py3
+  tags: [mcore-docker-node-small]
+  variables:
+    PUBLISH_DRYRUN: "yes"
+  script:
+    - VERSION=$(python -c "from megatron import core; print(core.__version__)")
+    - URL="https://github.com/NVIDIA/Megatron-LM/releases/tag/core_r$VERSION"          
+    - >
+      MESSAGE='{
+          "blocks": [
+            {
+              "type": "section",
+              "text": {
+                "type": "mrkdwn",
+                    "text": "Releasebot 🤖: Megatron-Core released <'$URL'|core_r'$VERSION'> 🚀"
+              }
+            }
+          ]
+        }'
+    - echo "$MESSAGE"
+    - >
+      CMD=$(echo curl \
+        -X POST \
+        -H "Content-type: application/json" \
+        --data "$MESSAGE" ${MCORE_NOTIFICATION_HOOK_MAIN}
+      )
+
+      if [[ "$PUBLISH_DRYRUN" == "yes" ]]; then
+        echo "$CMD"
+      else
+        eval "$CMD"
+      fi

@@ -5,6 +5,7 @@ import logging
 import random
 import os
 import time
+import warnings
 
 import numpy as np
 import torch
@@ -110,6 +111,7 @@ def initialize_megatron(
         _compile_dependencies()
 
         if args.tp_comm_overlap:
+            #TODO: Should this be activated with just decoder-tp-comm-overlap too?
            _initialize_tp_communicators()
 
         # No continuation function
@@ -210,7 +212,10 @@ def _initialize_tp_communicators():
     else:
        ub_cfgs = {}
 
-    input_shape = [(args.seq_length * args.micro_batch_size) // args.context_parallel_size , args.hidden_size]
+    if getattr(args, 'decoder_tp_comm_overlap', False):
+        input_shape = [(args.decoder_seq_length * args.micro_batch_size) // args.context_parallel_size , args.hidden_size]
+    else:
+        input_shape = [(args.seq_length * args.micro_batch_size) // args.context_parallel_size , args.hidden_size]
 
     if is_te_min_version("1.9.0"):
         # The process group with the target bootstrap backend is created in Transformer Engine.

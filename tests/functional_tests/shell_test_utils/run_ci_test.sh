@@ -17,7 +17,8 @@ echo "---------------------------------"
 # Check that mandatory vars are set
 MANDATORY_VARS=(
     "TRAINING_SCRIPT_PATH"
-    "TEST_CASE_PATH"
+    "TRAINING_PARAMS_PATH"
+    "GOLDEN_VALUES_PATH"
     "OUTPUT_PATH"
     "TENSORBOARD_PATH"
     "CHECKPOINT_PATH"
@@ -30,9 +31,6 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
         exit 1
     fi
 done
-
-export TRAINING_PARAMS_PATH=$TEST_CASE_PATH/model_config.yaml
-export GOLDEN_VALUES_PATH=$TEST_CASE_PATH/golden_values.json
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT_DIR=$(realpath $SCRIPT_DIR/../../../)
@@ -67,9 +65,15 @@ do
 
     # Save run results
     export PYTHONPATH=$ROOT_DIR
+    if [[ "$TEST_TYPE" == "release" ]]; then
+        EXTRACT_ARGS=("--is-convergence-test")
+    else
+        EXTRACT_ARGS=("--is-normal-test")
+    fi
     python3 $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
         --logs-dir $TENSORBOARD_PATH \
-        --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH)
+        --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
+        "${EXTRACT_ARGS[@]}"
 
     # Maybe run tests
     if [[ ${SKIP_PYTEST:-0} != 1 ]]; then

@@ -280,8 +280,8 @@ class TestFullyParallelSaveAndLoad:
 
         assert loaded_state_dict.keys() == state_dict.keys()
 
-    @pytest.mark.skip(reason="Tests are flaky and need to be debugged")
     @pytest.mark.parametrize('state_dict_device', ['cpu', 'cuda'])
+    @pytest.mark.flaky
     def test_memory_usage(self, state_dict_device, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(2, 1)
 

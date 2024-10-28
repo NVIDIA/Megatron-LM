@@ -131,6 +131,18 @@ class _HuggingFaceTokenizer(MegatronTokenizer):
     def detokenize(self, token_ids, **kwargs):
         return self._tokenizer.decode(token_ids, **kwargs)
 
+    def offsets(self, ids: list[int], text: str) -> list[int]:
+        retok_ids: "transformers.BatchEncoding" = self._tokenizer(text)
+        offsets, next_start_idx = [], 0
+        for i in range(len(ids)):
+            span = retok_ids.token_to_chars(i)
+            if span is not None:
+                offsets.append(span.start)
+                next_start_idx = span.end
+            else:
+                offsets.append(next_start_idx)
+        return offsets
+
     @property
     def eod(self):
         return self._tokenizer.eos_token_id
@@ -440,6 +452,9 @@ class _SentencePieceTokenizer(MegatronTokenizer):
         text += self.tokenizer.decode_ids(ids[last_i:])
         return text
 
+    def offsets(self, ids: list[int], text: str) -> list[int]:
+        return [p.begin for p in self.tokenizer.decode_ids_as_immutable_proto(ids).pieces]
+
     @property
     def cls(self):
         return self._cls_id
@@ -711,6 +726,9 @@ class CustomTikTokenizer(MegatronTokenizer):
     def detokenize(self, tokens: List[int]) -> str:
         return self._model.decode(tokens)
 
+    def offsets(self, ids: list[int], text: str) -> list[int]:
+        return self._model.decode_with_offsets(ids)[1]
+
     @property
     def vocab_size(self) -> int:
         return self._vocab_size
@@ -736,6 +754,13 @@ class _NullTokenizer(MegatronTokenizer):
     def detokenize(self, ids):
         text = [str(x) for x in ids]
         return ' '.join(text)
+
+    def offsets(self, ids: list[int], text: str) -> list[int]:
+        offsets, start_idx = [], 0
+        for id_ in ids:
+            offsets.append(start_idx)
+            start_idx += 1 + len(str(id_))
+        return offsets
 
     @property
     def vocab_size(self):

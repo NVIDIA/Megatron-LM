@@ -37,6 +37,16 @@ def flatten_workload(
     return workload_manifests
 
 
+def set_build_dependency(
+    workload_manifests: List[jetclient.JETWorkloadManifest],
+) -> List[jetclient.JETWorkloadManifest]:
+    for workload_manifest in workload_manifests:
+        workload_manifest.spec.build = workload_manifest.spec.build.format(
+            **dict(workload_manifest.spec)
+        )
+    return workload_manifests
+
+
 def load_config(config_path: str) -> jetclient.JETWorkloadManifest:
     """Loads and parses a yaml file into a JETWorkloadManifest"""
     with open(config_path) as stream:
@@ -48,12 +58,14 @@ def load_config(config_path: str) -> jetclient.JETWorkloadManifest:
 
 def load_and_flatten(config_path: str) -> List[jetclient.JETWorkloadManifest]:
     """Wrapper function for doing all the fun at once."""
-    return flatten_workload(flatten_products(load_config(config_path=config_path)))
+    return set_build_dependency(
+        flatten_workload(flatten_products(load_config(config_path=config_path)))
+    )
 
 
 def filter_by_test_case(
     workload_manifests: List[jetclient.JETWorkloadManifest], test_case: str
-) -> jetclient.JETWorkloadManifest:
+) -> Optional[jetclient.JETWorkloadManifest]:
     """Returns a workload with matching name. Raises an error if there no or more than a single workload."""
     workload_manifests = list(
         workload_manifest
@@ -62,10 +74,12 @@ def filter_by_test_case(
     )
 
     if len(workload_manifests) > 1:
-        raise ValueError("Duplicate test_case found!")
+        print("Duplicate test_case found!")
+        return
 
     if len(workload_manifests) == 0:
-        raise ValueError("No test_case found!")
+        print("No test_case found!")
+        return
 
     return workload_manifests[0]
 
@@ -81,7 +95,27 @@ def filter_by_scope(
     )
 
     if len(workload_manifests) == 0:
-        raise ValueError("No test_case found!")
+        print("No test_case found!")
+        return []
+
+    return workload_manifests
+
+
+def filter_by_environment(
+    workload_manifests: List[jetclient.JETWorkloadManifest], environment: str
+) -> List[jetclient.JETWorkloadManifest]:
+    workload_manifests = list(
+        workload_manifest
+        for workload_manifest in workload_manifests
+        if (
+            hasattr(workload_manifest.spec, "environment")
+            and workload_manifest.spec.environment == environment
+        )
+    )
+
+    if len(workload_manifests) == 0:
+        print("No test_case found!")
+        return []
 
     return workload_manifests
 
@@ -97,13 +131,36 @@ def filter_by_model(
     )
 
     if len(workload_manifests) == 0:
-        raise ValueError("No test_case found!")
+        print("No test_case found!")
+        return []
+
+    return workload_manifests
+
+
+def filter_by_test_cases(
+    workload_manifests: List[jetclient.JETWorkloadManifest], test_cases: str
+) -> List[jetclient.JETWorkloadManifest]:
+    """Returns a workload with matching name. Raises an error if there no or more than a single workload."""
+    workload_manifests = list(
+        workload_manifest
+        for workload_manifest in workload_manifests
+        for test_case in test_cases.split(",")
+        if workload_manifest.spec.test_case == test_case
+    )
+
+    if len(workload_manifests) == 0:
+        print("No test_case found!")
+        return []
 
     return workload_manifests
 
 
 def load_workloads(
     container_tag: str,
+    n_repeat: int = 1,
+    time_limit: int = 1800,
+    environment: Optional[str] = None,
+    test_cases: str = "all",
     scope: Optional[str] = None,
     model: Optional[str] = None,
     test_case: Optional[str] = None,
@@ -123,11 +180,20 @@ def load_workloads(
     if scope:
         workloads = filter_by_scope(workload_manifests=workloads, scope=scope)
 
-    if model:
+    if workloads and environment:
+        workloads = filter_by_environment(workload_manifests=workloads, environment=environment)
+
+    if workloads and model:
         workloads = filter_by_model(workload_manifests=workloads, model=model)
 
-    if test_case:
+    if workloads and test_cases != "all":
+        workloads = filter_by_test_cases(workload_manifests=workloads, test_cases=test_cases)
+
+    if workloads and test_case:
         workloads = [filter_by_test_case(workload_manifests=workloads, test_case=test_case)]
+
+    if not workloads:
+        return []
 
     for workload in list(workloads):
         for build_workload in build_workloads:
@@ -137,4 +203,6 @@ def load_workloads(
                 container_image = container_image or build_workload.spec.source.image
                 build_workload.spec.source.image = f"{container_image}:{container_tag}"
                 workloads.append(build_workload)
+        workload.spec.n_repeat = n_repeat
+        workload.spec.time_limit = time_limit
     return workloads
