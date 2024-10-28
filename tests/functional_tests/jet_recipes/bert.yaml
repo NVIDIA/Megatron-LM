@@ -36,14 +36,14 @@ products:
     n_repeat: [5]
     test_case: 
     - bert_mr_mcore_tp2_pp2_dgx_a100_1N8G
-    # - bert_mr_mcore_tp2_pp2_local_spec_dgx_a100_1N8G
+    - bert_mr_mcore_tp2_pp2_local_spec_dgx_a100_1N8G
     - bert_mr_mcore_tp2_pp2_resume_torch_dist_dgx_a100_1N8G
     - bert_mr_mcore_tp2_pp2_resume_torch_dist_local_spec_dgx_a100_1N8G
     - bert_mr_tp1_pp4_vp2_dgx_a100_1N8G
     - bert_mr_tp1_pp4_vp2_resume_torch_dgx_a100_1N8G
     - bert_mr_tp2_pp2_dgx_a100_1N8G
     - bert_mr_tp2_pp2_resume_torch_dgx_a100_1N8G
-  - environment: [lts]
+  - environment: [lts, dev]
     scope: [nightly]
     n_repeat: [5]
     time_limit: [3600]
