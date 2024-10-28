@@ -42,10 +42,8 @@ NVTE_ALLOW_NONDETERMINISTIC_ALGO=$(cat $TRAINING_PARAMS_PATH \
                                    | yq '.ENV_VARS.NVTE_ALLOW_NONDETERMINISTIC_ALGO')
 SKIP_PYTEST=$(cat $TRAINING_PARAMS_PATH \
               | yq '.ENV_VARS.SKIP_PYTEST')
-N_REPEATS=$(cat $TRAINING_PARAMS_PATH \
-              | yq '.ENV_VARS.N_REPEATS //1')
 
-for i in $(seq 1 $N_REPEATS);
+for i in $(seq 1 $N_REPEAT);
 do
     if [[ $i -gt 1 ]]; then
         rm -rf $CHECKPOINT_PATH/*
