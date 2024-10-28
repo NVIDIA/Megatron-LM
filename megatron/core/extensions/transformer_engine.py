@@ -655,11 +655,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         packed_seq_kwargs = (
             dataclasses.asdict(packed_seq_params) if packed_seq_params is not None else {}
         )
-        # overwrite self.qkv_format depending on self.config.apply_rope_fusion, which can be set
-        # after init
-        if self.config.apply_rope_fusion and is_te_min_version("0.13.0", check_equality=False):
-            self.qkv_format = 'bshd'
-
         qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
 
         if get_te_version() < PkgVersion("1.3.0"):
@@ -675,17 +670,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             # These two arguments did not exist prior to 1.8.0.Full support added in 1.10.0 (#1012)
             packed_seq_kwargs.pop("cu_seqlens_q_padded", None)
             packed_seq_kwargs.pop("cu_seqlens_kv_padded", None)
-
-        if self.config.apply_rope_fusion and qkv_format == 'bshd':
-            query, key, value = [x.transpose(0, 1).contiguous() for x in (query, key, value)]
-            # In PyTorch, the following two tensors are in fact the same:
-            #   Tensor with shape (1, S, H, D) and stride (S*H*D, H*D, D, 1)
-            #   Tensor with shape (1, S, H, D) and stride (H*D, H*D, D, 1)
-            # Stride for a dimension that is 1 has no meaning, so tensors created two different ways
-            # can have same shape but different strides.
-            # We unify them to the first one to pass the stride check in TE
-            if value.shape == key.shape and value.shape[0] == 1 and value.stride() != key.stride():
-                value = value.as_strided(value.shape, key.stride())
 
         if self.te_forward_mask_type:
             if qkv_format == 'thd' and is_te_min_version("1.7.0"):
@@ -707,10 +691,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         else:
             core_attn_out = super().forward(query, key, value, attention_mask, **packed_seq_kwargs)
 
-        if self.config.apply_rope_fusion and qkv_format == 'bshd':
-            return core_attn_out.transpose(0, 1)
-        else:
-            return core_attn_out
+        return core_attn_out
 
 
 if is_te_min_version("1.9.0.dev0"):
@@ -1091,3 +1072,31 @@ try:
 except ImportError:
 
     get_cpu_offload_context = None
+
+
+try:
+
+    from transformer_engine.pytorch.attention import FusedRoPEFunc
+
+    def fused_apply_rotary_pos_emb(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+        """Apply rotary positional embedding to input tensor T in `sbhd` format."""
+        return FusedRoPEFunc.apply(t, freqs, "sbhd")
+
+    def fused_apply_rotary_pos_emb_thd(
+        t: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        freqs: torch.Tensor,
+        cp_size: int = 1,
+        cp_rank: int = 0,
+    ) -> torch.Tensor:
+        """
+        Apply rotary positional embedding to input tensor T in `thd` format with CP support.
+        """
+        if is_te_min_version("1.11.0", check_equality=False):
+            return FusedRoPEFunc.apply(t, freqs, "thd", cu_seqlens, cp_size, cp_rank)
+        else:
+            return FusedRoPEFunc.apply(t, freqs, "thd", cu_seqlens)
+
+except ImportError:
+
+    pass

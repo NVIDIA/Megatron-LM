@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+from functools import lru_cache
 
 import torch
 from torch import Tensor
@@ -82,8 +83,17 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             use_cpu_initialization,
         )
 
+    @lru_cache(maxsize=32)
     def forward(self, max_seq_len: int, offset: int = 0) -> Tensor:
+        """Forward pass of Yarn Rotary Embedding.
 
+        Args:
+            max_seq_len (int): Maximum size of sequence
+            offset (int, optional): RoPE offset. Defaults to 0.
+
+        Returns:
+            Tensor: Embeddings after applying Yarn RoPE.
+        """
         assert (
             not self.rotary_interleaved
         ), "Yarn RoPE does not support interleaved rotary embeddings"
