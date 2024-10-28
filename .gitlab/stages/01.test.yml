@@ -100,7 +100,7 @@ test:build_image:
       - BUCKET: tests/unit_tests/transformer/
       - BUCKET: other
   script:
-    - docker run --name mcore_ci_${CI_PIPELINE_ID} -d --rm -e BUCKET -e TAG -e UNIT_TEST_REPEAT -e UNIT_TEST_TIMEOUT --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 ${IMAGE}:${CI_PIPELINE_ID} bash -c "sleep $(( ${UNIT_TEST_TIMEOUT} * 60 + 60 ))"
+    - docker run --name mcore_ci_${CI_PIPELINE_ID} -d --rm -e BUCKET -e TAG -e IMAGE -e UNIT_TEST_REPEAT -e UNIT_TEST_TIMEOUT --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 ${IMAGE}:${CI_PIPELINE_ID} bash -c "sleep $(( ${UNIT_TEST_TIMEOUT} * 60 + 60 ))"
     - |
       CMD=$(cat <<"RUN_TEST_EOF"
       set -euxo pipefail
@@ -111,23 +111,31 @@ test:build_image:
 
       for i in $(seq $UNIT_TEST_REPEAT); do
         SEED=$((RANDOM % 9000 + 1000));
-        ARGS=()
+        MARKER=()
         if [[ $TAG != latest ]]; then
-          ARGS+=(-m "not internal and not flaky and not flaky_in_dev")
-        else
-          ARGS+=(-m "not flaky and not flaky_in_dev")
+          MARKER+=("not internal")
         fi
+        if [[ "$IMAGE" == *dev* ]]; then
+          MARKER+=("not flaky_in_dev")
+        else
+          MARKER+=("not flaky")
+        fi
+        MARKER_ARG=$(printf "%s" "${MARKER[0]}")
+        for element in "${MARKER[@]:1}"; do
+          MARKER_ARG+=" and $element"
+        done
 
         if [[ $BUCKET == other ]]; then
           BUCKETS=($(cat /opt/megatron-lm/.gitlab/stages/01.test.yml | yq '.".unit_tests".parallel.matrix | del(.[] | select(.BUCKET == "other")) | .[].BUCKET' | tr " " "\n" | sed 's/[^ ]*/--ignore &/g' | tr "\n" " "))
-          ARGS+=(${BUCKETS[@]})
-          BUCKET=(tests/unit_tests)
+          IGNORE_ARGS=(${BUCKETS[@]})
+          BUCKET=tests/unit_tests
         else
-          BUCKET=(${BUCKET})
+          IGNORE_ARGS=()
+          BUCKET=${BUCKET}
         fi
 
         if [[ -d $BUCKET ]]; then
-          timeout ${UNIT_TEST_TIMEOUT}m torchrun --nproc_per_node=8 -m pytest -xvs --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail "${ARGS[@]}" ${BUCKET[@]}
+          timeout ${UNIT_TEST_TIMEOUT}m torchrun --nproc_per_node=8 -m pytest -xvs --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail "${IGNORE_ARGS[@]}" -m "${MARKER_ARG}" $BUCKET
         fi
       done
       RUN_TEST_EOF
