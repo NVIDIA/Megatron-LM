@@ -81,7 +81,6 @@ class TestRetroAttention:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.flaky_in_dev
     def test_constructor(self):
 
         config = self.get_config()
@@ -193,7 +192,6 @@ class TestRetroAttention:
             config.hidden_size,
         )
 
-    @pytest.mark.flaky_in_dev
     def test_gpu_forward(self):
         for recompute_granularity in (None, 'selective'):
             for use_transformer_engine in (True, False):
