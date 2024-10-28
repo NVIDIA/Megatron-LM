@@ -41,10 +41,9 @@ pre:create_ci_branches:
     matrix:
       - branch: ci-unit-test-extended
       - branch: ci-rebuild-mcore-nemo-image
-      - branch: ci-mr-a100
-      - branch: ci-nightly-a100
-      - branch: ci-weekly-a100
-      - branch: ci-weekly-h100
+      - branch: ci-mr
+      - branch: ci-nightly
+      - branch: ci-weekly
       - branch: ci-pre-release
   tags: [mcore-docker-node-small]
   stage: .pre

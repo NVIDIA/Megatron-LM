@@ -57,6 +57,9 @@ functional:configure:
       python tests/functional_tests/python_test_utils/jet/generate_jet_trigger_job.py \
         --scope $FUNCTIONAL_TEST_SCOPE \
         --environment dev \
+        --n-repeat "$FUNCTIONAL_TEST_REPEAT" \
+        --time-limit "$FUNCTIONAL_TEST_TIME_LIMIT" \
+        --test-cases $FUNCTIONAL_TEST_CASES \
         --a100-cluster $A100_CLUSTER \
         --h100-cluster $H100_CLUSTER \
         --container-image ${CI_MCORE_LTS_IMAGE} \
@@ -68,6 +71,9 @@ functional:configure:
       python tests/functional_tests/python_test_utils/jet/generate_jet_trigger_job.py \
         --scope $FUNCTIONAL_TEST_SCOPE \
         --environment lts \
+        --n-repeat "$FUNCTIONAL_TEST_REPEAT" \
+        --time-limit "$FUNCTIONAL_TEST_TIME_LIMIT" \
+        --test-cases $FUNCTIONAL_TEST_CASES \
         --a100-cluster $A100_CLUSTER \
         --h100-cluster $H100_CLUSTER \
         --container-image ${CI_MCORE_LTS_IMAGE} \

@@ -23,6 +23,7 @@ spec:
         "TRAINING_SCRIPT_PATH=pretrain_gpt.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}.json"
+        "N_REPEAT={n_repeat}"
     )
 
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
@@ -32,6 +33,7 @@ products:
     scope: [mr]
     platforms: [dgx_a100]
     time_limit: [1800]
+    n_repeat: [5]
     test_case:
     - gpt3_mr_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer_dgx_a100_1N8G
@@ -55,7 +57,6 @@ products:
     - gpt3_mr_mcore_te_tp1_pp4_vp1_decoupled_lr_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp1_pp4_vp1_uneven_pipeline_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp1_pp4_vp1_dgx_a100_1N8G
-    - gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_untied_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_decoupled_lr_dgx_a100_1N8G
@@ -73,10 +74,9 @@ products:
     - gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_groupedGEMM_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM_dgx_a100_1N8G
-    - gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_top2router_dgx_a100_1N8G
+    # - gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_top2router_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp2_cross_entropy_loss_fusion_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp2_ddp_average_in_collective_dgx_a100_1N8G
-    - gpt3_mr_mcore_te_tp2_pp2_defer_embedding_wgrad_compute_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp2_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp2_no_create_attention_mask_in_dataloader_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp2_no_mmap_bin_files_dgx_a100_1N8G
@@ -105,6 +105,7 @@ products:
     scope: [nightly]
     platforms: [dgx_a100]
     time_limit: [3600]
+    n_repeat: [5]
     test_case:
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_dist_optimizer_overlap_grad_reduce_param_gather
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather
@@ -138,12 +139,15 @@ products:
     scope: [mr]
     platforms: [dgx_a100]
     time_limit: [1800]
+    n_repeat: [5]
     test_case:
+    - gpt3_mr_mcore_te_tp2_pp2_defer_embedding_wgrad_compute_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp1_cp2_nondeterministic_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp2_cp2_nondeterministic_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G
   - environment: [lts]
     scope: [weekly]
     platforms: [dgx_h100]

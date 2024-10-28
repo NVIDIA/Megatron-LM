@@ -24,6 +24,7 @@ spec:
         "TRAINING_SCRIPT_PATH=pretrain_bert.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}.json"
+        "N_REPEAT={n_repeat}"
     )
 
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
@@ -32,6 +33,7 @@ products:
   - environment: [lts, dev]
     scope: [mr]
     time_limit: [1800]
+    n_repeat: [5]
     test_case: 
     - bert_mr_mcore_tp2_pp2_dgx_a100_1N8G
     # - bert_mr_mcore_tp2_pp2_local_spec_dgx_a100_1N8G
@@ -43,6 +45,7 @@ products:
     - bert_mr_tp2_pp2_resume_torch_dgx_a100_1N8G
   - environment: [lts]
     scope: [nightly]
+    n_repeat: [5]
     time_limit: [3600]
     test_case:
     - bert_nightly_dgx_a100_1N8G_mcore_tp1_pp2

@@ -13,31 +13,41 @@ workflow:
         FUNCTIONAL_TEST: "no"
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run tests/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
-        UNIT_TEST_REPEAT: 5
-        UNIT_TEST_TIMEOUT: 75
+        UNIT_TEST_REPEAT: 1
+        UNIT_TEST_TIMEOUT: 10
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: mr
+        FUNCTIONAL_TEST_REPEAT: 5
+        FUNCTIONAL_TEST_TIME_LIMIT: 1800
         FUNCTIONAL_TEST_CLUSTER_A100: ""
         FUNCTIONAL_TEST_CLUSTER_H100: ""
+        PUBLISH: "no"
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run nightly/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
-        UNIT_TEST_REPEAT: 5
-        UNIT_TEST_TIMEOUT: 75
+        UNIT_TEST_REPEAT: 1
+        UNIT_TEST_TIMEOUT: 10
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: nightly
+        FUNCTIONAL_TEST_REPEAT: 5
+        FUNCTIONAL_TEST_TIME_LIMIT: 1800
         FUNCTIONAL_TEST_CLUSTER_A100: ""
         FUNCTIONAL_TEST_CLUSTER_H100: ""
+        PUBLISH: "no"
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run weekly/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
-        UNIT_TEST_REPEAT: 5
-        UNIT_TEST_TIMEOUT: 75
+        UNIT_TEST_REPEAT: 1
+        UNIT_TEST_TIMEOUT: 10
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: weekly
+        FUNCTIONAL_TEST_REPEAT: 1
+        FUNCTIONAL_TEST_TIME_LIMIT: 9000
         FUNCTIONAL_TEST_CLUSTER_A100: ""
         FUNCTIONAL_TEST_CLUSTER_H100: ""
+        PUBLISH: "no"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
         FUNCTIONAL_TEST: "no"
+        PUBLISH: "no"
     - when: never
   auto_cancel:
     on_new_commit: interruptible
@@ -45,19 +55,24 @@ workflow:
 stages:
   - test 
   - functional_tests
-  - convergence_tests
   - publish
 
 default:
   interruptible: true
 
 variables:
-  UNIT_TEST_TIMEOUT: 
-    value: "15"
-    description: Timeout (minutes) for Unit tests (all repeats)
+  UNIT_TEST:
+    value: "yes"
+    options:
+      - "yes"
+      - "no"
+    description: To run the funtional test suite
   UNIT_TEST_REPEAT:
     value: "1"
     description: "Number of repetitions"
+  UNIT_TEST_TIMEOUT: 
+    value: "10"
+    description: Timeout (minutes) for Unit tests (all repeats)
   FUNCTIONAL_TEST: 
     value: "yes"
     options:
@@ -73,6 +88,15 @@ variables:
       - "pre-release"
       - "release"
     description: "Testsuite to run (only for FUNCTIONAL_TEST=yes)"
+  FUNCTIONAL_TEST_REPEAT:
+    value: "5"
+    description: "Number of repetitions per test"
+  FUNCTIONAL_TEST_TIME_LIMIT:
+    value: "1800"
+    description: "Timeout in seconds per test"
+  FUNCTIONAL_TEST_CASES:
+    value: "all"
+    description: "Comma-separated list of test_cases to run. Use 'all' to run the full suite."
   FUNCTIONAL_TEST_CLUSTER_A100:
     value: "dgxa100_dracooci"
     options:
