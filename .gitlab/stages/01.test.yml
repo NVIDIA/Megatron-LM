@@ -90,28 +90,50 @@ test:build_image:
   tags: [8xL40S]
   variables:
     GIT_STRATEGY: none
+  parallel:
+    matrix:
+      - BUCKET: tests/unit_tests/data/
+      - BUCKET: tests/unit_tests/dist_checkpointing/
+      - BUCKET: tests/unit_tests/distributed/ 
+      - BUCKET: tests/unit_tests/models/
+      - BUCKET: tests/unit_tests/pipeline_parallel/ tests/unit_tests/tensor_parallel/
+      - BUCKET: tests/unit_tests/transformer/
+      - BUCKET: other
   script:
-    - if [ $UNIT_TEST_REPEAT -eq 0 ]; then exit 0; fi;
-    - docker run --name mcore_ci_${CI_PIPELINE_ID} -d --rm -e TAG -e UNIT_TEST_REPEAT -e UNIT_TEST_TIMEOUT --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 ${IMAGE}:${CI_PIPELINE_ID} bash -c "sleep $(( ${UNIT_TEST_TIMEOUT} * 60 + 60 ))"
+    - docker run --name mcore_ci_${CI_PIPELINE_ID} -d --rm -e BUCKET -e TAG -e UNIT_TEST_REPEAT -e UNIT_TEST_TIMEOUT --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 ${IMAGE}:${CI_PIPELINE_ID} bash -c "sleep $(( ${UNIT_TEST_TIMEOUT} * 60 + 60 ))"
     - |
-      docker exec mcore_ci_${CI_PIPELINE_ID} bash -c '
-        set -e
+      CMD=$(cat <<"RUN_TEST_EOF"
+      set -euxo pipefail
         
-        MCORE_DIR=$([[ "$TAG" == "latest" ]] && echo "" || echo "-$TAG/")
+      MCORE_DIR=$([[ "$TAG" == "latest" ]] && echo "" || echo "-$TAG/")
 
-        cd /opt/megatron-lm$MCORE_DIR;
+      cd /opt/megatron-lm$MCORE_DIR;
 
-        for i in $(seq $UNIT_TEST_REPEAT); do
-          SEED=$((RANDOM % 9000 + 1000));
-          ARGS=()
-          if [[ $TAG != latest ]]; then
-            ARGS+=(-m "not internal and not flaky and not flaky_in_dev")
-          else
-            ARGS+=(-m "not flaky and not flaky_in_dev")
-          fi
-          timeout ${UNIT_TEST_TIMEOUT}m torchrun --nproc_per_node=8 -m pytest --random-order --random-order-seed ${SEED} -xvs --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail "${ARGS[@]}" tests/unit_tests
-        done
-      '
+      for i in $(seq $UNIT_TEST_REPEAT); do
+        SEED=$((RANDOM % 9000 + 1000));
+        ARGS=()
+        if [[ $TAG != latest ]]; then
+          ARGS+=(-m "not internal and not flaky and not flaky_in_dev")
+        else
+          ARGS+=(-m "not flaky and not flaky_in_dev")
+        fi
+
+        if [[ $BUCKET == other ]]; then
+          BUCKETS=($(cat /opt/megatron-lm/.gitlab/stages/01.test.yml | yq '.".unit_tests".parallel.matrix | del(.[] | select(.BUCKET == "other")) | .[].BUCKET' | tr " " "\n" | sed 's/[^ ]*/--ignore &/g' | tr "\n" " "))
+          ARGS+=(${BUCKETS[@]})
+          BUCKET=(tests/unit_tests)
+        else
+          BUCKET=(${BUCKET})
+        fi
+
+        if [[ -d $BUCKET ]]; then
+          timeout ${UNIT_TEST_TIMEOUT}m torchrun --nproc_per_node=8 -m pytest -xvs --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail "${ARGS[@]}" ${BUCKET[@]}
+        fi
+      done
+      RUN_TEST_EOF
+      )
+      
+      docker exec mcore_ci_${CI_PIPELINE_ID} bash -c "$CMD"
   after_script:
     - docker container stop mcore_ci_${CI_PIPELINE_ID} || true
   artifacts:
@@ -135,8 +157,6 @@ test:pyt(LTS)_mcore(0.9.0):
   variables:
     TAG: core_r0.9.0
     IMAGE: ${CI_MCORE_LTS_IMAGE}
-    UNIT_TEST_REPEAT: 1
-    UNIT_TEST_TIMEOUT: 15
 
 test:pyt(DEV)_mcore(latest):
   extends: [.unit_tests]
@@ -149,8 +169,6 @@ test:pyt(DEV)_mcore(0.9.0):
   variables:
     TAG: core_r0.9.0
     IMAGE: ${CI_MCORE_DEV_IMAGE}
-    UNIT_TEST_REPEAT: 1
-    UNIT_TEST_TIMEOUT: 15
 
 test:notify_unit_tests:
   extends: [.test_rules]
