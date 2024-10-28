@@ -4,13 +4,14 @@
 
 
 export HF_DATASETS_OFFLINE=0
-export HF_DATASETS_CACHE="/N/scratch/jindjia/.cache/huggingface/datasets"
+export HF_DATASETS_CACHE="path" #TODO
+
 MASTER_PORT=6000
 NODE_RANK=$SLURM_NODEID
 NNODES=1
 PROC_PER_NODE=64
 
-cd /N/scratch/jindjia/thepile
+cd path #TODO
 
 echo "data process start"
 date

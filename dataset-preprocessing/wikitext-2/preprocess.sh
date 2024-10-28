@@ -3,7 +3,7 @@
 
 mamba init
 source ~/.bashrc
-mamba activate megatron
+mamba activate env_name #TODO
 set -x
 
 cd PATH # TODO cd to saving path folder

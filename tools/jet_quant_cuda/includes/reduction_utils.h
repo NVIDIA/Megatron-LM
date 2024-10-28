@@ -3,6 +3,9 @@
 
 // DeepSpeed Team
 
+// This file may have been modified by Bytedance Ltd. and/or its affiliates (“Bytedance's Modifications”). 
+// All Bytedance's Modifications are Copyright 2024 Bytedance Ltd. and/or its affiliates. 
+
 #pragma once
 
 #include "conversion_utils.h"

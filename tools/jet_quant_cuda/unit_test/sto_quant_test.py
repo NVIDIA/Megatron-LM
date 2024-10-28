@@ -1,3 +1,18 @@
+# Copyright 2023-2024 Bytedance Ltd. and/or its affiliates 
+
+
+# Licensed under the Apache License, Version 2.0 (the "License"); 
+# you may not use this file except in compliance with the License. 
+# You may obtain a copy of the License at 
+
+#     http://www.apache.org/licenses/LICENSE-2.0 
+
+# Unless required by applicable law or agreed to in writing, software 
+# distributed under the License is distributed on an "AS IS" BASIS, 
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. 
+# See the License for the specific language governing permissions and 
+# limitations under the License. 
+
 import torch
 from tool_function import *
 from dequant_function import *
@@ -52,7 +67,7 @@ def unittest_1():
     quantization_module = build_and_import_module(pkg_path, 'quantization_cuda')
 
     N = 25600000
-    tensor = torch.load('/home/jindjia/scripts/bytedance/dump_data/dump/iteration_008040/bucketid_000/iteration_008040_bucketid_000_dprank_000.pt', map_location='cuda')[:N].to(torch.half)
+    tensor = torch.load('tensor.pt', map_location='cuda')[:N].to(torch.half)
     groupsize = 128
     enable_hadamard = True
 
@@ -104,16 +119,13 @@ def memory_profile02(quantization_module):
 
     N = 134_217_728
     tensor = torch.normal(size=(N,), dtype=torch.bfloat16, device='cuda', std=1, mean=0)
-    # tensor = fast_hadamard_transform(tensor, k=5, normalize=True)
-    # tensor = torch.load('/home/jindjia/scripts/bytedance/dump_data/dump/iteration_008040/bucketid_000/iteration_008040_bucketid_000_dprank_000.pt', map_location='cuda')
-    # tensor = tensor[:N].to(torch.half)
+
     groupsize = 128
     enable_hadamard = True
 
     N = tensor.nelement()
     num_groups = N // groupsize
     quant_tensor_cuda, quant_scales_cuda = quantization_module.stochastic_quantize(tensor, num_groups, 4, quantization_module.Symmetric)
-    # dequant_tensor_cuda = dequantize_4bits(quant_tensor_cuda, quant_scales_cuda, groupsize)
 
     print('finished')
 

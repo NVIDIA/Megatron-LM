@@ -1,3 +1,11 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+// DeepSpeed Team
+
+// This file may have been modified by Bytedance Ltd. and/or its affiliates (“Bytedance's Modifications”). 
+// All Bytedance's Modifications are Copyright 2024 Bytedance Ltd. and/or its affiliates. 
+
 #include <cstdio>
 #include "dequantization_utils.h"
 #include "ds_kernel_utils.h"
