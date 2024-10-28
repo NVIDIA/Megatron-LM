@@ -1367,6 +1367,12 @@ def _add_learning_rate_args(parser):
     group.add_argument('--decoupled-min-lr', type=float, default=None,
                        help='Minimum value for learning rate for the input and output layer. The scheduler'
                        'clip values below this threshold')
+    group.add_argument('--scale-lr-layer', type=str, default=None,
+                       help='Scale learning rate for the specified layer.' 
+                       'E.g.  --scale-lr-layer "linear_fc2"  to scale lr for down-proj layer (during pretraining or finetuning).'
+                       'Or,   --scale-lr-layer "head"        to scale lr for lm-head (during pretraining or finetuning).')
+    group.add_argument('--lr-multiplier', type=float, default=1.0,
+                       help='Learning rate multiplier for the specified layer in scale-lr-layer.')
 
     return parser
 
@@ -1819,8 +1825,6 @@ def _add_vision_args(parser):
     group.add_argument('--no-data-sharding', action='store_false',
                        help='Disable data sharding.',
                        dest='data_sharding')
-    group.add_argument('--head-lr-mult', type=float, default=1.0,
-                       help='learning rate multiplier for head during finetuning')
 
     # pretraining type and backbone selection`
     group.add_argument('--vision-pretraining', action='store_true',

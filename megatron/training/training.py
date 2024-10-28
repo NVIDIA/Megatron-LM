@@ -299,7 +299,10 @@ def pretrain(
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     app_metrics['app_build_optimizer_start_time'] = one_logger_utils.get_timestamp_in_ms()
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider, model_type, checkpointing_context=checkpointing_context)
+        model_provider, model_type, 
+        scale_lr_cond=(lambda name, param: args.scale_lr_layer in name) if args.scale_lr_layer else None,
+        lr_mult= args.lr_multiplier,
+        checkpointing_context=checkpointing_context)
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate '

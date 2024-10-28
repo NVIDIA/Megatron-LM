@@ -224,8 +224,8 @@ def finetune(
         setup_model_and_optimizer(
             model_provider,
             model_type,
-            scale_lr_cond=lambda name, param: ".head." in name,
-            lr_mult=args.head_lr_mult)
+            scale_lr_cond=(lambda name, param: args.scale_lr_layer in name) if args.scale_lr_layer else None,
+            lr_mult= args.lr_multiplier)
     timers("model and optimizer").stop()
 
     # If pretrained checkpoint is provided and we have not trained for
