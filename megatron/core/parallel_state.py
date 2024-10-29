@@ -120,7 +120,7 @@ def get_nccl_options(pg_name, nccl_comm_cfgs):
 def generate_masked_orthogonal_rank_groups(
     world_size: int, parallel_size: List[int], mask: List[bool]
 ) -> List[List[int]]:
-    """Generate orthogonal parallel groups based on the parallel size and mask.
+    r"""Generate orthogonal parallel groups based on the parallel size and mask.
 
     Arguments:
         world_size (int): world size

@@ -26,7 +26,7 @@ try:
     import transformer_engine  # pylint: disable=unused-import
 
     HAVE_TE = True
-    from megatron.core.transformer.custom_layers.transformer_engine import SplitAlongDim
+    from megatron.core.extensions.transformer_engine import SplitAlongDim
 except ImportError:
     HAVE_TE = False
     SplitAlongDim = None

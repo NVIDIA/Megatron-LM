@@ -158,6 +158,7 @@ def custom_backward(output, grad_output):
 
 
 def set_current_microbatch(model, microbatch_id):
+    """Set the current microbatch."""
     decoder_exists = True
     decoder = None
     try:
@@ -395,6 +396,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
 
 
 def check_first_val_step(first_val_step, forward_only, cond):
+    """Check if it is the first validation step."""
     if (first_val_step is not None) and forward_only:
         return first_val_step and cond
     else:
@@ -498,6 +500,7 @@ def forward_backward_no_pipelining(
 
 
 def clear_embedding_activation_buffer(config, model):
+    """Clear embedding activation buffer."""
 
     if (
         parallel_state.is_pipeline_last_stage(ignore_virtual=True)
@@ -519,6 +522,7 @@ def clear_embedding_activation_buffer(config, model):
 
 
 def finish_embedding_wgrad_compute(config, embedding_module):
+    """Finish embedding wgrad compute."""
     if (
         parallel_state.is_pipeline_last_stage(ignore_virtual=True)
         and config.defer_embedding_wgrad_compute
@@ -1168,15 +1172,15 @@ def get_tensor_shapes(
     config,
     encoder_decoder_xattn: bool,
 ):
-    # Determine right tensor sizes (based on position of rank with
-    # respect to split rank) and model size.
-    # Send two tensors if model decoder requires the encoder's output
-    # (via cross-attention) and rank is in decoder stage.
-    #     first tensor is decoder.
-    #     second tensor is encoder.
-    # If model has an encoder & decoder and rank is at the boundary:
-    #     send one tensor.
-    # Otherwise, send one tensor.
+    """
+    Determine right tensor sizes (based on position of rank with respect to split rank) and
+    model size.
+    Send two tensors if model decoder requires the encoder's output (via cross-attention) and
+    rank is in decoder stage.
+    First tensor is decoder. Second tensor is encoder.
+    If model has an encoder & decoder and rank is at the boundary, send one tensor.
+    Otherwise, send one tensor.
+    """
     tensor_shapes = []
 
     seq_length = seq_length // parallel_state.get_context_parallel_world_size()
@@ -1204,6 +1208,7 @@ def get_tensor_shapes(
 
 
 def recv_forward(tensor_shapes, config):
+    """recv forward."""
     input_tensors = []
     for tensor_shape in tensor_shapes:
         if tensor_shape is None:
@@ -1214,6 +1219,7 @@ def recv_forward(tensor_shapes, config):
 
 
 def recv_backward(tensor_shapes, config):
+    """recv backward."""
     output_tensor_grads = []
     for tensor_shape in tensor_shapes:
         if tensor_shape is None:
@@ -1224,6 +1230,7 @@ def recv_backward(tensor_shapes, config):
 
 
 def send_forward(output_tensors, tensor_shapes, config):
+    """send forward."""
     if not isinstance(output_tensors, list):
         output_tensors = [output_tensors]
     for output_tensor, tensor_shape in zip(output_tensors, tensor_shapes):
@@ -1233,6 +1240,7 @@ def send_forward(output_tensors, tensor_shapes, config):
 
 
 def send_backward(input_tensor_grads, tensor_shapes, config):
+    """send backward."""
     if not isinstance(input_tensor_grads, list):
         input_tensor_grads = [input_tensor_grads]
     for input_tensor_grad, tensor_shape in zip(input_tensor_grads, tensor_shapes):
@@ -1242,6 +1250,7 @@ def send_backward(input_tensor_grads, tensor_shapes, config):
 
 
 def send_forward_recv_backward(output_tensors, tensor_shapes, config):
+    """send forward and recv backward."""
     if not isinstance(output_tensors, list):
         output_tensors = [output_tensors]
     output_tensor_grads = []
@@ -1257,6 +1266,7 @@ def send_forward_recv_backward(output_tensors, tensor_shapes, config):
 
 
 def send_backward_recv_forward(input_tensor_grads, tensor_shapes, config):
+    """send backward and recv forward."""
     if not isinstance(input_tensor_grads, list):
         input_tensor_grads = [input_tensor_grads]
     input_tensors = []
@@ -1290,12 +1300,12 @@ def forward_backward_pipelining_without_interleaving(
     if isinstance(model, list):
         assert (
             len(model) == 1
-        ), "non-interleaved pipeline parallelism does not support model chunking"
+        ), "non-interleaved pipeline-parallel schedule does not support model chunking"
         model = model[0]
     if isinstance(data_iterator, list):
         assert (
             len(data_iterator) == 1
-        ), "non-pipeline-parallel schedule does not support model chunking"
+        ), "non-interleaved pipeline-parallel schedule does not support model chunking"
         data_iterator = data_iterator[0]
 
     config = get_model_config(model)
