@@ -328,7 +328,10 @@ test:pypi_push_wheel:
         export TWINE_PASSWORT=$TWINE_PROD_PASSWORD
       fi
     - pip install twine
-    - twine upload -u $TWINE_USERNAME -p $TWINE_PASSWORT --repository $REPOSITORY wheelhouse/*
+    - >
+      for i in 1 2 3 4 5; do 
+        twine upload --verbose -u $TWINE_USERNAME -p $TWINE_PASSWORT --repository $REPOSITORY wheelhouse/* && break || sleep $(( 60*2**i )); 
+      done
 
 test:gh_release:
   extends: [.test_rules]
