@@ -65,14 +65,10 @@ products:
     - gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_untied_dgx_a100_1N8G
-    - gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_groupedGEMM_dgx_a100_1N8G
-    - gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_top2router_dgx_a100_1N8G
-    - gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G
-    - gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_groupedGEMM_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_top2router_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp2_cross_entropy_loss_fusion_dgx_a100_1N8G
@@ -122,7 +118,6 @@ products:
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp4_resume_torch_dist
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_te_4experts2parallel
     # - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_resume_torch_dist_te_2experts  # non-determinism
-    - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_te_2experts
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp4_pp1
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp4_pp1_resume_torch
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp4_pp1_resume_torch_dist
@@ -134,7 +129,6 @@ products:
     - gpt3_345m_nightly_dgx_a100_1N8G_tp1_pp4_overlap_grad_reduce
     - gpt3_345m_nightly_dgx_a100_1N8G_tp1_pp4_resume_torch
     - gpt3_345m_nightly_dgx_a100_1N8G_tp1_pp4_vp1_overlap_grad_reduce
-    - gpt3_345m_nightly_dgx_a100_1N8G_tp2_pp2_4experts
     - gpt3_345m_nightly_dgx_a100_1N8G_tp2_pp2_overlap_grad_reduce
     - gpt3_345m_nightly_dgx_a100_1N8G_tp2_pp2_resume_torch_4experts
     - gpt3_345m_nightly_dgx_a100_1N8G_tp2_pp2_resume_torch_overlap_grad_reduce
