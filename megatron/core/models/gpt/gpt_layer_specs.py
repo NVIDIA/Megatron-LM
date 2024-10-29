@@ -27,6 +27,9 @@ try:
         TENorm,
         TERowParallelGroupedLinear,
         TERowParallelLinear,
+        TEActivationOp,
+        TEActivationOpFp8,
+        TERowParallelLinearOp,
     )
 
     HAVE_TE = True
@@ -204,13 +207,18 @@ def _get_mlp_module_spec(
     fp8: Optional[str] = None,
 ) -> ModuleSpec:
     """Helper function to get module spec for MLP/MoE"""
+    if use_te:
+        activation_func = TEActivationOpFp8 if fp8 else TEActivationOp
+    else:
+        activation_func = None
     if num_experts is None:
         # Dense MLP w/ or w/o TE modules.
         return ModuleSpec(
             module=MLP,
             submodules=MLPSubmodules(
                 linear_fc1=TELayerNormColumnParallelLinear if use_te else ColumnParallelLinear,
-                linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
+                linear_fc2=TERowParallelLinearOp if use_te else RowParallelLinear,
+                activation_func=activation_func,
             ),
         )
     else:
@@ -220,7 +228,7 @@ def _get_mlp_module_spec(
             linear_fc2 = TERowParallelGroupedLinear
         elif use_te and fp8:
             linear_fc1 = TEColumnParallelLinear
-            linear_fc2 = TERowParallelLinear
+            linear_fc2 = TERowParallelLinearOp
         else:
             linear_fc1 = ColumnParallelLinear
             linear_fc2 = RowParallelLinear
@@ -231,7 +239,7 @@ def _get_mlp_module_spec(
             module=MoELayer,
             submodules=MoESubmodules(
                 experts=(
-                    MLPSubmodules(linear_fc1=linear_fc1, linear_fc2=linear_fc2)
+                    MLPSubmodules(linear_fc1=linear_fc1, linear_fc2=linear_fc2, activation_func=activation_func)
                     if not moe_grouped_gemm or use_te_grouped_gemm
                     else None
                 ),
@@ -240,7 +248,8 @@ def _get_mlp_module_spec(
                     params={"gate": False},
                     submodules=MLPSubmodules(
                         linear_fc1=TEColumnParallelLinear if use_te else ColumnParallelLinear,
-                        linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
+                        linear_fc2=TERowParallelLinearOp if use_te else RowParallelLinear,
+                        activation_func=activation_func,
                     ),
                 ),
             ),

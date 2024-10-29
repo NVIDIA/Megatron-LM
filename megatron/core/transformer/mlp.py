@@ -26,6 +26,7 @@ from megatron.core.transformer.te_activation_func_utils import te_act_func
 @dataclass
 class MLPSubmodules:
     linear_fc1: Union[ModuleSpec, type] = None
+    activation_func: Union[ModuleSpec, type] = None
     linear_fc2: Union[ModuleSpec, type] = None
 
 
@@ -77,7 +78,14 @@ class MLP(MegatronModule):
             tp_comm_buffer_name='fc1',
         )
 
-        self.activation_func = self.config.activation_func
+        if self.config.use_te_activation_func:
+            self.activation_func = build_module(
+                submodules.activation_func,
+                config=self.config,
+                init_method=self.config.init_method,
+            )
+        else:
+            self.activation_func = self.config.activation_func
 
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
@@ -112,18 +120,6 @@ class MLP(MegatronModule):
                 )
             else:
                 raise ValueError("Only support fusion of gelu and swiglu")
-        elif self.config.use_te_activation_func:
-            if bias_parallel is not None:
-                intermediate_parallel = intermediate_parallel + bias_parallel
-            if (self.activation_func, self.config.gated_linear_unit) in te_act_func:
-                te_act_impl = te_act_func[(self.activation_func, self.config.gated_linear_unit)]
-                intermediate_parallel = te_act_impl(intermediate_parallel)
-            else:
-                raise ValueError(
-                    f"{self.activation_func} with gated_linear_unit={self.config.gated_linear_unit}"
-                    " is not supported by TransformerEngine. Consider setting use_te_activation_func"
-                    " to False."
-                )
         else:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
@@ -131,7 +127,7 @@ class MLP(MegatronModule):
 
                 def glu(x):
                     x = torch.chunk(x, 2, dim=-1)
-                    return self.config.activation_func(x[0]) * x[1]
+                    return self.activation_func(x[0]) * x[1]
 
                 intermediate_parallel = glu(intermediate_parallel)
             else:
