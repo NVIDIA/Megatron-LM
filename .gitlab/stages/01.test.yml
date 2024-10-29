@@ -156,6 +156,9 @@ test:build_image:
 
 test:pyt(LTS)_mcore(latest):
   extends: [.unit_tests]
+  needs:
+    - test:pyt(LTS)_mcore(0.9.0)
+    - test:pyt(DEV)_mcore(0.9.0)
   variables:
     TAG: latest
     IMAGE: ${CI_MCORE_LTS_IMAGE}
@@ -168,6 +171,9 @@ test:pyt(LTS)_mcore(0.9.0):
 
 test:pyt(DEV)_mcore(latest):
   extends: [.unit_tests]
+  needs:
+    - test:pyt(LTS)_mcore(0.9.0)
+    - test:pyt(DEV)_mcore(0.9.0)
   variables:
     TAG: latest
     IMAGE: ${CI_MCORE_DEV_IMAGE}
