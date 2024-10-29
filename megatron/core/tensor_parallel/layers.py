@@ -5,11 +5,11 @@
 
 import os
 import warnings
+from functools import partial
 from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import custom_bwd, custom_fwd
 from torch.nn.parameter import Parameter
 
 from megatron.core.model_parallel_config import ModelParallelConfig
@@ -21,6 +21,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from megatron.core.utils import is_torch_min_version
 
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..transformer.utils import make_sharded_tensors_for_checkpoint
@@ -47,6 +48,22 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     'partition_dim': -1,
     'partition_stride': 1,
 }
+
+
+if is_torch_min_version("2.4.0a0"):
+    custom_fwd = partial(torch.amp.custom_fwd, device_type="cuda")
+    custom_bwd = partial(torch.amp.custom_bwd, device_type="cuda")
+else:
+    custom_fwd = torch.cuda.amp.custom_fwd
+    custom_bwd = torch.cuda.amp.custom_bwd
+
+
+if is_torch_min_version("1.13.0"):
+    dist_all_gather_func = torch.distributed.all_gather_into_tensor
+    dist_reduce_scatter_func = torch.distributed.reduce_scatter_tensor
+else:
+    dist_all_gather_func = torch.distributed._all_gather_base
+    dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
 
 def param_is_not_tensor_parallel_duplicate(param):
@@ -416,9 +433,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             dim_size[0] = dim_size[0] * world_size
 
             all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
-            torch.distributed._all_gather_base(
-                all_gather_buffer, input, group=get_tensor_model_parallel_group()
-            )
+            dist_all_gather_func(all_gather_buffer, input, group=get_tensor_model_parallel_group())
             total_input = all_gather_buffer
         else:
             total_input = input
@@ -452,7 +467,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 all_gather_buffer = get_global_memory_buffer().get_tensor(
                     dim_size, input.dtype, "mpu"
                 )
-                handle = torch.distributed._all_gather_base(
+                handle = dist_all_gather_func(
                     all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
                 )
 
@@ -486,7 +501,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 dim_size, dtype=input.dtype, device=torch.cuda.current_device(), requires_grad=False
             )
             # reduce_scatter
-            handle = torch.distributed._reduce_scatter_base(
+            handle = dist_reduce_scatter_func(
                 sub_grad_input, grad_input, group=get_tensor_model_parallel_group(), async_op=True
             )
             # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the

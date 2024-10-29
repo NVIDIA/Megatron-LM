@@ -4,13 +4,10 @@ from importlib.metadata import version
 import pytest
 import torch
 
+from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.custom_layers.transformer_engine import (
-    TEColumnParallelLinear,
-    TERowParallelLinear,
-)
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.experts import SequentialMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer

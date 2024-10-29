@@ -28,6 +28,11 @@ from megatron.core.dist_checkpointing.mapping import ShardedTensor
 logger = logging.getLogger(__name__)
 
 
+try:
+    _torch_version = PkgVersion(torch.__version__)
+except:
+    # This is a WAR for building docs, where torch is not actually imported
+    _torch_version = PkgVersion("0.0.0")
 _te_version = None
 
 
@@ -53,6 +58,20 @@ def is_te_min_version(version, check_equality=True):
     if check_equality:
         return get_te_version() >= PkgVersion(version)
     return get_te_version() > PkgVersion(version)
+
+
+def get_torch_version():
+    """Get torch version from __version__."""
+
+    global _torch_version
+    return _torch_version
+
+
+def is_torch_min_version(version, check_equality=True):
+    """Check if minimum version of `torch` is installed."""
+    if check_equality:
+        return get_torch_version() >= PkgVersion(version)
+    return get_torch_version() > PkgVersion(version)
 
 
 def ensure_divisibility(numerator, denominator):
@@ -204,8 +223,8 @@ def assert_viewless_tensor(tensor, extra_msg=None):
     assert tensor._base is None, (
         "Ensure tensor._base is None before setting tensor.data or storing "
         "tensor to memory buffer. Otherwise, a memory leak will occur (and "
-        "likely accumulate over iterations). %s"
-    ) % extra_msg
+        f"likely accumulate over iterations). {extra_msg}"
+    )
     return tensor
 
 
@@ -414,6 +433,12 @@ def prepare_input_tensors_for_wgrad_compute(grad_output, all_gathered_input):
     return grad_output, all_gathered_input
 
 
+if is_torch_min_version("1.13.0"):
+    dist_all_gather_func = torch.distributed.all_gather_into_tensor
+else:
+    dist_all_gather_func = torch.distributed._all_gather_base
+
+
 def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_output_buffer, weight):
     """Helper for performing embedding wgrad GEMM's during the pipeline drain phase, pipelines the
     AllGather and GEMM's.
@@ -442,7 +467,7 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
     all_gathered_input = [None, None]
     if config.sequence_parallel:
         all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu_0")
-        handle = torch.distributed._all_gather_base(
+        handle = dist_all_gather_func(
             all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=False
         )
 
@@ -480,7 +505,7 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
         if config.sequence_parallel:
             name = "mpu_" + str((i + 1) % 2)
             all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, name)
-            handle = torch.distributed._all_gather_base(
+            handle = dist_all_gather_func(
                 all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
             )
 
@@ -752,7 +777,7 @@ class StragglerDetector:
             amp (float, optional): Set to 3.0 if we only use timers in fwd pass.
                                    Defaults to 3.0.
             port (int, optional): Control port, useful only for rank-0. Defaults to 65535.
-            prefill (int, optional): Howmany Events to pre-populate. Defaults to 1024.
+            prefill (int, optional): How many Events to pre-populate. Defaults to 1024.
             enabled (bool, optional): Whether or not collection is enabled on startup.
                                       Defaults to False.
         """
@@ -1003,7 +1028,7 @@ class StragglerDetector:
         indirectly from report() is the only way to activate the change that is made
         via rank-0
         """
-        # If no change just commnunicate the current
+        # If no change just communicate the current
         off = self._off
         if self.rank == 0 and self.toggle:
             off = not self._off
@@ -1038,7 +1063,7 @@ class StragglerDetector:
         if self.rank == 0:
             state = "OFF" if self._off else "ON"
             logger.info(
-                f"Controller ready to recv " f"commands on port {self.port}. Current state {state}"
+                f"Controller ready to recv commands on port {self.port}. Current state {state}"
             )
             while True and self.sock is not None:
                 try:
@@ -1209,7 +1234,7 @@ class StragglerDetector:
 
     @property
     def configured(self) -> bool:
-        """Can be called to check if the the instance is already configured
+        """Can be called to check if the instance is already configured
 
         Returns:
             bool: returns True if configure was called and was a success, else False
