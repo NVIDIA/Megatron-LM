@@ -2,13 +2,14 @@
 
 """Input/output checkpointing."""
 
-from enum import Enum, auto
-from logging import getLogger
+import contextlib
 import os
 import random
 import shutil
 import sys
 import threading
+from enum import Enum, auto
+from logging import getLogger
 from pathlib import Path
 
 import numpy as np
@@ -1081,8 +1082,17 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
             else:
                 gen_sd_optim = None
                 gen_sd_opt_param_scheduler = None
-            load_kwargs['sharded_state_dict'] = generate_state_dict(args, model, gen_sd_optim, gen_sd_opt_param_scheduler,
-                                                                    gen_sd_rng_state, True, optim_sd_kwargs=optim_sd_kwargs)
+
+            # [ModelOpt]: Initial loading from non-resume sharded checkpoint to a Distillation Model
+            # will result in key mismatch with loss modules potentially containing parameters, since
+            # it requires generating a state_dict before loading. Here we hide those modules if present.
+            with contextlib.ExitStack() as stack:  # Allows multiple context managers for each model shard
+                if args.finetune and hasattr(model[0], "hide_loss_modules"):
+                    for m in model:
+                        stack.enter_context(m.hide_loss_modules())
+                load_kwargs['sharded_state_dict'] = generate_state_dict(args, model, gen_sd_optim, gen_sd_opt_param_scheduler,
+                                                                        gen_sd_rng_state, True, optim_sd_kwargs=optim_sd_kwargs)
+
             # When "--fp8-param-gather" is disabled, this function doesn't modify anything.
             fix_fp8_params_lose_precision_when_loading_dist_ckpt(load_kwargs['sharded_state_dict'])
 

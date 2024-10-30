@@ -22,5 +22,21 @@ def add_modelopt_args(parser):
         choices=["int8", "int8_sq", "fp8", "int4_awq", "w4a8_awq", "int4", "None"],
         help="Specify a quantization config from the supported choices.",
     )
+    group.add_argument(
+        '--export-kd-cfg',
+        type=str,
+        default=None,
+        help='Path to distillation configuration yaml file.',
+    )
+    group.add_argument(
+        '--export-kd-teacher-load',
+        type=str,
+        help='Path to checkpoint to load as distillation teacher.',
+    )
+    group.add_argument(
+        '--export-kd-finalize',
+        action="store_true",
+        help='Export original student class back from a loaded distillation model.',
+    )
 
     return parser
