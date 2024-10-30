@@ -552,6 +552,13 @@ class TransformerConfig(ModelParallelConfig):
         if self.flash_decode and self.fp8:
             raise ValueError("FP8 inference is currently not support with flash decoding.")
 
+        if self.moe_token_dispatcher_type in ['allgather', 'alltoall_seq']:
+            if self.variable_seq_lengths is True:
+                raise ValueError(
+                    f"Token dispatcher type: {self.moe_token_dispatcher_type} does not support "
+                    f"variable sequence length, please use alltoall dispatcher instead."
+                )
+
         if self.cp_comm_type is not None:
             if isinstance(self.cp_comm_type, list):
                 assert len(self.cp_comm_type) == self.num_layers, (
