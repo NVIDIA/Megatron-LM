@@ -12,7 +12,9 @@ from megatron.training.tokenizer.gpt2_tokenization import PRETRAINED_VOCAB_ARCHI
 TOKENIZER_DIR = Path("~/data/tokenizers").expanduser()
 
 # Copied over from test_preprocess_data.py
-__LOCAL_GPT2_VOCAB = "/home/gitlab-runner/data/gpt3_data/gpt2-vocab.json"
+from tests.unit_tests.data.test_preprocess_data import __LOCAL_GPT2_VOCAB
+
+GPT2_VOCAB_SIZE = 32768
 
 
 def offsets_to_substrs(offsets, string):
@@ -117,14 +119,11 @@ def gpt2_tiktok_vocab(tmp_path_factory):
     )
 
 
-def specs():
-    if TOKENIZER_DIR.exists():
-        return local_test_specs()
-    return []
-
-
-@pytest.mark.parametrize("args", specs())
+@pytest.mark.parametrize("args", local_test_specs())
 def test_tokenizer(args):
+    if not TOKENIZER_DIR.exists():
+        pytest.skip("Skipping tokenizer tests because the tokenizer directory does not exist")
+
     tok = tokenizer.build_tokenizer(args)
     run_tokenizer_tests(tok)
 
