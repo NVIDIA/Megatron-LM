@@ -35,6 +35,16 @@ from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import make_sharded_object_for_checkpoint
 
+try:
+
+    from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
+
+    HAVE_TE = True
+
+except ImportError:
+
+    HAVE_TE = False
+
 
 class GroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using GroupedGEMM.
@@ -599,17 +609,10 @@ class TEGroupedMLP(MegatronModule):
             tp_comm_buffer_name='fc2',
         )
 
-        def remove_extra_states_check(self, incompatible_keys):
-            """
-            Remove extra _extra_state from unexpected keys.
-            These keys are for dist ckpt compatibility with SequentialMLP.
-            """
-            keys = deepcopy(incompatible_keys.unexpected_keys)
-            for key in keys:
-                if '_extra_state' in key:
-                    incompatible_keys.unexpected_keys.remove(key)
-
-        self.register_load_state_dict_post_hook(remove_extra_states_check)
+        if self.config.fp8:
+            assert HAVE_TE, "FP8 requires TE."
+            self.fp8_padding = Fp8Padding(self.num_local_experts)
+            self.fp8_unpadding = Fp8Unpadding(self.num_local_experts)
 
     def forward(
         self, permuted_local_hidden_states: torch.Tensor, tokens_per_expert: torch.Tensor
@@ -625,6 +628,12 @@ class TEGroupedMLP(MegatronModule):
             output (torch.Tensor): The output of the local experts.
         """
         tokens_per_expert = tokens_per_expert.tolist()
+        if self.config.fp8:
+            actual_tokens_per_expert = tokens_per_expert
+            permuted_local_hidden_states, tokens_per_expert = self.fp8_padding(
+                permuted_local_hidden_states, tokens_per_expert
+            )
+
         intermediate_parallel, bias_parallel = self.linear_fc1(
             permuted_local_hidden_states, tokens_per_expert
         )
@@ -646,7 +655,18 @@ class TEGroupedMLP(MegatronModule):
                 raise ValueError("Only support fusion of gelu and swiglu")
         else:
             if bias_parallel is not None:
-                intermediate_parallel = intermediate_parallel + bias_parallel
+                shape = intermediate_parallel.shape
+                intermediate_parallel = torch.cat(
+                    [
+                        t + b
+                        for t, b in zip(
+                            torch.split(
+                                intermediate_parallel.view(-1, shape[-1]), tokens_per_expert
+                            ),
+                            bias_parallel,
+                        )
+                    ]
+                ).view(shape)
             if self.config.gated_linear_unit:
 
                 def glu(x):
@@ -658,6 +678,10 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel = self.activation_func(intermediate_parallel)
 
         output, output_bias = self.linear_fc2(intermediate_parallel, tokens_per_expert)
+
+        # upad and concat the output
+        if self.config.fp8:
+            output = self.fp8_unpadding(output, actual_tokens_per_expert)
 
         return output, output_bias
 
