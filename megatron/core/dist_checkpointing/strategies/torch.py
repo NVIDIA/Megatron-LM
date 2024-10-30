@@ -13,8 +13,9 @@ import torch
 from packaging.version import Version as PkgVersion
 from torch.distributed import checkpoint
 from torch.distributed._shard.metadata import ShardMetadata
-from torch.distributed._shard.sharded_tensor import Shard, ShardedTensorMetadata, TensorProperties
-from torch.distributed._sharded_tensor import ShardedTensor as TorchShardedTensor
+from torch.distributed._shard.sharded_tensor import Shard
+from torch.distributed._shard.sharded_tensor import ShardedTensor as TorchShardedTensor
+from torch.distributed._shard.sharded_tensor import ShardedTensorMetadata, TensorProperties
 from torch.distributed._tensor import DTensor
 from torch.distributed.checkpoint import (
     BytesStorageMetadata,

@@ -26,7 +26,7 @@ try:
     import transformer_engine  # pylint: disable=unused-import
 
     HAVE_TE = True
-    from megatron.core.transformer.custom_layers.transformer_engine import SplitAlongDim
+    from megatron.core.extensions.transformer_engine import SplitAlongDim
 except ImportError:
     HAVE_TE = False
     SplitAlongDim = None
@@ -283,8 +283,14 @@ class Attention(MegatronModule, ABC):
             q_pos_emb, k_pos_emb = rotary_pos_emb
 
             if packed_seq_params is not None:
-                cu_seqlens_q = packed_seq_params.cu_seqlens_q
-                cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+                if packed_seq_params.cu_seqlens_q_padded is not None:
+                    cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
+                else:
+                    cu_seqlens_q = packed_seq_params.cu_seqlens_q
+                if packed_seq_params.cu_seqlens_kv_padded is not None:
+                    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
+                else:
+                    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
             query = apply_rotary_pos_emb(

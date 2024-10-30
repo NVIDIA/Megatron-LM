@@ -12,7 +12,7 @@ from megatron.core.datasets.multimodal_dataset import MockMultimodalDataset, Mul
 from megatron.core.enums import ModelType
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.models.multimodal.llava_model import LLaVAModel, IMAGE_TOKEN_INDEX
+from megatron.core.models.multimodal.llava_model import LLaVAModel, DEFAULT_IMAGE_TOKEN_INDEX
 from megatron.core.models.multimodal.llava_spec import (
     decoder_model_with_transformer_engine_default_spec,
     decoder_model_with_local_default_spec,
@@ -106,13 +106,13 @@ def model_provider(
         language_transformer_layer_spec = decoder_model_with_local_default_spec(
             args.num_experts, args.moe_grouped_gemm
         )
-    
+
     if sp_padding_needed > 0:
         if language_transformer_layer_spec.submodules.self_attention.params.get('attn_mask_type', '') == AttnMaskType.causal:
             language_transformer_layer_spec.submodules.self_attention.params['attn_mask_type'] = AttnMaskType.padding_causal
         elif language_transformer_layer_spec.submodules.self_attention.params.get('attn_mask_type', '') == AttnMaskType.no_mask:
             language_transformer_layer_spec.submodules.self_attention.params['attn_mask_type'] = AttnMaskType.padding
-    
+
     if args.transformer_impl == "transformer_engine":
         vision_transformer_layer_spec = get_vit_layer_with_transformer_engine_spec()
     else:  # transformer_impl == "local"
@@ -130,7 +130,7 @@ def model_provider(
     if vision_transformer_config.tp_comm_overlap:
         print_rank_0("> Disabling TP Comm overlap in Vision Transformer. Not yet supported")
         vision_transformer_config.tp_comm_overlap = False
-    
+
     vision_projection_type = "mlp"
     vision_projection_config = deepcopy(language_transformer_config)
     if vision_projection_config.sequence_parallel:
@@ -248,7 +248,7 @@ def _preprocess_data_for_llava(data):
     # Prepend image token index to tokens.
     data["tokens"] = torch.cat(
         [
-            IMAGE_TOKEN_INDEX
+            DEFAULT_IMAGE_TOKEN_INDEX
             * torch.ones(1, dtype=data["tokens"].dtype, device=data["tokens"].device),
             data["tokens"],
         ]

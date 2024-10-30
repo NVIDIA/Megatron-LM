@@ -5,12 +5,20 @@ from typing import Optional, Union
 import torch
 
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
-from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.models.common.vision_module.vision_module import VisionModule
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    from megatron.core.extensions.transformer_engine import TENorm
+
+    NORM_IMPL = TENorm
+except:
+    NORM_IMPL = torch.nn.LayerNorm
 
 
 # Note: This is under development and is missing features like position embedding interpolation.
@@ -32,8 +40,8 @@ class CLIPViTModel(VisionModule):
         self,
         transformer_config: TransformerConfig,
         transformer_layer_spec: ModuleSpec,
-        ln_pre_impl: Union[ModuleSpec, type] = TENorm,
-        ln_post_impl: Union[ModuleSpec, type] = TENorm,
+        ln_pre_impl: Union[ModuleSpec, type] = NORM_IMPL,
+        ln_post_impl: Union[ModuleSpec, type] = NORM_IMPL,
         add_class_token: bool = True,
         class_token_len: int = 1,
         patch_dim: int = 14,

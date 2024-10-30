@@ -7,8 +7,9 @@ from functools import partial
 import torch
 import yaml
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
-                                             os.path.pardir, os.path.pardir)))
+sys.path.append(
+    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
+)
 
 from dataloader_provider import train_valid_test_dataloaders_provider
 from model import model_provider
@@ -16,7 +17,7 @@ from multimodal_args import add_multimodal_extra_args
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
-from megatron.core.models.multimodal.llava_model import LLaVAModel
+from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, LLaVAModel
 from megatron.core.parallel_state import get_tensor_model_parallel_rank
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain
 from megatron.training.utils import is_last_rank
@@ -43,7 +44,6 @@ def get_batch(data_iterator):
         data = None
 
     data_text = tensor_parallel.broadcast_data(["text"], data, torch.int64)["text"]
-    prompt_len = tensor_parallel.broadcast_data(["prompt_len"], data, torch.int64)["prompt_len"]
     target = tensor_parallel.broadcast_data(["target"], data, torch.int64)["target"]
 
     imgs = tensor_parallel.broadcast_data(["imgs"], data, torch.float32)["imgs"]
@@ -62,105 +62,35 @@ def get_batch(data_iterator):
     tokenizer = get_tokenizer()
     text_length = tokens_.shape[1]
     tokens = tokens_[:, :text_length].contiguous()
-    labels = target[:, 1:text_length+1].contiguous()
+    labels = target[:, 1 : text_length + 1].contiguous()
 
     assert tokens.shape == labels.shape, f"tokens: {tokens.shape} != labels: {labels.shape}"
     torch.cuda.nvtx.range_pop()
 
     torch.cuda.nvtx.range_push("get_ltor_masks_and_position_ids")
-    if hasattr(tokenizer, 'eod'):
-        eod_token = tokenizer.eod
-    elif hasattr(tokenizer, 'eos_id'):
-        eod_token = tokenizer.eos_id
-    attention_mask, loss_mask, position_ids = \
-        get_ltor_masks_and_position_ids(tokens, eod_token,
-                                        args.reset_position_ids,
-                                        args.reset_attention_mask,
-                                        args.eod_mask_loss,
-                                        question_length=prompt_len,
-                                        target=target[:, 1:text_length+1]
-                                        )
+    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
+        tokens, labels, tokenizer.pad
+    )
     torch.cuda.nvtx.range_pop()
 
     return tokens, labels, loss_mask, attention_mask, position_ids, imgs, num_tiles
 
 
-def get_ltor_masks_and_position_ids(data,
-                                    eod_token,
-                                    reset_position_ids,
-                                    reset_attention_mask,
-                                    eod_mask_loss,
-                                    question_length=None,
-                                    target=None,
-                                    weights=None):
+def get_ltor_masks_and_position_ids(input_ids, target, pad_token):
     """Build masks and position id for left to right model."""
-
-    # Extract batch size and sequence length.
-    micro_batch_size, seq_length = data.size()
-
-    # Attention mask (lower triangular).
-    if reset_attention_mask:
-        att_mask_batch = micro_batch_size
-    else:
-        att_mask_batch = 1
-
-    attention_mask = torch.tril(torch.ones(
-        (att_mask_batch, seq_length, seq_length), device=data.device)).view(
-            att_mask_batch, 1, seq_length, seq_length)
-
-     # Loss mask.
-    if target != None: # use target to create loss mask that is created in data preparation step
-        loss_mask = torch.ones(target.size(), dtype=torch.float, device=data.device)
-        loss_mask[target == eod_token] = 0.0 # mask paddings
-        loss_mask[target == -100] = 0.0 # mask prompts
-
-    else: # default creation
-        loss_mask = torch.ones(data.size(), dtype=torch.float, device=data.device)
-        if eod_mask_loss:
-            loss_mask[data == eod_token] = 0.0
-
-        if question_length is not None:
-            # Create a mask based on question_length
-            question_length_mask = torch.arange(loss_mask.size(1), device=loss_mask.device)[None, :] < question_length[:, None]
-            # Invert the mask (1 where we want to keep the loss, 0 where we want to zero it out)
-            inverted_mask = ~question_length_mask
-            # Apply the mask to loss_mask
-            loss_mask = loss_mask * inverted_mask.float()
+    seq_length = input_ids.shape[1]
 
     # Position ids.
-    position_ids = torch.arange(seq_length, dtype=torch.long,
-                                device=data.device)
-    position_ids = position_ids.unsqueeze(0).expand_as(data)
-    # We need to clone as the ids will be modifed based on batch index.
-    if reset_position_ids:
-        position_ids = position_ids.clone()
+    position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device)
+    position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
 
-    if reset_position_ids or reset_attention_mask:
-        # Loop through the batches:
-        for b in range(micro_batch_size):
+    # Loss mask.
+    loss_mask = torch.ones(target.size(), dtype=torch.float, device=input_ids.device)
+    loss_mask[target == pad_token] = 0.0  # mask paddings
+    loss_mask[target == IGNORE_INDEX] = 0.0  # mask prompts
 
-            # Find indecies where EOD token is.
-            eod_index = position_ids[b, data[b] == eod_token]
-            # Detach indecies from positions if going to modify positions.
-            if reset_position_ids:
-                eod_index = eod_index.clone()
-
-            # Loop through EOD indecies:
-            prev_index = 0
-            for j in range(eod_index.size()[0]):
-                i = eod_index[j]
-                # Mask attention loss.
-                if reset_attention_mask:
-                    attention_mask[b, 0, (i + 1):, :(i + 1)] = 0
-                # Reset positions.
-                if reset_position_ids:
-                    position_ids[b, (i + 1):] -= (i + 1 - prev_index)
-                    prev_index = i + 1
-
-    # Convert attention mask to binary:
-    attention_mask = (attention_mask < 0.5)
-    if weights is not None:
-        loss_mask = loss_mask * weights
+    # Attention mask.
+    attention_mask = None
 
     return attention_mask, loss_mask, position_ids
 
@@ -179,11 +109,7 @@ def loss_func(loss_mask, output_tensor):
 
     local_num_tokens = loss[1].clone().detach().to(torch.int)
 
-    return (
-        total_loss,
-        local_num_tokens,
-        {'lm loss': (reporting_loss[0], reporting_loss[1])},
-    )
+    return (total_loss, local_num_tokens, {'lm loss': (reporting_loss[0], reporting_loss[1])})
 
 
 def forward_step(data_iterator, model: LLaVAModel):
@@ -201,10 +127,20 @@ def forward_step(data_iterator, model: LLaVAModel):
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()
-    tokens, labels, loss_mask, attention_mask, position_ids, images, num_image_tiles = get_batch(data_iterator)
+    tokens, labels, loss_mask, attention_mask, position_ids, images, num_image_tiles = get_batch(
+        data_iterator
+    )
     timers('batch-generator').stop()
 
-    output_tensor, loss_mask = model(images, tokens, position_ids, attention_mask, labels, loss_mask, num_image_tiles=num_image_tiles)
+    output_tensor, loss_mask = model(
+        images,
+        tokens,
+        position_ids,
+        attention_mask,
+        labels,
+        loss_mask,
+        num_image_tiles=num_image_tiles,
+    )
 
     return output_tensor, partial(loss_func, loss_mask)
 
@@ -243,7 +179,6 @@ def llava_position_embedding_ranks(pp_ranks):
         return [pp_ranks[epp]]
 
 
-
 def run_online_eval(model):
     """Run an evaluation benchmark during training."""
     args = get_args()
@@ -253,14 +188,12 @@ def run_online_eval(model):
         return []
 
     from config import EvaluationConfig
-    from run_text_generation import generate_and_write_samples, patch_tokenizer
+    from run_text_generation import generate_and_write_samples
 
     with open(args.online_evaluation_config, "r") as f:
         config_dict = yaml.safe_load(f)
 
     config = EvaluationConfig(**config_dict)
-
-    patch_tokenizer(args)
 
     # The inference code assumes the first rank is the leader.
     # Tensorboard writer is on the last rank.
@@ -311,5 +244,5 @@ if __name__ == "__main__":
         process_non_loss_data_func=write_online_eval_to_tensorboard,
         get_embedding_ranks=llava_embedding_ranks,
         get_position_embedding_ranks=llava_position_embedding_ranks,
-        non_loss_data_func=run_online_eval
+        non_loss_data_func=run_online_eval,
     )

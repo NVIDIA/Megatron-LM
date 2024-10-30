@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import torch.nn.functional as F
 
 from megatron.core.transformer import TransformerConfig, MLATransformerConfig
+from megatron.core.utils import get_torch_version, is_torch_min_version
 
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
 # Allows for yaml to use environment variables
@@ -274,10 +275,8 @@ def validate_yaml(args, defaults={}):
         assert args.start_weight_decay is not None
         assert args.end_weight_decay is not None
 
-    TORCH_MAJOR = int(torch.__version__.split('.')[0])
-    TORCH_MINOR = int(torch.__version__.split('.')[1])
     # Persistent fused layer norm.
-    if TORCH_MAJOR < 1 or (TORCH_MAJOR == 1 and TORCH_MINOR < 11):
+    if not is_torch_min_version("1.11.0a0"):
         args.language_model.persist_layer_norm = False
         if args.rank == 0:
             print('Persistent fused layer norm kernel is supported from '
@@ -295,10 +294,10 @@ def validate_yaml(args, defaults={}):
         assert args.language_model.recompute_method is not None, \
             'for distributed recompute activations to work you '\
             'need to use a recompute method '
-        assert (TORCH_MAJOR, TORCH_MINOR) >= (1, 10), \
+        assert is_torch_min_version("1.10.0a0"), \
             'distributed recompute activations are supported for pytorch ' \
             'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
-            'pytorch version is v%s.%s.' % (TORCH_MAJOR, TORCH_MINOR)
+            f'pytorch version is v{get_torch_version()}.'
 
     if args.language_model.recompute_granularity == 'selective':
         assert args.language_model.recompute_method is None, \

@@ -8,29 +8,44 @@ from typing import List
 
 import torch
 
+from megatron.core.utils import is_torch_min_version
+
+if is_torch_min_version("1.13.0"):
+    dist_all_gather_func = torch.distributed.all_gather_into_tensor
+else:
+    dist_all_gather_func = torch.distributed._all_gather_base
+
 
 class TimerBase(ABC):
+    """Timer base class."""
+
     def __init__(self, name):
         self.name = name
 
     @abstractmethod
     def start(self, barrier=False):
+        """Start the timer."""
         pass
 
     @abstractmethod
     def stop(self, barrier=False):
+        """Stop the timer."""
         pass
 
     @abstractmethod
     def reset(self):
+        """Reset timer."""
         pass
 
     @abstractmethod
     def elapsed(self, reset=True, barrier=False):
+        """Calculates the elapsed time."""
         pass
 
 
 class DummyTimer(TimerBase):
+    """Dummy Timer."""
+
     def __init__(self):
         super().__init__('dummy timer')
 
@@ -140,6 +155,7 @@ class Timer(TimerBase):
         return _elapsed
 
     def active_time(self):
+        """Returns the active time."""
         return self._active_time
 
 
@@ -151,7 +167,8 @@ class Timers:
 
         Args:
             log_level (int): Log level to control what timers are enabled.
-            log_option (str): Setting for logging statistics over ranks for all the timers. Allowed: ['max', 'minmax', 'all'].
+            log_option (str): Setting for logging statistics over ranks for all the timers.
+                              Allowed: ['max', 'minmax', 'all'].
         """
         self._log_level = log_level
         allowed_log_options = set(['max', 'minmax', 'all'])
@@ -236,9 +253,7 @@ class Timers:
                 rank_name_to_time[rank, i] = self._timers[name].elapsed(reset=reset)
 
         # See the note above for why we are not using gather.
-        torch.distributed._all_gather_base(
-            rank_name_to_time.view(-1), rank_name_to_time[rank, :].view(-1)
-        )
+        dist_all_gather_func(rank_name_to_time.view(-1), rank_name_to_time[rank, :].view(-1))
 
         return rank_name_to_time
 
@@ -309,10 +324,13 @@ class Timers:
         """Returns the output string with logged timer values according to configured options.
 
         Args:
-            names (List[str]): Names of the timers to log. If None, all registered timers are fetched. Defaults to None.
-            normalizer (float, optional): Normalizes the timer values by the factor. Defaults to 1.0.
+            names (List[str]): Names of the timers to log. If None, all registered timers are
+                               fetched. Defaults to None.
+            normalizer (float, optional): Normalizes the timer values by the factor.
+                                          Defaults to 1.0.
             reset (bool, optional): Whether to reset timer values after logging. Defaults to True.
-            barrier (bool, optional): Whether to do a global barrier before time measurments. Defaults to False.
+            barrier (bool, optional): Whether to do a global barrier before time measurments.
+                                      Defaults to False.
 
         Raises:
             Exception: Raises if log option is invalid.
@@ -348,15 +366,19 @@ class Timers:
         reset: bool = True,
         barrier: bool = False,
     ):
-        """logs the timers passed in names to stdout. Example usage is to log average per step value for timer 'foo',
-          this function can be called with normalizer factor set to logging interval.
+        """logs the timers passed in names to stdout. Example usage is to log average per step
+           value for timer 'foo', this function can be called with normalizer factor set to logging
+           interval.
 
         Args:
             names (List[str]): Names of the timers to log.
-            rank (int, optional): logs the timers to a specific rank. If set to None, logs to the last rank. Defaults to None.
-            normalizer (float, optional): Normalizes the timer values by the factor. Defaults to 1.0.
+            rank (int, optional): logs the timers to a specific rank. If set to None, logs to the
+                                  last rank. Defaults to None.
+            normalizer (float, optional): Normalizes the timer values by the factor.
+                                          Defaults to 1.0.
             reset (bool, optional): Whether to reset timer values after logging. Defaults to True.
-            barrier (bool, optional): Whether to do a global barrier before time measurments. Defaults to False.
+            barrier (bool, optional): Whether to do a global barrier before time measurments.
+                                      Defaults to False.
         """
 
         output_string = self.get_all_timers_string(names, normalizer, reset, barrier)
@@ -375,15 +397,18 @@ class Timers:
         reset: bool = True,
         barrier: bool = False,
     ):
-        """Write timers to a tensorboard writer. Note that we only report maximum time across ranks to tensorboard.
+        """Write timers to a tensorboard writer. Note that we only report maximum time across ranks
+           to tensorboard.
 
         Args:
             names (List[str]): Names of the timers to log.
             writer (SummaryWriter): Tensorboard SummaryWriter object
             iteration (int): Current iteration.
-            normalizer (float, optional): Normalizes the timer values by the factor. Defaults to 1.0.
+            normalizer (float, optional): Normalizes the timer values by the factor.
+                                          Defaults to 1.0.
             reset (bool, optional): Whether to reset timer values after logging. Defaults to True.
-            barrier (bool, optional): Whether to do a global barrier before time measurments. Defaults to False.
+            barrier (bool, optional): Whether to do a global barrier before time measurments.
+                                      Defaults to False.
         """
         # currently when using add_scalars,
         # torch.utils.add_scalars makes each timer its own run, which
