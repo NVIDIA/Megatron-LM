@@ -110,15 +110,41 @@ It also solved the problem of incompatibility between checkpoints of different p
 With the new distributed checkpointing solution, MCore can achieve flexible parallelism configurations by saving and loading the unified format checkpoints.
 Compared to native PyTorch solution, MCore achieves up to 50x reduction in checkpointing overhead.
 
-With MCore v0.8, MoE supports Distributed Checkpointing, which means users can save and load with any combination of parallelism and it is currently available, including expert parallel.
-1. Loading weight and distributed optimizer states with TPxPPxEP resharding is supported in version 0.8.
-2. GroupedMLP is also supported, including the ability to switch between GroupedMLP/SequentialMLP when loading and saving.
-    - When switching between GroupedMLP and SequentialMLP, loading distributed optimizer states is currently unsupported; this feature will be added in version 0.9.
-Besides these limitations, Distributed Checkpointing is fully functional.
+From MCore v0.8, MoE supports Distributed Checkpointing, which means users can save and load with any combination of parallelism and it is currently available, including expert parallel.
+1. Loading weight and distributed optimizer states with TPxCPxEPxPP resharding with SequentialMLP is supported in version 0.8.
+2. GroupedMLP weight resharding is supported in version 0.8.0 and optimizer state resharding is supported in version 0.10.0. Switching between GroupedMLP/SequentialMLP when loading and saving is partially supported.
+3. TEGroupedMLP has fully support on distributed checkpointing and is fully exchangable with SequentialMLP in version 0.9.0.
+4. Optimizer state resharding cannot do across EP=1 with EP>1 due to the different optimizer type.
 
 Usage
-- `--use-dist-ckpt` The main argument, it will attempt to save and load using distributed checkpointing.
+- `--ckpt-format torch_dist` The main argument, it will attempt to save and load using distributed checkpointing.
 - `--auto-detect-ckpt-format` With this, it can load both distributed checkpointing and legacy checkpointing.
+
+Checkpoint compatibility across SequentialMLP, GroupedMLP, and TEGroupedMLP:
+```text
+    ┌───────────────┐          ┌───────────────┐          ┌───────────────┐     
+    │   GroupedMLP  │          │ SequentialMLP │          │ TEGroupedMLP  │     
+    │               │          │               │          │               │     
+    │               │          │               │          │               │     
+    │ ┌───────────┐ │          │ ┌───────────┐ │          │ ┌───────────┐ │     
+    │ │legacy ckpt│ │          │ │legacy ckpt│ │          │ │legacy ckpt│ │     
+    │ └─────┬─────┘ │          │ └─────┬─────┘ │          │ └─────┬─────┘ │     
+    │       ▼       │          │       ▼       │          │       ▼       │     
+    │  ┌─────────┐  │          │  ┌─────────┐  │          │  ┌─────────┐  │     
+    │  │dist ckpt│  │          │  │dist ckpt│  │          │  │dist ckpt│  │     
+┌──►│  │ weight  │  │◄────────►│  │ weight  │  │◄────────►│  │ weight  │  │◄──┐ 
+│   │  └─────────┘  │          │  └─────────┘  │          │  └─────────┘  │   │ 
+└───┼───────────────┼──────────┼───────────────┼──────────┼───────────────┼───┘ 
+    │┌─────────────┐│          │┌─────────────┐│          │┌─────────────┐│     
+    ││  dist ckpt  ││          ││  dist ckpt  ││          ││  dist ckpt  ││     
+    ││optim states ││          ││optim states ││◄────────►││optim states ││     
+    │└─────────────┘│          │└─────────────┘│          │└─────────────┘│     
+    └───────────────┘          └───────────────┘          └───────────────┘     
+```
+
+Best practices for distributed checkpointing:
+1. Convert a legacy checkpoint to a distributed checkpoint. To achieve this, we can add both `--ckpt-format torch_dist --auto-detect-ckpt-format`, then it will load the legacy one and save as the distributed checkpoint format later when the training progress tries to save checkpoints.
+2. Convert checkpoint of the legacy GroupedMLP to TEGroupedMLP. This is only supported for the weight parts. To achieve this, we can use the above method to convert the legacy checkpoint to a distributed checkpoint of the legacy GroupedMLP. After updating the libraries and using TEGroupedMLP, we can directly load the previously saved checkpoint by adding argument `--no-load-optim`.
 
 ### Shared Experts
 MCore v0.9 introduced the shared expert feature. We can enable this feature by setting suitable `--moe-shared-expert-intermediate-size`.

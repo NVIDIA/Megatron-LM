@@ -5,6 +5,7 @@ import logging
 import random
 import os
 import time
+import warnings
 
 import numpy as np
 import torch
@@ -22,7 +23,7 @@ from megatron.training.global_vars import set_global_variables
 from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
-from megatron.core.utils import get_te_version, is_te_min_version
+from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,7 @@ def initialize_megatron(
         _compile_dependencies()
 
         if args.tp_comm_overlap:
+            #TODO: Should this be activated with just decoder-tp-comm-overlap too?
            _initialize_tp_communicators()
 
         # No continuation function
@@ -210,7 +212,10 @@ def _initialize_tp_communicators():
     else:
        ub_cfgs = {}
 
-    input_shape = [(args.seq_length * args.micro_batch_size) // args.context_parallel_size , args.hidden_size]
+    if getattr(args, 'decoder_tp_comm_overlap', False):
+        input_shape = [(args.decoder_seq_length * args.micro_batch_size) // args.context_parallel_size , args.hidden_size]
+    else:
+        input_shape = [(args.seq_length * args.micro_batch_size) // args.context_parallel_size , args.hidden_size]
 
     if is_te_min_version("1.9.0"):
         # The process group with the target bootstrap backend is created in Transformer Engine.
@@ -320,7 +325,7 @@ def _set_random_seed(seed_, data_parallel_random_init=False):
         if torch.cuda.device_count() > 0:
             tensor_parallel.model_parallel_cuda_manual_seed(seed)
     else:
-        raise ValueError("Seed ({}) should be a positive integer.".format(seed))
+        raise ValueError("Seed ({}) should be a positive integer.".format(seed_))
 
 
 def write_args_to_tensorboard():
@@ -335,9 +340,9 @@ def write_args_to_tensorboard():
 def set_jit_fusion_options():
     """Set PyTorch JIT layer fusion options."""
     # flags required to enable jit fusion kernels
-    TORCH_MAJOR = int(torch.__version__.split(".")[0])
-    TORCH_MINOR = int(torch.__version__.split(".")[1])
-    if (TORCH_MAJOR > 1) or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10):
+    if is_torch_min_version("2.2.0a0"):
+        pass  # we're using torch.compile for jit fusion
+    elif is_torch_min_version("1.10.0a0"):
         # nvfuser
         torch._C._jit_set_profiling_executor(True)
         torch._C._jit_set_profiling_mode(True)

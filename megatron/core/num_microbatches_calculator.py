@@ -51,6 +51,16 @@ def update_num_microbatches(
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR.update(consumed_samples, consistency_check, verbose)
 
 
+def unset_num_microbatches_calculator():
+    """Unset microbatches calculator.
+
+    Useful for multiple runs. See `tests/unit_tests/ckpt_converter/test_ckpt_converter.py`
+    for an example.
+    """
+    global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
+    _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
+
+
 def init_num_microbatches_calculator(
     rank: int,
     rampup_batch_size: Optional[List[int]],

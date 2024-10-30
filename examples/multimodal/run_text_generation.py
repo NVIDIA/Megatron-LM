@@ -20,7 +20,6 @@ import numpy as np
 import torch
 import yaml
 from config import EvaluationConfig
-from dataset_helpers import tokenizer_image_token
 from image_processing import get_visual_transform
 from MMMU.mmmu.utils.data_utils import (
     CAT_SHORT2LONG,
@@ -35,7 +34,7 @@ from PIL import Image
 from torchvision.io import read_video
 
 from megatron.core import parallel_state
-from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN_INDEX
+from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.inference.text_generation.api import generate_and_post_process
 from megatron.inference.text_generation.forward_step import ForwardStep
@@ -70,14 +69,7 @@ def add_text_generation_args(parser):
     group.add_argument(
         "--num-samples-per-partition", type=int, default=0, help="Number of samples per partition"
     )
-    group.add_argument(
-        "--prompt-format",
-        type=str,
-        default="mistral",
-        choices=["llama3", "mistral"],
-        help="Prompting format to use",
-    )
-    group.add_argument("--config-path", type=str, help="Config file to use.")
+    group.add_argument("--config-path", type=str, help="Evaluation config file to use.")
 
     # Add common multimodal arguments needed for e.g. building the model.
     parser = add_multimodal_extra_args(parser)
@@ -622,11 +614,9 @@ def get_evaluation_dataloader(
     return dataloader
 
 
-def generate_samples(model, config: EvaluationConfig):
+def generate_samples(model, config: EvaluationConfig, print_output):
     """Text generation using a trained vision language model."""
     args = get_args()
-
-    rank = torch.distributed.get_rank()
 
     dataloader = get_evaluation_dataloader(
         config.task,
@@ -645,22 +635,22 @@ def generate_samples(model, config: EvaluationConfig):
     )
 
     num_img_embeddings_per_tile = get_num_image_embeddings(
-        args.img_h, args.img_w, args.patch_dim, args.disable_vision_class_token, 1
+        args.img_h, args.img_w, args.patch_dim, args.vision_model_type, args.disable_vision_class_token, 1
     )
 
     for idx, (imgs, num_tiles, sample_id, question, answers, metadata) in enumerate(dataloader):
         imgs = imgs.to("cuda")
         num_tiles = num_tiles.to("cuda")
 
-        prompt = get_prompt(config.task, question, config.prompt_format)
+        conv = get_conversation(config.task, question)
 
         forward_step = partial(VLMForwardStep, num_img_embeddings_per_tile, imgs, num_tiles)
 
-        if rank == 0:
+        if is_first_rank():
             resp_sentences, _, _, _ = generate_and_post_process(
                 model,
                 forward_step=forward_step,
-                prompts=[prompt],
+                prompts=[conv],
                 tokens_to_generate=config.out_seq_length,
                 top_k_sampling=config.top_k,
                 top_p_sampling=config.top_p,
@@ -668,13 +658,14 @@ def generate_samples(model, config: EvaluationConfig):
                 temperature=config.temperature,
                 random_seed=args.seed,
                 detokenize_segments=False,
+                data_parallel=True,
             )
 
-            for prompt, generation in zip([prompt], resp_sentences):
+            for generation in resp_sentences:
                 if isinstance(sample_id, torch.Tensor):
                     sample_id = sample_id.item()
 
-                output = {"sample_id": sample_id, "prompt": prompt}
+                output = {"sample_id": sample_id}
 
                 output_name = ""
                 if config.task == "captioning":
@@ -687,11 +678,14 @@ def generate_samples(model, config: EvaluationConfig):
                     output_name = "response"
                     output = question
 
-                generated = get_generated(generation, config.prompt_format)
+                prompt, generated = get_prompt_and_generated(
+                    generation, args.tokenizer_prompt_format
+                )
                 if config.task == "VideoMME":
                     output["questions"][0][output_name] = generated
                 else:
                     output[output_name] = generated
+                    output["prompt"] = prompt
 
                 if config.task == "captioning":
                     output["ground_truth"] = answers
@@ -708,12 +702,15 @@ def generate_samples(model, config: EvaluationConfig):
 
                     output["prediction"] = prediction
 
-                print_rank_0(output)
+                if print_output:
+                    print(output)
 
                 yield output
                 idx += 1
         else:
-            generate_and_post_process(model, forward_step=forward_step, detokenize_segments=False)
+            generate_and_post_process(
+                model, forward_step=forward_step, detokenize_segments=False, data_parallel=True
+            )
 
             idx += 1
 
@@ -739,7 +736,6 @@ def get_evaluation_config():
             num_partitions=args.num_partitions,
             partition_id=args.partition_id,
             num_samples_per_partition=args.num_samples_per_partition,
-            prompt_format=args.prompt_format,
         )
 
     # Default output path if not defined...
@@ -750,18 +746,36 @@ def get_evaluation_config():
     return config
 
 
-def generate_and_write_samples(model, config):
-    """Generate text and write to an output file."""
-    rank = torch.distributed.get_rank()
+def is_first_rank():
+    return (
+        parallel_state.is_pipeline_first_stage(ignore_virtual=True)
+        and parallel_state.get_tensor_model_parallel_rank() == 0
+    )
 
-    if rank == 0:
-        output_file = open(config.output_path, "w")
+
+def get_output_path(config, dp_rank):
+    return (
+        f"{config.output_path}-{config.task}-dprank={dp_rank}-partition={config.partition_id}.jsonl"
+    )
+
+
+def generate_and_write_samples(model, config, print_output=True):
+    """Generate text and write to an output file."""
+    dp_rank = parallel_state.get_data_parallel_rank()
+
+    if is_first_rank():
+        output_path = get_output_path(config, dp_rank)
+        output_file = open(output_path, "w")
         print(f"output path: {output_file.name}")
 
-    for output in generate_samples(model, config):
-        if rank == 0:
-            output_file.write(json.dumps(output) + "\n")
-            output_file.flush()
+    with torch.no_grad():
+        for output in generate_samples(model, config, print_output):
+            if is_first_rank():
+                output_file.write(json.dumps(output) + "\n")
+                output_file.flush()
+
+    if is_first_rank():
+        output_file.close()
 
 
 class VLMForwardStep(ForwardStep):
@@ -800,7 +814,7 @@ class VLMForwardStep(ForwardStep):
 
         # On the first inference iteration, we compute image tokens.
         # Update the sequence length offset by the number of image tokens.
-        num_image_tokens = (tokens == -200).sum().item()
+        num_image_tokens = (tokens == self.model.module.image_token_index).sum().item()
         num_tokens = tokens.size(1)
         if num_tokens > 1 and num_image_tokens > 0:
             self.inference_params.sequence_len_offset += (
@@ -810,48 +824,31 @@ class VLMForwardStep(ForwardStep):
         return logits
 
 
-def get_prompt(task, question, prompt_format):
-    """Get a prompt for the evaluation task."""
+def get_conversation(task, question):
+    conversation = []
+
+    # In all cases, the tokenizer adds possible header tokens for the assistant.
     if task == "captioning":
-        if prompt_format == "llama3":
-            prompt = "<|start_header_id|>system<|end_header_id|>\n\nA chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n<image>\nProvide a one-sentence caption for provided image.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-        elif prompt_format == "mistral":
-            prompt = (
-                "[INST] <image>Give a short and clear explanation of the subsequent image. [/INST]"
-            )
-    elif task == "TextVQA":
-        if prompt_format == "llama3":
-            prompt = "<|start_header_id|>system<|end_header_id|>\n\nAnswer the questions.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n<image>\n{}\nAnswer the question using a single word or phrase.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n".format(
-                question
-            )
-        elif prompt_format == "mistral":
-            prompt = "[INST] <image>\n{}\nAnswer the question using a single word or phrase. [/INST]".format(
-                question
-            )
-    elif task == "VQAv2":
-        if prompt_format == "llama3":
-            prompt = "<|start_header_id|>system<|end_header_id|>\n\nAnswer the questions.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n<image>\n{}\nAnswer the question using a single word or phrase.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n".format(
-                question
-            )
-        elif prompt_format == "mistral":
-            prompt = "[INST] <image>\n{}\nAnswer the question using a single word or phrase. [/INST]".format(
-                question
-            )
-    elif task == "ChartQA":
-        if prompt_format == "llama3":
-            prompt = "<|start_header_id|>system<|end_header_id|>\n\nAnswer the questions.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n<image>\n{}\nAnswer the question using a single word or phrase.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n".format(
-                question
-            )
-        elif prompt_format == "mistral":
-            prompt = "[INST] <image>\n{}\nAnswer the question using a single word or phrase. [/INST]".format(
-                question
-            )
+        conversation = [
+            {"role": "system", "content": "Answer the questions."},
+            {
+                "role": "user",
+                "content": "<image>Provide a one-sentence caption for provided image.",
+            },
+        ]
+    elif task in ("TextVQA", "VQAv2", "ChartQA"):
+        conversation = [
+            {"role": "system", "content": "Answer the questions."},
+            {
+                "role": "user",
+                "content": f"<image>\n{question}\nAnswer the question using a single word or phrase.",
+            },
+        ]
     elif task == "MMMU":
-        if prompt_format == "llama3":
-            prompt = "<|start_header_id|>system<|end_header_id|>\n\nAnswer the questions.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-            prompt = prompt.format(question)
-        elif prompt_format == "mistral":
-            prompt = "[INST] {} [/INST]".format(question)
+        conversation = [
+            {"role": "system", "content": "Answer the questions."},
+            {"role": "user", "content": question},
+        ]
     elif task == "VideoMME":
         q = (
             "Select the best answer to the following multiple-choice "
@@ -864,70 +861,50 @@ def get_prompt(task, question, prompt_format):
         q += question["questions"][0]["choices"][2] + "\n"
         q += question["questions"][0]["choices"][3] + "\n"
 
-        if prompt_format == "llama3":
-            prompt = "<|start_header_id|>system<|end_header_id|>\n\nAnswer the questions.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n<image>\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-            prompt = prompt.format(q)
-        elif prompt_format == "mistral":
-            prompt = "[INST] <image>\n{} [/INST]".format(q)
+        conversation = [
+            {"role": "system", "content": "Answer the questions."},
+            {"role": "user", "content": f"<image>\n{question}"},
+        ]
 
-    return prompt
+    return conversation
 
 
-def get_generated(prompt_and_generation, prompt_format):
+def get_prompt_and_generated(prompt_and_generation, prompt_format):
     """Strip prompt and other unnecessary text from generation."""
     if prompt_format == "llama3":
-        generated = prompt_and_generation.split(
-            "<|start_header_id|>assistant<|end_header_id|>\n\n"
-        )[-1]
+        splitted = prompt_and_generation.split("<|start_header_id|>assistant<|end_header_id|>\n\n")
+        prompt = splitted[0]
+        generated = splitted[1]
         generated = generated.split("<|eot_id|>")[0]
     elif prompt_format == "mistral":
-        generated = prompt_and_generation.split("[/INST]")[-1]
+        splitted = prompt_and_generation.split("[/INST]")
+        prompt = splitted[0]
+        generated = splitted[1]
         generated = generated.split("</s>")[0]
+    elif prompt_format == "chatml":
+        splitted = prompt_and_generation.split("<|im_start|> assistant\n")
+        prompt = splitted[0]
+        generated = splitted[1]
+        generated = generated.split("<|im_end|>")[0]
 
+    # Remove possible garbage.
     generated = generated.strip()
     generated = generated.split("\n\n")[0]
     generated = generated.split("\n")[0]
 
-    return generated
-
-
-def patch_tokenizer(args):
-    """Patch tokenizer with image token support."""
-
-    def _decorate_tokenize(f):
-        # When tokenizing, replace <image> with the image token index (-200)
-        def wrapper(prompt):
-            tokens = tokenizer_image_token(args, prompt, f)
-
-            return tokens
-
-        return wrapper
-
-    def _decorate_detokenize(f):
-        # When detokenizing, skip image token index.
-        def wrapper(tokens):
-            tokens = np.array(tokens)
-            tokens = tokens[tokens != IMAGE_TOKEN_INDEX]
-            tokens = tokens.tolist()
-
-            return f(tokens)
-
-        return wrapper
-
-    tokenizer = get_tokenizer()
-    tokenizer.tokenize = _decorate_tokenize(tokenizer.tokenize)
-    tokenizer.detokenize = _decorate_detokenize(tokenizer.detokenize)
+    return prompt, generated
 
 
 def main():
     """Vision language model text generation."""
-    logging.getLogger(__name__).warning("Models using pipeline parallelism are not supported yet.")
-
     initialize_megatron(extra_args_provider=add_text_generation_args)
 
-    args = get_args()
+    if torch.distributed.get_rank() == 0:
+        logging.getLogger(__name__).warning(
+            "Models using pipeline parallelism are not supported yet."
+        )
 
-    patch_tokenizer(args)  # Make the tokenizer support image tokens.
+    args = get_args()
 
     def wrapped_model_provider(pre_process, post_process):
         return model_provider(pre_process, post_process, parallel_output=False)

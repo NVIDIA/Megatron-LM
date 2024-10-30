@@ -1,16 +1,13 @@
 import argparse
-import glob
 import json
 
+from evaluate_mmmu import get_input_output_paths
 from open_flamingo.eval.vqa_metric import VQAEval
 
 
 def merge_input_files(input_path):
     """Merge input files to a format compatible with the evaluator."""
-    output_file_path = input_path + "-VQAv2-merged.json"
-
-    pattern = input_path + "-VQAv2-[0-9].*jsonl"
-    input_file_paths = glob.glob(pattern)
+    input_file_paths, output_file_path = get_input_output_paths(input_path, task="VQAv2")
 
     results = []
 
@@ -29,6 +26,7 @@ def merge_input_files(input_path):
 
 
 def is_number(n: str):
+    """Check if input is a number."""
     try:
         float(n)
         return True
@@ -53,7 +51,7 @@ def compute_vqa_accuracy(result_file, use_chartqa_metric=False):
 
         # ChartQA uses relaxed accuracy:
         # "We consider an answer to be correct if it is within 5% of the gold answer.
-        #  For non-numeric answers, we still need an exact match to consider an answer to be correct."
+        # For non-numeric answers, we still need an exact match to consider an answer to be correct."
         if use_chartqa_metric:
             acc = 0.0
             assert len(gt) == 1, "expected exactly one groundtruth answer."

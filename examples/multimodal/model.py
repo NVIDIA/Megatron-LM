@@ -6,9 +6,9 @@ import torch
 from config import get_language_model_config, get_vision_model_config, get_vision_projection_config
 from layer_specs import get_layer_spec, get_layer_spec_te, get_mlp_module_spec
 
-from megatron.core.models.multimodal.llava_model import LLaVAModel
+from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN, LLaVAModel
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
-from megatron.training import get_args, print_rank_0
+from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 
 
@@ -139,6 +139,8 @@ def model_provider(
         img_w=args.img_w,
         patch_dim=args.patch_dim,
         language_rotary_base=args.rotary_base,
+        language_rope_scaling=args.use_rope_scaling,
+        image_token_index=get_tokenizer().convert_tokens_to_ids(IMAGE_TOKEN),
     )
 
     model.freeze(

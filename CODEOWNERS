@@ -41,7 +41,9 @@ megatron/core/inference/
 ; 
 
 [CI] @mcore-reviewers/ci
+.gitlab/
+.github/
 .gitlab-ci.yml
-Dockerfile.ci
-jet-tests.yml
+Dockerfile.ci.lts
+Dockerfile.ci.dev
 tests/

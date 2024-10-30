@@ -1,7 +1,7 @@
 include:
   - template: Security/Secret-Detection.gitlab-ci.yml
 
-.pre_mr_rules:
+.pre_rules:
   rules:
     - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
@@ -10,7 +10,16 @@ include:
     - when: never
   stage: .pre
 
-mirror_to_github:
+.dind_rules:
+  image: docker:26.1.4-dind
+  variables:
+    DOCKER_HOST: unix:///var/run/docker.sock
+  before_script:
+    - docker system prune -a --filter "until=36h" -f || true
+    - echo "$NGC_API_KEY" | docker login nvcr.io -u '$oauthtoken' --password-stdin
+    - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
+
+pre:mirror_to_github:
   rules:
     - if: '$CI_COMMIT_REF_PROTECTED == "true" && $CI_PIPELINE_SOURCE == "push"'
     - when: never
@@ -24,7 +33,7 @@ mirror_to_github:
     - git remote add github https://ko3n1g:$GH_TOKEN@github.com/NVIDIA/Megatron-LM.git || true
     - git push -u github $CI_COMMIT_BRANCH
 
-create_ci_branches:
+pre:create_ci_branches:
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
     - when: never
@@ -32,10 +41,9 @@ create_ci_branches:
     matrix:
       - branch: ci-unit-test-extended
       - branch: ci-rebuild-mcore-nemo-image
-      - branch: ci-mr-a100
-      - branch: ci-nightly-a100
-      - branch: ci-weekly-a100
-      - branch: ci-weekly-h100
+      - branch: ci-mr
+      - branch: ci-nightly
+      - branch: ci-weekly
       - branch: ci-pre-release
   tags: [mcore-docker-node-small]
   stage: .pre
@@ -47,8 +55,8 @@ create_ci_branches:
     - git switch --force-create $branch
     - git push --force -u origin $branch
 
-label_merge_request:
-  extends: [.pre_mr_rules]
+pre:label_merge_request:
+  extends: [.pre_rules]
   image: golang:1.22
   tags:
     - mcore-docker-node-small
@@ -67,21 +75,7 @@ label_merge_request:
       source labels
       curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}" --data-urlencode "add_labels=$LABELS" -X PUT
 
-clean_docker_node:
-  extends: [.pre_mr_rules]
-  image: docker:26.1.4-dind
-  tags: 
-    - ${node}
-  parallel:
-    matrix:
-      - node: 8xL40S
-      - node: mcore-docker-node-small
-      - node: mcore-docker-node-jet
-  script:
-    - export DOCKER_HOST='unix:///var/run/docker.sock'
-    - docker system prune -a --filter "until=36h" -f || true
-
-maybe_cherry_pick_commit:
+pre:maybe_cherry_pick_commit:
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
     - when: never
@@ -155,7 +149,7 @@ maybe_cherry_pick_commit:
                 "type": "section",
                 "text": {
                   "type": "mrkdwn",
-                  "text": ":alert: Cherrypick bot 🤖: Cherry-pick of <'$URL'|!'$MR_ID'> failed"
+                  "text": ":alert: Cherrypick bot 🤖: Cherry-pick of <'$URL'|!'$MR_ID'> failed\ncc '$SLACK_ADMIN'"
                 }
               }
             ]
@@ -168,11 +162,10 @@ maybe_cherry_pick_commit:
       done
   interruptible: false
 
-check_milestone:
-  extends: [.pre_mr_rules]
+pre:check_milestone:
+  extends: [.pre_rules]
   image: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_ci:buildcache
-  tags:
-    - mcore-docker-node-small
+  tags: [mcore-docker-node-small]
   script:
     - env
     - |

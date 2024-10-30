@@ -13,18 +13,36 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state
+from megatron.core.utils import is_te_min_version
 
 logger = logging.getLogger(__name__)
 
 try:
-    from apex.transformer.functional import (
+    from megatron.core.extensions.transformer_engine import (
         fused_apply_rotary_pos_emb,
         fused_apply_rotary_pos_emb_thd,
     )
 
     HAVE_APPLY_ROPE_FUSION = True
 except ImportError:
-    HAVE_APPLY_ROPE_FUSION = False
+    try:
+        from apex.transformer.functional import (
+            fused_apply_rotary_pos_emb,
+            fused_apply_rotary_pos_emb_thd,
+        )
+
+        HAVE_APPLY_ROPE_FUSION = True
+    except ImportError:
+        HAVE_APPLY_ROPE_FUSION = False
+
+
+try:
+    from flash_attn.layers.rotary import apply_rotary_emb as apply_rotary_emb_flash
+except ImportError:
+    apply_rotary_emb_flash = None
+
+
+__all__ = ['apply_rotary_emb_flash']
 
 
 def get_pos_emb_on_this_cp_rank(pos_emb: Tensor, seq_dim: int) -> Tensor:
@@ -103,6 +121,20 @@ def _apply_rotary_pos_emb_bshd(
     return torch.cat((t, t_pass), dim=-1)
 
 
+def _get_thd_freqs_on_this_cp_rank(cp_rank: int, cp_size: int, x: Tensor, freqs: Tensor) -> Tensor:
+    if cp_size > 1:
+        cp_seg = x.size(0) // 2
+        full_seqlen = cp_size * x.size(0)
+        return torch.cat(
+            [
+                freqs[cp_rank * cp_seg : (cp_rank + 1) * cp_seg],
+                freqs[full_seqlen - (cp_rank + 1) * cp_seg : full_seqlen - cp_rank * cp_seg],
+            ]
+        )
+    else:
+        return freqs[: x.size(0)]
+
+
 def _apply_rotary_pos_emb_thd(
     t: Tensor,
     cu_seqlens: Tensor,
@@ -123,12 +155,16 @@ def _apply_rotary_pos_emb_thd(
         Tensor: Shape [t, h, d]. The input tensor after applying RoPE.
     """
 
+    cp_size = parallel_state.get_context_parallel_world_size()
+    cp_rank = parallel_state.get_context_parallel_rank()
+    cu_seqlens = cu_seqlens // cp_size
     seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+
     return torch.cat(
         [
             _apply_rotary_pos_emb_bshd(
                 x.unsqueeze(1),
-                freqs[: x.size(0)],
+                _get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs),
                 rotary_interleaved=rotary_interleaved,
                 multi_latent_attention=multi_latent_attention,
                 mscale=mscale,
@@ -149,28 +185,24 @@ def apply_rotary_pos_emb(
     Reroute to the appropriate apply_rotary_pos_emb function depending on
     fused/unfused kernels, or bshd (conventional) / thd (packed seq) format
     """
-    if config.apply_rope_fusion and not HAVE_APPLY_ROPE_FUSION:
-        # setting apply_rope_fusion in config to False
-        # so that subsequent queries to this config also return False
-        config.apply_rope_fusion = False
-        if not getattr(apply_rotary_pos_emb, "printed_fused_warning", False):
-            logger.warning(
-                "Setting apply_rope_fusion to false because its implementation"
-                " is not included in Apex. Try upgrading to the latest version"
-            )
-            apply_rotary_pos_emb.printed_fused_warning = True
-
-    if getattr(config, "multi_latent_attention", False) and config.rotary_interleaved:
-        logger.warning(
-            "rotary_interleaved is not supported with multi_latent_attention, setting it to False"
-        )
-        config.rotary_interleaved = False
 
     if config.apply_rope_fusion:
         if cu_seqlens is None:
-            return fused_apply_rotary_pos_emb(t, freqs, transpose_output_memory=True)
+            return fused_apply_rotary_pos_emb(t, freqs)
         else:
-            return fused_apply_rotary_pos_emb_thd(t, cu_seqlens, freqs)
+            cp_size = parallel_state.get_context_parallel_world_size()
+            if cp_size > 1:
+                if not is_te_min_version("1.11.0", check_equality=False):
+                    raise ValueError("Only TE >= 1.12 supports RoPE fusion for THD format with CP.")
+                return fused_apply_rotary_pos_emb_thd(
+                    t,
+                    cu_seqlens,
+                    freqs,
+                    cp_size=cp_size,
+                    cp_rank=parallel_state.get_context_parallel_rank(),
+                )
+            else:
+                return fused_apply_rotary_pos_emb_thd(t, cu_seqlens, freqs)
     else:
         if cu_seqlens is None:
             return _apply_rotary_pos_emb_bshd(
@@ -189,3 +221,38 @@ def apply_rotary_pos_emb(
                 multi_latent_attention=config.multi_latent_attention,
                 mscale=mscale,
             )
+
+
+def apply_rotary_pos_emb_with_cos_sin(
+    t: Tensor, cos: Tensor, sin: Tensor, rotary_interleaved: bool = False
+) -> Tensor:
+    """
+    This function applies rotary positional embedding to the target tensor t
+    using precomputed cos and sin of size (seq_len, d_rot / 2)
+    """
+    cos = cos.to(t.dtype)
+    sin = sin.to(t.dtype)
+
+    if apply_rotary_emb_flash is None:
+        # Combine cos and sin into freqs
+        freqs = torch.stack([cos, sin], dim=-1).flatten(start_dim=-2)
+
+        # Expand freqs to match t's shape
+        while freqs.dim() < t.dim():
+            freqs = freqs.unsqueeze(1)
+        freqs = freqs.expand(t.shape[:-1] + (-1,))
+
+        y = _apply_rotary_pos_emb_bshd(
+            t,
+            freqs,
+            rotary_interleaved=rotary_interleaved,
+            multi_latent_attention=False,
+            mscale=1.0,
+        )
+    else:
+        # Use Flash Attention's optimized kernel for rotary embedding
+        t = t.permute(1, 0, 2, 3)
+        y = apply_rotary_emb_flash(t, cos, sin, rotary_interleaved)
+        y = y.permute(1, 0, 2, 3)
+
+    return y

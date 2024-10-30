@@ -92,8 +92,9 @@ OPTIONS=" \
     --log-interval ${LI} \
     --eval-iters 10 \
     --eval-interval 1000 \
-    --tokenizer-type HuggingFaceTokenizer \
+    --tokenizer-type MultimodalTokenizer \
     --tokenizer-model ${WORKSPACE}/${TOKENIZER_MODEL} \
+    --tokenizer-prompt-format mistral \
     --data-path ${DATA_TRAIN} \
     --prompt-path ${SOURCE}/examples/multimodal/manual_prompts.json \
     --save-interval 1000 \

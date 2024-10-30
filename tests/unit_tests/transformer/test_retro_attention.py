@@ -2,6 +2,7 @@
 
 import types
 
+import pytest
 import torch
 
 from megatron.core.models.retro import RetroConfig, get_retro_decoder_block_spec

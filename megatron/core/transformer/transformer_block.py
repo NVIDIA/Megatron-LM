@@ -289,6 +289,7 @@ class TransformerBlock(MegatronModule):
             return custom_forward
 
         def checkpoint_handler(forward_func):
+            """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
             if self.config.fp8:
                 return te_checkpoint(
                     forward_func,
@@ -395,6 +396,8 @@ class TransformerBlock(MegatronModule):
         context: Tensor = None,
         context_mask: Tensor = None,
         rotary_pos_emb: Tensor = None,
+        rotary_pos_cos: Tensor = None,
+        rotary_pos_sin: Tensor = None,
         inference_params: InferenceParams = None,
         packed_seq_params: PackedSeqParams = None,
     ):
@@ -496,6 +499,8 @@ class TransformerBlock(MegatronModule):
                                 context=context,
                                 context_mask=context_mask,
                                 rotary_pos_emb=rotary_pos_emb,
+                                rotary_pos_cos=rotary_pos_cos,
+                                rotary_pos_sin=rotary_pos_sin,
                                 inference_params=inference_params,
                                 packed_seq_params=packed_seq_params,
                             )

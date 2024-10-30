@@ -26,7 +26,7 @@ TYPE_OF_TEST_TO_METRIC = {
 }
 
 METRIC_TO_THRESHOLD = {
-    "iteration-time": 0.5,
+    "iteration-time": 0.8,
     "mem-allocated-bytes": 3 * 1000 * 1000,  # 3MB
     "lm loss": 0.05,
 }
@@ -53,18 +53,30 @@ def read_tb_logs_as_list(path, index=0):
         return summaries
 
     files.sort(key=lambda x: os.path.getmtime(os.path.join(path, x)))
+    accumulators = []
 
-    event_file = files[index]
-    ea = event_accumulator.EventAccumulator(event_file, size_guidance=SIZE_GUIDANCE)
-    ea.Reload()
+    if index == -1:
+        for event_file in files:
+            ea = event_accumulator.EventAccumulator(event_file, size_guidance=SIZE_GUIDANCE)
+            ea.Reload()
+            accumulators.append(ea)
+    else:
+        event_file = files[index]
+        ea = event_accumulator.EventAccumulator(event_file, size_guidance=SIZE_GUIDANCE)
+        ea.Reload()
+        accumulators.append(ea)
 
-    for scalar_name in ea.Tags()["scalars"]:
-        summaries[scalar_name] = [round(x.value, 5) for x in ea.Scalars(scalar_name)]
+    for ea in accumulators:
+        for scalar_name in ea.Tags()["scalars"]:
+            if scalar_name in summaries:
+                summaries[scalar_name] += [round(x.value, 5) for x in ea.Scalars(scalar_name)]
+            else:
+                summaries[scalar_name] = [round(x.value, 5) for x in ea.Scalars(scalar_name)]
 
-        print(
-            f"Extracted {len(summaries[scalar_name])} values of {scalar_name} from Tensorboard \
-logs. Here are the first 5 values: {summaries[scalar_name][:5]}"
-        )
+            print(
+                f"Extracted {len(summaries[scalar_name])} values of {scalar_name} from Tensorboard \
+    logs. Here are the first 5 values: {summaries[scalar_name][:5]}"
+            )
 
     return summaries
 

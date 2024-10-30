@@ -63,7 +63,7 @@ END=0
 
 for PARTITION_ID in $( eval echo {$START..$END} )
 do
-    torchrun --nproc_per_node 4 examples/multimodal/run_text_generation.py \
+    torchrun --nproc_per_node 8 examples/multimodal/run_text_generation.py \
         --apply-layernorm-1p \
         --attention-softmax-in-fp32 \
         --use-flash-attn \
@@ -91,8 +91,9 @@ do
         --max-position-embeddings 4096 \
         --no-masked-softmax-fusion \
         --load ${MODEL_PATH} \
-        --tokenizer-type HuggingFaceTokenizer \
+        --tokenizer-type MultimodalTokenizer \
         --tokenizer-model ${TOKENIZER_PATH} \
+        --tokenizer-prompt-format mistral \
         --bf16 \
         --micro-batch-size 1 \
         --seq-length 2048 \
@@ -108,10 +109,9 @@ do
         --input-image-path ${INPUT_IMAGE_PATH} \
         --num-partitions ${NUM_PARTITIONS} \
         --partition-id ${PARTITION_ID} \
-        --output-path ${OUTPUT_PATH}-${TASK}-${PARTITION_ID}.jsonl \
+        --output-path ${OUTPUT_PATH} \
         --gt-path ${GROUNDTRUTH_PATH} \
         --task ${TASK} \
         --disable-vision-class-token \
-        --prompt-format mistral \
         --num-frames ${NUM_FRAMES}
 done

@@ -11,7 +11,8 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.multimodal_dataset import MockMultimodalDataset, MultimodalDatasetConfig
 from megatron.core.enums import ModelType
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
-from megatron.core.models.multimodal.llava_model import LLaVAModel, IMAGE_TOKEN_INDEX
+from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.models.multimodal.llava_model import LLaVAModel, DEFAULT_IMAGE_TOKEN_INDEX
 from megatron.core.models.multimodal.llava_spec import (
     decoder_model_with_transformer_engine_default_spec,
     decoder_model_with_local_default_spec,
@@ -53,8 +54,12 @@ def model_provider(
     )
 
     old_seq_length = args.seq_length
+    # dataloader-seq-length is required to determine the length of text seq len
+    if args.dataloader_seq_length is None:
+        args.dataloader_seq_length = args.seq_length
+
     # decoder_seq_length denotes the language model sequence length.
-    args.decoder_seq_length = args.seq_length + num_image_embeddings
+    decoder_seq_len = args.seq_length + num_image_embeddings
 
     # seq_length and encoder_seq_length denote the vision model sequence length. Override if the user provided something else.
     args.seq_length = args.encoder_seq_length = num_image_embeddings
@@ -62,11 +67,34 @@ def model_provider(
         warnings.warn(
             f"Changed seq_length and encoder_seq_length (vision model sequence length) from {old_seq_length} to num_image_tokens ({num_image_embeddings})"
         )
+    #Padding to multiple of 64 when using sequence parallel
+    sp_padding_needed = 0
+    tp_size = args.tensor_model_parallel_size
+    if args.sequence_parallel:
+        assert args.transformer_impl == "transformer_engine", \
+            "TransformerEngine is needed to support Sequence Parallelism implementation"
+        if not args.decoder_tp_comm_overlap:
+            args.decoder_seq_length = decoder_seq_len
+            sp_padding_needed = int((args.decoder_seq_length + (tp_size-1)) // tp_size * tp_size) - args.decoder_seq_length
+            if sp_padding_needed > 0:
+                args.decoder_seq_length += sp_padding_needed
+        else:
+            # If TP Comm Overlap is enabled for LM backbone,
+            # user needs to provide decoder_seq_length with any potential padding needed
+            assert args.decoder_seq_length is not None, \
+                "Please provide --decoder-seq-length when using TP Comm overlap for LM backbone"
+            sp_padding_needed = args.decoder_seq_length - decoder_seq_len
+    else:
+        args.decoder_seq_length = decoder_seq_len
 
     args.max_position_embeddings = max(args.max_position_embeddings, args.decoder_seq_length)
 
     print_rank_0('building a multimodal model ...')
     language_transformer_config = core_transformer_config_from_args(get_args())
+    if args.decoder_tp_comm_overlap:
+        assert args.transformer_impl == "transformer_engine", \
+            "TransformerEngine is needed to support Decoder TP Comm overlap"
+        language_transformer_config.tp_comm_overlap = args.decoder_tp_comm_overlap
 
     if args.spec is not None:
         language_transformer_layer_spec = import_module(args.spec)
@@ -79,6 +107,12 @@ def model_provider(
             args.num_experts, args.moe_grouped_gemm
         )
 
+    if sp_padding_needed > 0:
+        if language_transformer_layer_spec.submodules.self_attention.params.get('attn_mask_type', '') == AttnMaskType.causal:
+            language_transformer_layer_spec.submodules.self_attention.params['attn_mask_type'] = AttnMaskType.padding_causal
+        elif language_transformer_layer_spec.submodules.self_attention.params.get('attn_mask_type', '') == AttnMaskType.no_mask:
+            language_transformer_layer_spec.submodules.self_attention.params['attn_mask_type'] = AttnMaskType.padding
+
     if args.transformer_impl == "transformer_engine":
         vision_transformer_layer_spec = get_vit_layer_with_transformer_engine_spec()
     else:  # transformer_impl == "local"
@@ -90,9 +124,21 @@ def model_provider(
     vision_transformer_config.first_pipeline_num_layers = None
     vision_transformer_config.last_pipeline_num_layers = None
     vision_transformer_config.vision_model_type = vision_model_type
+    if vision_transformer_config.sequence_parallel:
+        print_rank_0("> Disabling Sequence parallelism in Vision Transformer. Not yet supported")
+        vision_transformer_config.sequence_parallel = False
+    if vision_transformer_config.tp_comm_overlap:
+        print_rank_0("> Disabling TP Comm overlap in Vision Transformer. Not yet supported")
+        vision_transformer_config.tp_comm_overlap = False
 
     vision_projection_type = "mlp"
     vision_projection_config = deepcopy(language_transformer_config)
+    if vision_projection_config.sequence_parallel:
+        print_rank_0("> Disabling Sequence parallelism in Vision Projection. Not yet supported")
+        vision_projection_config.sequence_parallel = False
+    if vision_projection_config.tp_comm_overlap:
+        print_rank_0("> Disabling TP Comm overlap in Vision Projection. Not yet supported")
+        vision_projection_config.tp_comm_overlap = False
 
     if args.encoder_pipeline_model_parallel_size > 0:
         assert (
@@ -121,7 +167,7 @@ def model_provider(
         language_transformer_config=language_transformer_config,
         language_transformer_layer_spec=language_transformer_layer_spec,
         language_vocab_size=args.padded_vocab_size,
-        language_max_sequence_length=args.max_position_embeddings,
+        language_max_sequence_length=args.decoder_seq_length,
         vision_transformer_config=vision_transformer_config,
         vision_transformer_layer_spec=vision_transformer_layer_spec,
         drop_vision_class_token=args.disable_vision_class_token,
@@ -164,7 +210,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     config = MultimodalDatasetConfig(
         random_seed=args.seed,
         split=args.split,
-        sequence_length=args.decoder_seq_length - args.seq_length,
+        sequence_length=args.dataloader_seq_length,
         tokenizer=get_tokenizer(),
         reset_position_ids=args.reset_position_ids,
         reset_attention_mask=args.reset_attention_mask,
@@ -202,7 +248,7 @@ def _preprocess_data_for_llava(data):
     # Prepend image token index to tokens.
     data["tokens"] = torch.cat(
         [
-            IMAGE_TOKEN_INDEX
+            DEFAULT_IMAGE_TOKEN_INDEX
             * torch.ones(1, dtype=data["tokens"].dtype, device=data["tokens"].device),
             data["tokens"],
         ]
@@ -292,6 +338,10 @@ def add_vlm_extra_args(parser):
         default=False,
         help="Drop vision model class token",
     )
+    group.add_argument("--dataloader-seq-length", type=int, help="Make dataloader to produce sequences of specific length.")
+    group.add_argument("--decoder-tp-comm-overlap", action="store_true", default=False, help="Enables the overlap of "
+                        "Tensor parallel communication and GEMM kernels in Decoder only. "
+                        "Please provide decoder-seq-length when using this feature.")
     return parser
 
 

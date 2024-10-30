@@ -214,7 +214,7 @@ def pretrain(
         1) initialize Megatron.
         2) setup model, optimizer and lr schedule using the model_provider.
         3) call train_val_test_data_provider to get train/val/test datasets.
-        4) train the modle using the forward_step_func.
+        4) train the model using the forward_step_func.
 
     Args:
         train_valid_test_dataset_provider: a function that takes the size of
@@ -277,9 +277,6 @@ def pretrain(
         time.time() - _TRAIN_START_TIME))
     print_datetime('after megatron is initialized')
     app_metrics['app_model_init_finish_time'] = one_logger_utils.get_timestamp_in_ms()
-
-    args = get_args()
-    timers = get_timers()
 
     # Track E2E metrics on pretrain start
     one_logger_utils.on_pretrain_start()
@@ -1065,6 +1062,18 @@ def compute_throughputs_and_append_to_progress_log(iteration,
                            f"Tokens (in billions): {tokens_so_far / 10**9:.2f}")
 
 
+def enable_forward_pre_hook(model_chunks):
+    for model_chunk in model_chunks:
+        assert isinstance(model_chunk, DDP)
+        model_chunk.enable_forward_pre_hook()
+
+
+def disable_forward_pre_hook(model_chunks):
+    for model_chunk in model_chunks:
+        assert isinstance(model_chunk, DDP)
+        model_chunk.disable_forward_pre_hook()
+
+
 def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
                              num_floating_point_operations_so_far, checkpointing_context,
                              non_persistent_ckpt=False, train_data_iterator=None):
@@ -1081,14 +1090,14 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
     # Log E2E metrics before save-checkpoint
     one_logger_utils.track_e2e_metrics()
     if args.use_distributed_optimizer and args.overlap_param_gather:
-        optimizer.disable_pre_hook()
+        disable_forward_pre_hook(model)
     save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
                     num_floating_point_operations_so_far, checkpointing_context,
                     non_persistent_ckpt=non_persistent_ckpt, train_data_iterator=train_data_iterator,
                     ft_client=ft_integration.get_rank_monitor_client(
                         ft_integration.StateMachineActions.SAVE_CHECKPOINT))
     if args.use_distributed_optimizer and args.overlap_param_gather:
-        optimizer.enable_pre_hook()
+        enable_forward_pre_hook(model)
     timers(timer_key).stop(barrier=True)
     timers.log([timer_key])
     save_checkpoint_finish_time = timers('save-checkpoint').active_time()
@@ -1317,13 +1326,13 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if args.check_weight_hash_across_dp_replicas_interval is not None and \
                 iteration % args.check_weight_hash_across_dp_replicas_interval == 0:
             if args.use_distributed_optimizer and args.overlap_param_gather:
-                optimizer.disable_pre_hook()
+                disable_forward_pre_hook(model)
             assert check_param_hashes_across_dp_replicas(model, cross_check=True), \
                 "Parameter hashes not matching across DP replicas"
             torch.distributed.barrier()
             print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
             if args.use_distributed_optimizer and args.overlap_param_gather:
-                optimizer.enable_pre_hook()
+                enable_forward_pre_hook(model)
 
         # Autoresume
         if args.adlr_autoresume and \
@@ -1336,7 +1345,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
            args.do_valid:
             timers('interval-time').stop()
             if args.use_distributed_optimizer and args.overlap_param_gather:
-                optimizer.disable_pre_hook()
+                disable_forward_pre_hook(model)
             if args.manual_gc and args.manual_gc_eval:
                 # Collect all objects.
                 gc.collect()
@@ -1356,7 +1365,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 # Collect only the objects created and used in evaluation.
                 gc.collect(generation=0)
             if args.use_distributed_optimizer and args.overlap_param_gather:
-                optimizer.enable_pre_hook()
+                enable_forward_pre_hook(model)
             timers('interval-time', log_level=0).start(barrier=True)
 
 
@@ -1449,7 +1458,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if args.use_distributed_optimizer and args.overlap_param_gather:
-        optimizer.disable_pre_hook()
+        disable_forward_pre_hook(model)
 
     if args.enable_ft_package and ft_integration.get_rank_monitor_client() is not None:
         ft_integration.get_rank_monitor_client().shutdown_workload_monitoring()

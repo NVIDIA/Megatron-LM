@@ -13,8 +13,9 @@ import torch
 from packaging.version import Version as PkgVersion
 from torch.distributed import checkpoint
 from torch.distributed._shard.metadata import ShardMetadata
-from torch.distributed._shard.sharded_tensor import Shard, ShardedTensorMetadata, TensorProperties
-from torch.distributed._sharded_tensor import ShardedTensor as TorchShardedTensor
+from torch.distributed._shard.sharded_tensor import Shard
+from torch.distributed._shard.sharded_tensor import ShardedTensor as TorchShardedTensor
+from torch.distributed._shard.sharded_tensor import ShardedTensorMetadata, TensorProperties
 from torch.distributed._tensor import DTensor
 from torch.distributed.checkpoint import (
     BytesStorageMetadata,
@@ -510,6 +511,11 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
 
     def _validate_global_shapes(self, metadata, sharded_tensors):
         for sh_ten in sharded_tensors:
+            if sh_ten.key not in metadata.state_dict_metadata:
+                raise KeyError(
+                    f"{sh_ten.key} from model not in state dict:"
+                    f" {sorted(metadata.state_dict_metadata.keys())}"
+                )
             loaded_shape = metadata.state_dict_metadata[sh_ten.key].size
             if not is_nd_flattened_tensor(sh_ten):
                 expected_shape = sh_ten.global_shape

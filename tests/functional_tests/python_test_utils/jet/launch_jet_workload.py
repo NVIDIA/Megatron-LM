@@ -4,10 +4,12 @@ import re
 import signal
 import sys
 import tempfile
+import time
 from typing import List, Optional, Tuple
 
 import click
 import jetclient
+import requests
 import yaml
 from jetclient.services.dtos.pipeline import PipelineStatus
 
@@ -41,6 +43,9 @@ def register_pipeline_terminator(pipeline: jetclient.JETPipeline):
 
 def launch_and_wait_for_completion(
     test_case: str,
+    environment: str,
+    n_repeat: int,
+    time_limit: int,
     container_image: str,
     container_tag: str,
     cluster: str,
@@ -52,7 +57,12 @@ def launch_and_wait_for_completion(
         customer='mcore', gitlab_ci_token=os.getenv("RO_API_TOKEN"), env="prod"
     ).workloads.submit(
         workloads=common.load_workloads(
-            test_case=test_case, container_image=container_image, container_tag=container_tag
+            test_case=test_case,
+            n_repeat=n_repeat,
+            time_limit=time_limit,
+            container_image=container_image,
+            container_tag=container_tag,
+            environment=environment,
         ),
         config_id=resolve_cluster_config(cluster),
         custom_config={
@@ -81,7 +91,18 @@ def launch_and_wait_for_completion(
         flush=True,
     )
 
-    pipeline.wait(max_wait_time=60 * 60 * 24 * 7)
+    n_attempt = 0
+    while n_attempt < 10:
+        try:
+            status = pipeline.wait(max_wait_time=60 * 60 * 24 * 7)
+        except requests.exceptions.ConnectionError:
+            n_attempt += 1
+            print(f"Connection error, try again (attempt {n_attempt})")
+            time.sleep(60)
+        finally:
+            if status == PipelineStatus.SUCCESS:
+                break
+
     print(f"Pipeline terminated; status: {pipeline.get_status()}")
     return pipeline
 
@@ -116,16 +137,30 @@ def download_job_logs(job: jetclient.JETJob) -> List[str]:
             return fh.readlines()
 
 
-def parse_iterations_from_logs(logs: List[str]) -> Optional[Tuple[int, int]]:
+def parse_failed_job(logs: List[str]) -> Optional[bool]:
     for log_row in logs[::-1]:
-        match = re.search(r"iteration\s+(\d+)\s*/\s*(\d+)", log_row)
+        match = re.search(r"Job finished with status 'FAILED'", log_row)
         if match is not None:
-            return int(match.group(1)), int(match.group(2))
+            return True
+    return False
+
+
+def parse_finished_training(logs: List[str]) -> Optional[bool]:
+    for log_row in logs[::-1]:
+        match = re.search(r"after training is done", log_row)
+        if match is not None:
+            return True
+    return False
 
 
 @click.command()
 @click.option("--model", required=True, type=str, help="Model")
 @click.option("--test-case", required=True, type=str, help="Test case")
+@click.option(
+    "--environment", required=True, type=click.Choice(['dev', 'lts']), help="Pytorch LTS or DEV"
+)
+@click.option("--n-repeat", required=False, default=1, type=int)
+@click.option("--time-limit", required=False, default=1800, type=int)
 @click.option(
     "--account",
     required=False,
@@ -148,6 +183,9 @@ def parse_iterations_from_logs(logs: List[str]) -> Optional[Tuple[int, int]]:
 def main(
     model: str,
     test_case: str,
+    environment: str,
+    n_repeat: int,
+    time_limit: int,
     account: str,
     cluster: str,
     container_tag: str,
@@ -177,6 +215,9 @@ def main(
     while True and n_attempts < 3:
         pipeline = launch_and_wait_for_completion(
             test_case=test_case,
+            environment=environment,
+            n_repeat=n_repeat,
+            time_limit=time_limit,
             container_image=container_image,
             container_tag=container_tag,
             cluster=cluster,
@@ -197,15 +238,11 @@ def main(
             success = pipeline.get_status() == PipelineStatus.SUCCESS
             sys.exit(int(not success))  # invert for exit 0
 
-        parsed_result = parse_iterations_from_logs(logs=logs)
-        if not parsed_result:
-            print("Weird log, no iterations found")
+        if parse_failed_job(logs=logs):
             n_attempts += 1
             continue
 
-        current_iteration, total_iterations = parsed_result
-        if current_iteration == total_iterations:
-
+        if parse_finished_training(logs=logs):
             success = pipeline.get_status() == PipelineStatus.SUCCESS
             sys.exit(int(not success))  # invert for exit 0
         n_iteration += 1

@@ -4,7 +4,6 @@
 
 import copy
 import math
-import warnings
 from abc import ABC, abstractmethod
 from itertools import chain
 from logging import getLogger
@@ -13,7 +12,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 
 try:
-    from transformer_engine.pytorch.optimizers import multi_tensor_applier
+    from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_scale
+
+    multi_tensor_scale_impl = multi_tensor_scale
 except ImportError:
     try:
         from apex.multi_tensor_apply import multi_tensor_applier
@@ -963,24 +964,6 @@ class ChainedOptimizer(MegatronOptimizer):
                 optimizer.model_chunks[0].start_param_sync(force_dispatch=True)
 
         return success
-
-    def disable_pre_hook(self):
-        """Disable pre-hooks for underlying distributed optimizers."""
-        warnings.warn(
-            "`ChainedOptimizer.disable_pre_hook` will be deprecated in a future release. "
-            "Use `DistributedDataParallel.disable_forward_pre_hook` directly."
-        )
-        for model_chunk in self.model_chunks:
-            model_chunk.disable_forward_pre_hook()
-
-    def enable_pre_hook(self):
-        """Enable pre-hooks for underlying distributed optimizers."""
-        warnings.warn(
-            "`ChainedOptimizer.enable_pre_hook` will be deprecated in a future release. "
-            "Use `DistributedDataParallel.enable_forward_pre_hook` directly."
-        )
-        for model_chunk in self.model_chunks:
-            model_chunk.enable_forward_pre_hook()
 
     @torch.no_grad()
     def step(self):

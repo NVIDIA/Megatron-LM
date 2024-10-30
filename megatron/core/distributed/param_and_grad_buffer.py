@@ -3,17 +3,24 @@
 import logging
 import math
 import os
-import warnings
 from enum import Enum
 from typing import Dict, List, Optional
 
 import torch
 from torch.distributed import _coalescing_manager
 
-from ..utils import is_float8tensor, log_on_each_pipeline_stage
+from ..utils import is_float8tensor, is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 
 logger = logging.getLogger(__name__)
+
+
+if is_torch_min_version("1.13.0"):
+    dist_all_gather_func = torch.distributed.all_gather_into_tensor
+    dist_reduce_scatter_func = torch.distributed.reduce_scatter_tensor
+else:
+    dist_all_gather_func = torch.distributed._all_gather_base
+    dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
 
 class BufferType(Enum):
@@ -43,9 +50,9 @@ class _ParamAndGradBucket:
 
     Args:
         params: List of parameters whose gradients are collated in this bucket.
-        param_data: View in ParamAndGradBuffer.param_data that this bucket is responsible for.
-        grad_data: View in ParamAndGradBuffer.grad_data that this bucket is responsible for.
-        offset: Offset of this bucket's view in the larger ParamAndGradBuffer.
+        param_data: View in _ParamAndGradBuffer.param_data that this bucket is responsible for.
+        grad_data: View in _ParamAndGradBuffer.grad_data that this bucket is responsible for.
+        offset: Offset of this bucket's view in the larger _ParamAndGradBuffer.
         numel_unpadded: Number of unpadded elements in bucket.
         gradient_scaling_factor: This factor is utilized to scale gradients prior to their
             communication. Its application is twofold: it facilitates the averaging of gradients
@@ -173,7 +180,7 @@ class _ParamAndGradBucketGroup:
                 local_data_view = shard_buffer(bucket.param_data, self.data_parallel_world_size)[
                     self.data_parallel_rank
                 ]
-                torch.distributed._all_gather_base(
+                dist_all_gather_func(
                     bucket.param_data,
                     local_data_view,
                     group=self.data_parallel_group,
@@ -256,7 +263,7 @@ class _ParamAndGradBucketGroup:
                     local_data_view = shard_buffer(bucket.grad_data, self.data_parallel_world_size)[
                         self.data_parallel_rank
                     ]
-                    torch.distributed._reduce_scatter_base(
+                    dist_reduce_scatter_func(
                         local_data_view,
                         bucket.grad_data,
                         op=reduce_op,
@@ -619,7 +626,7 @@ class _ParamAndGradBuffer:
             assert end_index % self.data_parallel_world_size == 0
         assert (start_index, end_index) == self.bucket_indices[bucket_id]
 
-        # Get appropriate view into global ParamAndGradBuffer.
+        # Get appropriate view into global _ParamAndGradBuffer.
         bucketed_param_data = None
         if self.param_data is not None:
             bucketed_param_data = self._get(
@@ -756,14 +763,3 @@ def partition_buckets(
                 )
             )
         return bucket_groups
-
-
-# For backwards compatibility. ParamAndGradBuffer will be deprecated in future release.
-# _ParamAndGradBuffer is not intended to be consumed directly by external code.
-class ParamAndGradBuffer(_ParamAndGradBuffer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        warnings.warn(
-            "`ParamAndGradBuffer` will be deprecated in a future release, and is not "
-            "intended to be used by external code."
-        )

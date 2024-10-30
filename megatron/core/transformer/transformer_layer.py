@@ -112,9 +112,19 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             eps=self.config.layernorm_epsilon,
         )
 
+        attention_optional_kwargs = {}
+        if config.cp_comm_type is not None:
+            if isinstance(config.cp_comm_type, list):
+                attention_optional_kwargs["cp_comm_type"] = config.cp_comm_type[self.layer_number]
+            else:
+                attention_optional_kwargs["cp_comm_type"] = config.cp_comm_type
+
         # [Module 2: SelfAttention]
         self.self_attention = build_module(
-            submodules.self_attention, config=self.config, layer_number=layer_number
+            submodules.self_attention,
+            config=self.config,
+            layer_number=layer_number,
+            **attention_optional_kwargs,
         )
 
         # [Module 3: BiasDropoutFusion]
@@ -130,7 +140,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         # [Module 5: CrossAttention]
         self.cross_attention = build_module(
-            submodules.cross_attention, config=self.config, layer_number=layer_number
+            submodules.cross_attention,
+            config=self.config,
+            layer_number=layer_number,
+            **attention_optional_kwargs,
         )
 
         # [Module 6: BiasDropoutFusion]
@@ -206,7 +219,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                     )
                     last_pipeline_offset = (
                         0
-                        if self.config.first_pipeline_num_layers is None
+                        if self.config.last_pipeline_num_layers is None
                         else self.config.last_pipeline_num_layers
                     )
 
@@ -245,6 +258,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         context=None,
         context_mask=None,
         rotary_pos_emb=None,
+        rotary_pos_cos=None,
+        rotary_pos_sin=None,
         inference_params=None,
         packed_seq_params=None,
     ):
@@ -283,6 +298,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             attention_mask=attention_mask,
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
             packed_seq_params=packed_seq_params,
         )
 

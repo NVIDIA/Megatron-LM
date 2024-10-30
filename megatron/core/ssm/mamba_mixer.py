@@ -1,6 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2024, Tri Dao, Albert Gu.
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 # Some of this code was adopted from https://github.com/state-spaces/mamba/
 # This source code is licensed under the Apache license found in the
@@ -580,6 +579,7 @@ class MambaMixer(MegatronModule):
         return conv_state, ssm_state
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Provide a sharded state dictionary for distributed checkpointing."""
         sharded_state_dict = {}
         # Parameters
         self._save_to_state_dict(sharded_state_dict, '', keep_vars=True)

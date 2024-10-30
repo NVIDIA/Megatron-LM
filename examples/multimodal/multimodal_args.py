@@ -1,4 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN
 
 
 def add_multimodal_extra_args(parser):
@@ -38,6 +39,19 @@ def add_multimodal_extra_args(parser):
     )
     group.add_argument(
         "--online-evaluation-config", type=str, help="Config file for online evaluation."
+    )
+    group.add_argument(
+        "--special-tokens",
+        nargs="*",
+        default=[IMAGE_TOKEN],
+        help="Special tokens used in the multimodal model",
+    )
+    group.add_argument(
+        "--tokenizer-prompt-format",
+        type=str,
+        choices=["mistral", "llama3", "chatml"],
+        required=True,
+        help="Prompt format to use with the tokenizer.",
     )
 
     return parser

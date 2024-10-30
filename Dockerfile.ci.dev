@@ -11,7 +11,7 @@ RUN pip3 wheel -v git+https://github.com/fanshiqing/grouped_gemm@v1.1.2
 
 FROM $FROM_IMAGE_NAME as build_mamba_ssm
 WORKDIR /opt
-RUN MAMBA_FORCE_BUILD=TRUE pip3 wheel -v git+https://github.com/state-spaces/mamba.git@v2.0.3
+RUN MAMBA_FORCE_BUILD=TRUE pip3 wheel -v git+https://github.com/state-spaces/mamba.git@v2.2.0
 
 FROM $FROM_IMAGE_NAME as main
 ENV DEBIAN_FRONTEND=noninteractive
@@ -23,9 +23,9 @@ RUN apt-get update && \
     wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq && \
     chmod a+x /usr/local/bin/yq
 
-COPY --from=build_causal_conv1d /opt/causal_conv1d-1.2.2.post1-cp310-cp310-linux_x86_64.whl ./
-COPY --from=build_grouped_gemm /opt/grouped_gemm-1.1.2-cp310-cp310-linux_x86_64.whl ./
-COPY --from=build_mamba_ssm /opt/mamba_ssm-2.0.3-cp310-cp310-linux_x86_64.whl ./
+COPY --from=build_causal_conv1d /opt/causal_conv1d-*.whl ./
+COPY --from=build_grouped_gemm /opt/grouped_gemm-*.whl ./
+COPY --from=build_mamba_ssm /opt/mamba_ssm-*.whl ./
 
 RUN pip3 install --no-cache-dir --upgrade-strategy only-if-needed -v \
 einops \
@@ -36,20 +36,43 @@ pytest-cov \
 pytest_mock \
 pytest-random-order \
 sentencepiece \
+tiktoken \
 wrapt \
 zarr \
 wandb \
-triton==2.1.0 \
-causal_conv1d-1.2.2.post1-cp310-cp310-linux_x86_64.whl \
-mamba_ssm-2.0.3-cp310-cp310-linux_x86_64.whl \
-grouped_gemm-1.1.2-cp310-cp310-linux_x86_64.whl \
+causal_conv1d-*.whl \
+mamba_ssm-*.whl \
+grouped_gemm-*.whl \
 tensorstore==0.1.45 && \
 rm *.whl
 
 # Since megatron does not have any dependencies (and isn't a dependency to any other package), we can install it separately to make everything a bit quicker
-COPY . /opt/megatron-lm
-RUN pip install /opt/megatron-lm
+ARG MCORE_REPO
+ARG MCORE_REF
+ARG MCORE_BACKWARDS_REF
+RUN <<"EOF" bash -exu
+# Checkout latest
+cd /opt
+rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+git init
+git remote add origin ${MCORE_REPO}
+git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+git checkout $MCORE_REF
+
+# Checkout backwards-ref
+cd /opt
+rm -rf /opt/megatron-lm-$MCORE_BACKWARDS_REF; mkdir megatron-lm-$MCORE_BACKWARDS_REF; cd megatron-lm-$MCORE_BACKWARDS_REF
+git init
+git remote add origin ${MCORE_REPO}
+git fetch origin $MCORE_BACKWARDS_REF
+git checkout $MCORE_BACKWARDS_REF
+rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
+EOF
+
+RUN pip install -e /opt/megatron-lm
 ENV PYTHONPATH="/opt/megatron-lm:$PYTHONPATH"
+ENV NVTE_FLASH_ATTN=0
+ENV NVTE_FUSED_ATTN=0
 
 ##### For NVIDIANS only #####
 FROM main as jet

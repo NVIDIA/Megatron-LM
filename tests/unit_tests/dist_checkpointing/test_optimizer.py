@@ -37,6 +37,7 @@ from tests.unit_tests.dist_checkpointing import (
     init_checkpointing_mock_args,
     initialize_gpt_model,
     setup_model_and_optimizer,
+    setup_moe_model_and_optimizer,
 )
 from tests.unit_tests.test_utilities import Utils
 
@@ -177,7 +178,6 @@ class TestDistributedOptimizer:
             # ((2, 1), 2, 2),
         ],
     )
-    @pytest.mark.skip(reason="Tests are flaky and need to be debugged")
     def test_dp_sharding(self, tmp_path_dist_ckpt, tp_pp, src_dp, dest_dp, use_fpsl, initialize_fn):
         src_world_size = tp_pp[0] * tp_pp[1] * src_dp
         dest_world_size = tp_pp[0] * tp_pp[1] * dest_dp
@@ -255,7 +255,6 @@ class TestDistributedOptimizer:
         ('src_tp_pp', 'dest_tp_pp', 'use_glu'),
         [((2, 2), (2, 4), False), ((1, 8), (4, 1), True), ((2, 4), (4, 2), False)],
     )
-    @pytest.mark.skip(reason="Tests are flaky and need to be debugged")
     def test_finetune_doesnt_load_optimizer(
         self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_glu
     ):
@@ -328,7 +327,6 @@ class TestDistributedOptimizer:
                 assert not diffs[0] and not diffs[1] and diffs[2]
                 assert not any(diff(optimizer.state_dict(), optim_unloaded_state_dict))
 
-    @pytest.mark.skip(reason="Tests are flaky and need to be debugged")
     def test_can_load_deprecated_bucket_space_format(self, tmp_path_dist_ckpt):
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
         tp = 4
@@ -397,7 +395,6 @@ class TestFP32Optimizer:
     @pytest.mark.parametrize(
         ('src_tp_pp', 'dest_tp_pp'), [((2, 4), (2, 4)), ((2, 4), (4, 2)), ((8, 1), (1, 2))]
     )
-    @pytest.mark.skip(reason="Tests are flaky and need to be debugged")
     def test_fp32_optimizer_resharding(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp):
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
         Utils.initialize_model_parallel(*src_tp_pp)
@@ -464,7 +461,6 @@ class TestOptimizerResharding:
         ('src_tp_pp', 'dest_tp_pp'),
         [((2, 4), (2, 4)), ((2, 4), (2, 2)), ((2, 4), (4, 2)), ((8, 1), (1, 2))],
     )
-    @pytest.mark.skip(reason="Tests are flaky and need to be debugged")
     def test_optimizer_resharding(
         self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_dist_opt, bf16
     ):
@@ -503,3 +499,82 @@ class TestOptimizerResharding:
                 plain_state_dict_B = load_plain_tensors(ckpt_dir_B)
                 diffs = diff(plain_state_dict_A, plain_state_dict_B)
                 assert not any(map(bool, diffs)), diffs
+
+    @pytest.mark.parametrize(('use_dist_opt', 'bf16'), ((True, True),))  # DistOpt BF16
+    @pytest.mark.parametrize(('use_te', 'use_grouped_mlp'), ((False, False), (False, True)))
+    @pytest.mark.parametrize('use_glu', [False, True])
+    @pytest.mark.parametrize(
+        ('src_tp_pp_exp', 'dest_tp_pp_exp'),
+        [
+            ((2, 2, 2), (2, 2, 2)),
+            ((4, 1, 2), (1, 2, 2)),
+            ((1, 1, 2), (1, 1, 4)),
+            ((2, 1, 2), (1, 1, 8)),
+        ],
+    )
+    def test_chained_optimizer_resharding(
+        self,
+        tmp_path_dist_ckpt,
+        src_tp_pp_exp,
+        dest_tp_pp_exp,
+        use_dist_opt,
+        bf16,
+        use_te,
+        use_grouped_mlp,
+        use_glu,
+    ):
+        src_tp, src_pp, src_exp = src_tp_pp_exp
+        dest_tp, dest_pp, dest_exp = dest_tp_pp_exp
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=False
+        ) as ckpt_dir_A:
+            with TempNamedDir(
+                tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=False
+            ) as ckpt_dir_B:
+                Utils.initialize_model_parallel(src_tp, src_pp, expert_model_parallel_size=src_exp)
+                model_A, optimizer_A = setup_moe_model_and_optimizer(
+                    seed=2,
+                    tp=src_tp,
+                    pp=src_pp,
+                    ep=src_exp,
+                    bf16=bf16,
+                    dist_opt=use_dist_opt,
+                    use_te=use_te,
+                    use_grouped_mlp=use_grouped_mlp,
+                    use_glu=use_glu,
+                )
+
+                save(optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()), ckpt_dir_A)
+                Utils.destroy_model_parallel()
+
+                # Load checkpoint A with different TP/PP and save as checkpoint B
+                Utils.initialize_model_parallel(
+                    dest_tp, dest_pp, expert_model_parallel_size=dest_exp
+                )
+                model_B, optimizer_B = setup_moe_model_and_optimizer(
+                    seed=3,
+                    tp=dest_tp,
+                    pp=dest_pp,
+                    ep=dest_exp,
+                    bf16=bf16,
+                    dist_opt=use_dist_opt,
+                    use_te=use_te,
+                    use_grouped_mlp=use_grouped_mlp,
+                    use_glu=use_glu,
+                )
+                load_sharded_state_dict = optimizer_B.sharded_state_dict(
+                    model_B[0].sharded_state_dict()
+                )
+                state_dict = load(load_sharded_state_dict, ckpt_dir_A)
+
+                optimizer_B.load_state_dict(state_dict)
+                save(optimizer_B.sharded_state_dict(model_B[0].sharded_state_dict()), ckpt_dir_B)
+                Utils.destroy_model_parallel()
+
+                # Test both checkpoints are equal
+                Utils.initialize_model_parallel(1, 1)
+                plain_state_dict_A = load_plain_tensors(ckpt_dir_A)
+                plain_state_dict_B = load_plain_tensors(ckpt_dir_B)
+                diffs = diff(plain_state_dict_A, plain_state_dict_B)
+                assert not any(map(bool, diffs)), diffs
+                Utils.destroy_model_parallel()
