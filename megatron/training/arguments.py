@@ -1957,11 +1957,13 @@ def _add_experimental_args(parser):
                        help='Ratio of mlp layers to total layers, in the '
                        'range [0.0, 1.0].')
     group.add_argument('--hybrid-override-pattern', type=str, default=None,
-                       help='Force a specific hybrid layer pattern. If a value'
-                       'greater than 0.0 is supplied to any of the hybrid ratio'
-                       'arguments, then the number of each type of layer in the'
-                       'override pattern must match number in the overidden'
-                       'pattern')
+                       help='Force a specific hybrid layer pattern. The value'
+                       'should be a string of characters chosen from'
+                       'core.ssm.mamba_hybrid_layer_allocation.Symbols.'
+                       'If a value greater than 0.0 is supplied to any of the '
+                       'hybrid ratio arguments, then the number of each type'
+                       'of layer in the override pattern must match number in'
+                       'the overidden pattern')
     group.add_argument('--yaml-cfg', type=str, default=None,
                        help = 'Config file to add additional arguments')
     return parser
