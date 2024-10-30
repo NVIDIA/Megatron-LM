@@ -203,7 +203,7 @@ def get_args():
                        choices=['BertWordPieceLowerCase','BertWordPieceCase',
                                 'GPT2BPETokenizer', 'SentencePieceTokenizer',
                                 'GPTSentencePieceTokenizer', 'Llama2Tokenizer',
-                                'Llama3Tokenizer', 'MistralTokenizer', 'NullTokenizer'],
+                                'Llama3Tokenizer', 'MistralTokenizer', 'HuggingFaceTokenizer', 'NullTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='YTTM tokenizer model.')
