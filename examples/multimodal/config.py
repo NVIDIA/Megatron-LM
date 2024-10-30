@@ -151,5 +151,3 @@ class EvaluationConfig:
     num_partitions: int = 1
     partition_id: int = 0
     num_samples_per_partition: int = 0
-
-    prompt_format: str = "mistral"
