@@ -36,6 +36,15 @@ except ImportError:
         HAVE_APPLY_ROPE_FUSION = False
 
 
+try:
+    from flash_attn.layers.rotary import apply_rotary_emb as apply_rotary_emb_flash
+except ImportError:
+    apply_rotary_emb_flash = None
+
+
+__all__ = ['apply_rotary_emb_flash']
+
+
 def get_pos_emb_on_this_cp_rank(pos_emb: Tensor, seq_dim: int) -> Tensor:
     """Get the position embedding on the current context parallel rank.
 
@@ -212,3 +221,38 @@ def apply_rotary_pos_emb(
                 multi_latent_attention=config.multi_latent_attention,
                 mscale=mscale,
             )
+
+
+def apply_rotary_pos_emb_with_cos_sin(
+    t: Tensor, cos: Tensor, sin: Tensor, rotary_interleaved: bool = False
+) -> Tensor:
+    """
+    This function applies rotary positional embedding to the target tensor t
+    using precomputed cos and sin of size (seq_len, d_rot / 2)
+    """
+    cos = cos.to(t.dtype)
+    sin = sin.to(t.dtype)
+
+    if apply_rotary_emb_flash is None:
+        # Combine cos and sin into freqs
+        freqs = torch.stack([cos, sin], dim=-1).flatten(start_dim=-2)
+
+        # Expand freqs to match t's shape
+        while freqs.dim() < t.dim():
+            freqs = freqs.unsqueeze(1)
+        freqs = freqs.expand(t.shape[:-1] + (-1,))
+
+        y = _apply_rotary_pos_emb_bshd(
+            t,
+            freqs,
+            rotary_interleaved=rotary_interleaved,
+            multi_latent_attention=False,
+            mscale=1.0,
+        )
+    else:
+        # Use Flash Attention's optimized kernel for rotary embedding
+        t = t.permute(1, 0, 2, 3)
+        y = apply_rotary_emb_flash(t, cos, sin, rotary_interleaved)
+        y = y.permute(1, 0, 2, 3)
+
+    return y

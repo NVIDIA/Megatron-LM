@@ -258,6 +258,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         context=None,
         context_mask=None,
         rotary_pos_emb=None,
+        rotary_pos_cos=None,
+        rotary_pos_sin=None,
         inference_params=None,
         packed_seq_params=None,
     ):
@@ -296,6 +298,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             attention_mask=attention_mask,
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
             packed_seq_params=packed_seq_params,
         )
 
