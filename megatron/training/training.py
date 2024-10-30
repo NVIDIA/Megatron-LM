@@ -1223,7 +1223,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             elif iteration == args.profile_step_start:
                 torch.cuda.cudart().cudaProfilerStart()
                 torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
-            profiler_status = 1
+                profiler_status = 1
 
         maybe_finalize_async_save(False)
 
@@ -1434,7 +1434,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             else:
                 torch.cuda.cudart().cudaProfilerStop()
                 torch.autograd.profiler.emit_nvtx(record_shapes=True).__exit__(None,None,None)
-            profiler_status = 0
+                profiler_status = 0
 
         if args.manual_gc:
             if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:
@@ -1462,11 +1462,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if wandb_writer:
             wandb_writer.finish()
         if profiler_status != 0:
-            if args.use_pytorch_profiler:
-                prof.stop()
-            else:
-                torch.cuda.cudart().cudaProfilerStop()
-                torch.autograd.profiler.emit_nvtx(record_shapes=True).__exit__(None,None,None)
+            torch.cuda.cudart().cudaProfilerStop()
+            torch.autograd.profiler.emit_nvtx(record_shapes=True).__exit__(None,None,None)
         sys.exit()
 
     return iteration, num_floating_point_operations_so_far
