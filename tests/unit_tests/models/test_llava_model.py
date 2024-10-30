@@ -84,13 +84,12 @@ class TestLLaVAModel:
 
         # 3 images with 1 tile and 2 image with 2 tiles = 7 tiles.
         image_embeddings = (
-            1e-5
-            * torch.arange(577 * 7 * hidden_size, dtype=torch.float)
+            torch.arange(577 * 7 * hidden_size, dtype=torch.float)
             .reshape(577, 7, hidden_size)
             .cuda()
         )
 
-        image_token_index = -200
+        image_token_index = self.model.image_token_index
         input_ids = torch.arange(1024).expand(5, 1024).cuda()
         input_ids[0, 0] = image_token_index  # image before text
         input_ids[1, 100] = image_token_index  # image in between
@@ -99,19 +98,19 @@ class TestLLaVAModel:
         input_ids[4, 50] = image_token_index  # two images in between
         input_ids[4, 150] = image_token_index
 
-        # Offset by 1000 to distinguish from image embeddings.
+        # Using negative sign to distinguish from image embeddings.
         language_embeddings = (
-            1000.0
-            + 1e-5
-            * torch.arange(5 * 1024 * hidden_size, dtype=torch.float)
+            -torch.arange(5 * 1024 * hidden_size, dtype=torch.float)
             .reshape(5, 1024, hidden_size)
             .cuda()
         )
 
         # Labels are input_ids shifted to left by one.
         labels = torch.arange(1, 1025, dtype=torch.int).expand(5, 1024).cuda()
+        # labels[0] - image token got dropped by shift to left by one.
         labels[1, 99] = image_token_index
         labels[2, -2] = image_token_index
+        # labels[3] - no image.
         labels[4, 49] = image_token_index
         labels[4, 149] = image_token_index
 
@@ -272,7 +271,7 @@ class TestLLaVAModel:
         # 3 images with 1 tile and 2 images with 2 tiles.
         img = torch.randn((7, 3, 336, 336)).cuda()
 
-        image_token_index = -200
+        image_token_index = self.model.image_token_index
         input_ids = torch.randint(0, 2048, (5, 1024)).cuda()
         input_ids[0, 0] = image_token_index  # image before text
         input_ids[1, 100] = image_token_index  # image in between

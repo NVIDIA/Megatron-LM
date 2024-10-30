@@ -8,7 +8,6 @@ import torch
 
 from megatron.core import InferenceParams, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
-from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel, get_num_image_embeddings
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
@@ -16,10 +15,22 @@ from megatron.core.parallel_state import get_tensor_model_parallel_world_size
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_te_min_version
 
-IMAGE_TOKEN_INDEX = -200  # ID for images in the input sequence.
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    from megatron.core.extensions.transformer_engine import TEDotProductAttention
+    from megatron.core.utils import is_te_min_version
+
+    HAVE_TE = True
+except:
+    HAVE_TE = False
+
+
 IGNORE_INDEX = -100  # ID for labels that should be ignored.
+# Image token index can be tokenizer dependent so the default value does not work in all cases.
+DEFAULT_IMAGE_TOKEN_INDEX = -200
+IMAGE_TOKEN = "<image>"
 
 
 # Note: This is under development and may be missing features.
@@ -53,6 +64,8 @@ class LLaVAModel(MegatronModule):
         img_w (int): Input image width.
         patch_dim (int): The size of each image patch side.
         language_rotary_base (int): RoPE base.
+        language_rope_scaling (bool): Toggle RoPE scaling.
+        image_token_index (int): Token ID for image token such as <image>.
     """
 
     def __init__(
@@ -80,6 +93,7 @@ class LLaVAModel(MegatronModule):
         patch_dim: int = 14,
         language_rotary_base: int = 10000,
         language_rope_scaling: bool = False,
+        image_token_index: int = DEFAULT_IMAGE_TOKEN_INDEX,
     ) -> None:
         super().__init__(config=language_transformer_config)
 
@@ -106,6 +120,7 @@ class LLaVAModel(MegatronModule):
             assert (
                 language_transformer_layer_spec.submodules.self_attention.submodules.core_attention
                 == TEDotProductAttention
+                and HAVE_TE
             ), "Sequence Parallelism is supported only with Transformer Engine DotProductAttention."
         self.tp_comm_overlap_lm = language_transformer_config.tp_comm_overlap
 
@@ -184,6 +199,8 @@ class LLaVAModel(MegatronModule):
             drop_vision_class_token,
             class_token_len,
         )
+
+        self.image_token_index = image_token_index
 
     def shared_embedding_or_output_weight(self):
         """This is a convenience method to surface the language model's word embeddings, which is
@@ -495,7 +512,7 @@ class LLaVAModel(MegatronModule):
         loss_mask: Optional[torch.Tensor] = None,
         inference_params: Optional[InferenceParams] = None,
         num_image_tiles: Optional[List[int]] = None,
-        image_token_index: Optional[int] = IMAGE_TOKEN_INDEX,
+        image_token_index: Optional[int] = None,
         runtime_gather_output: Optional[bool] = None,
     ) -> torch.Tensor:
         """Forward function of the LLaVA model.
@@ -512,7 +529,8 @@ class LLaVAModel(MegatronModule):
             loss_mask (torch.Tensor): Text loss mask [batch, text_seq_len].
             inference_params (InferenceParams): Inference-time parameters including KV cache.
             num_image_tiles (list of int): Number of tiles per image. Default 1 tile per image.
-            image_token_index (int): ID for input images.
+            image_token_index (int): ID for input images. Default None means `image_token_index`
+                arg in the constructor will be used.
             runtime_gather_output (bool): Gather output at runtime. Default None means
                 `parallel_output` arg in the constructor will be used.
 
@@ -566,7 +584,7 @@ class LLaVAModel(MegatronModule):
         language_embeddings = None
         if self.pre_process:
             input_ids_text = input_ids.clone()
-            input_ids_text[input_ids_text == image_token_index] = 0
+            input_ids_text[input_ids_text == self.image_token_index] = 0
             # Note: This adds absolute position embedding but not RoPE.
             # Each image is counted as one position.
             # RoPE is added in language_model forward. Each image embedding is one position.
@@ -615,7 +633,7 @@ class LLaVAModel(MegatronModule):
             loss_mask,
             labels,
             use_inference_kv_cache,
-            image_token_index,
+            image_token_index if image_token_index is not None else self.image_token_index,
             num_image_tiles,
             attention_mask,
         )  # [combined_seq_len, b, h_language], [b, combined_seq_len], [b, combined_seq_len]

@@ -14,6 +14,7 @@ from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
 
 from .bert_tokenization import FullTokenizer as FullBertTokenizer
 from .gpt2_tokenization import GPT2Tokenizer
+from megatron.training.tokenizer.multimodal_tokenizer import MultimodalTokenizer
 
 
 def build_tokenizer(args, **kwargs):
@@ -64,6 +65,20 @@ def build_tokenizer(args, **kwargs):
     elif args.tokenizer_type == 'NullTokenizer':
         assert args.vocab_size is not None
         tokenizer = _NullTokenizer(args.vocab_size)
+    elif args.tokenizer_type == "MultimodalTokenizer":
+        try:
+            import transformers
+        except ImportError:
+            raise ImportError(
+                "MultimodalTokenizer currently requires transformers library to be installed"
+            )
+
+        # Currently, only HuggingFace tokenizers are supported.
+        underlying_tokenizer = transformers.AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path=args.tokenizer_model
+        )
+
+        tokenizer = MultimodalTokenizer(underlying_tokenizer, args.tokenizer_prompt_format, args.special_tokens)
     else:
         raise NotImplementedError('{} tokenizer is not ' 'implemented.'.format(args.tokenizer_type))
 

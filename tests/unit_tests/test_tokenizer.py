@@ -3,11 +3,13 @@ import json
 from argparse import Namespace
 from pathlib import Path
 
+import numpy as np
 import pytest
 import requests
 
 from megatron.training import tokenizer
 from megatron.training.tokenizer.gpt2_tokenization import PRETRAINED_VOCAB_ARCHIVE_MAP
+from megatron.training.tokenizer.multimodal_tokenizer import MultimodalTokenizer
 
 TOKENIZER_DIR = Path("~/data/tokenizers").expanduser()
 
@@ -191,3 +193,73 @@ def test_null_tokenizer():
         detok_str == test_string
     ), f"Detokenized string {detok_str} does not match original {test_string}"
     assert len(toks) == len(offsets), f"Tokenized string {toks} does not match original {offsets}"
+
+
+class MockUnderlyingTokenizer:
+    """Mock tokenizer for testing purposes."""
+
+    def __init__(self):
+        self.pad_token_id = 256
+
+    def __len__(self):
+        return 256
+
+    def encode(self, text: str) -> list[int]:
+        """Convert text to a list of token IDs."""
+        return [ord(c) for c in text]
+
+    def decode(self, tokens: list[int]) -> str:
+        """Convert list of token IDs to plaintext."""
+        return "".join([chr(t) for t in tokens])
+
+    def apply_chat_template(self, conversation: list[dict], *args, **kwargs) -> list[int]:
+        """Convert a conversation to token IDs."""
+        out = []
+        for turn in conversation:
+            turn_tokens = self.encode(f"{turn['role']}:{turn['content']}")
+            out.extend(turn_tokens)
+
+        if kwargs.get("return_tensors", None) == "np":
+            return [np.array(out)]
+
+        return out
+
+    def convert_tokens_to_ids(self, text: str) -> list[int]:
+        """Convert plaintext to token IDs."""
+        return self.encode(text)
+
+    def add_tokens(self, extra_tokens: list[str], *args, **kwargs) -> int:
+        """Add tokens to the tokenizer. No-op for this mock tokenizer."""
+        return len(extra_tokens)
+
+
+def test_multimodal_tokenizer():
+    """Test MultimodalTokenizer."""
+    underlying = MockUnderlyingTokenizer()
+    tokenizer = MultimodalTokenizer(underlying, "chatml", ["<image>"])
+
+    # Simple encode - decode roundtrip.
+    assert (
+        tokenizer.detokenize(tokenizer.tokenize("abc")) == "abc"
+    ), "encode-decode roundtrip failed"
+
+    # Apply chat template.
+    conversation = [
+        {"role": "system", "content": "abc"},
+        {"role": "user", "content": "123<image>"},
+        {"role": "assistant", "content": "xyz"},
+    ]
+    conv_tokens = tokenizer.tokenize_conversation(
+        conversation, return_target=False, add_generation_prompt=False
+    )
+    assert len(conv_tokens) > 0, "failed to tokenize conversation"
+
+    conv_tokens, target_tokens = tokenizer.tokenize_conversation(
+        conversation, return_target=True, add_generation_prompt=True
+    )
+    assert len(conv_tokens) > 0 and len(conv_tokens) == len(
+        target_tokens
+    ), "failed to tokenize conversation and return target tokens"
+
+    # Try converting tokens to ids.
+    assert tokenizer.convert_tokens_to_ids("a"), "failed to convert tokens to ids."

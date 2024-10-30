@@ -1,8 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from megatron.core import tensor_parallel
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_viewless_tensor
 
@@ -51,6 +50,14 @@ class MultimodalProjector(MegatronModule):
             raise Exception(f"Unsupported multimodal projection type {self.projector_type}")
 
     def forward(self, hidden_states):
+        """Run multimodal projector.
+
+        Args:
+            hidden_states (torch.Tensor): Input.
+
+        Returns:
+            torch.Tensor: The projected output.
+        """
         # Run encoder.
         encoder_output, encoder_output_bias = self.encoder(hidden_states)
 
