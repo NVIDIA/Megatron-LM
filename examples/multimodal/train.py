@@ -25,9 +25,6 @@ from megatron.training.utils import is_last_rank
 
 def get_batch(data_iterator):
     """Generate a batch"""
-
-    args = get_args()
-
     imgs = None
     tokens = None
     labels = None
