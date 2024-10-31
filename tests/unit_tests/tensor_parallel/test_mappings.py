@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from megatron.core.tensor_parallel import mappings
@@ -90,6 +91,7 @@ def test_ScatterToSequenceParallelRegion():
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.internal
 def test_GatherFromSequenceParallelRegion():
     Utils.initialize_model_parallel(4, 2)
     input_data = torch.ones(4).cuda() * Utils.rank
@@ -117,6 +119,7 @@ def test_GatherFromSequenceParallelRegion():
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.internal
 def test_ReduceScatterToSequenceParallelRegion():
     Utils.initialize_model_parallel(4, 2)
     input_data = torch.vstack(

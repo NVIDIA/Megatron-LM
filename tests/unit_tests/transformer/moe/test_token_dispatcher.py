@@ -82,6 +82,7 @@ class MoEModelTestContainer:
         torch.cuda.synchronize()
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     def dispatcher_dropless_test(self):
         moe_layer = self.moe_layer
         bs = 32
@@ -127,6 +128,7 @@ class MoEModelTestContainer:
             hidden_states.grad, ans
         ), "Restored hidden states do not match original hidden states"
 
+    @pytest.mark.internal
     def dispacher_capacity_test(self):
         moe_layer = self.moe_layer
         hidden_states = torch.randn((256, moe_layer.config.hidden_size))
@@ -163,6 +165,7 @@ class MoEModelTestContainer:
             hidden_states.grad, restored_hidden_states_answer
         ), "Gradient of hidden states should be same as hidden states"
 
+    @pytest.mark.internal
     def dispatcher_drop_and_pad_test(self):
         "Test if the tokens are dropped and padded correctly"
         moe_layer = self.moe_layer
@@ -231,6 +234,7 @@ class TestAllgatherDispatcher:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("tp_size,ep_size", [(8, 1), (1, 8), (2, 4), (1, 1)])
     def test_forward_backward(self, tp_size, ep_size):
@@ -246,6 +250,7 @@ class TestAllgatherDispatcher:
 
         container.dispatcher_dropless_test()
 
+    @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("tp_size,ep_size", [(2, 4)])
     def test_extend_tp_forward_backward(self, tp_size, ep_size):
