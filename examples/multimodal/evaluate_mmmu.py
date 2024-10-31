@@ -40,6 +40,14 @@ def convert_to_mmmu_format(input_path):
                 sample_id = res["sample_id"]
                 prediction = res["prediction"]
 
+                if res["question_type"] == "multiple-choice":
+                    from MMMU.mmmu.utils.eval_utils import parse_multi_choice_response
+
+                    prediction = parse_multi_choice_response(
+                        prediction, res["all_choices"], res["index2ans"]
+                    )
+
+                # MMMU eval script expects just a sample_id to prediction mapping.
                 output[sample_id] = prediction
 
     with open(output_file_path, "w") as output_file:
@@ -69,7 +77,7 @@ def mmmu_eval(input_path, groundtruth_path):
     print(output.stderr)
     print(output.stdout)
 
-    m = re.search("'Overall': {'num': \d, 'acc': (\d.\d+)}", output.stdout)
+    m = re.search("'Overall': {'num': \d+, 'acc': (\d.\d+)}", output.stdout)
 
     return float(m.group(1)) * 100.0
 

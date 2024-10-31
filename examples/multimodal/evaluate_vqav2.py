@@ -34,7 +34,7 @@ def is_number(n: str):
         return False
 
 
-def compute_vqa_accuracy(result_file, use_chartqa_metric=False):
+def compute_vqa_accuracy(result_file, task):
     """Compute VQA accuracy."""
     merged_results = json.load(open(result_file))
 
@@ -51,8 +51,8 @@ def compute_vqa_accuracy(result_file, use_chartqa_metric=False):
 
         # ChartQA uses relaxed accuracy:
         # "We consider an answer to be correct if it is within 5% of the gold answer.
-        # For non-numeric answers, we still need an exact match to consider an answer to be correct."
-        if use_chartqa_metric:
+        #  For non-numeric answers, we still need an exact match to consider an answer to be correct."
+        if task == "ChartQA":
             acc = 0.0
             assert len(gt) == 1, "expected exactly one groundtruth answer."
             gt = gt[0]
@@ -66,10 +66,16 @@ def compute_vqa_accuracy(result_file, use_chartqa_metric=False):
                 acc = 1.0
 
             all_acc.append(acc)
-        else:
+        elif task in ("VQAv2", "TextVQA"):
             num_match = sum([pred == ans for ans in gt])
             acc = min(1.0, num_match / 3.0)
             all_acc.append(acc)
+        elif task == "AI2D":
+            assert len(gt) == 1, f"Expected exactly 1 GT, got {gt}"
+            acc = pred == gt[0]
+            all_acc.append(acc)
+        else:
+            raise NotImplementedError(f"unknown task {task}")
 
     acc_avg = sum(all_acc) / len(all_acc) * 100
 
@@ -79,7 +85,7 @@ def compute_vqa_accuracy(result_file, use_chartqa_metric=False):
 def vqav2_eval(input_path):
     """Run VQAv2 evaluation."""
     result_file = merge_input_files(input_path)
-    avg_acc = compute_vqa_accuracy(result_file)
+    avg_acc = compute_vqa_accuracy(result_file, task="VQAv2")
     return avg_acc
 
 

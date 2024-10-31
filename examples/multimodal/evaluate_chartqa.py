@@ -28,7 +28,7 @@ def merge_input_files(input_path):
 def chartqa_eval(input_path):
     """Run ChartQA evaluation."""
     result_file_path = merge_input_files(input_path)
-    return compute_vqa_accuracy(result_file_path, use_chartqa_metric=True)
+    return compute_vqa_accuracy(result_file_path, task="ChartQA")
 
 
 if __name__ == "__main__":

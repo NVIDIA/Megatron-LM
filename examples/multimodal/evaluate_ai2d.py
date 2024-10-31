@@ -7,7 +7,7 @@ from evaluate_vqav2 import compute_vqa_accuracy
 
 def merge_input_files(input_path):
     """Merge input files to a format compatible with the evaluator."""
-    input_file_paths, output_file_path = get_input_output_paths(input_path, task="TextVQA")
+    input_file_paths, output_file_path = get_input_output_paths(input_path, task="AI2D")
 
     results = []
 
@@ -23,19 +23,16 @@ def merge_input_files(input_path):
                     }
                 )
 
-    # Make order deterministic.
-    # results = sorted(results, key=lambda d: d["question_id"])
-
     with open(output_file_path, "w") as output_file:
         json.dump(results, output_file)
 
     return output_file_path
 
 
-def textvqa_eval(input_path):
-    """Run TextVQA evaluation."""
+def ai2d_eval(input_path):
+    """Run AI2D evaluation."""
     result_file_path = merge_input_files(input_path)
-    avg_acc = compute_vqa_accuracy(result_file_path, task="TextVQA")
+    avg_acc = compute_vqa_accuracy(result_file_path, task="AI2D")
     return avg_acc
 
 
@@ -44,6 +41,6 @@ if __name__ == "__main__":
     parser.add_argument('--input-path', type=str, help="Path to input file(s)")
     args = parser.parse_args()
 
-    avg_acc = textvqa_eval(args.input_path)
+    avg_acc = ai2d_eval(args.input_path)
 
-    print(f"===== TextVQA Accuracy {avg_acc:.2f}% =====")
+    print(f"===== AI2D Accuracy {avg_acc:.2f}% =====")
