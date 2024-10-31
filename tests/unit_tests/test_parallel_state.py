@@ -166,6 +166,7 @@ def test_encoder_tensor_pipeline_parallelism(order):
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.internal
 @pytest.mark.parametrize(
     'src_tp_pp, ep_size',
     [
@@ -260,6 +261,7 @@ def test_different_initialize_order_unconsistency(src_tp_pp, ep_size):
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.internal
 @pytest.mark.parametrize(
     'nodes, num_gpu, tp, pp, cp, ep',
     [
