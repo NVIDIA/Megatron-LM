@@ -36,13 +36,25 @@ class LanguageModule(MegatronModule):
         # [b s] => [s b]
         labels = labels.transpose(0, 1).contiguous()
         if self.config.cross_entropy_loss_fusion:
+            if self.config.z_loss_weight > 0.0:
+                raise NotImplementedError(
+                    "z-loss is not yet implemented when enabling cross_entropy_loss_fusion, so "
+                    "it cannot be computed and/or logged. Use z-loss-weight: 0.0, or remove the flag."
+                    )
             loss = fused_vocab_parallel_cross_entropy(logits, labels)
+            losses = (loss, {'ce_loss': None, 'z_loss': None})
         else:
-            loss = tensor_parallel.vocab_parallel_cross_entropy(logits, labels)
+            losses = tensor_parallel.vocab_parallel_cross_entropy(
+                logits, labels, z_loss_weight=self.config.z_loss_weight)
 
         # [s b] => [b, s]
+        loss, extra_logs = losses
         loss = loss.transpose(0, 1).contiguous()
-        return loss
+        extra_logs['ce_loss'] = extra_logs['ce_loss'].transpose(0, 1).contiguous() \
+            if extra_logs['ce_loss'] is not None else None
+        extra_logs['z_loss'] = extra_logs['z_loss'].transpose(0, 1).contiguous() \
+            if extra_logs['z_loss'] is not None else None
+        return loss, extra_logs
 
     def setup_embeddings_and_output_layer(self) -> None:
         """Sets up embedding layer in first stage and output layer in last stage.

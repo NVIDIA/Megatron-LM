@@ -953,6 +953,9 @@ def _add_config_logger_args(parser):
 def _add_logging_args(parser):
     group = parser.add_argument_group(title='logging')
 
+    group.add_argument('--log-z-loss', action='store_true',
+                        help='Log z and c.e losses, in addition to total loss. '
+                        'Only if z-loss-weight > 0.')
     group.add_argument('--log-params-norm', action='store_true',
                        help='If set, calculate and log parameters norm.')
     group.add_argument('--log-num-zeros-in-grad', action='store_true',
@@ -1051,6 +1054,8 @@ def _add_regularization_args(parser):
                        'numerical stability')
     group.add_argument('--sgd-momentum', type=float, default=0.9,
                        help='Momentum factor for sgd')
+    group.add_argument('--z-loss-weight', type=float, default=0.0,
+                       help='Weight for z-loss applied to output logits.')
     return parser
 
 

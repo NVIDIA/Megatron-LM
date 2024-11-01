@@ -110,6 +110,12 @@ class TransformerConfig(ModelParallelConfig):
     """Whether cross entropy loss is calculated over the actual number of non-padded tokens in the
     global batch, versus the default behavior of assuming all tokens are non-padded."""
 
+    z_loss_weight: float = 0.0
+    """Weight for the z-loss in the loss function."""
+
+    z_loss_weight: float = 0.0
+    """Weight for the z-loss in the loss function."""
+
     multi_latent_attention: bool = False
     """Whether to use multi-latent attention."""
 

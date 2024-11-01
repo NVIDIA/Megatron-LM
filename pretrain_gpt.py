@@ -142,8 +142,10 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
             the data parallel ranks
     """
     args = get_args()
-
-    losses = output_tensor.float()
+    
+    total_losses, losses_for_logging = output_tensor
+    ce_losses, z_losses = losses_for_logging['ce_loss'], losses_for_logging['z_loss']
+    losses = total_losses.float()        
     loss_mask = loss_mask.view(-1).float()
     total_tokens = loss_mask.sum()
     loss = torch.cat([torch.sum(losses.view(-1) * loss_mask).view(1), total_tokens.view(1)])
@@ -162,12 +164,27 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     # Reduce loss for logging.
     reporting_loss = loss.clone().detach()
     torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
-
     local_num_tokens = loss[1].clone().detach().to(torch.int)
+
+    log_dict = {'lm loss': (loss[0], loss[1])}
+    if args.log_z_loss and (z_losses is not None):
+        # ce_loss and z_loss are already detached in cross_entropy.py. No need to detach
+        # them here like reporting_loss.
+        z_losses, ce_losses = z_losses.float(), ce_losses.float()
+        z_loss = torch.cat([torch.sum(z_losses.view(-1) * loss_mask).view(1), total_tokens.view(1)])
+        ce_loss = torch.cat([torch.sum(ce_losses.view(-1) * loss_mask).view(1), total_tokens.view(1)])
+        if args.context_parallel_size > 1:
+            torch.distributed.all_reduce(z_loss, group=mpu.get_context_parallel_group())
+            torch.distributed.all_reduce(ce_loss, group=mpu.get_context_parallel_group())
+        torch.distributed.all_reduce(z_loss, group=mpu.get_data_parallel_group())
+        torch.distributed.all_reduce(ce_loss, group=mpu.get_data_parallel_group())
+        log_dict['ce-loss'] = (ce_loss[0], ce_loss[1])
+        log_dict['z-loss'] = (z_loss[0], z_loss[1])
+
     return (
         loss[0] * args.context_parallel_size,
         local_num_tokens,
-        {'lm loss': (reporting_loss[0], reporting_loss[1])},
+        log_dict
     )
 
 
