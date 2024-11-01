@@ -1543,9 +1543,15 @@ def _add_distributed_args(parser):
                        '--tensor-model-parallel-size instead.')
     group.add_argument('--num-layers-per-virtual-pipeline-stage', type=int, default=None,
                        help='Number of layers per virtual pipeline stage')
+    group.add_argument('--microbatch-group-size-per-virtual-pipeline-stage', type=int, default=None,
+                       help='Number of contiguous microbatches per virtual pipeline stage',
+                       dest='microbatch_group_size_per_vp_stage')
     group.add_argument('--no-overlap-p2p-communication', action='store_false',
-                       help='overlap pipeline parallel communication with forward and backward chunks',
+                       help='overlap pipeline parallel communication with forward and backward chunks in 1F1B',
                        dest='overlap_p2p_comm')
+    group.add_argument('--overlap-p2p-communication-warmup-flush', action='store_true',
+                       default=False, help='if set, overlap pipeline parallel communication in warmup and flush',
+                       dest='overlap_p2p_comm_warmup_flush')
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')

@@ -272,6 +272,27 @@ class ModelParallelConfig:
        encoder and decoder (e.g., T5). Ignored if None.
     """
 
+    overlap_p2p_comm_warmup_flush: bool = False
+    """If true, overlap communication and computation in warm up and flush phase.
+       Only valid when overlap_p2p_comm is True and batch_p2p_comm is False. 
+       Defaults to False.
+    """
+
+    microbatch_group_size_per_vp_stage: Optional[int] = None
+    """This value specifies the number of micro-batches that are executed 
+       at a time for a given virtual stage (both forward and backward).
+       Default (in __post_init__() method below) to pipeline_parallel_size 
+       which specifies a depth-first schedule.
+       Example: for PP=2 VP=2, when microbatch_group_size_per_vp_stage=2, 
+       num_microbatches = 4, we have 
+       rank 0 | 0 1 0 1 2 3 2 3
+       rank 1 |   0 1 0 1 2 3 2 3
+       When microbatch_group_size_per_vp_stage=3, num_microbatches = 5, 
+       we have
+       rank 0 | 0 1 2 0 1 2 3 4 3 4 
+       rank 1 |   0 1 2 0 1 2 3 4 3 4
+    """
+
     ###################
     # CPU Offloading
     ###################
@@ -339,6 +360,16 @@ class ModelParallelConfig:
         if self.expert_model_parallel_size > 1 and self.tensor_model_parallel_size > 1:
             if self.sequence_parallel is False:
                 raise ValueError(
-                    "When using expert parallelism and tensor parallelism, sequence parallelism "
-                    "must be used"
+                    "When using expert parallelism and tensor parallelism, "
+                    "sequence parallelism must be used"
+                )
+
+        if self.microbatch_group_size_per_vp_stage is None:
+            self.microbatch_group_size_per_vp_stage = self.pipeline_model_parallel_size
+
+        if self.overlap_p2p_comm_warmup_flush:
+            if not self.overlap_p2p_comm or self.batch_p2p_comm:
+                raise ValueError(
+                    "Pipeline parallel communication overlapping in warmup and flush is only "
+                    "compatible with overlap_p2p_comm but not batch_p2p_comm"
                 )
