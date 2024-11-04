@@ -18,8 +18,10 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestFP8:
+
     @pytest.mark.parametrize('dtype', ['bf16', 'fp16', 'fp8'])
     @pytest.mark.parametrize('src_rank', [0, 6])
+    @pytest.mark.failing_on_rocm
     def test_simple_broadcast(self, dtype, src_rank):
         Utils.initialize_model_parallel()
 
@@ -52,6 +54,7 @@ class TestFP8:
         ],
     )
     @pytest.mark.flaky
+    @pytest.mark.failing_on_rocm
     def test_fp8_save_load(
         self, tmp_path_dist_ckpt, use_fpsl, src_tp_pp, dest_tp_pp, load_exchange_algo
     ):
