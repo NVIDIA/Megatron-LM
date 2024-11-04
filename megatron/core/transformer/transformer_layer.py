@@ -178,6 +178,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
     def _get_layer_offset(self):
         """Get the index number of this layer, given the level of pipelining."""
         pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
+        if not parallel_state.is_inside_encoder():
+            pipeline_rank = (
+                pipeline_rank - parallel_state.get_pipeline_model_parallel_decoder_start()
+            )
 
         num_layers_per_pipeline_rank = (
             self.config.num_layers // self.config.pipeline_model_parallel_size
@@ -194,13 +198,13 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         else:
             # Each stage gets a contiguous set of layers.
-            if parallel_state.get_pipeline_model_parallel_world_size() > 1:
+            if self.config.pipeline_model_parallel_size > 1:
                 if (
                     self.config.first_pipeline_num_layers is not None
                     or self.config.last_pipeline_num_layers is not None
                 ):
                     # Calculate number of pipelines for distributing layers
-                    middle_pipeline_stages = parallel_state.get_pipeline_model_parallel_world_size()
+                    middle_pipeline_stages = self.config.pipeline_model_parallel_size
                     middle_pipeline_stages -= sum(
                         [
                             1 if x is not None else 0

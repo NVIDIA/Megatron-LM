@@ -265,16 +265,8 @@ class ShardedTensor(ShardedBase):
         axis_fragmentations = [1] * (data.ndim + prepend_axis_num)
         _seen_axis = set()
         for axis, axis_rank_offset, axis_fragm in rank_offsets:
-            assert axis >= 0 and axis_rank_offset >= 0 and axis_fragm >= 0, (
-                axis,
-                axis_rank_offset,
-                axis_fragm,
-            )
-            assert (
-                axis_rank_offset < axis_fragm
-            ), 'Rank offset must be lower than axis fragmentation'
-            if axis in _seen_axis:
-                raise CheckpointingException('Duplicated axis specified')
+            if axis < 0 or axis_rank_offset < 0 or axis_fragm < 1 or axis_rank_offset >= axis_fragm:
+                raise CheckpointingException(f'Invalid rank offsets: {rank_offsets} for key {key}.')
             _seen_axis.add(axis)
 
             local_axis_shape = 1 if axis < prepend_axis_num else data.shape[axis - prepend_axis_num]
