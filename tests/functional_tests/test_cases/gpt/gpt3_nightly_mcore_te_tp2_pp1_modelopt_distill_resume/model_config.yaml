@@ -25,8 +25,8 @@ MODEL_ARGS:
   --global-batch-size: 16
   --seq-length: 1024
   --max-position-embeddings: 1024
-  --no-position-embedding: true
-  --use-rotary-position-embeddings: true
+  --position-embedding-type: rope
+  --no-rope-fusion: true  #TODO: We can remove this once upgrading to the DEV container
   --rotary-percent: 0.5
   --swiglu: true
   --untie-embeddings-and-output-weights: true

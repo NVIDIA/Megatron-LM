@@ -37,8 +37,8 @@ MODEL_ARGS:
   # Add network size args
   --apply-layernorm-1p: true
   --untie-embeddings-and-output-weights: true
-  --no-position-embedding: true
-  --use-rotary-position-embeddings: true
+  --position-embedding-type: rope
+  --no-rope-fusion: true  #TODO: We can remove this once upgrading to the DEV container
   --rotary-percent: 0.5
   --squared-relu: true
   --num-layers: 32
