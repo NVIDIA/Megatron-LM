@@ -27,26 +27,27 @@ COPY --from=build_causal_conv1d /opt/causal_conv1d-1.2.2.post1-cp310-cp310-linux
 COPY --from=build_grouped_gemm /opt/grouped_gemm-1.1.2-cp310-cp310-linux_x86_64.whl ./
 COPY --from=build_mamba_ssm /opt/mamba_ssm-2.0.3-cp310-cp310-linux_x86_64.whl ./
 
-RUN pip3 install --extra-index-url https://pypi.nvidia.com --no-cache-dir --upgrade-strategy only-if-needed -v \
-einops \
-flask-restful \
-nltk \
-pytest \
-pytest-cov \
-pytest_mock \
-pytest-random-order \
-sentencepiece \
-tiktoken \
-wrapt \
-zarr \
-wandb \
-triton==2.1.0 \
-causal_conv1d-1.2.2.post1-cp310-cp310-linux_x86_64.whl \
-mamba_ssm-2.0.3-cp310-cp310-linux_x86_64.whl \
-grouped_gemm-1.1.2-cp310-cp310-linux_x86_64.whl \
-tensorstore==0.1.45 \
-nvidia-modelopt[torch]  && \
-rm *.whl
+RUN pip3 uninstall -y nvidia-modelopt[torch] && \
+    pip3 install --extra-index-url https://pypi.nvidia.com --no-cache-dir --upgrade-strategy only-if-needed -v \
+    einops \
+    flask-restful \
+    nltk \
+    pytest \
+    pytest-cov \
+    pytest_mock \
+    pytest-random-order \
+    sentencepiece \
+    tiktoken \
+    wrapt \
+    zarr \
+    wandb \
+    triton==2.1.0 \
+    causal_conv1d-1.2.2.post1-cp310-cp310-linux_x86_64.whl \
+    mamba_ssm-2.0.3-cp310-cp310-linux_x86_64.whl \
+    grouped_gemm-1.1.2-cp310-cp310-linux_x86_64.whl \
+    tensorstore==0.1.45 \
+    nvidia-modelopt[torch]>=0.19.0 && \
+    rm *.whl
 
 # Since megatron does not have any dependencies (and isn't a dependency to any other package), we can install it separately to make everything a bit quicker
 ARG MCORE_REPO
@@ -59,6 +60,7 @@ rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
 git init
 git remote add origin ${MCORE_REPO}
 git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+git fetch origin $MCORE_REF
 git checkout $MCORE_REF
 
 # Checkout backwards-ref
