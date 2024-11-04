@@ -1,17 +1,19 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+import os
 from argparse import Namespace
 from collections import deque
 from typing import Any, List, Tuple
 
 import numpy
 import torch
+from packaging.version import Version as PkgVersion
 
 from megatron.core import tensor_parallel
-from megatron.core.datasets.t5_dataset import T5MaskedWordPieceDataset
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
 from megatron.core.models.T5 import T5Model
+from megatron.core.utils import get_te_version
 
 
 class T5InferenceWrapper(AbstractModelInferenceWrapper):
@@ -59,32 +61,17 @@ class T5InferenceWrapper(AbstractModelInferenceWrapper):
         encoder_prompts_tokens = self.batch_encoder_prompts_tokens.cpu().numpy()
         self.batch_mask_encoder = []
         self.batch_mask_decoder = []
-        self.batch_mask_encoder_decoder = []
         for i in range(len(self.prompts_tokens)):
-            self.batch_mask_encoder.append(
-                T5MaskedWordPieceDataset._make_attention_mask(
-                    encoder_prompts_tokens[i], encoder_prompts_tokens[i]
-                )
-            )
-            self.batch_mask_decoder.append(
-                T5MaskedWordPieceDataset._make_attention_mask(
-                    decoder_prompts_tokens[i], decoder_prompts_tokens[i]
-                )
-                * T5MaskedWordPieceDataset._make_history_mask(decoder_prompts_tokens[i])
-            )
-            self.batch_mask_encoder_decoder.append(
-                T5MaskedWordPieceDataset._make_attention_mask(
-                    decoder_prompts_tokens[i], encoder_prompts_tokens[i]
-                )
-            )
-        self.batch_mask_encoder = torch.tensor(numpy.array(self.batch_mask_encoder)).cuda()
-        self.batch_mask_decoder = torch.tensor(numpy.array(self.batch_mask_decoder)).cuda()
-        self.batch_mask_encoder_decoder = torch.tensor(
-            numpy.array(self.batch_mask_encoder_decoder)
-        ).cuda()
-        self.batch_mask_encoder = self.batch_mask_encoder < 0.5
-        self.batch_mask_decoder = self.batch_mask_decoder < 0.5
-        self.batch_mask_encoder_decoder = self.batch_mask_encoder_decoder < 0.5
+            mask_encoder = encoder_prompts_tokens[i] == tokenizer.pad
+            mask_decoder = decoder_prompts_tokens[i] == tokenizer.pad
+            self.batch_mask_encoder.append(mask_encoder)
+            self.batch_mask_decoder.append(mask_decoder)
+        self.batch_mask_encoder = (
+            torch.tensor(numpy.array(self.batch_mask_encoder)).unsqueeze(1).unsqueeze(1).cuda()
+        )
+        self.batch_mask_decoder = (
+            torch.tensor(numpy.array(self.batch_mask_decoder)).unsqueeze(1).unsqueeze(1).cuda()
+        )
 
     def tokenize_encoder_prompt(
         self, encoder_prompt: str, tokenizer
@@ -156,13 +143,32 @@ class T5InferenceWrapper(AbstractModelInferenceWrapper):
             List: A list of inputs that will be used by your model in the forward step
         """
 
-        # rerun encoder every step
         # T5 inference not yet support kv_cache
         encoder_tokens2use = self.batch_encoder_prompts_tokens
         decoder_tokens2use = self.prompts_tokens[:, :context_end_position]
         encoder_mask2use = self.batch_mask_encoder
-        decoder_mask2use = self.batch_mask_decoder[:, :context_end_position, :context_end_position]
-        encoder_decoder_mask2use = self.batch_mask_encoder_decoder[:, :context_end_position, :]
+        decoder_mask2use = self.batch_mask_decoder[:, :, :, :context_end_position]
+        encoder_decoder_mask2use = (decoder_mask2use, encoder_mask2use)
+
+        # For older TE version, cross-attention mask is
+        #   configued as [bs, 1, q_len, kv_len]
+        # For newer TE version, cross-attention mask is
+        #   configued as ([bs, 1, 1, q_len], [bs, 1, 1, kv_len])
+        flash_attention_enabled = os.getenv('NVTE_FLASH_ATTN') == '1'
+        fused_attention_enabled = os.getenv('NVTE_FUSED_ATTN') == '1'
+        if get_te_version() < PkgVersion("1.10.0"):
+            if not (flash_attention_enabled) and not (fused_attention_enabled):
+                batch_size = encoder_tokens2use.shape[0]
+                encoder_decoder_mask2use = []
+                for i in range(batch_size):
+                    source_block = decoder_tokens2use[i]
+                    target_block = encoder_tokens2use[i]
+                    mask = (target_block[None, :] >= 1) * (source_block[:, None] >= 1)
+                    mask = ~(mask)  # flip True to False
+                    encoder_decoder_mask2use.append(mask)
+                encoder_decoder_mask2use = torch.stack(encoder_decoder_mask2use)
+                encoder_decoder_mask2use = encoder_decoder_mask2use.unsqueeze(1)
+
         data_at_step_idx = [
             encoder_tokens2use,
             decoder_tokens2use,
