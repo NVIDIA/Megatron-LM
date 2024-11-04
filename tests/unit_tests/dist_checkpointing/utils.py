@@ -113,6 +113,8 @@ def init_basic_mock_args(args, tp, pp, bf16=True):
     args.ddp_average_in_collective = False
     args.tensor_model_parallel_size = tp
     args.pipeline_model_parallel_size = pp
+    args.encoder_tensor_model_parallel_size = 0
+    args.encoder_pipeline_model_parallel_size = 0
     args.enable_ft_package = False
     return args
 

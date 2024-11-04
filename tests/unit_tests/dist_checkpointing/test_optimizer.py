@@ -279,6 +279,8 @@ class TestDistributedOptimizer:
                 Utils.destroy_model_parallel()
 
                 Utils.initialize_model_parallel(*dest_tp_pp)
+                mock_args.tensor_model_parallel_size = dest_tp_pp[0]
+                mock_args.pipeline_model_parallel_size = dest_tp_pp[1]
                 model, optimizer = setup_model_and_optimizer(
                     seed=3,
                     tp=dest_tp_pp[0],
@@ -291,7 +293,10 @@ class TestDistributedOptimizer:
                 # Load with different TPxPP should raise DistributeOptimizer error
                 with pytest.raises(RuntimeError) as exc_info:
                     load_checkpoint_no_arg_checks(model, optimizer, None)
-                assert "(TP, PP) mismatch" in str(exc_info.value)
+                # "(TP, PP) mismatch" check is for backwards compatibility tests
+                assert "(TP, PP) mismatch" in str(
+                    exc_info.value
+                ) or "(TP, PP, encoder TP, encoder PP) mismatch" in str(exc_info.value)
 
                 # Check that the state didn't change
                 assert not any(diff(model[0].state_dict(), model_unloaded_state_dict))
