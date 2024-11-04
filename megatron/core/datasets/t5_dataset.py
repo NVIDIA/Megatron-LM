@@ -45,13 +45,15 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
     """The T5 dataset that assumes WordPiece tokenization
 
     Args:
-        indexed_dataset (IndexedDataset): The IndexedDataset around which to build the MegatronDataset
+        indexed_dataset (IndexedDataset): The IndexedDataset around
+            which to build the MegatronDataset
 
         dataset_path (str): The real path on disk to the dataset, for bookkeeping
 
         indexed_indices (numpy.ndarray): The set of the documents indices to expose
 
-        num_samples (Optional[int]): The number of samples to draw from the indexed dataset. When None, build as many samples as correspond to one epoch.
+        num_samples (Optional[int]): The number of samples to draw from the indexed
+            dataset. When None, build as many samples as correspond to one epoch.
 
         index_split (Split): The indexed_indices Split
 
@@ -160,10 +162,9 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
         )
 
         # Create attention and history masks
-        mask_encoder = self._make_attention_mask(encoder_input, encoder_input)
-        mask_encoder_decoder = self._make_attention_mask(decoder_input, encoder_input)
-        mask_decoder = self._make_attention_mask(decoder_input, decoder_input)
-        mask_decoder = mask_decoder * self._make_history_mask(decoder_input)
+        mask_encoder = numpy.array([1] * length_toks_encoder + [0] * length_pads_encoder)
+        mask_decoder = numpy.array([1] * length_toks_decoder + [0] * length_pads_decoder)
+        mask_encoder_decoder = None
 
         # Mask the labels
         decoder_output = numpy.array(decoder_output, dtype=numpy.int64)
@@ -181,7 +182,6 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
             "truncated": int(truncated),
             "enc_mask": mask_encoder,
             "dec_mask": mask_decoder,
-            "enc_dec_mask": mask_encoder_decoder,
         }
 
     @staticmethod
