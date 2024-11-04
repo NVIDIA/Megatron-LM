@@ -35,8 +35,8 @@ MODEL_ARGS:
   --num-workers: 6
   # Add network size args
   --untie-embeddings-and-output-weights: true
-  --no-position-embedding: true
   --position-embedding-type: rope
+  --no-rope-fusion: true  #TODO: We can remove this once upgrading to the DEV container
   --rotary-percent: 1.0
   --normalization: RMSNorm
   --swiglu: true
