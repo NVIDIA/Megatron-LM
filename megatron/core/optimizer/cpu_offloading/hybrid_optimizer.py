@@ -1,9 +1,10 @@
 import torch
-
+from collections import defaultdict
+from typing import Dict
 
 class HybridDeviceOptimizer(torch.optim.Optimizer):
     def __init__(
-        self, params, offload_ratio=0.5, cpu_optimizer_cls=None, gpu_optimizer_cls=None, **kwargs
+        self, params, offload_ratio=0.5, cpu_optimizer_cls=None, gpu_optimizer_cls=None, pin_cpu_grads: bool=True, **kwargs
     ):
         super(HybridDeviceOptimizer, self).__init__(params, defaults={})
         self.params = params.copy()
@@ -15,8 +16,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             self.gpu_params_map_cpu_copy,
             self.cpu_copys_map_gpu_param,
         ) = self._split_parameters_updated_on_the_cpu_and_gpu()
+        self.pin_cpu_grads = pin_cpu_grads
         self.cpu_optimizer = cpu_optimizer_cls(self.cpu_params, **kwargs)
         self.gpu_optimizer = gpu_optimizer_cls(self.gpu_params, **kwargs)
+        self.cpu_copy_map_grad: Dict[torch.Tensor, torch.Tensor] = defaultdict(torch.Tensor)
 
         self.register_grad_cpu_copy_hook()
         self.register_param_copy_back_gpu_hook()
@@ -25,8 +28,14 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         def grad_cpu_copy_hook_closure():
             def grad_cpu_copy_hook(optimizer, args, kwargs):
                 for gpu_param, cpu_copy in self.gpu_params_map_cpu_copy.items():
-                    cpu_copy.grad = gpu_param.grad.cpu()
-
+                    if cpu_copy not in self.cpu_copy_map_grad:
+                        self.cpu_copy_map_grad[cpu_copy] = torch.empty(
+                            gpu_param.grad.shape,
+                            dtype=gpu_param.grad.dtype,
+                            pin_memory=self.pin_cpu_grads
+                        )
+                    self.cpu_copy_map_grad[cpu_copy].data.copy_(gpu_param.grad, non_blocking=True)
+                    cpu_copy.grad = self.cpu_copy_map_grad[cpu_copy]
             return grad_cpu_copy_hook
 
         self.register_step_pre_hook(grad_cpu_copy_hook_closure())
@@ -101,3 +110,4 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             offloaded_params_numel += param.numel()
 
         return cpu_params, gpu_params, gpu_params_map_cpu_copy, cpu_copys_map_gpu_param
+
