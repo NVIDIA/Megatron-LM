@@ -32,6 +32,6 @@ products:
   - scope: [nightly]
     platforms: [dgx_a100]
     time_limit: [1200]
-    environment: [lts, dev]
+    environment: [lts] # Disable dev for now
     test_case:
       - gpt3_nightly_mcore_te_tp2_pp1_modelopt_distill_resume
