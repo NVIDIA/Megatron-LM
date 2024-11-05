@@ -12,55 +12,46 @@ def show_node_info() {
     """
 }
 
-def clean_up_docker() {
-    sh 'docker ps -a || true' // "|| true" suppresses errors
-    sh 'docker kill $(docker ps -q) || true'
-    sh 'docker rm $(docker ps -a -q) || true'
-    sh 'docker rmi $(docker images -q) || true'
-    sh 'docker system prune -af --volumes || true'
-}
+DOCKER_IMAGE = "megatron-lm"
+CONTAINER_NAME = "megatron-lm-container"
+DOCKER_BUILD_ARGS = "--build-arg PYTORCH_ROCM_ARCH_OVERRIDE=gfx90a"
+DOCKER_RUN_ARGS = "-v \$(pwd):/workspace/Megatron-LM/output --workdir /workspace/Megatron-LM --entrypoint /workspace/Megatron-LM/run_unit_tests.sh"
 
-def clean_up_docker_container() {
-    sh 'docker ps -a || true' // "|| true" suppresses errors
-    sh 'docker kill $(docker ps -q) || true'
-}
-
-//makes sure multiple builds are not triggered for branch indexing
-def resetbuild() {
-    if(currentBuild.getBuildCauses().toString().contains('BranchIndexingCause')) {
-        def milestonesList = []
-        def build = currentBuild
-
-        while(build != null) {
-            if(build.getBuildCauses().toString().contains('BranchIndexingCause')) {
-                milestonesList.add(0, build.number)
-            }
-            build = build.previousBuildInProgress
-        }
-
-        for (buildNum in milestonesList) {
-            milestone(buildNum)
-        }
-    }
-}
-
+DOCKER_RUN_CMD= "docker run --rm -t --network host -u root --group-add video --cap-add=SYS_PTRACE --cap-add SYS_ADMIN --device /dev/fuse --security-opt seccomp=unconfined --security-opt apparmor=unconfined --ipc=host --device=/dev/kfd --device=/dev/dri"
 pipeline {
-    agent any
+    parameters {
+        string(name: 'TEST_NODE_LABEL', defaultValue: 'MI250', description: 'Node or Label to launch Jenkins Job')
+    }
+
+    agent {node {label "${params.TEST_NODE_LABEL}"}}
 
     stages {
-        stage('Build') {
-            steps {
-                echo 'Building..'
-            }
-        }
-        stage('Test') {
-            steps {
-                echo 'Testing..'
-            }
-        }
-        stage('Deploy') {
+        stage('Build Docker Image') {
             steps {
                 show_node_info()
+                script {
+                    sh "docker build  -f Dockerfile_rocm_ci -t ${DOCKER_IMAGE}  ${DOCKER_BUILD_ARGS} ."
+                    }
+                }
+            }
+
+        stage('Run Docker Container') {
+            steps {
+                script {
+                    wrap([$class: 'AnsiColorBuildWrapper', 'colorMapName': 'xterm']) {
+                        sh "${DOCKER_RUN_CMD} ${DOCKER_RUN_ARGS} --name ${CONTAINER_NAME} ${DOCKER_IMAGE} "
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            //Cleanup
+            archiveArtifacts artifacts: 'test_report.csv'
+            script {
+                sh "docker rmi ${DOCKER_IMAGE}"
             }
         }
     }
