@@ -31,6 +31,8 @@ We propose a generalizable method to integrate Vocabulary Parallelism with exist
 - Vocabulary Parallelism with 2 all-reduce communication barriers (enable using `--disable-fb-fusion`)
   ![Vocabulary Parallelism with 2 all-reduce communication barriers](images/schedule-vocab-2.png)
 
+An implementation of Vocabulary Parallelism on the *V-Half* schedule can be found at [this branch of the Zero Bubble Pipeline Parallelism repository](https://github.com/sail-sg/zero-bubble-pipeline-parallelism/tree/v-half-vocab).
+
 For comparison, we also implement the interlaced pipeline ([Lin et al., 2024](https://www.usenix.org/conference/osdi24/presentation/lin-zhiqi)) which uses a tensor parallel style to handle the vocabulary layers.
 
 - Interlaced Pipeline (enable using `--use-interlaced-schedule`)
@@ -55,7 +57,4 @@ Vocabulary Parallelism resuls in a 5% to 51% improvement in throughput compared 
 ![](images/expt-pp32-flops.png)
 
 ![](images/expt-pp32-mem.png)
-
-
-
 
