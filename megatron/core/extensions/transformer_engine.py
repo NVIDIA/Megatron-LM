@@ -12,7 +12,6 @@ import transformer_engine as te
 from packaging.version import Version as PkgVersion
 from torch import Tensor
 from torch.nn.parameter import Parameter
-from transformer_engine.pytorch.export import is_in_onnx_export_mode
 
 from megatron.core import ModelParallelConfig, parallel_state
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
@@ -846,11 +845,8 @@ if is_te_min_version("1.9.0.dev0"):
             return out, None
 
         def _encode_extra_state(self, state):
-            if is_in_onnx_export_mode():
-                state_serialized = torch.frombuffer(pickle.dumps(state), dtype=torch.uint8)
-            else:
-                state_serialized = io.BytesIO()
-                torch.save(state, state_serialized)
+            state_serialized = io.BytesIO()
+            torch.save(state, state_serialized)
             return state_serialized
 
         def _decode_extra_state(self, state):
