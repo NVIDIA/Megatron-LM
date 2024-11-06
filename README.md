@@ -2,13 +2,18 @@ This repository is a fork of [Megatron-LM](https://github.com/NVIDIA/Megatron-LM
 
 # Balancing Pipeline Parallelism with Vocabulary Parallelism
 
-Vocabulary Parallelism is a novel technique that balances the computation and memory in pipeline parallelism.
+Vocabulary Parallelism is a novel technique that balances the computation and memory of vocabulary layers in pipeline parallelism.
 
 Check out our paper at [arxiv (TODO)]().
 
 **Quick Start**
 
-Run `pretrain_gpt.sh` with `VOCAB_PARALLEL=1`. This script comes with a dataset with varying vocabulary sizes of 32k, 64k, 128k and 256k. Change the vocabulary size by setting `VOCAB_SIZE` to either `32k`, `64k`, `128k` or `256k`.
+Run
+```shell
+VOCAB_PARALLEL=1 VOCAB_SIZE=256k pretrain_gpt.sh
+```
+
+This script comes with a dataset with varying vocabulary sizes of 32k, 64k, 128k and 256k. Change the vocabulary size by setting `VOCAB_SIZE` to either `32k`, `64k`, `128k` or `256k`.
 
 Alternatively, include the argument `--enable-vocab-parallel` when training with the GPT model. Vocabulary Parallelism is not yet supported for the other models.
 
