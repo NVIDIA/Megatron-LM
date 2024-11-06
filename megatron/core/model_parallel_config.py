@@ -30,6 +30,11 @@ class ModelParallelConfig:
        arxiv.org/pdf/2104.04473.pdf for more details.
     """
 
+    final_stage_num_layers: Optional[int] = None
+    """Used when layer redistribution is enabled. Sets the number of transformer layers handled
+       by the last pipeline stage.
+    """
+
     sequence_parallel: bool = False
     """Makes tensor parallelism more memory efficient for LLMs (20B+) by parallelizing layer norms
        and dropout sequentially.  See Reducing Activation Recomputation in Large Transformer Models

@@ -15,7 +15,14 @@ from .language_model import get_language_model
 
 def post_language_model_processing(lm_output, labels, logit_weights,
                                    parallel_output,
-                                   fp16_lm_cross_entropy):
+                                   fp16_lm_cross_entropy, output_layer):
+    
+    if get_args().enable_vocab_parallel:
+        assert labels is not None, "not supported yet"
+        labels = labels.transpose(0,1).contiguous()
+        loss, _ = output_layer(lm_output, weight=logit_weights, labels=labels)
+        loss = loss.transpose(0,1).contiguous()
+        return loss
 
     # Output. Format [s b h]
     output = parallel_lm_logits(
@@ -48,7 +55,10 @@ class GPTModel(MegatronModule):
                  num_tokentypes=0,
                  parallel_output=True,
                  pre_process=True,
-                 post_process=True):
+                 post_process=True,
+                 split_vocab_embedding: bool = False,
+                 noop_block: bool = False,
+                 include_layer_norm: bool = False):
         args = get_args()
         super().__init__(config=config, share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights)
 
@@ -64,7 +74,10 @@ class GPTModel(MegatronModule):
             add_pooler=False,
             encoder_attn_mask_type=AttnMaskType.causal,
             pre_process=self.pre_process,
-            post_process=self.post_process)
+            post_process=self.post_process,
+            split_vocab_embedding=split_vocab_embedding,
+            noop_block=noop_block,
+            include_layer_norm=include_layer_norm)
         
         if not args.untie_embeddings_and_output_weights:
             self.initialize_word_embeddings()
@@ -93,7 +106,8 @@ class GPTModel(MegatronModule):
                 lm_output, labels,
                 self.language_model.output_layer.weight if self.untie_embeddings_and_output_weights else self.shared_embedding_or_output_weight(),
                 self.parallel_output,
-                self.fp16_lm_cross_entropy)
+                self.fp16_lm_cross_entropy,
+                self.language_model.output_layer)
         else:
             return lm_output
 

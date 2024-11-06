@@ -392,6 +392,43 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             )
             this_model.model_type = model_type
             model.append(this_model)
+    elif args.enable_vocab_parallel:
+        pre_process = mpu.is_pipeline_first_stage()
+        add_encoder = True
+        add_decoder = True
+        assert model_type != ModelType.encoder_and_decoder, \
+            'vocab parallel is not yet supported in encoder-decoder models'
+        model = [
+            model_provider_func(
+                pre_process=pre_process,
+                post_process=False,
+                split_vocab_embedding=pre_process,
+                include_layer_norm=mpu.is_pipeline_last_stage(),
+            ),
+            model_provider_func(
+                pre_process=False,
+                post_process=True,
+                noop_block=True,
+            ),
+            model_provider_func(
+                pre_process=False,
+                post_process=False,
+                split_vocab_embedding=True,
+                noop_block=True,
+            )
+        ]
+        model[0].model_type = model_type
+        model[1].model_type = model_type
+        model[2].model_type = model_type
+        if mpu.is_pipeline_last_stage() and (not args.use_interlaced_schedule):
+            model.append(
+                model_provider_func(
+                    pre_process=False,
+                    post_process=False,
+                    noop_block=True,
+                )
+            )
+            model[3].model_type = model_type
     else:
         pre_process = mpu.is_pipeline_first_stage()
         post_process = mpu.is_pipeline_last_stage()
@@ -1068,6 +1105,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
            torch.distributed.get_rank() in args.profile_ranks:
             torch.cuda.cudart().cudaProfilerStart()
             torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
+        
+        if args.profile:
+            torch.cuda.nvtx.range_push(f"Iteration {iteration + 1}")
 
         maybe_finalize_async_save(False)
 
@@ -1171,6 +1211,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             if args.use_distributed_optimizer and args.overlap_param_gather:
                 optimizer.enable_pre_hook()
             timers('interval-time', log_level=0).start(barrier=True)
+
+        if args.profile:
+            torch.cuda.nvtx.range_pop()
 
         # Checkpointing
         saved_checkpoint = False

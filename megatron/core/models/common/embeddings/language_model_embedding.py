@@ -8,7 +8,7 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-
+from megatron.core.tensor_parallel.vocab_input_store import VocabInputStore
 
 class LanguageModelEmbedding(MegatronModule):
     """Language model embeddings.
@@ -30,6 +30,8 @@ class LanguageModelEmbedding(MegatronModule):
         max_sequence_length: int,
         position_embedding_type: Literal['learned_absolute', 'rope', 'none'] = 'learned_absolute',
         num_tokentypes: int = 0,
+        split_vocab_embedding: bool = False,
+        vocab_embedding_only: bool = False,
     ):
         super().__init__(config=config)
 
@@ -43,15 +45,28 @@ class LanguageModelEmbedding(MegatronModule):
             and self.num_tokentypes <= 0
             and self.config.sequence_parallel
         )
+        self.split_vocab_embedding = split_vocab_embedding
+        self.vocab_embedding_only = vocab_embedding_only
+
+        if self.vocab_embedding_only:
+            self.word_embeddings = tensor_parallel.VocabParallelInput(
+                num_embeddings=self.vocab_size,
+                embedding_dim=self.config.hidden_size,
+                init_method=self.config.init_method,
+                reduce_scatter_embeddings=self.reduce_scatter_embeddings,
+                config=self.config,
+            )
+            return
 
         # Word embeddings (parallel).
-        self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
-            num_embeddings=self.vocab_size,
-            embedding_dim=self.config.hidden_size,
-            init_method=self.config.init_method,
-            reduce_scatter_embeddings=self.reduce_scatter_embeddings,
-            config=self.config,
-        )
+        if not self.split_vocab_embedding:
+            self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
+                num_embeddings=self.vocab_size,
+                embedding_dim=self.config.hidden_size,
+                init_method=self.config.init_method,
+                reduce_scatter_embeddings=self.reduce_scatter_embeddings,
+                config=self.config,
+            )
 
         # Position embedding (serial).
         if self.add_position_embedding:
@@ -78,6 +93,7 @@ class LanguageModelEmbedding(MegatronModule):
 
     def zero_parameters(self):
         """Zero out all parameters in embedding."""
+
         self.word_embeddings.weight.data.fill_(0)
         self.word_embeddings.weight.shared = True
         self.position_embeddings.weight.data.fill_(0)
@@ -97,7 +113,14 @@ class LanguageModelEmbedding(MegatronModule):
         Returns:
             Tensor: The output embeddings
         """
-        word_embeddings = self.word_embeddings(input_ids)
+        if self.vocab_embedding_only:
+            word_embeddings = self.word_embeddings(input_ids)
+            return word_embeddings
+        if not self.split_vocab_embedding:
+            word_embeddings = self.word_embeddings(input_ids)
+        else:
+            word_embeddings = VocabInputStore.forward_get()
+
         if self.add_position_embedding:
             position_embeddings = self.position_embeddings(position_ids)
             embeddings = word_embeddings + position_embeddings

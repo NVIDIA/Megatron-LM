@@ -1,4 +1,6 @@
+from .vocab_output import VocabParallelOutput
 from .cross_entropy import vocab_parallel_cross_entropy
+from .vocab_input import VocabParallelInput
 from .data import broadcast_data
 from .layers import (
     ColumnParallelLinear,

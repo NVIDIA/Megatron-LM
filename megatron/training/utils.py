@@ -300,7 +300,6 @@ def append_to_progress_log(string, barrier=True):
 
 
 def get_batch_on_this_tp_rank(data_iterator):
-
     args = get_args()
 
     def _broadcast(item):
@@ -322,7 +321,7 @@ def get_batch_on_this_tp_rank(data_iterator):
            'position_ids': data["position_ids"].cuda(non_blocking = True)
        }
 
-       if args.pipeline_model_parallel_size == 1:
+       if (args.enable_vocab_parallel) or (args.pipeline_model_parallel_size == 1):
            _broadcast(batch['tokens'])
            _broadcast(batch['labels'])
            _broadcast(batch['loss_mask'])
@@ -352,7 +351,7 @@ def get_batch_on_this_tp_rank(data_iterator):
            attention_mask=None
        position_ids=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
 
-       if args.pipeline_model_parallel_size == 1:
+       if (args.enable_vocab_parallel) or (args.pipeline_model_parallel_size == 1):
            _broadcast(tokens)
            _broadcast(labels)
            _broadcast(loss_mask)
