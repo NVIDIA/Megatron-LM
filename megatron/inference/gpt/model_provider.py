@@ -150,7 +150,10 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
         transformer_layer_spec = import_module(args.spec)
     else:
         transformer_layer_spec = get_gpt_layer_modelopt_spec(
-            remap_te_layernorm=args.export_te_mcore_model, qk_layernorm=False
+            num_experts=args.num_experts,
+            moe_grouped_gemm=args.moe_grouped_gemm,
+            remap_te_layernorm=args.export_te_mcore_model,
+            qk_layernorm=False,
         )
 
     model_kwargs = {
