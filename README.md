@@ -33,7 +33,7 @@ We propose a generalizable method to integrate Vocabulary Parallelism with exist
 - Vocabulary Parallelism with 1 all-reduce communication barrier (default)
   ![Vocabulary Parallelism with 1 all-reduce communication barrier](images/schedule-vocab-1.png)
 
-- Vocabulary Parallelism with 2 all-reduce communication barriers (enable using `--disable-fb-fusion`)
+- Vocabulary Parallelism with 2 all-reduce communication barriers (enable using `--disable-backward-fusion`)
   ![Vocabulary Parallelism with 2 all-reduce communication barriers](images/schedule-vocab-2.png)
 
 An implementation of Vocabulary Parallelism on the *V-Half* schedule can be found at [this branch of the Zero Bubble Pipeline Parallelism repository](https://github.com/sail-sg/zero-bubble-pipeline-parallelism/tree/v-half-vocab).
