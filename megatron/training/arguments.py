@@ -1235,8 +1235,12 @@ def _add_training_args(parser):
                        help='Enable bias only in the QKV linear layers',
                        dest='add_qkv_bias')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'hybridadam'],
+                       choices=['adam', 'sgd'],
                        help='Optimizer function')
+    group.add_argument('--optimizer-cpu-offloading', action='store_true',
+                       help='Offload optimizer state to CPU')
+    group.add_argument('--optimizer-offload-fraction', type=float, default=1.0,
+                          help='Ratio of optimizer state to offload to CPU')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic', 'external'],
                        help='Single pass vs multiple pass data loader')

@@ -32,7 +32,7 @@ def test_multi_device_hybrid_optimizer():
 
     hdo = HybridDeviceOptimizer(
         list(net.parameters()),
-        offload_ratio=0.5,
+        offload_fraction=0.5,
         cpu_optimizer_cls=Adam,
         gpu_optimizer_cls=FusedAdam,
         lr=0.1,

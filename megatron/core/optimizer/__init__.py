@@ -3,6 +3,7 @@ import logging
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
+from torch.optim import Adam as CPUAdam, SGD as CPUSGD
 
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as Adam
@@ -35,8 +36,10 @@ from .optimizer import (
     Float16OptimizerWithFloat16Params,
     FP32Optimizer,
     MegatronOptimizer,
+    MegatronHybridDeviceOptimizer,
 )
 from .optimizer_config import OptimizerConfig
+from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 
 logger = logging.getLogger(__name__)
 
@@ -259,8 +262,36 @@ def _get_megatron_optimizer_based_on_param_groups(
     Returns:
         Instance of MegatronOptimizer.
     """
-    cpu_offload = False
-    if config.optimizer == 'adam':
+    if config.optimizer_cpu_offloading:
+        gpu_optimizer_cls = Adam if config.optimizer == 'adam' else SGD
+        cpu_optimizer_cls = CPUAdam if config.optimizer == 'adam' else CPUSGD
+        if config.optimizer == 'adam':
+            gpu_optimizer_cls = Adam
+            cpu_optimizer_cls = CPUAdam
+            optimizer_defaults = dict(
+                lr=config.lr,
+                weight_decay=config.weight_decay,
+                betas=(config.adam_beta1, config.adam_beta2),
+                eps=config.adam_eps,
+            )
+        else:
+            gpu_optimizer_cls = SGD
+            cpu_optimizer_cls = CPUSGD
+            optimizer_defaults = dict(
+                lr=config.lr,
+                weight_decay=config.weight_decay,
+                momentum=config.sgd_momentum,
+            )
+        hdo = HybridDeviceOptimizer(
+            param_groups,
+            offload_fraction=config.optimizer_offload_fraction,
+            cpu_optimizer_cls=cpu_optimizer_cls,
+            gpu_optimizer_cls=gpu_optimizer_cls,
+            **optimizer_defaults,
+        )
+        optimizer = MegatronHybridDeviceOptimizer(hdo)
+        init_state_fn = None
+    elif config.optimizer == 'adam':
         optimizer = Adam(
             param_groups,
             lr=config.lr,
@@ -284,21 +315,6 @@ def _get_megatron_optimizer_based_on_param_groups(
             momentum=config.sgd_momentum,
         )
         init_state_fn = None
-    elif config.optimizer == 'hybridadam' :
-        assert config.use_distributed_optimizer, \
-            "Currently HybridAdam must be wrapped with OffloadDistributedOptimizer!"
-        from .offload_distrib_optimizer import OffloadDistributedOptimizer
-        from .hybrid_adam import HybridAdam        
-        optimizer = HybridAdam(
-            param_groups,
-            lr=config.lr,
-            weight_decay=config.weight_decay,
-            betas=(config.adam_beta1, config.adam_beta2),
-            eps=config.adam_eps,
-        )
-        init_state_fn = None
-        
-        cpu_offload = True
     else:
         raise Exception('{} optimizer is not supported.'.format(config.optimizer))
 
@@ -334,24 +350,14 @@ def _get_megatron_optimizer_based_on_param_groups(
 
         optimizer_args = [optimizer, config, grad_scaler, init_state_fn]
         if config.use_distributed_optimizer:
-            if cpu_offload:
-                optimizer = OffloadDistributedOptimizer(
-                    *optimizer_args,
-                    model_chunks=model_chunks,
-                    per_model_buffers=per_model_buffers,
-                    data_parallel_group=data_parallel_group,
-                    data_parallel_group_gloo=data_parallel_group_gloo,
-                    data_parallel_group_idx=data_parallel_group_idx,
-                )
-            else:
-                optimizer = DistributedOptimizer(
-                    *optimizer_args,
-                    model_chunks=model_chunks,
-                    per_model_buffers=per_model_buffers,
-                    data_parallel_group=data_parallel_group,
-                    data_parallel_group_gloo=data_parallel_group_gloo,
-                    data_parallel_group_idx=data_parallel_group_idx,
-                )
+            optimizer = DistributedOptimizer(
+                *optimizer_args,
+                model_chunks=model_chunks,
+                per_model_buffers=per_model_buffers,
+                data_parallel_group=data_parallel_group,
+                data_parallel_group_gloo=data_parallel_group_gloo,
+                data_parallel_group_idx=data_parallel_group_idx,
+            )
         else:
             optimizer = Float16OptimizerWithFloat16Params(*optimizer_args)
             setattr(optimizer, 'model_parallel_group', model_parallel_group)
