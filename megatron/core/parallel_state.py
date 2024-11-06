@@ -16,6 +16,7 @@ from .utils import GlobalMemoryBuffer
 _TENSOR_MODEL_PARALLEL_GROUP = None
 # Inter-layer model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
+_LM_HEAD_MODEL_PARALLEL_GROUP = None
 # Model parallel group (both intra- and pipeline) that the current rank belongs to.
 _MODEL_PARALLEL_GROUP = None
 # Model parallel group (both intra-, pipeline, and expert) that the current rank belongs to.
@@ -42,6 +43,8 @@ _DATA_MODULO_EXPERT_PARALLEL_GROUP_WITH_CP_GLOO = None
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = None
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = None
 _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = None
+
+_VIRTUAL_VOCAB_PARALLEL_CHUNK = None
 
 _PIPELINE_MODEL_PARALLEL_DECODER_START = None
 
@@ -104,14 +107,14 @@ def get_nccl_options(pg_name, nccl_comm_cfgs):
 
     When an option (e.g., max_ctas) is not found in the config, use the NCCL default setting.
     """
+    nccl_options = torch.distributed.ProcessGroupNCCL.Options()
     if pg_name in nccl_comm_cfgs:
-        nccl_options = torch.distributed.ProcessGroupNCCL.Options()
         nccl_options.config.cga_cluster_size = nccl_comm_cfgs[pg_name].get('cga_cluster_size', 4)
         nccl_options.config.max_ctas = nccl_comm_cfgs[pg_name].get('max_ctas', 32)
         nccl_options.config.min_ctas = nccl_comm_cfgs[pg_name].get('min_ctas', 1)
-        return nccl_options
-    else:
-        return None
+    if (pg_name == "tp") or (pg_name == "pp") or (pg_name == "mp"):
+        nccl_options.is_high_priority_stream = True
+    return nccl_options
 
 
 def generate_masked_orthogonal_rank_groups(
@@ -641,10 +644,13 @@ def initialize_model_parallel(
 
     # Build the pipeline model-parallel groups and embedding groups
     # (first and last rank in each pipeline model-parallel group).
-    global _PIPELINE_MODEL_PARALLEL_GROUP
+    # An additional group separates the vocabulary layer communncation from the others
+    # to avoid deadlocks.
+    global _PIPELINE_MODEL_PARALLEL_GROUP, _LM_HEAD_MODEL_PARALLEL_GROUP
     global _PIPELINE_GLOBAL_RANKS
     assert (
-        _PIPELINE_MODEL_PARALLEL_GROUP is None
+        (_PIPELINE_MODEL_PARALLEL_GROUP is None)
+        and (_LM_HEAD_MODEL_PARALLEL_GROUP is None)
     ), 'pipeline model parallel group is already initialized'
     global _EMBEDDING_GROUP
     global _EMBEDDING_GLOBAL_RANKS
@@ -659,6 +665,12 @@ def initialize_model_parallel(
         if rank in ranks:
             _PIPELINE_MODEL_PARALLEL_GROUP = group
             _PIPELINE_GLOBAL_RANKS = ranks
+        
+        group = torch.distributed.new_group(
+            ranks, timeout=timeout, pg_options=get_nccl_options('pp-lmhead', nccl_comm_cfgs)
+        )
+        if rank in ranks:
+            _LM_HEAD_MODEL_PARALLEL_GROUP = group
 
         embedding_ranks = get_embedding_ranks(ranks)
         group = torch.distributed.new_group(
@@ -829,6 +841,14 @@ def get_pipeline_model_parallel_group():
         _PIPELINE_MODEL_PARALLEL_GROUP is not None
     ), 'pipeline_model parallel group is not initialized'
     return _PIPELINE_MODEL_PARALLEL_GROUP
+
+
+def get_lm_head_model_parallel_group():
+    """Get the language model head result reduce group the caller rank belongs to."""
+    assert (
+        _LM_HEAD_MODEL_PARALLEL_GROUP is not None
+    ), 'pipeline_model parallel group is not initialized'
+    return _LM_HEAD_MODEL_PARALLEL_GROUP
 
 
 def get_data_parallel_group(with_context_parallel=False):
@@ -1181,6 +1201,18 @@ def get_virtual_pipeline_model_parallel_world_size():
     return _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
 
 
+def get_virtual_vocab_parallel_chunk():
+    """Get the current chunk for vocab pipeline-parallel."""
+    global _VIRTUAL_VOCAB_PARALLEL_CHUNK
+    return _VIRTUAL_VOCAB_PARALLEL_CHUNK
+
+
+def set_virtual_vocab_parallel_chunk(chunk):
+    """Set the current chunk for vocab pipeline-parallel."""
+    global _VIRTUAL_VOCAB_PARALLEL_CHUNK
+    _VIRTUAL_VOCAB_PARALLEL_CHUNK = chunk
+
+
 def get_tensor_model_parallel_src_rank():
     """Calculate the global rank corresponding to the first local rank
     in the tensor model parallel group."""
@@ -1201,6 +1233,13 @@ def get_data_parallel_src_rank(with_context_parallel=False):
     else:
         assert _DATA_PARALLEL_GLOBAL_RANKS is not None, "Data parallel group is not initialized"
         return _DATA_PARALLEL_GLOBAL_RANKS[0]
+
+
+def get_pipeline_model_parallel_global_rank(local_rank):
+    """Return the global rank of a process in the pipeline for the current tensor
+    parallel group, given its local rank"""
+    assert _PIPELINE_GLOBAL_RANKS is not None, "Pipeline parallel group is not initialized"
+    return _PIPELINE_GLOBAL_RANKS[local_rank]
 
 
 def get_pipeline_model_parallel_first_rank():
@@ -1378,6 +1417,8 @@ def destroy_model_parallel():
     _TENSOR_MODEL_PARALLEL_GROUP = None
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None
+    global _LM_HEAD_MODEL_PARALLEL_GROUP
+    _LM_HEAD_MODEL_PARALLEL_GROUP = None
     global _DATA_PARALLEL_GROUP
     _DATA_PARALLEL_GROUP = None
     global _DATA_PARALLEL_GROUP_WITH_CP

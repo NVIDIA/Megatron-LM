@@ -9,6 +9,7 @@ from megatron.training import get_args
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.tensor_parallel.vocab_input_store import VocabInputStore
 
 from .enums import AttnMaskType, LayerType
 from .module import MegatronModule
@@ -54,7 +55,9 @@ def get_language_model(config, num_tokentypes, add_pooler,
                        add_encoder=True,
                        add_decoder=False,
                        decoder_attn_mask_type=AttnMaskType.causal,
-                       pre_process=True, post_process=True):
+                       pre_process=True, post_process=True,
+                       split_vocab_embedding=False, noop_block=False,
+                       include_layer_norm=False):
     """Build language model and return along with the key to save."""
     args = get_args()
     if config.init_method is None:
@@ -74,7 +77,10 @@ def get_language_model(config, num_tokentypes, add_pooler,
         decoder_attn_mask_type=decoder_attn_mask_type,
         add_pooler=add_pooler,
         pre_process=pre_process,
-        post_process=post_process
+        post_process=post_process,
+        split_vocab_embedding=split_vocab_embedding,
+        noop_block=noop_block,
+        include_layer_norm=include_layer_norm,
     )
     # key used for checkpoints.
     language_model_key = 'language_model'
@@ -138,20 +144,31 @@ class Embedding(MegatronModule):
                  max_sequence_length,
                  embedding_dropout_prob,
                  config,
-                 num_tokentypes=0):
+                 num_tokentypes=0,
+                 split_vocab_embedding: bool = False,
+                 vocab_embedding_only: bool = False):
         super(Embedding, self).__init__()
 
         self.hidden_size = hidden_size
         self.init_method = config.init_method
         self.num_tokentypes = num_tokentypes
+        self.split_vocab_embedding = split_vocab_embedding
+        self.vocab_embedding_only = vocab_embedding_only
 
         args = get_args()
 
         # Word embeddings (parallel).
         self.params_dtype = args.params_dtype
-        self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
-            vocab_size, self.hidden_size, config=config, init_method=config.init_method)
-        self._word_embeddings_key = 'word_embeddings'
+        if self.vocab_embedding_only:
+            self.word_embeddings = tensor_parallel.VocabParallelInput(
+                vocab_size, self.hidden_size, config=config, init_method=config.init_method)
+            self._word_embeddings_key = 'word_embeddings'
+            return
+        
+        if not self.split_vocab_embedding:
+            self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
+                vocab_size, self.hidden_size, config=config, init_method=config.init_method)
+            self._word_embeddings_key = 'word_embeddings'
 
         # Position embedding (serial).
         self.add_position_embedding = args.position_embedding_type == 'learned_absolute'
@@ -185,8 +202,9 @@ class Embedding(MegatronModule):
 
     def zero_parameters(self):
         """Zero out all parameters in embedding."""
-        self.word_embeddings.weight.data.fill_(0)
-        self.word_embeddings.weight.shared = True
+        if self.vocab_embedding_only or (not self.split_vocab_embedding):
+            self.word_embeddings.weight.data.fill_(0)
+            self.word_embeddings.weight.shared = True
         if self.add_position_embedding:
             self.position_embeddings.weight.data.fill_(0)
             self.position_embeddings.weight.shared = True
@@ -213,7 +231,13 @@ class Embedding(MegatronModule):
 
     def forward(self, input_ids, position_ids, tokentype_ids=None):
         # Embeddings.
-        words_embeddings = self.word_embeddings(input_ids)
+        if self.vocab_embedding_only:
+            words_embeddings = self.word_embeddings(input_ids)
+            return words_embeddings
+        if not self.split_vocab_embedding:
+            words_embeddings = self.word_embeddings(input_ids)
+        else:
+            words_embeddings = VocabInputStore.forward_get()
         if self.add_position_embedding:
             position_embeddings = self.position_embeddings(position_ids)
             embeddings = words_embeddings + position_embeddings
@@ -335,7 +359,10 @@ class TransformerLanguageModel(MegatronModule):
                  decoder_attn_mask_type=AttnMaskType.causal,
                  add_pooler=False,
                  pre_process=True,
-                 post_process=True):
+                 post_process=True,
+                 split_vocab_embedding: bool = False,
+                 noop_block: bool = False,
+                 include_layer_norm: bool = False):
         args = get_args()
         # TODO: passing share_embeddings_and_output_weights=False will not work correctly for T5 and embeddings will not be synced. Fix later for T5.
         if args.untie_embeddings_and_output_weights: assert not add_decoder
@@ -354,15 +381,23 @@ class TransformerLanguageModel(MegatronModule):
         self.encoder_hidden_state = None
         self.add_retriever = args.retro_add_retriever
         self.untie_embeddings_and_output_weights = args.untie_embeddings_and_output_weights
+        self.split_vocab_embedding = split_vocab_embedding
+        self.noop_block = noop_block
+        self.has_vocab_embedding = (
+            (self.pre_process and (not self.split_vocab_embedding))
+            or ((not self.pre_process) and self.split_vocab_embedding)
+        )
 
         # Embeddings.
-        if self.pre_process:
+        if self.pre_process or self.split_vocab_embedding:
             self.embedding = Embedding(self.hidden_size,
                                        args.padded_vocab_size,
                                        args.max_position_embeddings,
                                        args.hidden_dropout,
                                        config,
-                                       self.num_tokentypes)
+                                       self.num_tokentypes,
+                                       split_vocab_embedding=self.split_vocab_embedding,
+                                       vocab_embedding_only=(not self.pre_process))
             self._embedding_key = 'embedding'
 
         # Rotary positional embeddings
@@ -392,6 +427,9 @@ class TransformerLanguageModel(MegatronModule):
                 self_attn_mask_type=self.encoder_attn_mask_type,
                 pre_process=self.pre_process,
                 post_process=self.post_process,
+                noop_block=self.noop_block,
+                force_layer_norm=include_layer_norm,
+                post_norm=not get_args().enable_vocab_parallel,
             )
             self._encoder_key = 'encoder'
         else:
@@ -406,7 +444,11 @@ class TransformerLanguageModel(MegatronModule):
                 layer_type=LayerType.decoder,
                 self_attn_mask_type=self.decoder_attn_mask_type,
                 pre_process=self.pre_process,
-                post_process=self.post_process)
+                post_process=self.post_process,
+                noop_block=self.noop_block,
+                force_layer_norm=include_layer_norm,
+                post_norm=not get_args().enable_vocab_parallel,
+            )
             self._decoder_key = 'decoder'
         else:
             self.decoder = None
@@ -418,12 +460,25 @@ class TransformerLanguageModel(MegatronModule):
                 self._pooler_key = 'pooler'
 
             if self.untie_embeddings_and_output_weights:
-                self.output_layer = tensor_parallel.ColumnParallelLinear(
-                    args.hidden_size,
-                    args.padded_vocab_size,
-                    config=config,
-                    init_method=self.init_method,
-                    bias=False) # Setting bias to False always to keep it consistent with embedding tying that also does not have a bias.
+                if get_args().enable_vocab_parallel:
+                    self.output_layer = tensor_parallel.VocabParallelOutput(
+                        args.hidden_size,
+                        args.padded_vocab_size,
+                        config=config,
+                        init_method=self.init_method,
+                        fuse_forward_input_grad=(
+                            (not get_args().disable_backward_fusion)
+                            and (not get_args().use_interlaced_schedule)
+                        ),
+                        sync_allreduce=get_args().use_interlaced_schedule,
+                    )
+                else:
+                    self.output_layer = tensor_parallel.ColumnParallelLinear(
+                        args.hidden_size,
+                        args.padded_vocab_size,
+                        config=config,
+                        init_method=self.init_method,
+                        bias=False) # Setting bias to False always to keep it consistent with embedding tying that also does not have a bias.
                 self._output_layer_key = 'output_layer'
 
     def set_input_tensor(self, input_tensor):
@@ -463,6 +518,11 @@ class TransformerLanguageModel(MegatronModule):
                 inference_params=None,
                 pooling_sequence_index=0,
                 enc_hidden_states=None, output_enc_hidden=False):
+        
+        if self.has_vocab_embedding and (not self.pre_process):
+            embedding_output = self.embedding(enc_input_ids, enc_position_ids,
+                                              tokentype_ids=tokentype_ids)
+            return embedding_output
 
         # Encoder embedding.
         if self.pre_process:

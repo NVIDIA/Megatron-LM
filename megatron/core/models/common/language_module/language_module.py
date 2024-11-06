@@ -52,7 +52,7 @@ class LanguageModule(MegatronModule):
         """
 
         # Set `is_embedding_or_output_parameter` attribute.
-        if self.pre_process:
+        if self.has_vocab_embedding:
             self.embedding.word_embeddings.weight.is_embedding_or_output_parameter = True
         if self.post_process and self.output_layer.weight is not None:
             self.output_layer.weight.is_embedding_or_output_parameter = True
@@ -67,11 +67,12 @@ class LanguageModule(MegatronModule):
             self.shared_embedding_or_output_weight().zero_out_wgrad = True
             return
 
-        if parallel_state.is_pipeline_first_stage() and self.pre_process and not self.post_process:
+        if parallel_state.is_pipeline_first_stage() and self.has_vocab_embedding and not self.post_process:
             self.shared_embedding_or_output_weight().shared_embedding = True
 
-        if self.post_process and not self.pre_process:
-            assert not parallel_state.is_pipeline_first_stage()
+        if self.post_process and not self.has_vocab_embedding:
+            # disabled the following assertion, intended behavior in vocab parallel
+            # assert not parallel_state.is_pipeline_first_stage()
             # set word_embeddings weights to 0 here, then copy first
             # stage's weights using all_reduce below.
             self.output_layer.weight.data.fill_(0)
@@ -117,7 +118,7 @@ class LanguageModule(MegatronModule):
         Returns:
             Tensor: During pre processing it returns the input embeddings weight while during post processing it returns the final output layers weight
         """
-        if self.pre_process:
+        if self.has_vocab_embedding:
             return self.embedding.word_embeddings.weight
         elif self.post_process:
             return self.output_layer.weight

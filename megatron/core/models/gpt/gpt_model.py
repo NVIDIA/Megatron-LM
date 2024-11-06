@@ -18,6 +18,7 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
+from megatron.training import get_args
 
 class GPTModel(LanguageModule):
     """GPT Transformer language model.
@@ -53,6 +54,9 @@ class GPTModel(LanguageModule):
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
         seq_len_interpolation_factor: Optional[float] = None,
+        split_vocab_embedding: bool = False,
+        noop_block: bool = False,
+        include_layer_norm: bool = False,
     ) -> None:
         super().__init__(config=config)
 
@@ -65,6 +69,12 @@ class GPTModel(LanguageModule):
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
+        self.split_vocab_embedding = split_vocab_embedding
+        self.noop_block = noop_block
+        self.has_vocab_embedding = (
+            (self.pre_process and (not self.split_vocab_embedding))
+            or ((not self.pre_process) and self.split_vocab_embedding)
+        )
 
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
@@ -74,12 +84,14 @@ class GPTModel(LanguageModule):
         self.max_position_embeddings = max_sequence_length
         self.rotary_percent = rotary_percent
 
-        if self.pre_process:
+        if self.pre_process or self.split_vocab_embedding:
             self.embedding = LanguageModelEmbedding(
                 config=self.config,
                 vocab_size=self.vocab_size,
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type=position_embedding_type,
+                split_vocab_embedding=self.split_vocab_embedding,
+                vocab_embedding_only=(not self.pre_process),
             )
 
         if self.position_embedding_type == 'rope':
@@ -97,6 +109,9 @@ class GPTModel(LanguageModule):
             spec=transformer_layer_spec,
             pre_process=self.pre_process,
             post_process=self.post_process,
+            noop_block=self.noop_block,
+            force_layer_norm=include_layer_norm,
+            post_layer_norm=not get_args().enable_vocab_parallel,
         )
 
         # Output
@@ -115,21 +130,37 @@ class GPTModel(LanguageModule):
                 self.embedding_activation_buffer = None
                 self.grad_output_buffer = None
 
-            self.output_layer = tensor_parallel.ColumnParallelLinear(
-                config.hidden_size,
-                self.vocab_size,
-                config=config,
-                init_method=config.init_method,
-                bias=False,
-                skip_bias_add=False,
-                gather_output=not self.parallel_output,
-                skip_weight_param_allocation=self.pre_process
-                and self.share_embeddings_and_output_weights,
-                embedding_activation_buffer=self.embedding_activation_buffer,
-                grad_output_buffer=self.grad_output_buffer,
-            )
+            if get_args().enable_vocab_parallel:
+                self.output_layer = tensor_parallel.VocabParallelOutput(
+                    config.hidden_size,
+                    self.vocab_size,
+                    config=config,
+                    init_method=config.init_method,
+                    skip_weight_param_allocation=self.pre_process
+                    and self.share_embeddings_and_output_weights,
+                    embedding_activation_buffer=self.embedding_activation_buffer,
+                    fuse_forward_input_grad=(
+                        (not get_args().disable_backward_fusion)
+                        and (not get_args().use_interlaced_schedule)
+                    ),
+                    sync_allreduce=get_args().use_interlaced_schedule,
+                )
+            else:
+                self.output_layer = tensor_parallel.ColumnParallelLinear(
+                    config.hidden_size,
+                    self.vocab_size,
+                    config=config,
+                    init_method=config.init_method,
+                    bias=False,
+                    skip_bias_add=False,
+                    gather_output=not self.parallel_output,
+                    skip_weight_param_allocation=self.pre_process
+                    and self.share_embeddings_and_output_weights,
+                    embedding_activation_buffer=self.embedding_activation_buffer,
+                    grad_output_buffer=self.grad_output_buffer,
+                )
 
-        if self.pre_process or self.post_process:
+        if self.has_vocab_embedding or self.post_process:
             self.setup_embeddings_and_output_layer()
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
@@ -165,6 +196,10 @@ class GPTModel(LanguageModule):
 
         It either returns the Loss values if labels are given  or the final hidden units
         """
+        if self.has_vocab_embedding and (not self.pre_process):
+            embedding_output = self.embedding(input_ids=input_ids, position_ids=position_ids)
+            return embedding_output
+
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
 
@@ -203,13 +238,20 @@ class GPTModel(LanguageModule):
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
-        logits, _ = self.output_layer(hidden_states, weight=output_weight)
 
-        if labels is None:
-            # [s b h] => [b s h]
-            return logits.transpose(0, 1).contiguous()
+        if get_args().enable_vocab_parallel:
+            assert labels is not None, "not supported yet"
+            labels = labels.transpose(0, 1).contiguous()
+            loss, _ = self.output_layer(hidden_states, weight=output_weight, labels=labels)
+            loss = loss.transpose(0, 1).contiguous()
+        else:
+            logits, _ = self.output_layer(hidden_states, weight=output_weight)
 
-        loss = self.compute_language_model_loss(labels, logits)
+            if labels is None:
+                # [s b h] => [b s h]
+                return logits.transpose(0, 1).contiguous()
+            
+            loss = self.compute_language_model_loss(labels, logits)
 
         return loss
 

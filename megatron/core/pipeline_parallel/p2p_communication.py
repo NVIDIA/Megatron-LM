@@ -15,6 +15,8 @@ from megatron.core.parallel_state import (
     get_pipeline_model_parallel_rank,
     get_pipeline_model_parallel_world_size,
 )
+from megatron.core.tensor_parallel.vocab_input_store import VocabInputStore
+from megatron.training import get_args
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -347,7 +349,7 @@ def _communicate(
 
         p2p_func = _ring_exchange_wrapper
     elif config.batch_p2p_comm:
-        assert wait_on_reqs
+        # assert wait_on_reqs
         p2p_func = _batched_p2p_ops
     else:
         p2p_func = _p2p_ops
@@ -368,7 +370,8 @@ def _communicate(
     if config.batch_p2p_comm and config.batch_p2p_sync:
         # To protect against race condition when using batch_isend_irecv().
         # User should assert that we have a modern enough PyTorch to not need this
-        torch.cuda.synchronize()
+        if not get_args().enable_vocab_parallel:
+            torch.cuda.synchronize()
 
     return tensor_recv_prev, tensor_recv_next, reqs
 
@@ -381,6 +384,8 @@ def recv_forward(tensor_shape: Shape, config: ModelParallelConfig) -> torch.Tens
 
     if core.parallel_state.is_pipeline_first_stage():
         input_tensor = None
+        if get_args().enable_vocab_parallel:
+            input_tensor = VocabInputStore.forward_get(remove=False)
     else:
         if config.timers is not None:
             config.timers('forward-recv', log_level=2).start()
@@ -420,7 +425,7 @@ def recv_backward(tensor_shape: Shape, config: ModelParallelConfig) -> torch.Ten
     return output_tensor_grad
 
 
-def send_forward(output_tensor: torch.Tensor, config: ModelParallelConfig) -> None:
+def send_forward(output_tensor: torch.Tensor, config: ModelParallelConfig, wait_on_reqs=True) -> None:
     """Send tensor to next rank in pipeline (forward send).
 
     See _communicate for argument details.
@@ -429,16 +434,18 @@ def send_forward(output_tensor: torch.Tensor, config: ModelParallelConfig) -> No
     if not core.parallel_state.is_pipeline_last_stage():
         if config.timers is not None:
             config.timers('forward-send', log_level=2).start()
-        _communicate(
+        _, _, reqs = _communicate(
             tensor_send_next=output_tensor,
             tensor_send_prev=None,
             recv_prev=False,
             recv_next=False,
             tensor_shape=None,
             config=config,
+            wait_on_reqs=wait_on_reqs,
         )
         if config.timers is not None:
             config.timers('forward-send').stop()
+        return reqs
 
 
 def send_backward(input_tensor_grad: torch.Tensor, config: ModelParallelConfig) -> None:
@@ -495,6 +502,8 @@ def send_backward_recv_forward(
     """
     if core.parallel_state.is_pipeline_first_stage():
         input_tensor = None
+        if get_args().enable_vocab_parallel:
+            input_tensor = VocabInputStore.forward_get(remove=False)
     else:
         if config.timers is not None:
             config.timers('backward-send-forward-recv', log_level=2).start()

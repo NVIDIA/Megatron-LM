@@ -279,6 +279,19 @@ def validate_args(args, defaults={}):
         if args.rank == 0:
             print('WARNING: Setting args.overlap_p2p_comm to False since non-interleaved '
                   'schedule does not support overlapping p2p communication')
+    
+    if args.enable_layer_redistribution:
+        assert args.pipeline_model_parallel_size > 1, \
+            '--enable-layer-redistribution requires pipeline-model-parallel-size > 1'
+        _check_arg_is_not_none(args, 'final_stage_num_layers')
+        assert args.final_stage_num_layers >= 0 and args.final_stage_num_layers <= args.num_layers, \
+            '--final-stage-num-layers must be between 0 and the number of layers'
+        assert args.virtual_pipeline_model_parallel_size is None, \
+            '--enable-layer-redistribution does not support interleaved schedules'
+        assert not args.use_legacy_models, \
+            '--enable-layer-redistribution only supported with MCore models'
+    else:
+        del args.final_stage_num_layers
 
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer, \
@@ -287,6 +300,24 @@ def validate_args(args, defaults={}):
             '--overlap-grad-reduce should be turned on when using --overlap-param-gather'
         assert not args.use_legacy_models, \
             '--overlap-param-gather only supported with MCore models'
+
+    # Vocabulary parallelism.
+    if args.enable_vocab_parallel:
+        assert args.pipeline_model_parallel_size > 1, 'pipeline parallel size '\
+            'must be > 1 when vocab parallel is enabled'
+        assert args.virtual_pipeline_model_parallel_size is None, 'vocab parallel'\
+            'with interleaved schedule is not supported yet'
+        assert (
+            args.make_vocab_size_divisible_by %
+            (args.tensor_model_parallel_size * args.pipeline_model_parallel_size) == 0
+        ), 'vocab size must be divisible by model parallel size ({}) for vocab parallel'.format(
+            args.tensor_model_parallel_size * args.pipeline_model_parallel_size
+        )
+        assert args.untie_embeddings_and_output_weights, '--enable-vocab-parallel requires' \
+            'untie embeddings and output weights'
+    else:
+        args.use_interlaced_schedule = False
+        args.disable_backward_fusion = False
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -477,15 +508,15 @@ def validate_args(args, defaults={}):
     if args.sequence_parallel:
         args.async_tensor_model_parallel_allreduce = False
 
-    if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
-        if args.sequence_parallel:
-            raise RuntimeError(
-                "Using sequence parallelism requires setting the environment variable "
-                "CUDA_DEVICE_MAX_CONNECTIONS to 1")
-        if args.async_tensor_model_parallel_allreduce:
-            raise RuntimeError(
-                "Using async gradient all reduce requires setting the environment "
-                "variable CUDA_DEVICE_MAX_CONNECTIONS to 1")
+    # if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
+    #     if args.sequence_parallel:
+    #         raise RuntimeError(
+    #             "Using sequence parallelism requires setting the environment variable "
+    #             "CUDA_DEVICE_MAX_CONNECTIONS to 1")
+    #     if args.async_tensor_model_parallel_allreduce:
+    #         raise RuntimeError(
+    #             "Using async gradient all reduce requires setting the environment "
+    #             "variable CUDA_DEVICE_MAX_CONNECTIONS to 1")
 
     # Disable bias gelu fusion if we are disabling bias altogether
     if not args.add_bias_linear:
@@ -1470,6 +1501,24 @@ def _add_distributed_args(parser):
                         help='If set, distributed ranks initialize order is changed '
                         'from tp-dp-pp to tp-pp-dp. Make sure EP and CP aren\'t used '
                         'with this option enabled')
+    group.add_argument('--enable-vocab-parallel', action='store_true',
+                       help='Enables vocabulary parallelism at the vocabulary layers. '
+                       'Must be enabled together with pipeline model parallelism.')
+    group.add_argument('--use-interlaced-schedule', action='store_true',
+                       help='Use the interlaced pipeline schedule that forces synchronization '
+                       'at the vocabulary layers. See the paper for details: '
+                       'https://www.usenix.org/system/files/osdi24-lin-zhiqi.pdf')
+    group.add_argument('--disable-backward-fusion', action='store_true',
+                       help='disables the forward-backward fusion for the output '
+                       'layer. requires two communication barriers instead of one')
+    group.add_argument('--schedule-timer-start', type=int, default=10,
+                       help='Start iteration of the vocabulary parallelism schedule timer')
+    group.add_argument('--schedule-timer-end', type=int, default=20,
+                       help='End iteration of the vocabulary parallelism schedule timer')
+    group.add_argument('--enable-layer-redistribution', action='store_true',
+                       help='Enables redistribution of layers among pipeline stages')
+    group.add_argument('--final-stage-num-layers', type=int, default=0,
+                       help='Number of transformer layers processed by the last pipeline stage')
     return parser
 
 

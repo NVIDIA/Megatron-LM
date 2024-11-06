@@ -9,6 +9,10 @@ from torch.autograd.variable import Variable
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import p2p_communication
+from megatron.core.pipeline_parallel.schedule_timers import ScheduleTimers
+from megatron.core.tensor_parallel.vocab_output_store import VocabOutputStore
+from megatron.core.tensor_parallel.vocab_input_store import VocabInputStore
+from megatron.core.timers import Timer
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
@@ -17,6 +21,7 @@ from megatron.core.utils import (
     get_model_type,
     get_model_xattn,
 )
+from megatron.training import get_args
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -103,6 +108,16 @@ def get_forward_backward_func():
     if pipeline_model_parallel_size > 1:
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
             forward_backward_func = forward_backward_pipelining_with_interleaving
+        elif get_args().use_interlaced_schedule:
+            from megatron.core.pipeline_parallel.interlaced_schedule import (
+                forward_backward_pipelining_with_interlaced_schedule
+            )
+            forward_backward_func = forward_backward_pipelining_with_interlaced_schedule
+        elif get_args().enable_vocab_parallel:
+            from megatron.core.pipeline_parallel.vocab_parallel_schedule import (
+                forward_backward_pipelining_with_vocab_parallel
+            )
+            forward_backward_func = forward_backward_pipelining_with_vocab_parallel
         else:
             forward_backward_func = forward_backward_pipelining_without_interleaving
     else:
@@ -187,6 +202,9 @@ def forward_step(
     is_first_microbatch=False,
     current_microbatch=None,
     encoder_decoder_xattn=False,
+    skip_loss_compute=False,
+    force_loss_compute=False,
+    run_timer=False,
 ):
     """Forward step for passed-in model.
 
@@ -196,6 +214,11 @@ def forward_step(
     Returns output tensor."""
     if config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
+
+    if run_timer:
+        ScheduleTimers.for_chunk(0).f_cnt += 1
+        ScheduleTimers.for_chunk(0).f.start()
+    mem_before = torch.cuda.memory_allocated()
 
     if is_first_microbatch and hasattr(model, 'set_is_first_microbatch'):
         model.set_is_first_microbatch()
@@ -216,14 +239,16 @@ def forward_step(
         context_manager = contextlib.nullcontext()
     with context_manager:
         if checkpoint_activations_microbatch is None:
-            output_tensor, loss_func = forward_step_func(data_iterator, model)
+            output_tensor, loss_func = forward_step_func(data_iterator, model, microbatch_id=current_microbatch)
         else:
             output_tensor, loss_func = forward_step_func(
-                data_iterator, model, checkpoint_activations_microbatch
+                data_iterator, model, checkpoint_activations_microbatch, microbatch_id=current_microbatch
             )
 
     num_tokens = torch.tensor(0, dtype=torch.int)
-    if parallel_state.is_pipeline_last_stage():
+    if (parallel_state.is_pipeline_last_stage() and (not skip_loss_compute)) or (force_loss_compute):
+        if get_args().enable_vocab_parallel:
+            output_tensor = output_tensor.transpose(0, 1).contiguous()
         if not collect_non_loss_data:
             outputs = loss_func(output_tensor)
             if len(outputs) == 3:
@@ -243,6 +268,10 @@ def forward_step(
 
     if config.timers is not None:
         config.timers('forward-compute').stop()
+    
+    if run_timer:
+        ScheduleTimers.for_chunk(0).f.stop()
+        ScheduleTimers.for_chunk(0).f_mem += torch.cuda.memory_allocated() - mem_before
 
     # Set the loss scale for the auxiliary loss of the MoE layer.
     # Since we use a trick to do backward on the auxiliary loss, we need to set the scale explicitly.
@@ -268,10 +297,11 @@ def forward_step(
 
     if unwrap_output_tensor:
         return output_tensor, num_tokens
+
     return [output_tensor], num_tokens
 
 
-def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
+def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config, run_timer=False):
     """Backward step through passed-in output tensor.
 
     If last stage, output_tensor_grad is None, otherwise gradient of loss
@@ -286,6 +316,11 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
 
     if config.timers is not None:
         config.timers('backward-compute', log_level=2).start()
+    
+    if run_timer:
+        ScheduleTimers.for_chunk(0).b_cnt += 1
+        ScheduleTimers.for_chunk(0).b.start()
+    mem_before = torch.cuda.memory_allocated()
 
     # Retain the grad on the input_tensor.
     unwrap_input_tensor_grad = False
@@ -335,6 +370,10 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
 
     if config.timers is not None:
         config.timers('backward-compute').stop()
+    
+    if run_timer:
+        ScheduleTimers.for_chunk(0).b.stop()
+        ScheduleTimers.for_chunk(0).b_mem += torch.cuda.memory_allocated() - mem_before
 
     return input_tensor_grad
 
@@ -1163,13 +1202,17 @@ def recv_backward(tensor_shapes, config):
     return output_tensor_grads
 
 
-def send_forward(output_tensors, tensor_shapes, config):
+def send_forward(output_tensors, tensor_shapes, config, wait_on_reqs=True):
     if not isinstance(output_tensors, list):
         output_tensors = [output_tensors]
+    reqs = []
     for output_tensor, tensor_shape in zip(output_tensors, tensor_shapes):
         if tensor_shape is None:
             continue
-        p2p_communication.send_forward(output_tensor, config)
+        new_reqs = p2p_communication.send_forward(output_tensor, config, wait_on_reqs)
+        if isinstance(new_reqs, list):
+            reqs = reqs + new_reqs
+    return reqs
 
 
 def send_backward(input_tensor_grads, tensor_shapes, config):
@@ -1275,6 +1318,22 @@ def forward_backward_pipelining_without_interleaving(
 
     disable_grad_sync()
 
+    # Increment iter_counter in ScheduleTimers
+    ScheduleTimers.iter_counter += 1
+
+    if ScheduleTimers.iter_counter == get_args().schedule_timer_end + 1:
+        ScheduleTimers.sync_timer = False
+
+    if ScheduleTimers.iter_counter == get_args().schedule_timer_end + 6:
+        conclusion = ScheduleTimers.joint_conclusion(sync_timer=False, global_reduce=False)
+        print(f"rank {torch.distributed.get_rank()} profiling conclusion: {conclusion}")
+    
+    run_timer = (
+        get_args().schedule_timer_end + 5
+        >= ScheduleTimers.iter_counter
+        >= get_args().schedule_timer_start
+    )
+
     # Compute number of warmup microbatches.
     num_warmup_microbatches = (
         parallel_state.get_pipeline_model_parallel_world_size()
@@ -1341,6 +1400,8 @@ def forward_backward_pipelining_without_interleaving(
             checkpoint_activations_microbatch = None
 
         input_tensor = recv_forward(recv_tensor_shapes, config)
+        if get_args().profile:
+            torch.cuda.nvtx.range_push(f"F{i}")
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -1354,7 +1415,10 @@ def forward_backward_pipelining_without_interleaving(
             check_first_val_step(first_val_step, forward_only, i == 0),
             current_microbatch=i,
             encoder_decoder_xattn=encoder_decoder_xattn,
+            run_timer=run_timer,
         )
+        if get_args().profile:
+            torch.cuda.nvtx.range_pop()
         send_forward(output_tensor, send_tensor_shapes, config)
         total_num_tokens += num_tokens.item()
 
@@ -1381,6 +1445,9 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
+        if get_args().profile:
+            torch.cuda.nvtx.range_push(f"F{i + num_warmup_microbatches}")
+
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -1396,8 +1463,12 @@ def forward_backward_pipelining_without_interleaving(
             ),
             current_microbatch=i + num_warmup_microbatches,
             encoder_decoder_xattn=encoder_decoder_xattn,
+            run_timer=run_timer,
         )
         total_num_tokens += num_tokens.item()
+
+        if get_args().profile:
+            torch.cuda.nvtx.range_pop()
 
         if forward_only:
             send_forward(output_tensor, send_tensor_shapes, config)
@@ -1425,10 +1496,17 @@ def forward_backward_pipelining_without_interleaving(
             if num_warmup_microbatches == 0 and last_iteration:
                 if config.grad_sync_func is None or rank == 0:
                     enable_grad_sync()
+            
+            if get_args().profile:
+                torch.cuda.nvtx.range_push(f"B{i}")
 
             input_tensor_grad = backward_step(
-                input_tensor, output_tensor, output_tensor_grad, model_type, config
+                input_tensor, output_tensor, output_tensor_grad, model_type, config,
+                run_timer=run_timer, 
             )
+
+            if get_args().profile:
+                torch.cuda.nvtx.range_pop()
 
             if last_iteration:
                 input_tensor = None
@@ -1456,9 +1534,16 @@ def forward_backward_pipelining_without_interleaving(
 
             output_tensor_grad = recv_backward(send_tensor_shapes, config)
 
+            if get_args().profile:
+                torch.cuda.nvtx.range_push(f"B{i + num_microbatches_remaining}")
+
             input_tensor_grad = backward_step(
-                input_tensor, output_tensor, output_tensor_grad, model_type, config
+                input_tensor, output_tensor, output_tensor_grad, model_type, config,
+                run_timer=run_timer
             )
+
+            if get_args().profile:
+                torch.cuda.nvtx.range_pop()
 
             send_backward(input_tensor_grad, recv_tensor_shapes, config)
 
@@ -1485,3 +1570,40 @@ def forward_backward_pipelining_without_interleaving(
         config.timers('forward-backward').stop()
 
     return forward_data_store
+
+
+def bootstrap_and_profile_p2p_communication(
+    config, send_tensor_shapes, recv_tensor_shapes
+):
+    if ScheduleTimers.iter_counter == 1:
+        nccl_init_tensor = [torch.Tensor([0]).cuda()]
+        shape = [(1,)]
+        if not parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+            recv_forward(shape, config)
+        if not parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+            send_forward(nccl_init_tensor, shape, config)
+            recv_backward(shape, config)
+        if not parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+            send_backward(nccl_init_tensor, shape, config)
+
+        send_data = [torch.zeros(*shape, dtype=config.pipeline_dtype).cuda() for
+                     shape in send_tensor_shapes]
+        recv_data = [torch.zeros(*shape, dtype=config.pipeline_dtype).cuda() for
+                     shape in recv_tensor_shapes]
+        torch.distributed.barrier()
+        t = Timer('comm-benchmark')
+        t.start()
+        for _ in range(10):
+            if not parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+                recv_forward(recv_tensor_shapes, config)
+            if not parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+                send_forward(send_data, send_tensor_shapes, config)
+                recv_backward(send_tensor_shapes, config)
+            if not parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+                send_backward(recv_data, recv_tensor_shapes, config)
+        t.stop()
+        per_communication = torch.cuda.FloatTensor([t.elapsed() / (
+            parallel_state.get_pipeline_model_parallel_world_size() - 1) / 10])
+        torch.distributed.all_reduce(per_communication, torch.distributed.ReduceOp.MAX)
+        ScheduleTimers.comm_time = per_communication.item()
+

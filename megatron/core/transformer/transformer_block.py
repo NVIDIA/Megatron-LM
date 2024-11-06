@@ -53,7 +53,19 @@ def get_num_layers_to_build(config: TransformerConfig) -> int:
 
     pipeline_ranks = config.pipeline_model_parallel_size
 
-    num_layers_per_pipeline_rank = config.num_layers // pipeline_ranks
+    if config.final_stage_num_layers is not None:
+        num_layers_per_pipeline_rank = [
+            (config.num_layers - config.final_stage_num_layers) // (pipeline_ranks - 1)
+        ] * pipeline_ranks
+        remaining_layers = (config.num_layers - config.final_stage_num_layers) % (pipeline_ranks - 1)
+        for rank in range(pipeline_ranks - 2, pipeline_ranks - remaining_layers - 2, -1):
+            num_layers_per_pipeline_rank[rank] += 1
+        num_layers_per_pipeline_rank[pipeline_ranks - 1] = config.final_stage_num_layers
+    else:
+        num_layers_per_pipeline_rank = [config.num_layers // pipeline_ranks] * pipeline_ranks
+        remaining_layers = config.num_layers % pipeline_ranks
+        for rank in range(pipeline_ranks - 2, pipeline_ranks - remaining_layers - 2, -1):
+            num_layers_per_pipeline_rank[rank] += 1
 
     if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
         # Interleaved pipeline parallelism:
@@ -70,7 +82,7 @@ def get_num_layers_to_build(config: TransformerConfig) -> int:
 
         vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
 
-        num_layers_per_virtual_rank = num_layers_per_pipeline_rank // vp_size
+        num_layers_per_virtual_rank = (config.num_layers // pipeline_ranks) // vp_size
 
         num_layers_to_build = num_layers_per_virtual_rank
 
@@ -78,7 +90,9 @@ def get_num_layers_to_build(config: TransformerConfig) -> int:
         # Non-interleaved pipeline parallelism:
         # Each stage gets a contiguous set of layers.
 
-        num_layers_to_build = num_layers_per_pipeline_rank
+        num_layers_to_build = num_layers_per_pipeline_rank[
+            parallel_state.get_pipeline_model_parallel_rank()
+        ]
 
     return num_layers_to_build
 
@@ -92,6 +106,7 @@ class TransformerBlockSubmodules:
 def _get_block_submodules(
     config: TransformerConfig,
     spec: Union[TransformerBlockSubmodules, ModuleSpec],
+    noop_block: bool = False
 ) -> TransformerBlockSubmodules:
 
     # Transformer block submodules.
@@ -106,6 +121,8 @@ def _get_block_submodules(
             return spec.submodules
         elif issubclass(spec.module, BaseTransformerLayer):
             num_layers = get_num_layers_to_build(config)
+            if noop_block:
+                num_layers = 0
             return TransformerBlockSubmodules(
                 layer_specs=[spec] * num_layers,
                 layer_norm=LayerNormImpl,
@@ -126,13 +143,17 @@ class TransformerBlock(MegatronModule):
         post_layer_norm: bool = True,
         pre_process: bool = True,
         post_process: bool = True,
+        noop_block: bool = False,
+        force_layer_norm: bool = False,
     ):
         super().__init__(config=config)
 
-        self.submodules = _get_block_submodules(config, spec)
+        self.submodules = _get_block_submodules(config, spec, noop_block)
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
+        self.noop_block = noop_block
+        self.force_layer_norm = force_layer_norm
         # Dictionary to store CUDA graphs. Number of items in the dictionary = len(self.layers).
         # Item `i` in the dictionary is a list of `N` CUDA graphs for layer 'i' where N is the
         # number of microbatches. Multiple CUDA graphs per layer is required to support
@@ -208,7 +229,7 @@ class TransformerBlock(MegatronModule):
 
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
         # self.post_process and self.post_layer_norm guide this behavior
-        if self.submodules.layer_norm and self.post_process and self.post_layer_norm:
+        if self.submodules.layer_norm and ((self.post_process and self.post_layer_norm) or self.force_layer_norm):
             self.final_layernorm = build_module(
                 self.submodules.layer_norm,
                 config=self.config,
