@@ -56,7 +56,7 @@ WORKDIR ${STAGE_DIR}
 ENV NVTE_FRAMEWORK=pytorch
 ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH_OVERRIDE}
 ENV NVTE_USE_HIPBLASLT=1
-RUN git clone --recursive https://github.com/ROCmSoftwarePlatform/TransformerEngine &&\
+RUN git clone --recursive https://github.com/ROCm/TransformerEngine &&\
     cd TransformerEngine &&\
     pip install .
 

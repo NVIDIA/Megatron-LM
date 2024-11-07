@@ -2,8 +2,8 @@ TMP_DIR="tmp"
 mkdir -p $TMP_DIR
 mkdir -p ${TMP_DIR}/data
 
-DATA_PATH="${TMP_DIR}/data/bookcorpus_text_sentence"
-TOKENIZER_MODEL=$TMP/tokenizer.model
+DATA_PATH="${TMP_DIR}/data"
+TOKENIZER_MODEL=${TMP_DIR}/tokenizer.model
 
 # Download the tokenizer model
 if ! [ -f "$TOKENIZER_MODEL" ]; then

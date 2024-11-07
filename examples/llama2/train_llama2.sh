@@ -46,7 +46,7 @@ PP="${PP:-1}"
 MBS="${MBS:-2}"
 BS="${BS:-8}"
 SEQ_LENGTH="${SEQ_LENGTH:-4096}"
-TOTAL_ITERS="${TOTAL_ITERS:-4}"
+TOTAL_ITERS="${TOTAL_ITERS:-20}"
 SEQ_PARALLEL="${SEQ_PARALLEL:-1}" 
 CONTI_PARAMS="${CONTI_PARAMS:-0}"
 OPTIMIZER="${OPTIMIZER:-sgd}"
@@ -251,18 +251,19 @@ if [ "$NO_TRAINING" -eq 0 ]; then
     eval $run_cmd
 fi
 
+MEAN_LOG_SCRIPT=examples/llama2/mean_log_value.py
+TMP_FILE=${TMP_DIR}/tmp.txt
+# echo '============================================================================================================'
+grep -Eo 'throughput per GPU [^|]*' $TRAIN_LOG | sed -E 's/.*throughput per GPU \(TFLOP\/s\/GPU\): ([0-9\.]+).*/\1/' > $TMP_FILE
+THROUGHPUT=$(python ${MEAN_LOG_SCRIPT} ${TMP_FILE})
+echo "throughput per GPU (TFLOPs/GPU): ${THROUGHPUT}"
+rm $TMP_FILE
 
 # echo '============================================================================================================'
-grep -Eo 'throughput per GPU [^|]*' $TRAIN_LOG | sed -E 's/.*throughput per GPU \(TFLOP\/s\/GPU\): ([0-9\.]+).*/\1/' > tmp.txt
-echo "throughput per GPU: $(python mean_log_value.py tmp.txt)" |& tee -a $TRAIN_LOG
-THROUGHPUT=$(python parse_logs.py tmp.txt)
-rm tmp.txt
+grep -Eo 'elapsed time per iteration [^|]*' $TRAIN_LOG | sed -E 's/.*elapsed time per iteration \(ms\): ([0-9\.]+).*/\1/' > $TMP_FILE
+TIME_PER_ITER=$(python ${MEAN_LOG_SCRIPT}  ${TMP_FILE} 2>/dev/null | awk '{printf "%.6f", $0}')
+echo "elapsed time per iteration: ${TIME_PER_ITER}"
+rm $TMP_FILE
 
-# echo '============================================================================================================'
-grep -Eo 'elapsed time per iteration [^|]*' $TRAIN_LOG | sed -E 's/.*elapsed time per iteration \(ms\): ([0-9\.]+).*/\1/' > tmp.txt
-echo "elapsed time per iteration: $(python parse_logs.py  tmp.txt)" |& tee -a $TRAIN_LOG
-
-TIME_PER_ITER=$(python parse_logs.py  tmp.txt 2>/dev/null | awk '{printf "%.6f", $0}')
 PERFORMANCE=$(awk -v bs="$BS" -v sl="$SEQ_LENGTH" -v tpi="$TIME_PER_ITER" -v ws="$WORLD_SIZE" 'BEGIN {printf "%.6f", bs * sl * 1000/ (tpi * ws)}')
-echo "tokens/GPU/s: $PERFORMANCE" |& tee -a $TRAIN_LOG
-rm tmp.txt
+echo "tokens/GPU/s: $PERFORMANCE"
