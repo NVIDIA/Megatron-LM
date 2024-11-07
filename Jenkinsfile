@@ -30,7 +30,7 @@ pipeline {
             steps {
                 show_node_info()
                 script {
-                    sh "docker build  -f Dockerfile_rocm_ci -t ${DOCKER_IMAGE}  ${DOCKER_BUILD_ARGS} ."
+                    sh "docker build  -f Dockerfile_rocm.ci -t ${DOCKER_IMAGE}  ${DOCKER_BUILD_ARGS} ."
                     }
                 }
             }
