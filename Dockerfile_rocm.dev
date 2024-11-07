@@ -1,12 +1,12 @@
 ARG BASE_DOCKER=rocm/pytorch:latest
 FROM $BASE_DOCKER
+ARG PYTORCH_ROCM_ARCH_OVERRIDE="gfx942"
 ENV WORKSPACE_DIR=/workspace
 ENV STAGE_DIR=/workspace/installs
 RUN mkdir -p $WORKSPACE_DIR
 RUN mkdir -p ${STAGE_DIR}
 WORKDIR $WORKSPACE_DIR
 
-  
 RUN pip3 install \
 numpy==1.26.4 \
 scipy \
@@ -25,13 +25,12 @@ wandb \
 tensorstore==0.1.45 \
 pytest_mock \
 pybind11 \
-wrapt \ 
 setuptools==69.5.1 \
 datasets \
 tiktoken \
 pynvml
 
-RUN pip3 install "huggingface_hub[cli]" 
+RUN pip3 install "huggingface_hub[cli]"
 RUN python3 -m nltk.downloader punkt_tab
 
 
@@ -39,7 +38,7 @@ RUN python3 -m nltk.downloader punkt_tab
 WORKDIR ${STAGE_DIR}
 ENV CAUSAL_CONV1D_FORCE_BUILD=TRUE
 ENV MAMBA_FORCE_BUILD=TRUE
-ENV HIP_ARCHITECTURES="gfx942"
+ENV HIP_ARCHITECTURES=${PYTORCH_ROCM_ARCH_OVERRIDE}
 RUN git clone https://github.com/Dao-AILab/causal-conv1d causal-conv1d &&\
     cd causal-conv1d &&\
     git show --oneline -s &&\
@@ -49,17 +48,16 @@ RUN git clone https://github.com/Dao-AILab/causal-conv1d causal-conv1d &&\
 WORKDIR ${STAGE_DIR}
 RUN git clone https://github.com/state-spaces/mamba mamba &&\
     cd mamba &&\
-    git checkout bc84fb1 &&\
     git show --oneline -s &&\
     pip install --no-build-isolation .
 
 # Clone TE repo and submodules
 WORKDIR ${STAGE_DIR}
-ENV NVTE_FRAMEWORK=pytorch 
-ENV PYTORCH_ROCM_ARCH=gfx942
+ENV NVTE_FRAMEWORK=pytorch
+ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH_OVERRIDE}
 ENV NVTE_USE_HIPBLASLT=1
-RUN git clone --recursive https://github.com/ROCmSoftwarePlatform/TransformerEngine-private.git &&\
-    cd TransformerEngine-private &&\
+RUN git clone --recursive https://github.com/ROCmSoftwarePlatform/TransformerEngine &&\
+    cd TransformerEngine &&\
     pip install .
 
 WORKDIR $WORKSPACE_DIR
