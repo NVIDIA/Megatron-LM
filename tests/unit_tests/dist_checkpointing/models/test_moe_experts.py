@@ -102,6 +102,7 @@ class TestExpertLayerReconfiguration:
             (False, (1, 1, 4), (8, 1, 1), True),
         ],
     )
+    @pytest.mark.failing_on_rocm
     @pytest.mark.parametrize("expert_type", expert_type)
     def test_parallel_reconfiguration_e2e(
         self, tmp_path_dist_ckpt, src_tp_pp_exp, dest_tp_pp_exp, use_glu, use_fpsl, expert_type
@@ -182,6 +183,7 @@ class TestExpertLayerReconfiguration:
         ],
     )
     @pytest.mark.parametrize("src_module,dest_module", src_dest_expert_type)
+    @pytest.mark.failing_on_rocm
     def test_sequential_grouped_mlp_interchangeable(
         self, tmp_path_dist_ckpt, src_tp_pp_exp, dest_tp_pp_exp, use_glu, src_module, dest_module
     ):

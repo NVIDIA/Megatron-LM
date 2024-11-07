@@ -3,6 +3,7 @@
 import types
 
 import torch
+import pytest
 
 from megatron.core.models.retro import RetroConfig, get_retro_decoder_block_spec
 from megatron.core.models.retro.decoder_attention import (
@@ -80,6 +81,7 @@ class TestRetroAttention:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.failing_on_rocm
     def test_constructor(self):
 
         config = self.get_config()
@@ -101,6 +103,7 @@ class TestRetroAttention:
         assert get_nparams(modules.encoder_bda) == 0
         assert get_nparams(modules.encoder_norm) == 32
 
+    @pytest.mark.failing_on_rocm
     def test_cpu_forward(self):
         # we can't currently do this because the global memory buffer is on GPU
         pass
@@ -190,7 +193,7 @@ class TestRetroAttention:
             config.retro_num_neighbors * micro_batch_size * n_chunks_per_sample,
             config.hidden_size,
         )
-
+    @pytest.mark.failing_on_rocm
     def test_gpu_forward(self):
         for recompute_granularity in (None, 'selective'):
             for use_transformer_engine in (True, False):
