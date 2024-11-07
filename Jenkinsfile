@@ -35,7 +35,7 @@ pipeline {
                 }
             }
 
-        stage('Run Docker Container') {
+        stage('Run Unit Tests') {
             steps {
                 script {
                     wrap([$class: 'AnsiColorBuildWrapper', 'colorMapName': 'xterm']) {
