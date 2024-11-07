@@ -116,6 +116,7 @@ class MultiLatentAttention(Attention):
         packed_seq_params=None,
         position_ids=None,
     ):
+        """Forward pass for multi-latent attention"""
         assert rotary_pos_emb is None, "Rotary position embeddings should not be passed into MLA."
 
         # hidden_states: [sq, b, h]
@@ -138,8 +139,8 @@ class MultiLatentAttention(Attention):
         # Adjust key, value for inference
         # ===================================================
         # rotary_pos_emb = None
-        key, value, _, attn_mask_type = self._adjust_key_value_for_inference(
-            inference_params, key, value, rotary_pos_emb=None
+        query, key, value, _, attn_mask_type = self._adjust_key_value_for_inference(
+            inference_params, query, key, value, rotary_pos_emb=None
         )
 
         # ==================================
