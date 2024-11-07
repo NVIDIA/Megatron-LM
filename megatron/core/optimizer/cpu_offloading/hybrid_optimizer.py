@@ -22,6 +22,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.cpu_copy_map_grad: Dict[torch.Tensor, torch.Tensor] = defaultdict(torch.Tensor)
         self._data_stream = torch.cuda.Stream()
         self._step_stream = torch.cuda.Stream()
+        self._data_event: torch.cuda.Event = None
 
         self.register_grad_cpu_copy_hook()
         self.register_param_copy_back_gpu_hook()
@@ -36,11 +37,12 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                             dtype=gpu_param.grad.dtype,
                             pin_memory=self.pin_cpu_grads
                         )
-                self._data_stream.wait_stream(torch.cuda.default_stream())
+                self._data_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self._data_stream):
                     for gpu_param, cpu_copy in self.gpu_params_map_cpu_copy.items():
                         self.cpu_copy_map_grad[cpu_copy].data.copy_(gpu_param.grad, non_blocking=True)
                         cpu_copy.grad = self.cpu_copy_map_grad[cpu_copy]
+                    self._data_event = self._data_stream.record_event()
             return grad_cpu_copy_hook
 
         self.register_step_pre_hook(grad_cpu_copy_hook_closure())
@@ -48,13 +50,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
     def register_param_copy_back_gpu_hook(self):
         def param_copy_back_gpu_hook_closure():
             def param_copy_back_gpu_hook(optimizer, args, kwargs):
-                self._data_stream.wait_stream(torch.cuda.default_stream())
+                self._data_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self._data_stream):      
                     for cpu_copy, gpu_param in self.cpu_copys_map_gpu_param.items():
                         gpu_param.data.copy_(cpu_copy.data, non_blocking=True)
-                # NOTE: ensure all H2D/D2H Transfer and update operations finish
-                torch.cuda.synchronize()
-
+                self._data_stream.record_event().wait(
+                    torch.cuda.current_stream()
+                )
             return param_copy_back_gpu_hook
 
         self.register_step_post_hook(param_copy_back_gpu_hook_closure())
@@ -93,10 +95,15 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         return self.cpu_optimizer.param_groups + self.gpu_optimizer.param_groups
 
     def step(self, closure=None):
-        self._step_stream.wait_stream(torch.cuda.default_stream())
+        self._step_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self._step_stream):
             self.gpu_optimizer.step(closure)
-        self._data_stream.synchronize()
+        self._step_stream.record_event().wait(
+            torch.cuda.current_stream()
+        )
+        if self._data_event is not None:
+            self._data_event.synchronize()
+            self._data_event = None
         self.cpu_optimizer.step(closure)
 
     def _split_parameters_updated_on_the_cpu_and_gpu(self):
