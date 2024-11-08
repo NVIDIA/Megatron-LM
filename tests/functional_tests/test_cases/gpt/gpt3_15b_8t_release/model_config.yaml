@@ -25,14 +25,14 @@ MODEL_ARGS:
   --micro-batch-size: 4
   --rampup-batch-size: "384 384 97656250"
   --global-batch-size: 1152
-  --train-samples: 4882812
+  --train-samples: 19531250
   --manual-gc: true
 
   # Transformer Engine args
   --transformer-impl: transformer_engine
 
   # Data args
-  --data-cache-path: ${OUTPUT_PATH}/cache
+  --data-cache-path: ${DATA_CACHE_PATH}
   --tokenizer-type: GPTSentencePieceTokenizer
   --tokenizer-model: ${DATA_PATH}/utils/nemotron_2_256k.model
   --data-path: $DATA_BLEND

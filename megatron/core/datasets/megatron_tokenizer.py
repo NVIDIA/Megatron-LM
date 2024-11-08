@@ -57,6 +57,21 @@ class MegatronTokenizer(ABC):
         """
         raise NotImplementedError("{} has no method 'detokenize'".format(type(self).__name__))
 
+    def offsets(self, ids: list[int], text: str) -> list[int]:
+        """Convert embedding ids to text offsets
+
+        Args:
+            ids (list[int]): The ids to convert
+            text (str): The text to convert
+
+        Returns:
+            list[int]: The converted offsets
+
+        Raises:
+            NotImplementedError: Non-abstract, optional method
+        """
+        raise NotImplementedError("{} has no method 'offsets'".format(type(self).__name__))
+
     @property
     @abstractmethod
     def vocab(self):

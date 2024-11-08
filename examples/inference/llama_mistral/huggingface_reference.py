@@ -20,5 +20,6 @@ inputs = tokenizer(prompt, return_tensors="pt")
 for key in inputs:
     inputs[key] = inputs[key].cuda()
 # top_k, top_p and do_sample are set for greedy argmax based sampling
+
 outputs = model.generate(**inputs, max_length=100, do_sample=False, top_p=0, top_k=0, temperature=1.0)
 print(tokenizer.decode(outputs[0], skip_special_tokens=True))

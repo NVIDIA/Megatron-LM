@@ -1,17 +1,15 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-from importlib.metadata import version
-
 import pytest
 import torch
 import torch.nn.functional as F
-from pkg_resources import packaging
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 from megatron.legacy.model import Float16Module
 from megatron.training.arguments import parse_args
 from megatron.training.initialize import _set_random_seed
@@ -20,8 +18,6 @@ from tests.unit_tests.test_utilities import Utils
 DEVICE_CAPABILITY = None
 if torch.cuda.is_available():
     DEVICE_CAPABILITY = torch.cuda.get_device_capability()
-
-_te_version = packaging.version.Version(version("transformer-engine"))
 
 
 class TestParallelGroupedMLP:
@@ -218,7 +214,7 @@ class TestParallelGroupedMLP:
 
 
 @pytest.mark.skipif(
-    _te_version < packaging.version.Version("1.9.0.dev0"),
+    not is_te_min_version("1.9.0.dev0"),
     reason="TE Grouped MLP is only supported in TE 1.9.0.dev0 and later.",
 )
 class TestTEGroupedMLP:

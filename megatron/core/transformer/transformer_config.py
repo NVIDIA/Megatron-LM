@@ -1,14 +1,12 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
-from importlib.metadata import version
 from typing import Callable, Optional, Tuple
 
 import torch.nn.functional as F
-from pkg_resources import packaging
 
 from ..model_parallel_config import ModelParallelConfig
-from ..utils import init_method_normal, scaled_init_method_normal
+from ..utils import get_te_version, init_method_normal, is_te_min_version, scaled_init_method_normal
 
 
 @dataclass
@@ -112,6 +110,9 @@ class TransformerConfig(ModelParallelConfig):
     """Whether cross entropy loss is calculated over the actual number of non-padded tokens in the
     global batch, versus the default behavior of assuming all tokens are non-padded."""
 
+    multi_latent_attention: bool = False
+    """Whether to use multi-latent attention."""
+
     ####################
     # initialization
     ####################
@@ -163,6 +164,9 @@ class TransformerConfig(ModelParallelConfig):
 
     apply_rope_fusion: bool = False
     """If True, use fused RoPE kernel."""
+
+    disable_te_fused_rope: bool = False
+    """If True, disable fused RoPE kernel from transformer engine"""
 
     ####################
     # activation recomputation
@@ -262,7 +266,6 @@ class TransformerConfig(ModelParallelConfig):
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
     in a single kernel launch to improve the utilization and performance by leveraging the Grouped
     GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
-
     """
 
     moe_aux_loss_coeff: float = 0  # 1e-2 would be a good start value for load balance loss.
@@ -282,6 +285,7 @@ class TransformerConfig(ModelParallelConfig):
     moe_token_dispatcher_type: str = "allgather"
     """The type of token dispatcher to use. The default is 'allgather'.
     Options are 'allgather' and 'alltoall'."""
+
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
@@ -504,12 +508,62 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.num_moe_experts and self.fp8:
             # TE version below 1.7.0 will raise Error when handle zeros tokens for expert
-            te_version = packaging.version.Version(version("transformer-engine"))
-            if te_version < packaging.version.Version("1.7.0.dev0"):
+            if not is_te_min_version("1.7.0.dev0"):
                 raise ValueError(
                     "Only transformer-engine>=1.7.0 supports MoE FP8 training, "
-                    f"but your version is {te_version}."
+                    f"but your version is {get_te_version()}."
                 )
 
             if self.moe_grouped_gemm:
                 raise ValueError("Grouped GEMM of MoE not support fp8 for now.")
+
+
+@dataclass
+class MLATransformerConfig(TransformerConfig):
+    """Configuration object for megatron-core Multi-Latent Attention (MLA) transformers.
+
+    The initialization function has an argument for each parameter, including those in
+    ModelParallelConfig. Included YaRN RoPE parameters that is fused in MLA.
+    """
+
+    multi_latent_attention: bool = True
+    """Whether to use Multi-Latent Attention."""
+
+    q_lora_rank: int = 512
+    """Rank of Query tensor's low rank representation."""
+
+    kv_lora_rank: int = 512
+    """Rank of Key and Value tensors' low rank representation."""
+
+    qk_head_dim: int = 128
+    """Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim"""
+
+    qk_pos_emb_head_dim: int = 64
+    """Dimension of the position embedding in the QK projection."""
+
+    v_head_dim: int = 128
+    """Dimension of the head in the V projection."""
+
+    rotary_base: float = 10000
+    """Rotary base for the rotary embeddings."""
+
+    rotary_scaling_factor: float = 40
+    """Rotary scaling factor for the rotary embeddings."""
+
+    normalization: str = "RMSNorm"
+    """Default normalization layer for MLA models is RMSNorm."""
+
+    max_position_embeddings: int = 163840
+    """Maximum position embeddings for the original model."""
+
+    beta_fast: float = 32
+    """Beta fast for YaRN RoPE."""
+
+    beta_slow: float = 1
+    """Beta slow for YaRN RoPE."""
+
+    mscale: float = 0.707
+    """Mscale for YaRN RoPE in Multi-Latent Attention."""
+
+    mscale_all_dim: float = 0.707
+    """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention."""

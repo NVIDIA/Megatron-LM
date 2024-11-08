@@ -2,14 +2,13 @@
 
 """Megatron tokenizers."""
 
-import math
-from abc import ABC, abstractmethod
 import base64
 import json
+import math
+import types
+from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, List, Optional
-
-import types
 
 from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
 
@@ -20,27 +19,28 @@ from .gpt2_tokenization import GPT2Tokenizer
 def build_tokenizer(args, **kwargs):
     """Initialize tokenizer."""
     if args.rank == 0:
-        print('> building {} tokenizer ...'.format(args.tokenizer_type),
-              flush=True)
+        print('> building {} tokenizer ...'.format(args.tokenizer_type), flush=True)
 
     # Select and instantiate the tokenizer.
     if args.tokenizer_type == 'BertWordPieceLowerCase':
         assert args.vocab_file is not None
-        tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
-                                            lower_case=True,
-                                            vocab_extra_ids=args.vocab_extra_ids)
+        tokenizer = _BertWordPieceTokenizer(
+            vocab_file=args.vocab_file, lower_case=True, vocab_extra_ids=args.vocab_extra_ids
+        )
     elif args.tokenizer_type == 'BertWordPieceCase':
         assert args.vocab_file is not None
-        tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
-                                            lower_case=False,
-                                            vocab_extra_ids=args.vocab_extra_ids)
+        tokenizer = _BertWordPieceTokenizer(
+            vocab_file=args.vocab_file, lower_case=False, vocab_extra_ids=args.vocab_extra_ids
+        )
     elif args.tokenizer_type == 'GPT2BPETokenizer':
         assert args.vocab_file is not None
         assert args.merge_file is not None
         tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
     elif args.tokenizer_type == 'SentencePieceTokenizer':
         assert args.tokenizer_model is not None
-        tokenizer = _SentencePieceTokenizer(args.tokenizer_model, vocab_extra_ids=args.vocab_extra_ids)
+        tokenizer = _SentencePieceTokenizer(
+            args.tokenizer_model, vocab_extra_ids=args.vocab_extra_ids
+        )
     elif args.tokenizer_type == 'GPTSentencePieceTokenizer':
         assert args.tokenizer_model is not None
         tokenizer = _GPTSentencePieceTokenizer(args.tokenizer_model)
@@ -65,13 +65,11 @@ def build_tokenizer(args, **kwargs):
         assert args.vocab_size is not None
         tokenizer = _NullTokenizer(args.vocab_size)
     else:
-        raise NotImplementedError('{} tokenizer is not '
-                                  'implemented.'.format(args.tokenizer_type))
+        raise NotImplementedError('{} tokenizer is not ' 'implemented.'.format(args.tokenizer_type))
 
     # Add vocab size (if not already set from a checkpoint).
     if getattr(args, "padded_vocab_size", None) is None:
-        args.padded_vocab_size = _vocab_size_with_padding(tokenizer.vocab_size,
-                                                          args)
+        args.padded_vocab_size = _vocab_size_with_padding(tokenizer.vocab_size, args)
 
     return tokenizer
 
@@ -81,13 +79,14 @@ def _vocab_size_with_padding(orig_vocab_size, args, logging_enabled=True):
     still having GPU friendly size."""
 
     after = orig_vocab_size
-    multiple = args.make_vocab_size_divisible_by * \
-        args.tensor_model_parallel_size
+    multiple = args.make_vocab_size_divisible_by * args.tensor_model_parallel_size
     after = int(math.ceil(after / multiple) * multiple)
     if args.rank == 0 and logging_enabled:
-        print(' > padded vocab (size: {}) with {} dummy tokens '
-              '(new size: {})'.format(
-                  orig_vocab_size, after - orig_vocab_size, after), flush=True)
+        print(
+            ' > padded vocab (size: {}) with {} dummy tokens '
+            '(new size: {})'.format(orig_vocab_size, after - orig_vocab_size, after),
+            flush=True,
+        )
     return after
 
 
@@ -97,10 +96,14 @@ class _HuggingFaceTokenizer(MegatronTokenizer):
         try:
             import transformers
         except ImportError:
-            raise EnvironmentError(f"The transformers library must be installed to use huggingface_tokenizer_provider")
+            raise EnvironmentError(
+                f"The transformers library must be installed to use huggingface_tokenizer_provider"
+            )
 
         # TODO(bnorick): download tokenizer once to lustre and use force offline to make sure all tasks read it from there
-        self._tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path=pretrained_model_name_or_path, **kwargs)
+        self._tokenizer = transformers.AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path=pretrained_model_name_or_path, **kwargs
+        )
         self._vocab = self._tokenizer.get_vocab()
         self._inv_vocab = {token_id: token for token, token_id in self._vocab.items()}
 
@@ -128,6 +131,18 @@ class _HuggingFaceTokenizer(MegatronTokenizer):
     def detokenize(self, token_ids, **kwargs):
         return self._tokenizer.decode(token_ids, **kwargs)
 
+    def offsets(self, ids: list[int], text: str) -> list[int]:
+        retok_ids: "transformers.BatchEncoding" = self._tokenizer(text)
+        offsets, next_start_idx = [], 0
+        for i in range(len(ids)):
+            span = retok_ids.token_to_chars(i)
+            if span is not None:
+                offsets.append(span.start)
+                next_start_idx = span.end
+            else:
+                offsets.append(next_start_idx)
+        return offsets
+
     @property
     def eod(self):
         return self._tokenizer.eos_token_id
@@ -146,8 +161,7 @@ class _BertWordPieceTokenizer(MegatronTokenizer):
         self._additional_special_tokens = []
 
         # (dsachan) Add BOS and EOS tokens
-        SPECIAL_TOKENS = {'eos_token': '[EOS]',
-                          'bos_token': '[BOS]'}
+        SPECIAL_TOKENS = {'eos_token': '[EOS]', 'bos_token': '[BOS]'}
         self._bos_token = '[BOS]'
         self.add_token(self._bos_token)
         self._bos_token_id = self.vocab.get(self._bos_token)
@@ -160,7 +174,8 @@ class _BertWordPieceTokenizer(MegatronTokenizer):
         # These can be used as sentinel tokens in T5 model inputs
         additional_special_tokens = []
         additional_special_tokens.extend(
-            ["<extra_id_{}>".format(i) for i in range(vocab_extra_ids)])
+            ["<extra_id_{}>".format(i) for i in range(vocab_extra_ids)]
+        )
         self.add_additional_special_tokens(additional_special_tokens)
 
     def add_token(self, token):
@@ -195,6 +210,10 @@ class _BertWordPieceTokenizer(MegatronTokenizer):
         tokens = self.tokenizer.convert_ids_to_tokens(ids)
         return self.tokenizer.convert_tokens_to_string(tokens)
 
+    def detokenize(self, token_ids):
+        """Copy of decode() method for inference pipeline compatibility"""
+        return self.decode(token_ids)
+
     def decode_token_ids(self, token_ids):
         tokens = self.tokenizer.convert_ids_to_tokens(token_ids)
         exclude_list = ['[PAD]', '[CLS]']
@@ -227,32 +246,37 @@ class _BertWordPieceTokenizer(MegatronTokenizer):
 
     @property
     def bos(self):
-        """ Id of the beginning of sentence token in the vocabulary."""
+        """Id of the beginning of sentence token in the vocabulary."""
         return self._bos_token_id
 
     @property
     def eos(self):
-        """ Id of the end of sentence token in the vocabulary."""
+        """Id of the end of sentence token in the vocabulary."""
         return self._eos_token_id
 
     @property
+    def eod(self):
+        """Copy of eod property for inference pipeline compatibility"""
+        return self.eos
+
+    @property
     def bos_token(self):
-        """ Beginning of sentence token id """
+        """Beginning of sentence token id"""
         return self._bos_token
 
     @property
     def eos_token(self):
-        """ End of sentence token id """
+        """End of sentence token id"""
         return self._eos_token
 
     @property
     def additional_special_tokens(self):
-        """ All the additional special tokens you may want to use (list of strings)."""
+        """All the additional special tokens you may want to use (list of strings)."""
         return self._additional_special_tokens
 
     @property
     def additional_special_tokens_ids(self):
-        """ Ids of all the additional special tokens in the vocabulary (list of integers)."""
+        """Ids of all the additional special tokens in the vocabulary (list of integers)."""
         return [self.vocab.get(token) for token in self._additional_special_tokens]
 
     @additional_special_tokens.setter
@@ -266,8 +290,9 @@ class _GPT2BPETokenizer(MegatronTokenizer):
     def __init__(self, vocab_file, merge_file):
         super().__init__(vocab_file, merge_file)
 
-        self.tokenizer = GPT2Tokenizer(vocab_file, merge_file, errors='replace',
-                                       special_tokens=[], max_len=None)
+        self.tokenizer = GPT2Tokenizer(
+            vocab_file, merge_file, errors='replace', special_tokens=[], max_len=None
+        )
         self.eod_id = self.tokenizer.encoder['<|endoftext|>']
 
     @property
@@ -300,6 +325,7 @@ class _SentencePieceTokenizer(MegatronTokenizer):
         super().__init__(model_file, vocab_extra_ids=vocab_extra_ids)
 
         import sentencepiece
+
         self.tokenizer = sentencepiece.SentencePieceProcessor(model_file=model_file)
         self._initalize(vocab_extra_ids)
 
@@ -426,6 +452,9 @@ class _SentencePieceTokenizer(MegatronTokenizer):
         text += self.tokenizer.decode_ids(ids[last_i:])
         return text
 
+    def offsets(self, ids: list[int], text: str) -> list[int]:
+        return [p.begin for p in self.tokenizer.decode_ids_as_immutable_proto(ids).pieces]
+
     @property
     def cls(self):
         return self._cls_id
@@ -462,7 +491,7 @@ class _SentencePieceTokenizer(MegatronTokenizer):
 class _GPTSentencePieceTokenizer(_SentencePieceTokenizer):
     """SentencePieceTokenizer-Megatron wrapper"""
 
-    def __init__(self, model_file,):
+    def __init__(self, model_file):
         super().__init__(model_file, vocab_extra_ids=0)
 
     def _initalize(self, vocab_extra_ids):
@@ -502,7 +531,7 @@ class _GPTSentencePieceTokenizer(_SentencePieceTokenizer):
 class _Llama2Tokenizer(_SentencePieceTokenizer):
     """SentencePieceTokenizer-Megatron wrapper"""
 
-    def __init__(self, model_file,):
+    def __init__(self, model_file):
         super().__init__(model_file, vocab_extra_ids=0)
 
     def _initalize(self, vocab_extra_ids):
@@ -549,10 +578,7 @@ class _Llama2Tokenizer(_SentencePieceTokenizer):
         return None
 
 
-def reload_mergeable_ranks(
-    path: str,
-    max_vocab: Optional[int] = None,
-) -> Dict[bytes, int]:
+def reload_mergeable_ranks(path: str, max_vocab: Optional[int] = None) -> Dict[bytes, int]:
     """
     Reload our tokenizer JSON file and convert it to Tiktoken format.
     """
@@ -585,8 +611,11 @@ def reload_mergeable_ranks(
     return ranks
 
 
-PATTERN_TIKTOKEN = r"[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"
+PATTERN_TIKTOKEN = (
+    r"[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"
+)
 PATTERN_TIKTOKEN_V2 = "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+
 
 class CustomTikTokenizer(MegatronTokenizer):
     def __init__(
@@ -602,9 +631,10 @@ class CustomTikTokenizer(MegatronTokenizer):
             pattern=pattern,
             vocab_size=vocab_size,
             num_special_tokens=num_special_tokens,
-            special_tokens=special_tokens
+            special_tokens=special_tokens,
         )
         import tiktoken
+
         from .. import print_rank_0  # To prevent circular import.
 
         if vocab_size is None:
@@ -614,20 +644,30 @@ class CustomTikTokenizer(MegatronTokenizer):
         SPECIAL_TOKENS = ["<unk>", "<s>", "</s>"]
         if special_tokens is None:
             special_tokens = SPECIAL_TOKENS.copy()
-        assert len(special_tokens) == len(set(special_tokens)), f"Special tokens should be unique: {special_tokens}"
+        assert len(special_tokens) == len(
+            set(special_tokens)
+        ), f"Special tokens should be unique: {special_tokens}"
         assert len(special_tokens) <= num_special_tokens < self._vocab_size
-        assert set(SPECIAL_TOKENS) <= set(special_tokens), f"Custom special tokens should include {SPECIAL_TOKENS}"
+        assert set(SPECIAL_TOKENS) <= set(
+            special_tokens
+        ), f"Custom special tokens should include {SPECIAL_TOKENS}"
 
-        special_filler = ["<SPECIAL_{id}>".format(id=i) for i in range(len(special_tokens), num_special_tokens)]
+        special_filler = [
+            "<SPECIAL_{id}>".format(id=i) for i in range(len(special_tokens), num_special_tokens)
+        ]
         if special_filler:
             print_rank_0(f"Adding special tokens {special_filler[0]}, ..., {special_filler[-1]}")
         special_tokens = special_tokens + special_filler
         assert len(set(special_tokens)) == len(special_tokens) == num_special_tokens, special_tokens
         inner_vocab_size = self._vocab_size - num_special_tokens
 
-        token_to_id_without_special_tokens = reload_mergeable_ranks(path, max_vocab=inner_vocab_size)
+        token_to_id_without_special_tokens = reload_mergeable_ranks(
+            path, max_vocab=inner_vocab_size
+        )
         # Create space for special tokens.
-        token_to_id_without_special_tokens = {t: i + num_special_tokens for t, i in token_to_id_without_special_tokens.items()}
+        token_to_id_without_special_tokens = {
+            t: i + num_special_tokens for t, i in token_to_id_without_special_tokens.items()
+        }
 
         special_tokens = {t: i for i, t in enumerate(special_tokens)}
         self._unk_id = special_tokens["<unk>"]
@@ -649,7 +689,6 @@ class CustomTikTokenizer(MegatronTokenizer):
         self._token_to_id.update(special_tokens)
         self._id_to_token = {v: k for k, v in self._token_to_id.items()}
         assert set(range(self._vocab_size)) == set(self._id_to_token.keys())
-
 
     @property
     def bos(self) -> int:
@@ -687,6 +726,9 @@ class CustomTikTokenizer(MegatronTokenizer):
     def detokenize(self, tokens: List[int]) -> str:
         return self._model.decode(tokens)
 
+    def offsets(self, ids: list[int], text: str) -> list[int]:
+        return self._model.decode_with_offsets(ids)[1]
+
     @property
     def vocab_size(self) -> int:
         return self._vocab_size
@@ -712,6 +754,13 @@ class _NullTokenizer(MegatronTokenizer):
     def detokenize(self, ids):
         text = [str(x) for x in ids]
         return ' '.join(text)
+
+    def offsets(self, ids: list[int], text: str) -> list[int]:
+        offsets, start_idx = [], 0
+        for id_ in ids:
+            offsets.append(start_idx)
+            start_idx += 1 + len(str(id_))
+        return offsets
 
     @property
     def vocab_size(self):

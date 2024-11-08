@@ -4,6 +4,7 @@ ENV_VARS:
   NCCL_ALGO: Tree
   CUBLAS_WORKSPACE_CONFIG: :4096:8
   GPUS_PER_NODE: 7
+  N_REPEATS: 5
 MODEL_ARGS:
   --num-layers: 12
   --hidden-size: 624

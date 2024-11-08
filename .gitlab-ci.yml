@@ -13,22 +13,28 @@ workflow:
         FUNCTIONAL_TEST: "no"
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run tests/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
+        UNIT_TEST_REPEAT: 5
+        UNIT_TEST_TIMEOUT: 50
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: mr
-        UNIT_TEST_REPEAT: 5
-        UNIT_TEST_TIMEOUT: 50
+        FUNCTIONAL_TEST_CLUSTER_A100: ""
+        FUNCTIONAL_TEST_CLUSTER_H100: ""
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run nightly/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
+        UNIT_TEST_REPEAT: 5
+        UNIT_TEST_TIMEOUT: 50
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: nightly
-        UNIT_TEST_REPEAT: 5
-        UNIT_TEST_TIMEOUT: 50
+        FUNCTIONAL_TEST_CLUSTER_A100: ""
+        FUNCTIONAL_TEST_CLUSTER_H100: ""
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run weekly/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
-        FUNCTIONAL_TEST: "yes"
-        FUNCTIONAL_TEST_SCOPE: weekly
         UNIT_TEST_REPEAT: 5
         UNIT_TEST_TIMEOUT: 50
+        FUNCTIONAL_TEST: "yes"
+        FUNCTIONAL_TEST_SCOPE: weekly
+        FUNCTIONAL_TEST_CLUSTER_A100: ""
+        FUNCTIONAL_TEST_CLUSTER_H100: ""
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
         FUNCTIONAL_TEST: "no"
@@ -58,29 +64,23 @@ variables:
       - "mr"
       - "nightly"
       - "weekly"
+      - "pre-release"
+      - "release"
     description: "Testsuite to run (only for FUNCTIONAL_TEST=yes)"
-  FUNCTIONAL_TEST_CLUSTER:
+  FUNCTIONAL_TEST_CLUSTER_A100:
     value: "dgxa100_dracooci"
     options:
       - "dgxa100_dracooci"
       - "dgxa100_dracooci-ord"
+    description: 'Cluster for A100 workloads'
+  FUNCTIONAL_TEST_CLUSTER_H100:
+    value: "dgxh100_eos"
+    options:
+      - "dgxh100_coreweave"
       - "dgxh100_eos"
-    description: '"dgxa100_dracooci" for OCI-IAD, "dgxh100_eos" for EOS'
-  CONVERGENCE_TEST:
-    value: "no"
-    options:
-      - "yes"
-      - "no"
-    description: To run a convergence test
-  CONVERGENCE_TEST_SCOPE:
-    value: "release"
-    options:
-      - "release"
-      - "pre-release"
-    description: "Test suite to run (only for CONVERGENCE_TEST=yes)"
-  CONVERGENCE_TEST_RUN_NAME:
-    value: "pre-release-$$CI_PIPELINE_ID"
-    description: "Run directory of convergence test"
+    description: 'Cluster for H100 workloads'
+  FUNCTIONAL_TEST_NAME:
+    description: "Name of functional test run (only for pre-release and release)"
   PUBLISH: 
     value: "no"
     options: 
@@ -96,6 +96,7 @@ variables:
 
   # CI wide variables
   CI_MCORE_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_ci
+  CI_MCORE_DEV_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_ci_dev
   CI_NEMO_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/nemo_ci
   LINTING_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_linting
   UNIT_TEST_TIMEOUT: 15
@@ -105,5 +106,4 @@ include:
   - .gitlab/stages/00.pre.yml
   - .gitlab/stages/01.tests.yml
   - .gitlab/stages/02.functional-tests.yml
-  - .gitlab/stages/03.convergence-tests.yml
-  - .gitlab/stages/04.publish.yml
+  - .gitlab/stages/03.publish.yml

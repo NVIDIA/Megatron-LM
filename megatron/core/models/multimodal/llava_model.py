@@ -9,7 +9,7 @@ import torch
 from megatron.core import InferenceParams
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.models.gpt import GPTModel
-from megatron.core.models.vision.clip_vit_model import CLIPViTModel, get_image_sequence_length
+from megatron.core.models.vision.clip_vit_model import CLIPViTModel, get_num_image_embeddings
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -76,6 +76,7 @@ class LLaVAModel(MegatronModule):
         img_w: int = 336,
         patch_dim: int = 14,
         language_rotary_base: int = 10000,
+        language_rope_scaling: bool = False,
     ) -> None:
         super().__init__(config=language_transformer_config)
 
@@ -112,14 +113,28 @@ class LLaVAModel(MegatronModule):
                 pre_process=self.pre_process,
                 post_process=self.post_process,
                 rotary_base=language_rotary_base,
+                rope_scaling=language_rope_scaling,
             )
             self.share_embeddings_and_output_weights = (
                 self.language_model.share_embeddings_and_output_weights
             )
             self._language_max_sequence_length = language_max_sequence_length
+            self._language_is_pipeline_parallel = (
+                language_transformer_config.pipeline_model_parallel_size > 1
+            )
 
         class_token_len = 1
         if self.add_encoder:
+            self._drop_vision_class_token = drop_vision_class_token
+            add_class_token = True
+            if vision_transformer_config.vision_model_type == "siglip":
+                class_token_len = 0
+                add_class_token = False
+                error_msg = (
+                    "Siglip does not support vision class token, "
+                    "set disable-vision-class-token to False."
+                )
+                assert not self._drop_vision_class_token, error_msg
             self.vision_model = CLIPViTModel(
                 vision_transformer_config,
                 vision_transformer_layer_spec,
@@ -127,8 +142,9 @@ class LLaVAModel(MegatronModule):
                 img_w=img_w,
                 class_token_len=class_token_len,
                 patch_dim=patch_dim,
+                model_subtype=vision_transformer_config.vision_model_type,
+                add_class_token=add_class_token,
             )
-            self._drop_vision_class_token = drop_vision_class_token
             # Map (intermediate) vision model outputs to the language model input dimension.
             self.vision_projection = MultimodalProjector(
                 vision_projection_config,
@@ -149,8 +165,13 @@ class LLaVAModel(MegatronModule):
                     partial(_load_state_dict_hook_ignore_param_names, vision_projection_param_names)
                 )
 
-        self._img_seq_len = get_image_sequence_length(
-            img_h, img_w, patch_dim, not drop_vision_class_token, class_token_len
+        self._img_seq_len = get_num_image_embeddings(
+            img_h,
+            img_w,
+            patch_dim,
+            vision_transformer_config.vision_model_type,
+            drop_vision_class_token,
+            class_token_len,
         )
 
     def shared_embedding_or_output_weight(self):
@@ -283,6 +304,13 @@ class LLaVAModel(MegatronModule):
             # plus text sequence length.
             seq_lens = num_image_tiles_batch * img_seq_len - num_images_per_sample + text_seq_len
             max_seq_len = seq_lens.max()
+            # Pipeline parallel expects fixed input size. Check if we need to pad.
+            if (
+                self._language_is_pipeline_parallel
+                and max_seq_len < self._language_max_sequence_length
+            ):
+                max_seq_len = self._language_max_sequence_length
+
             batch_indices, non_image_indices = torch.where(input_ids != image_token_index)
 
             # New position ids for the text tokens, shifted by the image sequence length.
@@ -341,7 +369,9 @@ class LLaVAModel(MegatronModule):
             ]
 
             # Put image embeddings to image positions.
-            final_embedding[images_mask] = image_embeddings.reshape(-1, embed_dim).contiguous()
+            final_embedding[images_mask] = (
+                image_embeddings.permute(1, 0, 2).reshape(-1, embed_dim).contiguous()
+            )
 
         # Create the final labels and loss mask (if this is the last language model stage).
         final_labels, final_loss_mask = None, None
@@ -394,13 +424,15 @@ class LLaVAModel(MegatronModule):
             final_embedding = final_embedding.transpose(1, 0).contiguous()
 
         # Truncate if exceeding the language model's max sequence length.
-        if (
+        truncate_embedding = (
             final_embedding is not None
             and final_embedding.shape[0] > self._language_max_sequence_length
-        ):
+        )
+        if truncate_embedding:
             final_embedding = final_embedding[: self._language_max_sequence_length]
 
-        if has_labels and final_labels.shape[1] > self._language_max_sequence_length:
+        truncate_labels = has_labels and final_labels.shape[1] > self._language_max_sequence_length
+        if truncate_labels:
             final_labels = final_labels[:, : self._language_max_sequence_length]
             final_loss_mask = final_loss_mask[:, : self._language_max_sequence_length]
 
@@ -417,6 +449,7 @@ class LLaVAModel(MegatronModule):
         inference_params: Optional[InferenceParams] = None,
         num_image_tiles: Optional[List[int]] = None,
         image_token_index: Optional[int] = IMAGE_TOKEN_INDEX,
+        runtime_gather_output: Optional[bool] = None,
     ) -> torch.Tensor:
         """Forward function of the LLaVA model.
 
@@ -433,6 +466,8 @@ class LLaVAModel(MegatronModule):
             inference_params (InferenceParams): Inference-time parameters including KV cache.
             num_image_tiles (list of int): Number of tiles per image. Default 1 tile per image.
             image_token_index (int): ID for input images.
+            runtime_gather_output (bool): Gather output at runtime. Default None means
+                `parallel_output` arg in the constructor will be used.
 
         Returns:
             output (torch.Tensor): Loss of shape [b, s] if labels are provided,
@@ -451,7 +486,9 @@ class LLaVAModel(MegatronModule):
             image_embeddings = None
         elif self.add_encoder and not has_images:
             # If no images provided, use an empty image embeddings tensor.
-            image_embeddings = torch.tensor([], dtype=images.dtype, device=images.device)
+            image_embeddings = torch.tensor([], dtype=images.dtype, device=images.device).reshape(
+                0, 0, 0
+            )
         elif self.add_encoder and has_images:
             image_embeddings = self.vision_model(images)  # [num_tiles, img_seq_len, h_vision]
             if self._drop_vision_class_token:
@@ -516,6 +553,7 @@ class LLaVAModel(MegatronModule):
             decoder_input=combined_embeddings,
             labels=new_labels,
             inference_params=inference_params,
+            runtime_gather_output=runtime_gather_output,
         )
 
         if labels is None or loss_mask is None:
