@@ -44,13 +44,13 @@ class ParallelFileCacheManager(FileCacheManager):
     1. https://github.com/triton-lang/triton/pull/3544
     2. https://github.com/triton-lang/triton/pull/4295
 
-    The above changes will probably be included in Triton release version 3.1,
+    The above changes will probably be included in Triton release version 3.2,
     making this patch no longer necessary.
     """
 
     def put(self, data, filename, binary=True) -> str:
         """A patched version of put, implementing PR 3544 and PR 4295."""
-        patch_limit = '3.0'
+        patch_limit = '3.1'
         assert _version_no_greater_than(triton_version, patch_limit), (
             "Assertion failed: ParallelFileCacheManager patch should not be "
             f"used beyond Triton version {patch_limit}."
