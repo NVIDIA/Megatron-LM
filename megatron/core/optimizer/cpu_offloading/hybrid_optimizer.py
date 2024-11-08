@@ -1,13 +1,13 @@
 import torch
+from collections import defaultdict
 from typing import Any, Dict, Iterable, Union, TypeAlias
 
 
 ParamsT: TypeAlias = Union[Iterable[torch.Tensor], Iterable[Dict[str, Any]]]
 
-
 class HybridDeviceOptimizer(torch.optim.Optimizer):
     def __init__(
-        self, params: ParamsT, offload_fraction=0.5, cpu_optimizer_cls=None, gpu_optimizer_cls=None, **kwargs
+        self, params, offload_fraction=0.5, cpu_optimizer_cls=None, gpu_optimizer_cls=None, pin_cpu_grads: bool=True, **kwargs
     ):
         super(HybridDeviceOptimizer, self).__init__(params, defaults={
             "cpu_optimizer_cls": cpu_optimizer_cls,
@@ -31,6 +31,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             self.gpu_optimizer = gpu_optimizer_cls(self.gpu_params, **kwargs)
         else:
             self.gpu_optimizer = None
+        self.cpu_copy_map_grad: Dict[torch.Tensor, torch.Tensor] = defaultdict(torch.Tensor)
+        self._data_stream = torch.cuda.Stream()
+        self._step_stream = torch.cuda.Stream()
+        self._data_event: torch.cuda.Event = None
 
         self.register_grad_cpu_copy_hook()
         self.register_param_copy_back_gpu_hook()
@@ -38,14 +42,25 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
     def register_grad_cpu_copy_hook(self):
         def grad_cpu_copy_hook_closure():
             def grad_cpu_copy_hook(optimizer, args, kwargs):
-                for group in self.cpu_optimizer.param_groups:
-                    for param in group["params"]:
-                        gpu_param = self.cpu_copys_map_gpu_param[param]
-                        if hasattr(gpu_param, "grad"):
-                            param.grad = gpu_param.grad.cpu()
-                            param.requires_grad = True
-                        else:
-                            param.requires_grad = False
+                self._data_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self._data_stream):
+                    for group in self.cpu_optimizer.param_groups:
+                        for param in group["params"]:
+                            if param not in self.cpu_copy_map_grad:
+                                self.cpu_copy_map_grad[param] = torch.empty(
+                                    gpu_param.grad.shape,
+                                    dtype=gpu_param.grad.dtype,
+                                    pin_memory=self.pin_cpu_grads
+                                )
+
+                            gpu_param = self.cpu_copys_map_gpu_param[param]
+                            if hasattr(gpu_param, "grad"):
+                                self.cpu_copy_map_grad[param].data.copy_(gpu_param.grad, non_blocking=True)
+                                param.grad = self.cpu_copy_map_grad[param]
+                                param.requires_grad = True
+                            else:
+                                param.requires_grad = False
+                    self._data_event = self._data_stream.record_event()
 
             return grad_cpu_copy_hook
 
@@ -54,9 +69,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
     def register_param_copy_back_gpu_hook(self):
         def param_copy_back_gpu_hook_closure():
             def param_copy_back_gpu_hook(optimizer, args, kwargs):
-                for cpu_copy, gpu_param in self.cpu_copys_map_gpu_param.items():
-                    gpu_param.data.copy_(cpu_copy.data)
-
+                self._data_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self._data_stream):      
+                    for cpu_copy, gpu_param in self.cpu_copys_map_gpu_param.items():
+                        gpu_param.data.copy_(cpu_copy.data, non_blocking=True)
+                self._data_stream.record_event().wait(
+                    torch.cuda.current_stream()
+                )
             return param_copy_back_gpu_hook
 
         if self.cpu_optimizer:
@@ -101,10 +120,16 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             self.gpu_optimizer.load_state_dict(gpu_state_dict)
 
     def step(self, closure=None):
-        if self.cpu_optimizer:
-            self.cpu_optimizer.step(closure)
-        if self.gpu_optimizer:
+        self._step_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self._step_stream):
             self.gpu_optimizer.step(closure)
+        self._step_stream.record_event().wait(
+            torch.cuda.current_stream()
+        )
+        if self._data_event is not None:
+            self._data_event.synchronize()
+            self._data_event = None
+        self.cpu_optimizer.step(closure)
 
     def _split_parameters_updated_on_the_cpu_and_gpu(self, params: ParamsT, offload_fraction: float):
         if len(params) == 0:
@@ -129,7 +154,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         for param in params:
             if offloaded_params_numel < offload_threshold:
                 assert param.is_cuda
-                param_cpu_copy = param.detach().cpu()
+                param_cpu_copy = param.detach().cpu().pin_memory()
                 param_cpu_copy.requires_grad = True
                 gpu_params_map_cpu_copy[param] = param_cpu_copy
                 cpu_copys_map_gpu_param[param_cpu_copy] = param
@@ -160,3 +185,4 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             return cpu_param_groups, gpu_param_groups, gpu_params_map_cpu_copy, cpu_copys_map_gpu_param
 
         return cpu_params, gpu_params, gpu_params_map_cpu_copy, cpu_copys_map_gpu_param
+
