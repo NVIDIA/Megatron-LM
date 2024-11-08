@@ -9,6 +9,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
     def __init__(
         self, params: ParamsT, offload_fraction=0.5, cpu_optimizer_cls=None, gpu_optimizer_cls=None, **kwargs
     ):
+        super(HybridDeviceOptimizer, self).__init__(params, defaults={
+            "cpu_optimizer_cls": cpu_optimizer_cls,
+            "gpu_optimizer_cls": gpu_optimizer_cls,
+            "offload_fraction": offload_fraction,
+            **kwargs,
+        })
+
         (
             self.cpu_params,
             self.gpu_params,
@@ -16,10 +23,14 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             self.cpu_copys_map_gpu_param,
         ) = self._split_parameters_updated_on_the_cpu_and_gpu(params, offload_fraction)
 
-        self.cpu_optimizer = cpu_optimizer_cls(self.cpu_params, **kwargs)
-        self.gpu_optimizer = gpu_optimizer_cls(self.gpu_params, **kwargs)
-
-        super(HybridDeviceOptimizer, self).__init__(self.cpu_params + self.gpu_params, defaults=kwargs)
+        if len(self.cpu_params) > 0:
+            self.cpu_optimizer = cpu_optimizer_cls(self.cpu_params, **kwargs)
+        else:
+            self.cpu_optimizer = None
+        if len(self.gpu_params) > 0:
+            self.gpu_optimizer = gpu_optimizer_cls(self.gpu_params, **kwargs)
+        else:
+            self.gpu_optimizer = None
 
         self.register_grad_cpu_copy_hook()
         self.register_param_copy_back_gpu_hook()
@@ -27,8 +38,14 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
     def register_grad_cpu_copy_hook(self):
         def grad_cpu_copy_hook_closure():
             def grad_cpu_copy_hook(optimizer, args, kwargs):
-                for gpu_param, cpu_copy in self.gpu_params_map_cpu_copy.items():
-                    cpu_copy.grad = gpu_param.grad.cpu()
+                for group in self.cpu_optimizer.param_groups:
+                    for param in group["params"]:
+                        gpu_param = self.cpu_copys_map_gpu_param[param]
+                        if hasattr(gpu_param, "grad"):
+                            param.grad = gpu_param.grad.cpu()
+                            param.requires_grad = True
+                        else:
+                            param.requires_grad = False
 
             return grad_cpu_copy_hook
 
@@ -42,11 +59,18 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
             return param_copy_back_gpu_hook
 
-        self.register_step_post_hook(param_copy_back_gpu_hook_closure())
+        if self.cpu_optimizer:
+            self.cpu_optimizer.register_step_post_hook(param_copy_back_gpu_hook_closure())
 
     def state_dict(self):
-        cpu_state_dict = self.cpu_optimizer.state_dict()
-        gpu_state_dict = self.gpu_optimizer.state_dict()
+        if self.cpu_optimizer:
+            cpu_state_dict = self.cpu_optimizer.state_dict()
+        else:
+            cpu_state_dict = {"state": {}, "param_groups": []}
+        if self.gpu_optimizer:
+            gpu_state_dict = self.gpu_optimizer.state_dict()
+        else:
+            gpu_state_dict = {"state": {}, "param_groups": []}
 
         state = cpu_state_dict["state"].copy()
         state.update(
@@ -63,23 +87,24 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         return {"state": state, "param_groups": param_groups}
 
     def load_state_dict(self, state_dict):
-        cpu_state_dict = {
-            "state": state_dict["state"][: len(self.cpu_params)],
-            "param_groups": state_dict["param_groups"][: len(self.cpu_params)],
-        }
-        gpu_state_dict = {
-            "state": state_dict["state"][len(self.cpu_params) :],
-            "param_groups": state_dict["param_groups"][len(self.cpu_params) :],
-        }
-        self.cpu_optimizer.load_state_dict(cpu_state_dict)
-        self.gpu_optimizer.load_state_dict(gpu_state_dict)
-
-    # def param_groups(self):
-    #     return self.cpu_optimizer.param_groups + self.gpu_optimizer.param_groups
+        if self.cpu_optimizer:
+            cpu_state_dict = {
+                "state": {k: v for k, v in state_dict["state"].items() if k < len(self.cpu_params)},
+                "param_groups": state_dict["param_groups"][: len(self.cpu_params)],
+            }
+            self.cpu_optimizer.load_state_dict(cpu_state_dict)
+        if self.gpu_optimizer:
+            gpu_state_dict = {
+                "state": {k - len(self.cpu_params): v for k, v in state_dict["state"].items() if k >= len(self.cpu_params)},
+                "param_groups": state_dict["param_groups"][len(self.cpu_params) :],
+            }
+            self.gpu_optimizer.load_state_dict(gpu_state_dict)
 
     def step(self, closure=None):
-        self.cpu_optimizer.step(closure)
-        self.gpu_optimizer.step(closure)
+        if self.cpu_optimizer:
+            self.cpu_optimizer.step(closure)
+        if self.gpu_optimizer:
+            self.gpu_optimizer.step(closure)
 
     def _split_parameters_updated_on_the_cpu_and_gpu(self, params: ParamsT, offload_fraction: float):
         if len(params) == 0:
@@ -123,8 +148,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 _cpu_params = []
                 _gpu_params = []
                 for param in group["params"]:
-                    if param in cpu_params:
-                        _cpu_params.append(param)
+                    if param in gpu_params_map_cpu_copy:
+                        _cpu_params.append(gpu_params_map_cpu_copy[param])
                     else:
                         _gpu_params.append(param)
                 if len(_cpu_params) > 0:

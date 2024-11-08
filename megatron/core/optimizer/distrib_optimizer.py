@@ -43,6 +43,7 @@ from .optimizer import (
     _zero_grad_group_helper,
 )
 from .optimizer_config import OptimizerConfig
+from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 
 try:
     # This will be used when "--fp8-param-gather" is enabled.
@@ -472,9 +473,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             assert self.ddp_config == model_chunk.ddp_config
 
-        assert isinstance(
-            optimizer, Adam
-        ), "Only Adam currently supported, due to checkpointing requirements."
+        # assert isinstance(
+        #     optimizer, Adam
+        # ), "Only Adam currently supported, due to checkpointing requirements."
 
         # Model grad buffer ranges.
         assert per_model_buffers is not None, "per_model_buffers must be provided"
@@ -536,8 +537,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Update optimizer groups.
         # - Also, leverage state_dict() and load_state_dict() to
         #   recast preexisting per-param state tensors.
-        self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
-        self.optimizer.load_state_dict(self.optimizer.state_dict())
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            self.optimizer = HybridDeviceOptimizer(
+                params=[g["orig_group"] for g in self.opt_group_ranges],
+                **self.optimizer.defaults,
+            )
+        else:
+            self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
+            self.optimizer.load_state_dict(self.optimizer.state_dict())
 
     def enable_pre_hook(self):
         """

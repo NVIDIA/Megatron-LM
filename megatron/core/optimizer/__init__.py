@@ -3,7 +3,7 @@ import logging
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
-from torch.optim import Adam as CPUAdam, SGD as CPUSGD
+from torch.optim import AdamW as CPUAdam, SGD as CPUSGD
 
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as Adam
@@ -36,7 +36,6 @@ from .optimizer import (
     Float16OptimizerWithFloat16Params,
     FP32Optimizer,
     MegatronOptimizer,
-    MegatronHybridDeviceOptimizer,
 )
 from .optimizer_config import OptimizerConfig
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
@@ -282,14 +281,13 @@ def _get_megatron_optimizer_based_on_param_groups(
                 weight_decay=config.weight_decay,
                 momentum=config.sgd_momentum,
             )
-        hdo = HybridDeviceOptimizer(
+        optimizer = HybridDeviceOptimizer(
             param_groups,
             offload_fraction=config.optimizer_offload_fraction,
             cpu_optimizer_cls=cpu_optimizer_cls,
             gpu_optimizer_cls=gpu_optimizer_cls,
             **optimizer_defaults,
         )
-        optimizer = MegatronHybridDeviceOptimizer(hdo)
         init_state_fn = None
     elif config.optimizer == 'adam':
         optimizer = Adam(
