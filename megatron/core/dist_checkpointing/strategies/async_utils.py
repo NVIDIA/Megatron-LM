@@ -95,7 +95,7 @@ class DistributedAsyncCaller:
             f"rank: {torch.distributed.get_rank()}, takes {end_sync - start_sync} to finish D2H "
         )
 
-        ctx = mp.get_context('fork')
+        ctx = mp.get_context('spawn')
         self.start_time = time()
         self.process = ctx.Process(target=async_fn, args=save_args)
         self.process.start()
