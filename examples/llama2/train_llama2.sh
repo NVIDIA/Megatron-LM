@@ -15,9 +15,6 @@ do
    export "$KEY"="$VALUE"
 done
 
-# Change for multinode config
-export CUDA_DEVICE_MAX_CONNECTIONS=1
-
 USE_FLASH_ATTN="${USE_FLASH_ATTN:-1}"
 NO_TRAINING="${NO_TRAINING:-0}" # NO_TRAINING=1: for computing metrics only
 ENABLE_PROFILING="${ENABLE_PROFILING:-0}"
@@ -34,6 +31,7 @@ CWD=`pwd`
 GPUS_PER_NODE=`python -c "import torch; print(torch.cuda.device_count())"`
 
 # Change for multinode config
+export CUDA_DEVICE_MAX_CONNECTIONS=1
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-23731}
 NNODES=${NNODES:-1}
@@ -146,7 +144,6 @@ GPT_ARGS="
     --no-masked-softmax-fusion \
     --overlap-grad-reduce \
 "
-    # --no-masked-softmax-fusion \
 
 DATA_ARGS="
     --tokenizer-type Llama2Tokenizer \
@@ -161,9 +158,6 @@ OUTPUT_ARGS="
     --no-save-optim \
     --eval-iters -1
 "
-
-    # --save-interval $TOTAL_ITERS \
-    # --eval-interval $TOTAL_ITERS \
 
 DISTRIBUTED_ARGS="
     --nproc_per_node $GPUS_PER_NODE \
@@ -253,13 +247,13 @@ fi
 
 MEAN_LOG_SCRIPT=examples/llama2/mean_log_value.py
 TMP_FILE=${TMP_DIR}/tmp.txt
-# echo '============================================================================================================'
+
 grep -Eo 'throughput per GPU [^|]*' $TRAIN_LOG | sed -E 's/.*throughput per GPU \(TFLOP\/s\/GPU\): ([0-9\.]+).*/\1/' > $TMP_FILE
 THROUGHPUT=$(python ${MEAN_LOG_SCRIPT} ${TMP_FILE})
 echo "throughput per GPU (TFLOPs/GPU): ${THROUGHPUT}"
 rm $TMP_FILE
 
-# echo '============================================================================================================'
+
 grep -Eo 'elapsed time per iteration [^|]*' $TRAIN_LOG | sed -E 's/.*elapsed time per iteration \(ms\): ([0-9\.]+).*/\1/' > $TMP_FILE
 TIME_PER_ITER=$(python ${MEAN_LOG_SCRIPT}  ${TMP_FILE} 2>/dev/null | awk '{printf "%.6f", $0}')
 echo "elapsed time per iteration: ${TIME_PER_ITER}"
