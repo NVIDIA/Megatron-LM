@@ -316,6 +316,7 @@ test:pypi_push_wheel:
   needs: [test:pypi_test_wheel]
   variables:
     PUBLISH_DRYRUN: "yes"
+  timeout: 10m
   script:
     - >
       if [ "$PUBLISH_DRYRUN" = "yes" ]; then
@@ -332,6 +333,12 @@ test:pypi_push_wheel:
       for i in 1 2 3 4 5; do 
         twine upload --verbose -u $TWINE_USERNAME -p $TWINE_PASSWORT --repository $REPOSITORY wheelhouse/* && break || sleep $(( 60*2**i )); 
       done
+  rules:
+    - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+      allow_failure: true
+      when: on_success
+    - when: on_success
+      allow_failure: true
 
 test:gh_release:
   extends: [.test_rules]
