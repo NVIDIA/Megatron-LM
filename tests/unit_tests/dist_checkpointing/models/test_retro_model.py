@@ -1,4 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+import os
 import types
 
 import pytest
@@ -31,6 +32,10 @@ def initialize_retro_model(seed, decoder_spec_fn, spec_type, num_layers=9, **con
         retro_split_preprocessing="98,2,0",
     )
     default_config_kwargs.update(**config_kwargs)
+
+    os.environ['NVTE_FLASH_ATTN'] = "0"
+    os.environ['NVTE_FUSED_ATTN'] = "0"
+
     retro_config = RetroConfig(**default_config_kwargs)
     pre_process = ps.is_pipeline_first_stage()
     post_process = ps.is_pipeline_last_stage()
