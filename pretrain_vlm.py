@@ -50,7 +50,8 @@ def model_provider(
     vision_model_type = "clip"
 
     num_image_embeddings = get_num_image_embeddings(
-        args.img_h, args.img_w, args.patch_dim, vision_model_type, args.disable_vision_class_token, 1
+        args.img_h, args.img_w, args.patch_dim, vision_model_type, args.disable_vision_class_token,
+        class_token_len=1, pixel_shuffle=False,
     )
 
     old_seq_length = args.seq_length

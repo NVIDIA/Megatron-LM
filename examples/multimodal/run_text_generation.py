@@ -143,6 +143,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         args.vision_model_type,
         args.disable_vision_class_token,
         1,
+        args.pixel_shuffle,
     )
 
     for idx, (imgs, num_tiles, sample_id, question, answers, metadata) in enumerate(dataloader):

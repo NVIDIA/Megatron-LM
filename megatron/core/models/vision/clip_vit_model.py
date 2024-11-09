@@ -51,7 +51,7 @@ class CLIPViTModel(VisionModule):
     ) -> None:
 
         error_msg = f"CLIPViTModel model subtype {model_subtype} is not supported."
-        assert model_subtype in ["clip", "siglip"], error_msg
+        assert model_subtype in ["clip", "siglip", "internvit"], error_msg
 
         if model_subtype == "siglip":
             assert class_token_len == 0, "SigLIP does not support class tokens."
@@ -90,7 +90,7 @@ class CLIPViTModel(VisionModule):
             )
             conv_bias = False
             padding = 0
-        if model_subtype == "siglip":
+        elif model_subtype == "siglip":
             self.ln_post = build_module(
                 ln_post_impl,
                 config=transformer_config,
@@ -99,6 +99,11 @@ class CLIPViTModel(VisionModule):
             )
             conv_bias = True
             padding = "valid"
+        elif model_subtype == "internvit":
+            conv_bias = True
+            padding = 0
+        else:
+            raise ValueError(f"unsupported vision model type {model_subtype}")
 
         self.conv1 = torch.nn.Conv2d(
             in_channels=3,
@@ -182,17 +187,28 @@ class CLIPViTModel(VisionModule):
 
 
 def get_num_image_embeddings(
-    img_h, img_w, patch_dim, vision_model_type, disable_vision_class_token, class_token_len
+    img_h,
+    img_w,
+    patch_dim,
+    vision_model_type,
+    disable_vision_class_token,
+    class_token_len,
+    pixel_shuffle=False,
 ):
     """Get the number of image embeddings per image tile."""
     if vision_model_type == "siglip":
         keep_class_token = False
-    elif vision_model_type == "clip":
+    elif vision_model_type in ("clip", "internvit"):
         keep_class_token = not disable_vision_class_token
+    else:
+        raise ValueError(f"unsupported vision model: {vision_model_type}")
 
     num_patches_per_dim_h = img_h // patch_dim
     num_patches_per_dim_w = img_w // patch_dim
     num_patches = num_patches_per_dim_h * num_patches_per_dim_w
     num_image_embeddings_per_tile = num_patches + (class_token_len if keep_class_token else 0)
+
+    if pixel_shuffle:
+        num_image_embeddings_per_tile = int(num_image_embeddings_per_tile * (0.5**2))
 
     return num_image_embeddings_per_tile
