@@ -42,6 +42,7 @@ class VQADataset(torch.utils.data.Dataset):
         use_tiling,
         max_num_tiles,
         use_thumbnail,
+        vision_model_type,
     ):
         samples = json.load(open(gt_path, encoding='utf-8'))
         if "data" in samples:
@@ -62,6 +63,7 @@ class VQADataset(torch.utils.data.Dataset):
         self._use_tiling = use_tiling
         self._max_num_tiles = max_num_tiles
         self._use_thumbnail = use_thumbnail
+        self._vision_model_type = vision_model_type
 
     def __len__(self):
         return len(self._samples)
@@ -85,6 +87,7 @@ class VQADataset(torch.utils.data.Dataset):
             self._max_num_tiles,
             self._use_thumbnail,
             augment=False,
+            vision_model_type=self._vision_model_type,
         )
         tile_count = torch.tensor([len(imgs)], dtype=torch.int)
 
@@ -119,6 +122,7 @@ class CaptioningDataset(torch.utils.data.Dataset):
         use_tiling,
         max_num_tiles,
         use_thumbnail,
+        vision_model_type,
     ):
         image_files = sorted(glob.glob(input_image_path + "/*"))
 
@@ -141,6 +145,7 @@ class CaptioningDataset(torch.utils.data.Dataset):
         self._use_tiling = use_tiling
         self._max_num_tiles = max_num_tiles
         self._use_thumbnail = use_thumbnail
+        self._vision_model_type = vision_model_type
 
     def __len__(self):
         return len(self._image_files)
@@ -158,6 +163,7 @@ class CaptioningDataset(torch.utils.data.Dataset):
             self._max_num_tiles,
             self._use_thumbnail,
             augment=False,
+            vision_model_type=self._vision_model_type,
         )
 
         tile_count = torch.tensor([len(imgs)], dtype=torch.int)
@@ -183,6 +189,7 @@ class MMMUDataset(torch.utils.data.Dataset):
         max_num_tiles,
         use_thumbnail,
         single_image,
+        vision_model_type,
     ):
         import datasets
         from MMMU.mmmu.utils.data_utils import CAT_SHORT2LONG, load_yaml
@@ -240,6 +247,7 @@ class MMMUDataset(torch.utils.data.Dataset):
         self._max_num_tiles = max_num_tiles
         self._use_thumbnail = use_thumbnail
         self._single_image = single_image
+        self._vision_model_type = vision_model_type
 
     def __len__(self):
         return len(self._dataset)
@@ -263,6 +271,7 @@ class MMMUDataset(torch.utils.data.Dataset):
                 self._max_num_tiles,
                 self._use_thumbnail,
                 augment=False,
+                vision_model_type=self._vision_model_type,
             )
             sample_num_tiles = [len(sample_imgs)]
         else:
@@ -295,6 +304,7 @@ class MMMUDataset(torch.utils.data.Dataset):
                     adjusted_max_num_tiles,
                     self._use_thumbnail,
                     augment=False,
+                    vision_model_type=self._vision_model_type,
                 )  # List of tiles.
 
                 sample_imgs.extend(imgs)
@@ -346,6 +356,7 @@ class VideoMMMEDataset(torch.utils.data.Dataset):
         max_num_tiles,
         use_thumbnail,
         num_frames,
+        vision_model_type,
     ):
         ground_truth_original = json.load(open(gt_path))
         ground_truth = []
@@ -375,6 +386,7 @@ class VideoMMMEDataset(torch.utils.data.Dataset):
         self._max_num_tiles = max_num_tiles
         self._use_thumbnail = use_thumbnail
         self._num_frames = num_frames
+        self._vision_model_type = vision_model_type
 
     def __len__(self):
         return len(self._ground_truth)
@@ -401,6 +413,7 @@ class VideoMMMEDataset(torch.utils.data.Dataset):
                     self._max_num_tiles,
                     self._use_thumbnail,
                     augment=False,
+                    vision_model_type=self._vision_model_type,
                 )
                 for img in video_frames
             )
@@ -449,6 +462,7 @@ class OCRBenchDataset(torch.utils.data.Dataset):
         use_tiling,
         max_num_tiles,
         use_thumbnail,
+        vision_model_type,
     ):
         gt = json.load(open(gt_path, encoding='utf-8'))
 
@@ -465,6 +479,7 @@ class OCRBenchDataset(torch.utils.data.Dataset):
         self._use_tiling = use_tiling
         self._max_num_tiles = max_num_tiles
         self._use_thumbnail = use_thumbnail
+        self._vision_model_type = vision_model_type
 
     def __len__(self):
         return len(self._gt)
@@ -481,6 +496,7 @@ class OCRBenchDataset(torch.utils.data.Dataset):
             self._max_num_tiles,
             self._use_thumbnail,
             augment=False,
+            vision_model_type=self._vision_model_type,
         )
 
         tile_count = torch.tensor([len(imgs)], dtype=torch.int)
@@ -514,6 +530,7 @@ class MathVistaDataset(torch.utils.data.Dataset):
         use_tiling,
         max_num_tiles,
         use_thumbnail,
+        vision_model_type,
     ):
         import datasets
 
@@ -541,6 +558,7 @@ class MathVistaDataset(torch.utils.data.Dataset):
         self._use_tiling = use_tiling
         self._max_num_tiles = max_num_tiles
         self._use_thumbnail = use_thumbnail
+        self._vision_model_type = vision_model_type
 
     def __len__(self):
         return len(self._dataset["pid"])
@@ -557,6 +575,7 @@ class MathVistaDataset(torch.utils.data.Dataset):
             self._max_num_tiles,
             self._use_thumbnail,
             augment=False,
+            vision_model_type=self._vision_model_type,
         )
 
         tile_count = torch.tensor([len(imgs)], dtype=torch.int)
@@ -612,6 +631,7 @@ class AI2DDataset(torch.utils.data.Dataset):
         max_num_tiles,
         use_thumbnail,
         no_mask,
+        vision_model_type,
     ):
         with open(gt_path, 'r') as f:
             jsonl = list(f)
@@ -632,6 +652,7 @@ class AI2DDataset(torch.utils.data.Dataset):
         self._max_num_tiles = max_num_tiles
         self._use_thumbnail = use_thumbnail
         self._no_mask = no_mask
+        self._vision_model_type = vision_model_type
 
     def __len__(self):
         return len(self._gt)
@@ -650,6 +671,7 @@ class AI2DDataset(torch.utils.data.Dataset):
             self._max_num_tiles,
             self._use_thumbnail,
             augment=False,
+            vision_model_type=self._vision_model_type,
         )
 
         tile_count = torch.tensor([len(imgs)], dtype=torch.int)
@@ -679,6 +701,7 @@ def get_evaluation_dataset(
     num_partitions,
     partition_id,
     num_frames,
+    vision_model_type,
 ):
     """Get an evaluation dataset."""
     if task == "TextVQA":
@@ -701,6 +724,7 @@ def get_evaluation_dataset(
             use_tiling,
             max_num_tiles,
             use_thumbnail,
+            vision_model_type,
         )
     elif task == "VQAv2":
         keys = {
@@ -722,6 +746,7 @@ def get_evaluation_dataset(
             use_tiling,
             max_num_tiles,
             use_thumbnail,
+            vision_model_type,
         )
     elif task == "ChartQA":
         keys = {"image_id": "imgname", "question": "query", "answer": "label"}
@@ -738,6 +763,7 @@ def get_evaluation_dataset(
             use_tiling,
             max_num_tiles,
             use_thumbnail,
+            vision_model_type,
         )
     elif task == "captioning":
         dataset = CaptioningDataset(
@@ -751,6 +777,7 @@ def get_evaluation_dataset(
             use_tiling,
             max_num_tiles,
             use_thumbnail,
+            vision_model_type,
         )
     elif task == 'MMMU':
         # Note: single_image=True uses only one image like in the MMMU repo example.
@@ -766,6 +793,7 @@ def get_evaluation_dataset(
             max_num_tiles,
             use_thumbnail,
             single_image=True,
+            vision_model_type=vision_model_type,
         )
     elif task == "VideoMME":
         dataset = VideoMMMEDataset(
@@ -780,6 +808,7 @@ def get_evaluation_dataset(
             max_num_tiles,
             use_thumbnail,
             num_frames,
+            vision_model_type,
         )
     elif task == "OCRBench":
         dataset = OCRBenchDataset(
@@ -793,6 +822,7 @@ def get_evaluation_dataset(
             use_tiling,
             max_num_tiles,
             use_thumbnail,
+            vision_model_type,
         )
     elif task == "MathVista":
         dataset = MathVistaDataset(
@@ -805,6 +835,7 @@ def get_evaluation_dataset(
             use_tiling,
             max_num_tiles,
             use_thumbnail,
+            vision_model_type,
         )
     elif task == "AI2D":
         dataset = AI2DDataset(
@@ -819,6 +850,7 @@ def get_evaluation_dataset(
             max_num_tiles,
             use_thumbnail,
             no_mask=False,
+            vision_model_type=vision_model_type,
         )
     else:
         raise NotImplementedError(f"unsupported task {task}")

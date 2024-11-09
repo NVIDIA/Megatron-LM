@@ -85,6 +85,7 @@ def get_evaluation_dataloader(
     partition_id,
     num_frames,
     num_workers,
+    vision_model_type,
 ):
     """Build evaluation dataset."""
     dataset = get_evaluation_dataset(
@@ -100,6 +101,7 @@ def get_evaluation_dataloader(
         num_partitions,
         partition_id,
         num_frames,
+        vision_model_type,
     )
 
     dp_rank = parallel_state.get_data_parallel_rank()
@@ -134,6 +136,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         config.partition_id,
         args.num_frames,
         args.num_workers,
+        args.vision_model_type,
     )
 
     num_img_embeddings_per_tile = get_num_image_embeddings(

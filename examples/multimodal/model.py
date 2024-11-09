@@ -144,6 +144,7 @@ def model_provider(
         language_rotary_base=args.rotary_base,
         language_rope_scaling=args.use_rope_scaling,
         image_token_index=get_tokenizer().convert_tokens_to_ids(IMAGE_TOKEN),
+        pixel_shuffle=args.pixel_shuffle,
     )
 
     model.freeze(

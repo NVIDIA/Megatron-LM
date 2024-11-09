@@ -1,18 +1,14 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 import dataclasses
-import itertools
 import json
-import random
-import re
 import sys
 import traceback
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Union
 
 from image_processing import get_visual_transform
 import numpy as np
 import torch
-from torchvision import transforms as T
 
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX
 from megatron.energon import (
@@ -22,145 +18,16 @@ from megatron.energon import (
     OCRSample,
     SimilarityInterleavedSample,
     VQASample,
+    MultiChoiceVQASample
 )
-from megatron.energon.transforms import CustomTransform, MergeTransform
 from megatron.training import get_args, get_tokenizer
 
-
-class RandomResize(CustomTransform):
-    """Resizes the image by a random scale factor in the given interval, but at most max_size"""
-
-    def __init__(self, min_scale: float, max_scale: float, max_size: int):
-        self._min_scale = min_scale
-        self._max_scale = max_scale
-        self._max_size = max_size
-
-    def apply_transform(self, matrix: np.ndarray, dst_size: np.ndarray) -> Tuple[Any, Any, Any]:
-        scale = random.uniform(self._min_scale, self._max_scale)
-        new_size = tuple(int(x * scale) for x in dst_size)
-
-        if max(new_size) > self._max_size:
-            scale = self._max_size / max(new_size)
-            new_size = tuple(int(x * scale) for x in dst_size)
-
-        matrix = self.scale(scale, scale) @ matrix
-        dst_size = np.array(new_size, dtype=dst_size.dtype)
-
-        return matrix, dst_size, (self.__class__.__name__, scale)
-
-
-class RandomResizeLongEdge(CustomTransform):
-    """Resizes the image's longer edge to a random length between min_size and max_size pixels."""
-
-    def __init__(self, min_size: int, max_size: int):
-        self._min_size = min_size
-        self._max_size = max_size
-
-    def apply_transform(self, matrix: np.ndarray, dst_size: np.ndarray) -> Tuple[Any, Any, Any]:
-        new_long = random.randint(self._min_size, self._max_size)
-        if dst_size[0] > dst_size[1]:  # h > w
-            new_w, new_h = int(new_long * dst_size[1] / dst_size[0]), new_long
-        else:  # w > h
-            new_w, new_h = new_long, int(new_long * dst_size[0] / dst_size[1])
-
-        new_size = (new_h, new_w)
-        matrix = self.scale(new_w / dst_size[1], new_h / dst_size[0]) @ matrix
-        dst_size = np.array(new_size, dtype=dst_size.dtype)
-
-        return matrix, dst_size, (self.__class__.__name__, new_size)
-
-
-class RandomPad(CustomTransform):
-    """Pads the image to the given size, randomly choosing the position of the image within the new larger image.
-    If the image is already larger than the given size, it will not be padded in that direction(s)."""
-
-    def __init__(self, size: Tuple[int, int]):
-        self._new_size = size  # h, w
-
-    def apply_transform(self, matrix: np.ndarray, dst_size: np.ndarray) -> Tuple[Any, Any, Any]:
-        h_pad = max(self._new_size[0] - dst_size[0], 0)
-        w_pad = max(self._new_size[1] - dst_size[1], 0)
-
-        if h_pad == 0 and w_pad == 0:
-            return matrix, dst_size, (self.__class__.__name__, None)
-        else:
-            # TODO: fix me
-            # top = random.randint(0, h_pad)
-            # left = random.randint(0, w_pad)
-            top = 0
-            left = 0
-
-            matrix = self.translate(left, top) @ matrix
-            dst_size = np.array(self._new_size, dtype=dst_size.dtype)
-            return matrix, dst_size, (self.__class__.__name__, (top, left))
-
-
-def _get_ocr_document_visual_transform(IMG_H=1024, IMG_W=1024):
-    document_visual_transform = T.Compose(
-        [
-            MergeTransform(
-                [
-                    # T.RandomResizedCrop(size=FINAL_SIZE, scale=(0.5, 1.0), ratio=(0.8, 1.2)),
-                    RandomResizeLongEdge(960, 1008),  # Note: 1008 comes from list(range(960, 1024, 16))[-1]
-                    T.RandomRotation(5, interpolation=T.InterpolationMode.BILINEAR),
-                    T.RandomPerspective(distortion_scale=0.1, p=0.1),
-                    RandomPad((IMG_H, IMG_W)),
-                ]
-            ),
-            T.ColorJitter(brightness=(0.8, 1.2), contrast=(0.7, 1.0)),
-            T.RandomGrayscale(p=0.5),
-            T.RandomInvert(p=0.5),
-            T.RandomAdjustSharpness(sharpness_factor=0.0, p=0.5),
-            T.RandomAdjustSharpness(sharpness_factor=2.0, p=0.5),
-            # LogImage(),
-            # T.ToTensor(),
-            # T.Normalize(IMAGE_MEAN, IMAGE_STD),
-        ]
-    )
-    return document_visual_transform
-
-def _get_ocr_document_identity_transform(IMG_H=1024, IMG_W=1024):
-    long_edge = max(IMG_H, IMG_W)
-    document_identity_transform = T.Compose(
-        [
-            MergeTransform(
-                [
-                    RandomResizeLongEdge(long_edge, long_edge),
-                    RandomPad((long_edge, long_edge)),
-                ]
-            )
-        ]
-    )
-    return document_identity_transform
-
-def _get_ocr_paragraph_visual_transform(IMG_H=1024, IMG_W=1024):
-    paragraph_visual_transform = T.Compose(
-        [
-            MergeTransform(
-                [
-                    # T.RandomResizedCrop(size=FINAL_SIZE, scale=(0.5, 1.0), ratio=(0.8, 1.2)),
-                    RandomResize(0.5, 2.0, min(IMG_H, IMG_W)), #FINAL_SIZE),
-                    T.RandomRotation(1, interpolation=T.InterpolationMode.BILINEAR),
-                    T.RandomPerspective(distortion_scale=0.1, p=0.1),
-                    RandomPad((IMG_H, IMG_W)),
-                ]
-            ),
-            T.ColorJitter(brightness=(0.8, 1.2), contrast=(0.7, 1.0)),
-            T.RandomGrayscale(p=0.5),
-            T.RandomInvert(p=0.5),
-            # T.RandomAdjustSharpness(sharpness_factor=0.0, p=0.5),
-            # T.RandomAdjustSharpness(sharpness_factor=2.0, p=0.5),
-            # LogImage(),
-            # T.ToTensor(),
-            # T.Normalize(IMAGE_MEAN, IMAGE_STD),
-        ]
-    )
-    return paragraph_visual_transform
 
 # Type for intermediate batch, after batch()
 @dataclass
 class ImageTaskSample:
     __key__: str
+    __restore_key__: str
     __subflavors__: Dict
     # (c, h, w)
     imgs: List[torch.Tensor]
@@ -173,6 +40,7 @@ class ImageTaskSample:
 @dataclass
 class ImageTaskBatch(Batch):
     __keys__: List[str]
+    __restore_key__: str
     __subflavors__: List[Dict]
     # (num_tiles, c, h, w)
     imgs: torch.Tensor
@@ -205,32 +73,40 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
 
 
     def encode_sample(self, sample: Union[CaptioningSample, OCRSample, VQASample, SimilarityInterleavedSample]):
-        if isinstance(sample, CaptioningSample):
+        if isinstance(sample, OCRSample):
+            if "pdfa" in sample.__key__:
+                yield self.combined_ocr_encoder(sample, task_type='encode_pdf')
+            elif "multi" in sample.__key__:
+                yield self.combined_ocr_encoder(sample, task_type='_encode_ocr')
+            else:
+                yield self.combined_ocr_encoder(sample, task_type='encode_ocr_ref')
+        elif isinstance(sample, CaptioningSample):
             yield self.encode_captioning(sample)
         elif isinstance(sample, VQASample):
-            is_llava_training = sample.__subflavors__['is_llava_training'] if 'is_llava_training' in sample.__subflavors__ else False
+            is_llava_training = sample.__subflavors__["is_llava_training"] if "is_llava_training" in sample.__subflavors__ else False
 
             if "llava" in sample.__key__ or is_llava_training:
                 yield self.encode_llava_pretrain(sample)
             else:
-                yield self.encode_vqa(sample)
+                yield self.encode_any_single_turn_vqa(sample)
         elif isinstance(sample, SimilarityInterleavedSample):
-            if "llava" or "video" in sample.__key__:
-                yield self.encode_llava_sft(sample)
-            else:
-                raise NotImplementedError('Sample format not supported')
+            yield self.encode_llava_sft(sample)
+        elif isinstance(sample, MultiChoiceVQASample):
+            yield self.encode_any_single_turn_vqa(sample)
         else:
-            raise NotImplementedError('Sample format not supported')
+            raise NotImplementedError("Sample format not supported", sample)
 
     def encode_captioning(self, sample: CaptioningSample):
+        """Encode CaptioningSample."""
         augment = sample.__subflavors__.get("augmentation")
 
         imgs = get_visual_transform(
             sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles, self.args.use_thumbnail, augment,
+            self.args.vision_model_type,
         )
         num_tiles = [len(imgs)]
 
-        prompt_list = self.manual_prompts["CaptioningPretraining"]["llava"]
+        prompt_list = self.manual_prompts["CaptioningPretraining"]["raw"]
 
         prompt_idx = np.random.randint(len(prompt_list))
         cur_prompt = prompt_list[prompt_idx]
@@ -253,6 +129,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
 
         return ImageTaskSample(
             __key__=sample.__key__,
+            __restore_key__=sample.__restore_key__,
             __subflavors__=sample.__subflavors__,
             imgs=imgs,
             num_tiles=num_tiles,
@@ -261,10 +138,12 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
         )
 
     def encode_llava_pretrain(self, sample: VQASample):
+        """Encode pretrain sample in LLAVA style."""
         augment = sample.__subflavors__.get("augmentation", False)
 
         imgs = get_visual_transform(
             sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles, self.args.use_thumbnail, augment,
+            self.args.vision_model_type,
         )
         num_tiles = [len(imgs)]
 
@@ -279,6 +158,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
 
         return ImageTaskSample(
             __key__=sample.__key__,
+            __restore_key__=sample.__restore_key__,
             __subflavors__=sample.__subflavors__,
             imgs=imgs,
             num_tiles=num_tiles,
@@ -287,6 +167,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
         )
 
     def encode_llava_sft(self, sample: SimilarityInterleavedSample):
+        """Encode SFT sample."""
         augment = sample.__subflavors__['augmentation'] if 'augmentation' in sample.__subflavors__ else False
         has_image = sample.__subflavors__['has_image'] if 'has_image' in sample.__subflavors__ else False
         has_video = sample.__subflavors__['has_video'] if 'has_video' in sample.__subflavors__ else False
@@ -294,6 +175,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
         if has_image:
             imgs = get_visual_transform(
                 sample.images[0], self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles, self.args.use_thumbnail, augment,
+                self.args.vision_model_type,
             )
             num_tiles = [len(imgs)]
         elif has_video:
@@ -308,7 +190,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
                 imgs += get_visual_transform(
                     video_frame_hwc, self.img_h, self.img_w,
                     self.args.use_tiling, self.args.max_num_tiles,
-                    self.args.use_thumbnail, augment=False)
+                    self.args.use_thumbnail, augment, self.args.vision_model_type)
             num_tiles = [len(imgs)]
         else:
             imgs = num_tiles = []
@@ -333,6 +215,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
 
         return ImageTaskSample(
             __key__=sample.__key__,
+            __restore_key__=sample.__restore_key__,
             __subflavors__=sample.__subflavors__,
             imgs=imgs,
             num_tiles=num_tiles,
@@ -340,7 +223,8 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
             target=target,
         )
 
-    def encode_vqa(self, sample: VQASample):
+    def encode_any_single_turn_vqa(self, sample):
+        """Encode MultiChoiceVQA or VQA sample."""
         augment = sample.__subflavors__['augmentation'] if 'augmentation' in sample.__subflavors__ else False
         has_video = sample.__subflavors__['has_video'] if 'has_video' in sample.__subflavors__ else False
 
@@ -356,40 +240,187 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
                 imgs += get_visual_transform(
                     video_frame_hwc, self.img_h, self.img_w,
                     self.args.use_tiling, self.args.max_num_tiles,
-                    self.args.use_thumbnail, augment=False)
+                    self.args.use_thumbnail, augment, self.args.vision_model_type)
         else:
             imgs = get_visual_transform(
-                sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles, self.args.use_thumbnail, augment,
+                sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles,
+                self.args.use_thumbnail, augment, self.args.vision_model_type,
             )
+
         num_tiles = [len(imgs)]
 
-        if "<image>" not in sample.context:
-            sample.context = "<image>" + sample.context
+        if isinstance(sample, MultiChoiceVQASample):
+            cur_prompt = format_multichoice_question(sample.context, sample.choices)
+            if "<image>" not in cur_prompt:
+                cur_prompt = "<image>\n" + cur_prompt
+            cur_answer = format_multichoice_answer(sample.correct_choice_idx)
+        elif isinstance(sample, VQASample):
+            if 'docvqa' in sample.__key__:
+                prompt_list = self.manual_prompts["VQASFT"]["docvqa"]
+            elif sample.__subflavors__.get("VQASFT"):
+                prompt_list = self.manual_prompts["VQASFT"]["raw"]
+            else:
+                prompt_list = ["{}"]
 
-        if isinstance(sample.answers, list):
-            answer_list = sample.answers
-            weight_list = np.array(sample.answer_weights).astype(np.float32)
-            weight_list = weight_list / np.sum(weight_list)
-            answer_idx = np.random.choice(weight_list.shape[0], 1, p=weight_list)[0]
-            answer = answer_list[answer_idx]
+            prompt_idx = np.random.randint(len(prompt_list))
+            cur_prompt = prompt_list[prompt_idx]
+
+            cur_prompt = cur_prompt.format(sample.context)
+
+            if "<image>" not in cur_prompt:
+                cur_prompt = "<image>\n" + cur_prompt
+
+            if isinstance(sample.answers, list):
+                answer_list = sample.answers
+                weight_list = np.array(sample.answer_weights).astype(np.float32)
+                weight_list = weight_list / np.sum(weight_list)
+                answer_idx = np.random.choice(weight_list.shape[0], 1, p=weight_list)[0]
+                cur_answer = answer_list[answer_idx]
+            else:
+                cur_answer = sample.answers
         else:
-            answer = sample.answers
+            raise NotImplementedError("Unsupported data type provided", sample)
 
         conversation = [
-            {"role": "user", "content": sample.context},
-            {"role": "assistant", "content": answer},
+            {"role": "system", "content": "Answer the questions."},
+            {"role": "user", "content": cur_prompt},
+            {"role": "assistant", "content": str(cur_answer)},
         ]
 
         input_ids, target = self.tokenizer.tokenize_conversation(conversation, True, False)
 
         return ImageTaskSample(
             __key__=sample.__key__,
+            __restore_key__=sample.__restore_key__,
             __subflavors__=sample.__subflavors__,
             imgs=imgs,
             num_tiles=num_tiles,
             text=input_ids,
             target=target,
         )
+
+    def combined_ocr_encoder(self, sample, task_type):
+        """Encode OCR samples."""
+        augment = sample.__subflavors__['augmentation'] if 'augmentation' in sample.__subflavors__ else False
+
+        if task_type == "encode_pdf":
+            sample, cur_prompt, cur_answer = self.encode_pdf_prompt(sample)
+        elif task_type == "encode_ocr_ref":
+            sample, cur_prompt, cur_answer = self.encode_ocr_ref_prompt(sample)
+        elif task_type == "_encode_ocr":
+            sample, cur_prompt, cur_answer = self.encode_ocr_prompt(sample)
+
+        imgs = get_visual_transform(
+                sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles,
+                self.args.use_thumbnail, augment, self.args.vision_model_type,
+            )
+        num_tiles = [len(imgs)]
+
+        conversation = [
+            {"role": "system", "content": "Answer the questions."},
+            {"role": "user", "content": cur_prompt},
+            {"role": "assistant", "content": str(cur_answer)},
+        ]
+
+        input_ids, target = self.tokenizer.tokenize_conversation(conversation, True, False)
+
+        return ImageTaskSample(
+            __key__=sample.__key__,
+            __restore_key__=sample.__restore_key__,
+            __subflavors__=sample.__subflavors__,
+            imgs=imgs,
+            num_tiles=num_tiles,
+            text=input_ids,
+            target=target,
+        )
+
+    def encode_pdf_prompt(self, sample: OCRSample) -> ImageTaskSample:
+        """Encode OCR sample."""
+        prompt_list = self.manual_prompts["DocPretraining"]["raw"]
+        prompt_idx = np.random.randint(len(prompt_list))
+        cur_prompt = prompt_list[prompt_idx]
+        if "<image>" not in cur_prompt:
+            cur_prompt = "<image>\n" + cur_prompt
+
+        # Make sure there is no extra <image> tag.
+        sample.text = sample.text.replace("<image>", "")
+
+        caption = sample.text.strip()
+
+        split_by_line_flag = sample.__subflavors__.get("SplitByLine")
+        if split_by_line_flag:
+            caption_list = caption.split('\n')
+            caption = np.random.choice(caption_list)
+        cur_answer = caption
+
+        return sample, cur_prompt, cur_answer
+
+    def encode_ocr_ref_prompt(self, sample: OCRSample) -> ImageTaskSample:
+        """Encode OCR sample."""
+        ref = sample.text
+        region = sample.words_boxes
+
+        # Make sure there is no extra <image> tag
+        ref = ref.replace("<image>", "")
+
+        if len(region) == 4:
+            region = f"<box>({region[0]},{region[1]}),({region[2]},{region[3]})</box>"
+        else:
+            region = f"<quad>({region[0]},{region[1]}),({region[2]},{region[3]}),({region[4]},{region[5]}),({region[6]},{region[7]})</quad>"
+
+        # Randomly choose between two tasks
+        task_idx = np.random.randint(2)
+        if task_idx == 0:
+            # Referring Grounding
+            prompt_list = self.manual_prompts["DocPretraining"]["referring_grounding"]
+            prompt_content = ref
+            answer = region
+        else:
+            # Grounded OCR
+            prompt_list = self.manual_prompts["DocPretraining"]["grounded_ocr"]
+            prompt_content = region
+            answer = ref
+
+        prompt_idx = np.random.randint(len(prompt_list))
+        cur_prompt = prompt_list[prompt_idx]
+        cur_prompt = cur_prompt.format(prompt_content)
+        if "<image>" not in cur_prompt:
+            cur_prompt = "<image>\n" + cur_prompt
+
+        return sample, cur_prompt, answer
+
+    def bbox_coord_to_label(self, text, bbox):
+        """Format bbox coordinates as text."""
+        assert len(bbox) == 4 or len(bbox) == 8
+
+        # Make sure there is no extra <image> tag
+        text = text.replace("<image>", "")
+
+        if len(bbox) == 4:
+            label_str = f"<ref>{text}</ref><box>({bbox[0]},{bbox[1]}),({bbox[2]},{bbox[3]})</box>"
+        else:
+            label_str = f"<ref>{text}</ref><quad>({bbox[0]},{bbox[1]}),({bbox[2]},{bbox[3]}),({bbox[4]},{bbox[5]}),({bbox[6]},{bbox[7]})</quad>"
+
+        return label_str
+
+    def encode_ocr_prompt(self, sample: OCRSample) -> ImageTaskSample:
+        """Encode OCR sample."""
+        if isinstance(sample.words_boxes[0], int):
+            answer = self.bbox_coord_to_label(sample.text, sample.words_boxes)
+        elif isinstance(sample.words_boxes[0], list):
+            answer = ""
+            for i, bbox in enumerate(sample.words_boxes):
+                answer += self.bbox_coord_to_label(sample.words_text[i], bbox)
+
+        prompt_list = self.manual_prompts["DocPretraining"]["ocr_multi"]
+        prompt_idx = np.random.randint(len(prompt_list))
+        cur_prompt = prompt_list[prompt_idx]
+
+        if "<image>" not in cur_prompt:
+            cur_prompt = "<image>\n" + cur_prompt
+        cur_answer = answer
+
+        return sample, cur_prompt, cur_answer
 
     def batch(self, samples: List[ImageTaskSample]) -> ImageTaskBatch:
         # Stack images to [num_tiles, c, h, w]. If there are no images (text-only), then use a dummy image.
@@ -423,6 +454,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
 
         batch = ImageTaskBatch(
             __keys__=[s.__key__ for s in samples],
+            __restore_key__=[s.__restore_key__ for s in samples],
             __subflavors__=[s.__subflavors__ for s in samples],
             imgs=imgs,
             num_tiles=num_tiles,
@@ -444,3 +476,19 @@ def print_error_handler(exc: Exception, key: Optional[str]):
         file=sys.stderr,
     )
     traceback.print_exc()
+
+
+def format_multichoice_question(question, multichoice_options):
+    """Format multi-choice question."""
+    options_text = ["{}. {}\n".format(chr(ord('A') + i), option) for i, option in
+                    zip(range(len(multichoice_options)), multichoice_options)]
+    options_text = "".join(options_text)
+
+    options_text = f"{options_text}Answer with the option's letter from the given choices directly."
+
+    return "{}\n{}".format(question, options_text)
+
+
+def format_multichoice_answer(idx):
+    """Format multi-choice answer."""
+    return chr(ord('A') + idx)
