@@ -52,7 +52,7 @@ def get_visual_transform(img, img_h, img_w, use_tiling=False, max_num_tiles=1, u
     if use_tiling:
         assert img_h == img_w, "dynamic tiling expects equal tile height and width"
         imgs = dynamic_preprocess(img, min_num=1, max_num=max_num_tiles, image_size=img_h, use_thumbnail=use_thumbnail)
-        imgs = [standardize_image(img.convert("RGB")) for img in imgs]
+        imgs = [standardize_image(img.convert("RGB"), pixel_mean, pixel_std) for img in imgs]
     else:
         img = np.array(img)
         original_h, original_w = img.shape[0], img.shape[1]
