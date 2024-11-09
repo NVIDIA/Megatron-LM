@@ -53,5 +53,6 @@ def add_multimodal_extra_args(parser):
         required=True,
         help="Prompt format to use with the tokenizer.",
     )
+    group.add_argument("--pixel-shuffle", action="store_true", default=False)
 
     return parser

@@ -94,6 +94,7 @@ class LLaVAModel(MegatronModule):
         language_rotary_base: int = 10000,
         language_rope_scaling: bool = False,
         image_token_index: int = DEFAULT_IMAGE_TOKEN_INDEX,
+        pixel_shuffle: bool = False,
     ) -> None:
         super().__init__(config=language_transformer_config)
 
@@ -198,9 +199,11 @@ class LLaVAModel(MegatronModule):
             vision_transformer_config.vision_model_type,
             drop_vision_class_token,
             class_token_len,
+            pixel_shuffle,
         )
 
         self.image_token_index = image_token_index
+        self._pixel_shuffle = pixel_shuffle
 
     def shared_embedding_or_output_weight(self):
         """This is a convenience method to surface the language model's word embeddings, which is
@@ -558,6 +561,12 @@ class LLaVAModel(MegatronModule):
             image_embeddings = self.vision_model(images)  # [num_tiles, img_seq_len, h_vision]
             if self._drop_vision_class_token:
                 image_embeddings = image_embeddings[:, self.vision_model.class_token_len :, :]
+
+            if self._pixel_shuffle:
+                image_embeddings = pixel_shuffle(
+                    image_embeddings
+                )  # [num_tiles, img_seq_len_shuffled, h_vision_shuffled]
+
             # contiguous() required as `permute` can sparsify the tensor and this breaks pipelining
             image_embeddings = image_embeddings.permute(
                 1, 0, 2
@@ -676,3 +685,37 @@ def _load_state_dict_hook_ignore_param_names(
                 f"{param_name} being removed from incompatible_keys.missing_keys in LlavaModel"
             )
             incompatible_keys.missing_keys.remove(param_name)
+
+
+# pylint: disable-next=line-too-long
+# Based on https://github.com/OpenGVLab/InternVL/blob/c7c5af1a8930b4862afe8ed14672307082ef61fa/internvl_chat/internvl/model/internvl_chat/modeling_internvl_chat.py#L218
+# Copyright (c) 2023 OpenGVLab.
+def pixel_shuffle(x, scale_factor=0.5, version=2):
+    """Pixel shuffle based on InternVL but adapted for our use case.
+
+    Args:
+        x (torch.Tensor): Vision model outputs [num_tiles, img_seq_len, h_vision]
+        version (int): Implementation version.
+
+    Returns:
+        Shuffled vision model outputs [num_tiles, (sq ** 2) * (scale ** 2), h_vision / (scale ** 2)]
+    """
+    h = w = int(x.shape[1] ** 0.5)  # sq
+    x = x.reshape(x.shape[0], h, w, -1)  # [num_tiles, sq, sq, h_vision]
+
+    n, w, h, c = x.size()
+    # N, W, H, C --> N, W, H * scale, C // scale
+    x = x.view(n, w, int(h * scale_factor), int(c / scale_factor))
+    # N, W, H * scale, C // scale --> N, H * scale, W, C // scale
+    x = x.permute(0, 2, 1, 3).contiguous()
+    # N, H * scale, W, C // scale --> N, H * scale, W * scale, C // (scale ** 2)
+    x = x.view(
+        n, int(h * scale_factor), int(w * scale_factor), int(c / (scale_factor * scale_factor))
+    )
+
+    if version == 2:
+        x = x.permute(0, 2, 1, 3).contiguous()
+
+    x = x.reshape(x.shape[0], -1, x.shape[-1])
+
+    return x
