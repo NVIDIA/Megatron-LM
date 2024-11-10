@@ -17,6 +17,7 @@ from torch import multiprocessing as mp
 
 logger = logging.getLogger(__name__)
 
+xm = get_xla_model()
 
 class AsyncRequest(NamedTuple):
     """Represents an async request that needs to be scheduled for execution.
@@ -100,6 +101,8 @@ class DistributedAsyncCaller:
             logger.debug(
                 f"rank: {torch.distributed.get_rank(group=self.process_group)}, takes {end_sync - start_sync} to finish D2H "
             )
+        elif xm:
+            xm.mark_step()
 
         ctx = mp.get_context('fork')
         self.start_time = time()

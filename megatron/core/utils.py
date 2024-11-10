@@ -27,6 +27,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedTensor
 
 logger = logging.getLogger(__name__)
 
+xm = get_xla_model()
 
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
@@ -130,6 +131,8 @@ class MakeViewlessTensor(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, inp, requires_grad):
+        if xm:
+            xm.mark_step()
         return _kernel_make_viewless_tensor(inp, requires_grad)
 
     @staticmethod
@@ -408,7 +411,6 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
 
     all_gathered_input = [None, None]
     if config.sequence_parallel:
-        xm = get_xla_model()
         if xm:
             all_gather_buffer = xm.all_gather(input, groups=parallel_state.get_tensor_model_parallel_groups())
         else:
@@ -450,7 +452,6 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
         input = embedding_activation_buffer.pop(0)
         if config.sequence_parallel:
             name = "mpu_" + str((i + 1) % 2)
-            xm = get_xla_model()
             handle = None
             if xm:
                 all_gather_buffer = xm.all_gather(input, groups=parallel_state.get_tensor_model_parallel_groups())

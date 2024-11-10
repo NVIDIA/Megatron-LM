@@ -79,6 +79,8 @@ else:
 
 stimer = StragglerDetector()
 
+xm = get_xla_model()
+
 def destroy_global_state():
     destroy_global_vars()
     destroy_num_microbatches_calculator()
@@ -1211,7 +1213,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             args.train_sync_interval
             and iteration % args.train_sync_interval == 0
         ):
-            torch.cuda.synchronize()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            elif xm:
+                xm.mark_step()
 
         # Logging.
         loss_scale = optimizer.get_loss_scale().item()

@@ -17,6 +17,8 @@ from torch.distributed import ProcessGroup
 
 from .utils import GlobalMemoryBuffer
 
+xm = get_xla_model()
+
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
 # Inter-layer model parallel group that the current rank belongs to.
@@ -929,7 +931,7 @@ def initialize_model_parallel(
             _DATA_MODULO_EXPERT_PARALLEL_GROUP_WITH_CP_GLOO = group_gloo
 
     global _DEFAULT_PROCESS_GROUP
-    if get_xla_model() is not None:
+    if xm is not None:
         _DEFAULT_PROCESS_GROUP = torch.distributed.new_group(backend="gloo")
 
    
@@ -1687,7 +1689,7 @@ def get_moe_layer_wise_logging_tracker():
 
 def get_default_process_group():
     global _DEFAULT_PROCESS_GROUP
-    assert get_xla_model() is None or _DEFAULT_PROCESS_GROUP is not None, \
+    assert xm is None or _DEFAULT_PROCESS_GROUP is not None, \
         "_DEFAULT_PROCESS_GROUP is None for XLA" 
     return _DEFAULT_PROCESS_GROUP
 
@@ -1773,25 +1775,32 @@ def destroy_model_parallel():
 
     global _DATA_PARALLEL_GROUP_GLOO
     if _DATA_PARALLEL_GROUP_GLOO is not None:
+        torch.distributed.barrier(group=_DATA_PARALLEL_GROUP_GLOO)
         torch.distributed.destroy_process_group(_DATA_PARALLEL_GROUP_GLOO)
-    _DATA_PARALLEL_GROUP_GLOO = None
+        _DATA_PARALLEL_GROUP_GLOO = None
 
     global _DATA_PARALLEL_GROUP_WITH_CP_GLOO
     _DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
 
     global _DATA_MODULO_EXPERT_PARALLEL_GROUP_GLOO
     if _DATA_MODULO_EXPERT_PARALLEL_GROUP_GLOO is not None:
+        torch.distributed.barrier(group=_DATA_MODULO_EXPERT_PARALLEL_GROUP_GLOO)
         torch.distributed.destroy_process_group(_DATA_MODULO_EXPERT_PARALLEL_GROUP_GLOO)
-    _DATA_MODULO_EXPERT_PARALLEL_GROUP_GLOO = None
+        _DATA_MODULO_EXPERT_PARALLEL_GROUP_GLOO = None
 
     global _DATA_MODULO_EXPERT_PARALLEL_GROUP_WITH_CP_GLOO
     _DATA_MODULO_EXPERT_PARALLEL_GROUP_WITH_CP_GLOO = None
+    if _DATA_MODULO_EXPERT_PARALLEL_GROUP_WITH_CP_GLOO is not None:
+        torch.distributed.barrier(group=_DATA_MODULO_EXPERT_PARALLEL_GROUP_WITH_CP_GLOO)
+        torch.distributed.destroy_process_group(_DATA_MODULO_EXPERT_PARALLEL_GROUP_WITH_CP_GLOO)
+        _DATA_MODULO_EXPERT_PARALLEL_GROUP_WITH_CP_GLOO = None
 
     global _DEFAULT_PROCESS_GROUP
     if _DEFAULT_PROCESS_GROUP is not None:
+        torch.distributed.barrier(group=_DEFAULT_PROCESS_GROUP)
         torch.distributed.destroy_process_group(_DEFAULT_PROCESS_GROUP)
         _DEFAULT_PROCESS_GROUP = None
-
+    
     global _MODEL_PARALLEL_GROUPS
     _MODEL_PARALLEL_GROUPS = []
     global _TENSOR_AND_DATA_PARALLEL_GROUPS

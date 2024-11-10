@@ -4,12 +4,13 @@ import operator
 from functools import reduce
 from typing import Callable, List, Optional, Tuple, Union
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 from megatron import core
 from megatron.core import ModelParallelConfig
 from megatron.core.parallel_state import (
+    get_default_process_group,
     get_pipeline_model_parallel_group,
     get_pipeline_model_parallel_next_rank,
     get_pipeline_model_parallel_prev_rank,
@@ -20,6 +21,7 @@ from megatron.core.parallel_state import (
 # Types
 Shape = Union[List[int], torch.Size]
 
+xm = get_xla_model()
 
 def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next, config):
     """Communicate tensor shapes between stages. Used to communicate
@@ -61,6 +63,9 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
             tensor_send_next.size(), device=get_current_device(), dtype=torch.int64
         )
 
+    if xm:
+        xm.mark_step()
+
     if config.use_ring_exchange_p2p:
         torch.distributed.ring_exchange(
             tensor_send_prev=send_prev_shape_tensor,
@@ -72,31 +77,46 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
     else:
         ops = []
         if send_prev_shape_tensor is not None:
+            if xm:
+                send_prev_shape_tensor = send_prev_shape_tensor.cpu()
+
             send_prev_op = torch.distributed.P2POp(
                 torch.distributed.isend,
                 send_prev_shape_tensor,
                 get_pipeline_model_parallel_prev_rank(),
+                group=get_default_process_group()
             )
             ops.append(send_prev_op)
         if recv_prev_shape_tensor is not None:
+            if xm:
+                recv_prev_shape_tensor_orig = recv_prev_shape_tensor
+                recv_prev_shape_tensor = recv_prev_shape_tensor.cpu()
             recv_prev_op = torch.distributed.P2POp(
                 torch.distributed.irecv,
                 recv_prev_shape_tensor,
                 get_pipeline_model_parallel_prev_rank(),
+                group=get_default_process_group()
             )
             ops.append(recv_prev_op)
         if send_next_shape_tensor is not None:
+            if xm:
+                send_next_shape_tensor = send_next_shape_tensor.cpu()
             send_next_op = torch.distributed.P2POp(
                 torch.distributed.isend,
                 send_next_shape_tensor,
                 get_pipeline_model_parallel_next_rank(),
+                group=get_default_process_group()
             )
             ops.append(send_next_op)
         if recv_next_shape_tensor is not None:
+            if xm:
+                recv_next_shape_tensor_orig = recv_next_shape_tensor
+                recv_next_shape_tensor = recv_next_shape_tensor.cpu()
             recv_next_op = torch.distributed.P2POp(
                 torch.distributed.irecv,
                 recv_next_shape_tensor,
                 get_pipeline_model_parallel_next_rank(),
+                group=get_default_process_group()
             )
             ops.append(recv_next_op)
         if len(ops) > 0:
@@ -104,10 +124,22 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
             for req in reqs:
                 req.wait()
 
+            if xm:
+                device = get_current_device()
+                if recv_prev_shape_tensor:
+                    recv_prev_shape_tensor_orig.data = recv_prev_shape_tensor.to(device=device)
+                    recv_prev_shape_tensor = recv_prev_shape_tensor_orig
+                if recv_next_shape_tensor:
+                    recv_next_shape_tensor_orig.data = recv_next_shape_tensor.to(device=device)
+                    recv_next_shape_tensor = recv_next_shape_tensor_orig
+                xm.mark_step()
+                    
         # To protect against race condition when using batch_isend_irecv().
         # should take this out once the bug with batch_isend_irecv is resolved.
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        elif xm:
+            xm.mark_step()
 
     recv_prev_shape = [0, 0, 0]
     if recv_prev_shape_tensor is not None:
@@ -355,6 +387,9 @@ def _communicate(
     tensor_recv_prev_list = []
     tensor_recv_next_list = []
 
+    if xm:
+        xm.mark_step()
+        
     for group, nr, pr in zip(pp_group, next_rank, prev_rank):
         if tensor_recv_prev_func is not None:
             tensor_recv_prev = tensor_recv_prev_func()
@@ -367,6 +402,22 @@ def _communicate(
             tensor_recv_next_list.append(tensor_recv_next)
         else:
             tensor_recv_next = None
+
+        if xm:
+            xm_tensor_recv_prev_list = []
+            xm_tensor_recv_next_list = []
+            if tensor_send_prev is not None:
+                tensor_send_prev = tensor_send_prev.cpu()
+            if tensor_recv_prev is not None:
+                tensor_recv_prev = tensor_recv_prev.cpu()
+                xm_tensor_recv_prev_list.append(tensor_recv_prev)
+            if tensor_send_next is not None:
+                tensor_send_next = tensor_send_next.cpu()
+            if tensor_recv_next is not None:
+                tensor_recv_next = tensor_recv_next.cpu()
+                xm_tensor_recv_next_list.append(tensor_recv_next)
+
+            group = get_default_process_group()
 
         reqs.extend(
             p2p_func(
@@ -385,11 +436,20 @@ def _communicate(
             req.wait()
         reqs = None
 
+    if xm:
+        device = get_current_device()
+        for i, tensor_recv_prev in enumerate(xm_tensor_recv_prev_list):
+            tensor_recv_prev_list[i].data = tensor_recv_prev.to(device=device)
+        for i, tensor_recv_next in enumerate(xm_tensor_recv_next_list):
+            tensor_recv_next_list[i].data = tensor_recv_next.to(device=device)
+
     if config.batch_p2p_comm and config.batch_p2p_sync:
         # To protect against race condition when using batch_isend_irecv().
         # User should assert that we have a modern enough PyTorch to not need this
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        elif xm:
+            xm.mark_step()
 
     def _handle_tensor_list(x):
         """This basically handles all the cases that we expect to see. Either the list None,

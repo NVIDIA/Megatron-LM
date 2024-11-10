@@ -47,6 +47,8 @@ _CHECKPOINT_VERSION = None
 logger = getLogger(__name__)
 _NON_PERSISTENT_CKPT_SUBDIR = 'non_persistent'
 
+xm = get_xla_model()
+
 def set_checkpoint_version(value):
     global _CHECKPOINT_VERSION
     if _CHECKPOINT_VERSION is not None:
@@ -276,8 +278,6 @@ def get_rng_state(use_dist_ckpt: bool = False):
         
         rng_state_list = \
                 [None for i in range(mpu.get_data_parallel_world_size())]
-       
-        xm = get_xla_model()
         if xm:
              torch.distributed.all_gather_object(
                 rng_state_list,
@@ -406,7 +406,6 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 if args.ckpt_assume_constant_structure and args.ckpt_format == 'torch_dist':
                     save_strategy.use_cached_ckpt_structure = args.ckpt_assume_constant_structure
                 if args.ckpt_fully_parallel_save:
-                    xm = get_xla_model()
                     save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, mpu.get_data_parallel_group(with_context_parallel=True) if xm is None else \
                                                                         mpu.get_data_parallel_group_gloo(with_context_parallel=True),
                                                                      mpu.get_default_process_group(),
@@ -728,7 +727,6 @@ def _load_global_dist_base_checkpoint(
     load_strategy = get_default_load_sharded_strategy(checkpoint_name)
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if args.ckpt_fully_parallel_load:
-        xm = get_xla_model()
         parallelization_group = mpu.get_data_parallel_group(with_context_parallel=True) \
             if xm is None else mpu.get_data_parallel_group_gloo(with_context_parallel=True) 
         load_strategy = FullyParallelLoadStrategyWrapper(

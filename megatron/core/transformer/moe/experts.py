@@ -23,7 +23,7 @@ from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
-    _initialize_affine_weight_gpu,
+    _initialize_affine_weight_device,
 )
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.mlp import MLP, MLPSubmodules, apply_swiglu_sharded_factory
@@ -32,9 +32,6 @@ from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import make_sharded_object_for_checkpoint
-
-
-xm = get_xla_model()
 
 class GroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using CUTLASS GroupedGEMM.
@@ -137,13 +134,13 @@ class GroupedMLP(MegatronModule):
                 )
             )
             if config.perform_initialization:
-                _initialize_affine_weight_gpu(
+                _initialize_affine_weight_device(
                     self.weight1,
                     config.init_method,
                     partition_dim=1,
                     expert_parallel=self.expert_parallel,
                 )
-                _initialize_affine_weight_gpu(
+                _initialize_affine_weight_device(
                     self.weight2,
                     config.output_layer_init_method,
                     partition_dim=0,
@@ -189,9 +186,6 @@ class GroupedMLP(MegatronModule):
             h = torch.matmul(h, w2)
 
             fc2_output = h
-
-        if xm:
-            xm.mark_step()
             
         return fc2_output, None
 

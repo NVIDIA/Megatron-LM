@@ -23,6 +23,7 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.parallel_state import is_pipeline_first_stage, is_pipeline_last_stage
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -49,6 +50,8 @@ class TestTextGenerationController:
             transformer_layer_spec=get_gpt_layer_local_spec(), 
             vocab_size=self.vocab_size, 
             max_sequence_length=self.sequence_length, 
+            pre_process=is_pipeline_first_stage(),
+            post_process=is_pipeline_last_stage(),
             parallel_output = True).to(device=get_current_device())
         
         inference_wrapper_config = InferenceWrapperConfig(
@@ -155,7 +158,6 @@ class TestTextGenerationController:
         requests = self.text_generation_controller.generate_all_output_tokens_static_batch(
             active_requests
         )
-
         for request_id, request in requests.items():
             assert (
                 request.status == Status.COMPLETED

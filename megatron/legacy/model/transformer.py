@@ -42,6 +42,8 @@ except ImportError:
     except ImportError:
         flash_attn_unpadded_func = None
 
+xm = get_xla_model()
+
 """ We use the following notation throughout this file:
      h: hidden size
      n: number of attention heads
@@ -217,7 +219,6 @@ class SwitchMLP(MegatronModule):
         dim_size = list(local_indices.size())
         dim_size[0] = dim_size[0] * world_size
 
-        xm = get_xla_model()
         if xm:
             groups = get_tensor_and_expert_parallel_groups()
             output = xm.all_gather(local_indices.contiguous(), groups=groups)
@@ -369,9 +370,15 @@ class CoreAttention(MegatronModule):
                                    output_size[0] * output_size[1], -1)
 
         # preallocting input tensor: [b * np, sq, sk]
-        matmul_input_buffer = mpu.get_global_memory_buffer().get_tensor(
-            (output_size[0]*output_size[1], output_size[2], output_size[3]),
-            query_layer.dtype, "mpu")
+        if xm:
+            matmul_input_buffer = torch.empty(
+                (output_size[0]*output_size[1], output_size[2], output_size[3]), 
+                dtype=query_layer.dtype, device=get_current_device(), requires_grad=False
+            )
+        else:
+            matmul_input_buffer = mpu.get_global_memory_buffer().get_tensor(
+                (output_size[0]*output_size[1], output_size[2], output_size[3]),
+                query_layer.dtype, "mpu")
 
         # Raw attention scores. [b * np, sq, sk]
         matmul_result = torch.baddbmm(
@@ -1377,7 +1384,7 @@ class ParallelTransformer(MegatronModule):
         self.post_process = post_process
         self.input_tensor = None
         self.drop_path_rate = drop_path_rate
-        self.transformer_impl = args.transformer_impl if not get_xla_model() else "local"
+        self.transformer_impl = args.transformer_impl if not xm else "local"
         self.retro_add_retriever = args.retro_add_retriever
 
         # Store activation checkpoiting flag.
@@ -1412,7 +1419,7 @@ class ParallelTransformer(MegatronModule):
 
             assert not args.squared_relu, "TransformerEngine does not support squared relu activation."
 
-        self.use_fp8 = args.fp8 is not None and get_xla_model() is None
+        self.use_fp8 = args.fp8 is not None and xm is None
         self.fp8_recipe = None
         self.fp8_group = None
         if self.use_fp8:

@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core.device_utils import get_current_device
+import copy
+from megatron.core.device_utils import get_current_device, get_xla_model
 import pytest
 import torch
 
@@ -12,6 +13,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
+xm = get_xla_model()
 
 class MoEModelTestContainer:
     def __init__(
@@ -80,6 +82,9 @@ class MoEModelTestContainer:
         torch.distributed.barrier()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        elif xm:
+            xm.mark_step()
+
         Utils.destroy_model_parallel()
 
     def dispatcher_dropless_test(self):
@@ -157,6 +162,7 @@ class MoEModelTestContainer:
     def dispatcher_drop_and_pad_test(self):
         "Test if the tokens are dropped and padded correctly"
         moe_layer = self.moe_layer
+        moe_layer_2 = copy.deepcopy(moe_layer)
         hidden_states = torch.randn((256, moe_layer.config.hidden_size)).to(device=get_current_device())
         hidden_states.requires_grad = True
 
@@ -187,6 +193,9 @@ class MoEModelTestContainer:
         hidden_states.grad = None
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        elif xm:
+            xm.mark_step()
+
         moe_layer.token_dispatcher.drop_and_pad = True
         moe_layer.config.moe_pad_expert_input_to_capacity = True
         # End

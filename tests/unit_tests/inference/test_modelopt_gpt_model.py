@@ -1,4 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from megatron.core.parallel_state import is_pipeline_first_stage, is_pipeline_last_stage
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.gpt.gpt_model import GPTModel
 from tests.unit_tests.test_utilities import Utils
@@ -26,6 +27,8 @@ class TestModelOptGPTModel:
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=100,
             max_sequence_length=4,
+            pre_process=is_pipeline_first_stage(),
+            post_process=is_pipeline_last_stage(),
         )
         # Ensure that a GPTModel can be built with the modelopt spec.
         self.modelopt_gpt_model = GPTModel(

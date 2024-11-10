@@ -3,8 +3,6 @@
 # Parts of the code here are adapted from PyTorch
 # repo: https://github.com/pytorch/pytorch
 
-import io
-import math
 import os
 import warnings
 from typing import Any, Callable, List, Optional, Tuple
@@ -52,6 +50,7 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     'partition_stride': 1,
 }
 
+xm = get_xla_model()
 
 def param_is_not_tensor_parallel_duplicate(param):
     return (hasattr(param, 'tensor_model_parallel') and param.tensor_model_parallel) or (
@@ -87,7 +86,7 @@ def copy_tensor_model_parallel_attributes(destination_tensor, source_tensor):
         maybe_copy(attribute)
 
 
-def _initialize_affine_weight_gpu(
+def _initialize_affine_weight_device(
     weight, init_method, partition_dim, stride=1, expert_parallel=False
 ):
     """Initialize affine weight for model parallel on GPU."""
@@ -217,14 +216,17 @@ class VocabParallelEmbedding(torch.nn.Module):
                 )
             )
             if config.perform_initialization:
-                _initialize_affine_weight_gpu(self.weight, init_method, partition_dim=0, stride=1)
+                _initialize_affine_weight_device(self.weight, init_method, partition_dim=0, stride=1)
 
     def forward(self, input_):
+        if xm:
+            xm.mark_step()
+
         if self.tensor_model_parallel_size > 1:
             # Build the mask.
             input_mask = (input_ < self.vocab_start_index) | (input_ >= self.vocab_end_index)
             # Mask the input.
-            masked_input = input_.clone() - self.vocab_start_index
+            masked_input = input_ - self.vocab_start_index
             masked_input[input_mask] = 0
         else:
             masked_input = input_
@@ -298,7 +300,6 @@ class LinearWithFrozenWeight(torch.autograd.Function):
 
         if ctx.allreduce_dgrad:
             # All-reduce. Note: here async and sync are effectively the same.
-            xm = get_xla_model()
             if xm:
                 xm.all_reduce(xm.REDUCE_SUM, [grad_input], groups=get_tensor_model_parallel_groups())
             else:
@@ -408,8 +409,6 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             world_size = get_tensor_model_parallel_world_size()
             dim_size = list(input.size())
             dim_size[0] = dim_size[0] * world_size
-
-            xm = get_xla_model()
             if xm:
                 all_gather_buffer = xm.all_gather(input, groups=get_tensor_model_parallel_groups())
             else:
@@ -444,8 +443,6 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 world_size = get_tensor_model_parallel_world_size()
                 dim_size = list(input.size())
                 dim_size[0] = dim_size[0] * world_size
-
-                xm = get_xla_model()
                 handle = None
                 if xm:
                     all_gather_buffer = xm.all_gather(input, groups=get_tensor_model_parallel_groups())
@@ -473,7 +470,6 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             )
 
         if ctx.allreduce_dgrad:
-            xm = get_xla_model()
             if xm:
                 xm.all_reduce(xm.REDUCE_SUM, [grad_input], groups=get_tensor_model_parallel_groups())
             else:
@@ -487,8 +483,6 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         if ctx.sequence_parallel:
             assert not ctx.allreduce_dgrad
             dim_size = list(input.size())
-
-            xm = get_xla_model()
             if xm:
                 world_size = get_tensor_model_parallel_world_size()
                 sub_grad_input = xm.reduce_scatter(xm.REDUCE_SUM, grad_input, 1.0, 0, world_size,
@@ -777,7 +771,7 @@ class ColumnParallelLinear(torch.nn.Module):
                     )
                 )
                 if config.perform_initialization:
-                    _initialize_affine_weight_gpu(
+                    _initialize_affine_weight_device(
                         self.weight,
                         init_method,
                         partition_dim=0,
@@ -1052,7 +1046,7 @@ class RowParallelLinear(torch.nn.Module):
                 )
             )
             if config.perform_initialization:
-                _initialize_affine_weight_gpu(
+                _initialize_affine_weight_device(
                     self.weight,
                     init_method,
                     partition_dim=1,

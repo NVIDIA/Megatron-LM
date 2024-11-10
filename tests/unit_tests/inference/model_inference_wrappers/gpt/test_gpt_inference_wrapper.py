@@ -35,6 +35,8 @@ class TestGPTInferenceWrapper:
             transformer_layer_spec=get_gpt_layer_local_spec(), 
             vocab_size=self.vocab_size, 
             max_sequence_length=self.sequence_length, 
+            pre_process=parallel_state.is_pipeline_first_stage(),
+            post_process=parallel_state.is_pipeline_last_stage(),
             parallel_output = True).to(device=get_current_device())
 
         inference_wrapper_config = InferenceWrapperConfig(

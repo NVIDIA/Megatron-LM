@@ -4,7 +4,7 @@ import math
 from argparse import Namespace
 from typing import Iterable, List, Union
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
@@ -19,6 +19,7 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
 from megatron.core.inference_params import InferenceParams
 from megatron.core.models.gpt.gpt_model import GPTModel
 
+xm = get_xla_model()
 
 class AbstractModelInferenceWrapper(abc.ABC):
     def __init__(
@@ -219,6 +220,9 @@ class AbstractModelInferenceWrapper(abc.ABC):
         Returns:
             torch.Tensor: The output logits of shape [batch_size, seq_len, padded_vocab_size]. The logits are returned only in the last pipeline stage for PP models.
         """
+        if xm:
+            xm.mark_step()
+
         if self.model_is_pipeline_parallel:
             tokens = inference_input[0]
             current_batch_size, seq_len = tokens.shape

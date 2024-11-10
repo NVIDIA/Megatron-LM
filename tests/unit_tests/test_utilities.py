@@ -1,4 +1,6 @@
 import os
+
+import torch.distributed
 from megatron.core.device_utils import get_current_device, get_distributed_backend, get_local_device_count
 from megatron.core.device_utils import get_distributed_init_method
 import torch

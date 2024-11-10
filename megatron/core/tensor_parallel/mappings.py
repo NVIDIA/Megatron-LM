@@ -1,5 +1,6 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
+import torch.distributed
 from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
@@ -17,6 +18,7 @@ from megatron.core.parallel_state import (
 
 from .utils import split_tensor_along_last_dim
 
+xm = get_xla_model()
 
 def _reduce(input_):
     """All-reduce the input tensor across model parallel group."""
@@ -26,7 +28,6 @@ def _reduce(input_):
         return input_
 
     # All-reduce.
-    xm = get_xla_model()
     input_ = input_.contiguous()
     if xm:
         xm.all_reduce(xm.REDUCE_SUM, [input_], groups=get_tensor_model_parallel_groups())
@@ -89,7 +90,6 @@ def _gather_along_last_dim(input_):
     dim_size = list(input_.size())
     dim_size[0] = dim_size[0] * world_size
 
-    xm = get_xla_model()
     if xm:
         output = xm.all_gather(input_.contiguous(), groups=get_tensor_model_parallel_groups())
     else:
@@ -133,7 +133,6 @@ def _gather_along_first_dim(input_, output_split_sizes=None):
     if world_size == 1:
         return input_
 
-    xm = get_xla_model()
     dim_size = list(input_.size())
     if output_split_sizes is None:
         dim_size[0] = dim_size[0] * world_size
@@ -175,7 +174,6 @@ def _reduce_scatter_along_first_dim(input_, input_split_sizes=None):
     if world_size == 1:
         return input_
 
-    xm = get_xla_model()
     if input_split_sizes is None:
         dim_size = list(input_.size())
         assert (
@@ -216,7 +214,6 @@ def _gather_along_first_dim_moe(input_, use_global_buffer=False):
     dim_size = list(input_.size())
     dim_size[0] = dim_size[0] * world_size
 
-    xm = get_xla_model()
     if xm:
         output = xm.all_gather(input, groups=get_tensor_and_expert_parallel_groups())
     else:
@@ -241,7 +238,6 @@ def _reduce_scatter_along_first_dim_moe(input_, use_global_buffer=False):
     assert dim_size[0] % world_size == 0
     dim_size[0] = dim_size[0] // world_size
 
-    xm = get_xla_model()
     if xm:
         output = xm.reduce_scatter(xm.REDUCE_SUM, input_.contiguous(), 1.0, 0, world_size,
                                    groups=get_tensor_and_expert_parallel_groups())
@@ -265,7 +261,6 @@ def _gather_along_first_dim_expert_parallel(input_):
     dim_size = list(input_.size())
     dim_size[0] = dim_size[0] * world_size
 
-    xm = get_xla_model()
     if xm:
         output = xm.all_gather(input, groups=get_expert_model_parallel_groups())
     else:

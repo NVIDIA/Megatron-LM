@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 # attributes: key (str), global_offset (tuple) and flattened_range (optional tuple)
 _ShardId = Tuple[str, tuple, Optional[tuple]]
 
+xm = get_xla_model()
 
 class SaveLoadDistribution(NamedTuple):
     """Represents a save or load distribution of ShardedTensors.
@@ -285,6 +286,9 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         sync_start = time()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        elif xm:
+            xm.mark_step()
+
         end = time()
         logger.debug(f'torch.cuda.synchronize took {end - sync_start}s')
         logger.debug(f'self.exchange_loaded_tensors took {end - start}s')

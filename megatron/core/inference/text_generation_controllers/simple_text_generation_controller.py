@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from typing import List, OrderedDict, Tuple
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 import torch.nn.functional as F
 
@@ -13,6 +13,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 
+xm = get_xla_model()
 
 class SimpleTextGenerationController:
     def __init__(self, inference_wrapped_model: AbstractModelInferenceWrapper, tokenizer):

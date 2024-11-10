@@ -333,9 +333,6 @@ class Attention(MegatronModule, ABC):
 
         output, bias = self.linear_proj(core_attn_out)
 
-        if xm:
-            xm.mark_step()
-            
         return output, bias
 
 
@@ -419,7 +416,7 @@ class SelfAttention(Attention):
                 self.k_layernorm.bias.data,
             ]
         )
-        xm = get_xla_model()
+   
         if xm:
             dp_list = list(xm.all_gather(inputs, groups=get_data_parallel_groups()).split(inputs.size()[0]))
         else:
@@ -448,7 +445,6 @@ class SelfAttention(Attention):
                 "DP",
             )
 
-        xm = get_xla_model()
         if xm:
             tp_list = list(xm.all_gather(inputs, groups=get_tensor_model_parallel_groups()).split(inputs.size()[0]))
         else:

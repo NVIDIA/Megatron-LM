@@ -1,6 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_current_device_type, get_xla_model
 import pytest
 import torch
 
@@ -8,6 +8,7 @@ from megatron.core.models.common.embeddings.language_model_embedding import Lang
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
+xm = get_xla_model()
 
 class TestBaseEmbedding:
 
@@ -47,15 +48,15 @@ class TestBaseEmbedding:
         assert embeddings.shape[1] == input_ids.shape[0]
         assert embeddings.shape[2] == self.base_embedding.config.hidden_size
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_gpu_forward(self):
+    @pytest.mark.skipif(not torch.cuda.is_available() and not xm, reason="Device not available")
+    def test_device_forward(self):
         self.base_embedding.to(device=get_current_device())
         input_ids = torch.tensor(
             [0, 1, 2, 3], dtype=torch.int64).repeat((2, 1)).to(device=get_current_device())
         position_ids = torch.tensor(
             [0, 1, 2, 3], dtype=torch.int64).repeat((2, 1)).to(device=get_current_device())
         embeddings = self.base_embedding(input_ids, position_ids)
-        assert embeddings.device.type == 'cuda'
+        assert embeddings.device.type == get_current_device_type()
         assert embeddings.shape[0] == self.base_embedding.max_sequence_length
         assert embeddings.shape[1] == input_ids.shape[0]
         assert embeddings.shape[2] == self.base_embedding.config.hidden_size

@@ -7,7 +7,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.device_utils import get_xla_model
+from megatron.core.device_utils import get_xla_model, get_current_device
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import AttnMaskType
@@ -133,9 +133,15 @@ class DotProductAttention(MegatronModule):
         key = key.view(output_size[3], output_size[0] * output_size[1], -1)
 
         # preallocting input tensor: [b * np, sq, sk]
-        matmul_input_buffer = parallel_state.get_global_memory_buffer().get_tensor(
-            (output_size[0] * output_size[1], output_size[2], output_size[3]), query.dtype, "mpu"
-        )
+        if xm:
+            matmul_input_buffer = torch.empty(
+                (output_size[0] * output_size[1], output_size[2], output_size[3]), 
+                dtype=query.dtype, device=get_current_device(), requires_grad=False
+            )
+        else:
+            matmul_input_buffer = parallel_state.get_global_memory_buffer().get_tensor(
+                (output_size[0] * output_size[1], output_size[2], output_size[3]), query.dtype, "mpu"
+            )
 
         # Raw attention scores. [b * np, sq, sk]
         matmul_result = torch.baddbmm(
@@ -194,7 +200,5 @@ class DotProductAttention(MegatronModule):
         new_context_shape = context.size()[:-2] + (self.hidden_size_per_partition,)
         context = context.view(*new_context_shape)
 
-        if xm:
-            xm.mark_step()
             
         return context

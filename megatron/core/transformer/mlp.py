@@ -8,7 +8,6 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
-from megatron.core.device_utils import get_xla_model
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     ReplicaId,
@@ -23,7 +22,6 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
-xm = get_xla_model()
 
 @dataclass
 class MLPSubmodules:
@@ -129,9 +127,6 @@ class MLP(MegatronModule):
 
         # [s, b, h]
         output, output_bias = self.linear_fc2(intermediate_parallel)
-
-        if xm:
-            xm.mark_step()
             
         return output, output_bias
 

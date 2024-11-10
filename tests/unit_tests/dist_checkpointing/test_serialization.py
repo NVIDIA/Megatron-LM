@@ -9,9 +9,8 @@ import torch
 from torch.distributed.checkpoint import CheckpointException as PyTCheckpointingException
 
 from megatron.core import parallel_state
-from megatron.core.device_utils import get_xla_model
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
-from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_load_config
+from megatron.core.dist_checkpointing.core import CheckpointingException
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensorFactory
 from megatron.core.dist_checkpointing.serialization import (
@@ -23,7 +22,6 @@ from megatron.core.dist_checkpointing.validation import StrictHandling
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
-xm = get_xla_model()
 
 class TestSerialization:
     def setup_method(self, method):
@@ -53,13 +51,6 @@ class TestSerialization:
                  process_group=parallel_state.get_default_process_group())
             torch.distributed.barrier(group=parallel_state.get_default_process_group())
             
-            saved_config = maybe_load_config(ckpt_dir)
-            
-            if saved_config.sharded_backend == 'zarr':
-                assert (ckpt_dir / 'keyA').is_dir()
-                assert (ckpt_dir / 'keyB').is_dir()
-                assert not (ckpt_dir / 'keyC').exists()
-                assert not (ckpt_dir / 'sd_keyA').is_dir()
 
             load_ssd = {
                 'load_sd_keyA': ShardedTensor.from_rank_offsets(
@@ -95,14 +86,6 @@ class TestSerialization:
             save(state_dict, ckpt_dir, 
                  process_group=parallel_state.get_default_process_group())
             torch.distributed.barrier(group=parallel_state.get_default_process_group())
-
-            saved_config = maybe_load_config(ckpt_dir)
-            if saved_config.sharded_backend == 'zarr':
-                assert (ckpt_dir / 'keyA').is_dir()
-                assert (ckpt_dir / 'keyB').is_dir()
-                assert not (ckpt_dir / 'keyC').exists()
-                assert not (ckpt_dir / 'sd_keyA').is_dir()
-
         Utils.destroy_model_parallel()
 
     def test_partition_change_save_load(self, tmp_path_dist_ckpt, strategy=None):
@@ -507,12 +490,11 @@ class TestNonStrictLoad:
             ),
         }
 
-    @pytest.mark.parametrize('save_format', ['zarr', 'torch_dist'])
+    @pytest.mark.parametrize('save_format', ['torch_dist'])
     @pytest.mark.parametrize('validate_integrity', [True, False])
     def test_unexpected_keys_handling_during_validation(
         self, caplog, tmp_path_dist_ckpt, validate_integrity, save_format
     ):
-        save_format = 'torch_dist' if xm else save_format # force to 'torch_dist' for XLA
         sharded_state_dict = self._get_base_state_dict()
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_unexpected_keys_raises_error_during_validation',
@@ -586,12 +568,11 @@ class TestNonStrictLoad:
             loaded_state_dict = load_with_flag(StrictHandling.IGNORE_ALL)
             assert 'TenA' in loaded_state_dict
 
-    @pytest.mark.parametrize('save_format', ['zarr', 'torch_dist'])
+    @pytest.mark.parametrize('save_format', ['torch_dist'])
     @pytest.mark.parametrize('validate_integrity', [True, False])
     def test_missing_keys_raises_error_during_validation(
         self, caplog, tmp_path_dist_ckpt, validate_integrity, save_format
     ):
-        save_format = 'torch_dist' if xm else save_format # force to 'torch_dist' for XLA
         sharded_state_dict = self._get_base_state_dict()
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_missing_keys_raises_error_during_validation',
@@ -631,7 +612,6 @@ class TestNonStrictLoad:
                 loaded_state_dict = load_with_flag(StrictHandling.LOG_UNEXPECTED)
             assert (
                 caplog.text == ''
-                or '`zarr` distributed checkpoint backend is deprecated' in caplog.text
             )
             assert 'TenB' in loaded_state_dict
 
@@ -664,10 +644,9 @@ class TestNonStrictLoad:
             assert unexpected_keys == set()
             assert missing_keys == {'TenA', 'ObjB'}
 
-    @pytest.mark.parametrize('save_format', ['zarr', 'torch_dist'])
+    @pytest.mark.parametrize('save_format', ['torch_dist'])
     @pytest.mark.parametrize('validate_integrity', [True, False])
     def test_exact_load_handling(self, caplog, tmp_path_dist_ckpt, validate_integrity, save_format):
-        save_format = 'torch_dist' if xm else save_format # force to 'torch_dist' for XLA
         sharded_state_dict = self._get_base_state_dict()
         with TempNamedDir(tmp_path_dist_ckpt / 'test_exact_load_handling', sync=True,
                           process_group=parallel_state.get_default_process_group()) as ckpt_dir:
@@ -698,7 +677,6 @@ class TestNonStrictLoad:
                     loaded_state_dict = load_with_flag(strict)
                 assert (
                     caplog.text == ''
-                    or '`zarr` distributed checkpoint backend is deprecated' in caplog.text
                 )
                 assert 'TenB' in loaded_state_dict
                 assert 'ObjB' in loaded_state_dict
@@ -708,16 +686,14 @@ class TestNonStrictLoad:
                     loaded_state_dict, missing_keys, unexpected_keys = load_with_flag(strict)
                 assert (
                     caplog.text == ''
-                    or '`zarr` distributed checkpoint backend is deprecated' in caplog.text
                 )
                 assert 'TenB' in loaded_state_dict
                 assert 'ObjB' in loaded_state_dict
                 assert missing_keys == set()
                 assert unexpected_keys == set()
 
-    @pytest.mark.parametrize('save_format', ['zarr', 'torch_dist'])
+    @pytest.mark.parametrize('save_format', ['torch_dist'])
     def test_sharded_metadata(self, tmp_path_dist_ckpt, save_format):
-        save_format = 'torch_dist' if xm else save_format # force to 'torch_dist' for XLA
         sharded_state_dict = self._get_base_state_dict()
         with TempNamedDir(tmp_path_dist_ckpt / 'test_exact_load_handling', sync=True,
                           process_group=parallel_state.get_default_process_group()) as ckpt_dir:

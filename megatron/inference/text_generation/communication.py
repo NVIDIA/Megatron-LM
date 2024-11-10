@@ -8,7 +8,7 @@ import torch
 
 from megatron.core import mpu
 
-
+xm = get_xla_model()
 
 # TODO: use functions from megatron/p2p
 def recv_from_prev_pipeline_rank_(recv_buffer=None):
@@ -16,15 +16,26 @@ def recv_from_prev_pipeline_rank_(recv_buffer=None):
     input buffer inplace."""
     if not mpu.is_pipeline_first_stage():
         assert recv_buffer is not None
+        if xm:
+            xm.mark_step()
+            device = recv_buffer.device
+            recv_buffer_orig = recv_buffer
+            recv_buffer = recv_buffer.cpu()
         recv_prev_op = torch.distributed.P2POp(
             torch.distributed.irecv, recv_buffer,
-            mpu.get_pipeline_model_parallel_prev_rank())
+            mpu.get_pipeline_model_parallel_prev_rank(),
+            group=mpu.get_default_process_group())
         reqs = torch.distributed.batch_isend_irecv([recv_prev_op])
         for req in reqs:
             req.wait()
+        if xm:
+            recv_buffer_orig.data = recv_buffer.to(device=device)
+
         # To protect against race condition when using batch_isend_irecv().
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        elif xm:
+            xm.mark_step()
 
 
 
@@ -33,15 +44,21 @@ def send_to_next_pipeline_rank(tensor=None):
     """Send output to the next pipeline stage."""
     if not mpu.is_pipeline_last_stage():
         assert tensor is not None
+        if xm:
+            xm.mark_step()
+            tensor = tensor.cpu()
         send_next_op = torch.distributed.P2POp(
             torch.distributed.isend, tensor,
-            mpu.get_pipeline_model_parallel_next_rank())
+            mpu.get_pipeline_model_parallel_next_rank(),
+            group=mpu.get_default_process_group())
         reqs = torch.distributed.batch_isend_irecv([send_next_op])
         for req in reqs:
             req.wait()
         # To protect against race condition when using batch_isend_irecv().
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        elif xm:
+            xm.mark_step()
 
 
 
