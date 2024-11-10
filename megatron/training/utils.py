@@ -4,8 +4,10 @@
 import os
 import sys
 from datetime import datetime
+from dataclasses import dataclass, is_dataclass
 
 import torch
+import torch.nn.functional as F
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
@@ -37,6 +39,7 @@ from megatron.training import (
 from megatron.core import DistributedDataParallel as DDP
 from megatron.core import mpu
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.legacy.model import Float16Module
 from megatron.legacy.model.module import param_is_not_shared
 
@@ -307,6 +310,13 @@ def get_batch_on_this_tp_rank(data_iterator):
     def _broadcast(item):
        if item is not None:
            torch.distributed.broadcast(item, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group())
+    
+    def _broadcast_class(item):
+        if item and is_dataclass(item):
+            padded_tensors = F.pad(item.cu_seqlens_q, (0, args.seq_length - item.cu_seqlens_q.size(0)))
+            _broadcast(padded_tensors)
+            _broadcast(item.max_seqlen_q)
+
 
     if mpu.get_tensor_model_parallel_rank() == 0:
 
@@ -315,12 +325,21 @@ def get_batch_on_this_tp_rank(data_iterator):
        else:
            data = None
 
+    if data["packed_seq_params"]:
+       data["packed_seq_params"] = PackedSeqParams(**data["packed_seq_params"])
+       data["packed_seq_params"].cu_seqlens_q = data["packed_seq_params"].cu_seqlens_q.cuda().squeeze(0)
+       data["packed_seq_params"].cu_seqlens_kv = data["packed_seq_params"].cu_seqlens_kv.cuda().squeeze(0)
+       data["packed_seq_params"].max_seqlen_q = data["packed_seq_params"].max_seqlen_q.cuda().squeeze(0)
+       data["packed_seq_params"].max_seqlen_kv = data["packed_seq_params"].max_seqlen_kv.cuda().squeeze(0)
+       data["packed_seq_params"].qkv_format = 'thd'
+
        batch = {
            'tokens': data["tokens"].cuda(non_blocking = True),
            'labels': data["labels"].cuda(non_blocking = True),
            'loss_mask': data["loss_mask"].cuda(non_blocking = True),
            'attention_mask': None if "attention_mask" not in data else data["attention_mask"].cuda(non_blocking = True),
-           'position_ids': data["position_ids"].cuda(non_blocking = True)
+           'position_ids': data["position_ids"].cuda(non_blocking = True),
+           'packed_seq_params': data["packed_seq_params"] if data["packed_seq_params"] else None
        }
 
        if args.pipeline_model_parallel_size == 1:
@@ -329,11 +348,13 @@ def get_batch_on_this_tp_rank(data_iterator):
            _broadcast(batch['loss_mask'])
            _broadcast(batch['attention_mask'])
            _broadcast(batch['position_ids'])
+           _broadcast_class(batch['packed_seq_params'])
 
        elif mpu.is_pipeline_first_stage():
            _broadcast(batch['tokens'])
            _broadcast(batch['attention_mask'])
            _broadcast(batch['position_ids'])
+           _broadcast_class(batch['packed_seq_params'])
 
        elif mpu.is_pipeline_last_stage():
            _broadcast(batch['labels'])
@@ -352,6 +373,10 @@ def get_batch_on_this_tp_rank(data_iterator):
        else:
            attention_mask=None
        position_ids=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
+       
+       if args.reset_position_ids and args.reset_attention_mask:
+           cu_seqlens=torch.empty((args.seq_length), dtype = torch.int32 , device = torch.cuda.current_device())
+           max_seqlen=torch.empty((1), dtype = torch.int32 , device = torch.cuda.current_device())
 
        if args.pipeline_model_parallel_size == 1:
            _broadcast(tokens)
@@ -359,6 +384,9 @@ def get_batch_on_this_tp_rank(data_iterator):
            _broadcast(loss_mask)
            _broadcast(attention_mask)
            _broadcast(position_ids)
+           if args.reset_position_ids and args.reset_attention_mask:
+               _broadcast(cu_seqlens)
+               _broadcast(max_seqlen)
  
        elif mpu.is_pipeline_first_stage():
            labels=None
@@ -367,21 +395,37 @@ def get_batch_on_this_tp_rank(data_iterator):
            _broadcast(tokens)
            _broadcast(attention_mask)
            _broadcast(position_ids)
+           if args.reset_position_ids and args.reset_attention_mask:
+               _broadcast(cu_seqlens)
+               _broadcast(max_seqlen)
 
        elif mpu.is_pipeline_last_stage():
            tokens=None
            position_ids=None
+           cu_seqlens=None
+           max_seqlen=None
     
            _broadcast(labels)
            _broadcast(loss_mask)
            _broadcast(attention_mask)
+       
+       packed_seq_params = None
+       if args.reset_position_ids and args.reset_attention_mask:
+           packed_seq_params = PackedSeqParams(
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_kv=max_seqlen,
+                qkv_format='thd',
+            )
  
        batch = {
            'tokens': tokens,
            'labels': labels,
            'loss_mask': loss_mask,
            'attention_mask': attention_mask,
-           'position_ids': position_ids
+           'position_ids': position_ids,
+           'packed_seq_params': packed_seq_params
        }
 
     return batch
