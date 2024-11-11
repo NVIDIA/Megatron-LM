@@ -10,6 +10,47 @@ from ..transformer.transformer_config import TransformerConfig
 from ..utils import get_attr_wrapped_model, get_model_config
 
 
+def _allreduce_conditional_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig):
+    """
+    All-reduce conditional embedding grads.
+
+    Reduce grads across all the pp stages to ensure that parameters of the conditional embedders
+    (e.g., timestep embedder, FPS embedder, label embedder) stay in sync.
+    This is for the models with replicated embedders on each PP / VPP rank, like diffusion models.
+    """
+
+    if parallel_state.get_pipeline_model_parallel_world_size() > 1 and getattr(
+        config, "has_cond_embedder", False
+    ):
+        grads_dict = {}
+        for model_chunk in model:
+            for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
+                if param.requires_grad and getattr(param, 'pipeline_parallel', False):
+                    grad = param.main_grad
+                    if name in grads_dict:
+                        # Add all the virtual PP rank's gradients to
+                        # the first local virtual PP rank.
+                        grads_dict[name][0].add_(grad)
+                        # Append to the end for later update after cross-rank reduce.
+                        grads_dict[name].append(grad)
+                    else:
+                        grads_dict[name] = [grad]
+        if grads_dict:
+            # All-reduce the gradient on the first VPP rank.
+            grads = [param_grad[0] for _, param_grad in grads_dict.items()]
+            coalesced = _flatten_dense_tensors(grads)
+            torch.distributed.all_reduce(
+                coalesced, group=parallel_state.get_pipeline_model_parallel_group()
+            )
+            for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
+                buf.copy_(synced)
+
+            # Update the gradients on other VPP ranks.
+            for grads in grads_dict.values():
+                for grad in grads[1:]:
+                    grad.copy_(grads[0])
+
+
 def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig):
     """
     All-reduce word embedding grads.
@@ -112,6 +153,15 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
         model_chunk.finish_grad_sync()
     if config.timers is not None:
         config.timers('all-grads-sync').stop()
+
+    # All-reduce t_embedder grads (for pp & vpp of DiT).
+    if config.timers is not None:
+        config.timers('conditional-embedder-grads-all-reduce', log_level=1).start(
+            barrier=config.barrier_with_L1_time
+        )
+    _allreduce_conditional_embedding_grads(model, config)
+    if config.timers is not None:
+        config.timers('conditional-embedder-grads-all-reduce').stop()
 
     # All-reduce layer-norm grads (for sequence parallelism).
     if config.timers is not None:
