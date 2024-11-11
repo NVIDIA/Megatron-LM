@@ -4,7 +4,7 @@ This repository is a fork of [Megatron-LM](https://github.com/NVIDIA/Megatron-LM
 
 Vocabulary Parallelism is a novel technique that balances the computation and memory of vocabulary layers in pipeline parallelism.
 
-Check out our paper at [arxiv (TODO)]().
+Check out our paper at [arxiv](https://arxiv.org/abs/2411.05288).
 
 **Quick Start**
 
