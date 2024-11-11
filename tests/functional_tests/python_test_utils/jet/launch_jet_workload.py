@@ -226,6 +226,15 @@ def main(
 
         if test_type != "release":
             success = pipeline.get_status() == PipelineStatus.SUCCESS
+
+            if (
+                "Some NCCL operations have failed or timed out." in concat_logs
+                or "uncorrectable ECC error encountered" in concat_logs
+            ):
+                print("Detected NCCL failure, attempt restart.")
+                n_attempts += 1
+                continue
+
             sys.exit(int(not success))  # invert for exit 0
 
         if parse_failed_job(logs=logs):
