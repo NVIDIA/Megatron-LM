@@ -46,7 +46,7 @@ RUN pip3 uninstall -y nvidia-modelopt[torch] && \
     mamba_ssm-2.0.3-cp310-cp310-linux_x86_64.whl \
     grouped_gemm-1.1.2-cp310-cp310-linux_x86_64.whl \
     tensorstore==0.1.45 \
-    nvidia-modelopt[torch]>=0.19.0 && \
+    "nvidia-modelopt[torch]>=0.19.0" && \
     rm *.whl
 
 # Since megatron does not have any dependencies (and isn't a dependency to any other package), we can install it separately to make everything a bit quicker
