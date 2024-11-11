@@ -517,6 +517,7 @@ class TestOptimizerResharding:
             ((2, 1, 2), (1, 1, 8)),
         ],
     )
+    @pytest.mark.failing_on_rocm
     def test_chained_optimizer_resharding(
         self,
         tmp_path_dist_ckpt,

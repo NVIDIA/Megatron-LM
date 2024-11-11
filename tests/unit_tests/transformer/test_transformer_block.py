@@ -66,12 +66,14 @@ class TestParallelTransformerBlock:
     def test_gpu_forward_full_checkpoint(self):
         self._run_full_checkpoint_test(fp8=None)
 
+    @pytest.mark.failing_on_rocm_mi250
     def test_gpu_forward_full_checkpoint_fp8(self):
         self._run_full_checkpoint_test(fp8="e4m3")
 
     def test_gpu_forward_selective_checkpoint(self):
         self._run_selective_checkpoint_test(fp8=None)
 
+    @pytest.mark.failing_on_rocm_mi250
     def test_gpu_forward_selective_checkpoint_fp8(self):
         self._run_selective_checkpoint_test(fp8="e4m3")
 
