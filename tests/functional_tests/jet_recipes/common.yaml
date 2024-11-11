@@ -11,7 +11,7 @@ spec:
   script: |-
     ls
     cd /opt/megatron-lm
-    torchrun --nproc_per_node=8 -m tests.functional_tests.test_cases.common.{test_case}
+    python -m tests.functional_tests.test_cases.common.{test_case}
 
 products:
   - scope: [mr]

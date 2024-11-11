@@ -279,7 +279,8 @@ test:pypi_build_wheel:
     - echo $PUBLISH_DRYRUN
     - >
       if [ "$PUBLISH_DRYRUN" = "yes" ]; then
-        sed -i "/^PATCH/c\PATCH = $((RANDOM % 9000 + 1000))" megatron/core/package_info.py 
+        PRE_RELEASE=$(sed -n "s/.*PRE_RELEASE = '\(.*\)'/\1/p" megatron/core/package_info.py)
+        sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '${PRE_RELEASE}.dev$((RANDOM % 900000 + 100000))'" megatron/core/package_info.py 
       fi
     - /opt/python/cp310-cp310/bin/python -m build
     - /opt/python/cp311-cp311/bin/python -m build
@@ -316,7 +317,7 @@ test:pypi_push_wheel:
   needs: [test:pypi_test_wheel]
   variables:
     PUBLISH_DRYRUN: "yes"
-  timeout: 10m
+  timeout: 3m
   script:
     - >
       if [ "$PUBLISH_DRYRUN" = "yes" ]; then

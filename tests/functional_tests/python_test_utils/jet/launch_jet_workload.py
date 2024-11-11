@@ -66,7 +66,7 @@ def launch_and_wait_for_completion(
         ),
         config_id=resolve_cluster_config(cluster),
         custom_config={
-            "launchers": {cluster: {"account": account}},
+            "launchers": {cluster: {"account": account, "ntasks_per_node": 8}},
             "executors": {
                 "jet-ci": {
                     "environments": {
