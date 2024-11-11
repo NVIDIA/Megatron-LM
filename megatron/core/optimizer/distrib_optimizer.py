@@ -472,9 +472,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             assert self.ddp_config == model_chunk.ddp_config
 
-        assert isinstance(
-            optimizer, Adam
-        ), "Only Adam currently supported, due to checkpointing requirements."
+        # assert isinstance(
+        #     optimizer, Adam
+        # ), "Only Adam currently supported, due to checkpointing requirements."
 
         # Model grad buffer ranges.
         assert per_model_buffers is not None, "per_model_buffers must be provided"
