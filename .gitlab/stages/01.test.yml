@@ -46,7 +46,7 @@ test:build_image:
       
         ADDITIONAL_PARAMS=()
 
-        if [[ "$CI_COMMIT_BRANCH" == "ci-rebuild-mcore-nemo-image" ]]; then
+        if [[ "$CI_COMMIT_BRANCH" == "ci-rebuild-mcore-nemo-image" || "$CI_COMMIT_BRANCH" == "main" ]]; then
           ADDITIONAL_PARAMS+=("--pull")
           ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:main")
         fi
