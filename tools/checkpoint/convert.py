@@ -136,7 +136,7 @@ def main():
     saver.add_arguments(parser)
 
     args = parser.parse_args()
-
+    mp.set_start_method('spawn')  
     queue = mp.Queue(maxsize=args.max_queue_size)
 
     print("Starting saver...")
