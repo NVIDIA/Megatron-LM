@@ -1204,6 +1204,16 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                     opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
                 else:
                     opt_param_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
+
+            if args.override_opt_param_scheduler:
+                from megatron.core.optimizer import _update_min_and_max_lr_in_param_groups
+                _update_min_and_max_lr_in_param_groups(
+                    optimizer.param_groups,
+                    opt_param_scheduler.max_lr,
+                    opt_param_scheduler.min_lr,
+                    args.decoupled_lr,
+                    args.decoupled_min_lr,
+                    )
         except KeyError as e:
             print_rank_0('Unable to load optimizer from checkpoint {}. '
                          'Specify --no-load-optim or --finetune to prevent '
