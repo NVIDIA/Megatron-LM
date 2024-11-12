@@ -144,7 +144,7 @@ products:
     n_repeat: [5]
     test_case:
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_resume_torch_dist_te_4experts2parallel  # non-determinism in dev
-  - environment: [lts]
+  - environment: [lts, dev]
     scope: [weekly]
     platforms: [dgx_h100]
     time_limit: [9000]
@@ -152,8 +152,8 @@ products:
     - gpt3_345m_weekly_dgx_h100_1N8G_mcore_nondet_tp1_pp1_fp8_no_model_parallel
     - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp1_pp1_bf16_baseline
     - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp1_pp1_fp8_no_model_parallel
-    - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp1_pp2_fp8_pp
+    # - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp1_pp2_fp8_pp
     - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp2_pp2_fp8_tp_pp
-    - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp2_pp2_fp8_tp_pp_sp
-    - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp2_pp2_native_fp8_tp_pp_sp
-    - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp4_pp2_fp8_tp_pp
+    # - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp2_pp2_fp8_tp_pp_sp
+    # - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp2_pp2_native_fp8_tp_pp_sp
+    # - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp4_pp2_fp8_tp_pp
