@@ -2,36 +2,34 @@
 
 """Pretrain T5"""
 
+import os
 from copy import deepcopy
 from functools import partial
 from typing import Union
 
+import numpy
 import torch
+from packaging.version import Version as PkgVersion
 
-from megatron.training import (
-    get_args,
-    get_timers,
-    get_tokenizer,
-    print_rank_0
-)
+import megatron
 from megatron.core import mpu, tensor_parallel
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.t5_dataset import (
     T5MaskedWordPieceDataset,
     T5MaskedWordPieceDatasetConfig,
 )
+from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.enums import ModelType
 from megatron.core.models.T5 import T5Model
-from megatron.training import pretrain
+from megatron.core.models.T5.t5_spec import (
+    get_t5_decoder_with_local_block_spec,
+    get_t5_decoder_with_transformer_engine_block_spec,
+    get_t5_encoder_with_local_block_spec,
+    get_t5_encoder_with_transformer_engine_block_spec,
+)
+from megatron.core.utils import get_te_version
+from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.t5_dataset import T5MaskedWordPieceDataset, T5MaskedWordPieceDatasetConfig
-from megatron.core.datasets.utils import get_blend_from_list
-from megatron.core.models.T5.t5_spec import (get_t5_encoder_with_transformer_engine_block_spec,
-                                            get_t5_decoder_with_transformer_engine_block_spec,
-                                            get_t5_encoder_with_local_block_spec,
-                                            get_t5_decoder_with_local_block_spec)
-from megatron.legacy.model import T5Model as LegacyT5Model
 from pretrain_gpt import loss_func
 
 """
@@ -71,12 +69,14 @@ to accumulate the encoder_hidden_state gradient across skip connections
 
 def model_provider(
     pre_process=True, post_process=True, add_encoder=True, add_decoder=True
-) -> Union[LegacyT5Model, T5Model]:
+) -> Union[megatron.legacy.model.T5Model, T5Model]:
     """Builds the model.
 
     Args:
-        pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
-        post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
+        pre_process (bool, optional): Set to true if you need to
+            compute embedings. Defaults to True.
+        post_process (bool, optional): Set to true if you need to want to
+            compute output logits/loss. Defaults to True.
         add_encoder (bool, optional): Defaults to True
         add_decoder (bool, optional): Defaults to True
     Returns:
@@ -86,13 +86,14 @@ def model_provider(
     args = get_args()
 
     assert (
-        args.encoder_tensor_model_parallel_size == 0 or
-        args.encoder_tensor_model_parallel_size == args.tensor_model_parallel_size
-    ), f"Because word embeddings are shared between the encoder & decoder, these have to have the same tensor parallel size."
+        args.encoder_tensor_model_parallel_size == 0
+        or args.encoder_tensor_model_parallel_size == args.tensor_model_parallel_size
+    ), f"Because word embeddings are shared between the encoder & decoder, these \
+        have to have the same tensor parallel size."
 
     config = core_transformer_config_from_args(args)
     if args.use_legacy_models:
-        model = LegacyT5Model(
+        model = megatron.legacy.model.T5Model(
             config=config,
             num_tokentypes=0,
             parallel_output=True,
@@ -106,12 +107,16 @@ def model_provider(
         encoder_config.num_layers = args.encoder_num_layers
 
         if args.pipeline_model_parallel_size > 1:
-            assert args.encoder_pipeline_model_parallel_size > 0, "Need to know how to shard the encoder & decoder."
+            assert (
+                args.encoder_pipeline_model_parallel_size > 0
+            ), "Need to know how to shard the encoder & decoder."
 
         if args.encoder_pipeline_model_parallel_size > 0:
             encoder_config.pipeline_model_parallel_size = args.encoder_pipeline_model_parallel_size
 
-        encoder_layers_per_pipeline = encoder_config.num_layers // encoder_config.pipeline_model_parallel_size
+        encoder_layers_per_pipeline = (
+            encoder_config.num_layers // encoder_config.pipeline_model_parallel_size
+        )
         decoder_layers_per_pipeline = config.num_layers // config.pipeline_model_parallel_size
 
         if args.transformer_impl == "local":
@@ -141,16 +146,16 @@ def model_provider(
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
             add_encoder=add_encoder,
-            add_decoder=add_decoder
+            add_decoder=add_decoder,
         )
 
     return model
 
 
-def get_batch(data_iterator):
+def get_batch(data_iterator, use_local):
     """Build the batch."""
 
-    keys = ['text_enc', 'text_dec', 'labels', 'loss_mask', 'enc_mask', 'dec_mask', 'enc_dec_mask']
+    keys = ['text_enc', 'text_dec', 'labels', 'loss_mask', 'enc_mask', 'dec_mask']
     datatype = torch.int64
 
     # Broadcast data.
@@ -165,10 +170,64 @@ def get_batch(data_iterator):
     tokens_dec = data_b['text_dec'].long()
     labels = data_b['labels'].long()
     loss_mask = data_b['loss_mask'].float()
-
     enc_mask = data_b['enc_mask'] < 0.5
     dec_mask = data_b['dec_mask'] < 0.5
-    enc_dec_mask = data_b['enc_dec_mask'] < 0.5
+
+    def _convert_attention_mask(
+        source_block: torch.tensor, target_block: torch.tensor, make_history_mask: bool = False
+    ) -> torch.tensor:
+        """Convert an attention-mask compatible for transformer-engine
+            to local transformer implementation
+
+        Args:
+            source_block (numpy.ndarray): A 2-D array of tokens (bs, q_len)
+            target_block (numpy.ndarray): A 2-D array of tokens (bs, kv_len)
+            make_history_mask (bool): Whether to turn mask into causal mask
+
+        Returns:
+            torch.tensor: The 4-D attention mask (bs, 1, q_len, kv_len)
+        """
+        batch_size = source_block.shape[0]
+        attention_mask = []
+        for i in range(batch_size):
+            source_sample = source_block[i]
+            target_sample = target_block[i]
+            mask = (target_sample[None, :] >= 1) * (source_sample[:, None] >= 1)
+            if make_history_mask:
+                arange = numpy.arange(source_sample.shape[0])
+                history_mask = arange[None,] <= arange[:, None]
+                history_mask = torch.tensor(history_mask).to(mask.device)
+                mask = mask * history_mask
+            mask = ~(mask)  # flip True to False
+            attention_mask.append(mask)
+        attention_mask = torch.stack(attention_mask)
+        attention_mask = attention_mask.unsqueeze(1)
+        return attention_mask
+
+    # If using local transformer implementation (not transformer_engine)
+    # re-organize all attention masks, because local and transformer_engine
+    # backbones use different masks shapes. E.g.:
+    # (local: b1ss - transformer_engine: b11s)
+    if use_local:
+        enc_mask = _convert_attention_mask(tokens_enc, tokens_enc)
+        dec_mask = _convert_attention_mask(tokens_dec, tokens_dec, make_history_mask=True)
+        enc_dec_mask = _convert_attention_mask(tokens_dec, tokens_enc)
+
+    else:
+        # Process for Flash/Fused
+        enc_mask = enc_mask.unsqueeze(1).unsqueeze(1)
+        dec_mask = dec_mask.unsqueeze(1).unsqueeze(1)
+        enc_dec_mask = (dec_mask, enc_mask)
+
+        # For older TE version, cross-attention mask is
+        #   configued as [bs, 1, q_len, kv_len]
+        # For newer TE version, cross-attention mask is
+        #   configued as ([bs, 1, 1, q_len], [bs, 1, 1, kv_len])
+        flash_attention_enabled = os.getenv('NVTE_FLASH_ATTN') == '1'
+        fused_attention_enabled = os.getenv('NVTE_FUSED_ATTN') == '1'
+        if get_te_version() < PkgVersion("1.10.0"):
+            if not (flash_attention_enabled) and not (fused_attention_enabled):
+                enc_dec_mask = _convert_attention_mask(tokens_dec, tokens_enc)
 
     return tokens_enc, tokens_dec, loss_mask, labels, enc_mask, dec_mask, enc_dec_mask
 
@@ -186,8 +245,9 @@ def forward_step(data_iterator, model: T5Model):
 
     # Get the batch.
     timers('batch generator', log_level=2).start()
+    use_local = args.transformer_impl == "local"
     tokens_enc, tokens_dec, loss_mask, lm_labels, enc_mask, dec_mask, enc_dec_mask = get_batch(
-        data_iterator
+        data_iterator, use_local
     )
     timers('batch generator').stop()
 
@@ -203,7 +263,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples: int):
     """Build the train test and validation datasets.
 
     Args:
-        train_val_test_num_samples : A list containing the number of samples in train test and validation.
+        train_val_test_num_samples : A list containing the number of samples
+            in train test and validation.
     """
     args = get_args()
 
@@ -217,7 +278,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples: int):
         blend_per_split=[
             get_blend_from_list(args.train_data_path),
             get_blend_from_list(args.valid_data_path),
-            get_blend_from_list(args.test_data_path)
+            get_blend_from_list(args.test_data_path),
         ],
         renormalize_blend_weights=args.renormalize_blend_weights,
         split=args.split,
@@ -247,7 +308,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples: int):
 
 
 def t5_embedding_ranks(pp_ranks):
-    """T5's embedding ranks consist of the encoder's first rank, and the decoder's first & last ranks.
+    """T5's embedding ranks consist of the encoder's first rank, and
+        the decoder's first & last ranks.
     Args:
         pp_ranks: A list of global ranks that constitute a pipeline group.
     """

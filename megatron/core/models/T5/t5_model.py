@@ -1,17 +1,16 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-from typing import List, Literal, Optional, Tuple
+from typing import List, Literal, Optional
 
 import torch
 from torch import Tensor
 
-from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core import InferenceParams, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.enums import ModelType
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -256,12 +255,6 @@ class T5Model(LanguageModule):
             Tensor: loss tensor
         """
 
-        (encoder_attn_mask, decoder_attn_mask, encoder_decoder_attn_mask) = (
-            t5_extended_attention_mask(
-                [encoder_attn_mask, decoder_attn_mask, encoder_decoder_attn_mask]
-            )
-        )
-
         ## Encoder forward
         if encoder_hidden_states is None:
 
@@ -382,34 +375,6 @@ class T5Model(LanguageModule):
         elif self.post_process:
             return self.lm_head.output_layer.weight
         return None
-
-    def sharded_state_dict(
-        self,
-        prefix: str = '',
-        sharded_offsets: Tuple[Tuple[int, int, int]] = (),
-        metadata: Optional[dict] = None,
-    ) -> ShardedStateDict:
-        """Sharded state dict implementation handling duplication of encoder and decoder layers.
-
-        Some layers (output, embedding) are shared between the encoder and decoder.
-        This method sets the replica_id for them to ensure there is only one
-        layer instance with replica_id (0, 0, 0).
-
-        Args:
-            prefix (str): Module name prefix.
-            sharded_offsets (tuple): PP related offsets, expected to be empty at this module level.
-            metadata (Optional[Dict]): metadata controlling sharded state dict creation.
-
-        Returns:
-            ShardedStateDict: sharded state dict for the T5Model
-        """
-        sharded_sd = super().sharded_state_dict(prefix, sharded_offsets, metadata)
-        if not parallel_state.is_inside_encoder():
-            for k, sh_ten in sharded_sd.items():
-                if not k.startswith(f'{prefix}decoder'):
-                    # Bump replica_id of all the layers shared with the encoder (output, embedding)
-                    sh_ten.replica_id = (sh_ten.replica_id[0] + 1, *sh_ten.replica_id[1:])
-        return sharded_sd
 
 
 def t5_extended_attention_mask(attention_mask_list: List[Tensor]) -> List[Tensor]:

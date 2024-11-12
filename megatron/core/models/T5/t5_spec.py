@@ -52,7 +52,7 @@ def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
         submodules=TransformerLayerSubmodules(
             self_attention=ModuleSpec(
                 module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.arbitrary},
+                params={"attn_mask_type": AttnMaskType.padding},
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=TELayerNormColumnParallelLinear,
                     core_attention=TEDotProductAttention,
@@ -94,7 +94,7 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
             pre_cross_attn_layernorm=TENorm,
             cross_attention=ModuleSpec(
                 module=CrossAttention,
-                params={"attn_mask_type": AttnMaskType.arbitrary},
+                params={"attn_mask_type": AttnMaskType.padding},
                 submodules=CrossAttentionSubmodules(
                     linear_q=TEColumnParallelLinear,
                     linear_kv=TEColumnParallelLinear,
