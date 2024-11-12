@@ -1,5 +1,4 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from argparse import Namespace
 from collections import deque
 from typing import Any, List, Tuple
 
@@ -11,9 +10,13 @@ from megatron.core.datasets.t5_dataset import T5MaskedWordPieceDataset
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
+)
 from megatron.core.models.T5 import T5Model
 
 
+# pylint: disable=line-too-long
 class T5InferenceWrapper(AbstractModelInferenceWrapper):
     """Constructor for the model inference wrapper
 
@@ -22,11 +25,11 @@ class T5InferenceWrapper(AbstractModelInferenceWrapper):
 
     Args:
         model (T5Model): The T5 model (MCore or legacy)
-        args (Namespace): The command line arguments that were passed
+        inference_wrapper_config (InferenceWrapperConfig): The command line arguments that were passed
     """
 
-    def __init__(self, model: T5Model, args: Namespace):
-        super().__init__(model, args)
+    def __init__(self, model: T5Model, inference_wrapper_config: InferenceWrapperConfig):
+        super().__init__(model, inference_wrapper_config)
 
     def prep_model_for_inference(
         self, prompts_tokens: torch.Tensor, encoder_prompts: List[str] = None, tokenizer: Any = None
