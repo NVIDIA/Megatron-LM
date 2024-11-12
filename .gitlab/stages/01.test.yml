@@ -227,6 +227,11 @@ test:formatting:
   variables:
     GIT_STRATEGY: "clone"
   script:
+    - |
+      if [[ "$CI_PIPELINE_SOURCE" != "merge_request_event" ]]; then
+        exit 0
+      fi
+
     - set +e
     - git fetch origin $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
     - git fetch origin main:main
@@ -242,12 +247,6 @@ test:formatting:
     - git push -u origin $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
     - env
     - BASE_REF="$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" CHECK_ONLY=true SKIP_DOCS=$([[ "$CI_MERGE_REQUEST_LABELS" == *"Skip docs"* ]] && echo "true" || echo "false") bash tools/autoformat.sh
-  rules:
-    - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
-      allow_failure: true
-      when: on_success
-    - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event'
-      when: on_success
 
 test:copyright:
   extends: [.test_rules]
