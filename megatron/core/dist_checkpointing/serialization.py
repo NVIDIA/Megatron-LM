@@ -10,7 +10,7 @@ loading the sharded tensors.
 
 import logging
 from pathlib import Path
-from typing import Dict, Optional, Set, Tuple, Union
+from typing import Callable, Dict, Optional, Set, Tuple, Union
 
 import torch
 
@@ -19,6 +19,7 @@ from .core import CheckpointingConfig, save_config
 from .dict_utils import extract_matching_values, merge
 from .mapping import (
     CheckpointingException,
+    CommonStateDict,
     ShardedObject,
     ShardedStateDict,
     StateDict,
@@ -287,6 +288,7 @@ def save(
     common_strategy: Union[SaveCommonStrategy, Tuple[str, int], None] = None,
     validate_access_integrity: bool = True,
     async_sharded_save: bool = False,
+    preprocess_common_before_consistancy_check: Callable[[CommonStateDict], StateDict] = None,
 ) -> Optional[AsyncRequest]:
     """Saving entrypoint.
 
@@ -320,11 +322,16 @@ def save(
         common_strategy (SaveCommonStrategy, Tuple[str, int], optional):
             configures common data saving behavior and backend
         validate_access_integrity (bool default = True): checks if each tensor shard is accessed
-            exactly once (as main replica) by some process
+            exactly once (as main replica) by some process.
+            It also makes sure the common state dict is consistant across all ranks
         async_sharded_save (bool, optional): if True, for the sharded state dict part
             an async save implementation will be called, with the AsyncRequest
             being returned to the caller. Note that it is the caller responsibility to
             actually schedule the async save. Defaults to False.
+        preprocess_common_before_consistancy_check (Callable[[CommonStateDict], StateDict], None):
+            A callable function that will preprocess the common state dict (i.e can be used  to
+            remove keys that we expect to be different in the state dict). The function must not
+            modify the original state dict
 
     Returns:
         AsyncRequest (optional): if `async_sharded_save` is True, returns
@@ -359,7 +366,9 @@ def save(
         assert isinstance(common_strategy, tuple), type(common_strategy)
         common_strategy = get_default_strategy(StrategyAction.SAVE_COMMON, *common_strategy)
 
-    sharded_state_dict, state_dict = save_preprocess(sharded_state_dict, validate_access_integrity)
+    sharded_state_dict, state_dict = save_preprocess(
+        sharded_state_dict, validate_access_integrity, preprocess_common_before_consistancy_check
+    )
 
     common_strategy.save_common(state_dict, checkpoint_dir)
 
