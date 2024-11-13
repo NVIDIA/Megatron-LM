@@ -36,8 +36,14 @@ def model_provider(
     print_rank_0('building a multimodal model ...')
 
     num_image_embeddings = get_num_image_embeddings(
-        args.img_h, args.img_w, args.patch_dim, args.vision_model_type,
-        args.disable_vision_class_token, 1, args.pixel_shuffle,
+        args.img_h,
+        args.img_w,
+        args.patch_dim,
+        args.vision_model_type,
+        args.disable_vision_class_token,
+        1,
+        args.pixel_shuffle,
+        args.use_tile_tags,
     )
     old_seq_length = args.seq_length
     args.seq_length = args.encoder_seq_length = num_image_embeddings
@@ -119,6 +125,11 @@ def model_provider(
 
     vision_projection_layer_spec = get_mlp_module_spec(use_te=use_te).submodules
 
+    tokenizer = get_tokenizer()
+    image_token_index = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
+
+    tile_tags = _get_tile_tags(args, tokenizer)
+
     model = LLaVAModel(
         language_transformer_config=language_config,
         language_transformer_layer_spec=language_transformer_layer_spec,
@@ -143,8 +154,9 @@ def model_provider(
         patch_dim=args.patch_dim,
         language_rotary_base=args.rotary_base,
         language_rope_scaling=args.use_rope_scaling,
-        image_token_index=get_tokenizer().convert_tokens_to_ids(IMAGE_TOKEN),
+        image_token_index=image_token_index,
         pixel_shuffle=args.pixel_shuffle,
+        tile_tags=tile_tags,
     )
 
     model.freeze(
@@ -154,3 +166,26 @@ def model_provider(
     )
 
     return model
+
+
+def _get_tile_tags(args, tokenizer):
+    """Tile tags are used in NVLM to surround image tiles with text tags."""
+    if not args.use_tile_tags:
+        return None
+
+    # We expect the tokenized length of the tags is same.
+    thumbnail_tag_text = "<tile_global_thumbnail>"
+    if args.tokenizer_prompt_format == "chatml":
+        thumbnail_tag_text = "<tile_global>"
+
+    assert args.max_num_tiles <= 6, "Up to 6 tile tags used"
+    tile_tags_text = [f"<tile_{i}>" for i in range(1, args.max_num_tiles + 1)] + [thumbnail_tag_text]
+
+    start_idx = 0
+    if tokenizer._prompt_config.has_bos:
+        start_idx = 1
+
+    # Convert to tokens [num_tiles, tile_seq_len].
+    tile_tags = [tokenizer.tokenize(t)[start_idx:] for t in tile_tags_text]
+
+    return tile_tags

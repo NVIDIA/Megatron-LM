@@ -66,6 +66,8 @@ class LLaVAModel(MegatronModule):
         language_rotary_base (int): RoPE base.
         language_rope_scaling (bool): Toggle RoPE scaling.
         image_token_index (int): Token ID for image token such as <image>.
+        pixel_shuffle (bool): Enable pixel shuffle.
+        tile_tags (list): Optional tile tags.
     """
 
     def __init__(
@@ -95,6 +97,7 @@ class LLaVAModel(MegatronModule):
         language_rope_scaling: bool = False,
         image_token_index: int = DEFAULT_IMAGE_TOKEN_INDEX,
         pixel_shuffle: bool = False,
+        tile_tags: Optional[list] = None,
     ) -> None:
         super().__init__(config=language_transformer_config)
 
@@ -172,12 +175,16 @@ class LLaVAModel(MegatronModule):
                 model_subtype=vision_transformer_config.vision_model_type,
                 add_class_token=add_class_token,
             )
+
+            vision_projection_input_size = vision_transformer_config.hidden_size
+            vision_projection_input_size *= 4 if pixel_shuffle else 1
+
             # Map (intermediate) vision model outputs to the language model input dimension.
             self.vision_projection = MultimodalProjector(
                 vision_projection_config,
                 vision_projection_layer_spec,
                 vision_projection_type,
-                vision_transformer_config.hidden_size,  # input size to the projection.
+                vision_projection_input_size,
             )
             # Ignore missing weights for the vision projection during checkpoint loading.
             # This should be disabled by default but can be enabled if your checkpoint contains
@@ -200,10 +207,12 @@ class LLaVAModel(MegatronModule):
             drop_vision_class_token,
             class_token_len,
             pixel_shuffle,
+            tile_tags is not None,  # Tile tags enabled/disabled.
         )
 
         self.image_token_index = image_token_index
         self._pixel_shuffle = pixel_shuffle
+        self._tile_tags = tile_tags
 
     def shared_embedding_or_output_weight(self):
         """This is a convenience method to surface the language model's word embeddings, which is
@@ -505,6 +514,42 @@ class LLaVAModel(MegatronModule):
 
         return final_embedding, final_labels, final_loss_mask, attention_mask
 
+    def _apply_tile_tagging(self, image_embeddings, num_image_tiles):
+        """Apply tile tagging.
+
+        The image embeddings of multiple tiles are prepended with tile tags such as <tile_1>.
+        This implements the method used in NVLM https://arxiv.org/pdf/2409.11402.
+
+        Args:
+            image_embeddings (torch.Tensor): [img_seq_len, num_tiles, h_language].
+            num_image_tiles (torch.Tensor): Number of tiles for each input image [num_images].
+
+        Returns:
+            torch.Tensor: Tile tags prepended to image embeddings.
+                [tile_seq_len (=5) + img_seq_len, num_tiles, h_language]
+        """
+        assert (
+            num_image_tiles.shape[0] == 1 and len(num_image_tiles) == 1
+        ), "multiple input images are not supported yet."
+
+        num_tiles = num_image_tiles[0].item()
+        tile_tags = self._tile_tags[: num_tiles - 1] + [self._tile_tags[-1]]
+
+        # [num_tiles, tile_seq_len (=5)]
+        tile_tag_input_ids = torch.tensor(
+            tile_tags, dtype=torch.int64, device=num_image_tiles.device
+        )
+
+        # [tile_seq_len, num_tiles, h_language]
+        tile_tag_embeds = self.language_model.embedding(tile_tag_input_ids, position_ids=None)
+
+        # [num_tiles, dim] should be the same same
+        assert tile_tag_embeds.shape[1:] == image_embeddings.shape[1:]
+
+        image_embeddings = torch.cat([tile_tag_embeds, image_embeddings])
+
+        return image_embeddings  # [tile_seq_len + img_seq_len, num_tiles, h_language]
+
     def forward(
         self,
         images: torch.Tensor,
@@ -576,6 +621,10 @@ class LLaVAModel(MegatronModule):
             image_embeddings = self.vision_projection(
                 image_embeddings
             )  # [img_seq_len, num_tiles, h_language]
+
+            # Apply tile tagging if enabled and an image token is present.
+            if self._tile_tags is not None and torch.any(input_ids == self.image_token_index):
+                image_embeddings = self._apply_tile_tagging(image_embeddings, num_image_tiles)
 
             # TODO: Support batched inference.
             # In inference, the language model KV cache will be updated for image token positions.

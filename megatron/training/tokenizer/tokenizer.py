@@ -78,7 +78,12 @@ def build_tokenizer(args, **kwargs):
             pretrained_model_name_or_path=args.tokenizer_model
         )
 
-        tokenizer = MultimodalTokenizer(underlying_tokenizer, args.tokenizer_prompt_format, args.special_tokens)
+        tokenizer = MultimodalTokenizer(
+            underlying_tokenizer,
+            args.tokenizer_prompt_format,
+            args.special_tokens,
+            args.image_tag_type,
+        )
     else:
         raise NotImplementedError('{} tokenizer is not ' 'implemented.'.format(args.tokenizer_type))
 

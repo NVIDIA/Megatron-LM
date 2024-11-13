@@ -7,9 +7,16 @@ from typing import Dict, List, Union
 import numpy as np
 
 from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
+
 # Mark tokens that will be ignored in the loss function with this value.
 # Same ignore_index in https://pytorch.org/docs/stable/generated/torch.nn.CrossEntropyLoss.html
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, IMAGE_TOKEN
+
+IMAGE_TAGS = {
+    "nvlm": ("<Image>", "</Image>"),
+    "internvl": ("<img>", "</img>"),
+    "": None,  # Image tag not used.
+}
 
 
 # The default mistral template raises exceptions so we use a custom one.
@@ -46,7 +53,13 @@ class PromptConfig:
 class MultimodalTokenizer(MegatronTokenizer):
     """Multimodal Tokenizer."""
 
-    def __init__(self, tokenizer: MegatronTokenizer, prompt_format: str, special_tokens: List[str]):
+    def __init__(
+        self,
+        tokenizer: MegatronTokenizer,
+        prompt_format: str,
+        special_tokens: List[str],
+        image_tag_type: str,
+    ):
         """Tokenizer with a support for non-text inputs.
 
         Note: Currently, only HuggingFaceTokenizer is supported as the underlying text tokenizer.
@@ -55,6 +68,7 @@ class MultimodalTokenizer(MegatronTokenizer):
             tokenizer (MegatronTokenizer): Underlying tokenizer.
             prompt_format (str): Prompt format for the tokenizer.
             special_tokens (List[str]): Non-text tokens.
+            image_tag_type (str): Image tag to apply, if any. For example <img><image></img>.
         """
         self._vocab_size = len(tokenizer)
 
@@ -95,12 +109,34 @@ class MultimodalTokenizer(MegatronTokenizer):
         else:
             raise NotImplementedError("unknown multimodal tokenizer type", prompt_format)
 
+        self._image_tag = IMAGE_TAGS[image_tag_type]
+
+    def _apply_image_tag(self, text: Union[str, List[Dict]]):
+        """Surround <image> with image tags such as <img> and </img>."""
+        if self._image_tag is None:
+            return text
+
+        replacement = f"{self._image_tag[0]}{IMAGE_TOKEN}{self._image_tag[1]}"
+
+        if isinstance(text, list):
+            for turn in text:
+                turn["content"] = turn["content"].replace(IMAGE_TOKEN, replacement)
+        else:
+            text = text.replace(IMAGE_TOKEN, replacement)
+
+        return text
+
     def tokenize(self, text: Union[str, List[Dict]]):
-        """Tokenize input."""
+        """Tokenize conversation or string input."""
         if isinstance(text, list):
             # This code path is used by the inference code currently.
             return self.tokenize_conversation(text, False, True).tolist()
 
+        return self._encode(text)
+
+    def _encode(self, text: str):
+        """Tokenize text input."""
+        text = self._apply_image_tag(text)
         return self._tokenizer.encode(text)
 
     def tokenize_conversation(
@@ -121,6 +157,9 @@ class MultimodalTokenizer(MegatronTokenizer):
         # Skip system message if the tokenizer doesn't have a system role.
         if not self._prompt_config.has_system_role and conversation[0]["role"] == "system":
             conversation = conversation[1:]
+
+        # Apply possible image tag.
+        conversation = self._apply_image_tag(conversation)
 
         tokens = self._tokenizer.apply_chat_template(
             conversation,
