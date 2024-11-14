@@ -182,7 +182,17 @@ def validate_args(args, defaults={}):
         f"world size ({args.world_size}) is not divisible by total_model_size ({encoder_model_size=} + {decoder_model_size=})"
     )
 
+    # Tensor model parallel size.
+    args.tensor_model_parallel_size = min(
+        args.tensor_model_parallel_size, args.world_size)
+    assert args.world_size % args.tensor_model_parallel_size == 0, 'world size'\
+        ' ({}) is not divisible by tensor model parallel size ({})'.format(
+            args.world_size, args.tensor_model_parallel_size)
+    
     # Pipeline model parallel size.
+    args.pipeline_model_parallel_size = min(
+        args.pipeline_model_parallel_size,
+        (args.world_size // args.tensor_model_parallel_size))
     args.transformer_pipeline_model_parallel_size = (
         args.pipeline_model_parallel_size - 1
         if args.standalone_embedding_stage else
@@ -192,19 +202,29 @@ def validate_args(args, defaults={}):
     args.data_parallel_size = args.world_size // total_model_size
 
     # Checks.
+    model_parallel_size = args.pipeline_model_parallel_size * \
+                          args.tensor_model_parallel_size
+    assert args.world_size % (model_parallel_size * args.context_parallel_size) == 0, \
+        'world size ({}) is not divisible by tensor parallel size ({}) times ' \
+        'pipeline parallel size ({}) times context parallel size ({})'.format(
+        args.world_size, args.tensor_model_parallel_size,
+        args.pipeline_model_parallel_size, args.context_parallel_size)
+    args.data_parallel_size = args.world_size // (model_parallel_size * args.context_parallel_size)
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
               'context-parallel size: {}, '
               'tensor-model-parallel size: {}, '
               'encoder-tensor-model-parallel size: {}, '
               'pipeline-model-parallel size: {}, '
-              'encoder-pipeline-model-parallel size: {}'.format(
+              'encoder-pipeline-model-parallel size: {}, '
+              'pipeline-model-parallel size: {} '.format(
                   args.world_size, args.data_parallel_size,
                   args.context_parallel_size,
                   args.tensor_model_parallel_size,
                   args.encoder_tensor_model_parallel_size,
                   args.pipeline_model_parallel_size,
-                  args.encoder_pipeline_model_parallel_size), flush=True)
+                  args.encoder_pipeline_model_parallel_size,
+                  args.pipeline_model_parallel_size), flush=True)
 
     # backwards compatibility.
     if args.pipeline_model_parallel_split_rank is not None:
@@ -212,6 +232,13 @@ def validate_args(args, defaults={}):
         args.pipeline_model_parallel_size -= args.encoder_pipeline_model_parallel_size
         assert args.pipeline_model_parallel_size > 0
 
+    if args.pipeline_model_parallel_size > 1:
+        if args.pipeline_model_parallel_split_rank is not None:
+            assert args.pipeline_model_parallel_split_rank < \
+                    args.pipeline_model_parallel_size, 'split rank needs'\
+                    ' to be less than pipeline model parallel size ({})'.format(
+                            args.pipeline_model_parallel_size)
+            
     if args.tp_comm_overlap:
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
 
@@ -277,6 +304,11 @@ def validate_args(args, defaults={}):
                 'when interleaved schedule is used and p2p communication overlap is disabled, '\
                 'pipeline-model-parallel size should be greater than 2 to avoid having multiple '\
                 'p2p sends and recvs between same 2 ranks per communication batch'
+        
+        assert args.pipeline_model_parallel_size > 2, \
+            'pipeline-model-parallel size should be greater than 2 with ' \
+            'interleaved schedule'
+        
         assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
             'number of layers should be divisible by the pipeline parallel size'
         num_layers_per_pipeline_stage = args.num_layers // args.transformer_pipeline_model_parallel_size
@@ -547,6 +579,8 @@ def validate_args(args, defaults={}):
         raise RuntimeError('--rotary-interleaved does not work with rope_fusion.')
     if args.rotary_interleaved and args.use_legacy_models:
         raise RuntimeError('--rotary-interleaved is not supported in legacy models.')
+    if args.rotary_interleaved and not args.deprecated_use_mcore_models:
+        raise RuntimeError('--rotary-interleaved only support Megatron Core, please add --use-mcore-models.')
 
     # Would just need to add 'NoPE' as a position_embedding_type to support this, but for now
     # don't allow it to keep things simple
@@ -558,7 +592,10 @@ def validate_args(args, defaults={}):
         args.num_experts = None
     if args.num_experts is not None:
         assert args.spec is None, "Model Spec must be None when using MoEs"
-
+        if args.tensor_model_parallel_size > 1:
+            assert args.sequence_parallel, \
+                "When using MoE and tensor parallelism, sequence parallelism must be used."
+            
     # Context parallel
     if args.context_parallel_size > 1:
         assert not args.use_legacy_models, "Context parallelism is not supported in legacy models."
@@ -635,6 +672,8 @@ def validate_args(args, defaults={}):
 
     return args
 
+def validate_moe_args(args, defaults={}):
+    pass
 
 def _print_args(title, args):
     """Print arguments."""
@@ -697,6 +736,8 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['config_logger_dir'] = args.config_logger_dir
     if args.disable_te_fused_rope:
         kw_args['disable_te_fused_rope'] = args.disable_te_fused_rope
+
+    kw_args["cross_entropy_loss_fusion"] = args.cross_entropy_loss_fusion
 
     # Return config.
     return config_class(**kw_args)
@@ -998,6 +1039,8 @@ def _add_logging_args(parser):
                        'flush to disk.')
     group.add_argument('--log-timers-to-tensorboard', action='store_true',
                        help='If set, write timers to tensorboard.')
+    group.add_argument('--log-batch-size-to-tensorboard', action='store_true',
+                       help='If set, write batch-size to tensorboard.')
     group.add_argument('--no-log-loss-scale-to-tensorboard',
                        action='store_false',
                        help='Disable loss-scale logging to tensorboard.',
@@ -1706,7 +1749,8 @@ def _add_data_args(parser):
                                 'HuggingFaceTokenizer',
                                 'Llama2Tokenizer',
                                 'TikTokenizer',
-                                'NullTokenizer'],
+                                'NullTokenizer',
+                                'DeepSeekV2Tokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='Sentencepiece tokenizer model.')
@@ -1732,6 +1776,440 @@ def _add_data_args(parser):
                        help='Path to cache index files when using s3 dataloader')
     return parser
 
+def get_patch_args(parser):
+    group = parser.add_argument_group(title="patch")
+
+    for action in vars(group)["_actions"]:
+        if isinstance(action, argparse._StoreAction):
+            if "--tokenizer-type" in action.option_strings:
+                action.default = "NullTokenizer"
+
+    for action in vars(group)["_actions"]:
+        if isinstance(action, argparse._StoreAction):
+            if "--vocab-size" in action.option_strings:
+                action.default = -1
+
+    for action in vars(group)["_actions"]:
+        if isinstance(action, argparse._StoreAction):
+            if "--optimizer" in action.option_strings:
+                action.choices.append("hybridadam")
+
+    for action in vars(group)["_actions"]:
+        if isinstance(action, argparse._StoreAction):
+            if "--position-embedding-type" in action.option_strings:
+                action.choices.append("none")
+
+    has_rotary_base = False
+    for action in vars(group)["_actions"]:
+        if isinstance(action, argparse._StoreAction):
+            if "--rotary-base" in action.option_strings:
+                has_rotary_base = True
+
+    if not has_rotary_base:
+        group.add_argument(
+            "--rotary-base",
+            type=int,
+            default=10000,
+            help="Base to use for rotary positional embeddings, default 10000",
+        )
+
+    #group.add_argument(
+    #    "--local-rank",
+    #    type=int,
+    #    default=None,
+    #    help="local rank passed from distributed launcher",
+    #)
+
+    group.add_argument("--n-head-kv", type=int, default=None, help="n-head-kv")
+
+    group.add_argument(
+        "--transformer-type", type=str, default="megatron", help="transformer-type"
+    )
+
+    group.add_argument(
+        "--max-padding-length", type=int, default=None, help="max-padding-length"
+    )
+
+    group.add_argument("--dataset", type=str, default=None, help="dataset")
+
+    group.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Number of finetunning epochs. Zero results in " "evaluation only.",
+    )
+
+    group.add_argument(
+        "--intermediate-size", type=int, default=None, help="--intermediate-size"
+    )
+
+    group.add_argument(
+        "--extra-vocab-size", type=int, default=0, help="--extra-vocab-size"
+    )
+
+    group.add_argument(
+        "--keep-last",
+        action="store_true",
+        help="Keep the last batch (maybe incomplete) in" "the data loader",
+    )
+
+    group.add_argument("--data-dir", default=None, help="data-dir")
+
+    group.add_argument(
+        "--train-data",
+        nargs="+",
+        default=None,
+        help="Whitespace separated paths or corpora names " "for training.",
+    )
+
+    group.add_argument(
+        "--valid-data", nargs="+", default=None, help="path(s) to the validation data."
+    )
+
+    group.add_argument("--patch-tokenizer-type", type=str, help="patch-tokenizer-type")
+
+    group.add_argument(
+        "--use-alibi-mask",
+        action="store_true",
+        help="use alibi mask for baichuan model",
+    )
+
+    group.add_argument("--use-normhead", action="store_true", help="use-normhead")
+
+    group.add_argument("--glu-activation", type=str, help="GLU activations to use.")
+
+    group.add_argument(
+        "--attention-head-type",
+        type=str,
+        default=None,
+        choices=["multihead", "multiquery"],
+        help="Type of attention heads. `multihead` is the standard multi-head attention."
+        "`multiquery` shares the values and keys across attention heads",
+    )
+
+    group.add_argument(
+        "--transformer-timers",
+        action="store_true",
+        help="If set, activate the timers within the transformer layers."
+        "Only for debugging, as this slows down the model.",
+    )
+
+    group.add_argument("--text-generate-input-file", type=str, default="")
+
+    group.add_argument("--text-generate-output-file", type=str, default="")
+
+    group.add_argument("--text-generate-gt-file", type=str, default="")
+
+    group.add_argument(
+        "--time",
+        action="store_true",
+        help="measure end to end text generation average time",
+    )
+
+    group.add_argument("--eval-dev", action="store_true")
+
+    group.add_argument(
+        "--input-len",
+        type=int,
+        default=1,
+        help="input lenth for measure end to end text generation average time",
+    )
+
+    group.add_argument(
+        "--generation-length", type=int, default=None, help="generation-seq-len"
+    )
+
+    group.add_argument("--top-p", type=float, default=0.0, help="Top p sampling.")
+
+    group.add_argument("--top-k", type=int, default=0, help="Top k sampling.")
+
+    group.add_argument(
+        "--out-seq-length",
+        type=int,
+        default=1024,
+        help="Size of the output generated text.",
+    )
+
+    group.add_argument(
+        "--temperature", type=float, default=1.0, help="Sampling temperature."
+    )
+
+    group.add_argument(
+        "--repetition_penalty", type=float, default=1.1, help="Repetition_penalty."
+    )
+
+    group.add_argument(
+        "--embed-layernorm", action="store_true", help="use layernorm for embedding"
+    )
+
+    group.add_argument(
+        "--repetition-penalty", type=float, default=1.2, help="Repetition_penalty."
+    )
+
+    group.add_argument(
+        "--source-seq-len", type=int, default=None, help="source-seq-len"
+    )
+
+    group.add_argument(
+        "--target-seq-len", type=int, default=None, help="target-seq-len"
+    )
+
+    group.add_argument(
+        "--position-encoding-2d", action="store_true", help="position-encoding-2d"
+    )
+
+    group.add_argument(
+        "--z-loss-weight",
+        type=float,
+        default=0.0,
+        help="the max-z weight for baichuan2",
+    )
+
+    group.add_argument(
+        "--use-llama2-rotary-position-embeddings",
+        action="store_true",
+        help="Use llama2 rotary positional embeddings or not. "
+        "Deprecated: use --position-embedding-type",
+    )
+
+    group.add_argument(
+        "--use-mistral-rotary-position-embeddings",
+        action="store_true",
+        help="Use llama2 rotary positional embeddings or not. "
+        "Deprecated: use --position-embedding-type",
+    )
+
+    group.add_argument("--mm-use-im-start-end", action="store_true")
+
+    group.add_argument("--mm-use-im-patch-token", action="store_true")
+
+    group.add_argument("--tune-mm-mlp-adapter", action="store_true")
+
+    group.add_argument("--freeze-clip-vision-tower", action="store_true")
+
+    group.add_argument("--freeze-llm", action="store_true")
+
+    group.add_argument("--image-folder", type=str, default="")
+
+    group.add_argument("--mm-vision-select-layer", type=int, default=None)
+
+    group.add_argument("--vision-tower", type=str, default="")
+
+    group.add_argument("--image-aspect-ratio", type=str, default="square")
+
+    group.add_argument("--version", type=str, default="plain")
+
+    group.add_argument("--mm-projector-type", type=str, default=None)
+
+    group.add_argument("--image-size", type=int, default=None, help="image-size")
+
+    group.add_argument("--patch-size", type=int, default=None, help="patch-size")
+
+    group.add_argument("--sliding-window", type=int, default=None)
+
+    group.add_argument("--rotary-scale-factor", type=int, default=1)
+
+    group.add_argument("--cvcuda-image-processing", action="store_true")
+
+    group.add_argument(
+        "--expert-tensor-parallelism",
+        action="store_true",
+        default=False,
+        help="use tensor parallelism for expert layers in MoE",
+    )
+
+    group.add_argument(
+        "--expert-interval",
+        type=int,
+        default=2,
+        help='Use experts in every "expert-interval" layers',
+    )
+
+    group.add_argument("--moe", action="store_true")
+
+    group.add_argument("--moe-topk", type=int, default=1, help="moe-topk")
+
+    group.add_argument(
+        "--moe-expert-parallel-size",
+        type=int,
+        default=None,
+        help="Degree of the MoE expert parallelism. By default, "
+        "the size of this value will be automatically determined.",
+    )
+
+    group.add_argument(
+        "--moe-train-capacity-factor",
+        type=float,
+        default=1.0,
+        help="The capacity of the MoE expert at training time",
+    )
+
+    group.add_argument(
+        "--moe-eval-capacity-factor",
+        type=float,
+        default=1.0,
+        help="The capacity of the MoE expert at eval time.",
+    )
+
+    group.add_argument(
+        "--moe-min-capacity",
+        type=int,
+        default=4,
+        help="The minimum capacity per MoE expert regardless of the capacity_factor.",
+    )
+
+    group.add_argument(
+        "--moe-loss-coeff",
+        type=float,
+        default=0.01,
+        help="Scaling coefficient for adding MoE loss to model loss",
+    )
+
+    group.add_argument(
+        "--use-tutel", action="store_true", help="Use Tutel optimization for MoE"
+    )
+
+    group.add_argument(
+        "--router-type",
+        type=str,
+        default="topk",
+        choices=["topk", "expert_choice"],
+        help="Options for router type, support top1 & top2 and expert_choice",
+    )
+
+    group.add_argument(
+        "--moe-input-feature-slicing",
+        action="store_true",
+        help="Enable moe all2all performance optimization.",
+    )
+
+    group.add_argument(
+        "--disable-bias-linear-fc",
+        action="store_false",
+        help="Disable bias in the linear layers",
+        dest="add_bias_linear_fc",
+    )
+
+    group.add_argument(
+        "--disable-bias-attn-fc",
+        action="store_false",
+        help="Disable bias in the linear layers",
+        dest="add_bias_attn_fc",
+    )
+
+    group.add_argument(
+        "--disable-parallel-output",
+        action="store_false",
+        help="Disable parallel-output",
+        dest="enable_parallel_output",
+    )
+
+    group.add_argument(
+        "--task-list",
+        type=str,
+        default="all",
+        help='Either "all" or comma separated list of tasks.',
+    )
+
+    group.add_argument(
+        "--verbosity",
+        type=str,
+        default="INFO",
+        help="Logging verbosity",
+    )
+
+    group.add_argument(
+        "--adaptive-seq-len",
+        default=False,
+        action="store_true",
+        help="Should the sequence length be adapted to the batch during evaluation,"
+        " if in fp16 the results will be slightly different due to numerical"
+        " errors but greatly speed up evaluation.",
+    )
+
+    group.add_argument(
+        "--eval-fp32",
+        default=False,
+        action="store_true",
+        help="Should the evaluation run in fp32",
+    )
+
+    group.add_argument("--num-fewshot", type=int, default=None, help="num fewshot")
+
+    group.add_argument(
+        "--convert-checkpoint-from-megatron-to-transformers",
+        action="store_true",
+        help=(
+            "If True, convert a Megatron checkpoint to a Transformers checkpoint. "
+            "If False, convert a Transformers checkpoint to a Megatron checkpoint."
+        ),
+    )
+
+    group.add_argument("--moe-ffn-hidden-size", type=int, default=None)
+
+    group.add_argument("--shared-moe-ffn-hidden-size", type=int, default=None)
+
+    group.add_argument(
+        "--enable-shared-expert", action="store_true", help="enable-shared-expert"
+    )
+
+    group.add_argument("--qk-nope-head-dim", type=int, default=None)
+
+    group.add_argument("--qk-rope-head-dim", type=int, default=None)
+
+    group.add_argument("--num-shared-experts", type=int, default=None)
+
+    group.add_argument("--moe-layer-freq", type=int, default=1)
+
+    group.add_argument(
+        "--optimizer-offload-policy",
+        default="static",
+        type=str,
+        help="Optimizer Offload Policy used by OffloadDistributedOptimizer, "
+        "valid if base optimizer is HybridAdam.",
+    )
+
+    group.add_argument(
+        "--optimizer-offload-fraction",
+        type=float,
+        default=0.5,
+        help="Optimizer Offload Fraction used by static offload policy, "
+        "valid if base optimizer is HybridAdam",
+    )
+    group.add_argument(
+        "--train-mode", default="pretrain", type=str, help="pretrain or finetune"
+    )
+
+    group.add_argument(
+        "--optimizer-offload-auto-threshold",
+        type=int,
+        default=2048 * 1024 * 1024,
+        help="Optimizer Offload Threshold currently used by auto policy, "
+        "tune larger if OOM occurs",
+    )
+
+    group.add_argument(
+        "--optimizer-offload-chunk-size",
+        type=int,
+        default=32 * 1024 * 1024,
+        help="Chunk size of Chunk Manager in Optimizer Offload,"
+        "keep zero to search for a optimal size",
+    )
+
+    group.add_argument(
+        "--cpu-offloading",
+        default=False,
+        action="store_true",
+        help="Use activation checkpointing.",
+    )
+
+    group.add_argument(
+        "--cpu-offloading-num-layers",
+        type=int,
+        default=0,
+        help="The num of layers to be moved to CPU",
+    )
+    return parser
 
 def _add_autoresume_args(parser):
     group = parser.add_argument_group(title='autoresume')

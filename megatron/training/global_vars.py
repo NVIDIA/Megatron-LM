@@ -12,6 +12,7 @@ from megatron.training import dist_signal_handler
 from megatron.training.tokenizer import build_tokenizer
 
 _GLOBAL_ARGS = None
+_GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
 _GLOBAL_TOKENIZER = None
 _GLOBAL_TENSORBOARD_WRITER = None
 _GLOBAL_WANDB_WRITER = None
@@ -37,6 +38,9 @@ def get_tensorboard_writer():
     to check if it is initialized."""
     return _GLOBAL_TENSORBOARD_WRITER
 
+def update_num_microbatches(consumed_samples, consistency_check=True):
+    _GLOBAL_NUM_MICROBATCHES_CALCULATOR.update(consumed_samples,
+                                               consistency_check)
 
 def get_wandb_writer():
     """Return tensorboard writer. It can be None so no need
