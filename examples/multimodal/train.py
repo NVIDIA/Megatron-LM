@@ -11,20 +11,23 @@ sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 
-from dataloader_provider import train_valid_test_dataloaders_provider
+from dataloader_provider import train_valid_test_dataloaders_provider, is_first_or_last_stage
 from model import model_provider
 from multimodal_args import add_multimodal_extra_args
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, LLaVAModel
-from megatron.core.parallel_state import get_tensor_model_parallel_rank
+from megatron.core.parallel_state import get_tensor_model_parallel_rank, get_pipeline_model_parallel_world_size, is_pipeline_last_stage
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain
 from megatron.training.utils import is_last_rank
 
 
 def get_batch(data_iterator):
-    """Generate a batch"""
+    """Generate a batch
+
+    Note: attn_mask_type in layer_specs.py sets the attention mask. Attention mask is None here.
+    """
     imgs = None
     tokens = None
     labels = None
@@ -32,6 +35,14 @@ def get_batch(data_iterator):
     attention_mask = None
     position_ids = None
     num_tiles = None
+
+    args = get_args()
+
+    # Dataloader doesn't run on the middle stages in a pipeline parallel model.
+    pp_size = get_pipeline_model_parallel_world_size()
+    if not is_first_or_last_stage(pp_size, args.encoder_pipeline_model_parallel_size):
+        # Note these are all set to None above.
+        return tokens, labels, loss_mask, attention_mask, position_ids, imgs, num_tiles
 
     # Broadcast data.
     torch.cuda.nvtx.range_push("get_data")
@@ -48,8 +59,13 @@ def get_batch(data_iterator):
 
     # Dummy image, no image.
     if imgs.shape == torch.Size([1, 1]):
+        # FIXME: text-only data can cause a hang if the vision model is own its own pipeline rank and --freeze-ViT is enabled.
         imgs = torch.tensor([], dtype=torch.float32, device=data_text.device)
         num_tiles = torch.tensor([], dtype=torch.int, device=data_text.device)
+
+    # Last pipeline parallel stage doesn't need images.
+    if pp_size > 1 and is_pipeline_last_stage():
+        imgs = None
 
     torch.cuda.nvtx.range_pop()
 
@@ -65,7 +81,7 @@ def get_batch(data_iterator):
     torch.cuda.nvtx.range_pop()
 
     torch.cuda.nvtx.range_push("get_ltor_masks_and_position_ids")
-    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
+    loss_mask, position_ids = get_ltor_masks_and_position_ids(
         tokens, labels, tokenizer.pad
     )
     torch.cuda.nvtx.range_pop()
@@ -86,10 +102,7 @@ def get_ltor_masks_and_position_ids(input_ids, target, pad_token):
     loss_mask[target == pad_token] = 0.0  # mask paddings
     loss_mask[target == IGNORE_INDEX] = 0.0  # mask prompts
 
-    # Attention mask.
-    attention_mask = None
-
-    return attention_mask, loss_mask, position_ids
+    return loss_mask, position_ids
 
 
 def loss_func(loss_mask, output_tensor):
