@@ -8,6 +8,14 @@ import pytest
 import torch
 from torch.distributed.checkpoint import CheckpointException as PyTCheckpointingException
 
+try:
+    from torch.distributed import DeviceMesh
+    from torch.distributed._tensor import DTensor
+
+    HAVE_DTENSOR = True
+except ImportError:
+    HAVE_DTENSOR = False
+
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
 from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_load_config
@@ -42,6 +50,16 @@ class TestSerialization:
             ),
         }
 
+        if HAVE_DTENSOR:
+            mesh = DeviceMesh.from_group(
+                parallel_state.get_data_parallel_group(with_context_parallel=True), "cuda"
+            )
+            sharded_state_dict['sd_keyD'] = ShardedTensor.from_rank_offsets(
+                'keyD',
+                DTensor.from_local(torch.ones(3, 5, 7), mesh)._local_tensor,
+                replica_id=Utils.rank,
+            )
+
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_single_process_save_load', sync=True
@@ -55,6 +73,9 @@ class TestSerialization:
                 assert (ckpt_dir / 'keyB').is_dir()
                 assert not (ckpt_dir / 'keyC').exists()
                 assert not (ckpt_dir / 'sd_keyA').is_dir()
+
+                if HAVE_DTENSOR:
+                    assert (ckpt_dir / 'keyD').is_dir()
 
             load_ssd = {
                 'load_sd_keyA': ShardedTensor.from_rank_offsets(
