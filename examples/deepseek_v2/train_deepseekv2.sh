@@ -323,6 +323,7 @@ megatron_options="  \
         --disable-bias-linear \
         --use-mcore-models \
         --use-legacy-models \
+        --ckpt-format torch \
         --rotary-base ${ROPE_THETA} \
         --rotary-scaling-factor ${SCALE_FACTOR} \
         --transformer-impl transformer_engine \
