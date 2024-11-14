@@ -322,7 +322,7 @@ class TestLLaVAModel:
         assert loss.shape == new_loss_mask.shape == torch.Size((5, 1024))
 
         # Try without labels and without inference params.
-        logits = self.model.forward(
+        logits, _ = self.model.forward(
             img,
             input_ids,
             position_ids,
@@ -335,7 +335,7 @@ class TestLLaVAModel:
 
         # Try without labels and with inference params.
         inference_params = InferenceParams(5, max_seq_len)
-        logits = self.model.forward(
+        logits, _ = self.model.forward(
             img,
             input_ids,
             position_ids,

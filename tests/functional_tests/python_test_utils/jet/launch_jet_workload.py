@@ -66,7 +66,7 @@ def launch_and_wait_for_completion(
         ),
         config_id=resolve_cluster_config(cluster),
         custom_config={
-            "launchers": {cluster: {"account": account}},
+            "launchers": {cluster: {"account": account, "ntasks_per_node": 8}},
             "executors": {
                 "jet-ci": {
                     "environments": {
@@ -91,17 +91,7 @@ def launch_and_wait_for_completion(
         flush=True,
     )
 
-    n_attempt = 0
-    while n_attempt < 10:
-        try:
-            status = pipeline.wait(max_wait_time=60 * 60 * 24 * 7)
-        except requests.exceptions.ConnectionError:
-            n_attempt += 1
-            print(f"Connection error, try again (attempt {n_attempt})")
-            time.sleep(60)
-        finally:
-            if status == PipelineStatus.SUCCESS:
-                break
+    pipeline.wait(max_wait_time=60 * 60 * 24 * 7)
 
     print(f"Pipeline terminated; status: {pipeline.get_status()}")
     return pipeline
@@ -236,6 +226,17 @@ def main(
 
         if test_type != "release":
             success = pipeline.get_status() == PipelineStatus.SUCCESS
+
+            if (
+                "Some NCCL operations have failed or timed out." in concat_logs
+                or "uncorrectable ECC error encountered" in concat_logs
+                or "illegal memory access" in concat_logs
+                or "illegal instruction" in concat_logs
+            ):
+                print("Detected NCCL failure, attempt restart.")
+                n_attempts += 1
+                continue
+
             sys.exit(int(not success))  # invert for exit 0
 
         if parse_failed_job(logs=logs):

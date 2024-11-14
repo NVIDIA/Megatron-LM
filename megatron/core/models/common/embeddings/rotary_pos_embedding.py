@@ -112,6 +112,29 @@ class RotaryEmbedding(nn.Module):
 
         return inv_freq_llama
 
+    def get_freqs_non_repeated(self, max_seq_len: int, offset: int = 0) -> Tensor:
+        """Generates matrix of frequencies based on positions in the sequence,
+        used to create positional encodings"""
+        seq = (
+            torch.arange(max_seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+            + offset
+        )
+
+        if self.seq_len_interpolation_factor is not None:
+            seq *= 1 / self.seq_len_interpolation_factor
+
+        freqs = torch.outer(seq, self.inv_freq)  # [seq len, dim]
+
+        return freqs
+
+    def get_cos_sin(self, max_seq_len: int, offset: int = 0) -> (Tensor, Tensor):
+        """Cosine and sine values for RoPE are precomputed for all positions up to the maximum
+        sequence length"""
+        freqs = self.get_freqs_non_repeated(max_seq_len, offset)
+        cos = torch.cos(freqs)
+        sin = torch.sin(freqs)
+        return cos, sin
+
     @lru_cache(maxsize=32)
     def forward(self, max_seq_len: int, offset: int = 0, packed_seq: bool = False) -> Tensor:
         """Forward pass of RoPE embedding.
@@ -127,15 +150,8 @@ class RotaryEmbedding(nn.Module):
         if self.inv_freq.device.type == 'cpu':
             # move `inv_freq` to GPU once at the first micro-batch forward pass
             self.inv_freq = self.inv_freq.to(device=torch.cuda.current_device())
-        seq = (
-            torch.arange(max_seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
-            + offset
-        )
 
-        if self.seq_len_interpolation_factor is not None:
-            seq *= 1 / self.seq_len_interpolation_factor
-
-        freqs = torch.outer(seq, self.inv_freq)
+        freqs = self.get_freqs_non_repeated(max_seq_len, offset)
         # first part even vector components, second part odd vector components,
         #  2 * dim in dimension size
         if not self.rotary_interleaved:

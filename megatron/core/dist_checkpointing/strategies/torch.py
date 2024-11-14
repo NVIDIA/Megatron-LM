@@ -16,7 +16,6 @@ from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed._shard.sharded_tensor import Shard
 from torch.distributed._shard.sharded_tensor import ShardedTensor as TorchShardedTensor
 from torch.distributed._shard.sharded_tensor import ShardedTensorMetadata, TensorProperties
-from torch.distributed._tensor import DTensor
 from torch.distributed.checkpoint import (
     BytesStorageMetadata,
     DefaultLoadPlanner,
@@ -34,6 +33,7 @@ from torch.distributed.checkpoint._traverse import OBJ_PATH, traverse_state_dict
 from torch.distributed.checkpoint.metadata import Metadata
 from torch.distributed.checkpoint.planner_helpers import _create_write_items
 
+from ...utils import get_torch_version
 from ..core import CheckpointingException
 from ..dict_utils import nested_values
 from ..mapping import (
@@ -69,6 +69,13 @@ try:
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
+
+try:
+    from torch.distributed._tensor import DTensor
+
+    HAVE_DTENSOR = True
+except ImportError:
+    HAVE_DTENSOR = False
 
 
 def register_default_torch_strategies():
@@ -451,7 +458,7 @@ class MCoreSavePlanner(DefaultSavePlanner):
     ) -> None:
         # `dedup_replicated_tensors` was deprecated in 2.3; this check avoids warnings
         # during saving.
-        if PkgVersion(torch.__version__) <= PkgVersion("2.2"):
+        if get_torch_version() <= PkgVersion("2.2"):
             kwargs['dedup_replicated_tensors'] = dedup_replicated_tensors
         super().__init__(*args, **kwargs)
         self.nd_flattened_global_shapes = nd_flattened_global_shapes or {}
@@ -466,7 +473,7 @@ class MCoreSavePlanner(DefaultSavePlanner):
         # add those requests on all ranks. We inline a simplified version of this method below.
         write_items = []
         for fqn, obj in self.state_dict.items():
-            assert not isinstance(
+            assert not HAVE_DTENSOR or not isinstance(
                 obj, DTensor
             )  # translation from MCore ShardedTensors shouldn't result in DTensors
             # Create write requests for tensor and bytes values.

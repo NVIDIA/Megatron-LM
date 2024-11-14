@@ -46,7 +46,7 @@ test:build_image:
       
         ADDITIONAL_PARAMS=()
 
-        if [[ "$CI_COMMIT_BRANCH" == "ci-rebuild-mcore-nemo-image" ]]; then
+        if [[ "$CI_COMMIT_BRANCH" == "ci-rebuild-mcore-nemo-image" || "$CI_COMMIT_BRANCH" == "main" ]]; then
           ADDITIONAL_PARAMS+=("--pull")
           ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:main")
         fi
@@ -95,9 +95,6 @@ test:build_image:
       - BUCKET: tests/unit_tests/data/
       - BUCKET: tests/unit_tests/dist_checkpointing/
       - BUCKET: tests/unit_tests/distributed/ 
-      - BUCKET: tests/unit_tests/models/
-      - BUCKET: tests/unit_tests/pipeline_parallel/ tests/unit_tests/tensor_parallel/
-      - BUCKET: tests/unit_tests/transformer/
       - BUCKET: other
   script:
     - docker run --name mcore_ci_${CI_PIPELINE_ID} -d --rm -e BUCKET -e TAG -e IMAGE -e UNIT_TEST_REPEAT -e UNIT_TEST_TIMEOUT --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 ${IMAGE}:${CI_PIPELINE_ID} bash -c "sleep $(( ${UNIT_TEST_TIMEOUT} * 60 + 60 ))"
@@ -227,9 +224,29 @@ test:formatting:
   image: ${LINTING_IMAGE}:${CI_PIPELINE_ID}
   tags: [mcore-docker-node-small]
   needs: [test:build_image]
+  variables:
+    GIT_STRATEGY: "clone"
   script:
+    - |
+      if [[ "$CI_PIPELINE_SOURCE" != "merge_request_event" ]]; then
+        exit 0
+      fi
+    - set +e
+    - git fetch origin $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+    - git fetch origin main:main
+    - git checkout $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+    - |
+      if [[ "$CI_MERGE_REQUEST_PROJECT_PATH" == "$CI_MERGE_REQUEST_SOURCE_PROJECT_PATH" ]]; then 
+        bash tools/autoformat.sh
+        set -e
+        git config --global user.email "mcore-bot@nvidia.com"
+        git config --global user.name "Mcore Bot"
+        git remote set-url origin "https://gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
+        git add -A .
+        git commit -m "chore: Format files" || true
+        git push -u origin $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+      fi
     - env
-    - git fetch origin main
     - BASE_REF="$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" CHECK_ONLY=true SKIP_DOCS=$([[ "$CI_MERGE_REQUEST_LABELS" == *"Skip docs"* ]] && echo "true" || echo "false") bash tools/autoformat.sh
 
 test:copyright:
@@ -279,7 +296,8 @@ test:pypi_build_wheel:
     - echo $PUBLISH_DRYRUN
     - >
       if [ "$PUBLISH_DRYRUN" = "yes" ]; then
-        sed -i "/^PATCH/c\PATCH = $((RANDOM % 9000 + 1000))" megatron/core/package_info.py 
+        PRE_RELEASE=$(sed -n "s/.*PRE_RELEASE = '\(.*\)'/\1/p" megatron/core/package_info.py)
+        sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '${PRE_RELEASE}.dev$((RANDOM % 900000 + 100000))'" megatron/core/package_info.py 
       fi
     - /opt/python/cp310-cp310/bin/python -m build
     - /opt/python/cp311-cp311/bin/python -m build
@@ -316,6 +334,7 @@ test:pypi_push_wheel:
   needs: [test:pypi_test_wheel]
   variables:
     PUBLISH_DRYRUN: "yes"
+  timeout: 3m
   script:
     - >
       if [ "$PUBLISH_DRYRUN" = "yes" ]; then
@@ -332,6 +351,12 @@ test:pypi_push_wheel:
       for i in 1 2 3 4 5; do 
         twine upload --verbose -u $TWINE_USERNAME -p $TWINE_PASSWORT --repository $REPOSITORY wheelhouse/* && break || sleep $(( 60*2**i )); 
       done
+  rules:
+    - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+      allow_failure: true
+      when: on_success
+    - when: on_success
+      allow_failure: true
 
 test:gh_release:
   extends: [.test_rules]

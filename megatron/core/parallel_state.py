@@ -1287,6 +1287,12 @@ def is_inside_decoder(rank=None):
     return False
 
 
+def get_pipeline_model_parallel_decoder_start() -> Optional[int]:
+    """Return decoder start rank (if encoder pipeline parallelism is set)."""
+    global _PIPELINE_MODEL_PARALLEL_DECODER_START
+    return _PIPELINE_MODEL_PARALLEL_DECODER_START
+
+
 def is_pipeline_stage_at_split():
     """Return true if pipeline stage executes decoder block and next
     stage executes encoder block for a model with both encoder and
@@ -1562,6 +1568,9 @@ def destroy_model_parallel():
 
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None
+
+    global _PIPELINE_MODEL_PARALLEL_DECODER_START
+    _PIPELINE_MODEL_PARALLEL_DECODER_START = None
 
     global _DATA_PARALLEL_GROUP
     _DATA_PARALLEL_GROUP = None

@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from transformer_engine.pytorch.fp8 import check_fp8_support, fp8_autocast
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import load, load_plain_tensors, save
@@ -22,8 +23,10 @@ from megatron.core.utils import is_te_min_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
+fp8_available, reason_for_no_fp8 = check_fp8_support()
 
-def initialize_expert_layer(seed, glu=True, expert_type='sequential', **config_kwargs):
+
+def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False, **config_kwargs):
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
 
@@ -32,7 +35,7 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', **config_k
     num_local_experts = num_moe_experts // parallel_state.get_expert_model_parallel_world_size()
     default_config_kwargs = dict(
         num_layers=pp_size,
-        hidden_size=12,
+        hidden_size=16,
         num_attention_heads=4,
         num_moe_experts=num_moe_experts,
         use_cpu_initialization=True,
@@ -41,7 +44,7 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', **config_k
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs)
     transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-        num_experts=num_moe_experts, moe_grouped_gemm=(expert_type != 'sequential')
+        num_experts=num_moe_experts, moe_grouped_gemm=(expert_type != 'sequential'), fp8=fp8
     )
     if expert_type == 'grouped':
         model = GroupedMLP(num_local_experts, transformer_config)
@@ -229,4 +232,89 @@ class TestExpertLayerReconfiguration:
             state_dict_B = load_plain_tensors(ckpt_dir_B)
             diffs = diff(state_dict_A, state_dict_B)
             assert not any(map(bool, diffs)), diffs
+            Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not is_te_min_version("1.11.0"),
+        reason="FP8 support of TEGroupedMLP is only available in TE 1.11.0 and later.",
+    )
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.parametrize(
+        "src_module,dst_module,src_tp_pp_exp,dest_tp_pp_exp",
+        [
+            # Changing tp/pp/dp doesn't affect _extra_state
+            ('sequential', 'te_grouped', (1, 1, 1), (1, 1, 4)),
+            ('sequential', 'te_grouped', (1, 1, 4), (1, 1, 1)),
+            ('te_grouped', 'sequential', (1, 1, 1), (1, 1, 4)),
+            ('te_grouped', 'sequential', (1, 1, 4), (1, 1, 1)),
+        ],
+    )
+    def test_sequential_grouped_mlp_extra_state(
+        self, tmp_path_dist_ckpt, src_tp_pp_exp, dest_tp_pp_exp, src_module, dst_module
+    ):
+        """Test saving and loading _extra_state"""
+        src_tp, src_pp, src_exp = src_tp_pp_exp
+        dest_tp, dest_pp, dest_exp = dest_tp_pp_exp
+        use_glu = True
+        Utils.initialize_model_parallel(src_tp, src_pp, expert_model_parallel_size=src_exp)
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_grouped_mlp_extra_state_model_A'
+        ) as ckpt_dir_A, TempNamedDir(
+            tmp_path_dist_ckpt / 'test_grouped_mlp_extra_state_model_B'
+        ) as ckpt_dir_B, fp8_autocast():
+            tokens_per_expert = torch.tensor([16] * (8 // src_exp))
+            input_tensor = torch.randn(tokens_per_expert.sum(), 16, device="cuda")
+
+            # Save checkpoint A
+            model_A = initialize_expert_layer(1, use_glu, expert_type=src_module, fp8=True)
+            model_A = model_A.cuda()
+            # fp8 meta is initialized at the first step
+            model_A(input_tensor, tokens_per_expert)
+            sharded_state_dict = model_A.sharded_state_dict(sharded_offsets=get_pp_offsets())
+
+            save_strategy = get_default_save_sharded_strategy()
+            save(sharded_state_dict, ckpt_dir_A, save_strategy)
+            Utils.destroy_model_parallel()
+
+            Utils.initialize_model_parallel(dest_tp, dest_pp, expert_model_parallel_size=dest_exp)
+            load_strategy = None
+
+            # model_A load checkpoint A
+            model_A = initialize_expert_layer(1, use_glu, expert_type=src_module, fp8=True)
+            model_A = model_A.cuda()
+            state_dict = load(
+                model_A.sharded_state_dict(sharded_offsets=get_pp_offsets()),
+                ckpt_dir_A,
+                load_strategy,
+            )
+            model_A.load_state_dict(state_dict)
+
+            # model_B load checkpoint A
+            model_B = initialize_expert_layer(1, use_glu, expert_type=dst_module, fp8=True)
+            model_B = model_B.cuda()
+            state_dict = load(
+                model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()),
+                ckpt_dir_A,
+                load_strategy,
+            )
+            model_B.load_state_dict(state_dict)
+
+            # Should be bitwise equal
+            if src_module == "te_grouped":
+                model_A, model_B = model_B, model_A
+            torch.testing.assert_close(
+                torch.cat(
+                    [
+                        model_A.local_experts[i]
+                        .linear_fc1.fp8_meta["scaling_fwd"]
+                        .amax_history.view(-1, 1)
+                        for i in range(8 // dest_exp)
+                    ],
+                    dim=1,
+                ).view(1024, -1),
+                model_B.linear_fc1.fp8_meta["scaling_fwd"].amax_history,
+                rtol=0,
+                atol=0,
+            )
+
             Utils.destroy_model_parallel()

@@ -22,6 +22,13 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import torch
 from packaging.version import Version as PkgVersion
 
+try:
+    from torch.distributed._tensor import DTensor
+
+    HAVE_DTENSOR = True
+except ImportError:
+    HAVE_DTENSOR = False
+
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 
@@ -34,6 +41,23 @@ except:
     # This is a WAR for building docs, where torch is not actually imported
     _torch_version = PkgVersion("0.0.0")
 _te_version = None
+
+
+def get_torch_version():
+    """Get pytorch version from __version__; if not available use pip's. Use caching."""
+
+    def get_torch_version_str():
+        import torch
+
+        if hasattr(torch, '__version__'):
+            return str(torch.__version__)
+        else:
+            return version("torch")
+
+    global _torch_version
+    if _torch_version is None:
+        _torch_version = PkgVersion(get_torch_version_str())
+    return _torch_version
 
 
 def get_te_version():
@@ -368,21 +392,39 @@ def make_tp_sharded_tensor_for_checkpoint(
 
     Optionally, can provide offsets which prepend new dimensions to the tensor.
     """
-
     prepend_axis_num = len(prepend_offsets)
 
+    new_offsets = []
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    dp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+    tp_size = parallel_state.get_tensor_model_parallel_world_size()
+    dp_size = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
+    dp_replica_id = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+
+    new_offsets.append((tp_axis + prepend_axis_num, tp_rank, tp_size))
+
+    if HAVE_DTENSOR and isinstance(tensor, DTensor):
+        # TP + FSDP2 sharding
+        dp_replica_id = 0
+        tensor = tensor._local_tensor
+
+        if tp_axis == 0:
+            # both FSDP2 and TP shards axis 0
+            # default MCore uses tp-cp-ep-dp-pp
+            # FSDP2 is compatibile with TP, CP
+            new_offsets[0] = (prepend_axis_num, tp_rank * dp_size + dp_rank, tp_size * dp_size)
+        else:
+            # FSDP2 shards axis 0 and TP shards some other axis
+            new_offsets.append((prepend_axis_num, dp_rank, dp_size))
+
     if replica_id is None:
-        replica_id = (0, 0, parallel_state.get_data_parallel_rank(with_context_parallel=True))
+        replica_id = (0, 0, dp_replica_id)
 
     return ShardedTensor.from_rank_offsets(
         key,
         tensor,
         *prepend_offsets,
-        (
-            tp_axis + prepend_axis_num,
-            parallel_state.get_tensor_model_parallel_rank(),
-            parallel_state.get_tensor_model_parallel_world_size(),
-        ),
+        *new_offsets,
         replica_id=replica_id,
         prepend_axis_num=prepend_axis_num,
         **kwargs,
@@ -397,21 +439,46 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
 
     prepend_axis_num = len(prepend_offsets)
 
+    new_offsets = []
+    dp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+    dp_size = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
+    dp_replica_id = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+
+    if HAVE_DTENSOR and isinstance(tensor, DTensor):
+        # FSDP2 sharding
+        dp_replica_id = 0
+        tensor = tensor._local_tensor
+        new_offsets.append((prepend_axis_num, dp_rank, dp_size))
+
     if replica_id is None:
-        replica_id = (
-            0,
-            parallel_state.get_tensor_model_parallel_rank(),
-            parallel_state.get_data_parallel_rank(with_context_parallel=True),
-        )
+        replica_id = (0, parallel_state.get_tensor_model_parallel_rank(), dp_replica_id)
 
     return ShardedTensor.from_rank_offsets(
         key,
         tensor,
         *prepend_offsets,
+        *new_offsets,
         replica_id=replica_id,
         prepend_axis_num=prepend_axis_num,
         **kwargs,
     )
+
+
+def to_local_if_dtensor(tensor: Union[torch.Tensor, "DTensor"]) -> torch.Tensor:
+    """Returns the local shard of the given tensor if it is a DTensor."""
+    with torch.no_grad():
+        return tensor.to_local() if HAVE_DTENSOR and isinstance(tensor, DTensor) else tensor
+
+
+def get_data_parallel_group_if_dtensor(
+    tensor: Union[torch.Tensor, "DTensor"], data_parallel_group: "ProcessGroup" = None
+) -> Optional["ProcessGroup"]:
+    """Gets the data parallel group of the given tensor if it is a DTensor."""
+    if HAVE_DTENSOR and isinstance(tensor, DTensor):
+        current_group = tensor.device_mesh.get_group()
+        assert data_parallel_group is None or current_group == data_parallel_group
+        return current_group
+    return None
 
 
 def prepare_input_tensors_for_wgrad_compute(grad_output, all_gathered_input):

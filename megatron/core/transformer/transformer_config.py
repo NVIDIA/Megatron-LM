@@ -339,6 +339,9 @@ class TransformerConfig(ModelParallelConfig):
     config_logger_dir: str = ""
     """When non-empty, dumps entry-point configs to config_logger_dir"""
 
+    flash_decode: bool = False
+    """ Use the optimized flash decoding kernel during inference. """
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -540,8 +543,21 @@ class TransformerConfig(ModelParallelConfig):
                     f"but your version is {get_te_version()}."
                 )
 
-            if self.moe_grouped_gemm:
-                raise ValueError("Grouped GEMM of MoE not support fp8 for now.")
+            if self.moe_grouped_gemm and not is_te_min_version("1.11.0"):
+                raise ValueError(
+                    "Only transformer-engine>=1.11.0 supports FP8 grouped gemm, "
+                    f"but your version is {get_te_version()}."
+                )
+
+        if self.flash_decode and self.fp8:
+            raise ValueError("FP8 inference is currently not support with flash decoding.")
+
+        if self.moe_token_dispatcher_type in ['allgather', 'alltoall_seq']:
+            if self.variable_seq_lengths is True:
+                raise ValueError(
+                    f"Token dispatcher type: {self.moe_token_dispatcher_type} does not support "
+                    f"variable sequence length, please use alltoall dispatcher instead."
+                )
 
         if self.cp_comm_type is not None:
             if isinstance(self.cp_comm_type, list):

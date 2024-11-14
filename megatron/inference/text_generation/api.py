@@ -32,9 +32,9 @@ def generate_and_post_process(model,
                               stop_on_eol=False,
                               prevent_newline_after_colon=False,
                               random_seed=-1,
-                              return_logits=False,
                               detokenize_segments=True,
-                              data_parallel=False):
+                              data_parallel=False,
+                              return_topk_logprobs=0):
     """Run inference and post-process outputs, i.e., detokenize,
     move to cpu and convert to list.
 
@@ -45,7 +45,7 @@ def generate_and_post_process(model,
     """
 
     # Main inference.
-    tokens, lengths, output_log_probs, logits = generate(
+    tokens, lengths, output_log_probs, logprobs_topk = generate(
         model,
         forward_step=forward_step,
         prompts=prompts,
@@ -74,11 +74,10 @@ def generate_and_post_process(model,
             for i, (prob, seg) in enumerate(zip(output_log_probs, prompts_plus_generations_segments)):
                 output_log_probs[i] = prob[:len(seg)-1]
 
-        if return_logits:
-            assert(tokens_to_generate == 0)
-            assert(mpu.get_pipeline_model_parallel_world_size() == 1)
+        if return_topk_logprobs > 0:
+            assert tokens_to_generate == 0
             return prompts_plus_generations, prompts_plus_generations_segments, \
-            output_log_probs, tokens, logits
+            output_log_probs, tokens, logprobs_topk
         else:
             return prompts_plus_generations, prompts_plus_generations_segments, \
             output_log_probs, tokens

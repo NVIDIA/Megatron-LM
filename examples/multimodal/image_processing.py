@@ -7,13 +7,18 @@ from torchvision import transforms as T
 from torchvision.transforms import Compose, RandAugment, RandomResizedCrop, Resize, ToPILImage
 
 
-# Imagenet's mean and std.
-pixel_mean = [123.675, 116.28, 103.53]
-pixel_std = [58.395, 57.12, 57.375]
-
 # Reshape for broadcasting.
-pixel_mean = torch.Tensor(pixel_mean).view(-1, 1, 1)
-pixel_std = torch.Tensor(pixel_std).view(-1, 1, 1)
+pixel_mean_clip = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
+pixel_std_clip = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
+
+pixel_mean_siglip = torch.Tensor([127.5, 127.5, 127.5]).view(-1, 1, 1)
+pixel_std_siglip = torch.Tensor([127.5, 127.5, 127.5]).view(-1, 1, 1)
+
+pixel_statistics = {
+    "clip": (pixel_mean_clip, pixel_std_clip),
+    "siglip": (pixel_mean_siglip, pixel_std_siglip),
+    "internvit": (pixel_mean_clip, pixel_std_clip),
+}
 
 
 def convert_to_rgb(image):
@@ -36,16 +41,18 @@ def _transform_test(img_h, img_w):
     ])
 
 
-def standardize_image(img):
+def standardize_image(img, mean, std):
     """Standardize image pixel values."""
-    return (torch.Tensor(np.array(img)).permute(2, 0, 1) - pixel_mean) / pixel_std
+    return (torch.Tensor(np.array(img)).permute(2, 0, 1) - mean) / std
 
 
-def get_visual_transform(img, img_h, img_w, use_tiling=False, max_num_tiles=1, use_thumbnail=False, augment=False):
+def get_visual_transform(img, img_h, img_w, use_tiling=False, max_num_tiles=1, use_thumbnail=False, augment=False, vision_model_type="clip"):
+    pixel_mean, pixel_std = pixel_statistics[vision_model_type]
+
     if use_tiling:
         assert img_h == img_w, "dynamic tiling expects equal tile height and width"
         imgs = dynamic_preprocess(img, min_num=1, max_num=max_num_tiles, image_size=img_h, use_thumbnail=use_thumbnail)
-        imgs = [standardize_image(img.convert("RGB")) for img in imgs]
+        imgs = [standardize_image(img.convert("RGB"), pixel_mean, pixel_std) for img in imgs]
     else:
         img = np.array(img)
         original_h, original_w = img.shape[0], img.shape[1]
@@ -60,7 +67,7 @@ def get_visual_transform(img, img_h, img_w, use_tiling=False, max_num_tiles=1, u
         img = visual_transform(img)
 
         # Standardize pixel values.
-        img = standardize_image(img)
+        img = standardize_image(img, pixel_mean, pixel_std)
 
         # Pad to target image size.
         delta_h, delta_w = img_h - scaled_h, img_w - scaled_w

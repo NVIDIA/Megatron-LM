@@ -14,7 +14,9 @@ from megatron.training.tokenizer.multimodal_tokenizer import MultimodalTokenizer
 TOKENIZER_DIR = Path("~/data/tokenizers").expanduser()
 
 # Copied over from test_preprocess_data.py
-__LOCAL_GPT2_VOCAB = "/home/gitlab-runner/data/gpt3_data/gpt2-vocab.json"
+from tests.unit_tests.data.test_preprocess_data import __LOCAL_GPT2_VOCAB
+
+GPT2_VOCAB_SIZE = 32768
 
 
 def offsets_to_substrs(offsets, string):
@@ -119,14 +121,11 @@ def gpt2_tiktok_vocab(tmp_path_factory):
     )
 
 
-def specs():
-    if TOKENIZER_DIR.exists():
-        return local_test_specs()
-    return []
-
-
-@pytest.mark.parametrize("args", specs())
+@pytest.mark.parametrize("args", local_test_specs())
 def test_tokenizer(args):
+    if not TOKENIZER_DIR.exists():
+        pytest.skip("Skipping tokenizer tests because the tokenizer directory does not exist")
+
     tok = tokenizer.build_tokenizer(args)
     run_tokenizer_tests(tok)
 
@@ -236,7 +235,10 @@ class MockUnderlyingTokenizer:
 def test_multimodal_tokenizer():
     """Test MultimodalTokenizer."""
     underlying = MockUnderlyingTokenizer()
-    tokenizer = MultimodalTokenizer(underlying, "chatml", ["<image>"])
+    prompt_format = "chatml"
+    special_tokens = ["<image>"]
+    image_tag_type = ""
+    tokenizer = MultimodalTokenizer(underlying, prompt_format, special_tokens, image_tag_type)
 
     # Simple encode - decode roundtrip.
     assert (
@@ -263,3 +265,12 @@ def test_multimodal_tokenizer():
 
     # Try converting tokens to ids.
     assert tokenizer.convert_tokens_to_ids("a"), "failed to convert tokens to ids."
+
+    # Try image tags.
+    image_tag_type = "nvlm"
+    tokenizer = MultimodalTokenizer(underlying, prompt_format, special_tokens, image_tag_type)
+
+    assert tokenizer._apply_image_tag("<image>hello") == "<Image><image></Image>hello"
+    assert tokenizer._apply_image_tag([{"role": "user", "content": "<image>hello"}]) == [
+        {"role": "user", "content": "<Image><image></Image>hello"}
+    ]

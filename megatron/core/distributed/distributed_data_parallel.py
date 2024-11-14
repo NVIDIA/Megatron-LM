@@ -7,16 +7,16 @@ import torch
 
 from .. import parallel_state
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
-from ..transformer.module import MegatronModule
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import is_float8tensor, log_single_rank
+from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 
 logger = logging.getLogger(__name__)
 
 
-class DistributedDataParallel(MegatronModule):
+class DistributedDataParallel(_BaseDataParallel):
     """
     DDP wrapper which stores grads in contiguous buffers. Also has option of overlapping
     communication with backprop computation by breaking up full model's gradients into smaller
@@ -41,7 +41,7 @@ class DistributedDataParallel(MegatronModule):
         module: torch.nn.Module,
         disable_bucketing: bool = False,
     ):
-        super().__init__(config=config)
+        super().__init__(config=config, module=module)
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
@@ -298,12 +298,6 @@ class DistributedDataParallel(MegatronModule):
         # Force synchronize parameters.
         self.start_param_sync(force_sync=True)
 
-    def forward(self, *inputs, **kwargs):
-        """
-        Calls the wrapped module's forward() method.
-        """
-        return self.module(*inputs, **kwargs)
-
     def _make_forward_pre_hook(self):
         """
         Create a forward pre-hook to wait on all-gather handles when necessary (i.e.,
@@ -458,28 +452,3 @@ class DistributedDataParallel(MegatronModule):
                 src=torch.distributed.get_global_rank(data_parallel_group, 0),
                 group=data_parallel_group,
             )
-
-    def state_dict(self, prefix='', keep_vars=False):
-        """
-        Returns a dictionary containing references to the whole state of the
-        wrapped module.
-
-        Both parameters and persistent buffers (e.g. running averages) are included.
-        Keys are corresponding parameter and buffer names. Parameters and buffers
-        set to None are not included.
-        """
-        return self.module.state_dict(prefix=prefix, keep_vars=keep_vars)
-
-    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
-        """
-        Returns wrapped module's state_dict for checkpoint saving.
-        """
-        return self.module.state_dict_for_save_checkpoint(prefix=prefix, keep_vars=keep_vars)
-
-    def load_state_dict(self, state_dict, strict=True):
-        """
-        Copies parameters and buffers from state_dict into the wrapped module and its
-        descendants. If strict is True, then the keys of state_dict must exactly match
-        the keys returned by this module’s state_dict() function.
-        """
-        self.module.load_state_dict(state_dict, strict=strict)

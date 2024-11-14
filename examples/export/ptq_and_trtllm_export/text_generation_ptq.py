@@ -6,7 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../")))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
 import modelopt.torch.quantization as mtq
 import torch
@@ -120,6 +120,9 @@ if __name__ == "__main__":
 
     print_rank_0("WARNING: Forcing exit_on_missing_checkpoint to True for text generation.")
     args.exit_on_missing_checkpoint = True
+    if hasattr(args, 'moe_grouped_gemm') and args.moe_grouped_gemm == True:
+        print_rank_0("WARNING: Forcing moe_grouped_gemm to False for PTQ and export.")
+        args.moe_grouped_gemm = False
 
     # Set up model and load checkpoint
     # [ModelOpt]: make sure that output logits are allgathered.
@@ -168,7 +171,7 @@ if __name__ == "__main__":
                     model,
                     prompts=prompts,
                     tokens_to_generate=0,
-                    return_output_log_probs=True,
+                    return_output_log_probs=False,
                     temperature=1.0,
                 )
             else:
@@ -216,3 +219,4 @@ if __name__ == "__main__":
         )
 
         print_rank_0(f"TensorRT-LLM checkpoints saved to {args.export_dir}")
+        torch.distributed.barrier()

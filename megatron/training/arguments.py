@@ -9,6 +9,8 @@ import logging
 import os
 import torch
 import types
+import warnings
+from packaging.version import Version as PkgVersion
 
 import torch.nn.functional as F
 
@@ -39,6 +41,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_distributed_args(parser)
     parser = _add_validation_args(parser)
     parser = _add_data_args(parser)
+    parser = _add_tokenizer_args(parser)
     parser = _add_autoresume_args(parser)
     parser = _add_biencoder_args(parser)
     parser = _add_vision_args(parser)
@@ -213,9 +216,6 @@ def validate_args(args, defaults={}):
         args.pipeline_model_parallel_size -= args.encoder_pipeline_model_parallel_size
         assert args.pipeline_model_parallel_size > 0
 
-    if args.tp_comm_overlap:
-        assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
-
     # Deprecated arguments
     assert args.batch_size is None, '--batch-size argument is no longer ' \
         'valid, use --micro-batch-size instead'
@@ -303,6 +303,24 @@ def validate_args(args, defaults={}):
             'Must use --overlap-param-gather with --overlap-grad-reduce'
         assert not args.use_legacy_models, \
             '--overlap-param-gather only supported with MCore models'
+        
+    if getattr(args, "use_torch_fsdp2", False):
+        assert get_torch_version() >= PkgVersion("2.4"), \
+            'FSDP2 requires PyTorch >= 2.4.0 with FSDP 2 support.'
+        assert args.pipeline_model_parallel_size == 1, \
+            '--use-torch-fsdp2 is not supported with pipeline parallelism'
+        assert args.expert_model_parallel_size == 1, \
+            '--use-torch-fsdp2 is not supported with expert parallelism'
+        assert not args.use_distributed_optimizer, \
+            "--use-torch-fsdp2 is not supported with MCore's distributed optimizer"
+        assert not args.gradient_accumulation_fusion, \
+            '--use-torch-fsdp2 is not supported with gradient accumulation fusion'
+        assert args.ckpt_format == 'torch_dist', \
+            '--use-torch-fsdp2 requires --ckpt-format torch_dist'
+        assert args.untie_embeddings_and_output_weights, \
+            '--use-torch-fsdp2 requires --untie-embeddings-and-output-weights'
+        assert not args.fp16, \
+            '--use-torch-fsdp2 not supported with fp16 yet'
 
     if args.overlap_param_gather_with_optimizer_step:
         assert args.use_distributed_optimizer, \
@@ -499,12 +517,24 @@ def validate_args(args, defaults={}):
     # to avoid change in numerics when
     # sequence_parallelism is enabled.
     if args.tensor_model_parallel_size == 1:
+        if args.sequence_parallel:
+            warnings.warn("Disabling sequence parallelism because tensor model parallelism is disabled")
         args.sequence_parallel = False
+
+    if args.tp_comm_overlap:
+        assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
     if args.sequence_parallel:
         args.async_tensor_model_parallel_allreduce = False
+        if getattr(args, "use_torch_fsdp2", False):
+            warnings.warn(
+                "Using sequence parallelism with FSDP2 together. Try not to using them "
+                "together since they require different CUDA_MAX_CONNECTIONS settings "
+                "for best performance. sequence parallelism requires setting the "
+                "environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 while FSDP2 "
+                "requires not setting CUDA_DEVICE_MAX_CONNECTIONS=1 for better parallelization.")
 
     if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
         if args.sequence_parallel:
@@ -754,6 +784,8 @@ def _add_inference_args(parser):
                        choices=["megatron", "huggingface"],
                        help='Select either Megatron or Huggingface as the '
                        'Bert embedder.')
+    group.add_argument('--flash-decode', default=False, action="store_true",
+                       help='Whether to use the flash decoding kernel.')
 
     return parser
 
@@ -1140,6 +1172,10 @@ def _add_training_args(parser):
                        dest='use_pytorch_profiler')
     group.add_argument('--profile-ranks', nargs='+', type=int, default=[0],
                        help='Global ranks to profile.')
+    group.add_argument('--record-memory-history', action="store_true", default=False,
+                       help='Record memory history in last rank.')
+    group.add_argument('--memory-snapshot-path', type=str, default="snapshot.pickle",
+                       help='Specifies where to dump the memory history pickle.')
     group.add_argument('--tp-comm-overlap', action='store_true', help='Enables the '
                        ' overlap of Tensor parallel communication and GEMM kernels.')
     group.add_argument('--tp-comm-overlap-cfg', type=str, default=None,
@@ -1541,9 +1577,15 @@ def _add_distributed_args(parser):
                        '--tensor-model-parallel-size instead.')
     group.add_argument('--num-layers-per-virtual-pipeline-stage', type=int, default=None,
                        help='Number of layers per virtual pipeline stage')
+    group.add_argument('--microbatch-group-size-per-virtual-pipeline-stage', type=int, default=None,
+                       help='Number of contiguous microbatches per virtual pipeline stage',
+                       dest='microbatch_group_size_per_vp_stage')
     group.add_argument('--no-overlap-p2p-communication', action='store_false',
-                       help='overlap pipeline parallel communication with forward and backward chunks',
+                       help='overlap pipeline parallel communication with forward and backward chunks in 1F1B',
                        dest='overlap_p2p_comm')
+    group.add_argument('--overlap-p2p-communication-warmup-flush', action='store_true',
+                       default=False, help='if set, overlap pipeline parallel communication in warmup and flush',
+                       dest='overlap_p2p_comm_warmup_flush')
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')
@@ -1596,6 +1638,9 @@ def _add_distributed_args(parser):
                        'affects the encoder embedding.)')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
+    group.add_argument('--use-torch-fsdp2', action='store_true',
+                       help="Use the torch FSDP2 implementation. FSDP2 is not currently working with Pipeline Parallel."
+                       "It is still not in a stable release stage, and may therefore contain bugs or other potential issues.")
     group.add_argument('--context-parallel-size', type=int, default=1,
                        help='Degree of context parallelism.')
     group.add_argument('--nccl-communicator-config-path', type=str, default=None,
@@ -1624,6 +1669,41 @@ def _add_validation_args(parser):
                        default=False, help='If set, bypass the training loop, '
                        'optionally do evaluation for validation/test, and exit.')
 
+    return parser
+
+
+def _add_tokenizer_args(parser):
+    group = parser.add_argument_group(title='tokenizer')
+    group.add_argument('--vocab-size', type=int, default=None,
+                       help='Size of vocab before EOD or padding.')
+    group.add_argument('--vocab-file', type=str, default=None,
+                       help='Path to the vocab file.')
+    group.add_argument('--merge-file', type=str, default=None,
+                       help='Path to the BPE merge file.')
+    group.add_argument('--vocab-extra-ids', type=int, default=0,
+                       help='Number of additional vocabulary tokens. '
+                            'They are used for span masking in the T5 model')
+    group.add_argument('--tokenizer-type', type=str,
+                       default=None,
+                       choices=['BertWordPieceLowerCase',
+                                'BertWordPieceCase',
+                                'GPT2BPETokenizer',
+                                'SentencePieceTokenizer',
+                                'GPTSentencePieceTokenizer',
+                                'HuggingFaceTokenizer',
+                                'Llama2Tokenizer',
+                                'TikTokenizer',
+                                'MultimodalTokenizer',
+                                'NullTokenizer'],
+                       help='What type of tokenizer to use.')
+    group.add_argument('--tokenizer-model', type=str, default=None,
+                       help='Sentencepiece tokenizer model.')
+    group.add_argument('--tiktoken-pattern', type=str, default=None,
+                       help='Which tiktoken pattern to use. Options: [v1, v2]')
+    group.add_argument('--tiktoken-num-special-tokens', type=int, default=1000,
+                       help='Number of special tokens in tiktoken tokenizer')
+    group.add_argument('--tiktoken-special-tokens', type=str, nargs='+', default=None,
+                       help='List of tiktoken special tokens, needs to have ["<unk>", "<s>", "</s>"]')
     return parser
 
 
@@ -1665,15 +1745,6 @@ def _add_data_args(parser):
     group.add_argument('--mock-data', action='store_true',
                        help='Skip data loading and validation and opt for artificial '
                        'generation of mock data when an implementation is available.')
-    group.add_argument('--vocab-size', type=int, default=None,
-                       help='Size of vocab before EOD or padding.')
-    group.add_argument('--vocab-file', type=str, default=None,
-                       help='Path to the vocab file.')
-    group.add_argument('--merge-file', type=str, default=None,
-                       help='Path to the BPE merge file.')
-    group.add_argument('--vocab-extra-ids', type=int, default=0,
-                       help='Number of additional vocabulary tokens. '
-                            'They are used for span masking in the T5 model')
     group.add_argument('--seq-length', type=int, default=None,
                        help='Maximum sequence length to process.')
     group.add_argument('--encoder-seq-length', type=int, default=None,
@@ -1693,27 +1764,6 @@ def _add_data_args(parser):
                        help='Probability of producing a short sequence.')
     group.add_argument('--num-workers', type=int, default=2,
                        help="Dataloader number of workers.")
-    group.add_argument('--tokenizer-type', type=str,
-                       default=None,
-                       choices=['BertWordPieceLowerCase',
-                                'BertWordPieceCase',
-                                'GPT2BPETokenizer',
-                                'SentencePieceTokenizer',
-                                'GPTSentencePieceTokenizer',
-                                'HuggingFaceTokenizer',
-                                'Llama2Tokenizer',
-                                'TikTokenizer',
-                                'MultimodalTokenizer',
-                                'NullTokenizer'],
-                       help='What type of tokenizer to use.')
-    group.add_argument('--tokenizer-model', type=str, default=None,
-                       help='Sentencepiece tokenizer model.')
-    group.add_argument('--tiktoken-pattern', type=str, default=None,
-                       help='Which tiktoken pattern to use. Options: [v1, v2]')
-    group.add_argument('--tiktoken-num-special-tokens', type=int, default=1000,
-                       help='Number of special tokens in tiktoken tokenizer')
-    group.add_argument('--tiktoken-special-tokens', type=str, nargs='+', default=None,
-                       help='List of tiktoken special tokens, needs to have ["<unk>", "<s>", "</s>"]')
     group.add_argument('--reset-position-ids', action='store_true',
                        help='Reset posistion ids after end-of-document token.')
     group.add_argument('--reset-attention-mask', action='store_true',
@@ -1958,11 +2008,13 @@ def _add_experimental_args(parser):
                        help='Ratio of mlp layers to total layers, in the '
                        'range [0.0, 1.0].')
     group.add_argument('--hybrid-override-pattern', type=str, default=None,
-                       help='Force a specific hybrid layer pattern. If a value'
-                       'greater than 0.0 is supplied to any of the hybrid ratio'
-                       'arguments, then the number of each type of layer in the'
-                       'override pattern must match number in the overidden'
-                       'pattern')
+                       help='Force a specific hybrid layer pattern. The value'
+                       'should be a string of characters chosen from'
+                       'core.ssm.mamba_hybrid_layer_allocation.Symbols.'
+                       'If a value greater than 0.0 is supplied to any of the '
+                       'hybrid ratio arguments, then the number of each type'
+                       'of layer in the override pattern must match number in'
+                       'the overidden pattern')
     group.add_argument('--yaml-cfg', type=str, default=None,
                        help = 'Config file to add additional arguments')
     return parser
