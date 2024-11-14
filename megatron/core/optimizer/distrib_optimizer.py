@@ -544,10 +544,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         param_range_map = gbuf_range_map["param_map"][param]
         return param_range_map
 
-    def get_model_parallel_group(self) -> torch.distributed.ProcessGroup:
+    def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
         """
-        With the distributed optimizer, the model parallel group is the
-        entire world.
+        With the distributed optimizer, gradient statistics (num_zeros & norm) are reduced over
+        all ranks (versus only the model-parallel ranks with the non-distributed optimizer).
         """
         return None
 

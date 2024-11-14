@@ -2,7 +2,6 @@
 
 """Gradient clipping."""
 
-import os
 from typing import List, Optional, Union
 
 import torch
@@ -51,7 +50,7 @@ from ..transformer.module import param_is_not_shared
 def get_grad_norm_fp32(
     grads_for_norm: Union[List[torch.Tensor], torch.Tensor],
     norm_type: Union[int, float] = 2,
-    model_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    grad_stats_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> float:
     """Calculate the norm of gradients in fp32.
 
@@ -63,8 +62,9 @@ def get_grad_norm_fp32(
             Tensor that will be used for calculating the grad norm.
         norm_type (float or int): type of the used p-norm. Can be ``'inf'`` for
             infinity norm.
-        model_parallel_group (group): given the nature of the distributed
-            optimizer, this is passed as an argument.
+        grad_stats_parallel_group (group): Process group for reducing the grad norms. This is
+            generally the model-parallel group for non-distributed optimizers, and the entire
+            world for the distributed optimizer.
 
     Returns:
         Total norm of the parameters (viewed as a single vector).
@@ -83,7 +83,7 @@ def get_grad_norm_fp32(
         total_norm_cuda = torch.tensor([float(total_norm)], dtype=torch.float, device='cuda')
         # Take max across all model-parallel GPUs.
         torch.distributed.all_reduce(
-            total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=model_parallel_group
+            total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=grad_stats_parallel_group
         )
         total_norm = total_norm_cuda[0].item()
 
@@ -113,7 +113,7 @@ def get_grad_norm_fp32(
 
         # Sum across all model-parallel GPUs.
         torch.distributed.all_reduce(
-            total_norm, op=torch.distributed.ReduceOp.SUM, group=model_parallel_group
+            total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
         )
         total_norm = total_norm.item() ** (1.0 / norm_type)
 
@@ -153,7 +153,7 @@ def clip_grad_by_total_norm_fp32(
 
 def count_zeros_fp32(
     parameters: Union[List[torch.Tensor], torch.Tensor],
-    model_parallel_group: torch.distributed.ProcessGroup,
+    grad_stats_parallel_group: torch.distributed.ProcessGroup,
 ) -> float:
     """Counts the number of zeros in gradients associated with the passed-in list of
     parameters.
@@ -162,8 +162,9 @@ def count_zeros_fp32(
         parameters (Iterable[Tensor] or Tensor): an iterable of Tensors or a
             single Tensor that will have the number of zeros in its corresponding
             gradient counted.
-        model_parallel_group (torch.distributed.ProcessGroup, optional): model-parallel
-            group over which grad norm needs to be aggregated.
+        grad_stats_parallel_group (group): Process group for reducing the num_zeros count. This is
+            generally the model-parallel group for non-distributed optimizers, and the entire
+            world for the distributed optimizer.
     """
 
     if isinstance(parameters, torch.Tensor):
@@ -185,7 +186,7 @@ def count_zeros_fp32(
 
     # Sum across all model-parallel GPUs.
     torch.distributed.all_reduce(
-        total_num_zeros, op=torch.distributed.ReduceOp.SUM, group=model_parallel_group
+        total_num_zeros, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
     )
 
     total_num_zeros = total_num_zeros.item()
