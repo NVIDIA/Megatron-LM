@@ -209,11 +209,11 @@ def core_gpt_dataset_config_from_args(args):
         random_seed=args.seed,
         sequence_length=args.seq_length,
         blend=get_blend_from_list(args.data_path),
-        # blend_per_split=[
-        #     get_blend_from_list(args.train_data_path),
-        #     get_blend_from_list(args.valid_data_path),
-        #     get_blend_from_list(args.test_data_path),
-        # ],
+        blend_per_split=[
+            get_blend_from_list(args.train_data_path),
+            get_blend_from_list(args.valid_data_path),
+            get_blend_from_list(args.test_data_path),
+        ],
         split=args.split,
         num_dataset_builder_threads=args.num_dataset_builder_threads,
         path_to_cache=args.data_cache_path,

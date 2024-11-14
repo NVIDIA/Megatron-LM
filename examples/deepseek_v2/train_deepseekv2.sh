@@ -252,19 +252,6 @@ else
 fi
 
 sft_option="--train-mode pretrain"
-if [ ${MP_DATASET_TYPE} = "raw" ]; then
-    dataset_option=" \
-        --train-data-path ${DATASET_PATH} \
-        --valid-data-path ${VALID_DATASET_PATH} \
-        --dataloader-type cyclic \
-        --dataset LLama-SFT-Raw"
-else 
-    dataset_option=" \
-        --data-path ${DATASET_PATH} \
-        --split 99,1,0 \
-        --dataset LLama-Pretrain-Idxmap"
-fi
-
 
 NAME="${ENV}-finetune-mcore-deepseek-${MODEL_SIZE}-lr-${LR}-bs-${BATCH_SIZE}-seqlen-${SEQ_LEN}-pr-${PR}-tp-${TP}-pp-${PP}-ac-${AC}-do-${DO}-sp-${SP}"
 mkdir -p "${OUTPUT_BASEPATH}/tensorboard/"
@@ -324,7 +311,7 @@ megatron_options="  \
         --extra-vocab-size ${EXTRA_VOCAB_SIZE} \
         --patch-tokenizer-type DeepSeekV2Tokenizer \
         --tokenizer-type DeepSeekV2Tokenizer \
-        --dataset LLama-Pretrain-Raw \
+        --dataset LLama-Pretrain-Idxmap \
         --swiglu \
         --normalization RMSNorm \
         --norm-epsilon 1e-06 \
@@ -346,7 +333,7 @@ megatron_options="  \
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
 
 run_cmd="torchrun $DISTRIBUTED_ARGS /workspace/Megatron-LM/examples/deepseek_v2/pretrain_deepseek.py 
- ${megatron_options} ${dataset_option} ${pr_options} ${load_options} ${activation_checkpoint_options} \
+ ${megatron_options} ${pr_options} ${load_options} ${activation_checkpoint_options} \
  ${do_options} ${sp_options} ${moe_options} ${offload_option} ${sft_option} ${vp_options} ${flash_options}"
 
 run_cmd="$run_cmd | tee $TRAIN_LOG"
