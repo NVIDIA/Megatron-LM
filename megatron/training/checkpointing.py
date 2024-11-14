@@ -304,7 +304,7 @@ class CheckpointType(Enum):
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
-                    train_data_iterator=None, ft_client=None):
+                    train_data_iterator=None, ft_client=None, preprocess_common_state_dict_fn = None):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
     Checkpointing context is used to persist some checkpointing state
@@ -436,7 +436,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             logger.debug(f"rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt ")
             async_save_request = dist_checkpointing.save(state_dict, checkpoint_name, save_strategy,
                                                          async_sharded_save=args.async_save,
-                                                         validate_access_integrity=validate_sharding_integrity)
+                                                         validate_access_integrity=validate_sharding_integrity,
+                                                         preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn)
             # [ModelOpt]: save sharded modelopt_state
             if has_nvidia_modelopt:
                 save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))

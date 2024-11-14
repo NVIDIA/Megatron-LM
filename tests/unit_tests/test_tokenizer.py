@@ -235,7 +235,10 @@ class MockUnderlyingTokenizer:
 def test_multimodal_tokenizer():
     """Test MultimodalTokenizer."""
     underlying = MockUnderlyingTokenizer()
-    tokenizer = MultimodalTokenizer(underlying, "chatml", ["<image>"])
+    prompt_format = "chatml"
+    special_tokens = ["<image>"]
+    image_tag_type = ""
+    tokenizer = MultimodalTokenizer(underlying, prompt_format, special_tokens, image_tag_type)
 
     # Simple encode - decode roundtrip.
     assert (
@@ -262,3 +265,12 @@ def test_multimodal_tokenizer():
 
     # Try converting tokens to ids.
     assert tokenizer.convert_tokens_to_ids("a"), "failed to convert tokens to ids."
+
+    # Try image tags.
+    image_tag_type = "nvlm"
+    tokenizer = MultimodalTokenizer(underlying, prompt_format, special_tokens, image_tag_type)
+
+    assert tokenizer._apply_image_tag("<image>hello") == "<Image><image></Image>hello"
+    assert tokenizer._apply_image_tag([{"role": "user", "content": "<image>hello"}]) == [
+        {"role": "user", "content": "<Image><image></Image>hello"}
+    ]

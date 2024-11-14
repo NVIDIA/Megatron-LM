@@ -79,11 +79,22 @@ class TestSerialization:
             'sd_keyB': ShardedTensor.from_rank_offsets(
                 'keyB', torch.ones(3, 5, 7), (2, Utils.rank, Utils.world_size)
             ),
+            'lr': 0.01,
+            'rank': torch.distributed.get_rank(),
         }
+
+        def preprocess_fn(x):
+            del x['rank']
+            return x
 
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
         with TempNamedDir(tmp_path_dist_ckpt / 'test_multi_process_save', sync=True) as ckpt_dir:
-            save(state_dict, ckpt_dir)
+            save(
+                state_dict,
+                ckpt_dir,
+                validate_access_integrity=True,
+                preprocess_common_before_consistancy_check=preprocess_fn,
+            )
 
             saved_config = maybe_load_config(ckpt_dir)
             if saved_config.sharded_backend == 'zarr':
@@ -91,6 +102,42 @@ class TestSerialization:
                 assert (ckpt_dir / 'keyB').is_dir()
                 assert not (ckpt_dir / 'keyC').exists()
                 assert not (ckpt_dir / 'sd_keyA').is_dir()
+
+        Utils.destroy_model_parallel()
+
+    def test_multi_process_save_log_difference(self, tmp_path_dist_ckpt, caplog):
+        Utils.initialize_model_parallel(2, 4)
+
+        state_dict = {
+            'sd_keyA': ShardedTensor.from_rank_offsets(
+                'keyA', torch.ones(2, 4), (0, Utils.rank, Utils.world_size)
+            ),
+            'sd_keyB': ShardedTensor.from_rank_offsets(
+                'keyB', torch.ones(3, 5, 7), (2, Utils.rank, Utils.world_size)
+            ),
+            'rank': torch.distributed.get_rank(),
+        }
+
+        def preprocess_fn(x):
+            return x
+
+        with caplog.at_level(logging.WARNING):
+            # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
+            with TempNamedDir(
+                tmp_path_dist_ckpt / 'test_multi_process_save', sync=True
+            ) as ckpt_dir:
+                save(
+                    state_dict,
+                    ckpt_dir,
+                    validate_access_integrity=True,
+                    preprocess_common_before_consistancy_check=preprocess_fn,
+                )
+            # pylint: disable=line-too-long
+            if torch.distributed.get_rank() == 0:
+                assert (
+                    "There is difference in the common state dict in different ranks. The differences are {1: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 2: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 3: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 4: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 5: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 6: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 7: ([], [], [(('rank',), <class 'int'>, <class 'int'>)])}"
+                    in caplog.text
+                )
 
         Utils.destroy_model_parallel()
 

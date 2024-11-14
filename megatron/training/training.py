@@ -196,6 +196,17 @@ def get_start_time_from_progress_log():
         start_num_floating_point_operations
 
 
+def preprocess_common_state_dict(common_state_dict):
+    import copy
+    # Convert args key of type namespace to dictionary 
+    preprocessed_common_state_dict = copy.deepcopy(common_state_dict)
+    preprocessed_common_state_dict['args'] = vars(preprocessed_common_state_dict['args'])
+    # Remove rank and local rank from state dict if it exists, since they are expected to be different
+    preprocessed_common_state_dict['args'].pop('local_rank', None)
+    preprocessed_common_state_dict['args'].pop('rank', None)
+    return preprocessed_common_state_dict
+
+
 def pretrain(
     train_valid_test_dataset_provider,
     model_provider,
@@ -369,7 +380,7 @@ def pretrain(
                             num_floating_point_operations_so_far, checkpointing_context,
                             train_data_iterator=train_data_iterator,
                             ft_client=ft_integration.get_rank_monitor_client(
-                                ft_integration.StateMachineActions.SAVE_CHECKPOINT))
+                            ft_integration.StateMachineActions.SAVE_CHECKPOINT), preprocess_common_state_dict_fn=preprocess_common_state_dict)
 
         one_logger and one_logger.log_metrics({
             'app_train_loop_finish_time': one_logger_utils.get_timestamp_in_ms()
@@ -1095,7 +1106,7 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
                     num_floating_point_operations_so_far, checkpointing_context,
                     non_persistent_ckpt=non_persistent_ckpt, train_data_iterator=train_data_iterator,
                     ft_client=ft_integration.get_rank_monitor_client(
-                        ft_integration.StateMachineActions.SAVE_CHECKPOINT))
+                    ft_integration.StateMachineActions.SAVE_CHECKPOINT), preprocess_common_state_dict_fn=preprocess_common_state_dict)
     if args.use_distributed_optimizer and args.overlap_param_gather:
         enable_forward_pre_hook(model)
     timers(timer_key).stop(barrier=True)
