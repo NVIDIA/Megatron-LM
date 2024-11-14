@@ -109,19 +109,25 @@ def model_provider(
         vision_projection_config, language_config.hidden_size
     )
 
+    # --encoder-pipeline-model-parallel-size 1 will enable a separate pipeline stage for the vision model.
     if args.encoder_pipeline_model_parallel_size > 0:
         assert (
             args.encoder_pipeline_model_parallel_size == 1
         ), "vision model and projection can only live on 1 pipeline stage."
-        vision_config.pipeline_model_parallel_size = args.encoder_pipeline_model_parallel_size
-        vision_projection_config.pipeline_model_parallel_size = (
-            args.encoder_pipeline_model_parallel_size
-        )
+
         if args.encoder_tensor_model_parallel_size > 0:
             vision_config.tensor_model_parallel_size = args.encoder_tensor_model_parallel_size
             vision_projection_config.tensor_model_parallel_size = (
                 args.encoder_tensor_model_parallel_size
             )
+
+    # Make sure vision model pipeline parallel size is not inherited from the language model pipeline parallel size.
+    # 0 is not a valid for the config value, hence max(1, ).
+    vision_config.pipeline_model_parallel_size = max(1, args.encoder_pipeline_model_parallel_size)
+    vision_projection_config.pipeline_model_parallel_size = vision_config.pipeline_model_parallel_size
+
+    # Make sure the vision model does not inherit first and last pipeline num layers from the language model.
+    vision_config.first_pipeline_num_layers = vision_config.last_pipeline_num_layers = None
 
     vision_projection_layer_spec = get_mlp_module_spec(use_te=use_te).submodules
 

@@ -340,7 +340,11 @@ class VLMForwardStep(ForwardStep):
         )
 
     def __call__(self, tokens, position_ids, attention_mask):
-        logits = super().__call__(tokens, position_ids, attention_mask)
+        output = super().__call__(tokens, position_ids, attention_mask)
+        if isinstance(output, tuple):
+            logits = output[0]
+        else:
+            logits = output
 
         # On the first inference iteration, we compute image tokens.
         # Update the sequence length offset by the number of image tokens.
