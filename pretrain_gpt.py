@@ -166,7 +166,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
     local_num_tokens = loss[1].clone().detach().to(torch.int)
 
-    log_dict = {'lm loss': (loss[0], loss[1])}
+    log_dict = {'lm loss': (reporting_loss[0], reporting_loss[1])}
     if args.log_z_loss and (z_losses is not None):
         # ce_loss and z_loss are already detached in cross_entropy.py. No need to detach
         # them here like reporting_loss.
