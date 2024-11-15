@@ -107,6 +107,8 @@ products:
     - gpt3_mr_mcore_te_tp2_pp2_cp2_nondeterministic_dgx_a100_1N8G  # cp and attention
     - gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G  # cp and attention
     - gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G  # cp and attention    
+    - gpt3_mr_mcore_te_tp1_pp2_cp4_a2a_p2p_nondeterministic_dgx_a100_1N8G  # cp and attention with a2a+p2p comm type
+    - gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_cp4_a2a_p2p_nondeterministic_dgx_a100_1N8G  # cp and attention with a2a+p2p comm type 
   - environment: [lts, dev]
     scope: [nightly]
     platforms: [dgx_a100]
