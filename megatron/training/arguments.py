@@ -199,12 +199,14 @@ def validate_args(args, defaults={}):
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
               'context-parallel size: {}, '
+              'hierarchical context-parallel sizes: {}'
               'tensor-model-parallel size: {}, '
               'encoder-tensor-model-parallel size: {}, '
               'pipeline-model-parallel size: {}, '
               'encoder-pipeline-model-parallel size: {}'.format(
                   args.world_size, args.data_parallel_size,
                   args.context_parallel_size,
+                  args.hierarchical_context_parallel_sizes,
                   args.tensor_model_parallel_size,
                   args.encoder_tensor_model_parallel_size,
                   args.pipeline_model_parallel_size,
@@ -216,6 +218,13 @@ def validate_args(args, defaults={}):
         args.pipeline_model_parallel_size -= args.encoder_pipeline_model_parallel_size
         assert args.pipeline_model_parallel_size > 0
 
+    if args.hierarchical_context_parallel_sizes:
+        from numpy import prod
+        assert args.context_parallel_size == prod(args.hierarchical_context_parallel_sizes)
+    if "a2a+p2p" in args.cp_comm_type:
+        assert args.hierarchical_context_parallel_sizes is not None, \
+        "--hierarchical-context-parallel-sizes must be set when a2a+p2p is used in cp comm"
+        
     # Deprecated arguments
     assert args.batch_size is None, '--batch-size argument is no longer ' \
         'valid, use --micro-batch-size instead'
@@ -726,6 +735,9 @@ def core_transformer_config_from_args(args, config_class=None):
     else:
         kw_args['num_query_groups'] = None
     kw_args['config_logger_dir'] = args.config_logger_dir
+
+    if len(args.cp_comm_type) == 1:
+        kw_args['cp_comm_type'] = args.cp_comm_type[0]
 
     # Return config.
     return config_class(**kw_args)
@@ -1643,6 +1655,18 @@ def _add_distributed_args(parser):
                        "It is still not in a stable release stage, and may therefore contain bugs or other potential issues.")
     group.add_argument('--context-parallel-size', type=int, default=1,
                        help='Degree of context parallelism.')
+    group.add_argument('--cp-comm-type', nargs='+', type=str, default=["p2p"],
+                       help='Inter-gpu communication type for context parallelism: '
+                       'p2p, a2a, allgather or a2a+p2p. If a single string is provided, '
+                       'all layers will share the same communication type. Users can also '
+                       'specify separated types for each layer like '
+                       '--cp-comm-type p2p p2p a2a a2a a2a+p2p a2a+p2p')
+    group.add_argument('--hierarchical-context-parallel-sizes', nargs='+', type=int, default=None,
+                       help='Degrees of the hierarchical context parallelism. Users should '
+                       'provide a list to specify the sizes for different levels. '
+                       '--hierarchical-context-parallel-sizes 2 4 indicates every two adjacent gpus '
+                       'forms the first level of cp groups and the cp ranks with the same odevity '
+                       'forms the second level of cp groups.')
     group.add_argument('--nccl-communicator-config-path', type=str, default=None,
                        help='Path to the yaml file with NCCL communicator '
                        'configurations. The number of min/max thread groups and thread '

@@ -311,13 +311,16 @@ class TransformerConfig(ModelParallelConfig):
     """Inter-gpu communication type for context parallelism.
     str: all layers share same communication type.
     List[str]: each layer has its separate communication type.
-    cp_comm_type of each layer can be "p2p" or "all_gather" or "a2a".
+    cp_comm_type of each layer can be "p2p" or "all_gather" or "a2a" or "a2a+p2p".
     "p2p": Exchange KV chunks with P2P communications in ring topology. P2P is async and can be
     overlapped with attention compute.
     "all_gather": All-gather to get full sequence of KV before attention. The all-gather is not
     async, and cannot be overlapped.
     "a2a": Like DeepSpeed Ulysses, scatter attention heads across the CP group, and gather to get
     full sequence of QKV.
+    "a2a+p2p": A hierarchical implementation of context parallelism to attention. 
+    It uses A2A communications in low-level CP groups (e.g., via NVLink),
+    and P2P communications in high-level CP groups (e.g., via IBLink).
     """
 
     ####################
