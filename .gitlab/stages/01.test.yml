@@ -236,15 +236,17 @@ test:formatting:
     - git fetch origin $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
     - git fetch origin main:main
     - git checkout $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
-    - bash tools/autoformat.sh
-    - set -e
-    - git config --global user.email "mcore-bot@nvidia.com"
-    - git config --global user.name "Mcore Bot"
-    - git remote set-url origin "https://gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
-    - git add -A .
-    - >
-      git commit -m "chore: Format files" || true
-    - git push -u origin $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+    - |
+      if [[ "$CI_MERGE_REQUEST_PROJECT_PATH" == "$CI_MERGE_REQUEST_SOURCE_PROJECT_PATH" ]]; then 
+        bash tools/autoformat.sh
+        set -e
+        git config --global user.email "mcore-bot@nvidia.com"
+        git config --global user.name "Mcore Bot"
+        git remote set-url origin "https://gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
+        git add -A .
+        git commit -m "chore: Format files" || true
+        git push -u origin $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+      fi
     - env
     - BASE_REF="$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" CHECK_ONLY=true SKIP_DOCS=$([[ "$CI_MERGE_REQUEST_LABELS" == *"Skip docs"* ]] && echo "true" || echo "false") bash tools/autoformat.sh
 
