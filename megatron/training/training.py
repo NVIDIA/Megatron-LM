@@ -728,7 +728,8 @@ def setup_model_and_optimizer(model_provider_func,
         update_use_dist_ckpt(args)
 
         save_checkpoint(args.iteration, model, optimizer, opt_param_scheduler,
-                        args.num_floating_point_operations_so_far)
+                        args.num_floating_point_operations_so_far,
+                        preprocess_common_state_dict_fn=preprocess_common_state_dict)
 
         print_rank_0("> converted checkpoint: %s -> %s." % (load_ckpt_format, args.ckpt_format))
         torch.distributed.barrier()
