@@ -8,10 +8,11 @@ from torch import Tensor
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.enums import ModelType
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.transformer.enums import ModelType
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -177,7 +178,10 @@ class T5Model(LanguageModule):
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type=self.position_embedding_type,
             )
-            self.position_embeddings = self.embedding.position_embeddings
+            if position_embedding_type == "learned_absolute":
+                self.position_embeddings = self.embedding.position_embeddings
+            else:
+                self.position_embeddings = None
 
         # Rotary Position Embeddings
         if self.position_embedding_type == 'rope':
@@ -240,6 +244,7 @@ class T5Model(LanguageModule):
         encoder_hidden_states: Tensor = None,
         output_encoder_hidden_only: bool = False,
         inference_params: InferenceParams = None,
+        packed_seq_params: PackedSeqParams = None,
     ) -> Tensor:
         """Forward pass.
 
@@ -255,12 +260,6 @@ class T5Model(LanguageModule):
         Returns:
             Tensor: loss tensor
         """
-
-        (encoder_attn_mask, decoder_attn_mask, encoder_decoder_attn_mask) = (
-            t5_extended_attention_mask(
-                [encoder_attn_mask, decoder_attn_mask, encoder_decoder_attn_mask]
-            )
-        )
 
         ## Encoder forward
         if encoder_hidden_states is None:
@@ -281,7 +280,7 @@ class T5Model(LanguageModule):
             rotary_pos_emb = None
             if self.position_embedding_type == 'rope':
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                    inference_params, self.encoder, encoder_input, self.config
+                    inference_params, self.encoder, encoder_input, self.config, packed_seq_params
                 )
                 rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
@@ -316,7 +315,7 @@ class T5Model(LanguageModule):
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_params, self.decoder, decoder_input, self.config
+                inference_params, self.encoder, encoder_input, self.config, packed_seq_params
             )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
