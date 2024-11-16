@@ -201,7 +201,7 @@ def state_passing_fwd(states, dA_chunk_cumsum, initial_states=None, seq_idx=None
     out = torch.empty((batch, nchunks, nheads, dim), device=states.device, dtype=out_dtype)
     final_states = torch.empty((batch, nheads, dim), device=states.device, dtype=torch.float32)
     grid = lambda META: (triton.cdiv(dim, META['BLOCK_SIZE']), batch, nheads)
-    with torch.cuda.device(states.device.index):
+    with torch.device(states.device):
         _state_passing_fwd_kernel[grid](
             states, out, final_states, dA_chunk_cumsum, initial_states, seq_idx,
             dim, nchunks, seqlen if seq_idx is not None else 0, chunk_size if seq_idx is not None else 0,
@@ -249,7 +249,7 @@ def state_passing_bwd(
     ddA_chunk_cumsum = torch.empty(batch, nheads, nchunks, n_blocks,
                                    dtype=torch.float32, device=dA_chunk_cumsum.device)
     grid = lambda META: (triton.cdiv(dim, META['BLOCK_SIZE']), batch, nheads)
-    with torch.cuda.device(dout.device.index):
+    with torch.device(dout.device):
         _state_passing_bwd_kernel[grid](
             dout, states, dA_chunk_cumsum, dfinal_states, seq_idx,
             dstates, ddA_chunk_cumsum, dinitstates, states_converted,
