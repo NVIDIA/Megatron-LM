@@ -44,7 +44,9 @@ try:
         mamba_split_conv1d_scan_combined,
     )
 except (ModuleNotFoundError, ImportError):
-    raise ImportError("mamba-ssm is required by the Mamba model but cannot be imported")
+    from megatron.core.ssm.ops import RMSNormGated
+    from megatron.core.ssm.ops import  mamba_chunk_scan_combined
+    mamba_split_conv1d_scan_combined = None
 
 try:
     from einops import rearrange, repeat
@@ -290,7 +292,7 @@ class MambaMixer(MegatronModule):
         # transpose: l b pd --> b l pd
         xz = rearrange(xz, "l b d -> b l d").contiguous()
 
-        if self.use_mem_eff_path and inference_params is None:
+        if self.use_mem_eff_path and inference_params is None and mamba_split_conv1d_scan_combined is not None:
             assert ssm_state is None
 
             if self.conv1d.bias is not None:
