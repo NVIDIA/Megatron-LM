@@ -73,6 +73,20 @@ def get_language_model_config(config):
         config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
         config.ffn_hidden_size = 20480
+    elif config.language_model_type == "qwen2.0_72B":
+        config.activation_func = torch.nn.functional.silu
+        config.add_bias_linear = False
+        config.add_qkv_bias = True
+        config.bias_activation_fusion = False
+        config.gated_linear_unit = True
+        config.apply_query_key_layer_scaling = False
+        config.layernorm_zero_centered_gamma = (
+            False  # Zero centered gamma not supported for RMSNorm
+        )
+        config.bias_dropout_fusion = False
+        config.apply_rope_fusion = False
+        config.attention_softmax_in_fp32 = True
+        config.ffn_hidden_size = 29568
     else:
         raise ValueError(f"unknown language model type {config.language_model_type}")
 
@@ -146,7 +160,6 @@ def get_vision_model_config(config, apply_query_key_layer_scaling):
     else:
         raise ValueError(f"unknown vision model type {config.vision_model_type}")
 
-
     return config
 
 
@@ -169,6 +182,10 @@ def get_vision_projection_config(config, hidden_size):
         config.activation_func = torch.nn.functional.gelu
     elif config.language_model_type == "yi-34b":
         config.ffn_hidden_size = 20480
+        config.normalization = 'LayerNorm'
+        config.activation_func = torch.nn.functional.gelu
+    elif config.language_model_type == "qwen2.0_72B":
+        config.ffn_hidden_size = 29568
         config.normalization = 'LayerNorm'
         config.activation_func = torch.nn.functional.gelu
     else:
