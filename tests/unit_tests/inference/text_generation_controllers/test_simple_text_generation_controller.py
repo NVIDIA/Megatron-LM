@@ -29,7 +29,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
-class TestTextGenerationController:
+class TestSimpleTextGenerationController:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=2)

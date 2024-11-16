@@ -1,6 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import pytest
 import torch
 
@@ -9,6 +9,7 @@ from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.moe.test_token_dispatcher import MoEModelTestContainer
 
+xm = get_xla_model()
 
 class AuxlossTestContainer(MoEModelTestContainer):
     def partition_input(self, input):
@@ -57,7 +58,8 @@ class TestAuxLoss:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
+    @pytest.mark.internal
     @pytest.mark.parametrize(
         "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
     )
@@ -75,7 +77,8 @@ class TestAuxLoss:
         )
         container.aux_loss_test(self.input, self.baseline_grad)
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
+    @pytest.mark.internal
     @pytest.mark.parametrize(
         "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
     )

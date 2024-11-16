@@ -13,13 +13,10 @@ from pkg_resources import packaging
 from torch.utils.checkpoint import detach_variable
 
 from megatron.core.parallel_state import (
-    get_data_parallel_rank,
     get_expert_model_parallel_rank,
-    get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
 )
-from megatron.core.utils import  safely_set_viewless_tensor_data
+from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_data
 
 from .utils import gather_split_1d_tensor, split_tensor_into_1d_equal_chunks
 
@@ -29,11 +26,13 @@ _EXPERT_PARALLEL_RNG_TRACKER_NAME = 'expert-parallel-rng'
 _DATA_PARALLEL_RNG_TRACKER_NAME = 'data-parallel-rng'
 
 def get_expert_parallel_rng_tracker_name():
+    """Get the expert parallel rng tracker name"""
     global _EXPERT_PARALLEL_RNG_TRACKER_NAME
     return _EXPERT_PARALLEL_RNG_TRACKER_NAME
 
 
 def get_data_parallel_rng_tracker_name():
+    """Get the data parallel rng tracker name"""
     global _DATA_PARALLEL_RNG_TRACKER_NAME
     return _DATA_PARALLEL_RNG_TRACKER_NAME
 
@@ -51,6 +50,7 @@ class DeviceRNGStatesTracker:
         self.reset()
 
     def is_initialized(self):
+        """Checks if the internal RNG state has been set wirth set_states()."""
         return self._is_initialized
 
     def reset(self):
@@ -130,30 +130,31 @@ _DEVICE_RNG_STATE_TRACKER_INITIALIZED = False
 
 
 def initialize_rng_tracker(use_te_rng_tracker: bool = False):
+    """Create the RNG tracker. 'use_te_rng_tracker' determines whether to use
+    Megatron or TransformerEngine's implementation.
+    In particular, TransformerEngine's implementation is cudagraphable and supports FP8.
+    """
+
+
     global _DEVICE_RNG_STATE_TRACKER
     global _DEVICE_RNG_STATE_TRACKER_INITIALIZED
     if _DEVICE_RNG_STATE_TRACKER_INITIALIZED:
         return
 
-    if use_te_rng_tracker and get_xla_model():
+    if get_xla_model() and use_te_rng_tracker:
         import warnings
         warnings.warn("XLA model fall back: use_te_rng_tracker=False")
         use_te_rng_tracker = False
     
     if use_te_rng_tracker:
-        try:
-            import transformer_engine.pytorch as te
+        if not is_te_min_version("1.5.0"):
+            raise RuntimeError("use_te_rng_tracker requires TransformerEngine version >= 1.5")
+        from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
 
-            _te_version = packaging.version.Version(version("transformer-engine"))
-            if _te_version < packaging.version.Version("1.5.0"):
-                raise RuntimeError("use_te_rng_tracker requires TransformerEngine version >= 1.5")
-        except PackageNotFoundError:
-            raise RuntimeError("use_te_rng_tracker requires TransformerEngine, but not installed")
-        
-    if use_te_rng_tracker:
-        _DEVICE_RNG_STATE_TRACKER = te.distributed.DeviceRNGStatesTracker()
+        _DEVICE_RNG_STATE_TRACKER = TECudaRNGStatesTracker()
     else:
         _DEVICE_RNG_STATE_TRACKER = DeviceRNGStatesTracker()
+
     _DEVICE_RNG_STATE_TRACKER_INITIALIZED = True
 
 
@@ -171,8 +172,12 @@ def model_parallel_device_manual_seed(seed):
     after this function. Basically, this is replacement for that
     function.
     Two set of RNG states are tracked:
-    default state: This is for data parallelism and is the same among a set of model parallel GPUs but different across different model parallel groups. This is used for example for dropout in the non-tensor-model-parallel regions.
-    tensor-model-parallel state: This state is different among a set of model parallel GPUs, but the same across data parallel groups. This is used for example for dropout in model parallel regions.
+    default state: This is for data parallelism and is the same among a set of model parallel GPUs
+    but different across different model parallel groups. This is used for example for dropout
+    in the non-tensor-model-parallel regions.
+    tensor-model-parallel state: This state is different among a set of model parallel GPUs,
+    but the same across data parallel groups. This is used for example for dropout
+    in model parallel regions.
     """
     # 2718 is just for fun and any POSITIVE value will work.
     offset = seed + 2718

@@ -54,5 +54,5 @@ class TestParallelMLP:
         assert output.shape[2] == mlp.config.hidden_size
         assert output_bias.shape[0] == mlp.config.hidden_size
         assert output.dtype == torch.float32
-        assert output.device.type == 'cuda'
-        assert output_bias.device.type == 'cuda'
+        assert output.device.type == get_current_device_type()
+        assert output_bias.device.type == get_current_device_type()

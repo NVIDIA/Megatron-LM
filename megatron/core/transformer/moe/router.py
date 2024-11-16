@@ -79,7 +79,8 @@ class Router(ABC, MegatronModule):
             logits (torch.Tensor): Logits tensor.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Tuple of tensors representing max probs and the indices.
+            Tuple[torch.Tensor, torch.Tensor]: A tuple containing token assignment
+            probabilities and mapping.
         """
         raise NotImplementedError("Routing function not implemented.")
 
@@ -119,7 +120,8 @@ class TopKRouter(Router):
             logits (torch.Tensor): The logits tensor.
 
         Returns:
-            torch.Tensor: The logits tensor after applying sinkhorn routing.
+            Tuple[torch.Tensor, torch.Tensor]: A tuple containing token assignment
+            probabilities and mask.
         """
 
         def _sinkhorn_activation(logits):
@@ -137,11 +139,12 @@ class TopKRouter(Router):
                 )  # explicit fp32 conversion for stability
                 _, indices = torch.topk(norm_logits, k=self.topk, dim=1)
             logits = _sinkhorn_activation(logits)
-            scores = torch.gather(logits, 1, indices)
         else:
             logits = _sinkhorn_activation(logits)
-            scores, indices = torch.topk(logits, k=self.topk, dim=1)
-        return scores, indices
+            _, indices = torch.topk(logits, k=self.topk, dim=1)
+        map = torch.zeros_like(logits).int().scatter(1, indices, 1).bool()
+        scores = logits * map
+        return scores, map
 
     def aux_loss_load_balancing(self, logits: torch.Tensor):
         """Apply loss-based load balancing to the logits tensor.
@@ -150,23 +153,24 @@ class TopKRouter(Router):
             logits (torch.Tensor): the logits tensor after gating, shape: [num_tokens, num_experts].
 
         Returns:
-            probs (torch.Tensor): the probabilities tensor after load balancing.
-            indices (torch.Tensor): the indices tensor after top-k selection.
+            probs (torch.Tensor): The probabilities of token to experts assignment.
+            indices (torch.Tensor): The mask of token to experts assignment.
         """
-        probs, indices, tokens_per_expert = topk_softmax_with_capacity(
+        probs, routing_map, tokens_per_expert = topk_softmax_with_capacity(
             logits,
             self.topk,
             capacity_factor=self.config.moe_expert_capacity_factor,
             pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             drop_policy=self.config.moe_token_drop_policy,
             use_pre_softmax=self.config.moe_router_pre_softmax,
+            deterministic_mode=self.config.deterministic_mode,
         )
 
         if self.training:
             # Apply load balancing loss
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
             probs = self.apply_load_balancing_loss(scores, tokens_per_expert, activation=probs)
-        return probs, indices
+        return probs, routing_map
 
     def apply_load_balancing_loss(
         self,
@@ -177,8 +181,10 @@ class TopKRouter(Router):
         """Applies auxiliary loss to the MoE layer.
 
         Args:
-            probs (torch.Tensor): The probs output by the router for each token. [num_tokens, num_experts]
-            num_local_tokens_per_expert (torch.Tensor): The number of tokens per expert. [num_experts]
+            probs (torch.Tensor): The probs output by the router for each token.
+                [num_tokens, num_experts]
+            num_local_tokens_per_expert (torch.Tensor): The number of tokens per expert.
+                [num_experts]
             activation (torch.Tensor): The activation tensor to attach the gradient function to.
 
         Returns:
@@ -264,8 +270,9 @@ class TopKRouter(Router):
             logits (torch.Tensor): Logits tensor after gating.
 
         Returns:
-            probs (torch.Tensor): the probabilities tensor after load balancing.
-            indices (torch.Tensor): the indices tensor after top-k selection.
+            probs (torch.Tensor): The probabilities of token to experts assignment.
+            routing_map (torch.Tensor): The mapping of token to experts assignment,
+                with shape [num_tokens, num_experts].
         """
         logits = logits.view(-1, self.config.num_moe_experts)
 
@@ -277,23 +284,24 @@ class TopKRouter(Router):
             logits = gather_from_sequence_parallel_region(logits)
 
         if self.routing_type == "sinkhorn":
-            scores, indices = self.sinkhorn_load_balancing(logits)
+            scores, routing_map = self.sinkhorn_load_balancing(logits)
         elif self.routing_type == "aux_loss":
-            scores, indices = self.aux_loss_load_balancing(logits)
+            scores, routing_map = self.aux_loss_load_balancing(logits)
         elif self.routing_type == "none":
             # A naive top-k routing without load balancing
-            scores, indices, _ = topk_softmax_with_capacity(
+            scores, routing_map, _ = topk_softmax_with_capacity(
                 logits,
                 self.topk,
                 capacity_factor=self.config.moe_expert_capacity_factor,
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
                 drop_policy=self.config.moe_token_drop_policy,
                 use_pre_softmax=self.config.moe_router_pre_softmax,
+                deterministic_mode=self.config.deterministic_mode,
             )
         else:
             raise ValueError(f"Unsupported MoE routing type: {self.routing_type}")
 
-        return scores, indices
+        return scores, routing_map
 
     def forward(self, input: torch.Tensor):
         """
@@ -309,6 +317,6 @@ class TopKRouter(Router):
         logits = self.gating(input)
         logits = logits.view(-1, self.config.num_moe_experts)
 
-        scores, indices = self.routing(logits)
+        scores, routing_map = self.routing(logits)
 
-        return scores, indices
+        return scores, routing_map

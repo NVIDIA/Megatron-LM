@@ -6,16 +6,24 @@ from megatron.core.device_utils import get_distributed_init_method
 import torch
 
 from megatron.core.dist_checkpointing.strategies.base import deinit_async_calls, init_async_calls
-from megatron.core.dist_checkpointing.strategies.torch import deinit_shard_default_strategies, init_shard_default_strategies
 import megatron.core.parallel_state as ps
 
 
 class TestModel(torch.nn.Module):
-    def __init__(self, input_dim: int, output_dim: int, num_layers: int, bias: bool):
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        num_layers: int,
+        bias: bool,
+        shared_embedding: bool = False,
+    ):
         super().__init__()
         self.layers = torch.nn.ModuleList(
             [torch.nn.Linear(input_dim, output_dim, bias) for _ in range(num_layers)]
         )
+        if shared_embedding:
+            self.layers[-1].weight.shared_embedding = True
 
 
 class Utils:
@@ -61,7 +69,6 @@ class Utils:
             return
         torch.distributed.barrier()
         ps.destroy_model_parallel()
-        deinit_shard_default_strategies()
         deinit_async_calls()
         Utils.inited = False
 
@@ -80,7 +87,6 @@ class Utils:
             virtual_pipeline_model_parallel_size,
             **kwargs,
         )
-        init_shard_default_strategies(process_group=ps.get_default_process_group())
         init_async_calls(process_group=ps.get_default_process_group())
         get_current_device()
         Utils.inited = True

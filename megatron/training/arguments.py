@@ -17,11 +17,20 @@ from megatron.core.models.retro.utils import (
     get_config_path as get_retro_config_path,
     get_gpt_data_dir as get_retro_data_dir,
 )
-from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer import TransformerConfig, MLATransformerConfig
+from megatron.core.utils import get_torch_version, is_torch_min_version
 from megatron.training.activations import squared_relu
 from megatron.training.utils import update_use_dist_ckpt
 
-from megatron.core.distributed import HAVE_APEX_OR_TE
+try:
+    import transformer_engine # pylint: disable=unused-import
+    HAVE_APEX_OR_TE = True
+except ImportError:
+    try: 
+        import apex # pylint: disable=unused-import
+        HAVE_APEX_OR_TE = True
+    except ImportError:
+        HAVE_APEX_OR_TE = False
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""
@@ -39,10 +48,12 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_distributed_args(parser)
     parser = _add_validation_args(parser)
     parser = _add_data_args(parser)
+    parser = _add_tokenizer_args(parser)
     parser = _add_autoresume_args(parser)
     parser = _add_biencoder_args(parser)
     parser = _add_vision_args(parser)
     parser = _add_moe_args(parser)
+    parser = _add_mla_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_straggler_detector_args(parser)
     parser = _add_inference_args(parser)
@@ -162,6 +173,9 @@ def validate_args(args, defaults={}):
     # Load saved args from Retro (if applicable).
     load_retro_args(args)
 
+    # Set args.use_dist_ckpt from args.ckpt_format.
+    update_use_dist_ckpt(args)
+
     if args.encoder_tensor_model_parallel_size > 0:
         assert args.encoder_pipeline_model_parallel_size > 0, "encoder_pipeline_model_parallel_size must be defined."
         assert args.num_attention_heads % args.encoder_tensor_model_parallel_size == 0
@@ -208,7 +222,6 @@ def validate_args(args, defaults={}):
         args.encoder_pipeline_model_parallel_size = args.pipeline_model_parallel_split_rank
         args.pipeline_model_parallel_size -= args.encoder_pipeline_model_parallel_size
         assert args.pipeline_model_parallel_size > 0
-
 
     if args.tp_comm_overlap:
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
@@ -286,9 +299,12 @@ def validate_args(args, defaults={}):
         args.virtual_pipeline_model_parallel_size = None
         # Overlap P2P communication is disabled if not using the interleaved schedule.
         args.overlap_p2p_comm = False
-        if args.rank == 0:
-            print('WARNING: Setting args.overlap_p2p_comm to False since non-interleaved '
-                  'schedule does not support overlapping p2p communication')
+        args.align_param_gather = False
+        # Only print warning if PP size > 1.
+        if args.rank == 0 and args.pipeline_model_parallel_size > 1:
+            print('WARNING: Setting args.overlap_p2p_comm and args.align_param_gather to False '
+                  'since non-interleaved schedule does not support overlapping p2p communication '
+                  'and aligned param AG')
 
     if args.use_distributed_optimizer:
         assert HAVE_APEX_OR_TE, "--use-distributed-optimizer is only suported with Apex or TE"
@@ -296,9 +312,23 @@ def validate_args(args, defaults={}):
         assert args.use_distributed_optimizer and HAVE_APEX_OR_TE, \
             '--overlap-param-gather only supported with distributed optimizer with Apex or TE'
         assert args.overlap_grad_reduce, \
-            '--overlap-grad-reduce should be turned on when using --overlap-param-gather'
+            'Must use --overlap-param-gather with --overlap-grad-reduce'
         assert not args.use_legacy_models, \
             '--overlap-param-gather only supported with MCore models'
+
+    if args.overlap_param_gather_with_optimizer_step:
+        assert args.use_distributed_optimizer, \
+            '--overlap-param-gather-with-optimizer-step only supported with distributed optimizer'
+        assert args.overlap_param_gather, \
+            'Must use --overlap-param-gather-with-optimizer-step with --overlap-param-gather'
+        assert args.virtual_pipeline_model_parallel_size is not None, \
+            '--overlap-param-gather-with-optimizer-step only supported with interleaved pipeline parallelism'
+        assert not args.use_dist_ckpt, \
+            '--overlap-param-gather-with-optimizer-step not supported with distributed checkpointing yet'
+
+    if args.fp8_param_gather:
+        assert args.use_distributed_optimizer, \
+            '--fp8-param-gather only supported with distributed optimizer'
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -448,10 +478,8 @@ def validate_args(args, defaults={}):
         assert args.start_weight_decay is not None
         assert args.end_weight_decay is not None
 
-    TORCH_MAJOR = int(torch.__version__.split('.')[0])
-    TORCH_MINOR = int(torch.__version__.split('.')[1])
     # Persistent fused layer norm.
-    if TORCH_MAJOR < 1 or (TORCH_MAJOR == 1 and TORCH_MINOR < 11):
+    if not is_torch_min_version("1.11.0a0"):
         args.no_persist_layer_norm = True
         if args.rank == 0:
             print('Persistent fused layer norm kernel is supported from '
@@ -469,10 +497,10 @@ def validate_args(args, defaults={}):
         assert args.recompute_method is not None, \
             'for distributed recompute activations to work you '\
             'need to use a recompute method '
-        assert (TORCH_MAJOR, TORCH_MINOR) >= (1, 10), \
+        assert is_torch_min_version("1.10.0a0"), \
             'distributed recompute activations are supported for pytorch ' \
             'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
-            'pytorch version is v%s.%s.' % (TORCH_MAJOR, TORCH_MINOR)
+            f'pytorch version is v{get_torch_version()}.'
 
     if args.recompute_granularity == 'selective':
         assert args.recompute_method is None, \
@@ -519,9 +547,6 @@ def validate_args(args, defaults={}):
         assert args.pipeline_model_parallel_size == 1, \
             "retro currently does not support pipeline parallelism."
 
-    # Set args.use_dist_ckpt from args.ckpt_format.
-    update_use_dist_ckpt(args)
-
     if args.decoupled_lr is not None or args.decoupled_min_lr is not None:
         assert not args.use_legacy_models, \
             '--decoupled-lr and --decoupled-min-lr is not supported in legacy models.'
@@ -533,6 +558,8 @@ def validate_args(args, defaults={}):
         raise RuntimeError('--rotary-interleaved does not work with rope_fusion.')
     if args.rotary_interleaved and args.use_legacy_models:
         raise RuntimeError('--rotary-interleaved is not supported in legacy models.')
+    if args.position_embedding_type != 'rope':
+        args.apply_rope_fusion = False
 
     # Would just need to add 'NoPE' as a position_embedding_type to support this, but for now
     # don't allow it to keep things simple
@@ -606,6 +633,16 @@ def validate_args(args, defaults={}):
         print('--dist-ckpt-format is deprecated and has no effect.'
               ' Use --ckpt-format to select the checkpoint format.')
 
+    # MoE upcycling check
+    if args.moe_use_upcycling:
+        assert args.save is not None, "When using upcycling, the --save option must be specified."
+        if not args.no_load_optim:
+            args.no_load_optim = True
+            print('Warning: disabling --no-load-optim for upcycling.')
+        if not args.no_load_rng:
+            args.no_load_rng = True
+            print('Warning: disabling --no-load-rng for upcycling.')
+
     # Print arguments.
     _print_args("arguments", args)
 
@@ -632,9 +669,12 @@ def _check_arg_is_not_none(args, arg):
 
 
 def core_transformer_config_from_args(args, config_class=None):
-
+    
     # Config class.
     config_class = config_class or TransformerConfig
+
+    if args.multi_latent_attention:
+        config_class = MLATransformerConfig
 
     # Translate args to core transformer configuration
     kw_args = {}
@@ -649,6 +689,8 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
     kw_args['rotary_interleaved'] = args.rotary_interleaved
+    kw_args['first_pipeline_num_layers']= args.decoder_first_pipeline_num_layers
+    kw_args['last_pipeline_num_layers']= args.decoder_last_pipeline_num_layers
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
@@ -682,7 +724,7 @@ def _add_transformer_engine_args(parser):
                        help='Scaling margin for fp8',
                        dest='fp8_margin')
     group.add_argument('--fp8-interval', type=int, default=1,
-                       help='Scaling update interval for fp8',
+                       help='DEPRECATED. This flag is ignored. Scaling update interval for fp8',
                        dest='fp8_interval')
     group.add_argument('--fp8-amax-history-len', type=int, default=1,
                        help='Number of steps for which amax history is recorded per tensor',
@@ -697,6 +739,9 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--transformer-impl', default='transformer_engine',
                        choices=['local', 'transformer_engine'],
                        help='Which Transformer implementation to use.')
+    group.add_argument('--fp8-param-gather', action='store_true',
+                       help='Keep the compute param in fp8 (do not use any other intermediate '
+                            'dtype) and perform the param all-gather in fp8.')
 
     return parser
 
@@ -721,6 +766,8 @@ def _add_inference_args(parser):
                        choices=["megatron", "huggingface"],
                        help='Select either Megatron or Huggingface as the '
                        'Bert embedder.')
+    group.add_argument('--flash-decode', default=False, action="store_true",
+                       help='Whether to use the flash decoding kernel.')
 
     return parser
 
@@ -815,6 +862,8 @@ def _add_network_size_args(parser):
                           help='Use interleaved rotary embedding.')
     group.add_argument('--rotary-seq-len-interpolation-factor', type=int, default=None,
                        help='Sequence length interpolation factor for rotary embeddings.')
+    group.add_argument('--use-rope-scaling', action='store_true',
+                       help='Apply rope scaling as used in llama3.1')
     group.add_argument('--no-position-embedding',
                        action='store_false',
                        help='Disable position embedding. Deprecated: use --position-embedding-type',
@@ -849,7 +898,9 @@ def _add_network_size_args(parser):
                        help='Disable BERT binary head.',
                        dest='bert_binary_head')
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
-                       help='Untie embeddings and output weights.'),
+                       help='Untie embeddings and output weights.')
+    group.add_argument('--multi-latent-attention', action='store_true',
+                       help='Use multi-latent attention for model.')
     return parser
 
 
@@ -1038,7 +1089,7 @@ def _add_training_args(parser):
                        '                      <batch size incerement> '
                        '                      <ramp-up samples> '
                        'For example:'
-                       '   --rampup-batch-size 16 8 300000 \ '
+                       '   --rampup-batch-size 16 8 300000 \\ '
                        '   --global-batch-size 1024'
                        'will start with global batch size 16 and over '
                        ' (1024 - 16) / 8 = 126 intervals will increase'
@@ -1097,6 +1148,10 @@ def _add_training_args(parser):
                        help='Global step to start profiling.')
     group.add_argument('--profile-step-end', type=int, default=12,
                        help='Global step to stop profiling.')
+    group.add_argument('--use-pytorch-profiler', action='store_true',
+                       help='Use the built-in pytorch profiler. '
+                       'Useful if you wish to view profiles in tensorboard.',
+                       dest='use_pytorch_profiler')
     group.add_argument('--profile-ranks', nargs='+', type=int, default=[0],
                        help='Global ranks to profile.')
     group.add_argument('--tp-comm-overlap', action='store_true', help='Enables the '
@@ -1120,6 +1175,9 @@ def _add_training_args(parser):
     group.add_argument('--disable-tp-comm-bulk-wgrad', action='store_false',
                        help='Disables the Reduce-Scatter overlap with bprop weight gradient GEMM.',
                        dest='tp_comm_bulk_wgrad')
+    group.add_argument('--tp-comm-bootstrap-backend', default='nccl', type=str,
+                       choices=['nccl', 'mpi', 'gloo'],
+                       help='Set the bootstrapping backend of Tensor parallel communications.')
     group.add_argument('--use-cpu-initialization', action='store_true',
                        default=None,
                        help='If set, initialize weights on the CPU. This eliminates init differences based on tensor parallelism.')
@@ -1356,6 +1414,11 @@ def _add_checkpointing_args(parser):
                            'None - No non-persistent checkpointing (default option).')
     group.add_argument('--non-persistent-global-ckpt-dir', type=str, default=None,
                        help='Directory containing global non-persistent model checkpoints.')
+    group.add_argument('--non-persistent-local-ckpt-dir', type=str, default=None,
+                       help='Directory containing local non-persistent model checkpoints.')
+    group.add_argument('--non-persistent-local-ckpt-algo', type=str, default='fully_parallel',
+                       choices=['fully_parallel', 'atomic'],
+                       help='Algorithm for local non-persistent checkpointing.')
     group.add_argument('--finetune', action='store_true',
                        help='Load model for finetuning. Do not load optimizer '
                        'or rng state from checkpoint and set iteration to 0. '
@@ -1479,14 +1542,28 @@ def _add_distributed_args(parser):
                        type=int, default=None,
                        help=('Rank where encoder and decoder should be split. '
                              'Deprecated; use --encoder-pipeline-model-parallel-size instead.'))
+    group.add_argument('--decoder-first-pipeline-num-layers',
+                       type=int, default=None,
+                       help=('The number of transformer layers on the first pipeline stage of the decoder. '
+                       'Default None is even split of transformer layers across all pipeline stages'))
+    group.add_argument('--decoder-last-pipeline-num-layers',
+                       type=int, default=None,
+                       help=('The number of transformer layers on the last pipeline stage of the decoder. '
+                       'Default None is even split of transformer layers across all pipeline stages'))
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')
     group.add_argument('--num-layers-per-virtual-pipeline-stage', type=int, default=None,
                        help='Number of layers per virtual pipeline stage')
+    group.add_argument('--microbatch-group-size-per-virtual-pipeline-stage', type=int, default=None,
+                       help='Number of contiguous microbatches per virtual pipeline stage',
+                       dest='microbatch_group_size_per_vp_stage')
     group.add_argument('--no-overlap-p2p-communication', action='store_false',
-                       help='overlap pipeline parallel communication with forward and backward chunks',
+                       help='overlap pipeline parallel communication with forward and backward chunks in 1F1B',
                        dest='overlap_p2p_comm')
+    group.add_argument('--overlap-p2p-communication-warmup-flush', action='store_true',
+                       default=False, help='if set, overlap pipeline parallel communication in warmup and flush',
+                       dest='overlap_p2p_comm_warmup_flush')
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')
@@ -1501,17 +1578,22 @@ def _add_distributed_args(parser):
                        'weight gradient computation of vocabulary projection is deferred, defaults to 0 which'
                        'means all the micro-batches are deferred. Invalid if `defer-embedding-wgrad-compute`'
                        'is not set')
-    group.add_argument('--no-delay-grad-reduce', action='store_false',
-                       help='If not set, delay / synchronize grad reductions in all but first PP stage.',
-                       dest='delay_grad_reduce')
+    group.add_argument('--no-align-grad-reduce', action='store_false',
+                       help='If not set, all PP stages will launch gradient reduces simultaneously. '
+                       'Otherwise, each PP stage will independently launch as needed.',
+                       dest='align_grad_reduce')
     group.add_argument('--ddp-bucket-size', type=int, default=None,
                        help='Bucket size for data-parallel communication')
     group.add_argument('--ddp-average-in-collective', action='store_true',
                        default=False, help='If set, average directly in data-parallel communication collective.')
     group.add_argument('--overlap-param-gather', action='store_true',
                        default=False, help='If set, overlap param all-gather in distributed optimizer.')
-    group.add_argument('--delay-param-gather', action='store_true',
-                       default=False, help='If set, delay / synchronize param all-gathers in all but first PP stage.')
+    group.add_argument('--overlap-param-gather-with-optimizer-step', action='store_true',
+                       default=False, help='If set, overlap param all-gather of first bucket with optimizer step.')
+    group.add_argument('--no-align-param-gather', action='store_false',
+                       help='If not set, all PP stages will launch param all-gathers simultaneously. '
+                       'Otherwise, each PP stage will independently launch as needed.',
+                       dest='align_param_gather')
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
                        help='If not set, use scatter/gather to optimize communication of tensors in pipeline.',
                        dest='scatter_gather_tensors_in_pipeline')
@@ -1565,6 +1647,41 @@ def _add_validation_args(parser):
     return parser
 
 
+def _add_tokenizer_args(parser):
+    group = parser.add_argument_group(title='tokenizer')
+    group.add_argument('--vocab-size', type=int, default=None,
+                       help='Size of vocab before EOD or padding.')
+    group.add_argument('--vocab-file', type=str, default=None,
+                       help='Path to the vocab file.')
+    group.add_argument('--merge-file', type=str, default=None,
+                       help='Path to the BPE merge file.')
+    group.add_argument('--vocab-extra-ids', type=int, default=0,
+                       help='Number of additional vocabulary tokens. '
+                            'They are used for span masking in the T5 model')
+    group.add_argument('--tokenizer-type', type=str,
+                       default=None,
+                       choices=['BertWordPieceLowerCase',
+                                'BertWordPieceCase',
+                                'GPT2BPETokenizer',
+                                'SentencePieceTokenizer',
+                                'GPTSentencePieceTokenizer',
+                                'HuggingFaceTokenizer',
+                                'Llama2Tokenizer',
+                                'TikTokenizer',
+                                'MultimodalTokenizer',
+                                'NullTokenizer'],
+                       help='What type of tokenizer to use.')
+    group.add_argument('--tokenizer-model', type=str, default=None,
+                       help='Sentencepiece tokenizer model.')
+    group.add_argument('--tiktoken-pattern', type=str, default=None,
+                       help='Which tiktoken pattern to use. Options: [v1, v2]')
+    group.add_argument('--tiktoken-num-special-tokens', type=int, default=1000,
+                       help='Number of special tokens in tiktoken tokenizer')
+    group.add_argument('--tiktoken-special-tokens', type=str, nargs='+', default=None,
+                       help='List of tiktoken special tokens, needs to have ["<unk>", "<s>", "</s>"]')
+    return parser
+
+
 def _add_data_args(parser):
     group = parser.add_argument_group(title='data and dataloader')
 
@@ -1603,15 +1720,6 @@ def _add_data_args(parser):
     group.add_argument('--mock-data', action='store_true',
                        help='Skip data loading and validation and opt for artificial '
                        'generation of mock data when an implementation is available.')
-    group.add_argument('--vocab-size', type=int, default=None,
-                       help='Size of vocab before EOD or padding.')
-    group.add_argument('--vocab-file', type=str, default=None,
-                       help='Path to the vocab file.')
-    group.add_argument('--merge-file', type=str, default=None,
-                       help='Path to the BPE merge file.')
-    group.add_argument('--vocab-extra-ids', type=int, default=0,
-                       help='Number of additional vocabulary tokens. '
-                            'They are used for span masking in the T5 model')
     group.add_argument('--seq-length', type=int, default=None,
                        help='Maximum sequence length to process.')
     group.add_argument('--encoder-seq-length', type=int, default=None,
@@ -1631,26 +1739,6 @@ def _add_data_args(parser):
                        help='Probability of producing a short sequence.')
     group.add_argument('--num-workers', type=int, default=2,
                        help="Dataloader number of workers.")
-    group.add_argument('--tokenizer-type', type=str,
-                       default=None,
-                       choices=['BertWordPieceLowerCase',
-                                'BertWordPieceCase',
-                                'GPT2BPETokenizer',
-                                'SentencePieceTokenizer',
-                                'GPTSentencePieceTokenizer',
-                                'HuggingFaceTokenizer',
-                                'Llama2Tokenizer',
-                                'TikTokenizer',
-                                'NullTokenizer'],
-                       help='What type of tokenizer to use.')
-    group.add_argument('--tokenizer-model', type=str, default=None,
-                       help='Sentencepiece tokenizer model.')
-    group.add_argument('--tiktoken-pattern', type=str, default=None,
-                       help='Which tiktoken pattern to use. Options: [v1, v2]')
-    group.add_argument('--tiktoken-num-special-tokens', type=int, default=1000,
-                       help='Number of special tokens in tiktoken tokenizer')
-    group.add_argument('--tiktoken-special-tokens', type=str, nargs='+', default=None,
-                       help='List of tiktoken special tokens, needs to have ["<unk>", "<s>", "</s>"]')
     group.add_argument('--reset-position-ids', action='store_true',
                        help='Reset posistion ids after end-of-document token.')
     group.add_argument('--reset-attention-mask', action='store_true',
@@ -1814,6 +1902,14 @@ def _add_moe_args(parser):
                        help='Degree of expert model parallelism.')
     group.add_argument('--num-experts', type=int, default=None,
                        help='Number of Experts in MoE (None means no MoE)')
+    group.add_argument('--moe-shared-expert-intermediate-size', type=int, default=None,
+                       help='Shared expert total ffn hidden size. '
+                       'It should be equal to "num_shared_experts * ffn_size_of_each_shared_expert" if there are multiple shared experts. '
+                       'None means no shared expert.')
+    group.add_argument('--moe-shared-expert-overlap', action='store_true',
+                       help='Enable overlapping between shared expert computations and dispatcher communications. '
+                       'Without this, the shared epxerts execute after the routed experts. '
+                       'Only effective when moe-shared-expert-intermediate-size is set.')
     group.add_argument('--moe-router-load-balancing-type', type=str,
                        choices=['aux_loss', 'sinkhorn', 'none'],
                        default='aux_loss',
@@ -1847,6 +1943,26 @@ def _add_moe_args(parser):
                        help='Enable checkpointing for moe_layer, should be used when memory is not sufficient.')
     group.add_argument('--moe-extended-tp', action='store_true',
                        help='Alternative to expert parallelism, all experts are sharded across TPXEP domain.')
+    group.add_argument('--moe-use-upcycling', action='store_true',
+                       help='Load a checkpoint of a dense model, convert it into an MoE model, and save the converted model to the path specified by --save. '
+                       'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.')
+
+    return parser
+
+def _add_mla_args(parser):
+    group = parser.add_argument_group(title="mla")
+    group.add_argument('--q-lora-rank', type=int, default=None,
+                       help="Rank of Query tensor's low rank representation.")
+    group.add_argument('--kv-lora-rank', type=int, default=32,
+                       help="Rank of Key and Value tensors' low rank representation.")
+    group.add_argument('--qk-head-dim', type=int, default=128,
+                       help="Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim")
+    group.add_argument('--qk-pos-emb-head-dim', type=int, default=64,
+                       help="Dimension of the position embedding in the QK projection.")
+    group.add_argument('--v-head-dim', type=int, default=128,
+                       help="Dimension of the head in the V projection.")
+    group.add_argument('--rotary-scaling-factor', type=float, default=1.0,
+                       help="Rotary scaling factor for the rotary embeddings.")
 
     return parser
 
@@ -1867,11 +1983,13 @@ def _add_experimental_args(parser):
                        help='Ratio of mlp layers to total layers, in the '
                        'range [0.0, 1.0].')
     group.add_argument('--hybrid-override-pattern', type=str, default=None,
-                       help='Force a specific hybrid layer pattern. If a value'
-                       'greater than 0.0 is supplied to any of the hybrid ratio'
-                       'arguments, then the number of each type of layer in the'
-                       'override pattern must match number in the overidden'
-                       'pattern')
+                       help='Force a specific hybrid layer pattern. The value'
+                       'should be a string of characters chosen from'
+                       'core.ssm.mamba_hybrid_layer_allocation.Symbols.'
+                       'If a value greater than 0.0 is supplied to any of the '
+                       'hybrid ratio arguments, then the number of each type'
+                       'of layer in the override pattern must match number in'
+                       'the overidden pattern')
     group.add_argument('--yaml-cfg', type=str, default=None,
                        help = 'Config file to add additional arguments')
     return parser

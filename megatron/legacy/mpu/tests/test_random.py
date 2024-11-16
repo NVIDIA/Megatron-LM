@@ -1,15 +1,13 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+## Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
-import pytest
 from commons import print_separator
 from commons import initialize_distributed
-from megatron.core.device_utils import get_current_rng_state
 import mpu
 import torch
 import sys
 sys.path.append("../..")
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+
 def test_set_cuda_rng_state(tensor_model_parallel_size):
 
     if torch.distributed.get_rank() == 0:
@@ -25,7 +23,7 @@ def test_set_cuda_rng_state(tensor_model_parallel_size):
     tensor = torch.tensor(size, dtype=torch.float, device='cuda')
 
     # Get the state
-    rng_state = get_current_rng_state()
+    rng_state = torch.cuda.get_rng_state()
     rng_state_copy = rng_state.clone()
 
     # Do some stuff.
@@ -34,10 +32,10 @@ def test_set_cuda_rng_state(tensor_model_parallel_size):
     result_1 = tensor.clone()
 
     assert rng_state.sub(rng_state_copy).max() == 0
-    assert get_current_rng_state().sub(rng_state_copy).max() > 0
+    assert torch.cuda.get_rng_state().sub(rng_state_copy).max() > 0
 
     # State should be different.
-    new_rng_state = get_current_rng_state()
+    new_rng_state = torch.cuda.get_rng_state()
     max_diff = new_rng_state.sub(rng_state).max()
     print('   max diff in rng state (should be non-zero) on global rank {}: {}'.
           format(torch.distributed.get_rank(), max_diff))
@@ -71,7 +69,7 @@ def test_set_cuda_rng_state(tensor_model_parallel_size):
     if torch.distributed.get_rank() == 0:
         print('>> passed the test :-)')
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+
 def test_cuda_rng_tracker(tensor_model_parallel_size):
 
     if torch.distributed.get_rank() == 0:
@@ -142,7 +140,7 @@ def test_cuda_rng_tracker(tensor_model_parallel_size):
     if torch.distributed.get_rank() == 0:
         print('>> passed the test :-)')
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+
 def test_model_parallel_cuda_manual_seed(tensor_model_parallel_size):
 
     if torch.distributed.get_rank() == 0:

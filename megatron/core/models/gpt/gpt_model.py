@@ -1,11 +1,11 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from collections import OrderedDict
-from typing import Dict, Literal, Optional, Tuple, Union
+from typing import Dict, Literal, Optional
 
 from torch import Tensor
 
-from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core import InferenceParams, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.device_utils import get_xla_model
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
@@ -13,11 +13,10 @@ from megatron.core.models.common.embeddings.language_model_embedding import Lang
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.transformer.enums import AttnMaskType, ModelType
+from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
 
 xm = get_xla_model()
@@ -26,19 +25,37 @@ class GPTModel(LanguageModule):
     """GPT Transformer language model.
 
     Args:
-        config (TransformerConfig): Transformer config
-        transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers
-        vocab_size (int): Vocabulary size
-        max_sequence_length (int): maximum size of sequence. This is used for positional embedding
-        pre_process (bool, optional): Include embedding layer (used with pipeline parallelism). Defaults to True.
-        post_process (bool, optional): Include an output layer (used with pipeline parallelism). Defaults to True.
-        fp16_lm_cross_entropy (bool, optional): Defaults to False.
-        parallel_output (bool, optional): Do not gather the outputs, keep them split across tensor parallel ranks. Defaults to True.
-        share_embeddings_and_output_weights (bool, optional): When True, input embeddings and output logit weights are shared. Defaults to False.
-        position_embedding_type (Literal[learned_absolute,rope], optional):  Position embedding type.. Defaults to 'learned_absolute'.
-        rotary_percent (float, optional): Percent of rotary dimension to use for rotary position embeddings. Ignored unless position_embedding_type is 'rope'. Defaults to 1.0.
-        rotary_base (int, optional): Base period for rotary position embeddings. Ignored unless position_embedding_type is 'rope'. Defaults to 10000.
-        seq_len_interpolation_factor (Optional[float], optional): scale of linearly interpolating RoPE for longer sequences. The value must be a float larger than 1.0. Defaults to None.
+        config (TransformerConfig):
+            Transformer config
+        transformer_layer_spec (ModuleSpec):
+            Specifies module to use for transformer layers
+        vocab_size (int):
+            Vocabulary size
+        max_sequence_length (int):
+            maximum size of sequence. This is used for positional embedding
+        pre_process (bool, optional):
+            Include embedding layer (used with pipeline parallelism). Defaults to True.
+        post_process (bool, optional):
+            Include an output layer (used with pipeline parallelism). Defaults to True.
+        fp16_lm_cross_entropy (bool, optional):
+            Defaults to False.
+        parallel_output (bool, optional):
+            Do not gather the outputs, keep them split across tensor
+            parallel ranks. Defaults to True.
+        share_embeddings_and_output_weights (bool, optional):
+            When True, input embeddings and output logit weights are shared. Defaults to False.
+        position_embedding_type (Literal[learned_absolute,rope], optional):
+            Position embedding type.. Defaults to 'learned_absolute'.
+        rotary_percent (float, optional):
+            Percent of rotary dimension to use for rotary position embeddings.
+            Ignored unless position_embedding_type is 'rope'. Defaults to 1.0.
+        rotary_base (int, optional):
+            Base period for rotary position embeddings. Ignored unless
+            position_embedding_type is 'rope'.
+            Defaults to 10000.
+        seq_len_interpolation_factor (Optional[float], optional):
+            scale of linearly interpolating RoPE for longer sequences.
+            The value must be a float larger than 1.0. Defaults to None.
     """
 
     def __init__(
@@ -55,6 +72,7 @@ class GPTModel(LanguageModule):
         position_embedding_type: Literal['learned_absolute', 'rope', 'none'] = 'learned_absolute',
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
+        rope_scaling: bool = False,
         seq_len_interpolation_factor: Optional[float] = None,
     ) -> None:
         super().__init__(config=config)
@@ -76,9 +94,11 @@ class GPTModel(LanguageModule):
         # TODO: remove this dependency ?
         self.model_type = ModelType.encoder_or_decoder
 
-        # These 2 attributes are needed for TensorRT-LLM export.
+        # These 4 attributes are needed for TensorRT-LLM export.
         self.max_position_embeddings = max_sequence_length
         self.rotary_percent = rotary_percent
+        self.rotary_base = rotary_base
+        self.rotary_scaling = rope_scaling
 
         if self.pre_process:
             self.embedding = LanguageModelEmbedding(
@@ -88,13 +108,14 @@ class GPTModel(LanguageModule):
                 position_embedding_type=position_embedding_type,
             )
 
-        if self.position_embedding_type == 'rope':
+        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             self.rotary_pos_emb = RotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
                 rotary_interleaved=self.config.rotary_interleaved,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
+                rope_scaling=rope_scaling,
                 use_cpu_initialization=self.config.use_cpu_initialization,
             )
 
@@ -114,8 +135,9 @@ class GPTModel(LanguageModule):
                 # all the micro-batches of a global batch for the last pipeline stage. Once we are
                 # done with all the back props for all the microbatches for the last pipeline stage,
                 # it will be in the pipeline flush stage. During this pipeline flush we use the
-                # input activations stored in embedding activation buffer and gradient outputs stored
-                # in gradient buffer to calculate the weight gradients for the embedding final linear layer.
+                # input activations stored in embedding activation buffer and gradient outputs
+                # stored in gradient buffer to calculate the weight gradients for the embedding
+                # final linear layer.
                 self.embedding_activation_buffer = []
                 self.grad_output_buffer = []
             else:
@@ -170,12 +192,17 @@ class GPTModel(LanguageModule):
         inference_params: InferenceParams = None,
         packed_seq_params: PackedSeqParams = None,
         extra_block_kwargs: dict = None,
+        runtime_gather_output: Optional[bool] = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoeder and finally into the post
         processing layer (optional).
 
         It either returns the Loss values if labels are given  or the final hidden units
+
+        Args:
+            runtime_gather_output (bool): Gather output at runtime. Default None means
+                `parallel_output` arg in the constructor will be used.
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -192,11 +219,23 @@ class GPTModel(LanguageModule):
 
         # Rotary positional embeddings (embedding is None for PP intermediate devices)
         rotary_pos_emb = None
-        if self.position_embedding_type == 'rope':
-            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_params, self.decoder, decoder_input, self.config
-            )
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+        rotary_pos_cos = None
+        rotary_pos_sin = None
+        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+            if not self.training and self.config.flash_decode:
+                # Flash decoding uses precomputed cos and sin for RoPE
+                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cos_sin(
+                    inference_params.max_sequence_length
+                )
+            else:
+                rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                    inference_params, self.decoder, decoder_input, self.config, packed_seq_params
+                )
+                rotary_pos_emb = self.rotary_pos_emb(
+                    rotary_seq_len,
+                    packed_seq=packed_seq_params is not None
+                    and packed_seq_params.qkv_format == 'thd',
+                )
 
         # Run decoder.
         hidden_states = self.decoder(
@@ -204,6 +243,8 @@ class GPTModel(LanguageModule):
             attention_mask=attention_mask,
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
             packed_seq_params=packed_seq_params,
             **(extra_block_kwargs or {}),
         )
@@ -215,7 +256,9 @@ class GPTModel(LanguageModule):
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
-        logits, _ = self.output_layer(hidden_states, weight=output_weight)
+        logits, _ = self.output_layer(
+            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+        )
 
         if has_config_logger_enabled(self.config):
             payload = OrderedDict(
@@ -240,7 +283,8 @@ class GPTModel(LanguageModule):
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[Dict] = None
     ) -> ShardedStateDict:
-        """Sharded state dict implementation for GPTModel backward-compatibility (removing extra state).
+        """Sharded state dict implementation for GPTModel backward-compatibility
+        (removing extra state).
 
         Args:
             prefix (str): Module name prefix.
@@ -253,8 +297,8 @@ class GPTModel(LanguageModule):
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
         output_layer_extra_state_key = f'{prefix}output_layer._extra_state'
 
-        # Old GPT checkpoints only stored the output layer weight key. So we remove the _extra_state key
-        # but check that it doesn't contain any data anyway
+        # Old GPT checkpoints only stored the output layer weight key. So we remove the
+        # _extra_state key but check that it doesn't contain any data anyway
         output_extra_state = sharded_state_dict.pop(output_layer_extra_state_key, None)
         assert not (
             output_extra_state and output_extra_state.data

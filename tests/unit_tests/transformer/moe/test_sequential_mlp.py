@@ -1,15 +1,24 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+from importlib.metadata import version
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_current_device_type, get_xla_model
 import pytest
 import torch
 
+from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
+from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.moe.experts import SequentialMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
+xm = get_xla_model()
 
 class TestParallelSequentialMLP:
 
@@ -40,14 +49,16 @@ class TestParallelSequentialMLP:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     def test_constructor(self):
         assert isinstance(self.sequential_mlp, MoELayer)
 
         num_weights = sum([p.numel() for p in self.sequential_mlp.parameters()])
         assert num_weights == 3696
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_gpu_forward(self):
+    @pytest.mark.internal
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
+    def test_device_forward(self):
         sequential_mlp = self.sequential_mlp
         sequential_mlp.to(device=get_current_device())
         # [sequence length, batch size, hidden size]
@@ -59,5 +70,143 @@ class TestParallelSequentialMLP:
         assert output.shape[2] == sequential_mlp.config.hidden_size
         assert output_bias.shape[2] == sequential_mlp.config.hidden_size
         assert output.dtype == torch.float32
-        assert output.device.type == 'cuda'
-        assert output_bias.device.type == 'cuda'
+        assert output.device.type == get_current_device_type()
+        assert output_bias.device.type == get_current_device_type()
+
+
+class TestTEParallelSequentialMLP:
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2, expert_model_parallel_size=2)
+        model_parallel_device_manual_seed(123)
+        num_moe_experts = 4
+        self.transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=num_moe_experts,
+            use_cpu_initialization=False,
+            activation_func=torch.nn.functional.silu,
+            gated_linear_unit=True,
+            bias_activation_fusion=False,
+            moe_router_load_balancing_type="sinkhorn",
+            moe_router_topk=1,
+            params_dtype=torch.bfloat16,
+            expert_model_parallel_size=2,
+            tensor_model_parallel_size=2,
+            sequence_parallel=True,
+        )
+
+        self.local_mlp_spec = MLPSubmodules(
+            linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear
+        )
+        self.te_mlp_spec = MLPSubmodules(
+            linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear
+        )
+        print("Done intializing")
+
+        self.num_local_experts = 2
+        model_parallel_device_manual_seed(123)
+        self.local_sequential_mlp = SequentialMLP(
+            self.num_local_experts, self.transformer_config, self.local_mlp_spec
+        )
+
+        model_parallel_device_manual_seed(123)
+        self.te_sequential_mlp = SequentialMLP(
+            self.num_local_experts, self.transformer_config, self.te_mlp_spec
+        )
+
+    @pytest.mark.skipif(
+        not is_te_min_version("1.7.0"),
+        reason="Transformer Engine under v1.7.0 doesn't support MoE training.",
+    )
+    @pytest.mark.internal
+    def test_constructor(self):
+        for i in range(self.num_local_experts):
+            assert torch.equal(
+                self.local_sequential_mlp.local_experts[i].linear_fc1.weight,
+                self.te_sequential_mlp.local_experts[i].linear_fc1.weight,
+            )
+            assert torch.equal(
+                self.local_sequential_mlp.local_experts[i].linear_fc2.weight,
+                self.te_sequential_mlp.local_experts[i].linear_fc2.weight,
+            )
+
+    @pytest.mark.skipif(
+        not is_te_min_version("1.7.0"),
+        reason="Transformer Engine under v1.7.0 doesn't support MoE training.",
+    )
+    @pytest.mark.internal
+    def test_gpu_forward(self):
+        self.local_sequential_mlp.to(device=get_current_device())
+        self.te_sequential_mlp.to(device=get_current_device())
+        seq_len = 4
+        batch_size = 2
+
+        tokens_per_expert = torch.tensor([2, 2], device=get_current_device())
+        hidden_states = torch.rand(
+            (seq_len, batch_size, self.local_sequential_mlp.config.hidden_size),
+            dtype=torch.bfloat16,
+            device=get_current_device(),
+        )
+
+        output_local, _ = self.local_sequential_mlp(hidden_states, tokens_per_expert)
+        output_te, _ = self.te_sequential_mlp(hidden_states, tokens_per_expert)
+        assert torch.equal(output_local, output_te)
+
+    @pytest.mark.skipif(
+        not is_te_min_version("1.7.0"),
+        reason="Transformer Engine under v1.7.0 doesn't support MoE training.",
+    )
+    @pytest.mark.internal
+    def test_gpu_forward_with_one_local_expert(self):
+        model_parallel_device_manual_seed(123)
+        local_sequential_mlp = SequentialMLP(1, self.transformer_config, self.local_mlp_spec)
+        model_parallel_device_manual_seed(123)
+        te_sequential_mlp = SequentialMLP(1, self.transformer_config, self.te_mlp_spec)
+        seq_len = 4
+        batch_size = 2
+
+        tokens_per_expert = torch.tensor([4], device=get_current_device())
+        hidden_states = torch.rand(
+            (seq_len, batch_size, self.local_sequential_mlp.config.hidden_size),
+            dtype=torch.bfloat16,
+            device=get_current_device(),
+        )
+
+        output_local, _ = local_sequential_mlp(hidden_states, tokens_per_expert)
+        output_te, _ = te_sequential_mlp(hidden_states, tokens_per_expert)
+        assert torch.equal(output_local, output_te)
+
+    @pytest.mark.skipif(
+        not is_te_min_version("1.7.0"),
+        reason="Transformer Engine under v1.7.0 doesn't support MoE training.",
+    )
+    @pytest.mark.internal
+    def test_gpu_forward_with_no_tokens_allocated(self):
+        self.local_sequential_mlp.to(device=get_current_device())
+        self.te_sequential_mlp.to(device=get_current_device())
+        seq_len = 4
+        batch_size = 2
+
+        tokens_per_expert = torch.tensor([0, 4], device=get_current_device())
+        hidden_states = torch.rand(
+            (seq_len, batch_size, self.local_sequential_mlp.config.hidden_size),
+            dtype=torch.bfloat16,
+            device=get_current_device(),
+        )
+        output_local, _ = self.local_sequential_mlp(hidden_states, tokens_per_expert)
+        output_te, _ = self.te_sequential_mlp(hidden_states, tokens_per_expert)
+        assert torch.equal(output_local, output_te)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+
+if __name__ == "__main__":
+    MLP_test = TestTEParallelSequentialMLP()
+    MLP_test.setup_method(method=None)
+    MLP_test.test_constructor()
+    MLP_test.test_gpu_forward()
+    MLP_test.test_gpu_forward_with_one_local_expert()
+    MLP_test.test_gpu_forward_with_no_tokens_allocated()
+    MLP_test.teardown_method(method=None)

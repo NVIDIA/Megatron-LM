@@ -7,7 +7,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import get_linear_layer
 
 try:
-    import apex
+    import apex  # pylint: disable=unused-import
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 
@@ -17,10 +17,9 @@ except ImportError:
     import warnings
 
     from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
-    if torch.cuda.is_available():
-        warnings.warn('Apex is not installed. Falling back to Torch LayerNorm')
-    LNImpl = WrappedTorchLayerNorm
 
+    warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
+    LNImpl = WrappedTorchLayerNorm
 
 class BertLMHead(MegatronModule):
     """Masked LM head for Bert.

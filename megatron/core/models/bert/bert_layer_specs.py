@@ -11,7 +11,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
 try:
-    from megatron.core.transformer.custom_layers.transformer_engine import (
+    from megatron.core.extensions.transformer_engine import (
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
         TERowParallelLinear,
@@ -25,7 +25,7 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    import apex
+    import apex  # pylint: disable=unused-import
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 
@@ -36,8 +36,7 @@ except ImportError:
 
     from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
 
-    if torch.cuda.is_available():
-        warnings.warn('Apex is not installed. Falling back to Torch LayerNorm')
+    warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
     LNImpl = WrappedTorchLayerNorm
 
 # Use this spec to use lower level Transformer Engine modules (required for fp8 training)

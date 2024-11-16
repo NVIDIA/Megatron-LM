@@ -1,6 +1,7 @@
 import random
 import os
 import math
+from megatron.core.device_utils import set_manual_seed
 import mmcv
 import torch
 import numpy as np
@@ -90,7 +91,7 @@ class RandomSeedSegmentationDataset(Dataset):
         seed = idx + self.curr_seed
         img, mask = self.dataset[idx]
 
-        torch.manual_seed(seed)
+        set_manual_seed(seed)
         random.seed(seed)
         np.random.seed(seed)
         img, mask = self.joint_transform(img, mask)

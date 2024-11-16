@@ -27,7 +27,7 @@ from megatron.core.transformer.transformer_block import (
 )
 
 try:
-    import apex
+    import apex  # pylint: disable=unused-import
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 
@@ -37,16 +37,16 @@ except ImportError:
     import warnings
 
     from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
-    if torch.cuda.is_available():
-        warnings.warn('Apex is not installed. Falling back to Torch LayerNorm')
+
+    warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
     LNImpl = WrappedTorchLayerNorm
 
 try:
-    from megatron.core.transformer.custom_layers.transformer_engine import (
+    from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TEDotProductAttention,
-        TENorm,
         TERowParallelLinear,
+        TENorm
     )
 
     HAVE_TE = True
@@ -70,7 +70,8 @@ def get_retro_decoder_layer_te_spec(
     provided for the first Retro decoder layer.
 
     Args:
-        encoder_block_spec (ModuleSpec): Retro encoder block spec, to be provided for the first Retro decoder layer.
+        encoder_block_spec (ModuleSpec): Retro encoder block spec, to be provided for
+            the first Retro decoder layer.
 
     Returns:
         A module spec with Transformer Engine modules.
@@ -107,7 +108,8 @@ def get_retro_decoder_layer_local_spec(
     provided for the first Retro decoder layer.
 
     Args:
-        encoder_block_spec (ModuleSpec): Retro encoder block spec, to be provided for the first Retro decoder layer.
+        encoder_block_spec (ModuleSpec): Retro encoder block spec, to be provided
+            for the first Retro decoder layer.
 
     Returns:
         A module spec with local modules.
@@ -134,9 +136,12 @@ def get_retro_decoder_block_spec(
     """Retro decoder block spec.
 
     Retro decoder block implementation details:
-    - The retro decoder block consists of interleaved GPT layers and customized Retro decoder layers.
-    - The Retro decoder layers are spaced three layers apart, and start on layer 6 or 9 (depending on the total number of layers).
-    - The first decoder layer instantiates an encoder block, and it therefore passes in an encoder_block_spec.
+    - The retro decoder block consists of interleaved GPT layers
+        and customized Retro decoder layers.
+    - The Retro decoder layers are spaced three layers apart,
+        and start on layer 6 or 9 (depending on the total number of layers).
+    - The first decoder layer instantiates an encoder block,
+        and it therefore passes in an encoder_block_spec.
 
     Args:
         config (RetroConfig): Retro config.

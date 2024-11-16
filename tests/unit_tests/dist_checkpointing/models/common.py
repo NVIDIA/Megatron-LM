@@ -31,7 +31,8 @@ def common_test_simple_sharded_state_dict_save_load(
     gpt_model = initialize_model_fn(
         1, src_layer_spec_fn, tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp
     )
-    with TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model') as ckpt_dir:
+    with TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model', 
+                      process_group=parallel_state.get_default_process_group()) as ckpt_dir:
         # Save
         sharded_state_dict = gpt_model.sharded_state_dict()
         save(sharded_state_dict, ckpt_dir, process_group=parallel_state.get_default_process_group())
@@ -46,8 +47,8 @@ def common_test_simple_sharded_state_dict_save_load(
             process_group=parallel_state.get_default_process_group()
         )
         # Potential mismatch is because of extra states which is ok
-        assert all('_extra_state' in k for k in missing_keys)
-        assert all('_extra_state' in k for k in unexpected_keys)
+        assert all('_extra_state' in k for k in missing_keys), f"missing_keys: {missing_keys}"
+        assert all('_extra_state' in k for k in unexpected_keys), f"unexpected_keys: {unexpected_keys}"
         gpt_model.load_state_dict(state_dict)
     Utils.destroy_model_parallel()
 
@@ -62,15 +63,17 @@ def common_test_parallel_reconfiguration_e2e(
     use_fpsl,
     load_order="tp-dp-pp",
     store_order="tp-dp-pp",
+    src_tp_pp_kwargs=None,
+    dst_tp_pp_kwargs=None,
 ):
     """Test model saving and loading with different TP/PP"""
+    Utils.initialize_model_parallel(*src_tp_pp, **(src_tp_pp_kwargs or {}), order=load_order)
     with TempNamedDir(
         tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_A'
     ) as ckpt_dir_A, TempNamedDir(
         tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_B'
     ) as ckpt_dir_B:
         # Save checkpoint A
-        Utils.initialize_model_parallel(*src_tp_pp, order=load_order)
         gpt_model_A = initialize_model_fn(
             1,
             src_layer_spec_fn,
@@ -94,7 +97,7 @@ def common_test_parallel_reconfiguration_e2e(
 
         # Load checkpoint A with different TP/PP and save as checkpoint B
         # No FPS this time, only FPL
-        Utils.initialize_model_parallel(*dest_tp_pp, order=store_order)
+        Utils.initialize_model_parallel(*dest_tp_pp, **(dst_tp_pp_kwargs or {}), order=store_order)
         gpt_model_B = initialize_model_fn(
             2,
             dst_layer_spec_fn,

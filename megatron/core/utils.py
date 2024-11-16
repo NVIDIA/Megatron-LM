@@ -16,11 +16,13 @@ import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from functools import reduce
+from importlib.metadata import version
 from types import TracebackType
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
+from packaging.version import Version as PkgVersion
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
@@ -28,6 +30,59 @@ from megatron.core.dist_checkpointing.mapping import ShardedTensor
 logger = logging.getLogger(__name__)
 
 xm = get_xla_model()
+
+try:
+    _torch_version = PkgVersion(torch.__version__)
+except:
+    # This is a WAR for building docs, where torch is not actually imported
+    _torch_version = PkgVersion("0.0.0")
+_te_version = None
+
+
+def get_te_version():
+    """Get TE version from __version__; if not available use pip's. Use caching."""
+
+    def get_te_version_str():
+        import transformer_engine as te
+
+        if hasattr(te, '__version__'):
+            return str(te.__version__)
+        else:
+            return version("transformer-engine")
+
+    global _te_version
+    if _te_version is None:
+        try:
+            _te_version = PkgVersion(get_te_version_str())
+        except ImportError:
+            _te_version = None
+    return _te_version
+
+
+def is_te_min_version(version, check_equality=True):
+    """Check if minimum version of `transformer-engine` is installed."""
+    te_version = get_te_version()
+    if te_version:
+        if check_equality:
+            return te_version >= PkgVersion(version)
+        return te_version > PkgVersion(version)
+    else:
+        return False
+
+
+def get_torch_version():
+    """Get torch version from __version__."""
+
+    global _torch_version
+    return _torch_version
+
+
+def is_torch_min_version(version, check_equality=True):
+    """Check if minimum version of `torch` is installed."""
+    if check_equality:
+        return get_torch_version() >= PkgVersion(version)
+    return get_torch_version() > PkgVersion(version)
+
 
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
@@ -70,10 +125,12 @@ def get_attr_wrapped_model(model, attr, allow_none=True, return_model_obj=False)
 
 
 def get_model_type(model):
+    """Returns model_type attribute"""
     return get_attr_wrapped_model(model, 'model_type')
 
 
 def get_model_xattn(model):
+    """Returns whether the model has the xattn_needed attribute"""
     try:
         return get_attr_wrapped_model(model, 'xattn_needed')
     except RuntimeError:
@@ -81,6 +138,7 @@ def get_model_xattn(model):
 
 
 def get_model_config(model):
+    """Returns the config attribute, allowed to return None"""
     return get_attr_wrapped_model(model, 'config', allow_none=False)
 
 
@@ -93,6 +151,9 @@ class GlobalMemoryBuffer:
         self.buffer = {}
 
     def get_tensor(self, tensor_shape, dtype, name):
+        """
+        Returns (potentially) a sub-tensor from the self.buffer for the given shape.
+        """
         required_len = reduce(operator.mul, tensor_shape, 1)
         if (
             self.buffer.get((name, dtype), None) is None
@@ -106,28 +167,28 @@ class GlobalMemoryBuffer:
 
 
 def _kernel_make_viewless_tensor(inp, requires_grad):
-    '''Make a viewless tensor.
+    """Make a viewless tensor.
 
     View tensors have the undesirable side-affect of retaining a reference
     to the originally-viewed tensor, even after manually setting the '.data'
     field. This method creates a new tensor that links to the old tensor's
     data, without linking the viewed tensor, referenced via the '._base'
     field.
-    '''
+    """
     out = torch.empty((1,), dtype=inp.dtype, device=inp.device, requires_grad=requires_grad)
     out.data = inp.data
     return out
 
 
 class MakeViewlessTensor(torch.autograd.Function):
-    '''
+    """
     Autograd function to make a viewless tensor.
 
     This function should be used in cases where the computation graph needs
     to be propagated, but we only want a viewless tensor (e.g.,
     ParallelTransformer's hidden_states). Call this function by passing
     'keep_graph = True' to 'make_viewless_tensor()'.
-    '''
+    """
 
     @staticmethod
     def forward(ctx, inp, requires_grad):
@@ -137,18 +198,19 @@ class MakeViewlessTensor(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """No-op"""
         return grad_output, None
 
 
 def make_viewless_tensor(inp, requires_grad, keep_graph):
-    '''
+    """
     Entry-point for creating viewless tensors.
 
     This method should be used, rather than calling 'MakeViewlessTensor'
     or '_kernel_make_viewless_tensor' directly. This method acts as a
     switch for determining if an autograd function or a regular method
     should be used to create the tensor.
-    '''
+    """
 
     # return tensor as-is, if not a 'view'
     if inp._base is None:
@@ -162,8 +224,8 @@ def make_viewless_tensor(inp, requires_grad, keep_graph):
 
 
 def assert_viewless_tensor(tensor, extra_msg=None):
-    '''Assert that a tensor is not a view (i.e., its '._base' field is
-    not set).'''
+    """Assert that a tensor is not a view (i.e., its '._base' field is
+    not set)."""
     if isinstance(tensor, list):
         [assert_viewless_tensor(t) for t in tensor]
         return tensor
@@ -172,17 +234,17 @@ def assert_viewless_tensor(tensor, extra_msg=None):
     assert tensor._base is None, (
         "Ensure tensor._base is None before setting tensor.data or storing "
         "tensor to memory buffer. Otherwise, a memory leak will occur (and "
-        "likely accumulate over iterations). %s"
-    ) % extra_msg
+        f"likely accumulate over iterations). {extra_msg}"
+    )
     return tensor
 
 
 def safely_set_viewless_tensor_data(tensor, new_data_tensor):
-    '''Safely set tensor's '.data' field.
+    """Safely set tensor's '.data' field.
 
     Check first that the tensor is viewless (i.e., '._base' not set). If not,
     raise an exception.
-    '''
+    """
     assert_viewless_tensor(
         tensor,
         extra_msg="FYI, tensor._base has shape %s, and new_data_tensor has shape %s."
@@ -248,10 +310,11 @@ def log_on_each_pipeline_stage(logger: logging.Logger, *args: Any, **kwargs: Any
         logger.log(*args, **kwargs)
 
 
-def check_param_hashes_across_dp_replicas(model: List[torch.nn.Module]) -> bool:
+def check_param_hashes_across_dp_replicas(
+    model: List[torch.nn.Module], cross_check: bool = False
+) -> bool:
     """Computes hashes of all parameters in model, all-gathers hashes across DP replicas,
-    and then checks for equality between the locally-computed hashes and the hashes
-    from DP replica 0.
+    and then checks for equality between the locally-computed hashes and those of other ranks.
 
     NOTE: This function computes SHA-1 hashes on the CPU and thus needs to move all param
     tensors from GPU to CPU first; as a result, this function is not intended to be called
@@ -260,10 +323,11 @@ def check_param_hashes_across_dp_replicas(model: List[torch.nn.Module]) -> bool:
     Args:
         model (List[torch.nn.Module]): List of model chunks whose parameter hashes need to
             be checked.
+        cross_check (bool): If true, will check whether hashes match across all DP replicas.
 
     Returns:
-        True if all param hashes match with corresponding hash on DP replica 0, False
-        otherwise.
+        True if all param hashes match with corresponding hash on DP replica 0 or
+        across all replicas if cross_check is enabled, False otherwise.
     """
 
     # Compute per-parameter hashes on this rank.
@@ -297,15 +361,21 @@ def check_param_hashes_across_dp_replicas(model: List[torch.nn.Module]) -> bool:
             if not torch.equal(local_param_hashes[i], all_param_hashes[0][i]):
                 rank = torch.distributed.get_rank()
                 logger.info(
-                    f"[Rank {rank}] Hash not matching for {param_name} in model chunk {model_chunk_id}"
+                    f"[Rank {rank}] Hash not matching for {param_name} in model chunk"
+                    f"{model_chunk_id}"
                 )
-    return param_hashes_match
+    if cross_check:
+        # Make sure all ranks have the same hash.
+        return all(map(lambda x: torch.equal(local_param_hashes, x), all_param_hashes))
+    else:
+        return param_hashes_match
 
 
 def make_tp_sharded_tensor_for_checkpoint(
     tensor, key, tp_axis=0, replica_id=None, prepend_offsets=(), **kwargs
 ):
-    """Helper for instantiating a ShardedTensor where the `tp_axis` dimension is sharded across TP group.
+    """Helper for instantiating a ShardedTensor where the `tp_axis` dimension
+    is sharded across TP group.
 
     Optionally, can provide offsets which prepend new dimensions to the tensor.
     """
@@ -356,7 +426,7 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
 
 
 def prepare_input_tensors_for_wgrad_compute(grad_output, all_gathered_input):
-
+    """Ensure grad_output is stored in a contiguous buffer."""
     # Doing gather + slicing during the NeMo forward pass can make this tensor
     # not be contiguous. PyTorch only checks if the tensor is contiguous, and only
     # clones it if it's not contiguous:
@@ -374,10 +444,18 @@ def prepare_input_tensors_for_wgrad_compute(grad_output, all_gathered_input):
     return grad_output, all_gathered_input
 
 
-def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_output_buffer, weight):
-    """Helper for performing embedding wgrad GEMM's during the pipeline drain phase, pipelines the AllGather and GEMM's.
+if is_torch_min_version("1.13.0"):
+    dist_all_gather_func = torch.distributed.all_gather_into_tensor
+else:
+    dist_all_gather_func = torch.distributed._all_gather_base
 
-    Should only be used when pipeline model parallelism and gradient accumulation fusion are enabled.
+
+def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_output_buffer, weight):
+    """Helper for performing embedding wgrad GEMM's during the pipeline drain phase, pipelines the
+    AllGather and GEMM's.
+
+    Should only be used when pipeline model parallelism and gradient accumulation
+    fusion are enabled.
     """
 
     assert len(embedding_activation_buffer) == len(
@@ -415,7 +493,7 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
             all_gather_buffer = xm.all_gather(input, groups=parallel_state.get_tensor_model_parallel_groups())
         else:
             all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu_0")
-            handle = torch.distributed.all_gather_into_tensor(
+            handle = dist_all_gather_func(
                 all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=False
             )
 
@@ -457,7 +535,7 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
                 all_gather_buffer = xm.all_gather(input, groups=parallel_state.get_tensor_model_parallel_groups())
             else:
                 all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, name)
-                handle = torch.distributed.all_gather_into_tensor(
+                handle = dist_all_gather_func(
                     all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
                 )
 
@@ -480,24 +558,30 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
 
 
 def local_multi_tensor_applier(op, noop_flag_buffer, tensor_lists, *args):
+    """Multi tensor op applier"""
     return op(2048 * 32, noop_flag_buffer, tensor_lists, *args)
 
 
-## computes l2 norm for a list of contiguous tensors
-## works as a drop-in replacement for amp_C.multi_tensor_l2norm
+# computes l2 norm for a list of contiguous tensors
+# works as a drop-in replacement for amp_C.multi_tensor_l2norm
 def local_multi_tensor_l2_norm(chunk_size, noop_flag, tensor_lists, per_tensor, *args):
+    """
+    Computes l2 norm for a list of contiguous tensors
+    works as a drop-in replacement for amp_C.multi_tensor_l2norm
+    """
     l2 = [[(torch.norm(tensor)) for tensor in tensor_list] for tensor_list in tensor_lists]
     l2_reduced = torch.norm(torch.tensor(l2))
     l2_cuda = torch.tensor([float(l2_reduced)], dtype=torch.float, device=get_current_device())
     return l2_cuda, None
 
 
-## works as a drop-in replacement for amp_C.multi_tensor_scale
+# works as a drop-in replacement for amp_C.multi_tensor_scale
 def local_multi_tensor_scale(chunk_size, noop_flag, tensor_lists, scale):
+    """Works as a drop-in replacement for amp_C.multi_tensor_scale."""
     inputs, targets = tensor_lists[0], tensor_lists[1]
     if inputs == targets:
         for i in range(len(targets)):
-            ## for parity with apex implementation
+            # for parity with apex implementation
             targets[i] *= scale
     else:
         for i in range(len(targets)):
@@ -723,7 +807,7 @@ class StragglerDetector:
             amp (float, optional): Set to 3.0 if we only use timers in fwd pass.
                                    Defaults to 3.0.
             port (int, optional): Control port, useful only for rank-0. Defaults to 65535.
-            prefill (int, optional): Howmany Events to pre-populate. Defaults to 1024.
+            prefill (int, optional): How many Events to pre-populate. Defaults to 1024.
             enabled (bool, optional): Whether or not collection is enabled on startup.
                                       Defaults to False.
         """
@@ -756,7 +840,7 @@ class StragglerDetector:
             self.stop_data_tm = []
             backend = torch.distributed.get_backend()
             if backend == "nccl":
-                self.dev = torch.cuda.current_device()
+                self.dev = get_current_device()
             else:
                 self.dev = torch.device("cpu")
             # cache some events
@@ -974,7 +1058,7 @@ class StragglerDetector:
         indirectly from report() is the only way to activate the change that is made
         via rank-0
         """
-        # If no change just commnunicate the current
+        # If no change just communicate the current
         off = self._off
         if self.rank == 0 and self.toggle:
             off = not self._off
@@ -1004,12 +1088,12 @@ class StragglerDetector:
         collection state. The actual toggling happens at the end of
         calling report() when _check_toggle() is called.
         """
-        resp = f"HTTP/1.0 200 OK\r\nConnection: Close\r\nContent-length: "
+        resp = r"HTTP/1.0 200 OK\r\nConnection: Close\r\nContent-length: "
 
         if self.rank == 0:
             state = "OFF" if self._off else "ON"
             logger.info(
-                f"Controller ready to recv " f"commands on port {self.port}. Current state {state}"
+                f"Controller ready to recv commands on port {self.port}. Current state {state}"
             )
             while True and self.sock is not None:
                 try:
@@ -1180,7 +1264,7 @@ class StragglerDetector:
 
     @property
     def configured(self) -> bool:
-        """Can be called to check if the the instance is already configured
+        """Can be called to check if the instance is already configured
 
         Returns:
             bool: returns True if configure was called and was a success, else False
@@ -1260,3 +1344,19 @@ class StragglerDetector:
 __straggler__ = StragglerDetector()
 """StragglerDetector: private module variable, not be directly accessed
 """
+
+
+# Check if Transformer Engine has Float8Tensor class
+HAVE_TE_FLOAT8TENSOR = False
+try:
+    from transformer_engine.pytorch.float8_tensor import Float8Tensor
+
+    HAVE_TE_FLOAT8TENSOR = True
+except (ImportError, ModuleNotFoundError):
+    # Float8Tensor not found
+    pass
+
+
+def is_float8tensor(tensor: torch.Tensor) -> bool:
+    """Check if a tensor is a Transformer Engine Float8Tensor"""
+    return HAVE_TE_FLOAT8TENSOR and isinstance(tensor, Float8Tensor)

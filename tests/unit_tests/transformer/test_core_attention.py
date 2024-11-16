@@ -58,7 +58,7 @@ class TestCoreAttention:
         assert context_layer.shape[0] == sequence_length
         assert context_layer.shape[1] == micro_batch_size
         assert context_layer.shape[2] == config.hidden_size
-        assert context_layer.device.type == 'cuda'
+        assert context_layer.device.type == get_current_device_type()
         assert context_layer.dtype == torch.float32
 
 """

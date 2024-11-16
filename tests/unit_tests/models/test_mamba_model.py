@@ -1,19 +1,20 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import os
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import pytest
 import torch
 
 from megatron.core import InferenceParams
-if torch.cuda.is_available():
-    from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
-    from megatron.core.models.mamba.mamba_model import MambaModel
+from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+xm = get_xla_model()
+
+@pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
 class TestMambaModel:
 
     def setup_method(self, method):
@@ -124,3 +125,12 @@ class TestMambaModel:
         torch.save(self.model.state_dict(), path)
 
         self.model.load_state_dict(torch.load(path))
+
+    def test_layer_numbers(self):
+        """
+        The layer numbers should start at one (for the embedding # layer) and go up
+        incrementally from there. This is required for PEFT to work.
+        """
+        model = self.model
+        for expected, layer in enumerate(model.decoder.layers, start=1):
+            assert expected == layer.layer_number, "layer numbers are incorrect"

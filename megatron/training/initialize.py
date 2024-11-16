@@ -4,11 +4,10 @@
 import logging
 import random
 import os
-import packaging
-import packaging.version
 import time
+import warnings
 
-from megatron.core.device_utils import get_current_device, get_distributed_backend, get_local_device_count
+from megatron.core.device_utils import get_current_device, get_distributed_backend, get_local_device_count, set_manual_seed
 from megatron.core.device_utils import get_distributed_init_method
 import numpy as np
 import torch
@@ -26,6 +25,7 @@ from megatron.training.global_vars import set_global_variables
 from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
+from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +112,7 @@ def initialize_megatron(
         _compile_dependencies()
 
         if args.tp_comm_overlap:
+            #TODO: Should this be activated with just decoder-tp-comm-overlap too?
            _initialize_tp_communicators()
 
         # No continuation function
@@ -212,14 +213,26 @@ def _initialize_tp_communicators():
     else:
        ub_cfgs = {}
 
-    input_shape = [(args.seq_length * args.micro_batch_size) // args.context_parallel_size , args.hidden_size]
+    if getattr(args, 'decoder_tp_comm_overlap', False):
+        input_shape = [(args.decoder_seq_length * args.micro_batch_size) // args.context_parallel_size , args.hidden_size]
+    else:
+        input_shape = [(args.seq_length * args.micro_batch_size) // args.context_parallel_size , args.hidden_size]
 
-    #We create a MPI process group, which is needed to bootstrap the pipelined
-    #tensor-model-parallel communication overlap
-    torch.distributed.new_group(backend='mpi')
-
-    te_module.base.initialize_ub(shape = input_shape, tp_size = args.tensor_model_parallel_size,
-                                 use_fp8 = (args.fp8 is not None) , ub_cfgs = ub_cfgs,)
+    if is_te_min_version("1.9.0"):
+        # The process group with the target bootstrap backend is created in Transformer Engine.
+        te_module.base.initialize_ub(shape = input_shape, tp_size = args.tensor_model_parallel_size,
+                                     use_fp8 = (args.fp8 is not None) , ub_cfgs = ub_cfgs,
+                                     bootstrap_backend = args.tp_comm_bootstrap_backend)
+    else:
+        if args.tp_comm_bootstrap_backend != 'mpi':
+            warnings.warn(
+                f"Transformer Engine v{get_te_version()} supports only MPI bootstrap backend."
+            )
+        # Create a MPI process group to help with TP communication overlap bootstrap.
+        torch.distributed.new_group(backend='mpi')
+    
+        te_module.base.initialize_ub(shape = input_shape, tp_size = args.tensor_model_parallel_size,
+                                     use_fp8 = (args.fp8 is not None) , ub_cfgs = ub_cfgs)
 
 def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
     """Initialize torch.distributed and core model parallel."""
@@ -254,8 +267,6 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
             'rank': args.rank,
             'timeout': timedelta(minutes=args.distributed_timeout_minutes),
         }
-        if packaging.version.Version(torch.__version__) >= packaging.version.Version("2.3.0"):
-            init_process_group_kwargs['device_id'] = device_id
 
         torch.distributed.init_process_group(**init_process_group_kwargs)
 
@@ -310,11 +321,11 @@ def _set_random_seed(seed_, data_parallel_random_init=False):
             seed = seed + (10 * mpu.get_data_parallel_rank())
         random.seed(seed)
         np.random.seed(seed)
-        torch.manual_seed(seed)
+        set_manual_seed(seed)
         if get_local_device_count() > 0:
             tensor_parallel.model_parallel_device_manual_seed(seed)
     else:
-        raise ValueError("Seed ({}) should be a positive integer.".format(seed))
+        raise ValueError("Seed ({}) should be a positive integer.".format(seed_))
 
 
 def write_args_to_tensorboard():
@@ -329,9 +340,9 @@ def write_args_to_tensorboard():
 def set_jit_fusion_options():
     """Set PyTorch JIT layer fusion options."""
     # flags required to enable jit fusion kernels
-    TORCH_MAJOR = int(torch.__version__.split(".")[0])
-    TORCH_MINOR = int(torch.__version__.split(".")[1])
-    if (TORCH_MAJOR > 1) or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10):
+    if is_torch_min_version("2.2.0a0"):
+        pass  # we're using torch.compile for jit fusion
+    elif is_torch_min_version("1.10.0a0"):
         # nvfuser
         torch._C._jit_set_profiling_executor(True)
         torch._C._jit_set_profiling_mode(True)

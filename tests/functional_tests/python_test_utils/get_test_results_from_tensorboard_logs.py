@@ -1,23 +1,24 @@
 import os
 
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
-import json  # noqa: E402
+import json
 
-import click  # noqa: E402
+import click
 
-from tests.functional_tests.python_test_utils import common  # noqa: E402
+from tests.functional_tests.python_test_utils import common
 
 
 @click.command()
 @click.option("--logs-dir", required=True, type=str, help="Path to Tensorboard logs")
+@click.option("--output-path", required=False, type=str, help="Path to write golden values")
 @click.option(
-    "--output-path",
-    required=False,
-    type=str,
-    help="Rate in which Tensorboard was written, will be used to upsample to interval of 1",
+    "--is-convergence-test/--is-normal-test",
+    type=bool,
+    help="Tensorboard index to extract",
+    default=False,
 )
-def collect_train_test_metrics(logs_dir: str, output_path: str):
-    summaries = common.read_tb_logs_as_list(logs_dir)
+def collect_train_test_metrics(logs_dir: str, output_path: str, is_convergence_test: bool):
+    summaries = common.read_tb_logs_as_list(logs_dir, index=-1 if is_convergence_test else 0)
 
     train_metrics = {
         metric_name: {

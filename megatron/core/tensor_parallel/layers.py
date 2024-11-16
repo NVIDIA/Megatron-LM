@@ -5,12 +5,12 @@
 
 import os
 import warnings
+from functools import partial
 from typing import Any, Callable, List, Optional, Tuple
 
 from ..device_utils import get_current_device, get_current_device_type, get_xla_model
 import torch
 import torch.nn.functional as F
-import torch.nn.init as init
 from torch.nn.parameter import Parameter
 
 from megatron.core.model_parallel_config import ModelParallelConfig
@@ -23,6 +23,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from megatron.core.utils import is_torch_min_version
 
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..transformer.utils import make_sharded_tensors_for_checkpoint
@@ -36,7 +37,7 @@ from .mappings import (
     scatter_to_tensor_model_parallel_region,
 )
 from .random import get_device_rng_tracker, get_expert_parallel_rng_tracker_name
-from .utils import VocabUtility, divide, split_tensor_along_last_dim
+from .utils import VocabUtility, divide
 
 _grad_accum_fusion_available = True
 try:
@@ -52,13 +53,32 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
 
 xm = get_xla_model()
 
+if is_torch_min_version("2.4.0a0"):
+    custom_fwd = partial(torch.amp.custom_fwd, device_type=get_current_device_type())
+    custom_bwd = partial(torch.amp.custom_bwd, device_type=get_current_device_type())
+else:
+    custom_fwd = torch.cuda.amp.custom_fwd
+    custom_bwd = torch.cuda.amp.custom_bwd
+
+
+if is_torch_min_version("1.13.0"):
+    dist_all_gather_func = torch.distributed.all_gather_into_tensor
+    dist_reduce_scatter_func = torch.distributed.reduce_scatter_tensor
+else:
+    dist_all_gather_func = torch.distributed._all_gather_base
+    dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
+
+
 def param_is_not_tensor_parallel_duplicate(param):
+    """Returns true if the passed-in parameter is not a duplicate parameter
+    on another TP rank."""
     return (hasattr(param, 'tensor_model_parallel') and param.tensor_model_parallel) or (
         get_tensor_model_parallel_rank() == 0
     )
 
 
 def set_tensor_model_parallel_attributes(tensor, is_parallel, dim, stride):
+    """Sets tp attributes to tensor"""
     # Make sure the attributes are not set.
     for attribute in _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS:
         assert not hasattr(tensor, attribute)
@@ -69,6 +89,8 @@ def set_tensor_model_parallel_attributes(tensor, is_parallel, dim, stride):
 
 
 def set_defaults_if_not_set_tensor_model_parallel_attributes(tensor):
+    """Set default model parallel attributes if not set explicitly already."""
+
     def maybe_set(attribute, value):
         if not hasattr(tensor, attribute):
             setattr(tensor, attribute, value)
@@ -78,6 +100,8 @@ def set_defaults_if_not_set_tensor_model_parallel_attributes(tensor):
 
 
 def copy_tensor_model_parallel_attributes(destination_tensor, source_tensor):
+    """Copy model parallel attributes from one tensor to another."""
+
     def maybe_copy(attribute):
         if hasattr(source_tensor, attribute):
             setattr(destination_tensor, attribute, getattr(source_tensor, attribute))
@@ -116,21 +140,22 @@ def _initialize_affine_weight_cpu(
     params_dtype=torch.float32,
     rank=None,
     world_size=None,
+    skip_set_tensor_parallel_attributes=False,
 ):
     """Initialize affine weight for model parallel.
 
     Build the master weight on all processes and scatter
     the relevant chunk."""
 
-    set_tensor_model_parallel_attributes(
-        tensor=weight, is_parallel=True, dim=partition_dim, stride=stride
-    )
+    if not skip_set_tensor_parallel_attributes:
+        set_tensor_model_parallel_attributes(
+            tensor=weight, is_parallel=True, dim=partition_dim, stride=stride
+        )
 
     # Initialize master weight
     master_weight = torch.empty(output_size, input_size, dtype=torch.float, requires_grad=False)
     init_method(master_weight)
     master_weight = master_weight.to(dtype=params_dtype)
-
     # Split and copy
     per_partition_per_stride_size = divide(per_partition_size, stride)
     weight_list = torch.split(master_weight, per_partition_per_stride_size, dim=partition_dim)
@@ -219,6 +244,11 @@ class VocabParallelEmbedding(torch.nn.Module):
                 _initialize_affine_weight_device(self.weight, init_method, partition_dim=0, stride=1)
 
     def forward(self, input_):
+        """Forward.
+
+        Args:
+            input_ (torch.Tensor): Input tensor.
+        """
         if xm:
             xm.mark_step()
 
@@ -279,13 +309,9 @@ class LinearWithFrozenWeight(torch.autograd.Function):
     mathematically."""
 
     @staticmethod
-    def forward(
-        ctx,
-        input,
-        weight,
-        bias,
-        allreduce_dgrad,
-    ):
+    @custom_fwd
+    def forward(ctx, input, weight, bias, allreduce_dgrad):
+        """Forward with frozen weight."""
         ctx.save_for_backward(weight)
         ctx.allreduce_dgrad = allreduce_dgrad
         output = torch.matmul(input, weight.t())
@@ -295,6 +321,7 @@ class LinearWithFrozenWeight(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Backward with frozen weight."""
         (weight,) = ctx.saved_tensors
         grad_input = grad_output.matmul(weight)
 
@@ -313,11 +340,11 @@ def linear_with_frozen_weight(
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
     gradient_accumulation_fusion: bool,
-    async_grad_allreduce: bool,
+    allreduce_dgrad: bool,
     sequence_parallel: bool,
     grad_output_buffer: Optional[List[torch.Tensor]] = None,
-    wgrad_deferral_limit: Optional[int] = None,
-    allreduce_dgrad: bool = None,
+    wgrad_deferral_limit: None = None,
+    async_grad_allreduce: Optional[bool] = None,
 ) -> torch.Tensor:
     """Linear layer execution with weight.requires_grad == False.
 
@@ -337,8 +364,9 @@ def linear_with_frozen_weight(
     gradient_accumulation_fusion (bool required): dummy argument, used to
     keep the API unified between all forward implementation functions.
 
-    async_grad_allreduce (bool required): dummy argument, used to
-    keep the API unified between all forward implementation functions.
+    allreduce_dgrad (bool, required): Do the allreduce of input gradients.
+        Here, async and sync allreduce are the same. If sequence_parallel is
+        True, this must be False, as no all reduce is performed.
 
     sequence_parallel (bool required): Indicates that sequence
         parallelism is used and thus in the forward pass the input is
@@ -351,11 +379,17 @@ def linear_with_frozen_weight(
     wgrad_deferral_limit (int optional): dummy argument, used to
     keep the API unified between all forward implementation functions.
 
-    allreduce_dgrad (bool): Do the allreduce of input gradients.
-        Here, async and sync allreduce are the same. If sequence_parallel is
-        True, this must be False, as no all reduce is performed.
+
+    async_grad_allreduce (bool optional): Will be removed with 0.11.0.
+                                          Please use allreduce_dgrad instead.
 
     """
+
+    if async_grad_allreduce is not None:
+        warnings.warn(
+            "async_grad_allreduce is deprecated, not in use anymore and will"
+            " be fully removed with 0.11.0. Please use allreduce_dgrad instead."
+        )
 
     assert grad_output_buffer is None, (
         "grad_output_buffer kwarg is only supported with "
@@ -370,12 +404,6 @@ def linear_with_frozen_weight(
         input = gather_from_sequence_parallel_region(input, tensor_parallel_output_grad=True)
     else:
         input = input
-
-    if allreduce_dgrad is None:
-        warnings.warn(
-            "async_grad_allreduce is deprecated and will be removed in a future release. use allreduce_dgrad instead."
-        )
-        allreduce_dgrad = async_grad_allreduce
 
     args = [input, weight, bias, allreduce_dgrad]
 
@@ -397,6 +425,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         grad_output_buffer,
         wgrad_deferral_limit,
     ):
+        """Forward."""
         ctx.save_for_backward(input, weight)
         ctx.use_bias = bias is not None
         ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
@@ -413,7 +442,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 all_gather_buffer = xm.all_gather(input, groups=get_tensor_model_parallel_groups())
             else:
                 all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
-                torch.distributed.all_gather_into_tensor(
+                dist_all_gather_func(
                     all_gather_buffer, input, group=get_tensor_model_parallel_group()
                 )
             total_input = all_gather_buffer
@@ -427,6 +456,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Backward."""
         input, weight = ctx.saved_tensors
         use_bias = ctx.use_bias
         grad_output_buffer = ctx.grad_output_buffer
@@ -450,7 +480,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                     all_gather_buffer = get_global_memory_buffer().get_tensor(
                         dim_size, input.dtype, "mpu"
                     )
-                    handle = torch.distributed.all_gather_into_tensor(
+                    handle = dist_all_gather_func(
                         all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
                     )
 
@@ -492,7 +522,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                     dim_size, dtype=input.dtype, device=get_current_device(), requires_grad=False
                 )
                 # reduce_scatter
-                handle = torch.distributed.reduce_scatter_tensor(
+                handle = dist_reduce_scatter_func(
                     sub_grad_input, grad_input, group=get_tensor_model_parallel_group(), async_op=True
                 )
             # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
@@ -554,11 +584,11 @@ def linear_with_grad_accumulation_and_async_allreduce(
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
     gradient_accumulation_fusion: bool,
-    async_grad_allreduce: bool,
+    allreduce_dgrad: bool,
     sequence_parallel: bool,
     grad_output_buffer: Optional[List[torch.Tensor]] = None,
     wgrad_deferral_limit: Optional[int] = 0,
-    allreduce_dgrad: bool = None,
+    async_grad_allreduce: Optional[bool] = None,
 ) -> torch.Tensor:
     """Linear layer execution with asynchronous communication and
     gradient accumulation fusion in backprop.
@@ -601,12 +631,10 @@ def linear_with_grad_accumulation_and_async_allreduce(
             " Note that the extension requires CUDA>=11. Otherwise, you
             must turn off gradient accumulation fusion."
 
-
-        async_grad_allreduce (bool required): Do the allreduce of input
-            gradients asyncronously with the computation of weight
+        allreduce_dgrad (bool required): Do the allreduce of input gradients.
+            The allreduce is done asynchronously with the computation of weight
             gradients. If sequence_parallel is True, this must be
             False, as no all reduce is performed.
-
 
         sequence_parallel (bool required): Indicates that sequence
             parallelism is used and thus in the forward pass the input is
@@ -619,18 +647,17 @@ def linear_with_grad_accumulation_and_async_allreduce(
 
         wgrad_deferral_limit (int optional): Limit on the number of
             micro-batches for which embedding weight gradient GEMM should be
-            deferred. Defaults to 0.
+            deferred. Disable by setting this to 0. Defaults to 0.
 
-        allreduce_dgrad (bool): Do the allreduce of input gradients.
-            The allreduce is done asynchronously with the computation of weight
-            gradients. If sequence_parallel is True, this must be
-            False, as no all reduce is performed.
+        async_grad_allreduce (bool optional): Will be removed with 0.11.0.
+                                            Please use allreduce_dgrad instead.
     """
-    if allreduce_dgrad is None:
+
+    if async_grad_allreduce is not None:
         warnings.warn(
-            "async_grad_allreduce is deprecated and will be removed in a future release. use allreduce_dgrad instead."
+            "async_grad_allreduce is deprecated, not in use anymore and will"
+            " be fully removed with 0.11.0. Please use allreduce_dgrad instead."
         )
-        allreduce_dgrad = async_grad_allreduce
 
     args = [
         input,
@@ -674,21 +701,46 @@ class ColumnParallelLinear(torch.nn.Module):
     its second dimension as A = [A_1, ..., A_p].
 
     Args:
-        input_size: first dimension of matrix A.
-        output_size: second dimension of matrix A.
-        bias: If true, add bias
-        gather_output: If true, call all-gather on output and make Y available to all GPUs, otherwise, every GPU will have its output which is Y_i = XA_i
-        init_method: method to initialize weights. Note that bias is always set to zero.
-        stride: For the strided linear layers.
-        keep_master_weight_for_test: This was added for testing and should be set to False. It returns the master weights used for initialization.
-        skip_bias_add: If True, do not add the bias term, instead return it to be added by the caller. This enables performance optimations where bias can be fused with other elementwise operations.
-        skip_weight_param_allocation: If True, weight parameter is not allocated and must be passed as a keyword argument `weight` during the forward pass. Note that this does not affect bias, which will be allocated if bias is True. Defaults to False.
-        embedding_activation_buffer: This buffer holds the input activations of the final embedding linear layer on the last pipeline stage when defer_embedding_wgrad_compute is enabled.
-        grad_output_buffer: This buffer holds the gradient outputs of the final embedding linear layer on the last pipeline stage when defer_embedding_wgrad_compute is enabled.
-        is_expert: If True, the layer is treated as an MoE expert layer.
-        config: ModelParallelConfig object
-        tp_comm_buffer_name: Communication buffer name is not used in non-Transformer-Engine modules.
-        disable_grad_reduce: If True, reduction of output gradients across tensor-parallel ranks will be disabled. Defaults to False. This feature is used by Lora Adapter in Nemo to delay and fuse reduction along with other gradients for performance optimization.
+        input_size:
+            first dimension of matrix A.
+        output_size:
+            second dimension of matrix A.
+        bias:
+            If true, add bias
+        gather_output:
+            If true, call all-gather on output and make Y available to all GPUs,
+            otherwise, every GPU will have its output which is Y_i = XA_i
+        init_method:
+            method to initialize weights. Note that bias is always set to zero.
+        stride:
+            For the strided linear layers.
+        keep_master_weight_for_test:
+            This was added for testing and should be set to False. It
+            returns the master weights used for initialization.
+        skip_bias_add:
+            If True, do not add the bias term, instead return it to be added by the
+            caller. This enables performance optimations where bias can be fused with other
+            elementwise operations.
+        skip_weight_param_allocation:
+            If True, weight parameter is not allocated and must be passed
+            as a keyword argument `weight` during the forward pass. Note that this does not
+            affect bias, which will be allocated if bias is True. Defaults to False.
+        embedding_activation_buffer:
+            This buffer holds the input activations of the final embedding
+            linear layer on the last pipeline stage when defer_embedding_wgrad_compute is enabled.
+        grad_output_buffer:
+            This buffer holds the gradient outputs of the final embedding linear
+            layer on the last pipeline stage when defer_embedding_wgrad_compute is enabled.
+        is_expert:
+            If True, the layer is treated as an MoE expert layer.
+        config:
+            ModelParallelConfig object
+        tp_comm_buffer_name:
+            Communication buffer name is not used in non-Transformer-Engine modules.
+        disable_grad_reduce:
+            If True, reduction of output gradients across tensor-parallel ranks
+            will be disabled. Defaults to False. This feature is used by Lora Adapter in Nemo to
+            delay and fuse reduction along with other gradients for performance optimization.
     """
 
     def __init__(
@@ -808,8 +860,8 @@ class ColumnParallelLinear(torch.nn.Module):
         self.sequence_parallel = config.sequence_parallel
         if self.sequence_parallel and world_size <= 1:
             warnings.warn(
-                f"`sequence_parallel` is set to `True`, but tensor model parallel size is {world_size}. "
-                f"Disabling sequence parallel."
+                "`sequence_parallel` is set to `True`, but tensor model parallel size "
+                f"is {world_size}. Disabling sequence parallel."
             )
             self.sequence_parallel = False
 
@@ -843,14 +895,21 @@ class ColumnParallelLinear(torch.nn.Module):
             )
         )
 
-    def forward(self, input_: torch.Tensor, weight: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        input_: torch.Tensor,
+        weight: Optional[torch.Tensor] = None,
+        runtime_gather_output: Optional[bool] = None,
+    ):
         """Forward of ColumnParallelLinear
 
         Args:
-            input_: 3D tensor whose order of dimension is [sequence, batch, hidden]
-
-            weight (optional): weight tensor to use, compulsory when
-                skip_weight_param_allocation is True.
+            input_:
+                3D tensor whose order of dimension is [sequence, batch, hidden]
+            weight (optional):
+                weight tensor to use, compulsory when skip_weight_param_allocation is True.
+            runtime_gather_output (bool): Gather output at runtime. Default None means
+                `gather_output` arg in the constructor will be used.
 
         Returns:
             - output
@@ -874,9 +933,9 @@ class ColumnParallelLinear(torch.nn.Module):
                 )
 
         if self.config._cpu_offloading_context is not None:
-            if self.config._cpu_offloading_context.inside_context == True:
+            if self.config._cpu_offloading_context.inside_context is True:
                 assert (
-                    self.config.cpu_offloading == False
+                    self.config.cpu_offloading is False
                 ), "CPU Offloading cannot be enabled while using non-TE modules"
 
         bias = self.bias if not self.skip_bias_add else None
@@ -911,7 +970,7 @@ class ColumnParallelLinear(torch.nn.Module):
             weight=weight,
             bias=bias,
             gradient_accumulation_fusion=self.gradient_accumulation_fusion,
-            async_grad_allreduce=allreduce_dgrad,
+            allreduce_dgrad=allreduce_dgrad,
             sequence_parallel=False if self.explicit_expert_comm else self.sequence_parallel,
             grad_output_buffer=(
                 self.grad_output_buffer if self.config.defer_embedding_wgrad_compute else None
@@ -921,9 +980,14 @@ class ColumnParallelLinear(torch.nn.Module):
                 if self.config.defer_embedding_wgrad_compute
                 else None
             ),
-            allreduce_dgrad=allreduce_dgrad,
         )
-        if self.gather_output:
+
+        gather_output = self.gather_output
+        # Use the runtime gather output if it's set explicitly.
+        if runtime_gather_output is not None:
+            gather_output = runtime_gather_output
+
+        if gather_output:
             # All-gather across the partitions.
             assert not self.sequence_parallel
             output = gather_from_tensor_model_parallel_region(output_parallel)
@@ -950,21 +1014,36 @@ class ColumnParallelLinear(torch.nn.Module):
 class RowParallelLinear(torch.nn.Module):
     """Linear layer with row parallelism.
 
-    The linear layer is defined as Y = XA + b. A is parallelized along its first dimension and X along its second dimension. A = transpose([A_1 .. A_p]) X = [X_1, ..., X_p]
+    The linear layer is defined as Y = XA + b. A is parallelized along its first dimension and X
+    along its second dimension. A = transpose([A_1 .. A_p]) X = [X_1, ..., X_p]
 
     Args:
-        input_size: first dimension of matrix A.
-        output_size: second dimension of matrix A.
-        bias: If true, add bias. Note that bias is not parallelized.
-        input_is_parallel: If true, we assume that the input is already split across the GPUs and we do not split again.
-        init_method: method to initialize weights. Note that bias is always set to zero.
-        stride: For the strided linear layers.
-        keep_master_weight_for_test: This was added for testing and should be set to False. It returns the master weights used for initialization.
-        skip_bias_add: If True, do not add the bias term, instead return it to be added by the caller. This enables performance optimations where bias can be fused with other elementwise operations.
-        is_expert: If True, the layer is treated as an MoE expert layer
-        tp_comm_buffer_name: Communication buffer name. Not used in
-                             non-Transformer-Engine modules.
-        config: ModelParallelConfig object
+        input_size:
+            first dimension of matrix A.
+        output_size:
+            second dimension of matrix A.
+        bias:
+            If true, add bias. Note that bias is not parallelized.
+        input_is_parallel:
+            If true, we assume that the input is already split across the GPUs
+            and we do not split again.
+        init_method:
+            method to initialize weights. Note that bias is always set to zero.
+        stride:
+            For the strided linear layers.
+        keep_master_weight_for_test:
+            This was added for testing and should be set to False. It returns the master weights
+            used for initialization.
+        skip_bias_add:
+            If True, do not add the bias term, instead return it to be added by the
+            caller. This enables performance optimations where bias can be fused with other
+            elementwise operations.
+        is_expert:
+            If True, the layer is treated as an MoE expert layer
+        tp_comm_buffer_name:
+            Communication buffer name. Not used in non-Transformer-Engine modules.
+        config:
+            ModelParallelConfig object
 
     """
 
@@ -1097,9 +1176,9 @@ class RowParallelLinear(torch.nn.Module):
         """
 
         if self.config._cpu_offloading_context is not None:
-            if self.config._cpu_offloading_context.inside_context == True:
+            if self.config._cpu_offloading_context.inside_context is True:
                 assert (
-                    self.config.cpu_offloading == False
+                    self.config.cpu_offloading is False
                 ), "CPU Offloading cannot be enabled while using non-TE modules"
 
         # Set up backprop all-reduce.
@@ -1121,10 +1200,9 @@ class RowParallelLinear(torch.nn.Module):
             weight=self.weight,
             bias=None,
             gradient_accumulation_fusion=self.gradient_accumulation_fusion,
-            async_grad_allreduce=allreduce_dgrad,
+            allreduce_dgrad=allreduce_dgrad,
             sequence_parallel=False,
             grad_output_buffer=None,
-            allreduce_dgrad=allreduce_dgrad,
         )
 
         # All-reduce across all the partitions.

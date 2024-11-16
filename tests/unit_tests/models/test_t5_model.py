@@ -15,13 +15,19 @@ from megatron.core.tensor_parallel.random import model_parallel_device_manual_se
 from megatron.core.models.T5.t5_spec import (get_t5_encoder_with_transformer_engine_block_spec,
                                             get_t5_decoder_with_transformer_engine_block_spec,
                                             get_t5_encoder_with_local_block_spec,
-                                            get_t5_decoder_with_local_block_spec)
+                                            get_t5_decoder_with_local_block_spec,
+                                            HAVE_TE)
 
-@pytest.mark.skipif(int(os.environ.get('ACCEL_MEMORY_GB', 40)) < 32 , reason="insufficient accelerator memory")
 class TestT5Model:
 
     def setup_method(self, method):
-        Utils.initialize_model_parallel(1,1)
+        tp = 4
+        pp = 1
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp,
+            pipeline_model_parallel_size=pp,
+            encoder_pipeline_model_parallel_size=pp,
+        )
         model_parallel_device_manual_seed(123)
         transformer_config = TransformerConfig(
             num_layers=12,
@@ -36,8 +42,12 @@ class TestT5Model:
         )
         rank = ps.get_pipeline_model_parallel_rank()
         world_size = ps.get_pipeline_model_parallel_world_size()
-        en_block_spec = get_t5_encoder_with_transformer_engine_block_spec(12)
-        de_block_spec = get_t5_decoder_with_transformer_engine_block_spec(12)
+        if HAVE_TE:
+            en_block_spec = get_t5_encoder_with_transformer_engine_block_spec(12)
+            de_block_spec = get_t5_decoder_with_transformer_engine_block_spec(12)
+        else:
+            en_block_spec = get_t5_encoder_with_local_block_spec(12)
+            de_block_spec = get_t5_decoder_with_local_block_spec(12)
 
         first_decoder_rank = pp
         pre_process = rank == 0 or rank == first_decoder_rank
@@ -105,11 +115,24 @@ class TestT5Model:
         self.t5_model.to(device=get_current_device())
 
         data = list(range(sequence_length))
-        encoder_input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device=get_current_device())
-        decoder_input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device=get_current_device())
+        encoder_input_ids = (
+            torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device=get_current_device())
+        )
+        decoder_input_ids = (
+            torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device=get_current_device())
+        )
         encoder_attn_mask = torch.ones((1, sequence_length, sequence_length), dtype=bool).to(device=get_current_device())
         decoder_attn_mask = torch.ones((1, sequence_length, sequence_length), dtype=bool).to(device=get_current_device())
-        encoder_decoder_attn_mask = torch.ones((1, sequence_length, sequence_length), dtype=bool).to(device=get_current_device())
+        encoder_decoder_attn_mask = torch.ones(
+            (1, sequence_length, sequence_length), dtype=bool
+        ).to(device=get_current_device())
+
+        if self.t5_model.add_decoder:
+            encoder_hidden_states = torch.zeros(
+                (sequence_length, micro_batch_size, config.hidden_size), dtype=torch.float32
+            ).to(device=get_current_device())
+        else:
+            encoder_hidden_states = None
 
         output = self.t5_model.forward(
             encoder_input_ids=encoder_input_ids,
@@ -224,3 +247,4 @@ class TestT5Model:
 
     def test_load_state_dict(self):
         pass
+

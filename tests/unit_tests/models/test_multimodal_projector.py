@@ -1,25 +1,26 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-import os
-from megatron.core.device_utils import get_current_device
 import pytest
 import torch
 
-from megatron.core.models.gpt.gpt_layer_specs import _get_mlp_module_spec
+from megatron.core.device_utils import get_current_device
+from megatron.core.models.gpt.gpt_layer_specs import _get_mlp_module_spec, HAVE_TE
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
+from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
-from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
-from megatron.core.models.gpt.gpt_layer_specs import _get_mlp_module_spec, HAVE_TE
-from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+
 
 class TestMultimodalProjector:
 
     def setup_method(self, method):
-        Utils.initialize_model_parallel(1,1)
+        Utils.initialize_model_parallel(1, 1)
         model_parallel_device_manual_seed(123)
-        transformer_config = TransformerConfig(num_layers=1, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True)
+        transformer_config = TransformerConfig(
+            num_layers=1, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
+        )
         mlp_layer_spec = _get_mlp_module_spec().submodules
 
         affine_layer_spec = MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=None)
@@ -44,10 +45,13 @@ class TestMultimodalProjector:
         assert isinstance(self.affine, MultimodalProjector)
 
         num_weights = sum([p.numel() for p in self.mlp.parameters()])
-        assert num_weights == 280896 or not HAVE_TE
+        if HAVE_TE:
+            assert num_weights == 280896
+        else:
+            assert num_weights == 278848
 
         num_weights = sum([p.numel() for p in self.affine.parameters()])
-        assert num_weights == 65600 or not HAVE_TE
+        assert num_weights == 65600
 
     def test_forward(self):
         self.mlp.to(device=get_current_device())

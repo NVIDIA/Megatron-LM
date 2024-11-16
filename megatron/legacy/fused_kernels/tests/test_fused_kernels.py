@@ -1,9 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import math
 
-import pytest
-
-from megatron.core.device_utils import get_current_device
 import torch
 from torch.nn import LayerNorm
 
@@ -13,7 +10,6 @@ from megatron.legacy.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.legacy.model.utils import attention_mask_func
 from megatron.legacy.fused_kernels import load
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_load_fused_kernels():
     try:
         import fused_layer_norm_cuda
@@ -26,9 +22,8 @@ def test_load_fused_kernels():
         print("[Fail] load_fused_kernels")
         raise e
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_fused_softmax():
-    bert = BertModel.from_pretrained("bert-base-cased").to(device=get_current_device()).half()
+    bert = BertModel.from_pretrained("bert-base-cased").cuda().half()
     tokenizer = BertTokenizer.from_pretrained("bert-base-cased")
     test_text = (
         "Hello. How are you? I am fine thank you and you? yes Good. "
@@ -41,16 +36,16 @@ def test_fused_softmax():
     )
 
     embedding_output = bert.embeddings(
-        input_ids=tokens["input_ids"].to(device=get_current_device()),
+        input_ids=tokens["input_ids"].cuda(),
         position_ids=None,
-        token_type_ids=tokens["token_type_ids"].to(device=get_current_device()),
+        token_type_ids=tokens["token_type_ids"].cuda(),
         inputs_embeds=None,
         past_key_values_length=0,
     )
 
     # (bsz, 1, 1, seq_len)
     mask = bert.get_extended_attention_mask(
-        attention_mask=tokens["attention_mask"].to(device=get_current_device()),
+        attention_mask=tokens["attention_mask"].cuda(),
         input_shape=tokens["input_ids"].shape,
         device=bert.device,
     )
@@ -74,7 +69,7 @@ def test_fused_softmax():
             attn_mask_type=AttnMaskType.padding,
             scaled_masked_softmax_fusion=True,
         )
-        .to(device=get_current_device())
+        .cuda()
         .half()
     )
 
@@ -93,7 +88,7 @@ def test_fused_softmax():
             attn_mask_type=AttnMaskType.padding,
             scaled_masked_softmax_fusion=False,
         )
-        .to(device=get_current_device())
+        .cuda()
         .half()
     )
 
@@ -124,9 +119,9 @@ def test_fused_softmax():
             f"\n > torch_values={torch_softmax_output[-1][-1][-1][:5].tolist()}"
         )
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+
 def test_fused_upper_triangle_mask_softmax():
-    gpt = GPT2Model.from_pretrained("gpt2").to(device=get_current_device()).half()
+    gpt = GPT2Model.from_pretrained("gpt2").cuda().half()
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
     test_text = (
         "Hello. How are you? I am fine thank you and you? yes Good. "
@@ -138,14 +133,14 @@ def test_fused_upper_triangle_mask_softmax():
         return_tensors="pt",
     )
 
-    attention_mask = tokens["attention_mask"].to(device=get_current_device())
+    attention_mask = tokens["attention_mask"].cuda()
     attention_mask = attention_mask.view(attention_mask.size(0), -1)
     attention_mask = attention_mask[:, None, None, :]
     attention_mask = (1.0 - attention_mask) * -10000.0
     attention_mask = attention_mask.repeat(1, 1, attention_mask.size()[-1], 1)
     attn = gpt.h[0]
 
-    hidden_states = gpt.wte(tokens["input_ids"].to(device=get_current_device()))
+    hidden_states = gpt.wte(tokens["input_ids"].cuda())
     q, k, v = attn.attn.c_attn(hidden_states).split(768, dim=-1)
     q = attn.attn._split_heads(q, attn.attn.num_heads, attn.attn.head_dim)
     k = attn.attn._split_heads(k, attn.attn.num_heads, attn.attn.head_dim)
@@ -174,7 +169,7 @@ def test_fused_upper_triangle_mask_softmax():
             attn_mask_type=AttnMaskType.causal,
             scaled_masked_softmax_fusion=True,
         )
-        .to(device=get_current_device())
+        .cuda()
         .half()
     )
 
@@ -193,7 +188,7 @@ def test_fused_upper_triangle_mask_softmax():
             attn_mask_type=AttnMaskType.causal,
             scaled_masked_softmax_fusion=False,
         )
-        .to(device=get_current_device())
+        .cuda()
         .half()
     )
 
@@ -224,9 +219,9 @@ def test_fused_upper_triangle_mask_softmax():
             f"\n > torch_values={torch_softmax_output[-1][-1][-1][:5].tolist()}"
         )
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+
 def test_layer_norm():
-    bert = BertModel.from_pretrained("bert-base-cased").to(device=get_current_device()).half()
+    bert = BertModel.from_pretrained("bert-base-cased").cuda().half()
     tokenizer = BertTokenizer.from_pretrained("bert-base-cased")
     test_text = (
         "Hello. How are you? I am fine thank you and you? yes Good. "
@@ -241,22 +236,22 @@ def test_layer_norm():
     # [bsz, seq_len, d_model]
     embedding_output = (
         bert.embeddings(
-            input_ids=tokens["input_ids"].to(device=get_current_device()),
+            input_ids=tokens["input_ids"].cuda(),
             position_ids=None,
-            token_type_ids=tokens["token_type_ids"].to(device=get_current_device()),
+            token_type_ids=tokens["token_type_ids"].cuda(),
             inputs_embeds=None,
             past_key_values_length=0,
         )
-        .to(device=get_current_device())
+        .cuda()
         .half()
     )
 
     fused_layernorm_layer = (
-        MixedFusedLayerNorm(normalized_shape=embedding_output.size(-1)).to(device=get_current_device()).half()
+        MixedFusedLayerNorm(normalized_shape=embedding_output.size(-1)).cuda().half()
     )
 
     torch_layernorm_layer = (
-        LayerNorm(normalized_shape=embedding_output.size(-1)).to(device=get_current_device()).half()
+        LayerNorm(normalized_shape=embedding_output.size(-1)).cuda().half()
     )
 
     fused_output = fused_layernorm_layer(embedding_output)
@@ -295,7 +290,7 @@ def forward_torch_softmax(input, mask, scale):
     probs = torch.nn.Softmax(dim=-1)(mask_output)
     return probs
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+
 def test_masked_softmax_forward():
     import scaled_masked_softmax_cuda
 
@@ -311,7 +306,6 @@ def test_masked_softmax_forward():
             error = (softmax_results_torch - softmax_results).abs().max()
             assert error < 1e-3
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_masked_softmax_backward():
     import scaled_masked_softmax_cuda
 
@@ -332,7 +326,7 @@ def test_masked_softmax_backward():
             error = (back_grad - inputs.grad).abs().max()
             assert error < 1e-3
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+
 def test_allmasked_softmax_forward():
     import scaled_masked_softmax_cuda
 
@@ -348,7 +342,7 @@ def test_allmasked_softmax_forward():
             error = (softmax_results_torch - softmax_results).abs().max()
             assert error == 0.0
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+
 def test_allmasked_softmax_backward():
     import scaled_masked_softmax_cuda
 

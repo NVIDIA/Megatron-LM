@@ -8,7 +8,16 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from .. import parallel_state
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import get_attr_wrapped_model, get_model_config
-from .distributed_data_parallel_config import HAVE_APEX_OR_TE
+
+try:
+    import transformer_engine # pylint: disable=unused-import
+    HAVE_APEX_OR_TE = True
+except ImportError:
+    try: 
+        import apex # pylint: disable=unused-import
+        HAVE_APEX_OR_TE = True
+    except ImportError:
+        HAVE_APEX_OR_TE = False
 
 def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig):
     """

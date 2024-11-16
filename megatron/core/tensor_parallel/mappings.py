@@ -15,10 +15,18 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from megatron.core.utils import is_torch_min_version
 
 from .utils import split_tensor_along_last_dim
 
 xm = get_xla_model()
+if is_torch_min_version("1.13.0"):
+    dist_all_gather_func = torch.distributed.all_gather_into_tensor
+    dist_reduce_scatter_func = torch.distributed.reduce_scatter_tensor
+else:
+    dist_all_gather_func = torch.distributed._all_gather_base
+    dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
+
 
 def _reduce(input_):
     """All-reduce the input tensor across model parallel group."""
@@ -121,8 +129,11 @@ def _gather_along_first_dim(input_, output_split_sizes=None):
     """Gather tensors and concatenate along the first dimension.
 
     Args:
-        input_tensor (torch.Tensor): A tensor to be gathered.
-        output_split_sizes (List[int], optional): A list specifying the sizes of the output splits along the first dimension. If None, equal splitting is assumed. Default: None.
+        input_tensor (torch.Tensor):
+            A tensor to be gathered.
+        output_split_sizes (List[int], optional):
+            A list specifying the sizes of the output splits along the first dimension.
+            If None, equal splitting is assumed. Default: None.
 
     Returns:
         torch.Tensor: Gathered tensor.
@@ -141,7 +152,7 @@ def _gather_along_first_dim(input_, output_split_sizes=None):
             output = xm.all_gather(input_.contiguous(), groups=get_tensor_model_parallel_groups())
         else:
             output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
-            torch.distributed.all_gather_into_tensor(
+            dist_all_gather_func(
                 output, input_.contiguous(), group=get_tensor_model_parallel_group()
             )
     else:
@@ -153,7 +164,7 @@ def _gather_along_first_dim(input_, output_split_sizes=None):
         else:
             output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
             output_tensor_list = list(torch.split(output, output_split_sizes, dim=0))
-            torch.distributed.all_gather(
+            dist_all_gather_func(
                 output_tensor_list, input_, group=get_tensor_model_parallel_group()
             )
 
@@ -187,7 +198,7 @@ def _reduce_scatter_along_first_dim(input_, input_split_sizes=None):
                                        groups=get_tensor_model_parallel_groups())
         else:
             output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
-            torch.distributed.reduce_scatter_tensor(
+            dist_reduce_scatter_func(
                 output, input_.contiguous(), group=get_tensor_model_parallel_group()
             )
     else:
@@ -197,7 +208,7 @@ def _reduce_scatter_along_first_dim(input_, input_split_sizes=None):
             output = xm.reduce_scatter(xm.REDUCE_SUM, input_tensor_list, groups=get_tensor_model_parallel_groups())
         else:
             output = torch.empty_like(input_tensor_list[rank])
-            torch.distributed.reduce_scatter(
+            dist_reduce_scatter_func(
                 output, input_tensor_list, group=get_tensor_model_parallel_group()
             )
     return output
@@ -221,7 +232,7 @@ def _gather_along_first_dim_moe(input_, use_global_buffer=False):
             output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
         else:
             output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
-        torch.distributed.all_gather_into_tensor(output, input_.contiguous(), group=group)
+        dist_all_gather_func(output, input_.contiguous(), group=group)
 
     return output
 
@@ -246,7 +257,7 @@ def _reduce_scatter_along_first_dim_moe(input_, use_global_buffer=False):
             output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
         else:
             output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
-        torch.distributed.reduce_scatter_tensor(output, input_.contiguous(), group=group)
+        dist_reduce_scatter_func(output, input_.contiguous(), group=group)
     return output
 
 
@@ -265,7 +276,7 @@ def _gather_along_first_dim_expert_parallel(input_):
         output = xm.all_gather(input, groups=get_expert_model_parallel_groups())
     else:
         output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
-        torch.distributed.all_gather_into_tensor(output, input_.contiguous(), group=group)
+        dist_all_gather_func(output, input_.contiguous(), group=group)
 
     return output
 
@@ -616,10 +627,13 @@ def all_to_all(group, input_, output_split_sizes_=None, input_split_sizes=None):
 
 def all_to_all_sp2hp(input_):
     """
-    Perform AlltoAll communication on tensor parallel group, transform the input tensor from shape [num_tokens/TP, H] to [num_tokens, H/TP].
+    Perform AlltoAll communication on tensor parallel group, transform the input tensor from shape
+    [num_tokens/TP, H] to [num_tokens, H/TP].
 
     Args:
-        input_ (torch.Tensor): The input tensor which has been distributed along the sequence dimension.
+        input_ (torch.Tensor):
+            The input tensor which has been distributed along the sequence
+            dimension.
 
     Returns:
         torch.Tensor: The output tensor with shape [num_tokens, H/TP].
@@ -638,10 +652,13 @@ def all_to_all_sp2hp(input_):
 
 def all_to_all_hp2sp(input_):
     """
-    Perform AlltoAll communication on tensor parallel group, transform the input tensor from shape [num_tokens, H/TP] to [num_tokens/TP, H].
+    Perform AlltoAll communication on tensor parallel group, transform the input tensor from shape
+    [num_tokens, H/TP] to [num_tokens/TP, H].
 
     Args:
-        input_ (torch.Tensor): The input tensor which has been distributed along the hidden dimension.
+        input_ (torch.Tensor):
+            The input tensor which has been distributed along the hidden
+            dimension.
 
     Returns:
         torch.Tensor: The output tensor with shape [num_tokens/TP, H].

@@ -10,8 +10,8 @@ from megatron.core.transformer.attention import (
     SelfAttentionSubmodules,
 )
 try :
-    from megatron.core.transformer.custom_layers.transformer_engine import (
-        TEColumnParallelLinear,
+    
+    from megatron.core.extensions.transformer_engine import (
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
         TENorm,
@@ -32,17 +32,11 @@ except ImportError:
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_block import (
-    TransformerBlockSubmodules,
-    get_num_layers_to_build,
-)
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
 try:
-    import apex
+    import apex  # pylint: disable=unused-import
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 
@@ -52,10 +46,9 @@ except ImportError:
     import warnings
 
     from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
-    if torch.cuda.is_available():
-        warnings.warn('Apex is not installed. Falling back to Torch LayerNorm')
-    LNImpl = WrappedTorchLayerNorm
 
+    warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
+    LNImpl = WrappedTorchLayerNorm
 
 def decoder_model_with_transformer_engine_default_spec(
     num_experts: int = None, moe_grouped_gemm: bool = False, qk_layernorm: bool = False

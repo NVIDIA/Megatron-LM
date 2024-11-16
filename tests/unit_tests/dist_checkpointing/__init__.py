@@ -12,6 +12,7 @@ from tests.unit_tests.dist_checkpointing.utils import (
     init_checkpointing_mock_args,
     initialize_gpt_model,
     setup_model_and_optimizer,
+    setup_moe_model_and_optimizer,
 )
 from tests.unit_tests.test_utilities import Utils
 
@@ -56,8 +57,8 @@ class TempNamedDir(TemporaryDirectory):
         if sync:
             import torch
 
-            torch.distributed.barrier(group=self.process_group)
-
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.barrier(group=self.process_group)
         if Utils.rank == 0:
             super().cleanup()
 
@@ -66,7 +67,8 @@ class TempNamedDir(TemporaryDirectory):
         if self.sync:
             import torch
 
-            torch.distributed.barrier(group=self.process_group)
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.barrier(group=self.process_group)
         return path
 
     def __exit__(self, exc_type, exc_val, exc_tb):

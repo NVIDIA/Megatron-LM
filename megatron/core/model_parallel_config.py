@@ -182,8 +182,8 @@ class ModelParallelConfig:
 
     tp_comm_atomic_ag: bool = False
     """Deprecated from TransformerEngine v1.6.0.
-        If true, allows All-Gather overlap with Fprop GEMM by pipelining the GEMM and All-Gather both
-       done atomically. Don't care if tp_comm_overlap is False.
+       If true, allows All-Gather overlap with Fprop GEMM by pipelining the GEMM and All-Gather
+       both done atomically. Don't care if tp_comm_overlap is False.
     """
 
     tp_comm_split_rs: bool = True
@@ -211,6 +211,11 @@ class ModelParallelConfig:
     tp_comm_overlap_disable_fc1: bool = False
     """
        If true, the AllGather -> Gemm overlap for FC1 layer of MLP gets disabled
+    """
+
+    tp_comm_bootstrap_backend: str = 'nccl'
+    """
+       Set the bootstrapping backend out of 'nccl', 'mpi', and 'gloo'
     """
 
     ###################
@@ -257,13 +262,35 @@ class ModelParallelConfig:
 
     wgrad_deferral_limit: int = 0
     """This value tunes the number of micro-batches for which the embedding weight gradient compute
-       needs to be deferred to pipeline flush, this argument is invalid if `defer_embedding_wgrad_compute` is False.
+       needs to be deferred to pipeline flush, this argument is invalid if
+       `defer_embedding_wgrad_compute` is False.
        Defaults to 0, which means all micro-batches are deferred.
     """
 
     pipeline_model_parallel_split_rank: Optional[int] = None
     """If int, rank where encoder and decoder should be split in cases where the model has both an
        encoder and decoder (e.g., T5). Ignored if None.
+    """
+
+    overlap_p2p_comm_warmup_flush: bool = False
+    """If true, overlap communication and computation in warm up and flush phase.
+       Only valid when overlap_p2p_comm is True and batch_p2p_comm is False. 
+       Defaults to False.
+    """
+
+    microbatch_group_size_per_vp_stage: Optional[int] = None
+    """This value specifies the number of micro-batches that are executed 
+       at a time for a given virtual stage (both forward and backward).
+       Default (in __post_init__() method below) to pipeline_parallel_size 
+       which specifies a depth-first schedule.
+       Example: for PP=2 VP=2, when microbatch_group_size_per_vp_stage=2, 
+       num_microbatches = 4, we have 
+       rank 0 | 0 1 0 1 2 3 2 3
+       rank 1 |   0 1 0 1 2 3 2 3
+       When microbatch_group_size_per_vp_stage=3, num_microbatches = 5, 
+       we have
+       rank 0 | 0 1 2 0 1 2 3 4 3 4 
+       rank 1 |   0 1 2 0 1 2 3 4 3 4
     """
 
     ###################
@@ -276,7 +303,9 @@ class ModelParallelConfig:
     """Tells the number of transformer layers for which activations has to be offloaded."""
 
     _cpu_offloading_context: ContextManager = (
-        None  # Used for internal use only, not to be set by the user. TODO: Need to move to the 'right' place when possible.
+        None
+        # Used for internal use only, not to be set by a user.
+        # TODO: Need to move to the 'right' place when possible.
     )
     """For internal use only, do not set."""
 
@@ -297,7 +326,8 @@ class ModelParallelConfig:
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
-        See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more details.
+        See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
+        details.
         """
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:
@@ -324,11 +354,22 @@ class ModelParallelConfig:
 
         if self.defer_embedding_wgrad_compute and self.wgrad_deferral_limit < 0:
             raise ValueError(
-                "Wgrad deferral limit should be greater than or equal to 0 when this optimization is enabled!"
+                "Wgrad deferral limit should be greater than or equal to 0 when it is enabled!"
             )
 
         if self.expert_model_parallel_size > 1 and self.tensor_model_parallel_size > 1:
             if self.sequence_parallel is False:
                 raise ValueError(
-                    "When using expert parallelism and tensor parallelism, sequence parallelism must be used"
+                    "When using expert parallelism and tensor parallelism, "
+                    "sequence parallelism must be used"
+                )
+
+        if self.microbatch_group_size_per_vp_stage is None:
+            self.microbatch_group_size_per_vp_stage = self.pipeline_model_parallel_size
+
+        if self.overlap_p2p_comm_warmup_flush:
+            if not self.overlap_p2p_comm or self.batch_p2p_comm:
+                raise ValueError(
+                    "Pipeline parallel communication overlapping in warmup and flush is only "
+                    "compatible with overlap_p2p_comm but not batch_p2p_comm"
                 )

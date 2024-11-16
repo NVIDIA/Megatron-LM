@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import torch
+
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.ssm.mamba_block import MambaStack, MambaStackSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
@@ -8,7 +9,7 @@ from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 
 try:
-    from megatron.core.transformer.custom_layers.transformer_engine import (
+    from megatron.core.extensions.transformer_engine import (
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
         TERowParallelLinear,

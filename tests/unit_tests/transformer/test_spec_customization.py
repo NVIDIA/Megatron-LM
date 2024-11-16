@@ -2,13 +2,11 @@
 
 import sys
 from dataclasses import dataclass, fields
-from importlib.metadata import version
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, set_manual_seed
 import pytest
 import torch
 import transformer_engine as te
-from pkg_resources import packaging
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
@@ -16,7 +14,7 @@ from megatron.core.tensor_parallel.random import model_parallel_device_manual_se
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 
 try: 
-    from megatron.core.transformer.custom_layers.transformer_engine import (
+    from megatron.core.extensions.transformer_engine import (
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
         TENorm,
@@ -33,6 +31,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module, impor
 from megatron.core.transformer.transformer_block import TransformerBlock, TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -63,7 +62,7 @@ class TestSpecCustomization:
 
         # specify layernorm spec with module path to test dynamic importing
         self.layernorm_spec = ModuleSpec(
-            module=("megatron.core.transformer.custom_layers.transformer_engine", "TENorm")
+            module=("megatron.core.extensions.transformer_engine", "TENorm")
         )
 
         # specify bias dropout add with module path
@@ -142,8 +141,7 @@ class TestSpecCustomization:
         assert id(bda_op) == id(get_bias_dropout_add)
 
     def test_sliding_window_attention(self):
-        te_version = packaging.version.Version(version("transformer-engine"))
-        if te_version < packaging.version.Version("1.2.0"):
+        if not is_te_min_version("1.2.0"):
             print("SWA not tested because TE version is not >= 1.2.0", file=sys.stderr)
             return
 
@@ -210,7 +208,7 @@ class TestSpecCustomization:
         # `ModuleSpec` layer spec provided to all the layers of the block.
         layer_spec1 = ModuleSpec(module=TransformerLayer, submodules=layer_local_spec.submodules)
         model_parallel_device_manual_seed(123)
-        torch.manual_seed(0)
+        set_manual_seed(0)
         parallel_transformer_block1 = TransformerBlock(transformer_config, layer_spec1)
 
         layer_spec2 = TransformerBlockSubmodules(
@@ -222,7 +220,7 @@ class TestSpecCustomization:
         )
         # make sure the model init conditions are identical
         model_parallel_device_manual_seed(123)
-        torch.manual_seed(0)
+        set_manual_seed(0)
         parallel_transformer_block2 = TransformerBlock(transformer_config, layer_spec2)
 
         sequence_length = 32

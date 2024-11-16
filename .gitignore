@@ -10,3 +10,4 @@ logs
 local/
 *.sh
 *.log
+.gitmodules

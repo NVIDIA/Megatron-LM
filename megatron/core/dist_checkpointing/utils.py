@@ -2,7 +2,7 @@
 
 """ Helpers for manipulating sharded tensors and sharded state dicts. """
 
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 from .dict_utils import dict_list_map_inplace, extract_matching_values
 from .mapping import (
@@ -15,11 +15,47 @@ from .mapping import (
     StateDict,
 )
 
+# _ShardId uniquely identifies a ShardedTensor. This is a subset of ShardedTensor
+# attributes: key (str), global_offset (tuple) and flattened_range (optional tuple)
+_ShardId = Tuple[str, tuple, Optional[tuple]]
+
+
+def _sharded_tensor_shard_id(sharded_tensor: ShardedTensor) -> _ShardId:
+    """Unique id of the sharded tensor data.
+
+    Should yield the same value for same data replicated on different ranks.
+
+    Args:
+        sharded_tensor (ShardedTensor): sharded tensor representing the data shard
+
+    Returns (tuple): unique id of a data shard
+    """
+    f_range = sharded_tensor.flattened_range
+    return (
+        sharded_tensor.key,
+        sharded_tensor.global_offset,
+        None if f_range is None else (f_range.start, f_range.stop),
+    )
+
+
+def _sharded_object_id(sharded_object: ShardedObject) -> _ShardId:
+    """Unique id of the sharded object data.
+
+    Should yield the same value for same data replicated on different ranks.
+
+    Args:
+        sharded_object (ShardedObject): sharded object representing the data shard
+
+    Returns (tuple): unique id of a data shard
+    """
+    return (sharded_object.key, sharded_object.global_offset, sharded_object.global_shape)
+
 
 def extract_sharded_tensors(
     sharded_state_dict: ShardedStateDict,
 ) -> Tuple[ShardedStateDict, StateDict]:
-    """Extract a dict consisting of only ShardedTensor objects from a given state dict with any objects.
+    """Extract a dict consisting of only ShardedTensor objects
+    from a given state dict with any objects.
 
     Args:
         sharded_state_dict: state dict possibly containing ShardedTensor objects
@@ -27,7 +63,8 @@ def extract_sharded_tensors(
     Returns:
         Tuple[ShardedStateDict, StateDict]: tuple of:
             - state dict with all ShardedTensor (keeping the original state dict structure)
-            - state dict with all objects other than ShardedTensor (keeping the original state dict structure)
+            - state dict with all objects other than ShardedTensor
+              (keeping the original state dict structure)
     """
     return extract_matching_values(sharded_state_dict, lambda v: isinstance(v, ShardedTensor))
 
@@ -35,14 +72,17 @@ def extract_sharded_tensors(
 def extract_sharded_tensors_and_factories(
     sharded_state_dict: ShardedStateDict,
 ) -> Tuple[ShardedStateDict, StateDict]:
-    """Extract a dict consisting of only ShardedTensor and ShardedTensorFactory objects from a given state dict with any objects.
+    """Extract a dict consisting of only ShardedTensor and ShardedTensorFactory objects
+    from a given state dict with any objects.
 
     Args:
-        sharded_state_dict: state dict possibly containing ShardedTensor and ShardedTensorFactory objects
+        sharded_state_dict:
+            state dict possibly containing ShardedTensor and ShardedTensorFactory objects
 
     Returns:
         Tuple[ShardedStateDict, StateDict]: tuple of:
-            - state dict with all ShardedTensor and ShardedTensorFactory (keeping the original state dict structure)
+            - state dict with all ShardedTensor and ShardedTensorFactory
+              (keeping the original state dict structure)
             - state dict with all other objects (keeping the original state dict structure)
     """
     return extract_matching_values(
@@ -53,15 +93,17 @@ def extract_sharded_tensors_and_factories(
 def extract_sharded_tensors_or_nonpersistent(
     sharded_state_dict: ShardedStateDict,
 ) -> Tuple[ShardedStateDict, StateDict]:
-    """Extract a dict consisting of only ShardedTensor, ShardedTensorFactory and LocalNonpersistentObject
-    objects from a given state dict with any objects.
+    """Extract a dict consisting of only ShardedTensor, ShardedTensorFactory
+    and LocalNonpersistentObject objects from a given state dict with any objects.
 
     Args:
-        sharded_state_dict: state dict possibly containing ShardedTensor, ShardedTensorFactory and LocalNonpersistentObject objects
+        sharded_state_dict: state dict possibly containing ShardedTensor, ShardedTensorFactory
+        and LocalNonpersistentObject objects
 
     Returns:
         Tuple[ShardedStateDict, StateDict]: tuple of:
-            - state dict with all ShardedTensor, ShardedTensorFactory and LocalNonpersistentObject (keeping the original state dict structure)
+            - state dict with all ShardedTensor, ShardedTensorFactory and LocalNonpersistentObject
+              (keeping the original state dict structure)
             - state dict with all other objects (keeping the original state dict structure)
     """
     return extract_matching_values(
@@ -73,12 +115,34 @@ def extract_sharded_tensors_or_nonpersistent(
 def extract_sharded_base(
     sharded_state_dict: ShardedStateDict,
 ) -> Tuple[ShardedStateDict, StateDict]:
+    """Extract a dict consisting of only ShardedBase from a given state dict with any objects.
+
+    Args:
+        sharded_state_dict: state dict possibly containing ShardedBase objects
+
+    Returns:
+        Tuple[ShardedStateDict, StateDict]: tuple of:
+            - state dict with all ShardedBase objects (keeping the original state dict structure)
+            - state dict with all other objects (keeping the original state dict structure)
+    """
     return extract_matching_values(sharded_state_dict, lambda v: isinstance(v, ShardedBase))
 
 
 def extract_nonpersistent(
     sharded_state_dict: ShardedStateDict,
 ) -> Tuple[ShardedStateDict, StateDict]:
+    """Extract a dict consisting of only LocalNonpersistentObjects from a given state dict.
+
+    Args:
+        sharded_state_dict: state dict possibly containing LocalNonpersistentObjects
+
+    Returns:
+        Tuple[ShardedStateDict, StateDict]: tuple of:
+            - state dict with all LocalNonpersistentObjects
+              (keeping the original state dict structure)
+            - state dict with all other objects (keeping the original state dict structure)
+    """
+
     return extract_matching_values(
         sharded_state_dict, lambda v: isinstance(v, LocalNonpersistentObject)
     )
@@ -134,7 +198,8 @@ def apply_prefix_mapping(sharded_state_dict: ShardedStateDict, prefix_map: Dict[
 
     Args:
         sharded_state_dict (ShardedStateDict): sharded state dict to replace keys in
-        prefix_map (Dict[str, str]): map of old->new prefixes. The first matching prefix for each key is used
+        prefix_map (Dict[str, str]):
+            map of old->new prefixes. The first matching prefix for each key is used
 
     Returns:
         None: state dict is modified in place

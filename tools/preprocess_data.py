@@ -1,5 +1,3 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
-
 """Processing large data for pretraining."""
 import argparse
 import math
@@ -17,12 +15,14 @@ import multiprocessing
 try:
     import nltk
     from nltk.tokenize.punkt import PunktLanguageVars
+    from nltk.tokenize import sent_tokenize
     nltk_available = True
 except ImportError:
     PunktLanguageVars = object  # Fallback to the built-in object class
     nltk_available = False
 
 from megatron.training.tokenizer import build_tokenizer
+from megatron.training.arguments import _add_tokenizer_args
 from megatron.core.datasets import indexed_dataset
 
 
@@ -43,6 +43,11 @@ class IdentitySplitter(object):
     def tokenize(self, *text):
         return text
 
+class NltkSentenceSplitter(object):
+    def tokenize(self, *text):
+        tokenized_text = sent_tokenize(*text)
+        return tokenized_text
+
 
 class Encoder(object):
     def __init__(self, args):
@@ -61,14 +66,17 @@ class Encoder(object):
             else:
                 library = os.path.join("tokenizers", "punkt", f"{self.args.lang}.pickle")
                 url = f"nltk:{library}"
-            splitter = nltk.load(url)
-            if self.args.keep_newlines:
-                # this prevents punkt from eating newlines after sentences
-                Encoder.splitter = nltk.tokenize.punkt.PunktSentenceTokenizer(
-                    train_text = splitter._params,
-                    lang_vars = CustomLanguageVars())
-            else:
-                Encoder.splitter = splitter
+            try:
+                splitter = nltk.load(url)
+                if self.args.keep_newlines:
+                    # this prevents punkt from eating newlines after sentences
+                    Encoder.splitter = nltk.tokenize.punkt.PunktSentenceTokenizer(
+                        train_text = splitter._params,
+                        lang_vars = CustomLanguageVars())
+                else:
+                    Encoder.splitter = splitter
+            except:
+                Encoder.splitter = NltkSentenceSplitter()
 
         else:
             Encoder.splitter = IdentitySplitter()
@@ -188,6 +196,7 @@ class Partition(object):
 
 def get_args():
     parser = argparse.ArgumentParser()
+    parser = _add_tokenizer_args(parser)
     group = parser.add_argument_group(title='input data')
     group.add_argument('--input', type=str, required=True,
                        help='Path to input JSON')
@@ -197,22 +206,7 @@ def get_args():
                        help='Split documents into sentences.')
     group.add_argument('--keep-newlines', action='store_true',
                        help='Keep newlines between sentences when splitting.')
-
-    group = parser.add_argument_group(title='tokenizer')
-    group.add_argument('--tokenizer-type', type=str, required=True,
-                       choices=['BertWordPieceLowerCase','BertWordPieceCase',
-                                'GPT2BPETokenizer', 'SentencePieceTokenizer',
-                                'GPTSentencePieceTokenizer', 'Llama2Tokenizer',
-                                'Llama3Tokenizer', 'MistralTokenizer', 'NullTokenizer'],
-                       help='What type of tokenizer to use.')
-    group.add_argument('--tokenizer-model', type=str, default=None,
-                       help='YTTM tokenizer model.')
-    group.add_argument('--vocab-file', type=str, default=None,
-                       help='Path to the vocab file')
-    group.add_argument('--vocab-size', default=786,
-                       help='size of vocab for use with NullTokenizer')
-    group.add_argument('--merge-file', type=str, default=None,
-                       help='Path to the BPE merge file (if necessary).')
+    group = parser.add_argument_group(title='tokenization process')
     group.add_argument('--append-eod', action='store_true',
                        help='Append an <eod> token to the end of a document.')
     group.add_argument('--lang', type=str, default='english',
@@ -220,7 +214,6 @@ def get_args():
     group = parser.add_argument_group(title='output data')
     group.add_argument('--output-prefix', type=str, required=True,
                        help='Path to binary output file without suffix')
-
     group = parser.add_argument_group(title='runtime')
     group.add_argument('--workers', type=int, required=True,
                        help=('Number of worker processes to launch.'

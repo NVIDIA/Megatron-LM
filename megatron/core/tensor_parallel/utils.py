@@ -6,12 +6,12 @@ from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.parallel_state import (
-    get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
-from megatron.core.utils import divide
+from megatron.core.utils import divide, is_torch_min_version
+
+if is_torch_min_version("1.13.0"):
+    dist_all_gather_func = torch.distributed.all_gather_into_tensor
+else:
+    dist_all_gather_func = torch.distributed._all_gather_base
 
 
 def split_tensor_along_last_dim(
@@ -88,9 +88,7 @@ def gather_split_1d_tensor(tensor):
         gathered = torch.empty(
             numel_gathered, dtype=tensor.dtype, device=get_current_device(), requires_grad=False
         )
-        torch.distributed.all_gather_into_tensor(
-            gathered, tensor, group=parallel_state.get_tensor_model_parallel_group()
-        )
+        dist_all_gather_func(gathered, tensor, group=parallel_state.get_tensor_model_parallel_group())
     return gathered
 
 
@@ -105,6 +103,7 @@ class VocabUtility:
     def vocab_range_from_per_partition_vocab_size(
         per_partition_vocab_size: int, rank, world_size: int
     ) -> Sequence[int]:
+        """Vocab range from per partition vocab size."""
         index_f = rank * per_partition_vocab_size
         index_l = index_f + per_partition_vocab_size
         return index_f, index_l
@@ -113,6 +112,7 @@ class VocabUtility:
     def vocab_range_from_global_vocab_size(
         global_vocab_size: int, rank: int, world_size: int
     ) -> Sequence[int]:
+        """Vocab range from global vocab size."""
         per_partition_vocab_size = divide(global_vocab_size, world_size)
         return VocabUtility.vocab_range_from_per_partition_vocab_size(
             per_partition_vocab_size, rank, world_size

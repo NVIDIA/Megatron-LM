@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_xla_model
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.serialization import get_default_save_sharded_strategy
@@ -15,7 +16,9 @@ from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQu
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+xm = get_xla_model()
+
+@pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
 class TestCachedMetadata:
     def setup_method(self, method):
         pass

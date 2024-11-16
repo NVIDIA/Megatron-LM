@@ -457,7 +457,7 @@ def _validate_sharding_for_key_flattened(tensors_by_shard):
     starts, stops = map(np.asarray, zip(*sorted(all_slices)))
     if (
         starts[0] != 0
-        or stops[-1] != np.product(local_shape)
+        or stops[-1] != np.prod(local_shape)
         or not np.all(starts[1:] == stops[:-1])
     ):
         logger.error(

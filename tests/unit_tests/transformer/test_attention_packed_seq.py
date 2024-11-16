@@ -28,6 +28,22 @@ def make_test_packed_seq_params(sequence_length):
     )
     return packed_seq_params
 
+def make_test_packed_padded_seq_params(sequence_length):
+    cu_seqlens = torch.IntTensor([0, 18, 44, 52, 96, 118]).to(device=get_current_device())
+    cu_seqlens_padded = torch.IntTensor([0, 20, 48, 56, 100, sequence_length]).to(device=get_current_device())
+    seqlens = cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
+    max_seqlen, _ = seqlens.max(dim=0, keepdim=True)
+    packed_seq_params = PackedSeqParams(
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+        qkv_format='thd',
+    )
+    return packed_seq_params
+
 
 class TestParallelAttentionWithPackedSequence:
 
@@ -124,6 +140,32 @@ class TestParallelAttentionWithPackedSequence:
         output, bias = checkpointed_parallel_attention(hidden_states, attention_mask, packed_seq_params=packed_seq_params)
 
         assert config.recompute_granularity == 'selective'
+        assert output.shape[0] == sequence_length
+        assert output.shape[1] == micro_batch_size
+        assert output.shape[2] == config.hidden_size
+        assert bias.shape[0] == config.hidden_size
+
+# Note: this test requires TE >= 1.8 as well as cuDNN FusedAttention to run
+class TestParallelAttentionWithPackedPaddedSequence(TestParallelAttentionWithPackedSequence):
+
+    def test_gpu_forward(self):
+
+        config = self.parallel_attention.config
+        sequence_length = 128
+        micro_batch_size = 1
+
+        self.parallel_attention.to(device=get_current_device())
+
+        # [sequence length, batch size, hidden size]
+        hidden_states = torch.ones((sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size))
+        hidden_states = hidden_states.to(device=get_current_device()).to(torch.bfloat16)
+
+        attention_mask = None
+
+        packed_seq_params = make_test_packed_padded_seq_params(sequence_length)
+        output, bias = self.parallel_attention(hidden_states, attention_mask, packed_seq_params=packed_seq_params)
+
+        assert config.recompute_granularity is None
         assert output.shape[0] == sequence_length
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == config.hidden_size

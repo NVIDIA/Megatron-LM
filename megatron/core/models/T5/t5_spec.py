@@ -13,19 +13,15 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_block import (
-    TransformerBlockSubmodules,
-    get_num_layers_to_build,
-)
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
 try:
-    from megatron.core.transformer.custom_layers.transformer_engine import (
+    from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
-        TENorm,
+        TENorm as WrappedTorchLayerNorm,
         TERowParallelLinear,
     )
 
@@ -39,20 +35,19 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    import apex
+    import apex  # pylint: disable=unused-import
 
-    from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+    from megatron.core.fusions.fused_layer_norm import WrappedTorchLayerNorm
 
     HAVE_APEX = True
-    LNImpl = FusedLayerNorm
+    LNImpl = WrappedTorchLayerNorm
 except ImportError:
     import warnings
 
     from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
-    if torch.cuda.is_available():
-        warnings.warn('Apex is not installed. Falling back to Torch LayerNorm')
-    LNImpl = WrappedTorchLayerNorm
 
+    warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
+    LNImpl = WrappedTorchLayerNorm
 
 def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
     """T5 encoder TE spec (uses Transformer Engine components)."""
@@ -65,7 +60,7 @@ def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
         submodules=TransformerLayerSubmodules(
             self_attention=ModuleSpec(
                 module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.padding},
+                params={"attn_mask_type": AttnMaskType.arbitrary},
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=TELayerNormColumnParallelLinear,
                     core_attention=TEDotProductAttention,
@@ -107,9 +102,10 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_cross_attn_layernorm=TENorm,
+            pre_cross_attn_layernorm=WrappedTorchLayerNorm,
             cross_attention=ModuleSpec(
                 module=CrossAttention,
+                params={"attn_mask_type": AttnMaskType.arbitrary},
                 submodules=CrossAttentionSubmodules(
                     linear_q=TEColumnParallelLinear,
                     linear_kv=TEColumnParallelLinear,
@@ -138,7 +134,7 @@ def encoder_model_with_local_spec() -> ModuleSpec:
             input_layernorm=LNImpl,
             self_attention=ModuleSpec(
                 module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.padding},
+                params={"attn_mask_type": AttnMaskType.arbitrary},
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=ColumnParallelLinear,
                     core_attention=DotProductAttention,
@@ -186,6 +182,7 @@ def decoder_model_with_local_spec() -> ModuleSpec:
             pre_cross_attn_layernorm=LNImpl,
             cross_attention=ModuleSpec(
                 module=CrossAttention,
+                params={"attn_mask_type": AttnMaskType.arbitrary},
                 submodules=CrossAttentionSubmodules(
                     linear_q=ColumnParallelLinear,
                     linear_kv=ColumnParallelLinear,
@@ -220,7 +217,7 @@ def get_t5_encoder_with_transformer_engine_block_spec(
     """
 
     layer_spec = encoder_model_with_transformer_engine_default_spec()
-    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=TENorm)
+    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=WrappedTorchLayerNorm)
     return block_spec
 
 
@@ -234,7 +231,7 @@ def get_t5_decoder_with_transformer_engine_block_spec(
     """
 
     layer_spec = decoder_model_with_transformer_engine_default_spec()
-    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=TENorm)
+    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=WrappedTorchLayerNorm)
     return block_spec
 
 
@@ -246,7 +243,7 @@ def get_t5_encoder_with_local_block_spec(num_layers: int) -> TransformerBlockSub
     """
 
     layer_spec = encoder_model_with_local_spec()
-    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=TENorm)
+    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=WrappedTorchLayerNorm)
     return block_spec
 
 
@@ -258,5 +255,5 @@ def get_t5_decoder_with_local_block_spec(num_layers: int) -> TransformerBlockSub
     """
 
     layer_spec = decoder_model_with_local_spec()
-    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=TENorm)
+    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=WrappedTorchLayerNorm)
     return block_spec

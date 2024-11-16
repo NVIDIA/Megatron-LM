@@ -2,7 +2,9 @@
 
 import os
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Dict, Optional
+
+import torch.nn as nn
 
 from megatron.core import dist_checkpointing, parallel_state
 from megatron.training import get_args
@@ -18,8 +20,8 @@ except ImportError as e:
     raise ImportError("Required `\"nvidia-modelopt[torch]\"` is not installed!") from e
 
 
-def load_modelopt_state(load_dir: Optional[str] = None) -> Dict:
-    """Loading modelopt_state without a model.
+def load_modelopt_state(load_dir: Optional[str] = None, model: Optional[nn.Module] = None) -> Dict:
+    """Loading modelopt_state without loading the model.
 
     If --use-dist-ckpt, we try to load from the sharded modelopt_state. This will not load the model
     state_dict. Otherwise, if the checkpoint is not sharded, we load the base checkpoint (that
@@ -27,6 +29,7 @@ def load_modelopt_state(load_dir: Optional[str] = None) -> Dict:
 
     Args:
         load_dir: optionally provide a different loading path
+        model: required when loading a sharded checkpoint
     """
     args = get_args()
 
@@ -34,6 +37,8 @@ def load_modelopt_state(load_dir: Optional[str] = None) -> Dict:
         load_dir = args.load
 
     if args.use_dist_ckpt:
+        assert model is not None, "`model` argument required when `args.use_dist_ckpt is True`"
+
         # Read the tracker file and set the iteration.
         tracker_filename = os.path.join(load_dir, 'latest_checkpointed_iteration.txt')
         # If no tracker file, assuming that it is a .nemo checkpoint.
@@ -52,7 +57,8 @@ def load_modelopt_state(load_dir: Optional[str] = None) -> Dict:
             print_rank_0("Loading sharded modelopt_state ({})".format(modelopt_state_dir))
             modelopt_state = restore_modelopt_state_metadata(
                 dist_checkpointing.load(
-                    get_sharded_modelopt_state(args.num_layers), modelopt_state_dir,
+                    get_sharded_modelopt_state(args.num_layers), 
+                    modelopt_state_dir,
                     process_group=parallel_state.get_default_process_group()
                 )
             )

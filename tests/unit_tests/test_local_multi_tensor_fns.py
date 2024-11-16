@@ -1,5 +1,5 @@
 import copy
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, set_manual_seed
 
 import pytest
 import torch
@@ -15,7 +15,7 @@ def test_local_multi_tensor_l2_norm_and_scale():
     amp_C = pytest.importorskip("amp_C")
     multi_tensor_apply = pytest.importorskip("apex.multi_tensor_apply")
 
-    torch.manual_seed(42)
+    set_manual_seed(42)
 
     tensor_list = [torch.rand(5, 5).to(device=get_current_device()) for _ in range(10)]
     tensor_list_copy = copy.deepcopy(tensor_list)

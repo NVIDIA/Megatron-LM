@@ -61,6 +61,9 @@ Megatron-Core offers rich parallelism mappings, combining Expert Parallelism wit
 | --moe-token-drop-policy | The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped. |
 | --moe-layer-recompute | Enable activation checkpointing for moe_layer, should be used when memory is not sufficient. |
 | --moe-extended-tp | (Experimental) Alternative parallelization strategy for expert parallelism. Instead of distributing experts across *expert_model_parallel_size*, each expert is sharded along extendended tensor parallel domain (tensor_model_paralle_size * expert_model_parallel_size). It avoids the load balancing problem with MOE training. Only available with `--moe-token-dispatcher-type allgather`. |
+| --moe-shared-expert-intermediate-size | Set shared expert total ffn hidden size. It should be equal to `num_shared_experts * ffn_size_of_each_shared_expert` if there are multiple shared experts. None means no shared expert. |
+| --moe-shared-expert-overlap | (Experimental, may changed) If this is set, the communications/computations in the shared experts and the dispatcher will overlap (The `alltoall` dispatcher is needed.) Otherwise, the shared expert runs after the routed experts. |
+| --moe-use-upcycling | Load the dense model checkpoint, convert it into an MoE model at runtime and start training. The converted model will be saved to the path specified by `--save` before training begins. Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.|
 
 
 ## Usage
@@ -87,7 +90,8 @@ To enable the token drop mechanism, such as GShard and SwitchTransformer, includ
 ```
 
 The following figure illustrates differenting dropping strategies in MCore:
-![Token Droppling Strategies](../../../../docs/source/images/moe/token_drop.png)
+<!-- This image is uncommented for now as Sphinx cannot resolve this path. Sphinx imports this markdown file, and from the imported location this relative path does not exist anymore. Ideally, this markdown should not live here but rather in the `docs/` directory that Sphinx uses. -->
+<!-- ![Token Droppling Strategies](../../../../docs/source/images/moe/token_drop.png) -->
 
 1. The default dropless strategy will not drop or pad any token.
 2. By setting `--moe-expert-capacity-factor`, the tokens exceed the capacity of expert will be dropped based on their selected probabilities. 
@@ -97,7 +101,7 @@ The following figure illustrates differenting dropping strategies in MCore:
 
 ### Fine-tuning Mixtral Models
 Megatron-Core has full support for Mixtral MoE models, and we provide the checkpoint converter for Mixtral models from huggingface format to MCore format. 
-See more details in the [mixtral example](../../../../examples/mixtral/README.md).
+<!-- See more details in the [mixtral example](../../../../examples/mixtral/README.md). -->
 
 ### Distributed Checkpointing
 MCore v0.7 introduced fully parallel and asynchronous saving capabilities to distributed checkpointing, 
@@ -106,15 +110,58 @@ It also solved the problem of incompatibility between checkpoints of different p
 With the new distributed checkpointing solution, MCore can achieve flexible parallelism configurations by saving and loading the unified format checkpoints.
 Compared to native PyTorch solution, MCore achieves up to 50x reduction in checkpointing overhead.
 
-With MCore v0.8, MoE supports Distributed Checkpointing, which means users can save and load with any combination of parallelism and it is currently available, including expert parallel.
-1. Loading weight and distributed optimizer states with TPxPPxEP resharding is supported in version 0.8.
-2. GroupedMLP is also supported, including the ability to switch between GroupedMLP/SequentialMLP when loading and saving.
-    - When switching between GroupedMLP and SequentialMLP, loading distributed optimizer states is currently unsupported; this feature will be added in version 0.9.
-Besides these limitations, Distributed Checkpointing is fully functional.
+From MCore v0.8, MoE supports Distributed Checkpointing, which means users can save and load with any combination of parallelism and it is currently available, including expert parallel.
+1. Loading weight and distributed optimizer states with TPxCPxEPxPP resharding with SequentialMLP is supported in version 0.8.
+2. GroupedMLP weight resharding is supported in version 0.8.0 and optimizer state resharding is supported in version 0.10.0. Switching between GroupedMLP/SequentialMLP when loading and saving is partially supported.
+3. TEGroupedMLP has fully support on distributed checkpointing and is fully exchangable with SequentialMLP in version 0.9.0.
+4. Optimizer state resharding cannot do across EP=1 with EP>1 due to the different optimizer type.
 
 Usage
-- `--use-dist-ckpt` The main argument, it will attempt to save and load using distributed checkpointing.
+- `--ckpt-format torch_dist` The main argument, it will attempt to save and load using distributed checkpointing.
 - `--auto-detect-ckpt-format` With this, it can load both distributed checkpointing and legacy checkpointing.
+
+Checkpoint compatibility across SequentialMLP, GroupedMLP, and TEGroupedMLP:
+```text
+    ┌───────────────┐          ┌───────────────┐          ┌───────────────┐     
+    │   GroupedMLP  │          │ SequentialMLP │          │ TEGroupedMLP  │     
+    │               │          │               │          │               │     
+    │               │          │               │          │               │     
+    │ ┌───────────┐ │          │ ┌───────────┐ │          │ ┌───────────┐ │     
+    │ │legacy ckpt│ │          │ │legacy ckpt│ │          │ │legacy ckpt│ │     
+    │ └─────┬─────┘ │          │ └─────┬─────┘ │          │ └─────┬─────┘ │     
+    │       ▼       │          │       ▼       │          │       ▼       │     
+    │  ┌─────────┐  │          │  ┌─────────┐  │          │  ┌─────────┐  │     
+    │  │dist ckpt│  │          │  │dist ckpt│  │          │  │dist ckpt│  │     
+┌──►│  │ weight  │  │◄────────►│  │ weight  │  │◄────────►│  │ weight  │  │◄──┐ 
+│   │  └─────────┘  │          │  └─────────┘  │          │  └─────────┘  │   │ 
+└───┼───────────────┼──────────┼───────────────┼──────────┼───────────────┼───┘ 
+    │┌─────────────┐│          │┌─────────────┐│          │┌─────────────┐│     
+    ││  dist ckpt  ││          ││  dist ckpt  ││          ││  dist ckpt  ││     
+    ││optim states ││          ││optim states ││◄────────►││optim states ││     
+    │└─────────────┘│          │└─────────────┘│          │└─────────────┘│     
+    └───────────────┘          └───────────────┘          └───────────────┘     
+```
+
+Best practices for distributed checkpointing:
+1. Convert a legacy checkpoint to a distributed checkpoint. To achieve this, we can add both `--ckpt-format torch_dist --auto-detect-ckpt-format`, then it will load the legacy one and save as the distributed checkpoint format later when the training progress tries to save checkpoints.
+2. Convert checkpoint of the legacy GroupedMLP to TEGroupedMLP. This is only supported for the weight parts. To achieve this, we can use the above method to convert the legacy checkpoint to a distributed checkpoint of the legacy GroupedMLP. After updating the libraries and using TEGroupedMLP, we can directly load the previously saved checkpoint by adding argument `--no-load-optim`.
+
+### Shared Experts
+MCore v0.9 introduced the shared expert feature. We can enable this feature by setting suitable `--moe-shared-expert-intermediate-size`.
+
+The parallelism patterns of the shared experts follow the settings of the dense part, i.e., the attention module. The shared experts are not distributed but replicated in EP ranks.
+
+We also have an experimental feature that tries to overlap the communications and computations in the shared experts and the dispatcher.
+We can set `--moe-shared-expert-overlap` and use `alltoall` dispatcher to enable it.
+The overlapping relies on the envirionment setting `CUDA_DEVICE_MAX_CONNECTIONS=1`.
+The `AllGather` and `ReduceScatter` communications in the shared experts are overlapped with `permute`/`unpermute` in the dispatcher.
+The `MLP` computation part in the shared experts are overlapped with the `AlltoAll` communications in the dispatcher.
+Both the forward and the backward pass can overlap. But to get the overlapping in the backward pass, the PyTorch version should `>= 2.2.0`.
+
+### Upcycling
+Use `--moe-use-upcycling` to enable the upcycling feature, which will load the dense model from the directory specified by `--load`, convert it into an MoE model at runtime and start training. The converted model will be saved to the path specified by `--save` before training begins. Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.
+
+The MoE model structure is defined through script arguments. All MoE-related arguments (such as `--num-experts`) can be customized; however, other model structure arguments must be consistent with those of the dense model.
 
 ## MoE training example:
 <details>
@@ -241,7 +288,7 @@ torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
 
 # Performance Best Practice
 
-### Tuning Guide of Paralell Mappings
+### Tuning Guide of Parallel Mappings
 
 To find a good parallel mapping that help you achieve a high throughput of a new model, there are some general rule that could help. Here is an overview of properties in different aspects for each parallel strategy.
 

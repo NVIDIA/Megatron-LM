@@ -1,6 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import pytest
 import torch
 
@@ -11,6 +11,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
+xm = get_xla_model()
 
 class TestTop2Router:
     def setup_method(self, method):
@@ -45,7 +46,8 @@ class TestTop2Router:
         num_weights = sum([p.numel() for p in self.router.parameters()])
         assert num_weights == 12 * 4, num_weights
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
+    @pytest.mark.internal
     @pytest.mark.parametrize("moe_router_pre_softmax", [(True), (False)])
     def test_router_forward(self, moe_router_pre_softmax):
         with torch.no_grad():
@@ -56,7 +58,8 @@ class TestTop2Router:
             hidden_states = hidden_states.to(device=get_current_device())
             scores, indices = self.router(hidden_states)
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
+    @pytest.mark.internal
     def test_aux_loss(self):
         self.sequential_mlp = self.sequential_mlp.to(device=get_current_device())
         

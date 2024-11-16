@@ -28,6 +28,7 @@ MANDATORY_VARS=(
     "TENSORBOARD_PATH"
     "CHECKPOINT_PATH"
     "DATA_PATH"
+    "RUN_NUMBER"
 )
 for mandatory_var in "${MANDATORY_VARS[@]}"; do
     if [[ -z "${!mandatory_var}" ]]; then
@@ -37,8 +38,20 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
 done
 
 # Envsubst model_params
-cat $TRAINING_PARAMS_PATH | envsubst >$TRAINING_PARAMS_PATH.tmp
+cat $TRAINING_PARAMS_PATH | envsubst "$(env | cut -d= -f1 | sed -e 's/^/$/')" >$TRAINING_PARAMS_PATH.tmp
 mv $TRAINING_PARAMS_PATH.tmp $TRAINING_PARAMS_PATH
+
+# Pull env vars to export
+ENV_VARS=$(yq '... comments="" | .ENV_VARS | to_entries | .[] | [.key + "=" + .value] | join(" ")' $TRAINING_PARAMS_PATH)
+while IFS= read -r ARGUMENT; do
+    KEY=$(echo $ARGUMENT | cut -f1 -d=)
+
+    KEY_LENGTH=${#KEY}
+    VALUE="${ARGUMENT:$KEY_LENGTH+1}"
+
+    export "$KEY"="$VALUE"
+    echo "$KEY=$VALUE"
+done <<< "$ENV_VARS"
 
 # Run before script
 SCRIPT=$(cat $TRAINING_PARAMS_PATH | yq '.BEFORE_SCRIPT')
@@ -52,24 +65,21 @@ if [[ $(echo "$TRAINING_SCRIPT_PATH" | tr '[:upper:]' '[:lower:]') == *nemo* ]];
     TRAINING_PARAMS_FROM_CONFIG=$(yq '... comments="" | .MODEL_ARGS | to_entries | .[] | with(select(.value == "true"); .value = "") | [.key + "=" + .value] | join("")' $TRAINING_PARAMS_PATH | tr '\n' ' ')
 
 else
-    TRAINING_PARAMS_FROM_CONFIG=$(yq '... comments="" | .MODEL_ARGS | to_entries | .[] | with(select(.value == "true"); .value = "") | [.key + " " + .value] | join("")' $TRAINING_PARAMS_PATH | tr '\n' ' ')
+    # If this is a second run (of checkpoint-resume), we might want to use a 
+    # different model configuration than during first time. So if key `MODEL_ARGS_2`
+    # exists we use it, otherwise we use the same as for the first run.
+    if [[ $RUN_NUMBER -eq 2 && $(yq 'has("MODEL_ARGS_2")' $TRAINING_PARAMS_PATH) == true ]]; then
+        export KEY="MODEL_ARGS_2"
+    else
+        export  KEY="MODEL_ARGS"
+    fi
+
+    TRAINING_PARAMS_FROM_CONFIG=$(yq '... comments="" | .[env(KEY)] | to_entries | .[] | with(select(.value == "true"); .value = "") | [.key + " " + .value] | join("")' $TRAINING_PARAMS_PATH | tr '\n' ' ')
     PARAMS="--exit-duration-in-mins $((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60 - 15))"
 fi
 
 # Extract training params
 PARAMS="$PARAMS $TRAINING_PARAMS_FROM_CONFIG"
-
-# Pull env vars to export
-ENV_VARS=$(yq '... comments="" | .ENV_VARS | to_entries | .[] | [.key + "=" + .value] | join(" ")' $TRAINING_PARAMS_PATH)
-for ARGUMENT in $ENV_VARS; do
-    KEY=$(echo $ARGUMENT | cut -f1 -d=)
-
-    KEY_LENGTH=${#KEY}
-    VALUE="${ARGUMENT:$KEY_LENGTH+1}"
-
-    export "$KEY"="$VALUE"
-    echo "$KEY=$VALUE"
-done
 
 # Set PYTHONPATH
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"

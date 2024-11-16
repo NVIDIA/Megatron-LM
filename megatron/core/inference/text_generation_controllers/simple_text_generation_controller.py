@@ -16,15 +16,18 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 xm = get_xla_model()
 
 class SimpleTextGenerationController:
+    """The basic text generation controller
+
+    This class is responsible for tokenizing the input , running the inference, sampling
+    and also detokenizing the output
+
+    Args:
+        inference_wrapped_model (AbstractModelInferenceWrapper): A model that
+            is wrapped using the specs given in the abstract_model_inference_wrapper.py
+        tokenizer (_type_): Tokenizer used for tokenizing and detokenizing the prompts
+    """
+
     def __init__(self, inference_wrapped_model: AbstractModelInferenceWrapper, tokenizer):
-        """The basic text generation controller
-
-        This class is responsible for tokenizing the input , running the inference, sampling and also detokenizing the output
-
-        Args:
-            inference_wrapped_model (AbstractModelInferenceWrapper): A model that is wrapped using the specs given in the abstract_model_inference_wrapper.py
-            tokenizer (_type_): Tokenizer used for tokenizing and detokenizing the prompts
-        """
         self.inference_wrapped_model = inference_wrapped_model
         self.tokenizer = tokenizer
 
@@ -33,7 +36,9 @@ class SimpleTextGenerationController:
             parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
         )
 
-    def tokenize_prompt(self, prompt: str) -> Tuple[torch.Tensor, torch.Tensor]:
+    def tokenize_prompt(
+        self, prompt: str, add_BOS: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Utility to tokenize the input prompts
 
         Args:
@@ -42,13 +47,19 @@ class SimpleTextGenerationController:
         Returns:
             torch.Tensor: Returns the tokenized prompt
         """
-        return self.tokenizer.tokenize(prompt)
+        prompt_tokens = self.tokenizer.tokenize(prompt)
+
+        if add_BOS:
+            prompt_tokens = [self.tokenizer.bos] + prompt_tokens
+
+        return prompt_tokens
 
     def detokenize_generations(self, prompt_tokens_with_generated_tokens: torch.Tensor) -> str:
         """Detokenize the output generations
 
         Args:
-            prompt_tokens_with_generated_tokens (torch.Tensor): The input prompt tokens plus the generated tokens
+            prompt_tokens_with_generated_tokens (torch.Tensor): The input prompt
+            tokens plus the generated tokens
 
         Returns:
             str: The detokenized output
@@ -64,11 +75,15 @@ class SimpleTextGenerationController:
     ) -> torch.Tensor:
         """Samples the logits to generate outputs
 
-        Given the logits of the last token, this function samples it according to the parameters defined in common_inference_params and returns the samples
+        Given the logits of the last token, this function samples it
+        according to the parameters defined in common_inference_params
+        and returns the samples
 
         Args:
-            last_token_logits (torch.Tensor): The last token logits. A tensor of size [batch_size, vocab_size]
-            common_inference_params (CommonInferenceParams): The paramters to use for inference
+            last_token_logits (torch.Tensor): The last token logits. A tensor of
+                size [batch_size, vocab_size]
+            common_inference_params (CommonInferenceParams): The paramters to use
+                for inference
             vocab_size (int): Obtained from the tokenizer. Defaults to None
 
         Returns:
@@ -143,23 +158,35 @@ class SimpleTextGenerationController:
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Checks which prompts have reached an end condition
 
-        We check which prompts have reached an end condition and set the corresponding flags of the is_generation_done_tensor to True. The generated sequence lengths increase as we keep generating, until that prompts hits an end condition. The generation_started tensor determines which prompts have started generating.
+        We check which prompts have reached an end condition and set the corresponding
+        flags of the is_generation_done_tensor to True. The generated sequence lengths
+        increase as we keep generating, until that prompts hits an end condition. The
+        generation_started tensor determines which prompts have started generating.
 
         Args:
-            updated_prompts_tokens (torch.Tensor): The prompts tokens updated with the latest generated tokens. A tensor of shape [batch_size, max_seq_len] (i.e max_seq_len = max_prompt_len + tokens_to_generate)
-            generation_started (torch.Tensor): A boolean tensor of shape [batch_size]. True indicates the prompt at that index has started generating tokens.
-            current_context_end_position (int): An integer indicating which position to extract from the prompts tokens to get the latest generated tokens.
-            is_generation_done_tensor (torch.Tensor): A boolean tensor of shape [batch_size]. True indicates the prompt at that index has reached end condition.
-            generated_sequence_lengths (torch.Tensor): A int tensor of shape [batch_size]. Each value represents the generated sequence lengths for that prompt.
+            updated_prompts_tokens (torch.Tensor): The prompts tokens updated with the latest
+                generated tokens. A tensor of shape [batch_size, max_seq_len]
+                (i.e max_seq_len = max_prompt_len + tokens_to_generate)
+            generation_started (torch.Tensor): A boolean tensor of shape [batch_size]. True
+                indicates the prompt at that index has started generating tokens.
+            current_context_end_position (int): An integer indicating which position to
+                extract from the prompts tokens to get the latest generated tokens.
+            is_generation_done_tensor (torch.Tensor): A boolean tensor of shape [batch_size].
+                True indicates the prompt at that index has reached end condition.
+            generated_sequence_lengths (torch.Tensor): A int tensor of shape [batch_size].
+                Each value represents the generated sequence lengths for that prompt.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Returns the boolean is_generation_done_tensor and the generated_sequence_lengths after updating it
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Returns the boolean
+                is_generation_done_tensor and the generated_sequence_lengths after updating it
         """
         latest_samples = updated_prompts_tokens[:, current_context_end_position]
-        # Make sure we are checking eod criterion only for prompts that have started generating (i.e) We only look at the generated tokenns and not the input tokens.
+        # Make sure we are checking eod criterion only for prompts that have started generating
+        # (i.e) We only look at the generated tokenns and not the input tokens.
         reached_eod = (latest_samples == self.tokenizer.eod) & generation_started
         is_generation_done_tensor = is_generation_done_tensor | reached_eod
-        # We increment generated sequence lengths when that prompt has not hit the EOD and generation has started
+        # We increment generated sequence lengths when that prompt has not hit the
+        # EOD and generation has started
         generated_sequence_lengths += ~is_generation_done_tensor & generation_started
 
         return is_generation_done_tensor, generated_sequence_lengths
@@ -180,7 +207,9 @@ class SimpleTextGenerationController:
             num_tokens_togenerate (int): The number of tokens to generate for each prompt
 
         Returns:
-            torch.Tensor: A torch tensor of shape [bs, max_seq_len] (i.e) max_seq_len = max_prompt_length_in_batch + num_tokens_to_generate, with extra indices for each tensor padded with mask id.
+            torch.Tensor: A torch tensor of shape [bs, max_seq_len] (i.e)
+            max_seq_len = max_prompt_length_in_batch + num_tokens_to_generate,
+            with extra indices for each tensor padded with mask id.
         """
         max_seq_len = max_prompt_length_in_batch + num_tokens_to_generate
 
@@ -195,13 +224,16 @@ class SimpleTextGenerationController:
     ) -> OrderedDict[int, InferenceRequest]:
         """Utility to generate the output tokens and probabilities for the prompts
 
-        This utility generates the output tokens for a dynamic batch. It will run one forward step at a time, and pass control back to the engine, which will update the request pool and call this method again.
+        This utility generates the output tokens for a dynamic batch. It will run one forward step
+        at a time, and pass control back to the engine, which will update the request pool and call
+        this method again.
 
         Args:
             active_requests (OrderedDict[int, InferenceRequest]): The input active requests.
 
         Returns:
-            OrderedDict[int, InferenceRequest]: The result for each of the incoming requests after running one forward step.
+            OrderedDict[int, InferenceRequest]: The result for each of the incoming requests
+            after running one forward step.
         """
         raise Exception("Not implemented yet")
 
@@ -210,7 +242,9 @@ class SimpleTextGenerationController:
     ) -> OrderedDict[int, InferenceRequest]:
         """Utility to generate the all the output tokens and probabilities for the prompts .
 
-        This utility generates the output tokens for a static batch. It runs the forward steps till all prompts complete generation, updates the status of these requests to completed, adds the generated result and returns these requests
+        This utility generates the output tokens for a static batch. It runs the forward steps till
+        all prompts complete generation, updates the status of these requests to completed, adds
+        the generated result and returns these requests
 
         Args:
             active_requests (OrderedDict[int, InferenceRequest]): The input active requests.
@@ -254,8 +288,9 @@ class SimpleTextGenerationController:
         generated_sequence_lengths = torch.zeros(batch_size).to(device=get_current_device())
 
         with torch.no_grad():
-            self.inference_wrapped_model.prep_model_for_inference(
-                prompts_tokens=batch_prompt_tokens
+
+            self.prep_model_for_inference(
+                prompts_tokens=batch_prompt_tokens, active_requests=active_requests
             )
 
             context_start_position = 0
@@ -277,14 +312,17 @@ class SimpleTextGenerationController:
                         tensor=logits,
                     )
 
-                # Indicates which of the input prompts have started generating tokens. A 1D boolean tensor with [batch_size] elements (i.e) The shortest prompts will start generating first and so on
+                # Indicates which of the input prompts have started generating tokens.
+                # A 1D boolean tensor with [batch_size] elements (i.e) The shortest
+                # prompts will start generating first and so on
                 generation_started = prompt_lengths_in_batch <= context_end_position
                 last_token_logits = logits[:, -1, :]
                 sampled_logits = self.sample_from_logits(
                     last_token_logits, common_inference_params, self.tokenizer.vocab_size
                 )
 
-                # Substitute the sampled logits only for only the prompts that have started generating tokens
+                # Substitute the sampled logits only for only the prompts that
+                # have started generating tokens
                 batch_prompt_tokens[generation_started, context_end_position] = sampled_logits[
                     generation_started
                 ]
@@ -304,7 +342,8 @@ class SimpleTextGenerationController:
 
                 context_start_position = context_end_position
 
-                # Check end of generation status for each tensor and update generated sequence lengths
+                # Check end of generation status for each tensor
+                # and update generated sequence lengths
                 (is_generation_done_tensor, generated_sequence_lengths) = (
                     self.update_generation_status(
                         updated_prompts_tokens=batch_prompt_tokens,
@@ -350,3 +389,14 @@ class SimpleTextGenerationController:
             request.generated_text = self.detokenize_generations(required_result_tokens)
 
         return active_requests
+
+    def prep_model_for_inference(
+        self, prompts_tokens: torch.Tensor, active_requests: OrderedDict[int, InferenceRequest]
+    ):
+        """Preparing batch for inference, using respective wrapper's prep_model_for_inference method
+
+        Args:
+            prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_sequence_length]
+            active_requests (OrderedDict[int, InferenceRequest]): The input active requests
+        """
+        self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=prompts_tokens)

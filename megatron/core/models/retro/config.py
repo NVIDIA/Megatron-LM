@@ -3,14 +3,11 @@
 """Configuration dataclass for a RetroModel."""
 
 import os
-import types
 from dataclasses import dataclass
-from importlib.metadata import PackageNotFoundError, version
-
-from pkg_resources import packaging
 import torch
 
 from megatron.core.transformer import TransformerConfig
+from megatron.core.utils import is_te_min_version
 
 
 @dataclass
@@ -68,20 +65,20 @@ class RetroConfig(TransformerConfig):
 
         # Validate Transformer Engine version.
         try:
-            te_version = packaging.version.Version(version("transformer-engine"))
-            if te_version >= packaging.version.Version("1.3"):
+            if is_te_min_version("1.3"):
                 try:
                     assert os.getenv("NVTE_FLASH_ATTN") == "0"
                     assert os.getenv("NVTE_FUSED_ATTN") == "0"
                 except Exception as e:
                     raise Exception(
-                        "When using Transformer Engine >= 1.3, environment vars NVTE_FLASH_ATTN and NVTE_FUSED_ATTN most both be defined and set to '0'. Currently, NVTE_FLASH_ATTN == %s, NVTE_FUSED_ATTN == %s."
+                        "When using Transformer Engine >= 1.3, environment vars NVTE_FLASH_ATTN "
+                        "and NVTE_FUSED_ATTN most both be defined and set to '0'. "
+                        "Currently, NVTE_FLASH_ATTN == %s, NVTE_FUSED_ATTN == %s."
                         % (
                             os.getenv("NVTE_FLASH_ATTN", "[unset]"),
                             os.getenv("NVTE_FUSED_ATTN", "[unset]"),
-                        )
-                    )
-        except PackageNotFoundError:
+                        ))
+        except ImportError:
             import warnings
             if torch.cuda.is_available():
                 warnings.warn("transformer-engine package is not installled")

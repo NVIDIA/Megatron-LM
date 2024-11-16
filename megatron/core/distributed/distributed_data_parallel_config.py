@@ -3,15 +3,6 @@
 from dataclasses import dataclass
 from typing import Optional
 
-HAVE_APEX_OR_TE = True
-try:
-    from transformer_engine.pytorch.optimizers import FusedAdam
-except ImportError:
-    try:
-        from apex.optimizers import FusedAdam
-    except ImportError:
-        HAVE_APEX_OR_TE = False
-
 @dataclass
 class DistributedDataParallelConfig:
     """Configuration for DistributedDataParallel."""
@@ -21,6 +12,14 @@ class DistributedDataParallelConfig:
 
     overlap_grad_reduce: bool = False
     """If true, overlap grad all-reduce / reduce-scatter with backward compute."""
+
+    overlap_param_gather: bool = False
+    """If true, overlap param all-gather with forward compute."""
+
+    align_param_gather: bool = False
+    """If true, all PP stages will launch param all-gathers simultaneously. Otherwise, each
+    PP stage will independently launch as needed.
+    """
 
     use_distributed_optimizer: bool = False
     """If true, issue reduce-scatter collectives to aggregate gradients and clean up
@@ -38,3 +37,7 @@ class DistributedDataParallelConfig:
     average_in_collective: bool = False
     """If true, compute average in collective directly, as opposed to dividing by the
        dp_size first and then computing sum in the collective."""
+
+    fp8_param_gather: bool = False
+    """If true, keep the compute param in fp8 (do not use any other intermediate dtype) and
+       perform the param all-gather in fp8."""

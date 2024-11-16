@@ -2,6 +2,7 @@
 
 
 import math
+from typing import Optional
 
 import torch
 from torch import Tensor
@@ -23,7 +24,8 @@ class DotProductAttention(MegatronModule):
     Region where selective activation recomputation is applied.
     This region is memory intensive but less compute intensive which
     makes activation checkpointing more efficient for LLMs (20B+).
-    See Reducing Activation Recomputation in Large Transformer Models: https://arxiv.org/abs/2205.05198 for more details.
+    See Reducing Activation Recomputation in Large Transformer Models:
+    https://arxiv.org/abs/2205.05198 for more details.
 
     We use the following notation:
      h: hidden size
@@ -40,6 +42,8 @@ class DotProductAttention(MegatronModule):
         attn_mask_type: AttnMaskType,
         attention_type: str,
         attention_dropout: float = None,
+        softmax_scale: float = None,
+        cp_comm_type: str = None,
     ):
         super().__init__(config=config)
 
@@ -67,10 +71,14 @@ class DotProductAttention(MegatronModule):
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
         coeff = None
-        self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
+        if softmax_scale is None:
+            self.softmax_scale = 1.0 / math.sqrt(self.hidden_size_per_attention_head)
+        else:
+            self.softmax_scale = softmax_scale
+
         if self.config.apply_query_key_layer_scaling:
             coeff = self.layer_number
-            self.norm_factor *= coeff
+            self.softmax_scale /= coeff
 
         self.scale_mask_softmax = FusedScaleMaskSoftmax(
             input_in_fp16=self.config.fp16,
@@ -96,8 +104,9 @@ class DotProductAttention(MegatronModule):
         value: Tensor,
         attention_mask: Tensor,
         attn_mask_type: AttnMaskType = None,
-        packed_seq_params: PackedSeqParams = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ):
+        """Forward."""
         assert packed_seq_params is None, (
             "Packed sequence is not supported by DotProductAttention."
             "Please use TEDotProductAttention instead."
@@ -126,8 +135,8 @@ class DotProductAttention(MegatronModule):
 
         # [sq, b, np, hn] -> [sq, b * np, hn]
         # This will be a simple view when doing normal attention, but in group query attention
-        # the key and value tensors are repeated to match the queries so you can't use simple strides
-        # to extract the queries.
+        # the key and value tensors are repeated to match the queries so you can't use
+        # simple strides to extract the queries.
         query = query.reshape(output_size[2], output_size[0] * output_size[1], -1)
         # [sk, b, np, hn] -> [sk, b * np, hn]
         key = key.view(output_size[3], output_size[0] * output_size[1], -1)
@@ -149,7 +158,7 @@ class DotProductAttention(MegatronModule):
             query.transpose(0, 1),  # [b * np, sq, hn]
             key.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
             beta=0.0,
-            alpha=(1.0 / self.norm_factor),
+            alpha=self.softmax_scale,
         )
 
         # change view to [b, np, sq, sk]

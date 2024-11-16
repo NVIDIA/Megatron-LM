@@ -22,11 +22,11 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 
 try:
-    from megatron.core.transformer.custom_layers.transformer_engine import (
+    from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TEDotProductAttention,
-        TENorm,
         TERowParallelLinear,
+        TENorm
     )
 
     HAVE_TE = True
@@ -39,7 +39,7 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    import apex
+    import apex  # pylint: disable=unused-import
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 
@@ -49,10 +49,9 @@ except ImportError:
     import warnings
 
     from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
-    if torch.cuda.is_available():
-        warnings.warn('Apex is not installed. Falling back to Torch LayerNorm')
-    LNImpl = WrappedTorchLayerNorm
 
+    warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
+    LNImpl = WrappedTorchLayerNorm
 
 def get_retro_encoder_layer_te_spec() -> ModuleSpec:
     """Retro encoder TE spec (uses Transformer Engine components).
@@ -82,7 +81,7 @@ def get_retro_encoder_layer_te_spec() -> ModuleSpec:
         ),
     )
     spec.submodules.cross_attn_bda = ModuleSpec(module=RetroEncoderBiasDropoutAdd)
-    spec.submodules.pre_mlp_layernorm = ModuleSpec(module=RetroEncoderLayerNorm, submodules=TENorm)
+    spec.submodules.pre_mlp_layernorm = ModuleSpec(module=RetroEncoderLayerNorm, submodules=LNImpl)
     spec.submodules.mlp = ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear),

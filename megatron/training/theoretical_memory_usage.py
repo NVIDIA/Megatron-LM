@@ -5,7 +5,15 @@
 
 import math
 
-from megatron.core.distributed import HAVE_APEX_OR_TE
+try:
+    import transformer_engine # pylint: disable=unused-import
+    HAVE_APEX_OR_TE = True
+except ImportError:
+    try: 
+        import apex # pylint: disable=unused-import
+        HAVE_APEX_OR_TE = True
+    except ImportError:
+        HAVE_APEX_OR_TE = False
 
 NUM_BYTES_IN_MEGABYTE = 1024 * 1024
 

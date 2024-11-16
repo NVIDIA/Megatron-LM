@@ -93,3 +93,30 @@ class TestMCoreEngine:
             ), f"Status should be completed but its {result.status}"
             assert result.generated_length > 0, f"Generated length should be greater than zero"
             assert result.generated_text is not None, f'Generated text should not be None'
+
+    def test_generate_empty_prompt(self):
+        self.mock_tokenizer.vocab_size = self.vocab_size
+        self.mock_tokenizer.eod = self.vocab_size - 1
+        self.mock_tokenizer.bos = self.vocab_size - 2
+        # Generating random length integer prompts
+        self.mock_tokenizer.tokenize.return_value = [
+            random.randint(0, self.vocab_size - 1) for _ in range(random.randint(5, 10))
+        ]
+        # Generates some random string
+        self.mock_tokenizer.detokenize.return_value = ''.join(
+            random.choices(string.ascii_letters, k=random.randint(4, 10))
+        )
+
+        prompts = ["" for i in range(self.batch_size)]
+        results: List[InferenceRequest] = self.mcore_engine.generate(
+            prompts,
+            add_BOS=True,
+            common_inference_params=CommonInferenceParams(num_tokens_to_generate=10),
+        )
+
+        for result in results:
+            assert (
+                result.status == Status.COMPLETED
+            ), f"Status should be completed but its {result.status}"
+            assert result.generated_length > 0, f"Generated length should be greater than zero"
+            assert result.generated_text is not None, f'Generated text should not be None'

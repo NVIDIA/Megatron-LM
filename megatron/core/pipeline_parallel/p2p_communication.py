@@ -1,8 +1,6 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
-import operator
-from functools import reduce
-from typing import Callable, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
@@ -200,8 +198,7 @@ def _p2p_ops(
     prev_pipeline_rank: int,
     next_pipeline_rank: int,
 ):
-    reqs = []
-    rank = get_pipeline_model_parallel_rank()
+    reqs = {}
     even_send_odd_recv_group = group
     if get_pipeline_model_parallel_world_size() == 2:
         # Use the global process group for one of the two p2p communications
@@ -217,50 +214,50 @@ def _p2p_ops(
             send_next_req = torch.distributed.isend(
                 tensor=tensor_send_next, dst=next_pipeline_rank, group=even_send_odd_recv_group
             )
-            reqs.append(send_next_req)
+            reqs["send_next"] = send_next_req
 
         if tensor_recv_prev is not None:
             recv_prev_req = torch.distributed.irecv(
                 tensor=tensor_recv_prev, src=prev_pipeline_rank, group=even_recv_odd_send_group
             )
-            reqs.append(recv_prev_req)
+            reqs["recv_prev"] = recv_prev_req
 
         if tensor_send_prev is not None:
             send_prev_req = torch.distributed.isend(
                 tensor=tensor_send_prev, dst=prev_pipeline_rank, group=even_send_odd_recv_group
             )
-            reqs.append(send_prev_req)
+            reqs["send_prev"] = send_prev_req
 
         if tensor_recv_next is not None:
             recv_next_req = torch.distributed.irecv(
                 tensor=tensor_recv_next, src=next_pipeline_rank, group=even_recv_odd_send_group
             )
-            reqs.append(recv_next_req)
+            reqs["recv_next"] = recv_next_req
 
     else:
         if tensor_recv_prev is not None:
             recv_prev_req = torch.distributed.irecv(
                 tensor=tensor_recv_prev, src=prev_pipeline_rank, group=even_send_odd_recv_group
             )
-            reqs.append(recv_prev_req)
+            reqs["recv_prev"] = recv_prev_req
 
         if tensor_send_next is not None:
             send_next_req = torch.distributed.isend(
                 tensor=tensor_send_next, dst=next_pipeline_rank, group=even_recv_odd_send_group
             )
-            reqs.append(send_next_req)
+            reqs["send_next"] = send_next_req
 
         if tensor_recv_next is not None:
             recv_next_req = torch.distributed.irecv(
                 tensor=tensor_recv_next, src=next_pipeline_rank, group=even_send_odd_recv_group
             )
-            reqs.append(recv_next_req)
+            reqs["recv_next"] = recv_next_req
 
         if tensor_send_prev is not None:
             send_prev_req = torch.distributed.isend(
                 tensor=tensor_send_prev, dst=prev_pipeline_rank, group=even_recv_odd_send_group
             )
-            reqs.append(send_prev_req)
+            reqs["send_prev"] = send_prev_req
     return reqs
 
 
@@ -383,7 +380,10 @@ def _communicate(
         assert not isinstance(prev_rank, list)
         prev_rank = [prev_rank]
 
-    reqs = []
+    if config.use_ring_exchange_p2p or config.batch_p2p_comm:
+        reqs = []
+    else:
+        reqs = {}
     tensor_recv_prev_list = []
     tensor_recv_next_list = []
 
@@ -419,20 +419,22 @@ def _communicate(
 
             group = get_default_process_group()
 
-        reqs.extend(
-            p2p_func(
-                tensor_send_prev=tensor_send_prev,
-                tensor_recv_prev=tensor_recv_prev,
-                tensor_send_next=tensor_send_next,
-                tensor_recv_next=tensor_recv_next,
-                group=group,
-                prev_pipeline_rank=pr,
-                next_pipeline_rank=nr,
-            )
+        p2p_reqs = p2p_func(
+            tensor_send_prev=tensor_send_prev,
+            tensor_recv_prev=tensor_recv_prev,
+            tensor_send_next=tensor_send_next,
+            tensor_recv_next=tensor_recv_next,
+            group=group,
+            prev_pipeline_rank=pr,
+            next_pipeline_rank=nr,
         )
+        if isinstance(p2p_reqs, list):
+            reqs.extend(p2p_reqs)
+        else:
+            reqs.update(p2p_reqs)
 
     if wait_on_reqs and len(reqs) > 0:
-        for req in reqs:
+        for req in reqs if isinstance(reqs, list) else reqs.values():
             req.wait()
         reqs = None
 
