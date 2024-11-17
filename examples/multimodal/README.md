@@ -31,7 +31,7 @@ python examples/multimodal/model_converter/clip_converter.py --download-root /so
 Update the paths to point to the mcore converted CLIP and Mistral models and run the following script to combine the Mistral and CLIP models into a single multimodal checkpoint folder:
 
 ```
-examples/multimodal/combine_mistral_clip.sh /path/to/mistral/model /path/to/clip/model /output/dir
+examples/multimodal/combine_lm_vision_checkpoints.sh /path/to/mistral/model /path/to/clip/model /output/dir
 ```
 
 ## Training

@@ -19,6 +19,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_global_ranks,
     get_context_parallel_group,
+    get_hierarchical_context_parallel_groups,
     get_tensor_and_expert_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
@@ -593,6 +594,15 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             if is_te_min_version("1.10.0"):
                 if cp_comm_type is None:
                     extra_kwargs["cp_comm_type"] = "p2p"
+                elif cp_comm_type == "a2a+p2p":
+                    assert is_te_min_version("1.12.0"), (
+                        f"Transformer-Engine v{get_te_version()} must be >= 1.12.0 to support"
+                        "hierarchical cp commucation."
+                    )
+                    extra_kwargs["cp_comm_type"] = "a2a+p2p"
+                    extra_kwargs["cp_group"] = get_hierarchical_context_parallel_groups(
+                        check_initialized=False
+                    )
                 else:
                     extra_kwargs["cp_comm_type"] = cp_comm_type
         else:

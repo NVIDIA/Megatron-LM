@@ -39,6 +39,14 @@ class ModelParallelConfig:
     context_parallel_size: int = 1
     """Splits network input along sequence dimension across GPU ranks."""
 
+    hierarchical_context_parallel_sizes: list[int] = None
+    """Degrees of the hierarchical context parallelism. Users should provide a list to specify 
+       the sizes for different levels. Taking the a2a+p2p cp comm type as example, it contains
+       groups of two levels, so the first value of the list indicates the group size of the a2a
+       communication type, and the second value indicates the group size of the p2p communication
+       type.
+    """
+
     expert_model_parallel_size: int = 1
     """Distributes Moe Experts across sub data parallel dimension."""
 

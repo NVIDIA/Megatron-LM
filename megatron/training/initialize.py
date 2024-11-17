@@ -290,6 +290,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
                 args.virtual_pipeline_model_parallel_size,
                 args.pipeline_model_parallel_split_rank,
                 context_parallel_size=args.context_parallel_size,
+                hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
                 expert_model_parallel_size=args.expert_model_parallel_size,
                 distributed_timeout_minutes=args.distributed_timeout_minutes,
                 nccl_communicator_config_path=args.nccl_communicator_config_path,
