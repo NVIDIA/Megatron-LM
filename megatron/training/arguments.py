@@ -169,6 +169,10 @@ def validate_args(args, defaults={}):
     # Set args.use_dist_ckpt from args.ckpt_format.
     update_use_dist_ckpt(args)
 
+
+    if args.encoder_pipeline_model_parallel_size == 0 and args.num_experts == 0:
+        assert args.encoder_tensor_model_parallel_size == args.tensor_model_parallel_size,  "If non-MOE encoder shares first decoder pipeline rank it must have the same TP as the decoder."
+
     if args.encoder_tensor_model_parallel_size > 0:
         assert args.encoder_pipeline_model_parallel_size > 0, "encoder_pipeline_model_parallel_size must be defined."
         assert args.num_attention_heads % args.encoder_tensor_model_parallel_size == 0
@@ -224,7 +228,7 @@ def validate_args(args, defaults={}):
     if "a2a+p2p" in args.cp_comm_type:
         assert args.hierarchical_context_parallel_sizes is not None, \
         "--hierarchical-context-parallel-sizes must be set when a2a+p2p is used in cp comm"
-        
+
     # Deprecated arguments
     assert args.batch_size is None, '--batch-size argument is no longer ' \
         'valid, use --micro-batch-size instead'
@@ -312,7 +316,7 @@ def validate_args(args, defaults={}):
             'Must use --overlap-param-gather with --overlap-grad-reduce'
         assert not args.use_legacy_models, \
             '--overlap-param-gather only supported with MCore models'
-        
+
     if getattr(args, "use_torch_fsdp2", False):
         assert get_torch_version() >= PkgVersion("2.4"), \
             'FSDP2 requires PyTorch >= 2.4.0 with FSDP 2 support.'
@@ -696,7 +700,7 @@ def _check_arg_is_not_none(args, arg):
 
 
 def core_transformer_config_from_args(args, config_class=None):
-    
+
     # Config class.
     config_class = config_class or TransformerConfig
 

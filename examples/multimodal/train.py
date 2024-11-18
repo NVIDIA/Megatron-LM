@@ -242,6 +242,7 @@ def write_online_eval_to_tensorboard(data, iteration, writer):
 
 
 if __name__ == "__main__":
+
     train_valid_test_dataloaders_provider.is_distributed = True
 
     pretrain(

@@ -550,7 +550,6 @@ def initialize_model_parallel(
     world_size: int = torch.distributed.get_world_size()
 
     if encoder_tensor_model_parallel_size > 0:
-        assert encoder_pipeline_model_parallel_size > 0
         assert (
             encoder_tensor_model_parallel_size <= tensor_model_parallel_size
         ), "We do not support encoders with more TP than the decoder."
@@ -1308,22 +1307,30 @@ def is_pipeline_stage_after_split(rank=None):
     return False
 
 
-def is_inside_encoder(rank=None):
-    """Return True if pipeline stage executes encoder block for a model
-    with both encoder and decoder."""
+def is_inside_encoder(rank=None) -> bool:
+    """Return True if pipeline stage executes encoder block.
+    This function implicitly assumes we have a model with both
+    encoder and decoder."""
     if get_pipeline_model_parallel_world_size() == 1:
         return True
     if rank is None:
         rank = get_pipeline_model_parallel_rank()
     global _PIPELINE_MODEL_PARALLEL_DECODER_START
-    if _PIPELINE_MODEL_PARALLEL_DECODER_START is None:
+    # _PIPELINE_MODEL_PARALLEL_DECODER_START == None means that the
+    # encoder shares the first pipeline rank with the decoder
+    if _PIPELINE_MODEL_PARALLEL_DECODER_START is None and rank == 0:
         return True
-    if rank < _PIPELINE_MODEL_PARALLEL_DECODER_START:
+    # _PIPELINE_MODEL_PARALLEL_DECODER_START != None means that the
+    # encoder is on it's own pipeline ranks before the decoder
+    if (
+        _PIPELINE_MODEL_PARALLEL_DECODER_START is not None
+        and rank < _PIPELINE_MODEL_PARALLEL_DECODER_START
+    ):
         return True
     return False
 
 
-def is_inside_decoder(rank=None):
+def is_inside_decoder(rank=None) -> bool:
     """Return True if pipeline stage executes decoder block for a model
     with both encoder and decoder."""
     if get_pipeline_model_parallel_world_size() == 1:
@@ -1338,7 +1345,7 @@ def is_inside_decoder(rank=None):
     return False
 
 
-def get_pipeline_model_parallel_decoder_start() -> Optional[int]:
+def get_pipeline_model_parallel_decoder_start() -> int:
     """Return decoder start rank (if encoder pipeline parallelism is set)."""
     global _PIPELINE_MODEL_PARALLEL_DECODER_START
     return _PIPELINE_MODEL_PARALLEL_DECODER_START

@@ -179,9 +179,9 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         """Get the index number of this layer, given the level of pipelining."""
         pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
         if not parallel_state.is_inside_encoder():
-            pipeline_rank = (
-                pipeline_rank - parallel_state.get_pipeline_model_parallel_decoder_start()
-            )
+            pp_decoder_start = parallel_state.get_pipeline_model_parallel_decoder_start()
+            if pp_decoder_start is not None:
+                pipeline_rank = pipeline_rank - pp_decoder_start
 
         num_layers_per_pipeline_rank = (
             self.config.num_layers // self.config.pipeline_model_parallel_size
