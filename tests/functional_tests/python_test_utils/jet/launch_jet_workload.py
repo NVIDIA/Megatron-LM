@@ -222,18 +222,16 @@ def main(
         while n_download_attempt < 3:
             try:
                 jet_log = main_job.get_logs()
+                logs = extract_logs_to_string(logs=jet_log)
+                download_job_assets(logs=jet_log, iteration=n_iteration)
                 break
             except requests.exceptions.ConnectionError as e:
                 print(e)
                 time.sleep((3**n_download_attempt) * 60)
                 n_download_attempt += 1
 
-        logs = extract_logs_to_string(logs=jet_log)
-
         concat_logs = "\n".join(logs)
         print(f"Logs:\n{concat_logs}")
-
-        download_job_assets(logs=jet_log, iteration=n_iteration)
 
         if test_type != "release":
             success = pipeline.get_status() == PipelineStatus.SUCCESS
