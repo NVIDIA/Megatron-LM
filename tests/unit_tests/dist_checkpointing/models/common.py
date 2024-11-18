@@ -19,6 +19,7 @@ from megatron.core.dist_checkpointing.validation import StrictHandling
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
+xm = get_xla_model()
 
 def common_test_simple_sharded_state_dict_save_load(
     initialize_model_fn, tmp_path_dist_ckpt, src_layer_spec_fn, dst_layer_spec_fn
@@ -81,12 +82,12 @@ def common_test_parallel_reconfiguration_e2e(
             pipeline_model_parallel_size=src_tp_pp[1],
         )
         save_strategy = get_default_save_sharded_strategy()
+        parallelization_group = parallel_state.get_data_parallel_group(with_context_parallel=True) if xm is None else \
+                    parallel_state.get_data_parallel_group_gloo(with_context_parallel=True)
         if use_fpsl:
-            xm = get_xla_model()
             save_strategy = FullyParallelSaveStrategyWrapper(
                 save_strategy,
-                parallel_state.get_data_parallel_group(with_context_parallel=True) if xm is None else \
-                    parallel_state.get_data_parallel_group_gloo(with_context_parallel=True),
+                parallelization_group,
                 parallel_state.get_default_process_group(),
                 True,
             )
@@ -105,9 +106,11 @@ def common_test_parallel_reconfiguration_e2e(
             pipeline_model_parallel_size=dest_tp_pp[1],
         )
         if use_fpsl:
+            parallelization_group = parallel_state.get_data_parallel_group() if xm is None else \
+                    parallel_state.get_data_parallel_group_gloo()
             load_strategy = get_default_load_sharded_strategy(ckpt_dir_A)
             load_strategy = FullyParallelLoadStrategyWrapper(load_strategy,
-                                                             parallelization_group=parallel_state.get_default_process_group())
+                                                             parallelization_group=parallelization_group)
         else:
             load_strategy = None
         state_dict, missing_keys, unexpected_keys = load(
@@ -128,8 +131,8 @@ def common_test_parallel_reconfiguration_e2e(
 
         # Test both checkpoints are equal
         Utils.initialize_model_parallel(1, 1)
-        plain_state_dict_A = load_plain_tensors(ckpt_dir_A)
-        plain_state_dict_B = load_plain_tensors(ckpt_dir_B)
+        plain_state_dict_A = load_plain_tensors(ckpt_dir_A, process_group=parallel_state.get_default_process_group())
+        plain_state_dict_B = load_plain_tensors(ckpt_dir_B, process_group=parallel_state.get_default_process_group())
         diffs = diff(plain_state_dict_A, plain_state_dict_B)
         assert not any(map(bool, diffs)), diffs
 
@@ -165,8 +168,8 @@ def common_test_state_dict_comparison(initialize_model_fn, tmp_path_dist_ckpt):
         save(gpt_model_B.sharded_state_dict(), ckpt_dir_B, 
              process_group=parallel_state.get_default_process_group())
 
-        state_dict_A = load_plain_tensors(ckpt_dir_A)
-        state_dict_A_dup = load_plain_tensors(ckpt_dir_A)
+        state_dict_A = load_plain_tensors(ckpt_dir_A, process_group=parallel_state.get_default_process_group())
+        state_dict_A_dup = load_plain_tensors(ckpt_dir_A, process_group=parallel_state.get_default_process_group())
         state_dict_B = load_plain_tensors(ckpt_dir_B)
 
         # Test that A matches A
@@ -229,8 +232,8 @@ def common_test_vocab_size_padding_change(
 
         # Test equality
         Utils.initialize_model_parallel(1, 1)
-        plain_state_dict_A = load_plain_tensors(ckpt_dir_A)
-        plain_state_dict_B = load_plain_tensors(ckpt_dir_B)
+        plain_state_dict_A = load_plain_tensors(ckpt_dir_A, process_group=parallel_state.get_default_process_group())
+        plain_state_dict_B = load_plain_tensors(ckpt_dir_B, process_group=parallel_state.get_default_process_group())
         # Test vocab size dependent keys are equal up to `vocab_size_base`
         for vocab_layer_key in vocab_size_dependent_keys:
             if vocab_layer_key in plain_state_dict_A:

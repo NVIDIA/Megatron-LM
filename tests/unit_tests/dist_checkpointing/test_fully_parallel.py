@@ -391,7 +391,8 @@ class TestFullyParallelSaveAndLoad:
         with TempNamedDir(tmp_path_dist_ckpt / 'mock_dir') as ckpt_dir:
             for sharded_state_dict, expected_count in expected_call_counts:
                 load_strategy = FullyParallelLoadStrategyWrapper(
-                    mock_strategy, None, do_cache_distribution=True, exchange_algo='broadcast'
+                    mock_strategy, parallel_state.get_default_process_group(), 
+                        do_cache_distribution=True, exchange_algo='broadcast'
                 )
                 with mock.patch(
                     'megatron.core.dist_checkpointing.strategies.fully_parallel.torch.distributed.broadcast'

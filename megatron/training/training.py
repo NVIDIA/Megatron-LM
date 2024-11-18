@@ -563,11 +563,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
         else:
             xm = get_xla_model()
+            pg = parallel_state.get_data_parallel_group()
             if xm:
-                pg = parallel_state.get_data_parallel_group()
                 model = [ DDP(model_module, process_group=pg, gradient_as_bucket_view=True) for model_module in model ]
             else:
-                pg=parallel_state.get_data_parallel_group()
                 model = [ DDP(model_module, process_group=pg) for model_module in model ]
 
     return model

@@ -14,7 +14,7 @@ from tests.unit_tests.test_utilities import Utils
 
 xm = get_xla_model()
 
-@pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Mamba model requires CUDA at this time.")
 class TestMambaModel:
 
     def setup_method(self, method):

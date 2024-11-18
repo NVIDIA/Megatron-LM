@@ -15,6 +15,7 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
 )
+from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
@@ -24,10 +25,13 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 try:
+    import transformer_engine
+    HAVE_TE=True
+
     from transformer_engine.pytorch.fp8 import check_fp8_support, fp8_autocast
     fp8_available, reason_for_no_fp8 = check_fp8_support()
 except ImportError:
-    HAVE_TE = False
+    HAVE_TE=False
     fp8_available = False
     reason_for_no_fp8 = "Transformer Engine not available"
 
@@ -54,7 +58,7 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
     )
     if expert_type == 'grouped':
         model = GroupedMLP(num_local_experts, transformer_config)
-    elif expert_type == 'te_grouped':
+    elif HAVE_TE and expert_type == 'te_grouped':
         model = TEGroupedMLP(
             num_local_experts,
             transformer_config,
@@ -79,7 +83,7 @@ def get_pp_offsets():
 
 expert_type = ['sequential', 'grouped']
 src_dest_expert_type = [('sequential', 'grouped'), ('grouped', 'sequential')]
-if is_te_min_version("1.9.0.dev0"):
+if HAVE_TE and is_te_min_version("1.9.0.dev0"):
     expert_type.append('te_grouped')
     src_dest_expert_type.append(('sequential', 'te_grouped'))
     src_dest_expert_type.append(('te_grouped', 'sequential'))
@@ -176,8 +180,8 @@ class TestExpertLayerReconfiguration:
 
             # Test both checkpoints are equal
             Utils.initialize_model_parallel(1, 1)
-            state_dict_A = load_plain_tensors(ckpt_dir_A)
-            state_dict_B = load_plain_tensors(ckpt_dir_B)
+            state_dict_A = load_plain_tensors(ckpt_dir_A, process_group=parallel_state.get_default_process_group())
+            state_dict_B = load_plain_tensors(ckpt_dir_B, process_group=parallel_state.get_default_process_group())
             diffs = diff(state_dict_A, state_dict_B)
             assert not any(map(bool, diffs)), diffs
 
@@ -248,8 +252,8 @@ class TestExpertLayerReconfiguration:
 
             # Test both checkpoints are equal
             Utils.initialize_model_parallel(1, 1)
-            state_dict_A = load_plain_tensors(ckpt_dir_A)
-            state_dict_B = load_plain_tensors(ckpt_dir_B)
+            state_dict_A = load_plain_tensors(ckpt_dir_A, process_group=parallel_state.get_default_process_group())
+            state_dict_B = load_plain_tensors(ckpt_dir_B, process_group=parallel_state.get_default_process_group())
             diffs = diff(state_dict_A, state_dict_B)
             assert not any(map(bool, diffs)), diffs
             Utils.destroy_model_parallel()
@@ -306,6 +310,7 @@ class TestExpertLayerReconfiguration:
                 model_A.sharded_state_dict(sharded_offsets=get_pp_offsets()),
                 ckpt_dir_A,
                 load_strategy,
+                process_group=parallel_state.get_default_process_group()
             )
             model_A.load_state_dict(state_dict)
 
@@ -316,6 +321,7 @@ class TestExpertLayerReconfiguration:
                 model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()),
                 ckpt_dir_A,
                 load_strategy,
+                process_group=parallel_state.get_default_process_group()
             )
             model_B.load_state_dict(state_dict)
 

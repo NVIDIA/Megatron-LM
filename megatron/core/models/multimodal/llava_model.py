@@ -358,7 +358,9 @@ class LLaVAModel(MegatronModule):
                 sp_padding_needed = padded_seq_len - max_seq_len
                 max_seq_len = padded_seq_len
             batch_indices, non_image_indices = torch.where(input_ids != image_token_index)
-
+            batch_indices = batch_indices.to(torch.int32)
+            non_image_indices = non_image_indices.to(torch.int32)
+            
             # New position ids for the text tokens, shifted by the image sequence length.
             # E.g. for input_ids = [-200, 1, 2, 3] and img_seq_len = 576, we get
             # new_position_ids = [576, 577, 578, 579]. text_position_ids are then [577, 578, 579].
@@ -449,6 +451,8 @@ class LLaVAModel(MegatronModule):
             # Loss mask last text position just before an image
             # so that text token does not need to predict the first image token.
             batch_image_indices, image_indices = torch.where(image_token_mask)
+            batch_image_indices = batch_image_indices.to(torch.int32)
+            image_indices = image_indices.to(torch.int32)
             # Indices just before image tokens. If it's -1, skip it.
             before_image_indices = image_indices - 1
             valid = before_image_indices >= 0

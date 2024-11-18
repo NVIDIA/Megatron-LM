@@ -247,7 +247,7 @@ def load_sharded_metadata(
     return sharded_metadata
 
 
-def load_plain_tensors(checkpoint_dir: str) -> StateDict:
+def load_plain_tensors(checkpoint_dir: str, process_group: torch.distributed.ProcessGroup=None) -> StateDict:
     """Load checkpoint tensors without any sharding and plain structure.
 
     NOTE: common state dict is NOT included.
@@ -261,7 +261,7 @@ def load_plain_tensors(checkpoint_dir: str) -> StateDict:
     sharded_state_dict = load_tensors_metadata(checkpoint_dir)
     # Don't validate integrity because shards will be overlapped
     # if world_size > 1 (all processes load whole tensors)
-    return load(sharded_state_dict, checkpoint_dir, validate_access_integrity=False)
+    return load(sharded_state_dict, checkpoint_dir, validate_access_integrity=False, process_group=process_group)
 
 
 #

@@ -12,7 +12,7 @@ from typing import Dict, List, NamedTuple, Optional, Set, Tuple, TypeVar, cast
 import numpy as np
 import torch
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 
 from .core import CheckpointingException
 from .dict_utils import nested_values
@@ -38,6 +38,7 @@ def is_float8tensor(tensor: torch.Tensor) -> bool:
 
 logger = logging.getLogger(__name__)
 
+xm = get_xla_model()
 
 class ShardDistribution(NamedTuple):
     """Represents a distribution of ShardedTensors.
@@ -97,23 +98,24 @@ def _get_empty_tensor_for_exchange(
             and the device of the original state dict tensor (if there was any)
     """
     local_unloaded_sh_ten = needed_shards.get(shard_id)
+    cc_device = get_current_device() if xm is None else torch.device("cpu")
     if local_unloaded_sh_ten is None:
         orig_device = None  # this tensor will be discarded anyway
         sh_ten = unneeded_shards[shard_id]
         if sh_ten.data is None:
-            sh_ten.init_data(get_current_device())
+            sh_ten.init_data(device=cc_device)
             tensor = sh_ten.data
             sh_ten.data = None  # won't be used. free memory
         else:
             tensor = sh_ten.data
-            if tensor.device.type == 'cpu':
-                tensor = torch.empty_like(tensor, device=get_current_device())
+            if tensor.device.type != cc_device:
+                tensor = torch.empty_like(tensor, device=cc_device)
     else:
-        local_unloaded_sh_ten.init_data(get_current_device())
+        local_unloaded_sh_ten.init_data(device=cc_device)
         orig_device = local_unloaded_sh_ten.data.device
         tensor = local_unloaded_sh_ten.data
-        if tensor.device.type == 'cpu':
-            tensor = torch.empty_like(tensor, device=get_current_device())
+        if tensor.device.type != cc_device:
+            tensor = torch.empty_like(tensor, device=cc_device)
         loaded_tensors[shard_id] = tensor
     return tensor, orig_device
 
@@ -274,7 +276,7 @@ def exchange_loaded_tensors_gather_rounds(
     local_rank = torch.distributed.get_rank(group=parallelization_group)
 
     all_loaded_tensors = dict(loaded_tensors)
-
+    cc_device = get_current_device() if xm is None else torch.device("cpu")
     # Group by dtype so that we all_gather tensors of the same dtype
     for dtype in sorted(set(map(lambda sh_ten: sh_ten.dtype, shard_to_metadata.values())), key=str):
 
@@ -307,14 +309,14 @@ def exchange_loaded_tensors_gather_rounds(
             for rank, shard_id in enumerate(round_shard_ids):
                 if shard_id is None:
                     # if no more useful data, the given rank will exchange empty tensor
-                    local_ten = torch.empty(0, dtype=dtype, device=get_current_device())
+                    local_ten = torch.empty(0, dtype=dtype, device=cc_device)
                     orig_device = None
                 else:
                     assert isinstance(shard_id, tuple), type(shard_id)
                     if rank == local_rank:
                         assert shard_id in all_loaded_tensors, (shard_id, all_loaded_tensors.keys())
                         orig_device = all_loaded_tensors[shard_id]
-                        all_loaded_tensors[shard_id] = all_loaded_tensors[shard_id].to(device=get_current_device())
+                        all_loaded_tensors[shard_id] = all_loaded_tensors[shard_id].to(device=cc_device)
                         local_ten = all_loaded_tensors[shard_id]
                     else:
                         local_ten, orig_device = _get_empty_tensor_for_exchange(
@@ -430,7 +432,7 @@ def exchange_loaded_tensors_broadcast(
     all_loaded_tensors = dict(loaded_tensors)
 
     start = time()
-
+    cc_device = get_current_device() if xm is None else torch.device("cpu")
     for idx, (shard_id, rank) in enumerate(main_rank_for_shard.items()):
         if len(all_ranks_for_shard[shard_id]) == 1:
             assert all_ranks_for_shard[shard_id][0] == main_rank_for_shard[shard_id], (
@@ -446,7 +448,7 @@ def exchange_loaded_tensors_broadcast(
         if rank == local_rank:
             assert shard_id in all_loaded_tensors, (shard_id, all_loaded_tensors.keys())
             orig_device = all_loaded_tensors[shard_id].device
-            local_ten = all_loaded_tensors[shard_id].to(device=get_current_device())
+            local_ten = all_loaded_tensors[shard_id].to(device=cc_device)
         else:
             local_ten, orig_device = _get_empty_tensor_for_exchange(
                 shard_id, unloaded_shards, shard_to_metadata, all_loaded_tensors

@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_xla_model
 from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.serialization import (
@@ -48,7 +49,7 @@ def get_pp_offsets():
     pp_size = parallel_state.get_pipeline_model_parallel_world_size()
     return ((0, pp_rank, pp_size),)
 
-
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Mamba model requires CUDA at this time.")
 class TestMambaReconfiguration:
     @pytest.mark.parametrize(
         "use_fpsl,src_tp_pp_exp,dest_tp_pp_exp,use_glu",
@@ -87,9 +88,11 @@ class TestMambaReconfiguration:
 
             save_strategy = get_default_save_sharded_strategy()
             if use_fpsl:
+                xm = get_xla_model()
                 save_strategy = FullyParallelSaveStrategyWrapper(
                     save_strategy,
-                    parallel_state.get_data_parallel_group(with_context_parallel=True),
+                    parallel_state.get_data_parallel_group(with_context_parallel=True) if xm is None else \
+                        parallel_state.get_data_parallel_group_gloo(with_context_parallel=True),
                     parallel_state.get_default_process_group(),
                     True,
                 )
@@ -101,17 +104,18 @@ class TestMambaReconfiguration:
             Utils.initialize_model_parallel(dest_tp, dest_pp, expert_model_parallel_size=dest_exp)
             model_B = initialize_mamba(2, use_glu)
             if use_fpsl:
+                parallelization_group = parallel_state.get_data_parallel_group(with_context_parallel=True) if xm is None else \
+                    parallel_state.get_data_parallel_group_gloo(with_context_parallel=True)
                 load_strategy = get_default_load_sharded_strategy(ckpt_dir_A)
-                load_strategy = FullyParallelLoadStrategyWrapper(
-                    load_strategy,
-                    parallel_state.get_data_parallel_group(with_context_parallel=True),
-                )
+                load_strategy = FullyParallelLoadStrategyWrapper(load_strategy,
+                                                                parallelization_group=parallelization_group)
             else:
                 load_strategy = None
             state_dict = load(
                 model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()),
                 ckpt_dir_A,
                 load_strategy,
+                process_group=parallel_state.get_default_process_group()
             )
             model_B.load_state_dict(state_dict)
             save(model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_B)
@@ -119,8 +123,8 @@ class TestMambaReconfiguration:
 
             # Test both checkpoints are equal
             Utils.initialize_model_parallel(1, 1)
-            state_dict_A = load_plain_tensors(ckpt_dir_A)
-            state_dict_B = load_plain_tensors(ckpt_dir_B)
+            state_dict_A = load_plain_tensors(ckpt_dir_A, process_group=parallel_state.get_default_process_group())
+            state_dict_B = load_plain_tensors(ckpt_dir_B, process_group=parallel_state.get_default_process_group())
             diffs = diff(state_dict_A, state_dict_B)
             assert not any(map(bool, diffs)), diffs
         Utils.destroy_model_parallel()

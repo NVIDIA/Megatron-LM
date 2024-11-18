@@ -82,7 +82,7 @@ class TestParallelMLPWithGLU:
 
             # Test both checkpoints are equal
             Utils.initialize_model_parallel(1, 1)
-            state_dict_A = load_plain_tensors(ckpt_dir_A)
-            state_dict_B = load_plain_tensors(ckpt_dir_B)
+            state_dict_A = load_plain_tensors(ckpt_dir_A, process_group=parallel_state.get_default_process_group())
+            state_dict_B = load_plain_tensors(ckpt_dir_B, process_group=parallel_state.get_default_process_group())
             diffs = diff(state_dict_A, state_dict_B)
             assert not any(map(bool, diffs)), diffs
