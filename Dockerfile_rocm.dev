@@ -8,7 +8,6 @@ RUN mkdir -p ${STAGE_DIR}
 WORKDIR $WORKSPACE_DIR
 
 RUN pip3 install \
-numpy==1.26.4 \
 scipy \
 einops \
 flask-restful \

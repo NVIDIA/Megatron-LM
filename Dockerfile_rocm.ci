@@ -9,7 +9,6 @@ RUN mkdir -p ${STAGE_DIR}
 WORKDIR $WORKSPACE_DIR
 
 RUN pip3 install \
-numpy==1.26.4 \
 scipy \
 einops \
 flask-restful \
@@ -64,6 +63,7 @@ RUN git clone --recursive https://github.com/ROCm/TransformerEngine.git &&\
 WORKDIR $WORKSPACE_DIR
 COPY . Megatron-LM
 WORKDIR $WORKSPACE_DIR/Megatron-LM
+RUN pip install -e .
 
 # record configuration for posterity
 RUN pip list
