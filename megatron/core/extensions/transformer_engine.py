@@ -60,50 +60,24 @@ class TEActivationOp:
     function operators (e.g. Silu, SwiGLU, etc)
     """
     def __new__(cls, config: TransformerConfig):
-        instance = None
+        layer = None
         if config.gated_linear_unit:
             if config.activation_func == F.silu:
-                instance = te_ops.SwiGLU()
+                layer = te_ops.SwiGLU()
             elif config.activation_func == F.gelu:
-                instance = te_ops.GEGLU()
+                layer = te_ops.GEGLU()
             elif config.activation_func == F.silu:
-                instance = te_ops.ReGLU()
+                layer = te_ops.ReGLU()
         else:
             if config.activation_func == F.gelu:
-                instance = te_ops.GELU()
+                layer = te_ops.GELU()
             elif config.activation_func == F.silu:
-                instance = te_ops.ReLU()
-        if instance is None:
+                layer = te_ops.ReLU()
+        if layer is None:
             raise Exception('Only SwiGLU, GEGLU, ReGLU, GELU, ReLU are supported by '
             'transformer engine. Consider setting use_te_activation_func=False')
-        return te_ops.Sequential(instance)
+        return layer
 
-class TEActivationOpFp8:
-    """
-    A conditional wrapper to initialize an instance of Transformer-Engine's activation
-    function operators (e.g. Silu, SwiGLU, etc)
-    """
-    def __new__(cls, TransformerConfig):
-        instance = None
-        if config.gated_linear_unit:
-            if config.activation_func == F.silu:
-                instance = te_ops.SwiGLU()
-            elif config.activation_func == F.gelu:
-                instance = te_ops.GEGLU()
-            elif config.activation_func == F.silu:
-                instance = te_ops.ReGLU()
-        else:
-            if config.activation_func == F.gelu:
-                instance = te_ops.GELU()
-            elif config.activation_func == F.silu:
-                instance = te_ops.ReLU()
-        if instance is None:
-            raise Exception('Only SwiGLU, GEGLU, ReGLU, GELU, ReLU are supported by '
-            'transformer engine. Consider setting use_te_activation_func=False')
-        return te_ops.Sequential(
-                instance,
-                te_ops.Quantize(forward=True, backward=False),
-               )
 
 class TENorm:
     """
@@ -576,181 +550,6 @@ class TERowParallelLinear(TELinear):
         return make_sharded_tensors_for_checkpoint(
             state_dict, prefix, {'weight': 1}, sharded_offsets
         )
-
-
-class TERowParallelLinearOp(te_ops.Sequential):
-    """
-    Wrapper for the Transformer-Engine's `te.ops.Linear()` layer.
-
-    Note that if Megatron's parallel_state has not been initialized
-    yet, the tp_group passed to TE will be None and must be set later
-    via set_tensor_parallel_group().
-    """
-
-    def __init__(
-        self,
-        input_size: int,
-        output_size: int,
-        *,
-        config: ModelParallelConfig,
-        init_method: Callable,
-        bias: bool,
-        input_is_parallel: bool,
-        skip_bias_add: bool,
-        tp_comm_buffer_name: str = None,
-        is_expert: bool = False,
-    ):
-        if not input_is_parallel:
-            raise ValueError(
-                "Transformer Engine linear layers do not support input_is_parallel = False"
-            )
-        parallel_mode = 'row'
-        init_method = condition_init_method(config, init_method) if not config.use_cpu_initialization else lambda x: None
-        skip_weight_param_allocation = False
-    
-        self.config = config
-
-        # TE returns a zero length Tensor when bias=False and
-        # return_bias=True, but we prefer None.  So in that case we
-        # tell TE to not return the bias, and return None
-        # ourselves. This way our forward always returns two values
-        # and we don't have to deal with the zero length Tensor.
-        self.te_return_bias = skip_bias_add and bias
-        self.is_first_microbatch = True
-        self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
-        if skip_weight_param_allocation:
-            raise ValueError(
-                'Transformer Engine linear layers do not support skip_weight_param_allocation'
-            )
-
-        extra_kwargs = _get_extra_te_kwargs(config)
-
-        if is_te_min_version("0.8.0"):
-            if self.config.tp_comm_overlap:
-                if is_te_min_version("1.5.0"):
-                    # Use old overlap flags if they were supplied instead
-                    extra_kwargs["ub_overlap_ag"] = (
-                        self.config.tp_comm_overlap_ag
-                        if hasattr(self.config, "tp_comm_overlap_ag")
-                        else self.config.tp_comm_split_ag or self.config.tp_comm_atomic_ag
-                    )
-                    extra_kwargs["ub_overlap_rs"] = (
-                        self.config.tp_comm_overlap_rs
-                        if hasattr(self.config, "tp_comm_overlap_rs")
-                        else self.config.tp_comm_split_rs or self.config.tp_comm_atomic_rs
-                    )
-                    # Disable ub overlap for experts.
-                    if is_expert:
-                        extra_kwargs["ub_overlap_ag"] = False
-                        extra_kwargs["ub_overlap_rs"] = False
-                else:
-                    extra_kwargs["ub_split_ag"] = self.config.tp_comm_split_ag
-                    extra_kwargs["ub_atomic_gemm_ag"] = self.config.tp_comm_atomic_ag
-                    extra_kwargs["ub_split_rs"] = self.config.tp_comm_split_rs
-                    extra_kwargs["ub_atomic_gemm_rs"] = self.config.tp_comm_atomic_rs
-                    # Disable ub overlap for experts.
-                    if is_expert:
-                        extra_kwargs["ub_split_ag"] = False
-                        extra_kwargs["ub_atomic_gemm_ag"] = False
-                        extra_kwargs["ub_split_rs"] = False
-                        extra_kwargs["ub_atomic_gemm_rs"] = False
-                if is_te_min_version("1.0.0", check_equality=False):
-                    assert (
-                        tp_comm_buffer_name is not None
-                    ), "Buffer name should be set to configure communication overlap settings"
-                    extra_kwargs["ub_name"] = tp_comm_buffer_name
-
-        self.expert_parallel = self.config.expert_model_parallel_size > 1
-        if is_expert and self.expert_parallel:
-            rng_tracker_name = get_expert_parallel_rng_tracker_name()
-        else:
-            rng_tracker_name = None
-        if is_te_min_version("1.7.0"):
-            extra_kwargs["rng_tracker_name"] = rng_tracker_name
-
-        # Disable communications in TE when using SP or EP by making TE agnostic of model parallel.
-        tp_size = self.config.tensor_model_parallel_size
-        tp_group = get_tensor_model_parallel_group(check_initialized=False)
-        if is_expert and (self.config.sequence_parallel or self.expert_parallel):
-            if self.config.moe_extended_tp:
-                tp_size = get_tensor_and_expert_parallel_world_size()
-            if parallel_mode == "column":
-                output_size = divide(output_size, tp_size)
-            elif parallel_mode == "row":
-                input_size = divide(input_size, tp_size)
-            parallel_mode = None
-            tp_size = 1
-            tp_group = None
-
-        super().__init__(
-            te_ops.Linear(
-                in_features=input_size,
-                out_features=output_size,
-                sequence_parallel=self.config.sequence_parallel,
-                fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
-                tp_group=tp_group,
-                tp_size=tp_size,
-                get_rng_state_tracker=(
-                    get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
-                ),
-                init_method=condition_init_method(config, init_method),
-                bias=bias,
-                return_bias=self.te_return_bias,
-                parallel_mode=parallel_mode,
-                **extra_kwargs,
-            )
-        )
-
-        for param in self.parameters():
-            setattr(param, 'allreduce', not (is_expert and self.expert_parallel))
-
-        world_size = get_tensor_model_parallel_world_size()
-        rank = get_tensor_model_parallel_rank()
-        if config.use_cpu_initialization:
-            input_size_per_partition = divide(input_size, world_size)
-            self.master_weight = _initialize_affine_weight_cpu(
-                self.weight,
-                output_size,
-                input_size,
-                input_size_per_partition,
-                1,
-                init_method,
-                stride=1,
-                return_master_weight=False,
-                params_dtype=config.params_dtype,
-                rank=rank,
-                world_size=world_size,
-                skip_set_tensor_parallel_attributes=True,
-            )
-            if bias:
-                self.bias = Parameter(torch.empty(output_size, dtype=config.params_dtype))
-                # Always initialize bias to zero.
-                with torch.no_grad():
-                    self.bias.zero_()
-                setattr(self.bias, 'allreduce', True)
-                setattr(self.bias, 'sequence_parallel', config.sequence_parallel)
-
-    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
-        """Sharding along axis 1, bias not sharded"""
-        state_dict = self.state_dict(prefix='', keep_vars=True)
-        return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {'weight': 1}, sharded_offsets
-        )
-        
-    def forward(self, x):
-        """Forward."""
-        _is_first_microbatch = (
-            None if self.disable_parameter_transpose_cache else self.is_first_microbatch
-        )
-        out = super().forward(x, is_first_microbatch=_is_first_microbatch)
-        self.is_first_microbatch = False
-
-        # TE only returns a tuple when return_bias is True, otherwise
-        # it returns a single Tensor, we always want to return two
-        # values regardless of the arguments.
-        if self.te_return_bias:
-            return out
-        return out, None
 
 
 class TEDotProductAttention(te.pytorch.DotProductAttention):

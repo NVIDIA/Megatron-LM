@@ -29,8 +29,6 @@ try:
         TERowParallelGroupedLinear,
         TERowParallelLinear,
         TEActivationOp,
-        TEActivationOpFp8,
-        TERowParallelLinearOp,
     )
 
     HAVE_TE = True
@@ -213,7 +211,7 @@ def _get_mlp_module_spec(
 ) -> ModuleSpec:
     """Helper function to get module spec for MLP/MoE"""
     if use_te:
-        activation_func = TEActivationOpFp8 if fp8 else TEActivationOp
+        activation_func = TEActivationOp
     else:
         activation_func = None
     if num_experts is None:
@@ -222,7 +220,7 @@ def _get_mlp_module_spec(
             module=MLP,
             submodules=MLPSubmodules(
                 linear_fc1=TELayerNormColumnParallelLinear if use_te else ColumnParallelLinear,
-                linear_fc2=TERowParallelLinearOp if use_te else RowParallelLinear,
+                linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
                 activation_func=activation_func,
             ),
         )
@@ -233,7 +231,7 @@ def _get_mlp_module_spec(
             linear_fc2 = TERowParallelGroupedLinear
         elif use_te and fp8:
             linear_fc1 = TEColumnParallelLinear
-            linear_fc2 = TERowParallelLinearOp
+            linear_fc2 = TERowParallelLinear
         else:
             linear_fc1 = ColumnParallelLinear
             linear_fc2 = RowParallelLinear
@@ -253,7 +251,7 @@ def _get_mlp_module_spec(
                     params={"gate": False},
                     submodules=MLPSubmodules(
                         linear_fc1=TEColumnParallelLinear if use_te else ColumnParallelLinear,
-                        linear_fc2=TERowParallelLinearOp if use_te else RowParallelLinear,
+                        linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
                         activation_func=activation_func,
                     ),
                 ),

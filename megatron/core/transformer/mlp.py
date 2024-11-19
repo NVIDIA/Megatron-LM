@@ -80,7 +80,6 @@ class MLP(MegatronModule):
             self.activation_func = build_module(
                 submodules.activation_func,
                 config=self.config,
-                init_method=self.config.init_method,
             )
         else:
             self.activation_func = self.config.activation_func
@@ -103,7 +102,11 @@ class MLP(MegatronModule):
         # [s, b, 4 * h/p]
         intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
 
-        if self.config.bias_activation_fusion:
+        if self.config.use_te_activation_func:
+            if bias_parallel is not None:
+                intermediate_parallel = intermediate_parallel + bias_parallel
+            intermediate_parallel = self.activation_func(intermediate_parallel)
+        elif self.config.bias_activation_fusion:
             if self.activation_func == F.gelu:
                 if self.config.gated_linear_unit:
                     intermediate_parallel = bias_geglu_impl(intermediate_parallel, bias_parallel)
@@ -125,7 +128,7 @@ class MLP(MegatronModule):
 
                 def glu(x):
                     x = torch.chunk(x, 2, dim=-1)
-                    return self.activation_func(x[0]) * x[1]
+                    return self.config.activation_func(x[0]) * x[1]
 
                 intermediate_parallel = glu(intermediate_parallel)
             else:

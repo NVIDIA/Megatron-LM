@@ -344,6 +344,7 @@ class TransformerConfig(ModelParallelConfig):
 
     use_te_activation_func: bool = False
     """Whether to use ffn activation functions implemented by TransformerEngine"""
+    
     flash_decode: bool = False
     """ Use the optimized flash decoding kernel during inference. """
 
