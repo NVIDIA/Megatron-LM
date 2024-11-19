@@ -12,27 +12,35 @@ include:
 test:build_image:
   extends: [.test_rules, .dind_rules]
   tags:
+    - arch/amd64
+    - origin/jet-fleet
+    - env/prod
     - ${TAG}
+  services:
+    - name: docker:24.0.5-dind
+      variables:
+        HEALTHCHECK_TCP_PORT: '2376'
   timeout: 45m
   parallel:
     matrix:
       - IMAGE: CI_MCORE_LTS_IMAGE
         FILE: Dockerfile.ci.lts
         BASE_IMAGE: nvcr.io/nvidia/pytorch:24.01-py3
-        TAG: mcore-docker-node-large
       - IMAGE: CI_MCORE_DEV_IMAGE
         FILE: Dockerfile.ci.dev
         BASE_IMAGE: nvcr.io/nvidia/pytorch:24.07-py3
-        TAG: mcore-docker-node-large
       - IMAGE: CI_NEMO_IMAGE
         FILE: Dockerfile.ci.lts
         BASE_IMAGE: nvcr.io/nvidian/nemo:nightly
-        TAG: mcore-docker-node-large
-      - IMAGE: LINTING_IMAGE
+      - IMAGE: UTILITY_IMAGE
         FILE: Dockerfile.linting
         BASE_IMAGE: python:3.10
-        TAG: mcore-docker-node-small
   variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: '/certs'
+    DOCKER_TLS_VERIFY: 1
+    DOCKER_CERT_PATH: '$DOCKER_TLS_CERTDIR/client'
+    TAG: purpose/builder-large
     STAGE: main
   script:
     - apk add bash
@@ -42,8 +50,9 @@ test:build_image:
         env
         eval "IMAGE=\$$IMAGE"
         
-        docker buildx create --name container --driver=docker-container
-      
+        docker context create tls-environment
+        docker buildx create --name container --driver=docker-container --use tls-environment
+
         ADDITIONAL_PARAMS=()
 
         if [[ "$CI_COMMIT_BRANCH" == "ci-rebuild-mcore-nemo-image" || "$CI_COMMIT_BRANCH" == "main" ]]; then
@@ -81,7 +90,7 @@ test:build_image:
 
 .unit_tests:
   extends: [.test_rules, .dind_rules]
-  needs: 
+  needs:
     - test:build_image
     - test:docs_build
     - test:formatting
@@ -94,7 +103,7 @@ test:build_image:
     matrix:
       - BUCKET: tests/unit_tests/data/
       - BUCKET: tests/unit_tests/dist_checkpointing/
-      - BUCKET: tests/unit_tests/distributed/ 
+      - BUCKET: tests/unit_tests/distributed/
       - BUCKET: other
   script:
     - docker run --name mcore_ci_${CI_PIPELINE_ID} -d --rm -e BUCKET -e TAG -e IMAGE -e UNIT_TEST_REPEAT -e UNIT_TEST_TIMEOUT --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 ${IMAGE}:${CI_PIPELINE_ID} bash -c "sleep $(( ${UNIT_TEST_TIMEOUT} * 60 + 60 ))"
@@ -137,7 +146,7 @@ test:build_image:
       done
       RUN_TEST_EOF
       )
-      
+
       docker exec mcore_ci_${CI_PIPELINE_ID} bash -c "$CMD"
   after_script:
     - docker container stop mcore_ci_${CI_PIPELINE_ID} || true
@@ -183,7 +192,7 @@ test:pyt(DEV)_mcore(0.9.0):
 
 test:notify_unit_tests:
   extends: [.test_rules]
-  image: ${CI_MCORE_LTS_IMAGE}:${CI_PIPELINE_ID}
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   needs:
     - test:pyt(LTS)_mcore(latest)
     - test:pyt(DEV)_mcore(latest)
@@ -209,7 +218,7 @@ test:notify_unit_tests:
 
 test:docs_build:
   extends: [.test_rules]
-  image: ${CI_MCORE_LTS_IMAGE}:${CI_PIPELINE_ID}
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   tags: [mcore-docker-node-small]
   needs: [test:build_image]
   script:
@@ -221,11 +230,11 @@ test:docs_build:
 
 test:formatting:
   extends: [.test_rules]
-  image: ${LINTING_IMAGE}:${CI_PIPELINE_ID}
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   tags: [mcore-docker-node-small]
   needs: [test:build_image]
   variables:
-    GIT_STRATEGY: "clone"
+    GIT_STRATEGY: 'clone'
   script:
     - |
       if [[ "$CI_PIPELINE_SOURCE" != "merge_request_event" ]]; then
@@ -252,7 +261,7 @@ test:formatting:
 test:copyright:
   extends: [.test_rules]
   tags: [mcore-docker-node-small]
-  image: ${CI_MCORE_LTS_IMAGE}:${CI_PIPELINE_ID}
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   needs: [test:build_image]
   script:
     - git fetch origin main
@@ -266,7 +275,7 @@ secret_detection:
 # Inherit and modify template
 test:secret_detection:
   tags: [mcore-docker-node-small]
-  extends: [".secret-analyzer"]
+  extends: ['.secret-analyzer']
   variables:
     GIT_DEPTH: 0
     SECRET_DETECTION_LOG_OPTIONS: ${CI_MERGE_REQUEST_DIFF_BASE_SHA}..${CI_COMMIT_SHA}
@@ -286,12 +295,12 @@ test:secret_detection:
 
 test:pypi_build_wheel:
   extends: [.test_rules]
-  image: 
-    name: quay.io/pypa/manylinux_2_28_x86_64  
-    entrypoint: [""]
+  image:
+    name: quay.io/pypa/manylinux_2_28_x86_64
+    entrypoint: ['']
   tags: [mcore-docker-node-small]
   variables:
-    PUBLISH_DRYRUN: "yes"
+    PUBLISH_DRYRUN: 'yes'
   script:
     - echo $PUBLISH_DRYRUN
     - >
@@ -304,7 +313,7 @@ test:pypi_build_wheel:
     - auditwheel repair dist/*.whl
   artifacts:
     paths:
-      - megatron/core/package_info.py 
+      - megatron/core/package_info.py
       - wheelhouse/
 
 test:pypi_test_wheel:
@@ -313,7 +322,7 @@ test:pypi_test_wheel:
   needs: [test:pypi_build_wheel]
   tags: [mcore-docker-node-small]
   variables:
-    PUBLISH_DRYRUN: "yes"
+    PUBLISH_DRYRUN: 'yes'
   script:
     - EXPECTED_RELEASE_NUMBER=$(python -c "from megatron import core; print(core.__version__)")
     - rm -rf megatron
@@ -323,7 +332,10 @@ test:pypi_test_wheel:
     - >
       echo "$EXPECTED_RELEASE_NUMBER" == "$RELEASE_NUMBER"
     - test "$EXPECTED_RELEASE_NUMBER" == "$RELEASE_NUMBER"
+    - echo "RELEASE_NUMBER=$EXPECTED_RELEASE_NUMBER" | tee -a build.env
   artifacts:
+    reports:
+      dotenv: build.env
     paths:
       - wheelhouse/
 
@@ -333,7 +345,7 @@ test:pypi_push_wheel:
   tags: [mcore-docker-node-small]
   needs: [test:pypi_test_wheel]
   variables:
-    PUBLISH_DRYRUN: "yes"
+    PUBLISH_DRYRUN: 'yes'
   timeout: 3m
   script:
     - >
@@ -360,12 +372,12 @@ test:pypi_push_wheel:
 
 test:gh_release:
   extends: [.test_rules]
+  needs: [test:pypi_test_wheel]
   tags: [mcore-docker-node-small]
-  image: nvcr.io/nvidia/pytorch:24.01-py3
+  image: badouralix/curl-jq
   variables:
-    PUBLISH_DRYRUN: "yes"
-  script: 
-    - RELEASE_NUMBER=$(python -c "from megatron import core; print(core.__version__)")
+    PUBLISH_DRYRUN: 'yes'
+  script:
     - NAME="NVIDIA Megatron Core $RELEASE_NUMBER"
     - CHANGELOG=$(awk '/^## '"$NAME"'/{flag=1; next} /^## /{flag=0} flag' CHANGELOG.md)
     - CHANGELOG=$(echo "$CHANGELOG" | sed '/./!d')
@@ -401,15 +413,14 @@ test:gh_release:
       fi
 
 test:notify_release:
-  needs: [test:pypi_push_wheel, test:gh_release]
+  needs: [test:pypi_test_wheel, test:pypi_push_wheel, test:gh_release]
   extends: [.test_rules]
-  image: nvcr.io/nvidia/pytorch:24.01-py3
+  image: badouralix/curl-jq
   tags: [mcore-docker-node-small]
   variables:
-    PUBLISH_DRYRUN: "yes"
+    PUBLISH_DRYRUN: 'yes'
   script:
-    - VERSION=$(python -c "from megatron import core; print(core.__version__)")
-    - URL="https://github.com/NVIDIA/Megatron-LM/releases/tag/core_r$VERSION"          
+    - URL="https://github.com/NVIDIA/Megatron-LM/releases/tag/core_r$RELEASE_NUMBER"
     - >
       MESSAGE='{
           "blocks": [
@@ -417,7 +428,7 @@ test:notify_release:
               "type": "section",
               "text": {
                 "type": "mrkdwn",
-                    "text": "Releasebot 🤖: Megatron-Core released <'$URL'|core_r'$VERSION'> 🚀"
+                    "text": "Releasebot 🤖: Megatron-Core released <'$URL'|core_r'"$RELEASE_NUMBER"'> 🚀"
               }
             }
           ]

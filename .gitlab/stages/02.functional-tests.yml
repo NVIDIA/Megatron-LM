@@ -16,31 +16,27 @@ include:
     ref: main
     file: downstreams.yml
 
-functional:clean_docker_node:
-  extends: [.functional_tests_rules, .dind_rules]
-  tags: [mcore-docker-node-jet]
-  script: ':'
-
 functional:build_image:
   extends: [test:build_image, .functional_tests_rules]
-  needs: 
+  needs:
     - test:build_image
     - test:docs_build
     - test:formatting
     - test:copyright
   variables:
     STAGE: jet
+    TAG: purpose/builder-large
 
 functional:configure:
   needs: [functional:build_image]
   extends: [.functional_tests_rules]
-  image: ${CI_MCORE_LTS_IMAGE}:${CI_PIPELINE_ID}
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   tags: [mcore-docker-node-small]
   before_script:
     - git rm -r tests/functional_tests/local_recipes || true
     - git submodule add --force https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/ADLR/megatron-lm-convergence-tests.git tests/functional_tests/local_recipes
     - ls tests/functional_tests/local_recipes
-  script: 
+  script:
     - set -x
     - |
       A100_CLUSTER=$([[ "$FUNCTIONAL_TEST_CLUSTER_A100" != "" ]] && echo $FUNCTIONAL_TEST_CLUSTER_A100 || echo $DEFAULT_A100_CLUSTER)
@@ -67,7 +63,7 @@ functional:configure:
         --test-cases $FUNCTIONAL_TEST_CASES \
         --a100-cluster $A100_CLUSTER \
         --h100-cluster $H100_CLUSTER \
-        --container-image ${CI_MCORE_LTS_IMAGE} \
+        --container-image ${UTILITY_IMAGE} \
         --container-tag ${CI_PIPELINE_ID} \
         --output-path "jet-trigger-job-dev.yaml" \
         ${RELEASE_ARGS[@]}
@@ -81,7 +77,7 @@ functional:configure:
         --test-cases $FUNCTIONAL_TEST_CASES \
         --a100-cluster $A100_CLUSTER \
         --h100-cluster $H100_CLUSTER \
-        --container-image ${CI_MCORE_LTS_IMAGE} \
+        --container-image ${UTILITY_IMAGE} \
         --container-tag ${CI_PIPELINE_ID} \
         --output-path "jet-trigger-job-lts.yaml" \
         ${RELEASE_ARGS[@]}
@@ -93,7 +89,7 @@ functional:configure:
 
 .run:
   stage: functional_tests
-  needs: [functional:configure, functional:clean_docker_node]
+  needs: [functional:configure]
   extends: [.functional_tests_rules]
   trigger:
     include:
@@ -121,8 +117,8 @@ functional:run_dev:
 
 .notify:
   extends: [.functional_tests_rules]
-  image: ${GITLAB_ENDPOINT}:5005/dl/jet/api:latest
-  needs: 
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  needs:
     - functional:run_lts
     - functional:run_dev
   tags:
