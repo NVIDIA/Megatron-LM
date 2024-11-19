@@ -264,6 +264,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         rotary_pos_emb=None,
         rotary_pos_cos=None,
         rotary_pos_sin=None,
+        attention_bias=None,
         inference_params=None,
         packed_seq_params=None,
     ):
@@ -280,6 +281,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             context (Tensor, optional): Context tensor for cross-attention.
             context_mask (Tensor, optional): Mask tensor for cross-attention.
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
+            attention_bias (Tensor, optional): Bias tensor for Q * K.T.
             inference_params (object, optional): Parameters for inference-time optimizations.
             packed_seq_params (object, optional): Parameters for packed sequence processing.
 
@@ -304,6 +306,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             rotary_pos_emb=rotary_pos_emb,
             rotary_pos_cos=rotary_pos_cos,
             rotary_pos_sin=rotary_pos_sin,
+            attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
         )
 
