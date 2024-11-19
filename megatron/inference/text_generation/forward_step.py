@@ -32,7 +32,7 @@ class ForwardStep:
         args = get_args()
         self.pipeline_size_larger_than_one = (
             args.pipeline_model_parallel_size > 1)
-        # Threshold of pipelining.
+        # Threshold for whether we split up the batch for pipelining.
         self.pipelining_batch_x_seqlen = \
             args.inference_batch_times_seqlen_threshold
 
@@ -43,6 +43,9 @@ class ForwardStep:
         """Invocation of the forward methods. Note that self.inference_params
         is being modified by the forward step."""
         # Pipelining case.
+        # This runs only if current_batch_x_seqlen > args.inference_batch_times_seqlen_threshold
+        # and requires setting args.pipeline_model_parallel > 1. The batch will be split into
+        # smaller microbatches to be pipelined through the stages.
         if self.pipeline_size_larger_than_one:
             current_batch_x_seqlen = tokens.size(0) * tokens.size(1)
             if current_batch_x_seqlen >= self.pipelining_batch_x_seqlen:
@@ -52,7 +55,7 @@ class ForwardStep:
                                                           position_ids,
                                                           attention_mask,
                                                           micro_batch_size)
-
+        # Do not pipeline the batch; the entire batch will be passed through all at once.
         return self._no_pipelining_forward_step(tokens,
                                                 position_ids,
                                                 attention_mask)
