@@ -102,6 +102,7 @@ class DotProductAttention(MegatronModule):
         value: Tensor,
         attention_mask: Tensor,
         attn_mask_type: AttnMaskType = None,
+        attention_bias: Tensor = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """Forward."""
@@ -109,6 +110,7 @@ class DotProductAttention(MegatronModule):
             "Packed sequence is not supported by DotProductAttention."
             "Please use TEDotProductAttention instead."
         )
+        assert attention_bias is None, "Attention bias is not supported for DotProductAttention."
 
         # ===================================
         # Raw attention scores. [b, n/p, s, s]
