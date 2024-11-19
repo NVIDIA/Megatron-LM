@@ -1,4 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+"""Support ckpt:torch,torch_dist; model: dense, moe"""
 
 import os
 import sys
@@ -11,7 +12,6 @@ from utils import get_mcore_transformer_block_key, print_memory_usage
 
 
 class MCoreSetter(ModelSetter):
-
     transformer_block_key = None
 
     @classmethod
@@ -203,6 +203,7 @@ class MCoreTESetter(MCoreSetter):
         if mlp_fc2_bias is not None:
             cls.set_tensor(l.mlp.linear_fc2.bias, mlp_fc2_bias)
 
+
 class MCoreMoETESetter(MCoreSetter):
 
     @classmethod
@@ -223,6 +224,9 @@ class MCoreMoETESetter(MCoreSetter):
         mlp_fc1_bias=None,
         mlp_fc2_weight=None,
         mlp_fc2_bias=None,
+        mlp_shared_exp_fc1_weight=None,
+        mlp_shared_exp_fc2_weight=None,
+        shared_mlp_gate_weight=None,
     ):
 
         block = cls.get_transformer_block(model)
@@ -251,6 +255,15 @@ class MCoreMoETESetter(MCoreSetter):
             cls.set_tensor(l.mlp.experts.local_experts[expert_idx].linear_fc1.weight, mlp_fc1_weight[expert_idx])
             cls.set_tensor(l.mlp.experts.local_experts[expert_idx].linear_fc2.weight, mlp_fc2_weight[expert_idx])
 
+        # shared exp
+        if mlp_shared_exp_fc1_weight is not None:
+            cls.set_tensor(l.mlp.shared_experts.linear_fc1.weight, mlp_shared_exp_fc1_weight)
+        if mlp_shared_exp_fc2_weight is not None:
+            cls.set_tensor(l.mlp.shared_experts.linear_fc2.weight, mlp_shared_exp_fc2_weight)
+
+        if shared_mlp_gate_weight is not None:
+            cls.set_tensor(l.mlp.shared_experts.gate_weight, shared_mlp_gate_weight)
+
 
 def get_model_setter(model_type, transformer_impl, num_experts=0):
     if num_experts is not None and num_experts > 0:
@@ -259,8 +272,8 @@ def get_model_setter(model_type, transformer_impl, num_experts=0):
         setter = MCoreMoETESetter
     else:
         setter = {
-            "local" : MCoreLocalSetter,
-            "transformer_engine" : MCoreTESetter,
+            "local": MCoreLocalSetter,
+            "transformer_engine": MCoreTESetter,
         }[transformer_impl]
     setter.transformer_block_key = get_mcore_transformer_block_key(model_type)
     return setter
@@ -274,19 +287,21 @@ def add_arguments(parser):
 
     group.add_argument('--target-tensor-parallel-size', type=int,
                        help='Target tensor model parallel size, defaults to the tensor parallel size '
-                       'in the input checkpoint if provided by the loader, otherwise to 1')
+                            'in the input checkpoint if provided by the loader, otherwise to 1')
     group.add_argument('--target-pipeline-parallel-size', type=int,
                        help='Target tensor model parallel size, default to the pipeline parall size '
-                       'in the input checkpoint if provided by the loader, otherwise to 1')
+                            'in the input checkpoint if provided by the loader, otherwise to 1')
     group.add_argument('--saver-transformer-impl', default='transformer_engine',
                        choices=['local', 'transformer_engine'],
                        help='Which Transformer implementation to use.')
     group.add_argument('--target-expert-parallel-size', type=int, default=1,
                        help='Target expert model parallel size, default to 1')
+    parser.add_argument('--target-ckpt-format', default='torch',
+                        choices=['torch', 'torch_dist', 'zarr'],
+                        help='Checkpoint format to use.')
 
 
 def save_checkpoint(queue, args):
-
     # Transformer engine >= 0.12.0, for CPU initialization.
     te_version = packaging.version.Version(version("transformer-engine"))
     assert te_version >= packaging.version.Version("0.12.0"), \
@@ -304,6 +319,7 @@ def save_checkpoint(queue, args):
         from megatron.training.arguments import (parse_args, validate_args)
         from megatron.training.checkpointing import save_checkpoint
         from megatron.training.global_vars import set_global_variables, get_args
+        from megatron.core.parallel_state import initialize_model_parallel
         from megatron.core.enums import ModelType
         from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
         from megatron.legacy import fused_kernels
@@ -336,7 +352,6 @@ def save_checkpoint(queue, args):
             print(f"Exiting. If you want to ignore this, use the argument --no-checking.")
             exit(1)
 
-
     md = queue_get()
 
     if args.target_tensor_parallel_size is None:
@@ -344,7 +359,7 @@ def save_checkpoint(queue, args):
             args.target_tensor_parallel_size = md.previous_tensor_parallel_size
         else:
             print("loader did not provide a tensor parallel size and --target-tensor-parallel-size not provided on command line. "
-                  "Default to 1.")
+                "Default to 1.")
             args.target_tensor_parallel_size = 1
 
     if args.target_pipeline_parallel_size is None:
@@ -352,9 +367,13 @@ def save_checkpoint(queue, args):
             args.target_pipeline_parallel_size = md.previous_pipeline_parallel_size
         else:
             print("loader did not provide a pipeline parallel size and --target-pipeline-parallel-size not provided on command line. "
-                  "Default to 1.")
+                "Default to 1.")
             args.target_pipeline_parallel_size = 1
 
+    if args.target_ckpt_format == "torch_dist":
+        assert args.target_tensor_parallel_size == 1, "Please setting --target-tensor-parallel-size to 1 to use dist ckpt"
+        assert args.target_pipeline_parallel_size == 1, "Please setting --target-pipeline-parallel-size to 1 to use dist ckpt"
+        assert args.target_expert_parallel_size == 1, "Please setting --target-expert-parallel-size to 1 to use dist ckpt"
 
     # Arguments do sanity checks on the world size, but we don't care,
     # so trick it into thinking we are plenty of processes
@@ -390,7 +409,7 @@ def save_checkpoint(queue, args):
                 '--no-initialization',
                 '--save-interval', '1',
                 '--save', args.save_dir,
-                '--ckpt-format', 'torch', # only 'torch' supported for conversion
+                '--ckpt-format', str(args.target_ckpt_format),
                 ]
 
     if md.make_vocab_size_divisible_by is not None:
@@ -410,10 +429,11 @@ def save_checkpoint(queue, args):
 
     margs = parse_args()
 
-    if hasattr (md, 'checkpoint_args'):
+    if hasattr(md, 'checkpoint_args'):
         # These are arguments that we are either changing, or cause problems for validation if they are set
         # Note that some of these deal with T5 so will need to be changed if we support T5.
-        args_to_keep = ['tensor_model_parallel_size', 'pipeline_model_parallel_size', 'expert_model_parallel_size', 'world_size', 'params_dtype',
+        args_to_keep = ['tensor_model_parallel_size', 'pipeline_model_parallel_size', 'expert_model_parallel_size',
+                        'world_size', 'params_dtype',
                         'num_layers_per_virtual_pipeline_stage', 'virtual_pipeline_model_parallel_size',
                         'masked_softmax_fusion', 'bias_gelu_fusion', 'bias_dropout_fusion',
                         'sequence_parallel', 'async_tensor_model_parallel_allreduce',
@@ -427,7 +447,7 @@ def save_checkpoint(queue, args):
                         'train_iters', 'lr_decay_iters', 'lr_warmup_iters', 'lr_warmup_fraction',
                         'start_weight_decay', 'end_weight_decay',
                         'ckpt_format',
-        ]
+                        ]
 
         for arg, value in vars(md.checkpoint_args).items():
             if arg in args_to_keep:
@@ -482,14 +502,25 @@ def save_checkpoint(queue, args):
         margs.model_type = ModelType.encoder_or_decoder
     else:
         raise Exception(f'unrecognized model type: {args.model_type}')
-
+    print(f"saver's margs {margs}")
     # fake initializing distributed
-    mpu.set_tensor_model_parallel_world_size(args.target_tensor_parallel_size)
-    mpu.set_pipeline_model_parallel_world_size(args.target_pipeline_parallel_size)
-    mpu.set_expert_model_parallel_world_size(args.target_expert_parallel_size)
-    mpu.set_tensor_model_parallel_rank(0)
-    mpu.set_pipeline_model_parallel_rank(0)
-    mpu.set_expert_model_parallel_rank(0)
+    if args.target_ckpt_format == "torch_dist":
+        torch.distributed.init_process_group(
+            backend=margs.distributed_backend,
+            world_size=margs.world_size,
+            rank=margs.rank,
+        )
+        initialize_model_parallel()
+        print(f"real initializing distributed")
+    else:
+        print(f"fake initializing distributed")
+        # fake initializing distributed
+        mpu.set_tensor_model_parallel_world_size(args.target_tensor_parallel_size)
+        mpu.set_pipeline_model_parallel_world_size(args.target_pipeline_parallel_size)
+        mpu.set_expert_model_parallel_world_size(args.target_expert_parallel_size)
+        mpu.set_tensor_model_parallel_rank(0)
+        mpu.set_pipeline_model_parallel_rank(0)
+        mpu.set_expert_model_parallel_rank(0)
     fused_kernels.load(margs)
 
     # Embeddings
@@ -511,7 +542,7 @@ def save_checkpoint(queue, args):
 
             # Cut out extra padding we don't need
             if orig_vocab_size > margs.padded_vocab_size:
-                full_word_embed = orig_word_embed[0:margs.padded_vocab_size,:]
+                full_word_embed = orig_word_embed[0:margs.padded_vocab_size, :]
 
             # Expanding embedding to larger size by replicating final entry
             elif orig_vocab_size < margs.padded_vocab_size:
@@ -526,7 +557,7 @@ def save_checkpoint(queue, args):
                 full_word_embed = orig_word_embed
         else:
             print("Original vocab size not specified, leaving embedding table as-is. "
-                "If you've changed the tensor parallel size this could cause problems.")
+                  "If you've changed the tensor parallel size this could cause problems.")
             margs.padded_vocab_size = orig_word_embed.shape[0]
             full_word_embed = orig_word_embed
         return full_word_embed
@@ -540,7 +571,8 @@ def save_checkpoint(queue, args):
     setter = get_model_setter(md.model_type, margs.transformer_impl, margs.num_experts)
 
     # Construct a 3D(PPxEPxTP) arry for models, fill it with None
-    models = [[[None for _ in range(args.target_tensor_parallel_size)] for _ in range(args.target_expert_parallel_size)] for _ in range(args.target_pipeline_parallel_size)]
+    models = [[[None for _ in range(args.target_tensor_parallel_size)] for _ in range(args.target_expert_parallel_size)]
+              for _ in range(args.target_pipeline_parallel_size)]
 
     # Model is lazy instantiated at firstly using
     def get_local_model(pp_rank, ep_rank, tp_rank):
@@ -604,7 +636,7 @@ def save_checkpoint(queue, args):
     for pp_rank in range(args.target_pipeline_parallel_size):
         mpu.set_pipeline_model_parallel_rank(pp_rank)
         # initial the first module in pp stage to get the layer_num, pooler, lm_head. binary_head
-        get_local_model(pp_rank,0,0)
+        get_local_model(pp_rank, 0, 0)
         for layer_id in range(len(setter.get_transformer_block(models[pp_rank][0][0]).layers)):
             msg = queue_get(f"transformer layer {total_layer_num}")
 
@@ -618,90 +650,122 @@ def save_checkpoint(queue, args):
             # Split up the parallel tensors
             qkv_weight = chunk_weight(msg.pop("qkv weight"), "column", args.target_tensor_parallel_size)
             dense_weight = chunk_weight(msg.pop("dense weight"), "row", args.target_tensor_parallel_size)
-            mlp_l1_weight = chunk_weight(msg.pop("mlp l1 weight"), "row", args.target_tensor_parallel_size, args.target_expert_parallel_size)
+            mlp_l1_weight = chunk_weight(msg.pop("mlp l1 weight"), "row", args.target_tensor_parallel_size,
+                                         args.target_expert_parallel_size)
+
+            if margs.moe_shared_expert_intermediate_size:
+                if md.swiglu:
+                    shared_mlp_l0_weight_W = chunk_weight(msg.pop("shared mlp l0 weight W"), "column",
+                                                          args.target_tensor_parallel_size)
+                    shared_mlp_l0_weight_V = chunk_weight(msg.pop("shared mlp l0 weight V"), "column",
+                                                          args.target_tensor_parallel_size)
+                    shared_mlp_l0_weight = torch.cat((shared_mlp_l0_weight_W, shared_mlp_l0_weight_V), dim=-2)
+                else:
+                    shared_mlp_l0_weight = chunk_weight(msg.pop("shared mlp l0 weight"), "column",
+                                                        args.target_tensor_parallel_size)
+                shared_mlp_l1_weight = chunk_weight(msg.pop("shared mlp l1 weight"), "row",
+                                                    args.target_tensor_parallel_size)
+                if md.moe_shared_experts_gate:
+                    shared_experts_gate = msg.pop("shared mlp gate weight")
 
             if margs.num_experts:
                 router = msg.pop("router weight")
 
             # Special handling for swiglu
             if md.swiglu:
-                mlp_l0_weight_W = chunk_weight(msg.pop("mlp l0 weight W"), "column", args.target_tensor_parallel_size, args.target_expert_parallel_size)
-                mlp_l0_weight_V = chunk_weight(msg.pop("mlp l0 weight V"), "column", args.target_tensor_parallel_size, args.target_expert_parallel_size)
+                mlp_l0_weight_W = chunk_weight(msg.pop("mlp l0 weight W"), "column", args.target_tensor_parallel_size,
+                                               args.target_expert_parallel_size)
+                mlp_l0_weight_V = chunk_weight(msg.pop("mlp l0 weight V"), "column", args.target_tensor_parallel_size,
+                                               args.target_expert_parallel_size)
                 mlp_l0_weight = torch.cat((mlp_l0_weight_W, mlp_l0_weight_V), dim=-2)
             else:
-                mlp_l0_weight = chunk_weight(msg.pop("mlp l0 weight"), "column", args.target_tensor_parallel_size, args.target_expert_parallel_size)
+                mlp_l0_weight = chunk_weight(msg.pop("mlp l0 weight"), "column", args.target_tensor_parallel_size,
+                                             args.target_expert_parallel_size)
 
             if md.qkv_bias:
                 qkv_bias = chunk_bias(msg.pop("qkv bias"), 'column', args.target_tensor_parallel_size)
             if md.linear_bias:
                 dense_bias = msg.pop("dense bias")
-                mlp_l1_bias = chunk_bias(msg.pop("mlp l1 bias"), 'row', args.target_tensor_parallel_size, args.target_expert_parallel_size)
+                mlp_l1_bias = chunk_bias(msg.pop("mlp l1 bias"), 'row', args.target_tensor_parallel_size,
+                                         args.target_expert_parallel_size)
                 if md.swiglu:
-                    mlp_l0_bias_W = chunk_bias(msg.pop("mlp l0 bias W"), 'column', args.target_tensor_parallel_size, args.target_expert_parallel_size)
-                    mlp_l0_bias_V = chunk_bias(msg.pop("mlp l0 bias V"), 'column', args.target_tensor_parallel_size, args.target_expert_parallel_size)
+                    mlp_l0_bias_W = chunk_bias(msg.pop("mlp l0 bias W"), 'column', args.target_tensor_parallel_size,
+                                               args.target_expert_parallel_size)
+                    mlp_l0_bias_V = chunk_bias(msg.pop("mlp l0 bias V"), 'column', args.target_tensor_parallel_size,
+                                               args.target_expert_parallel_size)
                     mlp_l0_bias = torch.cat((mlp_l0_bias_W, mlp_l0_bias_V), dim=-1)
                 else:
-                    mlp_l0_bias = chunk_bias(msg.pop("mlp l0 bias"), 'column', args.target_tensor_parallel_size, args.target_expert_parallel_size)
+                    mlp_l0_bias = chunk_bias(msg.pop("mlp l0 bias"), 'column', args.target_tensor_parallel_size,
+                                             args.target_expert_parallel_size)
 
             # Save them to the model
             for ep_rank in range(args.target_expert_parallel_size):
                 for tp_rank in range(args.target_tensor_parallel_size):
                     params_dict = {
-                        "self_attn_norm_weight" : input_norm_weight,
-                        "self_attn_qkv_weight" : qkv_weight[tp_rank],
-                        "self_attn_proj_weight" : dense_weight[tp_rank],
-                        "mlp_norm_weight" : post_norm_weight
+                        "self_attn_norm_weight": input_norm_weight,
+                        "self_attn_qkv_weight": qkv_weight[tp_rank],
+                        "self_attn_proj_weight": dense_weight[tp_rank],
+                        "mlp_norm_weight": post_norm_weight
                     }
+                    if margs.moe_shared_expert_intermediate_size:
+                        params_dict.update({
+                            "mlp_shared_exp_fc1_weight": shared_mlp_l0_weight[tp_rank],
+                            "mlp_shared_exp_fc2_weight": shared_mlp_l1_weight[tp_rank]
+                        })
                     if margs.num_experts:
                         params_dict.update({
-                            "mlp_fc1_weight" : mlp_l0_weight[ep_rank][tp_rank],
-                            "mlp_fc2_weight" : mlp_l1_weight[ep_rank][tp_rank]
+                            "mlp_fc1_weight": mlp_l0_weight[ep_rank][tp_rank],
+                            "mlp_fc2_weight": mlp_l1_weight[ep_rank][tp_rank]
                         })
                     else:
                         params_dict.update({
-                            "mlp_fc1_weight" : mlp_l0_weight[tp_rank],
-                            "mlp_fc2_weight" : mlp_l1_weight[tp_rank]
+                            "mlp_fc1_weight": mlp_l0_weight[tp_rank],
+                            "mlp_fc2_weight": mlp_l1_weight[tp_rank]
                         })
                     params_dict.update({
-                        "self_attn_norm_bias" : input_norm_bias if md.norm_has_bias else None,
-                        "mlp_norm_bias" : post_norm_bias if md.norm_has_bias else None,
+                        "self_attn_norm_bias": input_norm_bias if md.norm_has_bias else None,
+                        "mlp_norm_bias": post_norm_bias if md.norm_has_bias else None,
                     })
                     if md.qkv_bias:
                         params_dict.update({
-                            "self_attn_qkv_bias" : qkv_bias[tp_rank]
+                            "self_attn_qkv_bias": qkv_bias[tp_rank]
                         })
                     if md.linear_bias:
                         params_dict.update({
-                            "self_attn_proj_bias" : dense_bias
+                            "self_attn_proj_bias": dense_bias
                         })
                         if margs.num_experts:
                             params_dict.update({
-                                "mlp_fc1_bias" : mlp_l0_bias[ep_rank][tp_rank],
-                                "mlp_fc2_bias" : mlp_l1_bias[ep_rank]
+                                "mlp_fc1_bias": mlp_l0_bias[ep_rank][tp_rank],
+                                "mlp_fc2_bias": mlp_l1_bias[ep_rank]
                             })
-                        else :
+                        else:
                             params_dict.update({
-                                "mlp_fc1_bias" : mlp_l0_bias[tp_rank],
-                                "mlp_fc2_bias" : mlp_l1_bias
+                                "mlp_fc1_bias": mlp_l0_bias[tp_rank],
+                                "mlp_fc2_bias": mlp_l1_bias
                             })
                     if margs.num_experts:
                         params_dict.update({
-                            "router_weight":  router
+                            "router_weight": router
                         })
+                        if md.moe_shared_experts_gate:
+                            params_dict.update({
+                                "shared_mlp_gate_weight": shared_experts_gate
+                            })
                     model = get_local_model(pp_rank, ep_rank, tp_rank)
                     setter.set_layer(model, layer_id, **params_dict)
 
             total_layer_num = total_layer_num + 1
             check_message(msg)
 
-
         if pp_rank == args.target_pipeline_parallel_size - 1:
             msg = queue_get("final norm")
             final_norm_weight = msg.pop("weight")
             if md.norm_has_bias:
                 final_norm_bias = msg.pop("bias")
-            pp_local_models = [get_local_model(pp_rank, ep_rank, tp_rank) for ep_rank in range(args.target_expert_parallel_size)
-                for tp_rank in range(args.target_tensor_parallel_size)]
+            pp_local_models = [get_local_model(pp_rank, ep_rank, tp_rank) for ep_rank in
+                               range(args.target_expert_parallel_size)
+                               for tp_rank in range(args.target_tensor_parallel_size)]
             for eptp_rank, model in enumerate(pp_local_models):
                 tp_rank = eptp_rank % args.target_tensor_parallel_size
                 setter.set_final_norm(
@@ -794,10 +858,11 @@ def save_checkpoint(queue, args):
 
         for ep_rank in range(args.target_expert_parallel_size):
             for tp_rank in range(args.target_tensor_parallel_size):
-                save_checkpoint(md.iteration, [get_local_model(pp_rank, ep_rank, tp_rank)], None, None, num_floating_point_operations_so_far=0,
-                    pipeline_rank=pp_rank, pipeline_parallel=args.target_pipeline_parallel_size > 1,
-                    expert_rank=ep_rank, expert_parallel=args.target_expert_parallel_size > 1,
-                    tensor_rank=tp_rank)
+                save_checkpoint(md.iteration, [get_local_model(pp_rank, ep_rank, tp_rank)], None, None,
+                                num_floating_point_operations_so_far=0,
+                                pipeline_rank=pp_rank, pipeline_parallel=args.target_pipeline_parallel_size > 1,
+                                expert_rank=ep_rank, expert_parallel=args.target_expert_parallel_size > 1,
+                                tensor_rank=tp_rank)
                 # release the uselese model parts
                 models[pp_rank][ep_rank][tp_rank] = None
 
