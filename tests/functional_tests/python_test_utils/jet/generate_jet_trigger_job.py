@@ -53,6 +53,15 @@ def main(
         if test_case.type != "build"
     ]
 
+    tags = [
+        "arch/amd64",
+        "env/prod",
+        "origin/jet-fleet",
+        "owner/jet-core",
+        "purpose/jet-client",
+        "team/megatron",
+    ]
+
     if not test_cases:
         gitlab_pipeline = {
             "stages": ["empty-pipeline-placeholder"],
@@ -60,7 +69,7 @@ def main(
             "empty-pipeline-placeholder-job": {
                 "stage": "empty-pipeline-placeholder",
                 "image": f"{container_image}:{container_tag}",
-                "tags": ["mcore-docker-node-jet"],
+                "tags": tags,
                 "rules": [
                     {"if": '$CI_PIPELINE_SOURCE == "parent_pipeline"'},
                     {"if": '$CI_MERGE_REQUEST_ID'},
@@ -108,7 +117,7 @@ def main(
             gitlab_pipeline[test_case.spec.test_case] = {
                 "stage": f"{test_case.spec.model}",
                 "image": f"{container_image}:{container_tag}",
-                "tags": ["mcore-docker-node-jet"],
+                "tags": tags,
                 "rules": [
                     {"if": '$CI_PIPELINE_SOURCE == "parent_pipeline"'},
                     {"if": '$CI_MERGE_REQUEST_ID'},
