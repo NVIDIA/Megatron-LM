@@ -65,9 +65,9 @@ wget -O $TOKENIZER_MODEL https://huggingface.co/NousResearch/Llama-2-7b-chat-hf/
 fi
 
 MAX_POSITION_EMBEDDINGS=32768
-LOG_NAME="${TMP_DIR}/train_${MODEL_SIZE}B_iter${TOTAL_ITERS}_mbs${MBS}_bs${BS}_tp${TP}_pp${PP}_\
-            seq${SEQ_LENGTH}_optim_${OPTIMIZER}_fa_${USE_FLASH_ATTN}_seqpara_${SEQ_PARALLEL}_\
-            contiparam_${CONTI_PARAMS}_te_bg16_${TE_BF16}_${LABEL}.log"
+LOG_NAME="${TMP_DIR}/train_${MODEL_SIZE}B_iter${TOTAL_ITERS}_mbs${MBS}_bs${BS}_tp${TP}_pp${PP}_"\
+"seq${SEQ_LENGTH}_optim_${OPTIMIZER}_fa_${USE_FLASH_ATTN}_seqpara_${SEQ_PARALLEL}_"\
+"contiparam_${CONTI_PARAMS}_te_bg16_${TE_BF16}_${LABEL}"
 TRAIN_LOG="${LOG_NAME}.log"
 PROFILING_DIR="profile_${LOG_NAME}"
 
