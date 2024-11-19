@@ -323,9 +323,9 @@ class RankGenerator(object):
                          separated by hyphens (e.g., 'tp-dp').
         """
         ordered_token = order.split('-')
-        token = token.split('-')
+        token_list = token.split('-')
         mask = [False] * len(ordered_token)
-        for t in token:
+        for t in token_list:
             mask[ordered_token.index(t)] = True
         return mask
 
@@ -392,12 +392,12 @@ def initialize_model_parallel(
     pipeline_model_parallel_split_rank: Optional[int] = None,
     use_sharp: bool = False,
     context_parallel_size: int = 1,
-    hierarchical_context_parallel_sizes: List[int] = None,
+    hierarchical_context_parallel_sizes: Optional[List[int]] = None,
     expert_model_parallel_size: int = 1,
     nccl_communicator_config_path: Optional[str] = None,
     distributed_timeout_minutes: int = 30,
     order: str = "tp-cp-ep-dp-pp",
-    encoder_tensor_model_parallel_size: Optional[int] = 0,
+    encoder_tensor_model_parallel_size: int = 0,
     encoder_pipeline_model_parallel_size: Optional[int] = 0,
     get_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
     get_position_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
