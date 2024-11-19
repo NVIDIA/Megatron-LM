@@ -37,11 +37,15 @@ from megatron.training import (
 from megatron.core import DistributedDataParallel as DDP
 from megatron.core import mpu
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
+from megatron.core.utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
 from megatron.legacy.model import Float16Module
 from megatron.legacy.model.module import param_is_not_shared
 
-
-ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, Float16Module)
+try:
+    from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
+    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, torch_FSDP, Float16Module)
+except ImportError:
+    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, Float16Module)
 
 
 def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
@@ -66,16 +70,23 @@ def calc_params_l2_norm(model):
         model = [model]
     # Remove duplicate params.
     params_data = []
-    for model_ in model:
-        for param in model_.parameters():
+    data_parallel_group = None
+
+    for model_chunk in model:
+        for i, param in enumerate(model_chunk.parameters()):
+            data_parallel_group = get_data_parallel_group_if_dtensor(param, data_parallel_group)
             is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
+            if not (param.requires_grad and is_not_tp_duplicate):
+                continue
+            assert is_not_tp_duplicate
             if mpu.get_expert_model_parallel_rank() > 0:
-                if not getattr(param, 'allreduce', True) and is_not_tp_duplicate:
+                if not getattr(param, 'allreduce', True):
                     assert param_is_not_shared(param)
+                    param = to_local_if_dtensor(param)
                     params_data.append(param.data.float() if args.bf16 else param.data)
             else:
-                is_not_shared = param_is_not_shared(param)
-                if is_not_shared and is_not_tp_duplicate:
+                if param_is_not_shared(param):
+                    param = to_local_if_dtensor(param)
                     params_data.append(param.data.float() if args.bf16 else param.data)
 
     # Calculate norm
@@ -87,6 +98,12 @@ def calc_params_l2_norm(model):
         False # no per-parameter norm
     )
     norm_2 = norm * norm
+
+    if data_parallel_group is not None:
+        torch.distributed.all_reduce(norm_2,
+                                     op=torch.distributed.ReduceOp.SUM,
+                                     group=data_parallel_group)
+
     if mpu.get_expert_model_parallel_world_size() == 1:
         # Sum across all model-parallel GPUs(tensor + pipeline).
         torch.distributed.all_reduce(norm_2,

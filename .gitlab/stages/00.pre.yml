@@ -27,7 +27,7 @@ pre:mirror_to_github:
   stage: .pre
   image: python:3.10
   variables:
-    GIT_STRATEGY: "clone"
+    GIT_STRATEGY: 'clone'
   script:
     - git checkout $CI_COMMIT_BRANCH
     - git remote add github https://ko3n1g:$GH_TOKEN@github.com/NVIDIA/Megatron-LM.git || true
@@ -41,16 +41,15 @@ pre:create_ci_branches:
     matrix:
       - branch: ci-unit-test-extended
       - branch: ci-rebuild-mcore-nemo-image
-      - branch: ci-mr-a100
-      - branch: ci-nightly-a100
-      - branch: ci-weekly-a100
-      - branch: ci-weekly-h100
+      - branch: ci-mr
+      - branch: ci-nightly
+      - branch: ci-weekly
       - branch: ci-pre-release
   tags: [mcore-docker-node-small]
   stage: .pre
   image: python:3.10
   variables:
-    GIT_STRATEGY: "clone"
+    GIT_STRATEGY: 'clone'
   script:
     - git remote set-url origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/adlr/megatron-lm.git"
     - git switch --force-create $branch
@@ -76,33 +75,21 @@ pre:label_merge_request:
       source labels
       curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}" --data-urlencode "add_labels=$LABELS" -X PUT
 
-pre:clean_docker_node:
-  extends: [.pre_rules, .dind_rules]
-  tags: 
-    - ${node}
-  parallel:
-    matrix:
-      - node: mcore-docker-node-small
-      - node: mcore-docker-node-large
-  script: ':'
-
 pre:maybe_cherry_pick_commit:
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
     - when: never
   tags: [mcore-docker-node-small]
   stage: .pre
-  image:
-    name: registry.gitlab.com/gitlab-ci-utils/curl-jq
-    entrypoint: [""]
+  image: badouralix/curl-jq
   variables:
-    GIT_STRATEGY: "clone"
-  script: 
+    GIT_STRATEGY: 'clone'
+  script:
     - set -x
     - set +e
     - SHA=$(git rev-list --no-merges -n 1 HEAD)
     - MESSAGE=$(git log -n 1 --pretty=format:%s $SHA)
-    - MR_ID=$(echo $MESSAGE | awk -F'!' '{print $2}' | awk '{print $1}' )  
+    - MR_ID=$(echo $MESSAGE | awk -F'!' '{print $2}' | awk '{print $1}' )
     - git remote set-url origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
     - git config --global user.email "mcore-bot@nvidia.com"
     - git config --global user.name "Mcore Bot"
@@ -120,10 +107,10 @@ pre:maybe_cherry_pick_commit:
         echo Nothing to cherry pick
         exit 0
       fi
-      
+
       echo $TARGET_BRANCHES | while read -r RELEASE_BRANCH ; do
         TARGET_BRANCH_EXISTS_OK=$([[ "$(git ls-remote --heads origin refs/heads/$RELEASE_BRANCH)" != "" ]] && echo true || echo false)
-      
+
         if [[ "$TARGET_BRANCH_EXISTS_OK" == "false" ]]; then
           echo Release branch does not yet exist, will not  cherry-pick
           continue
@@ -160,7 +147,7 @@ pre:maybe_cherry_pick_commit:
                 "type": "section",
                 "text": {
                   "type": "mrkdwn",
-                  "text": ":alert: Cherrypick bot 🤖: Cherry-pick of <'$URL'|!'$MR_ID'> failed"
+                  "text": ":alert: Cherrypick bot 🤖: Cherry-pick of <'$URL'|!'$MR_ID'> failed\ncc '$SLACK_ADMIN'"
                 }
               }
             ]
@@ -175,7 +162,7 @@ pre:maybe_cherry_pick_commit:
 
 pre:check_milestone:
   extends: [.pre_rules]
-  image: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_ci:buildcache
+  image: badouralix/curl-jq
   tags: [mcore-docker-node-small]
   script:
     - env
@@ -186,4 +173,3 @@ pre:check_milestone:
         echo Please assign a Milestone to this MR!
         exit 1
       fi
-  

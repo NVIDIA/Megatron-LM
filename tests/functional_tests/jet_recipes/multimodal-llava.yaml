@@ -2,14 +2,17 @@ type: basic
 format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
+launchers:
+  type:slurm:
+    ntasks_per_node: '{gpus}'
 spec:
-  name: "{test_case}"
+  name: '{test_case}'
   model: multimodal-llava
   build: mcore-pyt-{environment}
   nodes: 1
   gpus: 8
   platforms: dgx_a100
-  time_limit: 12000
+  time_limit: 1800
   scope: null
   script: |-
     ls
@@ -24,6 +27,7 @@ spec:
         "TRAINING_SCRIPT_PATH=pretrain_vlm.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}.json"
+        "N_REPEAT={n_repeat}"
     )
 
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
@@ -31,8 +35,15 @@ spec:
 products:
   - environment: [lts, dev]
     scope: [mr]
+    n_repeat: [5]
+    gpus: [8]
     test_case:
-    - multimodal_llava_mr_mcore_te_tp1_pp1_dgx_a100_1N8G
-    - multimodal_llava_mr_mcore_te_tp2_pp3_dgx_a100_1N8G
-    - multimodal_llava_mr_mcore_te_tp4_pp1_etp3_dgx_a100_1N7G
-    - multimodal_llava_mr_mcore_te_tp4_pp1_resume_torch_etp3_dgx_a100_1N7G
+      - multimodal_llava_mr_mcore_te_tp1_pp1_dgx_a100_1N8G
+      - multimodal_llava_mr_mcore_te_tp2_pp3_dgx_a100_1N8G
+  - environment: [lts, dev]
+    scope: [mr]
+    n_repeat: [5]
+    gpus: [7]
+    test_case:
+      - multimodal_llava_mr_mcore_te_tp4_pp1_etp3_dgx_a100_1N7G
+      - multimodal_llava_mr_mcore_te_tp4_pp1_resume_torch_etp3_dgx_a100_1N7G

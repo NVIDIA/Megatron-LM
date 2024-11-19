@@ -84,7 +84,7 @@ class TestEncoderDecoderTextGenerationController:
 
         inference_wrapper_config = InferenceWrapperConfig(
             hidden_size=hidden_size,
-            inference_batch_times_seqlen_threshold=20,
+            inference_batch_times_seqlen_threshold=-1,
             fp32_residual_connection=False,
             params_dtype=torch.float,
             padded_vocab_size=self.vocab_size,

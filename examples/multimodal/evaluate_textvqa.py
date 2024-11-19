@@ -35,7 +35,7 @@ def merge_input_files(input_path):
 def textvqa_eval(input_path):
     """Run TextVQA evaluation."""
     result_file_path = merge_input_files(input_path)
-    avg_acc = compute_vqa_accuracy(result_file_path)
+    avg_acc = compute_vqa_accuracy(result_file_path, task="TextVQA")
     return avg_acc
 
 

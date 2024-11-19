@@ -32,6 +32,13 @@ from megatron.training.checkpointing import checkpoint_exists
 from megatron.legacy.model import Float16Module
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
+try:
+    from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
+
+    HAVE_FSDP2 = True
+except ImportError:
+    HAVE_FSDP2 = False
+
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig
@@ -196,6 +203,17 @@ def get_start_time_from_progress_log():
         start_num_floating_point_operations
 
 
+def preprocess_common_state_dict(common_state_dict):
+    import copy
+    # Convert args key of type namespace to dictionary 
+    preprocessed_common_state_dict = copy.deepcopy(common_state_dict)
+    preprocessed_common_state_dict['args'] = vars(preprocessed_common_state_dict['args'])
+    # Remove rank and local rank from state dict if it exists, since they are expected to be different
+    preprocessed_common_state_dict['args'].pop('local_rank', None)
+    preprocessed_common_state_dict['args'].pop('rank', None)
+    return preprocessed_common_state_dict
+
+
 def pretrain(
     train_valid_test_dataset_provider,
     model_provider,
@@ -214,7 +232,7 @@ def pretrain(
         1) initialize Megatron.
         2) setup model, optimizer and lr schedule using the model_provider.
         3) call train_val_test_data_provider to get train/val/test datasets.
-        4) train the modle using the forward_step_func.
+        4) train the model using the forward_step_func.
 
     Args:
         train_valid_test_dataset_provider: a function that takes the size of
@@ -277,9 +295,6 @@ def pretrain(
         time.time() - _TRAIN_START_TIME))
     print_datetime('after megatron is initialized')
     app_metrics['app_model_init_finish_time'] = one_logger_utils.get_timestamp_in_ms()
-
-    args = get_args()
-    timers = get_timers()
 
     # Track E2E metrics on pretrain start
     one_logger_utils.on_pretrain_start()
@@ -372,7 +387,7 @@ def pretrain(
                             num_floating_point_operations_so_far, checkpointing_context,
                             train_data_iterator=train_data_iterator,
                             ft_client=ft_integration.get_rank_monitor_client(
-                                ft_integration.StateMachineActions.SAVE_CHECKPOINT))
+                            ft_integration.StateMachineActions.SAVE_CHECKPOINT), preprocess_common_state_dict_fn=preprocess_common_state_dict)
 
         one_logger and one_logger.log_metrics({
             'app_train_loop_finish_time': one_logger_utils.get_timestamp_in_ms()
@@ -533,6 +548,12 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                     fp8_meta.amax_history[0][fp8_meta_index] = 0
 
     if wrap_with_ddp:
+        if getattr(args, "use_torch_fsdp2", False):
+            assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
+            DP = torch_FSDP
+        else:
+            DP = DDP
+
         config = get_model_config(model[0])
 
         kwargs = {}
@@ -546,9 +567,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         ddp_config = DistributedDataParallelConfig(**kwargs)
 
         overlap_param_gather_with_optimizer_step = getattr(args, 'overlap_param_gather_with_optimizer_step', False)
-        model = [DDP(config,
-                     ddp_config,
-                     model_chunk,
+        model = [DP(config=config,
+                     ddp_config=ddp_config,
+                     module=model_chunk,
                      # Turn off bucketing for model_chunk 2 onwards, since communication for these
                      # model chunks is overlapped with compute anyway.
                      disable_bucketing=(model_chunk_idx > 0) or overlap_param_gather_with_optimizer_step)
@@ -679,7 +700,8 @@ def setup_model_and_optimizer(model_provider_func,
 
         args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
                 model, optimizer, opt_param_scheduler,
-                ft_client=ft_integration.get_rank_monitor_client(), checkpointing_context=checkpointing_context)
+                ft_client=ft_integration.get_rank_monitor_client(), checkpointing_context=checkpointing_context,
+                skip_load_to_model_and_opt=HAVE_FSDP2 and getattr(args, "use_torch_fsdp2", False))
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics({
@@ -706,7 +728,8 @@ def setup_model_and_optimizer(model_provider_func,
         update_use_dist_ckpt(args)
 
         save_checkpoint(args.iteration, model, optimizer, opt_param_scheduler,
-                        args.num_floating_point_operations_so_far)
+                        args.num_floating_point_operations_so_far,
+                        preprocess_common_state_dict_fn=preprocess_common_state_dict)
 
         print_rank_0("> converted checkpoint: %s -> %s." % (load_ckpt_format, args.ckpt_format))
         torch.distributed.barrier()
@@ -877,6 +900,12 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         timers.write(timers_to_log, writer, iteration,
                      normalizer=total_iterations)
     if writer and (iteration % args.tensorboard_log_interval == 0):
+        if args.record_memory_history and is_last_rank():
+            snapshot = torch.cuda.memory._snapshot()
+            from pickle import dump
+            with open(args.memory_snapshot_path , 'wb') as f:
+                dump(snapshot, f)
+
         if wandb_writer:
             wandb_writer.log({'samples vs steps': args.consumed_train_samples},
                              iteration)
@@ -1065,6 +1094,18 @@ def compute_throughputs_and_append_to_progress_log(iteration,
                            f"Tokens (in billions): {tokens_so_far / 10**9:.2f}")
 
 
+def enable_forward_pre_hook(model_chunks):
+    for model_chunk in model_chunks:
+        assert isinstance(model_chunk, DDP)
+        model_chunk.enable_forward_pre_hook()
+
+
+def disable_forward_pre_hook(model_chunks):
+    for model_chunk in model_chunks:
+        assert isinstance(model_chunk, DDP)
+        model_chunk.disable_forward_pre_hook()
+
+
 def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
                              num_floating_point_operations_so_far, checkpointing_context,
                              non_persistent_ckpt=False, train_data_iterator=None):
@@ -1081,14 +1122,14 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
     # Log E2E metrics before save-checkpoint
     one_logger_utils.track_e2e_metrics()
     if args.use_distributed_optimizer and args.overlap_param_gather:
-        optimizer.disable_pre_hook()
+        disable_forward_pre_hook(model)
     save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
                     num_floating_point_operations_so_far, checkpointing_context,
                     non_persistent_ckpt=non_persistent_ckpt, train_data_iterator=train_data_iterator,
                     ft_client=ft_integration.get_rank_monitor_client(
-                        ft_integration.StateMachineActions.SAVE_CHECKPOINT))
+                    ft_integration.StateMachineActions.SAVE_CHECKPOINT), preprocess_common_state_dict_fn=preprocess_common_state_dict)
     if args.use_distributed_optimizer and args.overlap_param_gather:
-        optimizer.enable_pre_hook()
+        enable_forward_pre_hook(model)
     timers(timer_key).stop(barrier=True)
     timers.log([timer_key])
     save_checkpoint_finish_time = timers('save-checkpoint').active_time()
@@ -1316,13 +1357,13 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if args.check_weight_hash_across_dp_replicas_interval is not None and \
                 iteration % args.check_weight_hash_across_dp_replicas_interval == 0:
             if args.use_distributed_optimizer and args.overlap_param_gather:
-                optimizer.disable_pre_hook()
+                disable_forward_pre_hook(model)
             assert check_param_hashes_across_dp_replicas(model, cross_check=True), \
                 "Parameter hashes not matching across DP replicas"
             torch.distributed.barrier()
             print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
             if args.use_distributed_optimizer and args.overlap_param_gather:
-                optimizer.enable_pre_hook()
+                enable_forward_pre_hook(model)
 
         # Autoresume
         if args.adlr_autoresume and \
@@ -1335,7 +1376,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
            args.do_valid:
             timers('interval-time').stop()
             if args.use_distributed_optimizer and args.overlap_param_gather:
-                optimizer.disable_pre_hook()
+                disable_forward_pre_hook(model)
             if args.manual_gc and args.manual_gc_eval:
                 # Collect all objects.
                 gc.collect()
@@ -1355,7 +1396,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 # Collect only the objects created and used in evaluation.
                 gc.collect(generation=0)
             if args.use_distributed_optimizer and args.overlap_param_gather:
-                optimizer.enable_pre_hook()
+                enable_forward_pre_hook(model)
             timers('interval-time', log_level=0).start(barrier=True)
 
 
@@ -1448,7 +1489,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if args.use_distributed_optimizer and args.overlap_param_gather:
-        optimizer.disable_pre_hook()
+        disable_forward_pre_hook(model)
 
     if args.enable_ft_package and ft_integration.get_rank_monitor_client() is not None:
         ft_integration.get_rank_monitor_client().shutdown_workload_monitoring()

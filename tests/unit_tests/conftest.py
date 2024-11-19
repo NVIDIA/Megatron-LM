@@ -13,7 +13,7 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="function", autouse=True)
 def set_env():
     if is_te_min_version("1.3"):
         os.environ['NVTE_FLASH_ATTN'] = '0'

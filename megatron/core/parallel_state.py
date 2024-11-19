@@ -79,6 +79,8 @@ _CONTEXT_PARALLEL_GROUP = None
 # A list of global ranks for each context parallel group to ease calculation of the
 # destination rank when exchanging KV/dKV between context parallel_ranks
 _CONTEXT_PARALLEL_GLOBAL_RANKS = None
+# Hierarchical context parallel groups
+_HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = []
 
 # Data parallel group information with context parallel combined.
 _DATA_PARALLEL_GROUP_WITH_CP = None
@@ -120,7 +122,7 @@ def get_nccl_options(pg_name, nccl_comm_cfgs):
 def generate_masked_orthogonal_rank_groups(
     world_size: int, parallel_size: List[int], mask: List[bool]
 ) -> List[List[int]]:
-    """Generate orthogonal parallel groups based on the parallel size and mask.
+    r"""Generate orthogonal parallel groups based on the parallel size and mask.
 
     Arguments:
         world_size (int): world size
@@ -226,6 +228,40 @@ def generate_masked_orthogonal_rank_groups(
     return ranks
 
 
+def create_hierarchical_parallel_groups(
+    rank, ranks, group_size, hierarchical_group_sizes, pg_options
+):
+    """Create hierarchical groups for one parallelism.
+    Taking a group size of 16 as example, so we have a total of 16 GPUs denoted by g0 ... g15.
+    If the hierarchical group sizes are [2,2,4], we use 2 GPUs in the first and second level
+    of sub-groups, and 4 GPUs in the last level of sub groups. The present function will
+    create 8 level-1 sub-groups, 8 level-2 sub-groups and 4 level-3 sub-groups as:
+        8 level-1 sub-groups:
+            [g0, g1], [g2, g3], [g4, g5], [g6, g7], [g8, g9], [g10, g11], [g12, g13], [g14, g15]
+        8 level-2 sub-groups:
+            [g0, g2], [g1, g3], [g4, g6], [g5, g7], [g8, g10], [g9, g11], [g12, g14], [g13, g15]
+        4 level-3 sub-groups:
+            [g0, g4, g8, g12], [g1, g5, g9, g13], [g2, g6, g10, g14], [g3, g7, g11, g15]
+    """
+
+    hierarchical_groups = []
+    accumulated_group_sizes = 1
+    processed_group_sizes = 1
+    for hierarchical_group_size in hierarchical_group_sizes:
+        accumulated_group_sizes *= hierarchical_group_size
+        for k in range(group_size // accumulated_group_sizes):
+            for j in range(processed_group_sizes):
+                global_sub_ranks = [
+                    ranks[j + i * processed_group_sizes + k * accumulated_group_sizes]
+                    for i in range(hierarchical_group_size)
+                ]
+                sub_group = torch.distributed.new_group(global_sub_ranks, pg_options=pg_options)
+                if rank in global_sub_ranks:
+                    hierarchical_groups.append(sub_group)
+        processed_group_sizes *= hierarchical_group_size
+    return hierarchical_groups
+
+
 class RankGenerator(object):
     """A class for generating rank groups for different modes of parallelism."""
 
@@ -287,9 +323,9 @@ class RankGenerator(object):
                          separated by hyphens (e.g., 'tp-dp').
         """
         ordered_token = order.split('-')
-        token = token.split('-')
+        token_list = token.split('-')
         mask = [False] * len(ordered_token)
-        for t in token:
+        for t in token_list:
             mask[ordered_token.index(t)] = True
         return mask
 
@@ -356,11 +392,12 @@ def initialize_model_parallel(
     pipeline_model_parallel_split_rank: Optional[int] = None,
     use_sharp: bool = False,
     context_parallel_size: int = 1,
+    hierarchical_context_parallel_sizes: Optional[List[int]] = None,
     expert_model_parallel_size: int = 1,
     nccl_communicator_config_path: Optional[str] = None,
     distributed_timeout_minutes: int = 30,
     order: str = "tp-cp-ep-dp-pp",
-    encoder_tensor_model_parallel_size: Optional[int] = 0,
+    encoder_tensor_model_parallel_size: int = 0,
     encoder_pipeline_model_parallel_size: Optional[int] = 0,
     get_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
     get_position_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
@@ -513,7 +550,6 @@ def initialize_model_parallel(
     world_size: int = torch.distributed.get_world_size()
 
     if encoder_tensor_model_parallel_size > 0:
-        assert encoder_pipeline_model_parallel_size > 0
         assert (
             encoder_tensor_model_parallel_size <= tensor_model_parallel_size
         ), "We do not support encoders with more TP than the decoder."
@@ -691,6 +727,15 @@ def initialize_model_parallel(
         if rank in ranks:
             _CONTEXT_PARALLEL_GROUP = group
             _CONTEXT_PARALLEL_GLOBAL_RANKS = ranks
+        if hierarchical_context_parallel_sizes:
+            global _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
+            _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS += create_hierarchical_parallel_groups(
+                rank,
+                ranks,
+                context_parallel_size,
+                hierarchical_context_parallel_sizes,
+                get_nccl_options('cp', nccl_comm_cfgs),
+            )
 
     # Build the model-parallel groups.
     global _MODEL_PARALLEL_GROUP
@@ -960,6 +1005,13 @@ def get_context_parallel_global_ranks(check_initialized=True):
             _CONTEXT_PARALLEL_GLOBAL_RANKS is not None
         ), 'context parallel group is not initialized'
     return _CONTEXT_PARALLEL_GLOBAL_RANKS
+
+
+def get_hierarchical_context_parallel_groups(check_initialized=True):
+    """Get the inner ring of context parallel group the caller rank belongs to."""
+    if check_initialized:
+        assert _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS is not None
+    return _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
 
 
 def get_embedding_group():
@@ -1255,22 +1307,30 @@ def is_pipeline_stage_after_split(rank=None):
     return False
 
 
-def is_inside_encoder(rank=None):
-    """Return True if pipeline stage executes encoder block for a model
-    with both encoder and decoder."""
+def is_inside_encoder(rank=None) -> bool:
+    """Return True if pipeline stage executes encoder block.
+    This function implicitly assumes we have a model with both
+    encoder and decoder."""
     if get_pipeline_model_parallel_world_size() == 1:
         return True
     if rank is None:
         rank = get_pipeline_model_parallel_rank()
     global _PIPELINE_MODEL_PARALLEL_DECODER_START
-    if _PIPELINE_MODEL_PARALLEL_DECODER_START is None:
+    # _PIPELINE_MODEL_PARALLEL_DECODER_START == None means that the
+    # encoder shares the first pipeline rank with the decoder
+    if _PIPELINE_MODEL_PARALLEL_DECODER_START is None and rank == 0:
         return True
-    if rank < _PIPELINE_MODEL_PARALLEL_DECODER_START:
+    # _PIPELINE_MODEL_PARALLEL_DECODER_START != None means that the
+    # encoder is on it's own pipeline ranks before the decoder
+    if (
+        _PIPELINE_MODEL_PARALLEL_DECODER_START is not None
+        and rank < _PIPELINE_MODEL_PARALLEL_DECODER_START
+    ):
         return True
     return False
 
 
-def is_inside_decoder(rank=None):
+def is_inside_decoder(rank=None) -> bool:
     """Return True if pipeline stage executes decoder block for a model
     with both encoder and decoder."""
     if get_pipeline_model_parallel_world_size() == 1:
@@ -1283,6 +1343,12 @@ def is_inside_decoder(rank=None):
     if rank >= _PIPELINE_MODEL_PARALLEL_DECODER_START:
         return True
     return False
+
+
+def get_pipeline_model_parallel_decoder_start() -> int:
+    """Return decoder start rank (if encoder pipeline parallelism is set)."""
+    global _PIPELINE_MODEL_PARALLEL_DECODER_START
+    return _PIPELINE_MODEL_PARALLEL_DECODER_START
 
 
 def is_pipeline_stage_at_split():
@@ -1560,6 +1626,9 @@ def destroy_model_parallel():
 
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None
+
+    global _PIPELINE_MODEL_PARALLEL_DECODER_START
+    _PIPELINE_MODEL_PARALLEL_DECODER_START = None
 
     global _DATA_PARALLEL_GROUP
     _DATA_PARALLEL_GROUP = None

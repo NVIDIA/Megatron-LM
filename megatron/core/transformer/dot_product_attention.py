@@ -41,6 +41,7 @@ class DotProductAttention(MegatronModule):
         attention_type: str,
         attention_dropout: float = None,
         softmax_scale: float = None,
+        cp_comm_type: str = None,
     ):
         super().__init__(config=config)
 
@@ -101,12 +102,15 @@ class DotProductAttention(MegatronModule):
         value: Tensor,
         attention_mask: Tensor,
         attn_mask_type: AttnMaskType = None,
+        attention_bias: Tensor = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
+        """Forward."""
         assert packed_seq_params is None, (
             "Packed sequence is not supported by DotProductAttention."
             "Please use TEDotProductAttention instead."
         )
+        assert attention_bias is None, "Attention bias is not supported for DotProductAttention."
 
         # ===================================
         # Raw attention scores. [b, n/p, s, s]

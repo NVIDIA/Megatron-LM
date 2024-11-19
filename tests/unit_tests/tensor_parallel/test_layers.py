@@ -24,7 +24,6 @@ def test_LinearWithFrozenWeight(tensor_parallel, allreduce_dgrad):
     bias = torch.zeros((size_per_partition)).cuda()
 
     gradient_accumulation_fusion = False
-    async_grad_allreduce = allreduce_dgrad
     sequence_parallel = False
     grad_output_buffer = None
     wgrad_deferral_limit = None
@@ -34,11 +33,10 @@ def test_LinearWithFrozenWeight(tensor_parallel, allreduce_dgrad):
         weight,
         bias,
         gradient_accumulation_fusion,
-        async_grad_allreduce,
+        allreduce_dgrad,
         sequence_parallel,
         grad_output_buffer,
         wgrad_deferral_limit,
-        allreduce_dgrad,
     )
     output = gather_from_tensor_model_parallel_region(
         output_parallel

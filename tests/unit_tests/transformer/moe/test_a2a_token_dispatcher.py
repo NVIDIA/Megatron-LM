@@ -3,7 +3,6 @@
 import pytest
 import torch
 
-from megatron.core.transformer.moe.moe_utils import permute, unpermute
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.moe.test_token_dispatcher import MoEModelTestContainer
 
@@ -70,7 +69,6 @@ class TestAlltoAllDispatcher:
     @pytest.mark.internal
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2), (1, 1)])
-    @pytest.mark.flaky
     def test_capacity_padding_forward_backward(self, tp_size, ep_size):
         container = MoEModelTestContainer(
             tp_size=tp_size,
@@ -81,7 +79,7 @@ class TestAlltoAllDispatcher:
             moe_router_load_balancing_type="aux_loss",
             moe_token_dispatcher_type="alltoall",
             moe_token_drop_policy="probs",
-            moe_expert_capacity_factor=0.5,
+            moe_expert_capacity_factor=0.6,
             moe_pad_expert_input_to_capacity=True,
         )
         container.dispatcher_drop_and_pad_test()

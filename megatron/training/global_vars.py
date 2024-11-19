@@ -7,7 +7,7 @@ import sys
 import torch
 
 from megatron.core import Timers
-from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator
+from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator, unset_num_microbatches_calculator
 from megatron.training import dist_signal_handler
 from megatron.training.tokenizer import build_tokenizer
 
@@ -99,6 +99,35 @@ def set_global_variables(args, build_tokenizer=True):
 
     if args.exit_signal_handler:
         _set_signal_handler()
+
+
+def unset_global_variables():
+    """Unset global vars.
+
+    Useful for multiple runs. See `tests/unit_tests/ckpt_converter/test_ckpt_converter.py` for an example.
+    """
+
+    global _GLOBAL_ARGS
+    global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
+    global _GLOBAL_TOKENIZER
+    global _GLOBAL_TENSORBOARD_WRITER
+    global _GLOBAL_WANDB_WRITER
+    global _GLOBAL_ONE_LOGGER
+    global _GLOBAL_ADLR_AUTORESUME
+    global _GLOBAL_TIMERS
+    global _GLOBAL_SIGNAL_HANDLER
+
+    _GLOBAL_ARGS = None
+    _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
+    _GLOBAL_TOKENIZER = None
+    _GLOBAL_TENSORBOARD_WRITER = None
+    _GLOBAL_WANDB_WRITER = None
+    _GLOBAL_ONE_LOGGER = None
+    _GLOBAL_ADLR_AUTORESUME = None
+    _GLOBAL_TIMERS = None
+    _GLOBAL_SIGNAL_HANDLER = None
+
+    unset_num_microbatches_calculator()
 
 
 def set_args(args):

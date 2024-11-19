@@ -4,8 +4,9 @@ ENV_VARS:
   NCCL_ALGO: Tree
   CUBLAS_WORKSPACE_CONFIG: :4096:8
   SKIP_PYTEST: 1
-  N_REPEATS: 1
-BEFORE_SCRIPT: pip uninstall -y transformer_engine pip uninstall -y Apex ## TODO: remove once Apex dependency has been removed completely
+BEFORE_SCRIPT: |
+  pip uninstall -y transformer_engine || true
+  pip uninstall -y Apex || true ## TODO: remove once Apex dependency has been removed completely
 MODEL_ARGS:
   --num-layers: 12
   --hidden-size: 512

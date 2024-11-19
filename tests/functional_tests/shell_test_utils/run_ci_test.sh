@@ -42,10 +42,8 @@ NVTE_ALLOW_NONDETERMINISTIC_ALGO=$(cat $TRAINING_PARAMS_PATH \
                                    | yq '.ENV_VARS.NVTE_ALLOW_NONDETERMINISTIC_ALGO')
 SKIP_PYTEST=$(cat $TRAINING_PARAMS_PATH \
               | yq '.ENV_VARS.SKIP_PYTEST')
-N_REPEATS=$(cat $TRAINING_PARAMS_PATH \
-              | yq '.ENV_VARS.N_REPEATS //1')
 
-for i in $(seq 1 $N_REPEATS);
+for i in $(seq 1 $N_REPEAT);
 do
     if [[ $i -gt 1 ]]; then
         rm -rf $CHECKPOINT_PATH/*
@@ -57,17 +55,30 @@ do
 
     # Maybe checkpoint resume training
     if [[ "$TEST_TYPE" == "ckpt-resume" ]]; then 
-        rm -rf $CHECKPOINT_PATH/iter_0000100; 
-        echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt;
+        if [[ ${SLURM_PROCID} -eq 0 ]]; then
+            rm -rf $CHECKPOINT_PATH/iter_0000100; 
+            echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt;
+        fi
+
         export RUN_NUMBER=2
         bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
     fi
 
+    if [[ ${SLURM_PROCID} -gt 0 ]]; then
+        continue
+    fi
+
     # Save run results
     export PYTHONPATH=$ROOT_DIR
+    if [[ "$TEST_TYPE" == "release" ]]; then
+        EXTRACT_ARGS=("--is-convergence-test")
+    else
+        EXTRACT_ARGS=("--is-normal-test")
+    fi
     python3 $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
         --logs-dir $TENSORBOARD_PATH \
-        --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH)
+        --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
+        "${EXTRACT_ARGS[@]}"
 
     # Maybe run tests
     if [[ ${SKIP_PYTEST:-0} != 1 ]]; then

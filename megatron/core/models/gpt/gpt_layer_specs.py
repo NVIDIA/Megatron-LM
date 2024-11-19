@@ -17,6 +17,7 @@ from megatron.core.transformer.multi_latent_attention import (
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.utils import is_te_min_version
 
 try:
     from megatron.core.extensions.transformer_engine import (
@@ -46,10 +47,10 @@ try:
 except ImportError:
     import warnings
 
-    from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-    warnings.warn('Apex is not installed. Falling back to Torch LayerNorm')
-    LNImpl = WrappedTorchLayerNorm
+    warnings.warn('Apex is not installed. Falling back to Torch Norm')
+    LNImpl = WrappedTorchNorm
 
 
 def get_gpt_layer_with_transformer_engine_spec(
@@ -102,6 +103,12 @@ def get_gpt_layer_with_transformer_engine_spec(
             ),
         )
     else:
+
+        # TENorm significantly harms convergence when used
+        # for QKLayerNorm if TE Version < 1.9;
+        # we instead use the Apex implementation.
+        qk_norm = TENorm if is_te_min_version("1.9.0") else FusedLayerNorm
+
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
@@ -112,10 +119,8 @@ def get_gpt_layer_with_transformer_engine_spec(
                         linear_qkv=TELayerNormColumnParallelLinear,
                         core_attention=TEDotProductAttention,
                         linear_proj=TERowParallelLinear,
-                        # TENorm significantly harms convergence when used
-                        # for QKLayerNorm; we instead use the Apex implementation.
-                        q_layernorm=FusedLayerNorm if qk_layernorm else IdentityOp,
-                        k_layernorm=FusedLayerNorm if qk_layernorm else IdentityOp,
+                        q_layernorm=qk_norm if qk_layernorm else IdentityOp,
+                        k_layernorm=qk_norm if qk_layernorm else IdentityOp,
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,

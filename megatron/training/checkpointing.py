@@ -2,13 +2,14 @@
 
 """Input/output checkpointing."""
 
-from enum import Enum, auto
-from logging import getLogger
+import contextlib
 import os
 import random
 import shutil
 import sys
 import threading
+from enum import Enum, auto
+from logging import getLogger
 from pathlib import Path
 
 import numpy as np
@@ -303,7 +304,7 @@ class CheckpointType(Enum):
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
-                    train_data_iterator=None, ft_client=None):
+                    train_data_iterator=None, ft_client=None, preprocess_common_state_dict_fn = None):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
     Checkpointing context is used to persist some checkpointing state
@@ -435,7 +436,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             logger.debug(f"rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt ")
             async_save_request = dist_checkpointing.save(state_dict, checkpoint_name, save_strategy,
                                                          async_sharded_save=args.async_save,
-                                                         validate_access_integrity=validate_sharding_integrity)
+                                                         validate_access_integrity=validate_sharding_integrity,
+                                                         preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn)
             # [ModelOpt]: save sharded modelopt_state
             if has_nvidia_modelopt:
                 save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))
@@ -990,11 +992,15 @@ def fix_fp8_params_lose_precision_when_loading_dist_ckpt(state_dict):
 
 
 def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
-                    ft_client=None, checkpointing_context=None):
+                    ft_client=None, checkpointing_context=None, skip_load_to_model_and_opt=False):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
         :attr:`state_dict` of the checkpoint match the names of
         parameters and buffers in model.
+    skip_load_to_model_and_opt (bool): whether to call `load_state_dict`
+        for :attr:`model` and :attr:`optimizer`. In case of running FSDP2
+        or other torch features that uses DTensor in state dict, the tensors
+        are already loaded in-place by `_load_base_checkpoint`.
     """
     args = get_args()
     load_dir = getattr(args, load_arg)
@@ -1038,13 +1044,18 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
             ckpt_tp_pp = (
                 state_dict['args'].tensor_model_parallel_size,
                 state_dict['args'].pipeline_model_parallel_size,
+                getattr(state_dict['args'], 'encoder_tensor_model_parallel_size', 0),
+                getattr(state_dict['args'], 'encoder_pipeline_model_parallel_size', 0),
             )
             run_tp_pp = (
-                mpu.get_tensor_model_parallel_world_size(),
-                mpu.get_pipeline_model_parallel_world_size(),
+                args.tensor_model_parallel_size,
+                args.pipeline_model_parallel_size,
+                # TODO: change this to args.encoder_tensor_model_parallel_size after 30th Nov 24
+                getattr(args, 'encoder_tensor_model_parallel_size', 0),
+                getattr(args, 'encoder_pipeline_model_parallel_size', 0),
             )
-            mismatch_msg = "(TP, PP) mismatch after resume ({} vs {} from checkpoint)".format(
-                ckpt_tp_pp, run_tp_pp
+            mismatch_msg = "(TP, PP, encoder TP, encoder PP) mismatch after resume ({} vs {} from checkpoint)".format(
+                run_tp_pp, ckpt_tp_pp
             )
 
             # Determine if RNG state will be loaded
@@ -1081,8 +1092,17 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
             else:
                 gen_sd_optim = None
                 gen_sd_opt_param_scheduler = None
-            load_kwargs['sharded_state_dict'] = generate_state_dict(args, model, gen_sd_optim, gen_sd_opt_param_scheduler,
-                                                                    gen_sd_rng_state, True, optim_sd_kwargs=optim_sd_kwargs)
+
+            # [ModelOpt]: Initial loading from non-resume sharded checkpoint to a Distillation Model
+            # will result in key mismatch with loss modules potentially containing parameters, since
+            # it requires generating a state_dict before loading. Here we hide those modules if present.
+            with contextlib.ExitStack() as stack:  # Allows multiple context managers for each model shard
+                if args.finetune and hasattr(model[0], "hide_loss_modules"):
+                    for m in model:
+                        stack.enter_context(m.hide_loss_modules())
+                load_kwargs['sharded_state_dict'] = generate_state_dict(args, model, gen_sd_optim, gen_sd_opt_param_scheduler,
+                                                                        gen_sd_rng_state, True, optim_sd_kwargs=optim_sd_kwargs)
+
             # When "--fp8-param-gather" is disabled, this function doesn't modify anything.
             fix_fp8_params_lose_precision_when_loading_dist_ckpt(load_kwargs['sharded_state_dict'])
 
@@ -1148,12 +1168,13 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
 
     # Model.
     strict = False if args.retro_add_retriever else strict
-    if len(model) == 1:
-        model[0].load_state_dict(state_dict['model'], strict=strict)
-    else:
-        for i in range(len(model)):
-            mpu.set_virtual_pipeline_model_parallel_rank(i)
-            model[i].load_state_dict(state_dict['model%d' % i], strict=strict)
+    if not skip_load_to_model_and_opt:
+        if len(model) == 1:
+            model[0].load_state_dict(state_dict['model'], strict=strict)
+        else:
+            for i in range(len(model)):
+                mpu.set_virtual_pipeline_model_parallel_rank(i)
+                model[i].load_state_dict(state_dict['model%d' % i], strict=strict)
 
     # Fix up query/key/value matrix ordering if needed.
     checkpoint_version = get_checkpoint_version()
@@ -1164,7 +1185,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     if not release and not args.finetune and not args.no_load_optim:
         try:
             # Load state dict.
-            if optimizer is not None:
+            if not skip_load_to_model_and_opt and optimizer is not None:
                 optimizer.load_state_dict(state_dict['optimizer'])
 
             # Load distributed optimizer's custom parameter state.
