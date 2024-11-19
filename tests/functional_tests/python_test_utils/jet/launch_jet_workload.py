@@ -5,12 +5,13 @@ import signal
 import sys
 import tempfile
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import click
 import jetclient
 import requests
 import yaml
+from jetclient.facades.objects import log as jet_log
 from jetclient.services.dtos.pipeline import PipelineStatus
 
 from tests.functional_tests.python_test_utils.jet import common
@@ -97,8 +98,7 @@ def launch_and_wait_for_completion(
     return pipeline
 
 
-def download_job_assets(job: jetclient.JETJob, iteration: int = 0) -> List[str]:
-    logs = job.get_logs()
+def download_job_assets(logs: List[jet_log.JETLog], iteration: int = 0) -> List[str]:
     if not logs:
         return [""]
 
@@ -113,8 +113,7 @@ def download_job_assets(job: jetclient.JETJob, iteration: int = 0) -> List[str]:
                 assets[log_filename].download(pathlib.Path(fh.name))
 
 
-def download_job_logs(job: jetclient.JETJob) -> List[str]:
-    logs = job.get_logs()
+def extract_logs_to_string(logs: List[jet_log.JETLog]) -> List[str]:
     if not logs:
         return [""]
 
@@ -201,8 +200,9 @@ def main(
         sys.exit(1)
 
     n_attempts = 0
+    n_nondeterminism_attemps = 0
     n_iteration = 0
-    while True and n_attempts < 3:
+    while True and n_attempts < 3 and n_nondeterminism_attemps < 2:
         pipeline = launch_and_wait_for_completion(
             test_case=test_case,
             environment=environment,
@@ -218,14 +218,26 @@ def main(
 
         main_job = [job for job in pipeline.get_jobs() if job.name.startswith("basic")][0]
 
-        logs = download_job_logs(job=main_job)
+        n_download_attempt = 0
+        while n_download_attempt < 3:
+            try:
+                jet_log = main_job.get_logs()
+                logs = extract_logs_to_string(logs=jet_log)
+                download_job_assets(logs=jet_log, iteration=n_iteration)
+                break
+            except requests.exceptions.ConnectionError as e:
+                print(e)
+                time.sleep((3**n_download_attempt) * 60)
+                n_download_attempt += 1
+
         concat_logs = "\n".join(logs)
         print(f"Logs:\n{concat_logs}")
 
-        download_job_assets(job=main_job, iteration=n_iteration)
-
         if test_type != "release":
             success = pipeline.get_status() == PipelineStatus.SUCCESS
+
+            if success:
+                sys.exit(int(not success))  # invert for exit 0
 
             if (
                 "Some NCCL operations have failed or timed out." in concat_logs
@@ -236,8 +248,10 @@ def main(
                 print("Detected NCCL failure, attempt restart.")
                 n_attempts += 1
                 continue
-
-            sys.exit(int(not success))  # invert for exit 0
+            else:
+                print("Non-determinism, let's try another node.")
+                n_nondeterminism_attemps += 1
+                continue
 
         if parse_failed_job(logs=logs):
             n_attempts += 1

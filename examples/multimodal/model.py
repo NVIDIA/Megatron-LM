@@ -30,6 +30,8 @@ def model_provider(
         model: A multimodal model.
     """
     args = get_args()
+    assert args.ckpt_format == 'torch', "Only ckpt-format torch is supported for VLM training currently."
+    assert args.encoder_pipeline_model_parallel_size <= 1, "LLaVA does not support pp>1 for encoder on it's own pipeline rank"
 
     use_te = args.use_te
 

@@ -661,6 +661,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         value: Tensor,
         attention_mask: Tensor,
         attn_mask_type: AttnMaskType,
+        attention_bias: Tensor = None,
         packed_seq_params: PackedSeqParams = None,
     ):
         """Forward."""
@@ -683,6 +684,16 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             packed_seq_kwargs.pop("cu_seqlens_q_padded", None)
             packed_seq_kwargs.pop("cu_seqlens_kv_padded", None)
 
+        attention_bias_kwargs = {}
+        if attention_bias is not None:
+            assert is_te_min_version("1.2.0"), (
+                f"Transformer-Engine v{get_te_version()} must be >= 1.2.0 to support"
+                "`attention_bias`."
+            )
+            attention_bias_kwargs = dict(
+                core_attention_bias_type='post_scale_bias', core_attention_bias=attention_bias
+            )
+
         if self.te_forward_mask_type:
             if qkv_format == 'thd' and is_te_min_version("1.7.0"):
                 # thd format uses flash attention with cuDNN kernel which requires is_padding=True,
@@ -698,10 +709,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 value,
                 attention_mask,
                 attn_mask_type=attn_mask_type.name,
+                **attention_bias_kwargs,
                 **packed_seq_kwargs,
             )
         else:
-            core_attn_out = super().forward(query, key, value, attention_mask, **packed_seq_kwargs)
+            core_attn_out = super().forward(
+                query, key, value, attention_mask, **attention_bias_kwargs, **packed_seq_kwargs
+            )
 
         return core_attn_out
 
