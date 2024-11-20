@@ -102,16 +102,27 @@ test:build_image:
   parallel:
     matrix:
       - BUCKET: tests/unit_tests/data/
+        BACKWARDS: 'true'
       - BUCKET: tests/unit_tests/dist_checkpointing/
+        BACKWARDS: 'true'
       - BUCKET: tests/unit_tests/distributed/
+        BACKWARDS: 'true'
       - BUCKET: other
+        BACKWARDS: 'true'
+      - BUCKET: test_inference.py test_tokenizer.py test_utilities.py test_training.py
+        BACKWARDS: 'false'
   script:
-    - docker run --name mcore_ci_${CI_PIPELINE_ID} -d --rm -e BUCKET -e TAG -e IMAGE -e UNIT_TEST_REPEAT -e UNIT_TEST_TIMEOUT --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 ${IMAGE}:${CI_PIPELINE_ID} bash -c "sleep $(( ${UNIT_TEST_TIMEOUT} * 60 + 60 ))"
+    - docker run --name mcore_ci_${CI_PIPELINE_ID} -d --rm -e BUCKET -e BACKWARDS -e TAG -e IMAGE -e UNIT_TEST_REPEAT -e UNIT_TEST_TIMEOUT --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 ${IMAGE}:${CI_PIPELINE_ID} bash -c "sleep $(( ${UNIT_TEST_TIMEOUT} * 60 + 60 ))"
     - |
       CMD=$(cat <<"RUN_TEST_EOF"
       set -euxo pipefail
         
       MCORE_DIR=$([[ "$TAG" == "latest" ]] && echo "" || echo "-$TAG/")
+
+      if [[ "$TAG" != "latest" && $BACKWARDS == "false" ]]; then
+        echo "No backwards checks on $BUCKET"
+        exit 0
+      fi
 
       cd /opt/megatron-lm$MCORE_DIR;
 
