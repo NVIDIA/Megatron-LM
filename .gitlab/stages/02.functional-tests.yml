@@ -25,10 +25,15 @@ functional:build_image:
     - test:copyright
   variables:
     STAGE: jet
-    TAG: purpose/builder-large
+    TAG: purpose/builder-small
 
 functional:configure:
-  needs: [functional:build_image]
+  needs:
+    - functional:build_image
+    - job: test:pyt(LTS)_mcore(latest)
+      optional: true
+    - job: test:pyt(DEV)_mcore(latest)
+      optional: true
   extends: [.functional_tests_rules]
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   tags: [mcore-docker-node-small]

@@ -47,7 +47,7 @@ def launch_and_wait_for_completion(
     environment: str,
     n_repeat: int,
     time_limit: int,
-    container_image: str,
+    container_image: Optional[str],
     container_tag: str,
     cluster: str,
     account: str,
@@ -96,6 +96,7 @@ def launch_and_wait_for_completion(
     while n_wait_attempt < 3:
         try:
             pipeline.wait(max_wait_time=60 * 60 * 24 * 7)
+            break
         except requests.exceptions.ConnectionError as e:
             print(e)
             time.sleep((3**n_wait_attempt) * 60)
@@ -118,6 +119,7 @@ def download_job_assets(logs: List[jet_log.JETLog], iteration: int = 0) -> List[
         for log_filename in assets.keys():
             with open(assets_path / log_filename, "w") as fh:
                 assets[log_filename].download(pathlib.Path(fh.name))
+    return assets
 
 
 def extract_logs_to_string(logs: List[jet_log.JETLog]) -> List[str]:

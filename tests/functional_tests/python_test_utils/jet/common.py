@@ -75,11 +75,11 @@ def filter_by_test_case(
 
     if len(workload_manifests) > 1:
         print("Duplicate test_case found!")
-        return
+        return None
 
     if len(workload_manifests) == 0:
         print("No test_case found!")
-        return
+        return None
 
     return workload_manifests[0]
 
@@ -173,9 +173,9 @@ def load_workloads(
     workloads: List[jetclient.JETWorkloadManifest] = []
     build_workloads: List[jetclient.JETClient] = []
     for file in list(recipes_dir.glob("*.yaml")) + list(local_dir.glob("*.yaml")):
-        workloads += load_and_flatten(config_path=file)
+        workloads += load_and_flatten(config_path=str(file))
         if file.stem.startswith("_build"):
-            build_workloads.append(load_config(config_path=file))
+            build_workloads.append(load_config(config_path=str(file)))
 
     if scope:
         workloads = filter_by_scope(workload_manifests=workloads, scope=scope)
