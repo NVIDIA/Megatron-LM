@@ -45,7 +45,7 @@ def main(
     run_name: Optional[str] = None,
     wandb_experiment: Optional[str] = None,
 ):
-    test_cases = [
+    list_of_test_cases = [
         test_case
         for test_case in common.load_workloads(
             scope=scope, container_tag=container_tag, environment=environment, test_cases=test_cases
@@ -53,14 +53,23 @@ def main(
         if test_case.type != "build"
     ]
 
-    if not test_cases:
+    tags = [
+        "arch/amd64",
+        "env/prod",
+        "origin/jet-fleet",
+        "owner/jet-core",
+        "purpose/jet-client",
+        "team/megatron",
+    ]
+
+    if not list_of_test_cases:
         gitlab_pipeline = {
             "stages": ["empty-pipeline-placeholder"],
             "default": {"interruptible": True},
             "empty-pipeline-placeholder-job": {
                 "stage": "empty-pipeline-placeholder",
                 "image": f"{container_image}:{container_tag}",
-                "tags": ["mcore-docker-node-jet"],
+                "tags": tags,
                 "rules": [
                     {"if": '$CI_PIPELINE_SOURCE == "parent_pipeline"'},
                     {"if": '$CI_MERGE_REQUEST_ID'},
@@ -74,11 +83,11 @@ def main(
 
     else:
         gitlab_pipeline = {
-            "stages": list(set([test_case.spec.model for test_case in test_cases])),
+            "stages": list(set([test_case.spec.model for test_case in list_of_test_cases])),
             "default": {"interruptible": True},
         }
 
-        for test_case in test_cases:
+        for test_case in list_of_test_cases:
             if test_case.spec.platforms == "dgx_a100":
                 cluster = a100_cluster
             elif test_case.spec.platforms == "dgx_h100":
@@ -108,7 +117,7 @@ def main(
             gitlab_pipeline[test_case.spec.test_case] = {
                 "stage": f"{test_case.spec.model}",
                 "image": f"{container_image}:{container_tag}",
-                "tags": ["mcore-docker-node-jet"],
+                "tags": tags,
                 "rules": [
                     {"if": '$CI_PIPELINE_SOURCE == "parent_pipeline"'},
                     {"if": '$CI_MERGE_REQUEST_ID'},
