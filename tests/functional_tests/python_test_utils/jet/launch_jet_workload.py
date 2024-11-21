@@ -11,6 +11,7 @@ import click
 import jetclient
 import requests
 import yaml
+from jet import workloads
 from jetclient.facades.objects import log as jet_log
 from jetclient.services.dtos.pipeline import PipelineStatus
 
@@ -92,7 +93,16 @@ def launch_and_wait_for_completion(
         flush=True,
     )
 
-    pipeline.wait(max_wait_time=60 * 60 * 24 * 7, interval=60 * 3)
+    n_wait_attempts = 0
+    while n_wait_attempts < 3:
+        try:
+            pipeline.wait(max_wait_time=60 * 60 * 24 * 7, interval=60 * 3)
+            break
+        except requests.exceptions.ConnectionError as e:
+            print(e)
+            time.sleep(60 * 3**n_wait_attempts)
+            pipeline = workloads.get_pipeline(pipeline.jet_id)
+            n_wait_attempts += 1
 
     print(f"Pipeline terminated; status: {pipeline.get_status()}")
     return pipeline
