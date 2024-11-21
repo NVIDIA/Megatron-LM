@@ -1,6 +1,6 @@
 # Megatron Core MoE Key Features
 
-Megatron-Core offers rich parallelism mappings, combining Expert Parallelism with tensor, data, sequence, and pipeline parallelism. This boosts Mixtral 8X7B bf16 training to achieve **438 TFLOPS** as of MCore v0.8.
+Megatron-Core offers rich parallelism mappings, combining Expert Parallelism with tensor, data, sequence, and pipeline parallelism. This boosts Mixtral 8X7B bf16 training to achieve **468 TFLOPS** as of MCore v0.9.
 
 
 ### Parallelism
@@ -25,6 +25,7 @@ Megatron-Core offers rich parallelism mappings, combining Expert Parallelism wit
     - Supported dtype: bf16
     - Performance improvements for larger MoE models
 - Enable `--tp-comm-overlap` for MoE
+- FP8 training support
 
 ### Token Dispatch Mechanism
 - Dropless / No token drop
@@ -34,11 +35,15 @@ Megatron-Core offers rich parallelism mappings, combining Expert Parallelism wit
 - Checkpoint converter for Mixtral models, see the [example](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/mixtral) for details.
 - Distributed checkpoining
 - Per-layer logging
+- Upcycling Support
+- Granular upcycling
 
 ## Upcoming features
-- Token permutation / unpermutation fusion
-- Fused Sinkhorn Kernel
-- FP8 training support
+- New Parallelism for Large-scale MoE training
+- FP8 support for GroupedGEMM
+- Token permutation / Unpermutation fusion
+- TopK Router Fusion
+- MoE Layer Frequency
 
 # User Guide
 
@@ -159,9 +164,11 @@ The `MLP` computation part in the shared experts are overlapped with the `AlltoA
 Both the forward and the backward pass can overlap. But to get the overlapping in the backward pass, the PyTorch version should `>= 2.2.0`.
 
 ### Upcycling
-Use `--moe-use-upcycling` to enable the upcycling feature, which will load the dense model from the directory specified by `--load`, convert it into an MoE model at runtime and start training. The converted model will be saved to the path specified by `--save` before training begins. Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.
+Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.
 
-The MoE model structure is defined through script arguments. All MoE-related arguments (such as `--num-experts`) can be customized; however, other model structure arguments must be consistent with those of the dense model.
+We currently only support the default upcycling strategy, which duplicates the existing MLP to multiple experts, with each expert starting from a copy of the MLP. In the future, we will support more state-of-the-art upcycling strategies, such as Granular upcycling from [our recent research work](https://arxiv.org/abs/2410.07524).
+
+Note: The MoE model structure is defined through script arguments. All MoE-related arguments (such as `--num-experts`) can be customized; however, other model structure arguments must be consistent with those of the dense model.
 
 ## MoE training example:
 <details>
@@ -363,4 +370,4 @@ Server:
 - InfiniBand 8x400 Gbit/s
 
 Docker Image:
-- PyTorch 24.04 with TransformerEngine v1.9
+- PyTorch 24.09 with TransformerEngine v1.11
