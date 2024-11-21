@@ -615,14 +615,8 @@ def local_multi_tensor_l2_norm(chunk_size, noop_flag, tensor_lists, per_tensor, 
 # works as a drop-in replacement for amp_C.multi_tensor_scale
 def local_multi_tensor_scale(chunk_size, noop_flag, tensor_lists, scale):
     """Works as a drop-in replacement for amp_C.multi_tensor_scale."""
-    inputs, targets = tensor_lists[0], tensor_lists[1]
-    if inputs == targets:
-        for i in range(len(targets)):
-            # for parity with apex implementation
-            targets[i] *= scale
-    else:
-        for i in range(len(targets)):
-            targets[i] = inputs[i] * scale
+    for src, dst in zip(tensor_lists[0], tensor_lists[1]):
+        dst.copy_(src * scale)
 
 
 class _ValueWithRank:
