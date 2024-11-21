@@ -52,7 +52,7 @@ class TRTLLMHelper:
         Args:
             transformer_config (TransformerConfig): The transformer config
             model_type (ModelType): The type of the input model. Enum (megatron.core.export.model_type.ModelType)
-            conversion_dict (dict, optional): A conversion dictionary that will map your model layer names to trtllm equivalent layer names. Sample dictionaries are given megatron/core/export/model_mapping. NOTE: Ingore layer numbers in the model layer names. (e.g) decoder.layers.0.attention_qkv.weight will be decoder.layers.attention_qkv.weight in the mapping dictionary. Defaults to {}.
+            trtllm_conversion_dict (dict, optional): A conversion dictionary that will map your model layer names to trtllm equivalent layer names. Default dictionary is given megatron/core/export/model_to_trtllm_mapping. This dict is merged into the default dict. NOTE: Ignore layer numbers in the model layer names. (e.g) decoder.layers.0.attention_qkv.weight will be decoder.layers.attention_qkv.weight in the mapping dictionary. Defaults to {}.
             position_embedding_type (str, optional): The position embedding type. Defaults to None.
             max_position_embeddings (int, optional): Max posistion embeddings value. Defaults to None.
             rotary_percentage (int, optional): The rotary percentage if using rope embedding. Defaults to 1.0.
@@ -67,7 +67,7 @@ class TRTLLMHelper:
 
         self.transformer_config = transformer_config
         self.model_type = model_type
-        self.trtllm_conversion_dict = DEFAULT_CONVERSION_DICT[model_type]
+        self.trtllm_conversion_dict = DEFAULT_CONVERSION_DICT.copy()
         self.trtllm_conversion_dict.update(trtllm_conversion_dict)
         assert position_embedding_type in [
             'learned_absolute',
@@ -83,6 +83,7 @@ class TRTLLMHelper:
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
         self.moe_renorm_mode = moe_renorm_mode
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
+        self.weights_converter = None
 
     def _get_trtllm_config(
         self,
@@ -192,8 +193,7 @@ class TRTLLMHelper:
         Same thing happens with the pretrained config
 
         Args:
-            model_state_dict (dict, optional): The input model state dictionary (Entire model state loaded on CPU). Used only when on device conversion is set to False. Defaults to None.
-            False, or the model state dict of each GPU in the case of on_device conversion)
+            model_state_dict (dict): The input model state dictionary (Entire model state loaded on CPU) or the model state dict of each GPU in the case of on_device conversion)
             export_config (ExportConfig): The export config used to define inference tp size, pp size etc. Used only for on device conversion.
             dtype (DataType): The data type of model precision
             on_device_distributed_conversion (bool, optional): Convert on gpus in distributed setting. This assumes that the model state dict is sharded according to required inference model parallelism and that each gpu gets its part of the model state dict . Defaults to False.
@@ -262,21 +262,21 @@ class TRTLLMHelper:
             Two lists . List of trtllm converted model weights and trtllm model configs (One for each gpu).
         """
 
-        distributed_trtllm_model_weights_converter = DistributedTRTLLMModelWeightsConverter(
+        self.weights_converter = DistributedTRTLLMModelWeightsConverter(
             transformer_config=self.transformer_config,
             dtype=dtype,
             multi_query_mode=self.multi_query_mode,
             activation=self.activation,
         )
-        distributed_trtllm_model_weights_converter.convert(
+        self.weights_converter.convert(
             model_state_dict=model_state_dict,
             trtllm_conversion_dict=self.trtllm_conversion_dict,
             tokenizer_vocab_size=vocab_size,
         )
 
         export_config = ExportConfig(
-            inference_pp_size=distributed_trtllm_model_weights_converter.inference_pp_size,
-            inference_tp_size=distributed_trtllm_model_weights_converter.inference_tp_size,
+            inference_pp_size=self.weights_converter.inference_pp_size,
+            inference_tp_size=self.weights_converter.inference_tp_size,
             use_parallel_embedding=True,
             use_embedding_sharing=self.share_embeddings_and_output_weights,
         )
@@ -292,9 +292,8 @@ class TRTLLMHelper:
         )
 
         model_parallel_rank = (
-            distributed_trtllm_model_weights_converter.pp_rank
-            * distributed_trtllm_model_weights_converter.inference_tp_size
-            + distributed_trtllm_model_weights_converter.tp_rank
+            self.weights_converter.pp_rank * self.weights_converter.inference_tp_size
+            + self.weights_converter.tp_rank
         )
 
         trtllm_model_config.mapping = tensorrt_llm.Mapping(
@@ -304,7 +303,7 @@ class TRTLLMHelper:
             pp_size=export_config.inference_pp_size,
         )
 
-        return distributed_trtllm_model_weights_converter.trtllm_model_weights, trtllm_model_config
+        return self.weights_converter.trtllm_model_weights, trtllm_model_config
 
     def _get_trtllm_pretrained_config_and_model_weights_list_on_single_device(
         self,
@@ -331,7 +330,7 @@ class TRTLLMHelper:
         trtllm_model_configs_list = []
         trtllm_model_weights_list = []
 
-        single_device_trtllm_model_weights_converter = SingleDeviceTRTLLMModelWeightsConverter(
+        self.weights_converter = SingleDeviceTRTLLMModelWeightsConverter(
             export_config=export_config,
             transformer_config=self.transformer_config,
             dtype=dtype,
@@ -339,13 +338,13 @@ class TRTLLMHelper:
             multi_query_mode=self.multi_query_mode,
         )
         # Convert the input model state dict to trtllm model weights dictionary
-        single_device_trtllm_model_weights_converter.convert(
+        self.weights_converter.convert(
             model_state_dict=model_state_dict,
             trtllm_conversion_dict=self.trtllm_conversion_dict,
             state_dict_split_by_layer_numbers=state_dict_split_by_layer_numbers,
         )
 
-        vocab_size_padded = single_device_trtllm_model_weights_converter.get_padded_vocab_size()
+        vocab_size_padded = self.weights_converter.get_padded_vocab_size()
         world_size = export_config.inference_tp_size * export_config.inference_pp_size
         gpus_per_node = gpus_per_node or export_config.inference_tp_size
 
@@ -369,10 +368,8 @@ class TRTLLMHelper:
             trtllm_model_configs_list.append(trtllm_model_config)
 
             # Get the model weights for each rank and append it to the trtllm_model_weights_list
-            trtllm_model_weights_per_gpu = (
-                single_device_trtllm_model_weights_converter.get_local_model_weights_per_gpu(
-                    mapping, trtllm_model_config
-                )
+            trtllm_model_weights_per_gpu = self.weights_converter.get_local_model_weights_per_gpu(
+                mapping, trtllm_model_config
             )
             trtllm_model_weights_list.append(trtllm_model_weights_per_gpu)
 
@@ -434,7 +431,7 @@ class TRTLLMHelper:
             gemm_plugin (str, optional): Gemma plugin to use. Defaults to "auto".
         """
 
-        TRTLLMEngineBuilder.build_and_save_engine(
+        engine = TRTLLMEngineBuilder.build_and_save_engine(
             engine_dir,
             trtllm_model_weights,
             trtllm_model_config,
@@ -459,3 +456,5 @@ class TRTLLMHelper:
             gpt_attention_plugin,
             gemm_plugin,
         )
+
+        return engine
