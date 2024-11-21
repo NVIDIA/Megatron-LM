@@ -93,7 +93,7 @@ class MultimodalTokenizer(MegatronTokenizer):
             self._prompt_config = PromptConfig(
                 assistant_prefix_len=4,
                 pad_token_id=tokenizer.convert_tokens_to_ids("<|end_of_text|>"),
-                custom_chat_template=None,
+                custom_chat_template=mistral_custom_template,
                 has_bos=True,
                 has_system_role=True,
             )

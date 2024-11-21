@@ -57,7 +57,7 @@ examples/multimodal/combine_lm_vision_checkpoints.sh /path/to/mistral/model /pat
 
     ```
     cd <LLaVA-Pretrain dir>/wds
-    energon ./
+    energon prepare ./
     ```
 
     select the following values for the presented options:
