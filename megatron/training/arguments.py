@@ -1477,8 +1477,12 @@ def _add_checkpointing_args(parser):
                        'checkpoint',
                        dest='perform_initialization')
     group.add_argument('--use-checkpoint-args', action='store_true',
-                       help='Override any command line arguments with arguments '
-                       'from the checkpoint')
+                       help='Override model-related command-line arguments with arguments from checkpoint')
+    group.add_argument('--use-mp-args-from-checkpoint-args', action='store_true',
+                       help='Copy model parallelism command-line arguments from checkpoint')
+    group.add_argument('--no-use-tokenizer-model-from-checkpoint-args', action='store_false',
+                       dest='use_tokenizer_model_from_checkpoint_args',
+                       help='If set, do not use tokenizer model path from checkpoint')
     group.add_argument('--exit-on-missing-checkpoint', action='store_true',
                        help="If '--load' is set, but checkpoint is not found "
                        "(e.g., path typo), then exit instead of random "
