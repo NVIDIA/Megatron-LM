@@ -133,7 +133,7 @@ OPTIONS=" \
     --log-num-zeros-in-grad \
     --ckpt-format torch \
     --pixel-shuffle \
-    --use-image-tag
+    --image-tag-type nvlm
 "
 
 

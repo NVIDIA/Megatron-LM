@@ -73,9 +73,17 @@ def build_tokenizer(args, **kwargs):
                 "MultimodalTokenizer currently requires transformers library to be installed"
             )
 
+        kwargs = dict()
+        if args.tokenizer_prompt_format == "nvlm-yi-34b":
+            kwargs = {
+                "from_slow": True,
+                "legacy": False,
+                "add_bos_token": True,
+            }
+
         # Currently, only HuggingFace tokenizers are supported.
         underlying_tokenizer = transformers.AutoTokenizer.from_pretrained(
-            pretrained_model_name_or_path=args.tokenizer_model
+            pretrained_model_name_or_path=args.tokenizer_model, **kwargs
         )
 
         tokenizer = MultimodalTokenizer(
