@@ -67,7 +67,6 @@ from .utils import (
     check_adlr_autoresume_termination,
     is_last_rank,
     print_rank_0,
-    print_rank_last,
     report_memory,
     unwrap_model,
     append_to_progress_log,
@@ -1047,7 +1046,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
-        print_rank_last(log_string)
+        print_rank_0(log_string)
         if report_memory_flag and learning_rate > 0.:
             # Report memory after optimizer state has been initialized.
             if torch.distributed.get_rank() == 0:
@@ -1662,9 +1661,9 @@ def evaluate_and_print_results(prefix, forward_step_func,
         process_non_loss_data_func(collected_non_loss_data, iteration, writer)
 
     length = len(string) + 1
-    print_rank_last('-' * length)
-    print_rank_last(string)
-    print_rank_last('-' * length)
+    print_rank_0('-' * length)
+    print_rank_0(string)
+    print_rank_0('-' * length)
 
 
 def cyclic_iter(iter):
