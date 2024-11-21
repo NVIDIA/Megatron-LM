@@ -1,9 +1,12 @@
-import pytest
 import torch
 from pytest_mock import mocker
 
 from megatron.core.export.data_type import DataType
-from megatron.core.export.trtllm.model_to_trllm_mapping.gpt_model import GPT_DICT
+from megatron.core.export.trtllm.model_to_trllm_mapping.default_conversion_dict import (
+    DEFAULT_CONVERSION_DICT,
+)
+
+# pylint: disable=line-too-long
 from megatron.core.export.trtllm.trtllm_weights_converter.distributed_trtllm_model_weights_converter import (
     DistributedTRTLLMModelWeightsConverter,
 )
@@ -18,8 +21,14 @@ _VOCAB_SIZE = 256
 
 
 class TestTRTLLMDistributedGPUConverter:
+    """
+    Test Distributed converter
+    """
 
     def setup_method(self, method):
+        """
+        Setup method
+        """
         Utils.initialize_model_parallel(2, 1)
         model_parallel_cuda_manual_seed(123)
 
@@ -40,9 +49,15 @@ class TestTRTLLMDistributedGPUConverter:
         )
 
     def teardown_method(self, method):
+        """
+        teardown method
+        """
         Utils.destroy_model_parallel()
 
     def test_get_model_weights_converter(self, mocker):
+        """
+        test model weights onverter
+        """
         device = torch.device("cuda")
         self.gpt_model.to(device)
 
@@ -66,7 +81,7 @@ class TestTRTLLMDistributedGPUConverter:
 
         distributed_converter.convert(
             model_state_dict=model_state_dict,
-            trtllm_conversion_dict=GPT_DICT,
+            trtllm_conversion_dict=DEFAULT_CONVERSION_DICT,
             tokenizer_vocab_size=_VOCAB_SIZE,
         )
 
