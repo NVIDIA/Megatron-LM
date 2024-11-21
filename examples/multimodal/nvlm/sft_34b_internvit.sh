@@ -81,7 +81,7 @@ OPTIONS=" \
     --max-position-embeddings ${MAX_POS_EMBED} \
     --tokenizer-type MultimodalTokenizer \
     --tokenizer-model ${WORKSPACE}/<tokenizer path> \
-    --tokenizer-prompt-format chatml \
+    --tokenizer-prompt-format nvlm-yi-34b \
     --vocab-size 64000 \
     --make-vocab-size-divisible-by 1 \
     --position-embedding-type rope \
@@ -136,7 +136,7 @@ OPTIONS=" \
     --max-num-tiles 6 \
     --use-thumbnail \
     --use-tile-tags \
-    --use-image-tag
+    --image-tag-type nvlm
     "
 
 export NVTE_ALLOW_NONDETERMINISTIC_ALGO=${ALLOW_NONDETERMINISTIC}

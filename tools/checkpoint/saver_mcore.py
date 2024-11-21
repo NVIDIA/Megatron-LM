@@ -1,13 +1,13 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-
-import os
-import sys
-import torch
 from importlib.metadata import version
-from pkg_resources import packaging
+import os
+from packaging.version import Version as PkgVersion
+import sys
+
+import torch
 
 from setter import ModelSetter
-from utils import get_mcore_transformer_block_key, print_memory_usage
+from utils import get_mcore_transformer_block_key
 
 
 class MCoreSetter(ModelSetter):
@@ -288,8 +288,8 @@ def add_arguments(parser):
 def save_checkpoint(queue, args):
 
     # Transformer engine >= 0.12.0, for CPU initialization.
-    te_version = packaging.version.Version(version("transformer-engine"))
-    assert te_version >= packaging.version.Version("0.12.0"), \
+    te_version = PkgVersion(version("transformer-engine"))
+    assert te_version >= PkgVersion("0.12.0"), \
         "transformer engine version: %s (>=0.12.0 required)." % te_version
 
     # Search in directory above this

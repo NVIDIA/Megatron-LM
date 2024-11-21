@@ -113,5 +113,6 @@ do
         --gt-path ${GROUNDTRUTH_PATH} \
         --task ${TASK} \
         --disable-vision-class-token \
-        --num-frames ${NUM_FRAMES}
+        --num-frames ${NUM_FRAMES} \
+        --ckpt-format torch
 done
