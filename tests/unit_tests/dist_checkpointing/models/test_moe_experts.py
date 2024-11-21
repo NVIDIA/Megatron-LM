@@ -318,3 +318,28 @@ class TestExpertLayerReconfiguration:
             )
 
             Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not is_te_min_version("1.9.0"),
+        reason="TEGroupedMLP is only supported in TE 1.9.0 and later.",
+    )
+    @pytest.mark.parametrize("ep_size", [1, 2])
+    def test_te_grouped_linear_torch_native(self, tmp_path_dist_ckpt, ep_size):
+        """Test saving and loading torch native checkpoints"""
+        use_glu = True
+        Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=ep_size)
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_te_grouped_linear_torch_native') as ckpt_dir:
+            tokens_per_expert = torch.tensor([16] * (8 // ep_size))
+            input_tensor = torch.randn(tokens_per_expert.sum(), 16, device="cuda")
+
+            # Save checkpoint
+            model = initialize_expert_layer(1, use_glu, expert_type="te_grouped")
+            model = model.cuda()
+            model(input_tensor, tokens_per_expert)
+            torch.save(model.state_dict(), ckpt_dir / f"model_ep{torch.distributed.get_rank()}.pt")
+
+            # Load checkpoint
+            state_dict = torch.load(ckpt_dir / f"model_ep{torch.distributed.get_rank()}.pt")
+            model.load_state_dict(state_dict)
+
+            Utils.destroy_model_parallel()
