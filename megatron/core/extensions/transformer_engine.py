@@ -819,9 +819,14 @@ if is_te_min_version("1.9.0.dev0"):
                 self.init_fp8_metadata(num_gemms=self.num_gemms)
                 fp8_checkpoint = self.fp8_meta["fp8_checkpoint"] or self.fp8 or self.fp8_calibration
 
-                state_list = [
-                    state_dict.pop(f"{prefix}_extra_state{i}") for i in range(1, self.num_gemms)
-                ]
+                try:
+                    state_list = [
+                        state_dict.pop(f"{prefix}_extra_state{i}") for i in range(1, self.num_gemms)
+                    ]
+                except KeyError:
+                    # "_extra_state{i}" only exists for dist-ckpt. Return for torch native ckpt.
+                    return
+
                 if not fp8_checkpoint:
                     return
                 state_list = [state_dict.pop(f"{prefix}_extra_state")] + state_list
