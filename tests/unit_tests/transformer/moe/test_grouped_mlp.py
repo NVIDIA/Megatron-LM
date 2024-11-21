@@ -278,6 +278,7 @@ class TestTEGroupedMLP:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.test_on_rocm
     @pytest.mark.internal
     def test_constructor(self):
         assert isinstance(self.sequential_mlp, MoELayer)
@@ -313,6 +314,7 @@ class TestTEGroupedMLP:
             )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.test_on_rocm
     @pytest.mark.internal
     def test_gpu_forward_backward(self):
         self.sequential_mlp.cuda()
@@ -356,6 +358,7 @@ class TestTEGroupedMLP:
             torch.testing.assert_close(smm_result, gmm_result)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.test_on_rocm
     @pytest.mark.internal
     def test_gpu_forward_backward_with_no_tokens_allocated(self):
         """Test the case when no token is allocated for groupedGEMM kernels."""
