@@ -17,20 +17,22 @@ try:
     multi_tensor_scale_impl = multi_tensor_scale
 except ImportError:
     try:
-        from apex.multi_tensor_apply import multi_tensor_applier
-    except ImportError:
-        from megatron.core.utils import local_multi_tensor_applier
-
-        multi_tensor_applier = local_multi_tensor_applier
-    try:
         import amp_C
+        from apex.multi_tensor_apply import multi_tensor_applier
 
-        l2_norm_impl = amp_C.multi_tensor_l2norm
         multi_tensor_scale_impl = amp_C.multi_tensor_scale
     except ImportError:
-        from megatron.core.utils import local_multi_tensor_l2_norm, local_multi_tensor_scale
+        import warnings
 
-        l2_norm_impl = local_multi_tensor_l2_norm
+        warnings.warn(
+            'Transformer Engine and Apex are not installed. '
+            'Falling back to local implementations of '
+            'multi_tensor_applier and multi_tensor_scale'
+        )
+
+        from megatron.core.utils import local_multi_tensor_applier, local_multi_tensor_scale
+
+        multi_tensor_applier = local_multi_tensor_applier
         multi_tensor_scale_impl = local_multi_tensor_scale
 
 from .. import parallel_state, tensor_parallel
@@ -76,7 +78,7 @@ def _multi_tensor_copy_this_to_that(
     is not provided, we default back to simple loop copy to be compatible
     with bfloat16.
     """
-    if overflow_buf:
+    if overflow_buf is not None:
         overflow_buf.fill_(0)
         # Scaling with factor `1.0` is equivalent to copy.
         multi_tensor_applier(multi_tensor_scale_impl, overflow_buf, [this, that], 1.0)
@@ -684,7 +686,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         optimizer_key = 'optimizer'
         if optimizer_key not in state_dict:
             optimizer_key = 'optimizer_state_dict'
-            logger.info('***WARNING*** loading optimizer from ' 'an old checkpoint ...')
+            logger.info('***WARNING*** loading optimizer from an old checkpoint ...')
         if 'common_step' in state_dict[optimizer_key]['state']:
             common_step = state_dict[optimizer_key]['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict[optimizer_key], common_step)
@@ -693,9 +695,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
             if self.config.fp16:
-                logger.info(
-                    '***WARNING*** found an old checkpoint, will not ' 'load grad scaler ...'
-                )
+                logger.info('***WARNING*** found an old checkpoint, will not load grad scaler ...')
         else:
             if self.grad_scaler:
                 self.grad_scaler.load_state_dict(state_dict['grad_scaler'])
