@@ -20,16 +20,6 @@ from tests.unit_tests.dist_checkpointing import (
 )
 from tests.unit_tests.test_utilities import Utils
 
-try:
-    import transformer_engine # pylint: disable=unused-import
-    HAVE_APEX_OR_TE = True
-except ImportError:
-    try: 
-        import apex # pylint: disable=unused-import
-        HAVE_APEX_OR_TE = True
-    except ImportError:
-        HAVE_APEX_OR_TE = False
-
 class TestNonPersistentSaveAndLoad:
     def setup_method(self, method):
         pass

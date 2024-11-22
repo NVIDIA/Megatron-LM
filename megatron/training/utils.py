@@ -8,7 +8,6 @@ from datetime import datetime
 from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
-HAVE_APEX_OR_TE=True
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
 except ImportError:
@@ -20,7 +19,6 @@ except ImportError:
     try:
         from amp_C import multi_tensor_l2norm
     except ImportError:
-        HAVE_APEX_OR_TE = False
         import warnings
 
         if torch.cuda.is_available():
@@ -39,10 +37,7 @@ from megatron.training import (
     get_args,
     get_adlr_autoresume,
 )
-if HAVE_APEX_OR_TE:
-    from megatron.core.distributed import DistributedDataParallel as DDP
-else:
-    from torch.nn.parallel import DistributedDataParallel as DDP
+from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core import mpu
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.legacy.model import Float16Module

@@ -9,16 +9,6 @@ from .. import parallel_state
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import get_attr_wrapped_model, get_model_config
 
-try:
-    import transformer_engine # pylint: disable=unused-import
-    HAVE_APEX_OR_TE = True
-except ImportError:
-    try: 
-        import apex # pylint: disable=unused-import
-        HAVE_APEX_OR_TE = True
-    except ImportError:
-        HAVE_APEX_OR_TE = False
-
 def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig):
     """
     All-reduce word embedding grads.
@@ -40,8 +30,7 @@ def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: Transf
 
         model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
         if model_module.share_embeddings_and_output_weights:
-            weight = model_module.shared_embedding_or_output_weight()
-            grad = weight.main_grad
+            grad = model_module.shared_embedding_or_output_weight().main_grad
             torch.distributed.all_reduce(grad, group=parallel_state.get_embedding_group())
 
 
@@ -94,7 +83,7 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
                     or 'q_layernorm' in name
                     or 'k_layernorm' in name
                 ):
-                    grad = param.main_grad
+                    grad = param.main_grad if hasattr(param, "main_grad") else param.grad
                     grads.append(grad.data)
         if grads:
             coalesced = _flatten_dense_tensors(grads)
@@ -111,8 +100,6 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
     embedding grads across first and last pipeline stages (if not tied),
     scale gradients by `num_tokens`.
     """
-
-    assert HAVE_APEX_OR_TE, "Install Apex or TE to use finalize_model_grads"
 
     config = get_model_config(model[0])
 

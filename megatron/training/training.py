@@ -66,7 +66,6 @@ from .utils import (
     unwrap_model,
     append_to_progress_log,
     update_use_dist_ckpt,
-    HAVE_APEX_OR_TE
 )
 from .global_vars import (
     destroy_global_vars,
@@ -80,11 +79,10 @@ from . import one_logger_utils
 
 from . import ft_integration
 
-if HAVE_APEX_OR_TE:
-    from megatron.core.distributed import DistributedDataParallelConfig
-    from megatron.core.distributed import DistributedDataParallel as DDP
-else:
-    from torch.nn.parallel import DistributedDataParallel as DDP
+
+from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import DistributedDataParallel as DDP
+
 
 stimer = StragglerDetector()
 
@@ -539,35 +537,26 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                     fp8_meta.amax_history[0][fp8_meta_index] = 0
 
     if wrap_with_ddp:
-        if HAVE_APEX_OR_TE:
-            config = get_model_config(model[0])
+        config = get_model_config(model[0])
 
-            kwargs = {}
-            for f in dataclasses.fields(DistributedDataParallelConfig):
-                if hasattr(args, f.name):
-                    kwargs[f.name] = getattr(args, f.name)
-            kwargs['grad_reduce_in_fp32'] = args.accumulate_allreduce_grads_in_fp32
-            kwargs['check_for_nan_in_grad'] = args.check_for_nan_in_loss_and_grad
-            kwargs['bucket_size'] = args.ddp_bucket_size
-            kwargs['average_in_collective'] = args.ddp_average_in_collective
-            ddp_config = DistributedDataParallelConfig(**kwargs)
+        kwargs = {}
+        for f in dataclasses.fields(DistributedDataParallelConfig):
+            if hasattr(args, f.name):
+                kwargs[f.name] = getattr(args, f.name)
+        kwargs['grad_reduce_in_fp32'] = args.accumulate_allreduce_grads_in_fp32
+        kwargs['check_for_nan_in_grad'] = args.check_for_nan_in_loss_and_grad
+        kwargs['bucket_size'] = args.ddp_bucket_size
+        kwargs['average_in_collective'] = args.ddp_average_in_collective
+        ddp_config = DistributedDataParallelConfig(**kwargs)
 
-            overlap_param_gather_with_optimizer_step = getattr(args, 'overlap_param_gather_with_optimizer_step', False)
-            model = [DDP(config,
-                        ddp_config,
-                        model_chunk,
-                        # Turn off bucketing for model_chunk 2 onwards, since communication for these
-                        # model chunks is overlapped with compute anyway.
-                        disable_bucketing=(model_chunk_idx > 0) or overlap_param_gather_with_optimizer_step)
-                    for (model_chunk_idx, model_chunk) in enumerate(model)]
-
-        else:
-            xm = get_xla_model()
-            pg = parallel_state.get_data_parallel_group()
-            if xm:
-                model = [ DDP(model_module, process_group=pg, gradient_as_bucket_view=True) for model_module in model ]
-            else:
-                model = [ DDP(model_module, process_group=pg) for model_module in model ]
+        overlap_param_gather_with_optimizer_step = getattr(args, 'overlap_param_gather_with_optimizer_step', False)
+        model = [DDP(config,
+                    ddp_config,
+                    model_chunk,
+                    # Turn off bucketing for model_chunk 2 onwards, since communication for these
+                    # model chunks is overlapped with compute anyway.
+                    disable_bucketing=(model_chunk_idx > 0) or overlap_param_gather_with_optimizer_step)
+                for (model_chunk_idx, model_chunk) in enumerate(model)]
 
     return model
 
@@ -1102,14 +1091,14 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
 
     # Log E2E metrics before save-checkpoint
     one_logger_utils.track_e2e_metrics()
-    if args.use_distributed_optimizer and args.overlap_param_gather and HAVE_APEX_OR_TE:
+    if args.use_distributed_optimizer and args.overlap_param_gather:
         disable_forward_pre_hook(model)
     save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
                     num_floating_point_operations_so_far, checkpointing_context,
                     non_persistent_ckpt=non_persistent_ckpt, train_data_iterator=train_data_iterator,
                     ft_client=ft_integration.get_rank_monitor_client(
                         ft_integration.StateMachineActions.SAVE_CHECKPOINT))
-    if args.use_distributed_optimizer and args.overlap_param_gather and HAVE_APEX_OR_TE:
+    if args.use_distributed_optimizer and args.overlap_param_gather:
         enable_forward_pre_hook(model)
     timers(timer_key).stop(barrier=True)
     timers.log([timer_key])
@@ -1161,23 +1150,23 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     # Setup some training config params
     config.grad_scale_func = optimizer.scale_loss
     config.timers = timers
-    if HAVE_APEX_OR_TE:
-        if isinstance(model[0], DDP) and args.overlap_grad_reduce:
-            assert config.no_sync_func is None, \
-                ('When overlap_grad_reduce is True, config.no_sync_func must be None; '
-                'a custom no_sync_func is not supported when overlapping grad-reduce')
-            config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
+ 
+    if isinstance(model[0], DDP) and args.overlap_grad_reduce:
+        assert config.no_sync_func is None, \
+            ('When overlap_grad_reduce is True, config.no_sync_func must be None; '
+            'a custom no_sync_func is not supported when overlapping grad-reduce')
+        config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
+        if len(model) == 1:
+            config.no_sync_func = config.no_sync_func[0]
+        if args.align_grad_reduce:
+            config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
             if len(model) == 1:
-                config.no_sync_func = config.no_sync_func[0]
-            if args.align_grad_reduce:
-                config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
-                if len(model) == 1:
-                    config.grad_sync_func = config.grad_sync_func[0]
-        if args.overlap_param_gather and args.align_param_gather:
-            config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
-            if len(model) == 1:
-                config.param_sync_func = config.param_sync_func[0]
-        config.finalize_model_grads_func = finalize_model_grads
+                config.grad_sync_func = config.grad_sync_func[0]
+    if args.overlap_param_gather and args.align_param_gather:
+        config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
+        if len(model) == 1:
+            config.param_sync_func = config.param_sync_func[0]
+    config.finalize_model_grads_func = finalize_model_grads
 
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
@@ -1360,7 +1349,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if args.eval_interval and iteration % args.eval_interval == 0 and \
            args.do_valid:
             timers('interval-time').stop()
-            if args.use_distributed_optimizer and args.overlap_param_gather and HAVE_APEX_OR_TE:
+            if args.use_distributed_optimizer and args.overlap_param_gather:
                 disable_forward_pre_hook(model)
             if args.manual_gc and args.manual_gc_eval:
                 # Collect all objects.
@@ -1380,7 +1369,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             if args.manual_gc and args.manual_gc_eval:
                 # Collect only the objects created and used in evaluation.
                 gc.collect(generation=0)
-            if args.use_distributed_optimizer and args.overlap_param_gather and HAVE_APEX_OR_TE:
+            if args.use_distributed_optimizer and args.overlap_param_gather:
                 enable_forward_pre_hook(model)
             timers('interval-time', log_level=0).start(barrier=True)
 
@@ -1473,7 +1462,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         writer.flush()
 
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
-    if args.use_distributed_optimizer and args.overlap_param_gather and HAVE_APEX_OR_TE:
+    if args.use_distributed_optimizer and args.overlap_param_gather:
         disable_forward_pre_hook(model)
 
     if args.enable_ft_package and ft_integration.get_rank_monitor_client() is not None:

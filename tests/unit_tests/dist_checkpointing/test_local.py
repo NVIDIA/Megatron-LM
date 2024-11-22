@@ -9,6 +9,7 @@ from unittest import mock
 import pytest
 import torch
 
+from megatron.core.device_utils import get_xla_model
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.mapping import ShardedBase, ShardedTensorFactory
@@ -17,7 +18,7 @@ from megatron.core.dist_checkpointing.state_dict_transformation import (
     recreate_state_dict_after_load,
 )
 from megatron.core.dist_checkpointing.utils import extract_nonpersistent
-from megatron.core.parallel_state import get_default_process_group
+from megatron.core.parallel_state import get_data_parallel_group, get_data_parallel_group_gloo, get_default_process_group
 from megatron.training.async_utils import maybe_finalize_async_save
 from megatron.training.checkpointing import generate_state_dict, load_checkpoint, save_checkpoint
 from tests.unit_tests.dist_checkpointing import (
@@ -28,15 +29,7 @@ from tests.unit_tests.dist_checkpointing import (
 )
 from tests.unit_tests.test_utilities import Utils
 
-try:
-    import transformer_engine # pylint: disable=unused-import
-    HAVE_APEX_OR_TE = True
-except ImportError:
-    try: 
-        import apex # pylint: disable=unused-import
-        HAVE_APEX_OR_TE = True
-    except ImportError:
-        HAVE_APEX_OR_TE = False
+xm = get_xla_model()
 
 def find_matching_values(
     x: Union[dict, list], predicate: Callable[[Any], bool]
@@ -77,7 +70,7 @@ class TestLocalCheckpointing:
         model, optimizer = setup_model_and_optimizer(1, tp, pp)
         opt_param_scheduler = None
         rng_state = None
-        use_dist_ckpt = HAVE_APEX_OR_TE
+        use_dist_ckpt = True
         iteration = None
         optim_sd_kwargs = dict(sharding_type='fully_sharded_model_space')
         mock_args = SimpleNamespace()
@@ -129,7 +122,9 @@ class TestLocalCheckpointing:
         nonpersistent_state_dict, _ = extract_nonpersistent(state_dict)
         # For a given use case
         assert not nonpersistent_state_dict
+        parallelization_group = get_data_parallel_group() if not xm else get_data_parallel_group_gloo()
         loaded_state_dict = recreate_state_dict_after_load(state_dict, saved_state_dict, 
+                                                           parallelization_group=parallelization_group,
                                                            process_group=get_default_process_group())
         only_left, only_right, mismatch = diff(loaded_state_dict, state_dict)
         assert not only_left

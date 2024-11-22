@@ -328,13 +328,12 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         # Dummy tensor needed for apex multi-apply tensor.
         # For bfloat, we don't have multi-tensor apply and for now
         # we set it to none so the multi-tensor apply gets ignored.
-        if HAVE_APEX_OR_TE:
-            if self.config.bf16:
-                self._dummy_overflow_buf = None
-            else:
-                self._dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device=get_current_device())
-        else:
+        if self.config.bf16:
             self._dummy_overflow_buf = None
+        else:
+            self._dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device=get_current_device())
+        #else:
+            #self._dummy_overflow_buf = None
 
         # In case grad scaler is not passed, define the unity scale.
         if self.grad_scaler is None:
@@ -751,6 +750,7 @@ class FP32Optimizer(MegatronOptimizer):
             timers('optimizer-copy-to-main-grad', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
+        
         for param_group in self.optimizer.param_groups:
             for param in param_group['params']:
                 param.grad = param.main_grad

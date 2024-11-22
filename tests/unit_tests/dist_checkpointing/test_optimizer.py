@@ -46,13 +46,10 @@ from megatron.core.device_utils import get_current_device, get_xla_model
 try:
     import transformer_engine # pylint: disable=unused-import
     HAVE_TE = True
-    HAVE_APEX_OR_TE = True
 except ImportError:
-    try: 
-        import apex # pylint: disable=unused-import
-        HAVE_APEX_OR_TE = True
-    except ImportError:
-        HAVE_APEX_OR_TE = False
+    HAVE_TE = False
+
+xm = get_xla_model()
 
 class Model(torch.nn.Module):
     def __init__(self):
@@ -170,6 +167,7 @@ def load_checkpoint_no_arg_checks(*args, **kwargs):
             return load_checkpoint(*args, **kwargs)
 
 
+@pytest.mark.skipif(xm is not None, reason="Distributed Optimizer is not supported for XLA")
 class TestDistributedOptimizer:
     def setup_method(self, method):
         pass
@@ -208,9 +206,8 @@ class TestDistributedOptimizer:
                 if Utils.rank >= 0:
                     # Save checkpoint A
                     model, optimizer_A = setup_model_and_optimizer(
-                        seed=2, tp=tp_pp[0], pp=tp_pp[1], initialize_fn=initialize_fn, dist_opt=HAVE_APEX_OR_TE
+                        seed=2, tp=tp_pp[0], pp=tp_pp[1], initialize_fn=initialize_fn, dist_opt=True
                     )
-
                     save_strategy = get_default_save_sharded_strategy()
                     if use_fpsl:
                         xm = get_xla_model()
@@ -221,24 +218,16 @@ class TestDistributedOptimizer:
                             parallel_state.get_default_process_group(),
                             True,
                         )
-                    
-                    if HAVE_APEX_OR_TE:
-                        sharded_state_dict = optimizer_A.sharded_state_dict(
-                            model[0].sharded_state_dict(), sharding_type=sharding_type
-                        )
-                    else:
-                        sharded_state_dict = optimizer_A.sharded_state_dict(model[0].sharded_state_dict())
+                    sharded_state_dict = optimizer_A.sharded_state_dict(
+                        model[0].sharded_state_dict(), sharding_type=sharding_type
+                    )
                     save(
                         sharded_state_dict,
                         ckpt_dir,
                         save_strategy,
                         process_group=parallel_state.get_default_process_group()
                     )
-                    if hasattr(optimizer_A, 'get_parameter_state_dp_zero'):
-                        optim_param_state_A = optimizer_A.get_parameter_state_dp_zero()
-                    else:
-                        optim_param_state_A = optimizer_A.state_dict()
-
+                    optim_param_state_A = optimizer_A.get_parameter_state_dp_zero()
                     Utils.destroy_model_parallel()
                 else:
                     # this prevents NCCL errors when changing DP. TODO: fix it properly
@@ -252,34 +241,21 @@ class TestDistributedOptimizer:
                     Utils.initialize_model_parallel(*tp_pp)
 
                     model, optimizer_B = setup_model_and_optimizer(
-                        seed=3, tp=tp_pp[0], pp=tp_pp[1], initialize_fn=initialize_fn, dist_opt=HAVE_APEX_OR_TE
+                        seed=3, tp=tp_pp[0], pp=tp_pp[1], initialize_fn=initialize_fn, dist_opt=True
                     )
-                    if hasattr(optimizer_B, 'get_parameter_state_dp_zero'):
-                        optim_param_state_B = optimizer_B.get_parameter_state_dp_zero()
-                    else:
-                        optim_param_state_B = optimizer_B.state_dict()
+                    optim_param_state_B = optimizer_B.get_parameter_state_dp_zero()
                     diffs = diff(optim_param_state_A, optim_param_state_B)
                     # Expect a mismatch in values - diffs[2] nonempty
                     if parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0:
                         assert not diffs[0] and not diffs[1] and diffs[2], diffs
 
-                    if HAVE_APEX_OR_TE:
-                        sharded_state_dict = optimizer_B.sharded_state_dict(
-                            model[0].sharded_state_dict(), is_loading=True, sharding_type=sharding_type
-                        )
-                    else:
-                        sharded_state_dict = optimizer_B.sharded_state_dict(model[0].sharded_state_dict(), is_loading=True)
+                    sharded_state_dict = optimizer_B.sharded_state_dict(
+                        model[0].sharded_state_dict(), is_loading=True, sharding_type=sharding_type
+                    )
                     optim_state_dict = load(sharded_state_dict, ckpt_dir,
                                             process_group=parallel_state.get_default_process_group())
                     optimizer_B.load_state_dict(optim_state_dict)
-                    if hasattr(optimizer_B, 'get_parameter_state_dp_zero'):
-                        optim_param_state_B = optimizer_B.get_parameter_state_dp_zero()
-                    else:
-                        optim_param_state_B = optimizer_B.state_dict()
-                        optim_state = optim_param_state_B['optimizer']['state']
-                        for value in optim_state.values():
-                            value.pop('step', None)
-
+                    optim_param_state_B = optimizer_B.get_parameter_state_dp_zero()
                     # Test both param state dicts are equal
                     diffs = diff(optim_param_state_A, optim_param_state_B)
                     assert not any(map(bool, diffs)), diffs
@@ -312,7 +288,7 @@ class TestDistributedOptimizer:
                     tp=src_tp_pp[0],
                     pp=src_tp_pp[1],
                     initialize_fn=partial(initialize_gpt_model, use_glu=use_glu),
-                    dist_opt=HAVE_APEX_OR_TE
+                    dist_opt=True
                 )
 
                 save_checkpoint(10, model, optimizer, None, 0)
@@ -326,7 +302,7 @@ class TestDistributedOptimizer:
                     tp=dest_tp_pp[0],
                     pp=dest_tp_pp[1],
                     initialize_fn=partial(initialize_gpt_model, use_glu=use_glu),
-                    dist_opt=HAVE_APEX_OR_TE
+                    dist_opt=True
                 )
                 model_unloaded_state_dict = deepcopy(model[0].state_dict())
                 optim_unloaded_state_dict = deepcopy(optimizer.state_dict())
@@ -365,7 +341,7 @@ class TestDistributedOptimizer:
                     tp=dest_tp_pp[0],
                     pp=dest_tp_pp[1],
                     initialize_fn=partial(initialize_gpt_model, use_glu=use_glu),
-                    dist_opt=HAVE_APEX_OR_TE
+                    dist_opt=True
                 )
                 mock_args.finetune = False
                 mock_args.no_load_optim = True
@@ -381,7 +357,6 @@ class TestDistributedOptimizer:
                 optim_state_dict.pop('fp32_from_fp16_params', None)
                 assert not any(diff(optim_state_dict, optim_unloaded_state_dict))
 
-    @pytest.mark.skipif(not HAVE_APEX_OR_TE, reason="Require Apex or Transformer Engine")
     def test_can_load_deprecated_bucket_space_format(self, tmp_path_dist_ckpt):
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
         tp = 4
@@ -400,7 +375,7 @@ class TestDistributedOptimizer:
 
                 model, optimizer = setup_model_and_optimizer(
                     seed=2, tp=tp, pp=pp, initialize_fn=initialize_gpt_model,
-                    dist_opt=HAVE_APEX_OR_TE
+                    dist_opt=True
                 )
 
                 # Mock optimizer sharded_state_dict so that it ignores the externally
@@ -434,7 +409,7 @@ class TestDistributedOptimizer:
                         flag = 1
 
                 tensor = torch.tensor([flag], dtype=torch.long, device=get_current_device())
-                torch.distributed.broadcast(tensor, 0)
+                torch.distributed.broadcast(tensor, 0, group=parallel_state.get_default_process_group())
                 flag = tensor[0].item()
                 assert flag == 1, key_list
 
@@ -469,7 +444,7 @@ class TestFP32Optimizer:
                     pp=src_tp_pp[1],
                     initialize_fn=initialize_small_model,
                     bf16=False,
-                    dist_opt=HAVE_APEX_OR_TE
+                    dist_opt=True
                 )
 
                 save(optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()), ckpt_dir_A,
@@ -484,7 +459,7 @@ class TestFP32Optimizer:
                     pp=dest_tp_pp[1],
                     initialize_fn=initialize_small_model,
                     bf16=False,
-                    dist_opt=HAVE_APEX_OR_TE
+                    dist_opt=True
                 )
                 load_sharded_state_dict = optimizer_B.sharded_state_dict(
                     model_B[0].sharded_state_dict()
@@ -526,7 +501,6 @@ class TestOptimizerResharding:
     def test_optimizer_resharding(
         self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_dist_opt, bf16
     ):
-        use_dist_opt = use_dist_opt and HAVE_APEX_OR_TE
         Utils.initialize_model_parallel(*src_tp_pp)
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=False
@@ -590,7 +564,6 @@ class TestOptimizerResharding:
         use_glu,
     ):
         use_te = use_te and HAVE_TE
-        use_dist_opt = use_dist_opt and HAVE_APEX_OR_TE
         src_tp, src_pp, src_exp = src_tp_pp_exp
         dest_tp, dest_pp, dest_exp = dest_tp_pp_exp
         with TempNamedDir(

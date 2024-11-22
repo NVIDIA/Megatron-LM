@@ -497,7 +497,7 @@ def determine_global_metadata(
         Tuple[_LocalMetadata, _GlobalMetadata]: local and global ShardedBase objects with stripped data
     """
     local_metadata = [ten.without_data() for ten in nested_values(sharded_state_dict)]
-    global_metadata = [None] * torch.distributed.get_world_size()
+    global_metadata = [None] * torch.distributed.get_world_size(group=process_group)
     torch.distributed.all_gather_object(global_metadata, local_metadata, group=process_group)
     return local_metadata, global_metadata
 

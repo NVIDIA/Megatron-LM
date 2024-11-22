@@ -47,16 +47,6 @@ try:
     has_nvidia_modelopt = True
 except Exception:
     has_nvidia_modelopt = False
-
-try:
-    import transformer_engine # pylint: disable=unused-import
-    HAVE_APEX_OR_TE = True
-except ImportError:
-    try: 
-        import apex # pylint: disable=unused-import
-        HAVE_APEX_OR_TE = True
-    except ImportError:
-        HAVE_APEX_OR_TE = False
         
 _CHECKPOINT_VERSION = None
 
@@ -307,7 +297,7 @@ def get_rng_state(use_dist_ckpt: bool = False):
     else:
         rng_state_list = [rng_state]
 
-    if use_dist_ckpt and HAVE_APEX_OR_TE:
+    if use_dist_ckpt:
         pp_rank = mpu.get_pipeline_model_parallel_rank()
         pp_size = mpu.get_pipeline_model_parallel_world_size()
         tp_rank = mpu.get_tensor_model_parallel_rank()
@@ -390,7 +380,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     # Save distributed optimizer's custom parameter state.
     if (
-        ( args.use_distributed_optimizer and HAVE_APEX_OR_TE) 
+        args.use_distributed_optimizer 
         and not args.no_save_optim
         and optimizer is not None
         and ckpt_type == CheckpointType.LEGACY
@@ -414,7 +404,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             or mpu.get_data_modulo_expert_parallel_rank(with_context_parallel=True) == 0 \
             or ckpt_type != CheckpointType.LEGACY:
         optim_sd_kwargs = {}
-        if ckpt_type != CheckpointType.LEGACY and args.use_distributed_optimizer and HAVE_APEX_OR_TE:
+        if ckpt_type != CheckpointType.LEGACY and args.use_distributed_optimizer:
             optim_sd_kwargs['sharding_type'] = ('fully_sharded_model_space'
                                                 if args.ckpt_fully_parallel_save
                                                 else 'dp_zero_gather_scatter')
@@ -1098,7 +1088,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 gen_sd_optim = optimizer
                 gen_sd_opt_param_scheduler = opt_param_scheduler
 
-                if args.use_distributed_optimizer and HAVE_APEX_OR_TE:
+                if args.use_distributed_optimizer:
                     optim_sd_kwargs['sharding_type'] = ('fully_sharded_model_space'
                                                         if getattr(state_dict['args'], 'ckpt_fully_parallel_save', False)
                                                         else 'dp_zero_gather_scatter')
@@ -1216,7 +1206,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above
-            if args.use_distributed_optimizer and HAVE_APEX_OR_TE and not is_dist_ckpt:
+            if args.use_distributed_optimizer and not is_dist_ckpt:
                 # NOTE: this is a manual read of the tracker file.
                 # This code should not be reached when reading from a non_persistent checkpoint
                 assert not is_dist_ckpt
@@ -1313,7 +1303,7 @@ def load_biencoder_checkpoint(model, only_query_model=False,
         iteration = int(f.read().strip())
 
     checkpoint_name = get_checkpoint_name(load_path, iteration,
-                                          args.use_distributed_optimizer and HAVE_APEX_OR_TE,
+                                          args.use_distributed_optimizer,
                                           release=False)
 
     if mpu.get_data_parallel_rank() == 0:

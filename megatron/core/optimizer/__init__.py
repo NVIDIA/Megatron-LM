@@ -4,7 +4,6 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
-HAVE_APEX_OR_TE = True
 
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as Adam
@@ -25,7 +24,6 @@ except ImportError:
         # pylint: disable-next=line-too-long.
         # See https://github.com/NVIDIA/apex/blob/7b73b12361068a10b0f44844534613f252a5ea75/apex/optimizers/fused_adam.py#L16.
         from torch.optim import AdamW as Adam, SGD
-        HAVE_APEX_OR_TE = False
 
 from megatron.core import mpu
 
@@ -294,7 +292,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     # - Note: both the Float16Optimizer and the DistributedOptimizer inherit
     #   from the MixedPrecisionOptimizer, which manages any optimizer where
     #   the model params and main params are distinct.
-    if config.fp16 or config.bf16 or (config.use_distributed_optimizer and HAVE_APEX_OR_TE):
+    if config.fp16 or config.bf16 or config.use_distributed_optimizer:
 
         # Grad scaler:
         #    if loss-scale is provided, instantiate the constant scaler.

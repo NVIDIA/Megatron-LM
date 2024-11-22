@@ -12,6 +12,7 @@ import types
 
 import torch.nn.functional as F
 
+from megatron.core.device_utils import get_xla_model
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.models.retro.utils import (
     get_config_path as get_retro_config_path,
@@ -22,15 +23,7 @@ from megatron.core.utils import get_torch_version, is_torch_min_version
 from megatron.training.activations import squared_relu
 from megatron.training.utils import update_use_dist_ckpt
 
-try:
-    import transformer_engine # pylint: disable=unused-import
-    HAVE_APEX_OR_TE = True
-except ImportError:
-    try: 
-        import apex # pylint: disable=unused-import
-        HAVE_APEX_OR_TE = True
-    except ImportError:
-        HAVE_APEX_OR_TE = False
+xm = get_xla_model()
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""
@@ -307,10 +300,10 @@ def validate_args(args, defaults={}):
                   'and aligned param AG')
 
     if args.use_distributed_optimizer:
-        assert HAVE_APEX_OR_TE, "--use-distributed-optimizer is only suported with Apex or TE"
+        assert xm is None, "--use-distributed-optimizer is not supported with XLA"
     if args.overlap_param_gather:
-        assert args.use_distributed_optimizer and HAVE_APEX_OR_TE, \
-            '--overlap-param-gather only supported with distributed optimizer with Apex or TE'
+        assert args.use_distributed_optimizer, \
+            '--overlap-param-gather is only supported with distributed optimizer'
         assert args.overlap_grad_reduce, \
             'Must use --overlap-param-gather with --overlap-grad-reduce'
         assert not args.use_legacy_models, \

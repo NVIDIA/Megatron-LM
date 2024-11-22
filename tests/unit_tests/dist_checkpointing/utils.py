@@ -4,6 +4,7 @@ from unittest import mock
 
 import torch
 
+from megatron.core.device_utils import get_xla_model
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
@@ -18,18 +19,14 @@ from megatron.training.utils import unwrap_model
 try:
     import transformer_engine # pylint: disable=unused-import
     HAVE_TE = True
-    HAVE_APEX_OR_TE = True
 except ImportError:
-    try: 
-        import apex # pylint: disable=unused-import
-        HAVE_APEX_OR_TE = True
-    except ImportError:
-        HAVE_APEX_OR_TE = False
+    HAVE_TE = False
 
 NUM_LAYERS = 8
 HIDDEN_SIZE = 16
 NUM_ATTENTION_HEADS = 8
 
+xm = get_xla_model()
 
 def initialize_gpt_model(
     pre_process=True, post_process=True, seed=0, use_glu=True, **config_kwargs
@@ -115,7 +112,7 @@ def init_basic_mock_args(args, tp, pp, bf16=True):
     args.bf16 = bf16
     args.accumulate_allreduce_grads_in_fp32 = False
     args.overlap_grad_reduce = False
-    args.use_distributed_optimizer = HAVE_APEX_OR_TE
+    args.use_distributed_optimizer = xm is None
     args.ddp_bucket_size = None
     args.check_for_nan_in_loss_and_grad = False
     args.ddp_average_in_collective = False
@@ -160,8 +157,9 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
 
 
 def setup_model_and_optimizer(
-    seed, tp, pp, initialize_fn=initialize_gpt_model, bf16=True, dist_opt=HAVE_APEX_OR_TE
+    seed, tp, pp, initialize_fn=initialize_gpt_model, bf16=True, dist_opt=True
 ):
+    dist_opt = dist_opt and xm is None
     mock_args = SimpleNamespace()
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
@@ -178,7 +176,7 @@ def setup_model_and_optimizer(
     config = OptimizerConfig(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
-        use_distributed_optimizer=dist_opt and HAVE_APEX_OR_TE,
+        use_distributed_optimizer=dist_opt and  xm is None,
     )
     optimizer = get_megatron_optimizer(config, model)
 

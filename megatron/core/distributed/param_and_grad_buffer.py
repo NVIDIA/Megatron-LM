@@ -13,16 +13,6 @@ from torch.distributed import _coalescing_manager
 from ..utils import is_float8tensor, is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 
-try:
-    import transformer_engine # pylint: disable=unused-import
-    HAVE_APEX_OR_TE = True
-except ImportError:
-    try: 
-        import apex # pylint: disable=unused-import
-        HAVE_APEX_OR_TE = True
-    except ImportError:
-        HAVE_APEX_OR_TE = False
-
 logger = logging.getLogger(__name__)
 
 
@@ -373,8 +363,6 @@ class _ParamAndGradBuffer:
         gradient_scaling_factor: float,
         param_indices: List[int],
     ):
-        assert HAVE_APEX_OR_TE, "Install Apex or TE to use ParamAndGradBuffer"
-
         self.ddp_config = ddp_config
         self.params = params
         self.param_indices = param_indices

@@ -50,7 +50,6 @@ class DistributedDataParallel(MegatronModule):
         module: torch.nn.Module,
         disable_bucketing: bool = False,
     ):
-        assert HAVE_APEX_OR_TE, "Install Apex or TE to use DistributedDataParallel"
         super().__init__(config=config)
 
         if has_config_logger_enabled(config):
@@ -366,13 +365,15 @@ class DistributedDataParallel(MegatronModule):
                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                 ):
                     param.main_grad.add_(param.grad.data)
+                elif not HAVE_APEX_OR_TE:
+                    param.main_grad = param.grad.to(device=param.main_grad.device, dtype=param.main_grad.dtype)
                 param.grad = None
 
                 if self.ddp_config.overlap_grad_reduce:
                     self.param_to_bucket_group[param].register_grad_ready(param)
 
         return hook
-
+    
     @contextmanager
     def no_sync(self):
         """

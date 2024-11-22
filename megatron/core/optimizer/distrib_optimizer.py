@@ -8,7 +8,7 @@ from dataclasses import replace
 from logging import getLogger
 from typing import Callable, Dict, List, Optional, Tuple
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 HAVE_APEX_OR_TE = True
@@ -54,6 +54,7 @@ except:
 
 logger = getLogger(__name__)
 
+xm = get_xla_model()
 
 class Range:
     """
@@ -460,6 +461,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 distributed checkpointing logic).
         """
 
+        assert xm is None, "Distributed Optimizer is not supported for XLA"
+        
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
@@ -567,10 +570,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Extract 'step', for non-Apex/TE support.
         if not HAVE_APEX_OR_TE:
-            steps = list(set([s["step"].item() for s in inner_state_dict["state"].values()]))
-            assert len(steps) == 1
-            step = steps[0]
-
+            try:
+                steps = list(set([s["step"].item() for s in inner_state_dict["state"].values()]))
+                assert len(steps) == 1
+                step = steps[0]
+            except KeyError:
+                step = 0.0
+    
         # Optimizer state (do not store parameter state here).
         state_dict['optimizer'] = {k: v for k, v in inner_state_dict.items() if k != "state"}
         for param_group in state_dict["optimizer"]["param_groups"]:
@@ -670,8 +676,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if not HAVE_APEX_OR_TE:
             steps = list(set([g["step"] for g in state_dict["optimizer"]["param_groups"]]))
             assert len(steps) == 1
-            step = torch.tensor(steps[0], dtype=torch.float)
-
+            step = steps[0]
+           
             for s in state_dict_state.values():
                 # Native PyTorch state dict requires step (i.e., iteration).
                 s["step"] = step
@@ -908,11 +914,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for k, v in state_dict.items()
             }
 
-        if is_loading:
-            # Call the distributed optimizer's specialized load_state_dict(),
-            # which conditionally skips re-allocating the optimizer's state if
-            # already initialized, which in turn reduces memory fragmentation.
-            self.load_state_dict(self.state_dict())
+        # Call the distributed optimizer's specialized load_state_dict(),
+        # which conditionally skips re-allocating the optimizer's state if
+        # already initialized, which in turn reduces memory fragmentation.
+        self.load_state_dict(self.state_dict())
 
         if sharding_type == 'fully_sharded_bucket_space':
             param_state = self.sharded_param_state_fs_bucket_space(
@@ -1054,9 +1059,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             tensors['padding'] = False
 
                         for key in tensors:
-                            if key == 'padding':
+                            if key == 'padding' or (not HAVE_APEX_OR_TE and key == 'step'):
                                 tensors[key] = LocalNonpersistentObject(tensors[key])
                                 continue
+
                             assert tensors[key].shape == (gbuf_local_end - gbuf_local_start,), (
                                 tensors[key].shape,
                                 gbuf_local_start,
@@ -1108,6 +1114,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                         main_param = self.optimizer.param_groups[group_index]["params"][group_order]
                         optim_state = self.optimizer.state[main_param]
+
+                        if not HAVE_APEX_OR_TE:
+                            optim_state.pop('step', None)
 
                         tensors = {"fp32_param": main_param, **optim_state}
                         # Match optimizer parameter with model ShardedTensor (or
@@ -1193,7 +1202,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """Loads the parameter state from a "model space" representation.
 
         Inverse of the `sharded_param_state_fs_model_space` method.
-        """
+        """      
         param_idx = 0  # matching order with `sharded_param_state_fs_model_space`
         for gbuf_range_maps in self.gbuf_ranges:
             for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
@@ -1202,6 +1211,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         group_index, group_order = self.model_param_group_index_map[model_param]
                         main_param = self.optimizer.param_groups[group_index]["params"][group_order]
                         optim_state = self.optimizer.state[main_param]
+
+                        if not HAVE_APEX_OR_TE:
+                            optim_state.pop('step', None)
 
                         src_tensors = state_dict[param_idx]
                         dst_tensors = {"fp32_param": main_param, **optim_state}

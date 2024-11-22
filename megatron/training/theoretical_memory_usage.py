@@ -5,16 +5,6 @@
 
 import math
 
-try:
-    import transformer_engine # pylint: disable=unused-import
-    HAVE_APEX_OR_TE = True
-except ImportError:
-    try: 
-        import apex # pylint: disable=unused-import
-        HAVE_APEX_OR_TE = True
-    except ImportError:
-        HAVE_APEX_OR_TE = False
-
 NUM_BYTES_IN_MEGABYTE = 1024 * 1024
 
 
@@ -90,7 +80,7 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
             )
 
     num_bytes_per_parameter = (
-        18 if not (args.use_distributed_optimizer and HAVE_APEX_OR_TE) else 6 + (12 / args.data_parallel_size)
+        18 if not (args.use_distributed_optimizer) else 6 + (12 / args.data_parallel_size)
     )
     weight_and_optimizer_memory = (
         num_parameters_on_most_loaded_model_shard * num_bytes_per_parameter
