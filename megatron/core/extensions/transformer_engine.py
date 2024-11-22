@@ -706,6 +706,15 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         else:
             return core_attn_out
 
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        state_dict = self.state_dict(prefix='', keep_vars=True)
+        # TE with version>=1.9 introduces an extra state in DotProductAttention Module
+        if is_te_min_version("1.9.0.dev0") and ('_extra_state' in state_dict):
+            state_dict.pop('_extra_state')
+        return make_sharded_tensors_for_checkpoint(
+            state_dict, prefix, {}, sharded_offsets
+        )
+
 
 if is_te_min_version("1.9.0.dev0"):
 
