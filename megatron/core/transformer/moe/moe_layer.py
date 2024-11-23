@@ -42,15 +42,11 @@ class BaseMoELayer(MegatronModule, ABC):
         self.expert_parallel_size = parallel_state.get_expert_model_parallel_world_size()
         assert self.expert_parallel_size > 0, "Expected non-negative expert parallel size"
 
-        if self.config.moe_extended_tp:
-            self.num_local_experts = self.config.num_moe_experts
-            local_expert_indices_offset = 0
-        else:
-            assert self.config.num_moe_experts % self.expert_parallel_size == 0
-            self.num_local_experts = self.config.num_moe_experts // self.expert_parallel_size
-            local_expert_indices_offset = (
-                parallel_state.get_expert_model_parallel_rank() * self.num_local_experts
-            )
+        assert self.config.num_moe_experts % self.expert_parallel_size == 0
+        self.num_local_experts = self.config.num_moe_experts // self.expert_parallel_size
+        local_expert_indices_offset = (
+            parallel_state.get_expert_model_parallel_rank() * self.num_local_experts
+        )
 
         self.use_shared_expert = self.config.moe_shared_expert_intermediate_size is not None
         self.shared_expert_overlap = self.config.moe_shared_expert_overlap

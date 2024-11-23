@@ -18,6 +18,7 @@ class AuxlossTestContainer(MoEModelTestContainer):
         output.requires_grad = True
         return output
 
+    @pytest.mark.internal
     def aux_loss_test(self, input, baseline_grad):
         partitioned_input = self.partition_input(input)
         moe_layer = self.moe_layer
@@ -56,6 +57,7 @@ class TestAuxLoss:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.parametrize(
@@ -75,6 +77,7 @@ class TestAuxLoss:
         )
         container.aux_loss_test(self.input, self.baseline_grad)
 
+    @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.parametrize(

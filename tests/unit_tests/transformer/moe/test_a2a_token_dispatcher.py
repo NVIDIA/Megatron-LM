@@ -63,7 +63,7 @@ class TestAlltoAllDispatcher:
             moe_expert_capacity_factor=0.5,
             moe_pad_expert_input_to_capacity=False,
         )
-        container.dispacher_capacity_test()
+        container.dispatcher_capacity_test()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal

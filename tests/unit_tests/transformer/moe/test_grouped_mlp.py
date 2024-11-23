@@ -312,6 +312,7 @@ class TestTEGroupedMLP:
                 self.fc2_ffn_hidden_size,
             )
 
+    @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     def test_gpu_forward_backward(self):
@@ -355,6 +356,7 @@ class TestTEGroupedMLP:
         for smm_result, gmm_result in zip(smm_results, gmm_results):
             torch.testing.assert_close(smm_result, gmm_result)
 
+    @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     def test_gpu_forward_backward_with_no_tokens_allocated(self):
