@@ -67,12 +67,12 @@ MAX_POS_EMBED=8192
 EXTRA_ARGS=""
 
 if [[ $USE_TILING -eq 1 ]]; then
-    EXTRA_ARGS+=" --pixel-shuffle --use-tiling --max-num-tiles 6 --use-thumbnail --use-tile-tags --use-image-tag"
+    EXTRA_ARGS+=" --pixel-shuffle --use-tiling --max-num-tiles 6 --use-thumbnail --use-tile-tags"
     SEQ_LEN=261     # Image embeddings sequence length (256 image embeddings + 5 tile tag embeddings).
 fi
 
 if [[ $USE_PIXEL_SHUFFLE_ONLY -eq 1 ]]; then
-    EXTRA_ARGS+=" --pixel-shuffle --use-image-tag"
+    EXTRA_ARGS+=" --pixel-shuffle"
     SEQ_LEN=256
 fi
 
@@ -96,7 +96,7 @@ do
         --max-position-embeddings ${MAX_POS_EMBED} \
         --tokenizer-type MultimodalTokenizer \
         --tokenizer-model <tokenizer model path> \
-        --tokenizer-prompt-format chatml \
+        --tokenizer-prompt-format nvlm-yi-34b \
         --vocab-size 64000 \
         --make-vocab-size-divisible-by 1 \
         --position-embedding-type rope \
@@ -134,5 +134,7 @@ do
         --input-image-path ${INPUT_IMAGE_PATH} \
         --gt-path ${GROUNDTRUTH_PATH} \
         ${EXTRA_ARGS} \
-        --task ${TASK}
+        --task ${TASK} \
+        --image-tag-type nlvm \
+        --ckpt-format torch
 done

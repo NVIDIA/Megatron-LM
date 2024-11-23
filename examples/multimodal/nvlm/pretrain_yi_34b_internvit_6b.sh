@@ -76,7 +76,7 @@ OPTIONS=" \
     --max-position-embeddings ${MAX_POS_EMBED} \
     --tokenizer-type MultimodalTokenizer \
     --tokenizer-model ${WORKSPACE}/<path to tokenizer> \
-    --tokenizer-prompt-format chatml \
+    --tokenizer-prompt-format nvlm-yi-34b \
     --vocab-size 64000 \
     --make-vocab-size-divisible-by 1 \
     --position-embedding-type rope \
@@ -130,7 +130,7 @@ OPTIONS=" \
     --use-checkpoint-args \
     --ckpt-format torch \
     --pixel-shuffle \
-    --use-image-tag
+    --image-tag-type nvlm
     "
 
 export NVTE_ALLOW_NONDETERMINISTIC_ALGO=${ALLOW_NONDETERMINISTIC}

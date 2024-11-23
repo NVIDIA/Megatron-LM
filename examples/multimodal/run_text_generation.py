@@ -368,7 +368,7 @@ def get_conversation(task, question):
             {"role": "system", "content": "Answer the questions."},
             {
                 "role": "user",
-                "content": "<image>Provide a one-sentence caption for provided image.",
+                "content": "<image>\nProvide a one-sentence caption for provided image.",
             },
         ]
     elif task in ("TextVQA", "VQAv2", "ChartQA"):
@@ -423,6 +423,11 @@ def get_prompt_and_generated(prompt_and_generation, prompt_format):
         generated = generated.split("</s>")[0]
     elif prompt_format == "chatml":
         splitted = prompt_and_generation.split("<|im_start|> assistant\n")
+        prompt = splitted[0]
+        generated = splitted[1]
+        generated = generated.split("<|im_end|>")[0]
+    elif prompt_format in ("nvlm-yi-34b", "qwen2p0"):
+        splitted = prompt_and_generation.split("<|im_start|>assistant\n")
         prompt = splitted[0]
         generated = splitted[1]
         generated = generated.split("<|im_end|>")[0]
