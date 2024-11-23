@@ -126,6 +126,7 @@ class TestLLaVAModel:
 
         use_inference_kv_cache = False
         attention_mask = None
+        inference_params = None
 
         embeddings, labels, loss_mask, attention_mask = self.model._preprocess_data(
             image_embeddings,
@@ -134,6 +135,7 @@ class TestLLaVAModel:
             loss_mask,
             labels,
             use_inference_kv_cache,
+            inference_params,
             image_token_index,
             num_image_tiles,
             attention_mask,
