@@ -74,6 +74,10 @@ _DATA_PARALLEL_GLOBAL_RANKS = None
 # the first local rank in the tensor model parallel group
 _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = None
 
+# A list of global ranks for each model parallel group to ease calculation of
+# the first local rank in the model parallel group
+_MODEL_PARALLEL_GLOBAL_RANKS = None
+
 # Context parallel group that the current rank belongs to
 _CONTEXT_PARALLEL_GROUP = None
 # A list of global ranks for each context parallel group to ease calculation of the
@@ -739,6 +743,7 @@ def initialize_model_parallel(
 
     # Build the model-parallel groups.
     global _MODEL_PARALLEL_GROUP
+    global _MODEL_PARALLEL_GLOBAL_RANKS
     assert _MODEL_PARALLEL_GROUP is None, 'model parallel group is already initialized'
     for ranks in generator_wrapper('tp-pp'):
         group = torch.distributed.new_group(
@@ -746,6 +751,7 @@ def initialize_model_parallel(
         )
         if rank in ranks:
             _MODEL_PARALLEL_GROUP = group
+            _MODEL_PARALLEL_GLOBAL_RANKS = ranks
 
     # Build the model-parallel groups with expert parallel
     global _MODEL_AND_EXPERT_PARALLEL_GROUP
@@ -1384,6 +1390,13 @@ def get_tensor_model_parallel_src_rank():
         _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS is not None
     ), "Tensor model parallel group is not initialized"
     return _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS[0]
+
+
+def get_model_parallel_src_rank():
+    """Calculate the global rank corresponding to the first local rank
+    in the model parallel group."""
+    assert _MODEL_PARALLEL_GLOBAL_RANKS is not None, "Model parallel group is not initialized"
+    return _MODEL_PARALLEL_GLOBAL_RANKS[0]
 
 
 def get_data_parallel_src_rank(with_context_parallel=False):

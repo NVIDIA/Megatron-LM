@@ -272,6 +272,7 @@ class LLaVAModel(MegatronModule):
         loss_mask,
         labels,
         use_inference_kv_cache,
+        inference_params,
         image_token_index,
         num_image_tiles,
         attention_mask,
@@ -351,6 +352,7 @@ class LLaVAModel(MegatronModule):
             if (
                 self._language_is_pipeline_parallel
                 and max_seq_len < self._language_max_sequence_length
+                and inference_params is None
             ):
                 max_seq_len = self._language_max_sequence_length
 
@@ -696,6 +698,7 @@ class LLaVAModel(MegatronModule):
             loss_mask,
             labels,
             use_inference_kv_cache,
+            inference_params,
             image_token_index if image_token_index is not None else self.image_token_index,
             num_image_tiles,
             attention_mask,
