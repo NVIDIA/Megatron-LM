@@ -6,7 +6,6 @@ import torch
 import torch.distributed
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.tensor_parallel.mappings import _gather_along_first_dim_expert_parallel
 from megatron.core.transformer.moe.moe_utils import (
     get_capacity,
     permute,
@@ -150,8 +149,8 @@ class MoEAlltoAllSEQTokenDispatcher(MoETokenDispatcher):
                 .to(torch.device("cpu"), non_blocking=True)
                 .numpy()
             )
-            num_global_tokens_per_expert = _gather_along_first_dim_expert_parallel(
-                num_local_tokens_per_expert
+            num_global_tokens_per_expert = tensor_parallel.gather_from_sequence_parallel_region(
+                num_local_tokens_per_expert, group=self.ep_group
             ).reshape(ep_size, self.num_experts)
             self.num_global_tokens_per_local_expert = num_global_tokens_per_expert[
                 :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1

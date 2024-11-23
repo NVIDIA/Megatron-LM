@@ -14,9 +14,9 @@ from torch.nn.parameter import Parameter
 
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
+    get_expert_tensor_parallel_rank,
+    get_expert_tensor_parallel_world_size,
     get_global_memory_buffer,
-    get_tensor_and_expert_parallel_rank,
-    get_tensor_and_expert_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -107,16 +107,14 @@ def copy_tensor_model_parallel_attributes(destination_tensor, source_tensor):
         maybe_copy(attribute)
 
 
-def _initialize_affine_weight_gpu(
-    weight, init_method, partition_dim, stride=1, expert_parallel=False
-):
+def _initialize_affine_weight_gpu(weight, init_method, partition_dim, stride=1, is_expert=False):
     """Initialize affine weight for model parallel on GPU."""
 
     set_tensor_model_parallel_attributes(
         tensor=weight, is_parallel=True, dim=partition_dim, stride=stride
     )
 
-    if not expert_parallel:
+    if not is_expert:
         with get_cuda_rng_tracker().fork():
             init_method(weight)
     else:
@@ -756,15 +754,13 @@ class ColumnParallelLinear(torch.nn.Module):
         self.config = config
         self.disable_grad_reduce = disable_grad_reduce
 
-        self.explicit_expert_comm = self.is_expert and (
-            config.tensor_model_parallel_size > 1 or self.expert_parallel
-        )
-        if self.explicit_expert_comm and config.moe_extended_tp:
-            world_size = get_tensor_and_expert_parallel_world_size()
-            rank = get_tensor_and_expert_parallel_rank()
+        if is_expert:
+            world_size = get_expert_tensor_parallel_world_size()
+            rank = get_expert_tensor_parallel_rank()
         else:
             world_size = get_tensor_model_parallel_world_size()
             rank = get_tensor_model_parallel_rank()
+        self.explicit_expert_comm = self.is_expert and (world_size > 1 or self.expert_parallel)
 
         self.output_size_per_partition = divide(output_size, world_size)
 
@@ -807,7 +803,7 @@ class ColumnParallelLinear(torch.nn.Module):
                         init_method,
                         partition_dim=0,
                         stride=stride,
-                        expert_parallel=(self.is_expert and self.expert_parallel),
+                        is_expert=self.is_expert,
                     )
 
             setattr(self.weight, 'allreduce', not (self.is_expert and self.expert_parallel))
@@ -1056,17 +1052,14 @@ class RowParallelLinear(torch.nn.Module):
         if self.sequence_parallel and not self.input_is_parallel:
             raise RuntimeError("To enable `sequence_parallel`, `input_is_parallel` must be `True`")
 
-        self.explicit_expert_comm = self.is_expert and (
-            config.tensor_model_parallel_size > 1 or self.expert_parallel
-        )
-
         # Divide the weight matrix along the last dimension.
-        if self.explicit_expert_comm and config.moe_extended_tp:
-            world_size = get_tensor_and_expert_parallel_world_size()
-            rank = get_tensor_and_expert_parallel_rank()
+        if self.is_expert:
+            world_size = get_expert_tensor_parallel_world_size()
+            rank = get_expert_tensor_parallel_rank()
         else:
             world_size = get_tensor_model_parallel_world_size()
             rank = get_tensor_model_parallel_rank()
+        self.explicit_expert_comm = self.is_expert and (world_size > 1 or self.expert_parallel)
 
         self.input_size_per_partition = divide(input_size, world_size)
 
@@ -1109,7 +1102,7 @@ class RowParallelLinear(torch.nn.Module):
                     init_method,
                     partition_dim=1,
                     stride=stride,
-                    expert_parallel=(self.is_expert and self.expert_parallel),
+                    is_expert=self.is_expert,
                 )
         setattr(self.weight, 'allreduce', not (self.is_expert and self.expert_parallel))
 

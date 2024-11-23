@@ -1,0 +1,493 @@
+{
+    "forward-backward-time": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            13.47392,
+            0.25841,
+            0.27289,
+            0.25653,
+            0.26625,
+            0.25628,
+            0.26339,
+            0.26204,
+            0.2749,
+            0.28151
+        ]
+    },
+    "forward-compute-time": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            8.79707,
+            0.14316,
+            0.15675,
+            0.14123,
+            0.15065,
+            0.14186,
+            0.14773,
+            0.14675,
+            0.15897,
+            0.16523
+        ]
+    },
+    "backward-compute-time": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            0.73122,
+            0.11386,
+            0.1138,
+            0.11348,
+            0.11317,
+            0.11208,
+            0.11347,
+            0.11357,
+            0.11427,
+            0.11465
+        ]
+    },
+    "batch-generator-time": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            0.77139,
+            0.0019,
+            0.00182,
+            0.00185,
+            0.00185,
+            0.00197,
+            0.00171,
+            0.00165,
+            0.00182,
+            0.00166
+        ]
+    },
+    "layernorm-grads-all-reduce-time": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            0.00311,
+            0.00225,
+            0.0023,
+            0.00216,
+            0.00213,
+            0.00207,
+            0.00206,
+            0.00196,
+            0.00208,
+            0.00197
+        ]
+    },
+    "embedding-grads-all-reduce-time": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            8e-05,
+            4e-05,
+            4e-05,
+            4e-05,
+            4e-05,
+            4e-05,
+            4e-05,
+            4e-05,
+            4e-05,
+            4e-05
+        ]
+    },
+    "all-grads-sync-time": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            4.01852,
+            0.00289,
+            0.00287,
+            0.00289,
+            0.00286,
+            0.00286,
+            0.00285,
+            0.00294,
+            0.00296,
+            0.00282
+        ]
+    },
+    "optimizer-copy-to-main-grad-time": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            0.00047,
+            0.00032,
+            0.00033,
+            0.0003,
+            0.00031,
+            0.00028,
+            0.00025,
+            0.00026,
+            0.00027,
+            0.00026
+        ]
+    },
+    "optimizer-inner-step-time": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            0.00803,
+            0.00182,
+            0.00185,
+            0.00182,
+            0.00184,
+            0.00179,
+            0.00184,
+            0.00178,
+            0.0018,
+            0.00179
+        ]
+    },
+    "optimizer-copy-main-to-model-params-time": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            0.00153,
+            0.00114,
+            0.00114,
+            0.00113,
+            0.00114,
+            0.00112,
+            0.00117,
+            0.00111,
+            0.00111,
+            0.0011
+        ]
+    },
+    "optimizer-time": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            2.65854,
+            0.01318,
+            0.01283,
+            0.01264,
+            0.01264,
+            0.01242,
+            0.01289,
+            0.01226,
+            0.01232,
+            0.01228
+        ]
+    },
+    "learning-rate": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+        ]
+    },
+    "learning-rate vs samples": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+        ]
+    },
+    "batch-size": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            32.0,
+            32.0,
+            32.0,
+            32.0,
+            32.0,
+            32.0,
+            32.0,
+            32.0,
+            32.0,
+            32.0
+        ]
+    },
+    "batch-size vs samples": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            32.0,
+            32.0,
+            32.0,
+            32.0,
+            32.0,
+            32.0,
+            32.0,
+            32.0,
+            32.0,
+            32.0
+        ]
+    },
+    "lm loss": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            10.81298,
+            10.87741,
+            10.87628,
+            10.80047,
+            10.67764,
+            10.5788,
+            10.06451,
+            10.18736,
+            10.08297,
+            9.75169
+        ]
+    },
+    "lm loss vs samples": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            10.81298,
+            10.87741,
+            10.87628,
+            10.80047,
+            10.67764,
+            10.5788,
+            10.06451,
+            10.18736,
+            10.08297,
+            9.75169
+        ]
+    },
+    "loss-scale": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+        ]
+    },
+    "loss-scale vs samples": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+        ]
+    },
+    "grad-norm": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            8.33414,
+            5.78016,
+            5.87842,
+            6.80216,
+            6.7125,
+            6.39007,
+            8.68862,
+            5.16113,
+            4.57425,
+            4.41469
+        ]
+    },
+    "grad-norm vs samples": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            8.33414,
+            5.78016,
+            5.87842,
+            6.80216,
+            6.7125,
+            6.39007,
+            8.68862,
+            5.16113,
+            4.57425,
+            4.41469
+        ]
+    },
+    "num-zeros": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            26888.0,
+            32285.0,
+            33214.0,
+            31691.0,
+            28562.0,
+            30589.0,
+            28925.0,
+            33010.0,
+            33385.0,
+            35045.0
+        ]
+    },
+    "num-zeros vs samples": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            26888.0,
+            32285.0,
+            33214.0,
+            31691.0,
+            28562.0,
+            30589.0,
+            28925.0,
+            33010.0,
+            33385.0,
+            35045.0
+        ]
+    },
+    "params-norm": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            262.92148,
+            262.92148,
+            262.92148,
+            262.92148,
+            262.92145,
+            262.92145,
+            262.92142,
+            262.9213,
+            262.92111,
+            262.92087
+        ]
+    },
+    "params-norm vs samples": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            262.92148,
+            262.92148,
+            262.92148,
+            262.92148,
+            262.92145,
+            262.92145,
+            262.92142,
+            262.9213,
+            262.92111,
+            262.92087
+        ]
+    },
+    "load_balancing_loss": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            1.03508,
+            1.03273,
+            1.02893,
+            1.03497,
+            1.04648,
+            1.04875,
+            1.09296,
+            1.10445,
+            1.12111,
+            1.13657
+        ]
+    },
+    "iteration-time": {
+        "start_step": 0,
+        "end_step": 50,
+        "step_interval": 5,
+        "values": [
+            16.86916,
+            0.28405,
+            0.29778,
+            0.28081,
+            0.29056,
+            0.28009,
+            0.28785,
+            0.28603,
+            0.29846,
+            0.30491
+        ]
+    },
+    "lm loss validation": {
+        "start_step": 0,
+        "end_step": 2,
+        "step_interval": 5,
+        "values": [
+            9.79266
+        ]
+    },
+    "lm loss validation vs samples": {
+        "start_step": 0,
+        "end_step": 2,
+        "step_interval": 5,
+        "values": [
+            9.79266
+        ]
+    },
+    "lm loss validation ppl": {
+        "start_step": 0,
+        "end_step": 2,
+        "step_interval": 5,
+        "values": [
+            17901.80664
+        ]
+    },
+    "lm loss validation ppl vs samples": {
+        "start_step": 0,
+        "end_step": 2,
+        "step_interval": 5,
+        "values": [
+            17901.80664
+        ]
+    }
+}

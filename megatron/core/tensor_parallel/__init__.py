@@ -18,12 +18,10 @@ from .mappings import (
     all_to_all_sp2hp,
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
-    gather_from_sequence_parallel_region_to_moe,
     gather_from_tensor_model_parallel_region,
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_last_dim_to_tensor_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
-    reduce_scatter_to_sequence_parallel_region_from_moe,
     scatter_to_sequence_parallel_region,
     scatter_to_tensor_model_parallel_region,
 )
@@ -71,6 +69,4 @@ __all__ = [
     "split_tensor_along_last_dim",
     "split_tensor_into_1d_equal_chunks",
     "gather_split_1d_tensor",
-    "gather_from_sequence_parallel_region_to_moe",
-    "reduce_scatter_to_sequence_parallel_region_from_moe",
 ]

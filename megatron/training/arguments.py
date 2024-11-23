@@ -5,13 +5,12 @@
 import argparse
 import dataclasses
 import json
-import logging
 import os
-import torch
 import types
 import warnings
 from packaging.version import Version as PkgVersion
 
+import torch
 import torch.nn.functional as F
 
 from megatron.core.dist_checkpointing.validation import StrictHandling
@@ -228,6 +227,9 @@ def validate_args(args, defaults={}):
     if "a2a+p2p" in args.cp_comm_type:
         assert args.hierarchical_context_parallel_sizes is not None, \
         "--hierarchical-context-parallel-sizes must be set when a2a+p2p is used in cp comm"
+
+    if args.expert_tensor_parallel_size is None:
+        args.expert_tensor_parallel_size = args.tensor_model_parallel_size
 
     # Deprecated arguments
     assert args.batch_size is None, '--batch-size argument is no longer ' \
@@ -1963,6 +1965,8 @@ def _add_moe_args(parser):
     group = parser.add_argument_group(title="moe")
     group.add_argument('--expert-model-parallel-size', type=int, default=1,
                        help='Degree of expert model parallelism.')
+    group.add_argument('--expert-tensor-parallel-size', type=int, default=None,
+                       help='Degree of expert model parallelism. Default is None, which will be set to the value of --tensor-model-paralle-size.')
     group.add_argument('--num-experts', type=int, default=None,
                        help='Number of Experts in MoE (None means no MoE)')
     group.add_argument('--moe-shared-expert-intermediate-size', type=int, default=None,
@@ -2005,7 +2009,7 @@ def _add_moe_args(parser):
     group.add_argument('--moe-layer-recompute', action='store_true',
                        help='Enable checkpointing for moe_layer, should be used when memory is not sufficient.')
     group.add_argument('--moe-extended-tp', action='store_true',
-                       help='Alternative to expert parallelism, all experts are sharded across TPXEP domain.')
+                       help='Deprecated. Use --expert-tensor-parallel-size instead.')
     group.add_argument('--moe-use-upcycling', action='store_true',
                        help='Load a checkpoint of a dense model, convert it into an MoE model, and save the converted model to the path specified by --save. '
                        'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.')
