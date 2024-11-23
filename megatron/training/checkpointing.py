@@ -391,7 +391,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     # Collect args, model, RNG.
     if not torch.distributed.is_initialized() \
-            or mpu.get_data_modulo_expert_parallel_rank(with_context_parallel=True) == 0 \
+            or mpu.get_expert_data_parallel_rank() == 0 \
             or ckpt_type != CheckpointType.LEGACY:
         optim_sd_kwargs = {}
         if ckpt_type != CheckpointType.LEGACY and args.use_distributed_optimizer:

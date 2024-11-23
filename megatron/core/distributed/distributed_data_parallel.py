@@ -232,7 +232,7 @@ class DistributedDataParallel(_BaseDataParallel):
         self.expert_parallel_buffers, self.expert_parallel_bucket_groups = (
             _allocate_buffers_for_parameters(
                 expert_parallel_params,
-                parallel_state.get_data_modulo_expert_parallel_group(with_context_parallel=True),
+                parallel_state.get_expert_data_parallel_group(),
                 gradient_scaling_factor=expert_gradient_scaling_factor,
             )
         )
@@ -440,9 +440,7 @@ class DistributedDataParallel(_BaseDataParallel):
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
             if is_expert_parallel:
-                data_parallel_group = parallel_state.get_data_modulo_expert_parallel_group(
-                    with_context_parallel=True
-                )
+                data_parallel_group = parallel_state.get_expert_data_parallel_group()
             else:
                 data_parallel_group = parallel_state.get_data_parallel_group(
                     with_context_parallel=True

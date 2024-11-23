@@ -2,7 +2,7 @@
 
 import itertools
 from copy import deepcopy
-from functools import partial
+from functools import partial, wraps
 from math import ceil
 from typing import Optional, Tuple
 
@@ -46,6 +46,44 @@ except ImportError:
     HAVE_TE = False
 
 
+def expert_dist_ckpt_decorator(func):
+    """Decorator of shared_state_dict in expert layer for distributed checkpoint.
+
+    Since !1940, the TP size for Expert layer can be different with Attention.
+    To make distributed checkpoint work in such cases, we use a decorator to
+    replace the default TP parallel states with expert-TP parallel states.
+    """
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        # Store original states
+        original_rank = parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK
+        original_size = parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
+        original_group = parallel_state._TENSOR_MODEL_PARALLEL_GROUP
+        try:
+            # Set new states
+            parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = (
+                parallel_state.get_expert_tensor_parallel_rank()
+            )
+            parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = (
+                parallel_state.get_expert_tensor_parallel_world_size()
+            )
+            parallel_state._TENSOR_MODEL_PARALLEL_GROUP = (
+                parallel_state.get_expert_tensor_parallel_group()
+            )
+
+            # Execute the function
+            result = func(*args, **kwargs)
+        finally:
+            # Restore original states
+            parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = original_rank
+            parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = original_size
+            parallel_state._TENSOR_MODEL_PARALLEL_GROUP = original_group
+        return result
+
+    return wrapper
+
+
 class GroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using GroupedGEMM.
 
@@ -76,11 +114,8 @@ class GroupedMLP(MegatronModule):
             self.activation_func = self.config.activation_func
 
         # How many feature each rank holds for fc1 and fc2, respectively.
-        self.moe_extended_tp = config.moe_extended_tp
-        if config.moe_extended_tp:
-            tp_size = parallel_state.get_tensor_and_expert_parallel_world_size()
-        else:
-            tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        tp_size = parallel_state.get_expert_tensor_parallel_world_size()
+        tp_rank = parallel_state.get_expert_tensor_parallel_rank()
 
         fc1_output_size = self.config.ffn_hidden_size * self.num_local_experts
         if config.gated_linear_unit:
@@ -119,6 +154,8 @@ class GroupedMLP(MegatronModule):
                     partition_dim=1,
                     init_method=config.init_method,
                     params_dtype=config.params_dtype,
+                    rank=tp_rank,
+                    world_size=tp_size,
                 )
                 _initialize_affine_weight_cpu(
                     self.weight2,
@@ -128,6 +165,8 @@ class GroupedMLP(MegatronModule):
                     partition_dim=0,
                     init_method=config.output_layer_init_method,
                     params_dtype=config.params_dtype,
+                    rank=tp_rank,
+                    world_size=tp_size,
                 )
         else:
             self.weight1 = Parameter(
@@ -148,16 +187,10 @@ class GroupedMLP(MegatronModule):
             )
             if config.perform_initialization:
                 _initialize_affine_weight_gpu(
-                    self.weight1,
-                    config.init_method,
-                    partition_dim=1,
-                    expert_parallel=self.expert_parallel,
+                    self.weight1, config.init_method, partition_dim=1, is_expert=True
                 )
                 _initialize_affine_weight_gpu(
-                    self.weight2,
-                    config.output_layer_init_method,
-                    partition_dim=0,
-                    expert_parallel=self.expert_parallel,
+                    self.weight2, config.output_layer_init_method, partition_dim=0, is_expert=True
                 )
         setattr(self.weight1, 'allreduce', not self.expert_parallel)
         setattr(self.weight2, 'allreduce', not self.expert_parallel)
@@ -203,6 +236,7 @@ class GroupedMLP(MegatronModule):
 
         return fc2_output, None
 
+    @expert_dist_ckpt_decorator
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """
         Maps local expert to global experts.
@@ -210,11 +244,6 @@ class GroupedMLP(MegatronModule):
         whereas the optimizer states are not due to the limitation from weight transposing.
         That is, for finetuning scenario, the checkpoint is compatible with the SequentialMLP.
         """
-        if self.moe_extended_tp:
-            raise NotImplementedError(
-                'Currently distributed checkpointing is not supported for moe_extended_tp'
-            )
-
         sharded_state_dict = {}
         num_global_experts = (
             parallel_state.get_expert_model_parallel_world_size() * self.num_local_experts
@@ -226,11 +255,7 @@ class GroupedMLP(MegatronModule):
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
 
         prepend_axis_num = len(sharded_offsets)
-        replica_id = (
-            0,
-            0,
-            parallel_state.get_data_modulo_expert_parallel_rank(with_context_parallel=True),
-        )
+        replica_id = (0, 0, parallel_state.get_expert_data_parallel_rank())
 
         local_ffn_dim_size = (
             self.weight2.numel() // self.num_local_experts // self.config.hidden_size
@@ -542,7 +567,7 @@ class GroupedMLP(MegatronModule):
         replica_id = (
             0,
             parallel_state.get_tensor_model_parallel_rank(),
-            parallel_state.get_data_modulo_expert_parallel_rank(with_context_parallel=True),
+            parallel_state.get_expert_data_parallel_rank(),
         )
         # Add fake _extra_state to be compatible with SequentialMLP
         for expert_local_idx in range(self.num_local_experts):
@@ -572,7 +597,6 @@ class TEGroupedMLP(MegatronModule):
 
     def __init__(self, num_local_experts, config: TransformerConfig, submodules: MLPSubmodules):
         super().__init__(config=config)
-        self.moe_extended_tp = config.moe_extended_tp
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size
 
@@ -685,6 +709,7 @@ class TEGroupedMLP(MegatronModule):
 
         return output, output_bias
 
+    @expert_dist_ckpt_decorator
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
@@ -692,10 +717,6 @@ class TEGroupedMLP(MegatronModule):
         Maps local expert to global experts.
         The sharded state dict is interchangable with SequentialMLP's.
         """
-        if self.moe_extended_tp:
-            raise NotImplementedError(
-                'Currently distributed checkpointing is not supported for moe_extended_tp'
-            )
         sharded_state_dict = {}
         for name, module in self._modules.items():
             sub_sd = module.sharded_state_dict(f'{name}.', sharded_offsets, metadata)
@@ -730,7 +751,6 @@ class SequentialMLP(MegatronModule):
     def __init__(self, num_local_experts, config: TransformerConfig, submodules: MLPSubmodules):
         super().__init__(config=config)
         self.add_bias = config.add_bias_linear
-        self.moe_extended_tp = config.moe_extended_tp
         self.num_local_experts = num_local_experts
         self.local_experts = torch.nn.ModuleList()
         for _ in range(self.num_local_experts):
@@ -786,13 +806,9 @@ class SequentialMLP(MegatronModule):
 
             return output_local, output_bias_local
 
+    @expert_dist_ckpt_decorator
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Maps local expert to global experts."""
-        if self.moe_extended_tp:
-            raise NotImplementedError(
-                'Currently distributed checkpointing is not supported for moe_extended_tp'
-            )
-
         sharded_state_dict = {}
         num_global_experts = (
             parallel_state.get_expert_model_parallel_world_size() * self.num_local_experts
@@ -825,7 +841,7 @@ class SequentialMLP(MegatronModule):
                 ), f'Expected replica_id for {k} to be in (PP, TP, DP) format, got: {replica_id}'
                 sh_ten.replica_id = (
                     *replica_id[:2],
-                    parallel_state.get_data_modulo_expert_parallel_rank(with_context_parallel=True),
+                    parallel_state.get_expert_data_parallel_rank(),
                 )
 
             sharded_state_dict.update(expert_state_dict)

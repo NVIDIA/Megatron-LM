@@ -53,6 +53,7 @@ Megatron-Core offers rich parallelism mappings, combining Expert Parallelism wit
 | --- | --- |
 | --num-experts | Number of Experts in MoE (None means no MoE) |
 | --expert-model-parallel-size | Degree of expert model parallelism. Default is 1. |
+| --expert-tensor-parallel-size | Degree of tensor model parallelism of expert layer. Default is same to --tensor-model-parallel-size. |
 | --moe-grouped-gemm | When there are multiple experts per rank, launch multiple local GEMM kernels in multiple streams to improve the utilization and performance with GroupedLinear in TransformerEngine. |
 | --moe-router-load-balancing-type | Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss". |
 | --moe-router-topk | Number of experts to route to for each token. The default is 2. |  
@@ -65,7 +66,6 @@ Megatron-Core offers rich parallelism mappings, combining Expert Parallelism wit
 | --moe-pad-expert-input-to-capacity | Pads the input for each expert to match the expert capacity length, effective only after the --moe-expert-capacity-factor is set. |
 | --moe-token-drop-policy | The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped. |
 | --moe-layer-recompute | Enable activation checkpointing for moe_layer, should be used when memory is not sufficient. |
-| --moe-extended-tp | (Experimental) Alternative parallelization strategy for expert parallelism. Instead of distributing experts across *expert_model_parallel_size*, each expert is sharded along extendended tensor parallel domain (tensor_model_paralle_size * expert_model_parallel_size). It avoids the load balancing problem with MOE training. Only available with `--moe-token-dispatcher-type allgather`. |
 | --moe-shared-expert-intermediate-size | Set shared expert total ffn hidden size. It should be equal to `num_shared_experts * ffn_size_of_each_shared_expert` if there are multiple shared experts. None means no shared expert. |
 | --moe-shared-expert-overlap | (Experimental, may changed) If this is set, the communications/computations in the shared experts and the dispatcher will overlap (The `alltoall` dispatcher is needed.) Otherwise, the shared expert runs after the routed experts. |
 | --moe-use-upcycling | Load the dense model checkpoint, convert it into an MoE model at runtime and start training. The converted model will be saved to the path specified by `--save` before training begins. Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.|
@@ -328,6 +328,21 @@ Here we provide some general rules to get better performance:
     - The efficiency of CP largely depends on whether its communication can be overlapped with computation. 
     - Emperically, use CP when sequence length >= 8K.
 
+### MoE Parallel Folding
+
+MoE Parallel Folding separates the MoE related parallel groups from Dense groups.
+1. Traditional MoE parallel groups are entangled with dense by using a 5-dimension parallel group generator with default order `tp-cp-ep-dp-pp`. The EP group in MoE is a sub-group of DP in Attention.
+2. With MoE Parallel Fodling, we use a parallel group generator with `tp-cp-dp-pp` for Attention, and another with `tp-ep-dp-pp` for MoE. The EPxTP group in MoE is a sub-group of DPxCPxTP in Attention.
+
+By setting `--expert-tensor-parallel-size`, we can set MoE-specific TP size.
+
+#### Advantages of MoE Parallel Folding
+1. The CP and EP group are folded together by defualt, such that:
+    1. It reduces the minimal required GPUs to turn on both CP and EP. For example, the traditional way with (CP=8, EP=8) needs at least 64 GPUs, for now it only requires 8 GPUs.
+    2. The CP and EP communication can be both put in the NVLink domain.
+2. We can set different TP sizes for Attention and MoE part.
+    1. For MoE, EP is often more efficient than TP. But in the traditional way, only using EP can get OOM for most models.
+    2. With MoE parallel folding, we can turn on TP for Attention part and setting TP=1 for MoE models, which often gets better MFU.
 
 ### End-to-End Training Practice
 **Use the latest NVIDIA PyTorch or NeMo Docker Image**
@@ -352,7 +367,7 @@ Here we provide some general rules to get better performance:
 **OOM Caused by Token Distribution Imbalance when Training From Scratch**  
 MoE suffers from a severe load imbalance issue when the router is under-trained, leading to the model easily running out of memory (OOM), which typically occurs in the first 100~300 steps when training from scratch. 
 Therefore, there are two recommended ways during the first 200 steps to avoid the OOM problem, which can be removed after the token distribution is more stable:
-1. Use Extended-TP(`-moe-extended-tp`) to replace EP with TP in MoELayer, this can prevent the load imbalancing between EP ranks. Since current ETP implementation has some memeory overhead, you can further enable activation recomputation only for MoE Layer by adding `--moe-layer-recompute`.
+1. Increase the `expert-tensor-parallel-size` and decrease `expert-model-parallel-size` to replace EP with TP in MoELayer, this can prevent the load imbalancing between EP ranks. Since current ETP implementation has some memeory overhead, you can further enable activation recomputation only for MoE Layer by adding `--moe-layer-recompute`.
 2. Setting capacity factor to a relatively small number like 1.0 by adding `--moe-token-capacity-factor 1.0`.
 
 ### Reference Best Parallel Mapping
