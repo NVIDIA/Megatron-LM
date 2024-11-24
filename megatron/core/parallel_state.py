@@ -749,7 +749,7 @@ def initialize_model_parallel(
     assert _CONTEXT_PARALLEL_GROUP is None, 'context parallel group is already initialized'
     for ranks in generator_wrapper('cp'):
         group = torch.distributed.new_group(
-            ranks, timeout=timeout, pg_options=get_nccl_options('cp', nccl_comm_cfgs), group_desc="cp"
+            ranks, timeout=timeout, pg_options=get_nccl_options('cp', nccl_comm_cfgs), group_desc='cp'
         )
         if rank in ranks:
             _CONTEXT_PARALLEL_GROUP = group
@@ -822,7 +822,7 @@ def initialize_model_parallel(
         embedding_ranks = get_embedding_ranks(ranks)
         group = torch.distributed.new_group(
             embedding_ranks, timeout=timeout, pg_options=get_nccl_options('embd', nccl_comm_cfgs), group_desc='embd'
-        )0
+        )
         if rank in embedding_ranks:
             _EMBEDDING_GROUP = group
             _EMBEDDING_GLOBAL_RANKS = embedding_ranks
