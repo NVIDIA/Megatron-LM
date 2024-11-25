@@ -1,359 +1,19 @@
 {
-    "forward-backward-time": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            5.87989,
-            0.25748,
-            0.25366,
-            0.25572,
-            0.2567,
-            0.25799,
-            0.26476,
-            0.26513,
-            0.27047,
-            0.26564
-        ]
-    },
-    "forward-compute-time": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            3.77461,
-            0.14169,
-            0.13928,
-            0.14013,
-            0.14114,
-            0.14295,
-            0.14946,
-            0.14968,
-            0.15533,
-            0.1511
-        ]
-    },
-    "backward-compute-time": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            0.70676,
-            0.11366,
-            0.11287,
-            0.11354,
-            0.11325,
-            0.11292,
-            0.11324,
-            0.114,
-            0.11328,
-            0.11353
-        ]
-    },
-    "batch-generator-time": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            0.53331,
-            0.00182,
-            0.00166,
-            0.00153,
-            0.00159,
-            0.00154,
-            0.00168,
-            0.00158,
-            0.00165,
-            0.00159
-        ]
-    },
-    "layernorm-grads-all-reduce-time": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            0.00268,
-            0.00176,
-            0.00167,
-            0.00206,
-            0.00204,
-            0.0017,
-            0.00191,
-            0.00171,
-            0.002,
-            0.00164
-        ]
-    },
-    "embedding-grads-all-reduce-time": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            7e-05,
-            4e-05,
-            4e-05,
-            5e-05,
-            4e-05,
-            4e-05,
-            4e-05,
-            4e-05,
-            4e-05,
-            4e-05
-        ]
-    },
-    "all-grads-sync-time": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            1.39476,
-            0.00284,
-            0.00279,
-            0.00279,
-            0.00281,
-            0.00285,
-            0.00281,
-            0.00279,
-            0.00282,
-            0.00279
-        ]
-    },
-    "optimizer-copy-to-main-grad-time": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            0.00037,
-            0.0003,
-            0.00028,
-            0.00026,
-            0.00024,
-            0.00027,
-            0.00027,
-            0.00026,
-            0.00023,
-            0.00022
-        ]
-    },
-    "optimizer-inner-step-time": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            0.00756,
-            0.0018,
-            0.00179,
-            0.00178,
-            0.00179,
-            0.00178,
-            0.00179,
-            0.0018,
-            0.00177,
-            0.00176
-        ]
-    },
-    "optimizer-copy-main-to-model-params-time": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            0.00143,
-            0.00111,
-            0.00111,
-            0.0011,
-            0.00109,
-            0.0011,
-            0.0011,
-            0.0011,
-            0.00108,
-            0.00115
-        ]
-    },
-    "optimizer-time": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            1.52684,
-            0.01306,
-            0.01274,
-            0.01275,
-            0.01268,
-            0.01284,
-            0.01269,
-            0.01278,
-            0.01244,
-            0.01255
-        ]
-    },
-    "learning-rate": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0
-        ]
-    },
-    "learning-rate vs samples": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0
-        ]
-    },
-    "batch-size": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            32.0,
-            32.0,
-            32.0,
-            32.0,
-            32.0,
-            32.0,
-            32.0,
-            32.0,
-            32.0,
-            32.0
-        ]
-    },
-    "batch-size vs samples": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            32.0,
-            32.0,
-            32.0,
-            32.0,
-            32.0,
-            32.0,
-            32.0,
-            32.0,
-            32.0,
-            32.0
-        ]
-    },
     "lm loss": {
         "start_step": 0,
         "end_step": 50,
         "step_interval": 5,
         "values": [
-            10.81298,
-            10.87741,
-            10.87628,
-            10.80047,
-            10.67764,
-            10.5788,
-            10.06451,
-            10.18736,
-            10.08297,
-            9.75169
-        ]
-    },
-    "lm loss vs samples": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            10.81298,
-            10.87741,
-            10.87628,
-            10.80047,
-            10.67764,
-            10.5788,
-            10.06451,
-            10.18736,
-            10.08297,
-            9.75169
-        ]
-    },
-    "loss-scale": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            1.0,
-            1.0,
-            1.0,
-            1.0,
-            1.0,
-            1.0,
-            1.0,
-            1.0,
-            1.0,
-            1.0
-        ]
-    },
-    "loss-scale vs samples": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            1.0,
-            1.0,
-            1.0,
-            1.0,
-            1.0,
-            1.0,
-            1.0,
-            1.0,
-            1.0,
-            1.0
-        ]
-    },
-    "grad-norm": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            8.33414,
-            5.78016,
-            5.87842,
-            6.80216,
-            6.7125,
-            6.39007,
-            8.68862,
-            5.16113,
-            4.57425,
-            4.41469
-        ]
-    },
-    "grad-norm vs samples": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            8.33414,
-            5.78016,
-            5.87842,
-            6.80216,
-            6.7125,
-            6.39007,
-            8.68862,
-            5.16113,
-            4.57425,
-            4.41469
+            10.81823,
+            10.86998,
+            10.8727,
+            10.80014,
+            10.67571,
+            10.57944,
+            10.06572,
+            10.19342,
+            10.08575,
+            9.75236
         ]
     },
     "num-zeros": {
@@ -361,84 +21,16 @@
         "end_step": 50,
         "step_interval": 5,
         "values": [
-            26888.0,
-            32285.0,
-            33214.0,
-            31691.0,
-            28562.0,
-            30589.0,
-            28925.0,
-            33010.0,
-            33385.0,
-            35045.0
-        ]
-    },
-    "num-zeros vs samples": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            26888.0,
-            32285.0,
-            33214.0,
-            31691.0,
-            28562.0,
-            30589.0,
-            28925.0,
-            33010.0,
-            33385.0,
-            35045.0
-        ]
-    },
-    "params-norm": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            262.92148,
-            262.92148,
-            262.92148,
-            262.92148,
-            262.92145,
-            262.92145,
-            262.92142,
-            262.9213,
-            262.92111,
-            262.92087
-        ]
-    },
-    "params-norm vs samples": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            262.92148,
-            262.92148,
-            262.92148,
-            262.92148,
-            262.92145,
-            262.92145,
-            262.92142,
-            262.9213,
-            262.92111,
-            262.92087
-        ]
-    },
-    "load_balancing_loss": {
-        "start_step": 0,
-        "end_step": 50,
-        "step_interval": 5,
-        "values": [
-            1.03508,
-            1.03273,
-            1.02893,
-            1.03497,
-            1.04648,
-            1.04875,
-            1.09296,
-            1.10445,
-            1.12111,
-            1.13657
+            26801.0,
+            32734.0,
+            32925.0,
+            31593.0,
+            28610.0,
+            30362.0,
+            28464.0,
+            33486.0,
+            33403.0,
+            35162.0
         ]
     },
     "iteration-time": {
@@ -446,48 +38,16 @@
         "end_step": 50,
         "step_interval": 5,
         "values": [
-            7.81347,
-            0.28438,
-            0.27865,
-            0.2808,
-            0.28157,
-            0.28301,
-            0.28981,
-            0.29022,
-            0.29452,
-            0.28987
-        ]
-    },
-    "lm loss validation": {
-        "start_step": 0,
-        "end_step": 2,
-        "step_interval": 5,
-        "values": [
-            9.79266
-        ]
-    },
-    "lm loss validation vs samples": {
-        "start_step": 0,
-        "end_step": 2,
-        "step_interval": 5,
-        "values": [
-            9.79266
-        ]
-    },
-    "lm loss validation ppl": {
-        "start_step": 0,
-        "end_step": 2,
-        "step_interval": 5,
-        "values": [
-            17901.80664
-        ]
-    },
-    "lm loss validation ppl vs samples": {
-        "start_step": 0,
-        "end_step": 2,
-        "step_interval": 5,
-        "values": [
-            17901.80664
+            8.63293,
+            0.29454,
+            0.28102,
+            0.28297,
+            0.28369,
+            0.2848,
+            0.30008,
+            0.29214,
+            0.31041,
+            0.295
         ]
     }
 }
