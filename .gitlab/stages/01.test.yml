@@ -203,7 +203,7 @@ test:pyt(DEV)_mcore(0.9.0):
 
 test:notify_unit_tests:
   extends: [.test_rules]
-  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  image: badouralix/curl-jq
   needs:
     - test:pyt(LTS)_mcore(latest)
     - test:pyt(DEV)_mcore(latest)
