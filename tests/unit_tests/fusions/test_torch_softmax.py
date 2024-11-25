@@ -5,12 +5,14 @@ import torch
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.utils import attention_mask_func
+from tests.unit_tests.test_utilities import Utils
 
 
 class TestTorchSoftmax:
     def setup_method(self, method):
         # The important settings tested are forward_torch_softmax path
         # with locally generated casual mask for attention_mask_func:
+        Utils.initialize_model_parallel()
         self.softmax = FusedScaleMaskSoftmax(
             input_in_fp16=False,
             input_in_bf16=False,
@@ -20,6 +22,9 @@ class TestTorchSoftmax:
             softmax_in_fp32=True,
             scale=None,
         )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
 
     def test_output_shape(self):
         x = torch.randn(8, 2, 4, 4, device=get_current_device())

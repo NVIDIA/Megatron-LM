@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.device_utils import get_xla_model
+from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 from tests.unit_tests.test_utilities import TestModel, Utils
@@ -35,18 +35,22 @@ def get_model_and_buffers(
         bias=bias,
         shared_embedding=shared_embedding,
     )
+    model.to(device=get_current_device())
     params = list(model.parameters())
     param_to_name = {}
     for name, param in model.named_parameters():
         param_to_name[param] = name
     param_indices = list(range(len(params)))
 
+    data_parallel_group = parallel_state.get_data_parallel_group() \
+        if xm is None else parallel_state.get_data_parallel_group_gloo()
+    
     param_and_grad_buffer = _ParamAndGradBuffer(
         ddp_config,
         param_dtype=torch.bfloat16,
         grad_dtype=torch.float32,
         params=params,
-        data_parallel_group=parallel_state.get_data_parallel_group(),
+        data_parallel_group=data_parallel_group,
         bucket_size=bucket_size,
         param_to_name=param_to_name,
         gradient_scaling_factor=1.0,
@@ -62,6 +66,8 @@ def get_model_and_buffers(
 def test_bucket_sizes(
     bucket_size: Optional[int], use_distributed_optimizer: bool, bias: bool, shared_embedding: bool
 ):
+    use_distributed_optimizer = use_distributed_optimizer and xm is None
+    
     Utils.initialize_model_parallel()
 
     if shared_embedding and bias:

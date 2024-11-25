@@ -67,12 +67,13 @@ class TestLocalCheckpointing:
     def test_sharded_tensors(self, tp, pp):
         Utils.initialize_model_parallel(tp, pp)
         num_floating_point_operations_so_far = 0
-        model, optimizer = setup_model_and_optimizer(1, tp, pp)
+        dist_opt = xm is None
+        model, optimizer = setup_model_and_optimizer(1, tp, pp, dist_opt=dist_opt)
         opt_param_scheduler = None
         rng_state = None
         use_dist_ckpt = True
         iteration = None
-        optim_sd_kwargs = dict(sharding_type='fully_sharded_model_space')
+        optim_sd_kwargs = dict(sharding_type='fully_sharded_model_space') if dist_opt else {}
         mock_args = SimpleNamespace()
         mock_args.no_save_optim = False
         mock_args.no_save_rng = True
@@ -93,7 +94,11 @@ class TestLocalCheckpointing:
         sharded_tensors = find_matching_values(state_dict, lambda x: isinstance(x, ShardedTensor))
         for ten in sharded_tensors:
             assert ten.data != None
-        saved_state_dict = prepare_state_dict_for_save(state_dict, process_group=get_default_process_group())
+        parallelization_group = get_data_parallel_group() if not xm else get_data_parallel_group_gloo()
+        saved_state_dict = prepare_state_dict_for_save(state_dict, 
+                                                       parallelization_group=parallelization_group,
+                                                       process_group=get_default_process_group())
+
         saved_sharded_tensors = find_matching_values(
             saved_state_dict, lambda x: isinstance(x, ShardedTensor)
         )
@@ -121,11 +126,22 @@ class TestLocalCheckpointing:
         )
         nonpersistent_state_dict, _ = extract_nonpersistent(state_dict)
         # For a given use case
-        assert not nonpersistent_state_dict
-        parallelization_group = get_data_parallel_group() if not xm else get_data_parallel_group_gloo()
+        if dist_opt:
+            assert not nonpersistent_state_dict
+        else:
+            assert nonpersistent_state_dict['optimizer']['optimizer']['param_groups']
+
         loaded_state_dict = recreate_state_dict_after_load(state_dict, saved_state_dict, 
                                                            parallelization_group=parallelization_group,
                                                            process_group=get_default_process_group())
+        
+        if not dist_opt:
+            for group in state_dict['optimizer']['optimizer']['param_groups']:
+                del group['params']
+
+            for group in loaded_state_dict['optimizer']['optimizer']['param_groups']:
+                del group['params']
+        
         only_left, only_right, mismatch = diff(loaded_state_dict, state_dict)
         assert not only_left
         assert not only_right
@@ -143,7 +159,8 @@ class TestLocalCheckpointing:
     ):
         Utils.initialize_model_parallel(tp, pp)
         num_floating_point_operations_so_far = 0
-        model, optimizer = setup_model_and_optimizer(1, tp, pp)
+        dist_opt = xm is None
+        model, optimizer = setup_model_and_optimizer(1, tp, pp, dist_opt=dist_opt)
         opt_param_scheduler = None
 
         mock_args = SimpleNamespace()

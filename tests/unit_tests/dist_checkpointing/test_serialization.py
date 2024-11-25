@@ -580,20 +580,22 @@ class TestNonStrictLoad:
         ) as ckpt_dir:
             save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, save_format, 1)
             save(sharded_state_dict, ckpt_dir, save_strategy, 
-                 process_group=parallel_state.get_default_process_group())
+                process_group=parallel_state.get_default_process_group())
             torch.distributed.barrier(group=parallel_state.get_default_process_group())
 
             def load_with_flag(strict):
                 sharded_state_dict = self._get_base_state_dict()
                 del sharded_state_dict['TenA']
                 del sharded_state_dict['ObjB']
-                return load(
+                loaded_state_dict = load(
                     sharded_state_dict,
                     ckpt_dir,
                     validate_access_integrity=validate_integrity,
                     strict=strict,
                     process_group=parallel_state.get_default_process_group()
                 )
+                torch.distributed.barrier(group=parallel_state.get_default_process_group())
+                return loaded_state_dict
 
             def test_error(error_msg):
                 assert 'Unexpected keys' not in error_msg

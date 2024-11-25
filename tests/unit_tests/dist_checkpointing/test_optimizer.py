@@ -129,9 +129,10 @@ class TestOptimizer:
     def test_optimizer_params(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(1, 1)
         model = Model()
+        model.to(device=get_current_device())
         # Force optimizer state initialization
         for p in model.parameters():
-            p.grad = torch.ones_like(p.data)
+            p.grad = torch.ones_like(p.data, device=get_current_device())
         optim = Adam(model.parameters())
         optim.step()
 
@@ -167,7 +168,7 @@ def load_checkpoint_no_arg_checks(*args, **kwargs):
             return load_checkpoint(*args, **kwargs)
 
 
-@pytest.mark.skipif(xm is not None, reason="Distributed Optimizer is not supported for XLA")
+@pytest.mark.skipif(xm is not None, reason="Distributed Optimizer not supported on XLA")
 class TestDistributedOptimizer:
     def setup_method(self, method):
         pass
@@ -210,7 +211,6 @@ class TestDistributedOptimizer:
                     )
                     save_strategy = get_default_save_sharded_strategy()
                     if use_fpsl:
-                        xm = get_xla_model()
                         save_strategy = FullyParallelSaveStrategyWrapper(
                             save_strategy,
                             parallel_state.get_data_parallel_group(with_context_parallel=True) if xm is None else \
@@ -438,13 +438,14 @@ class TestFP32Optimizer:
                 process_group=parallel_state.get_default_process_group()
             ) as ckpt_dir_B:
 
+                dist_opt = xm is None
                 model_A, optimizer_A = setup_model_and_optimizer(
                     seed=2,
                     tp=src_tp_pp[0],
                     pp=src_tp_pp[1],
                     initialize_fn=initialize_small_model,
                     bf16=False,
-                    dist_opt=True
+                    dist_opt=dist_opt
                 )
 
                 save(optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()), ckpt_dir_A,
@@ -459,7 +460,7 @@ class TestFP32Optimizer:
                     pp=dest_tp_pp[1],
                     initialize_fn=initialize_small_model,
                     bf16=False,
-                    dist_opt=True
+                    dist_opt=dist_opt
                 )
                 load_sharded_state_dict = optimizer_B.sharded_state_dict(
                     model_B[0].sharded_state_dict()
@@ -501,6 +502,7 @@ class TestOptimizerResharding:
     def test_optimizer_resharding(
         self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_dist_opt, bf16
     ):
+        use_dist_opt = use_dist_opt and xm is None
         Utils.initialize_model_parallel(*src_tp_pp)
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=False
@@ -563,6 +565,7 @@ class TestOptimizerResharding:
         use_grouped_mlp,
         use_glu,
     ):
+        use_dist_opt = use_dist_opt and xm is None
         use_te = use_te and HAVE_TE
         src_tp, src_pp, src_exp = src_tp_pp_exp
         dest_tp, dest_pp, dest_exp = dest_tp_pp_exp
@@ -585,7 +588,8 @@ class TestOptimizerResharding:
                     use_glu=use_glu,
                 )
 
-                save(optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()), ckpt_dir_A)
+                save(optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()), ckpt_dir_A, 
+                     process_group=parallel_state.get_default_process_group())
                 Utils.destroy_model_parallel()
 
                 # Load checkpoint A with different TP/PP and save as checkpoint B
@@ -610,7 +614,8 @@ class TestOptimizerResharding:
                                   process_group=parallel_state.get_default_process_group())
 
                 optimizer_B.load_state_dict(state_dict)
-                save(optimizer_B.sharded_state_dict(model_B[0].sharded_state_dict()), ckpt_dir_B)
+                save(optimizer_B.sharded_state_dict(model_B[0].sharded_state_dict()), ckpt_dir_B, 
+                     process_group=parallel_state.get_default_process_group())
                 Utils.destroy_model_parallel()
 
                 # Test both checkpoints are equal

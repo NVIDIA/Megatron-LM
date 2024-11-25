@@ -5,6 +5,8 @@ from contextlib import contextmanager
 
 import torch
 
+from megatron.core.device_utils import get_xla_model
+
 from .. import parallel_state
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..transformer.module import MegatronModule
@@ -24,6 +26,8 @@ except ImportError:
         HAVE_APEX_OR_TE = False
         
 logger = logging.getLogger(__name__)
+
+xm = get_xla_model()
 
 class DistributedDataParallel(MegatronModule):
     """
@@ -232,17 +236,21 @@ class DistributedDataParallel(MegatronModule):
                 expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
 
         # Allocate the param+grad buffers for dense params' grads.
+        data_parallel_group = parallel_state.get_data_parallel_group(with_context_parallel=True) \
+            if xm is None else parallel_state.get_data_parallel_group_gloo(with_context_parallel=True)
         self.buffers, self.bucket_groups = _allocate_buffers_for_parameters(
             dense_params,
-            parallel_state.get_data_parallel_group(with_context_parallel=True),
+            data_parallel_group,
             gradient_scaling_factor=gradient_scaling_factor,
         )
 
+        data_parallel_modulo_expert_group = parallel_state.get_data_modulo_expert_parallel_group(with_context_parallel=True) \
+            if xm is None else parallel_state.get_data_modulo_expert_parallel_group_gloo(with_context_parallel=True)
         # Allocate separate param+grad buffers for expert parallel params' grads.
         self.expert_parallel_buffers, self.expert_parallel_bucket_groups = (
             _allocate_buffers_for_parameters(
                 expert_parallel_params,
-                parallel_state.get_data_modulo_expert_parallel_group(with_context_parallel=True),
+                data_parallel_modulo_expert_group,
                 gradient_scaling_factor=expert_gradient_scaling_factor,
             )
         )
@@ -460,9 +468,13 @@ class DistributedDataParallel(MegatronModule):
             if is_expert_parallel:
                 data_parallel_group = parallel_state.get_data_modulo_expert_parallel_group(
                     with_context_parallel=True
-                )
+                ) if xm is None else parallel_state.get_data_modulo_expert_parallel_group_gloo(
+                    with_context_parallel=True
+                ) 
             else:
                 data_parallel_group = parallel_state.get_data_parallel_group(
+                    with_context_parallel=True
+                ) if xm is None else parallel_state.get_data_parallel_group_gloo(
                     with_context_parallel=True
                 )
             torch.distributed.broadcast(

@@ -5,9 +5,13 @@ from typing import List, Optional
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
+from megatron.core.device_utils import get_xla_model
+
 from .. import parallel_state
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import get_attr_wrapped_model, get_model_config
+
+xm = get_xla_model()
 
 def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig):
     """
@@ -153,7 +157,9 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
         assert all(x.item() == num_tokens_list[0] for x in num_tokens_list)
 
         # all-reduce across DP ranks.
-        torch.distributed.all_reduce(num_tokens, group=parallel_state.get_data_parallel_group())
+        data_parallel_group = parallel_state.get_data_parallel_group() \
+            if xm is None else parallel_state.get_data_parallel_group_gloo()
+        torch.distributed.all_reduce(num_tokens, group=data_parallel_group)
         for model_chunk in model:
             if num_tokens > 0:
                 scaling = 1.0 / num_tokens

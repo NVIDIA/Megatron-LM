@@ -6,7 +6,10 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+import torch
 
+from megatron.core.device_utils import get_xla_model
+from megatron.core.parallel_state import get_default_process_group
 from megatron.training.checkpointing import (
     _NON_PERSISTENT_CKPT_SUBDIR,
     load_checkpoint,
@@ -20,6 +23,8 @@ from tests.unit_tests.dist_checkpointing import (
 )
 from tests.unit_tests.test_utilities import Utils
 
+xm =  get_xla_model()
+
 class TestNonPersistentSaveAndLoad:
     def setup_method(self, method):
         pass
@@ -31,7 +36,8 @@ class TestNonPersistentSaveAndLoad:
     def test_basic_save_load_scenarios(self, tmp_path_dist_ckpt, tp, pp):
         Utils.initialize_model_parallel(tp, pp)
         num_floating_point_operations_so_far = 0
-        model, optimizer = setup_model_and_optimizer(1, tp, pp)
+        dist_opt = xm is None
+        model, optimizer = setup_model_and_optimizer(1, tp, pp, dist_opt=dist_opt)
         opt_param_scheduler = None
 
         mock_args = SimpleNamespace()
@@ -45,6 +51,8 @@ class TestNonPersistentSaveAndLoad:
             init_basic_mock_args(mock_args, tp, pp)
             init_checkpointing_mock_args(mock_args, non_persistent_ckpt_dir)
             mock_args.non_persistent_ckpt_type = "global"
+            mock_args.no_save_rng = True
+            mock_args.no_load_rng = True
 
             save_checkpoint(
                 2,
@@ -56,7 +64,7 @@ class TestNonPersistentSaveAndLoad:
                 non_persistent_ckpt=True,
             )
             save_checkpoint(
-                3, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, {}
+                3, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, {},
             )
             save_checkpoint(
                 4,
@@ -70,7 +78,7 @@ class TestNonPersistentSaveAndLoad:
             iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler)
             assert iteration == 4
             save_checkpoint(
-                6, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, {}
+                6, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, {}, 
             )
             iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler)
             assert iteration == 6
@@ -118,7 +126,8 @@ class TestLegacySaveAndLoad:
     def test_basic_save_load_scenario(self, tmp_path_dist_ckpt, tp, pp):
         Utils.initialize_model_parallel(tp, pp)
         num_floating_point_operations_so_far = 0
-        model, optimizer = setup_model_and_optimizer(1, tp, pp)
+        dist_opt = xm is None
+        model, optimizer = setup_model_and_optimizer(1, tp, pp, dist_opt=dist_opt)
         opt_param_scheduler = None
 
         mock_args = SimpleNamespace()

@@ -6,7 +6,7 @@ import os
 from enum import Enum
 from typing import Dict, List, Optional
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 from torch.distributed import _coalescing_manager
 
@@ -23,6 +23,8 @@ else:
     dist_all_gather_func = torch.distributed._all_gather_base
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
+
+xm = get_xla_model()
 
 class BufferType(Enum):
     """
@@ -149,7 +151,7 @@ class _ParamAndGradBucketGroup:
         assert not norm_is_nan, (
             f'Rank {global_rank}: found NaN in local grad norm in '
             f'backward pass before data-parallel communication collective. '
-            f'Device: {get_current_device()}, node: {os.uname()[1]}'
+            f'Device: {get_current_device() if xm is None else torch.device("cpu")}, node: {os.uname()[1]}'
         )
 
     def start_param_sync(self, force_sync: bool = False):
@@ -504,6 +506,7 @@ class _ParamAndGradBuffer:
         self.param_data = None
         # Only re-map param tensors if using distributed optimizer.
         if self.ddp_config.use_distributed_optimizer:
+            assert xm is None, "Distributed optimizer is not supported on XLA"
             self.param_data = torch.zeros(
                 self.numel,
                 dtype=self.param_dtype,
@@ -513,7 +516,7 @@ class _ParamAndGradBuffer:
         self.grad_data = torch.zeros(
             self.numel,
             dtype=self.grad_dtype,
-            device=get_current_device(),
+            device=get_current_device() if xm is None else torch.device("cpu"),
             requires_grad=False,
         )
 
@@ -623,6 +626,7 @@ class _ParamAndGradBuffer:
         # Assert that indices are correctly padded (if needed), and that bucket
         # position is same as originally computed.
         if self.ddp_config.use_distributed_optimizer:
+            assert xm is None, "Distributed optimizer is not supported on XLA"
             assert start_index % self.data_parallel_world_size == 0
             assert end_index % self.data_parallel_world_size == 0
         assert (start_index, end_index) == self.bucket_indices[bucket_id]

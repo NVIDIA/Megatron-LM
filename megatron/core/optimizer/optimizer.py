@@ -590,10 +590,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
             for model_param, main_param in zip(model_group, main_group):
                 if hasattr(model_param, 'main_grad'):
-                    main_param.grad = model_param.main_grad.float()
+                    main_param.grad = model_param.main_grad.float().to(device=main_param.grad.device)
                 else:
                     if model_param.grad is not None:
-                        main_param.grad = model_param.grad.float()
+                        main_param.grad = model_param.grad.float().to(device=main_param.grad.device)
 
                 # Safe to deallocate model's grad/main_grad after copying.
                 # (If using contiguous buffers, main_grad's memory should
@@ -603,7 +603,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         # For fp32 grads, we need to reset the grads to main grad.
         for model_group in self.fp32_from_fp32_groups:
             for model_param in model_group:
-                model_param.grad = model_param.main_grad
+                model_param.grad = model_param.main_grad.to(device=model_param.grad.device, 
+                                                            dtype=model_param.grad.dtype)
 
     def _copy_main_params_to_model_params(self):
         # Only needed for the float16 params.
@@ -753,7 +754,8 @@ class FP32Optimizer(MegatronOptimizer):
         
         for param_group in self.optimizer.param_groups:
             for param in param_group['params']:
-                param.grad = param.main_grad
+                param.grad = param.main_grad.to(device=param.grad.device, 
+                                                dtype=param.grad.dtype)
         if timers is not None:
             timers('optimizer-copy-to-main-grad').stop()
 

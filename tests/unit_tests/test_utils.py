@@ -73,7 +73,7 @@ def test_check_param_hashes_across_dp_replicas():
     # Setup.
     _init_distributed(world, rank)
     Utils.initialize_model_parallel()
-    model = torch.nn.Linear(100, 100, bias=False)
+    model = torch.nn.Linear(100, 100, bias=False, device=get_current_device())
 
     # First check case where all replicas agree.
     model.weight.data.fill_(1.0)
@@ -97,7 +97,7 @@ def test_cross_check_param_hashes_across_dp_replicas():
     # Setup.
     _init_distributed(world, rank)
     Utils.initialize_model_parallel()
-    model = torch.nn.Linear(100, 100, bias=False)
+    model = torch.nn.Linear(100, 100, bias=False, device=get_current_device())
 
     # First check case where all replicas agree.
     model.weight.data.fill_(1.0)
