@@ -167,7 +167,7 @@ class MambaStack(MegatronModule):
                 # Transformer layers apply their own pp_layer_offset
                 layer = build_module(submodules.mlp_layer, config=self.config, layer_number=i + 1)
             else:
-                assert True, "unexpected layer_type"
+                assert False, "unexpected layer_type"
             self.layers.append(layer)
 
         # Required for activation recomputation
