@@ -38,6 +38,16 @@ class TRTLLMLayers(Enum):
     mlp_projection_weight = 'transformer.layers.mlp.proj.weight'
     mlp_projection_bias = 'transformer.layers.mlp.proj.bias'
 
+    # mamba layers
+    mixer_dt_bias = 'transformer.layers.layer.dt_bias'
+    mixer_A_log = 'transformer.layers.layer.A'
+    mixer_D = 'transformer.layers.layer.D'
+    mixer_in_proj_weight = 'transformer.layers.layer.in_proj.weight'
+    mixer_out_proj_weight = 'transformer.layers.layer.out_proj.weight'
+    mixer_conv_weight = 'transformer.layers.layer.conv1d.weight'
+    mixer_conv_bias = 'transformer.layers.layer.conv1d.bias'
+    mixer_norm_weight = 'transformer.layers.layer.norm.weight'
+
     # mixture of expert layers
     mlp_router_weight = 'transformer.layers.mlp.router.weight'
     mlp_fc_weight_mixture_of_experts = 'transformer.layers.mlp.fc.weight.expert'

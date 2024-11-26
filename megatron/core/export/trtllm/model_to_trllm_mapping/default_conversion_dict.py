@@ -7,6 +7,7 @@ from megatron.core.export.trtllm.model_to_trllm_mapping.gpt_model import GPT_DIC
 from megatron.core.export.trtllm.model_to_trllm_mapping.gpt_next_model import GPT_NEXT_DICT
 from megatron.core.export.trtllm.model_to_trllm_mapping.llama_model import LLAMA_DICT
 from megatron.core.export.trtllm.model_to_trllm_mapping.starcoder_model import STARCODER_DICT
+from megatron.core.export.trtllm.model_to_trllm_mapping.mamba_hybrid_model import MAMBA_HYBRID_DICT
 
 DEFAULT_CONVERSION_DICT = {
     ModelType.llama: LLAMA_DICT,
@@ -15,4 +16,5 @@ DEFAULT_CONVERSION_DICT = {
     ModelType.starcoder: STARCODER_DICT,
     ModelType.gpt: GPT_DICT,
     ModelType.gptnext: GPT_NEXT_DICT,
+    ModelType.mamba_hybrid: MAMBA_HYBRID_DICT,
 }

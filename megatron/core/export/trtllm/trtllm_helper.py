@@ -42,6 +42,7 @@ class TRTLLMHelper:
         seq_len_interpolation_factor: float = None,
         moe_renorm_mode=None,
         share_embeddings_and_output_weights=False,
+        hybrid_override_pattern: str=None,
     ):
         """Constructor for the TRTLLMHelper
 
@@ -72,6 +73,7 @@ class TRTLLMHelper:
         assert position_embedding_type in [
             'learned_absolute',
             'rope',
+            'none',
         ], f"Position embedding type should be one of learned_absolute, rope. You entered {position_embedding_type}"
         self.position_embedding_type = position_embedding_type
         self.max_position_embeddings = max_position_embeddings
@@ -83,6 +85,7 @@ class TRTLLMHelper:
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
         self.moe_renorm_mode = moe_renorm_mode
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
+        self.hybrid_override_pattern = hybrid_override_pattern
 
     def _get_trtllm_config(
         self,
@@ -162,6 +165,19 @@ class TRTLLMHelper:
                 False if self.transformer_config.num_layers == 32 else True
             )
             config["parallel_attention"] = True
+        elif self.model_type == ModelType.mamba_hybrid:
+            config["mamba_version"] = "Mamba2"
+            config["rnn_hidden_size"] = 2 * self.transformer_config.hidden_size
+            config["state_size"] = 128
+            config["conv_kernel"] = 4
+            config["rnn_head_size"] = 64
+            config["ngroups"] = 8
+            config["chunk_size"] = 128
+            config["rnn_conv_dim_size"] = (config["rnn_hidden_size"] + 2 * config["ngroups"]
+                                           * config["state_size"])
+            config["use_bias"] = config["bias"]
+            config["hybrid_override_pattern"] = self.hybrid_override_pattern
+            config["ssm_rmsnorm"] =  True
 
         if self.seq_len_interpolation_factor is not None:
             config["rotary_scaling"] = {

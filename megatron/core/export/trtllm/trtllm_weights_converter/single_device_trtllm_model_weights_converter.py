@@ -111,6 +111,11 @@ class SingleDeviceTRTLLMModelWeightsConverter:
                     self.trtllm_model_weights[f'{layer_name}.{split_num}.bin'] = (
                         split_val.to(self.storage_type).detach().contiguous()
                     )
+            elif split_type == 'conv':
+                val = val.unsqueeze(-1)
+                self.trtllm_model_weights[layer_name] = (
+                    val.to(self.storage_type).detach().contiguous()
+                )
             else:
                 if val.ndim >= 2:
                     val = torch.transpose(val.reshape(val.shape[0], -1), 1, 0)
@@ -130,6 +135,12 @@ class SingleDeviceTRTLLMModelWeightsConverter:
             or layer_name.endswith(suffix(TRTLLMLayers.attention_dense_bias))
             or layer_name.endswith(suffix(TRTLLMLayers.mlp_projection_bias))
             or layer_name.endswith(suffix(TRTLLMLayers.mlp_router_weight))
+            or layer_name.endswith(suffix(TRTLLMLayers.mixer_dt_bias))
+            or layer_name.endswith(suffix(TRTLLMLayers.mixer_D))
+            or layer_name.endswith(suffix(TRTLLMLayers.mixer_conv_bias))
+            or layer_name.endswith(suffix(TRTLLMLayers.mixer_in_proj_weight))
+            or layer_name.endswith(suffix(TRTLLMLayers.mixer_norm_weight))
+            or layer_name.endswith(suffix(TRTLLMLayers.mixer_out_proj_weight))
         ):
             # Same as layernorm1p in NeMo
             if (
@@ -261,6 +272,13 @@ class SingleDeviceTRTLLMModelWeightsConverter:
             _add_to_trtllm_model_weights(
                 val=split_vals, layer_name=layer_name, split_type='expert_split'
             )
+        elif layer_name.endswith(suffix(TRTLLMLayers.mixer_A_log)):
+            val = -torch.exp(val.float())
+            _add_to_trtllm_model_weights(val=val, layer_name=layer_name, split_type=None)
+        elif layer_name.endswith(suffix(TRTLLMLayers.mixer_conv_weight)):
+            _add_to_trtllm_model_weights(
+                val=val, layer_name=layer_name, split_type='conv'
+            )
         else:
             raise ValueError(f"{layer_name} cannot be handled by converter")
 
@@ -277,6 +295,9 @@ class SingleDeviceTRTLLMModelWeightsConverter:
             trtllm_conversion_dict (dict): The conversion dictionary used to convert model layer names to trtllm layer names
             state_dict_split_by_layer_numbers (bool, optional): Are the model layers split by layer numbers in state dict. For example : mlp.fc1.weight can be represented like mlp.fc1.weight of shape [num_layers, hidden_dim, ffn_hidden_dim]} or it can be like mlp.fc1.layers.0.weight of shape [hidden_dim, ffn_hidden_dim], then mlp.fc1.layers.1.weight ... for all layers. If you use represenation 2 set this to True. Defaults to True
         """
+
+        if 'preprocess_weight' in trtllm_conversion_dict:
+            trtllm_conversion_dict['preprocess_weight'](model_state_dict)
 
         # First step is to convert input model layer names to equivalent trtllm layer names
         model_state_dict = TRTLLMLayers.rename_input_layer_names_to_trtllm_layer_names(
@@ -365,6 +386,7 @@ class SingleDeviceTRTLLMModelWeightsConverter:
 
         pp_layer_range = mapping.pp_layers(self.transformer_config.num_layers)
 
+        is_mamba = hasattr(trtllm_model_config, "mamba_version")
         trtllm_model_weights_per_gpu = {}
         for layer_name, value in self.trtllm_model_weights.items():
             if layer_name in NON_TRANSFORMER_LAYERS_NAMES:
@@ -391,6 +413,11 @@ class SingleDeviceTRTLLMModelWeightsConverter:
             ):
                 layer_name = layer_name.replace("post_layernorm", "mlp_layernorm")
 
+            if is_mamba:
+                layer_name = layer_name.replace("transformer", "backbone")
+                layer_name = layer_name.replace("mlp", "layer")
+                layer_name = layer_name.replace("attention", "layer")
+
             trtllm_model_weights_per_gpu[layer_name] = value
 
         if mapping.is_first_pp_rank():
@@ -404,7 +431,10 @@ class SingleDeviceTRTLLMModelWeightsConverter:
                 else self.trtllm_model_weights[TRTLLMLayers.vocab_embedding.value]
             )
 
-            trtllm_model_weights_per_gpu[TRTLLMLayers.vocab_embedding.value] = embedding_weight
+            key = TRTLLMLayers.vocab_embedding.value
+            if is_mamba:
+                key = key.replace("transformer", "backbone")
+            trtllm_model_weights_per_gpu[key] = embedding_weight
 
             pos_embedding_weight = self.trtllm_model_weights.get(
                 TRTLLMLayers.position_embedding.value
@@ -426,7 +456,10 @@ class SingleDeviceTRTLLMModelWeightsConverter:
                     lm_head_weight, mapping.tp_size, mapping.tp_rank
                 )
 
-            trtllm_model_weights_per_gpu[TRTLLMLayers.final_layernorm_weight.value] = (
+            key = TRTLLMLayers.final_layernorm_weight.value
+            if is_mamba:
+                key = key.replace("transformer", "backbone")
+            trtllm_model_weights_per_gpu[key] = (
                 self.trtllm_model_weights[TRTLLMLayers.final_layernorm_weight.value]
             )
 
