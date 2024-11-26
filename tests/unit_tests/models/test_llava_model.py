@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -9,8 +10,12 @@ from megatron.core import parallel_state as ps
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
+from megatron.training.global_vars import set_args
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -125,10 +130,10 @@ class TestLLaVAModel:
         num_image_tiles = torch.tensor([1, 2, 1, 2, 1], dtype=torch.int).cuda()
 
         use_inference_kv_cache = False
-        attention_mask = None
         inference_params = None
+        image_token_mask = None
 
-        embeddings, labels, loss_mask, attention_mask = self.model._preprocess_data(
+        embeddings, labels, loss_mask = self.model._preprocess_data(
             image_embeddings,
             language_embeddings,
             input_ids,
@@ -138,7 +143,7 @@ class TestLLaVAModel:
             inference_params,
             image_token_index,
             num_image_tiles,
-            attention_mask,
+            image_token_mask,
         )
 
         img_seq_len = 577
@@ -442,6 +447,197 @@ class TestLLaVAModelSigLIP:
         input_tensor = torch.zeros(expected_shape)
         self.model.set_input_tensor(input_tensor)
         assert self.model.vision_model.decoder.input_tensor.shape == expected_shape
+
+
+def create_test_args(cp_size, sequence_parallel):
+    # Set dummy values for the args.
+    args = SimpleNamespace()
+    args.context_parallel_size = cp_size
+    args.sequence_parallel = sequence_parallel
+
+    return args
+
+
+class TestLLaVAModelTokenParallel:
+
+    def init_llava_model(self):
+        self.language_hidden_size = 64
+        self.language_num_attention_heads = 16
+
+        language_config = TransformerConfig(
+            num_layers=3,
+            hidden_size=self.language_hidden_size,
+            num_attention_heads=self.language_num_attention_heads,
+            use_cpu_initialization=False,
+            tensor_model_parallel_size=self.tp_size,
+            sequence_parallel=self.sequence_parallel,
+            context_parallel_size=1,  # Init with CP=1 until CI catches up to TEv1.10
+            # context_parallel_size=self.cp_size,
+        )
+        # SP and CP are not yet supported for the Vision Backbone
+        vision_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=16,
+            num_attention_heads=8,
+            use_cpu_initialization=False,
+            tensor_model_parallel_size=self.tp_size,
+            sequence_parallel=False,
+            context_parallel_size=1,
+        )
+        vision_projection_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=self.language_hidden_size,
+            ffn_hidden_size=1024,
+            num_attention_heads=8,
+            use_cpu_initialization=False,
+            tensor_model_parallel_size=self.tp_size,
+            sequence_parallel=False,
+            context_parallel_size=1,
+        )
+
+        language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        # SP/CP either requires user to ensure token lengths do not require padding OR change mask type to padding
+        if (
+            language_layer_spec.submodules.self_attention.params.get('attn_mask_type', '')
+            == AttnMaskType.causal
+        ):
+            language_layer_spec.submodules.self_attention.params['attn_mask_type'] = (
+                AttnMaskType.padding_causal
+            )
+        elif (
+            language_layer_spec.submodules.self_attention.params.get('attn_mask_type', '')
+            == AttnMaskType.no_mask
+        ):
+            language_layer_spec.submodules.self_attention.params['attn_mask_type'] = (
+                AttnMaskType.padding
+            )
+
+        vision_layer_spec = deepcopy(language_layer_spec)
+        vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
+
+        vision_config.vision_model_type = "clip"
+        self.model = LLaVAModel(
+            language_transformer_config=language_config,
+            language_transformer_layer_spec=language_layer_spec,
+            language_vocab_size=8192,
+            language_max_sequence_length=4096,
+            vision_transformer_config=vision_config,
+            vision_transformer_layer_spec=vision_layer_spec,
+            drop_vision_class_token=False,
+            vision_projection_config=vision_projection_config,
+            vision_projection_layer_spec=vision_projection_spec,
+            img_h=336,
+            img_w=336,
+            patch_dim=14,
+        )
+
+    @pytest.mark.internal  # The model is under active development and its methods may change.
+    def setup_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "cp_size,tp_size,sequence_parallel", [(1, 8, True), (2, 4, False), (2, 4, True)]
+    )
+    def test_process_embedding_token_parallel(self, cp_size, tp_size, sequence_parallel):
+        self.cp_size = cp_size
+        self.tp_size = tp_size
+        self.sequence_parallel = sequence_parallel
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=self.tp_size, context_parallel_size=self.cp_size
+        )
+        model_parallel_cuda_manual_seed(123)
+
+        self.init_llava_model()
+        self.model.cuda()
+        # Setting CP size for LLM here as model init is done with CP=1 to
+        # avoid TE version check until CI catches up to TEv1.10
+        if self.cp_size > 1:
+            self.model.context_parallel_lm = self.cp_size
+
+        args = create_test_args(self.cp_size, self.sequence_parallel)
+        set_args(args)
+
+        batch_size = 2
+        combined_valid_seqlen = 2049
+        combined_padded_seqlen = 2056
+        if self.cp_size > 1:
+            combined_embeddings = torch.ones(
+                [batch_size, combined_padded_seqlen, 4096], device='cuda', dtype=torch.bfloat16
+            )  # [B, S, H]
+        else:
+            combined_embeddings = torch.ones(
+                [combined_padded_seqlen, batch_size, 4096], device='cuda', dtype=torch.bfloat16
+            )  # [S, B, H]
+        new_labels = torch.ones(
+            [batch_size, combined_padded_seqlen], device='cuda', dtype=torch.bfloat16
+        )  # [B, S]
+        new_loss_mask = torch.ones(
+            [batch_size, combined_padded_seqlen], device='cuda', dtype=torch.bfloat16
+        )  # [B, S]
+
+        cu_seqlens = torch.arange(
+            0,
+            (batch_size + 1) * (combined_valid_seqlen),
+            step=(combined_valid_seqlen),
+            dtype=torch.int32,
+            device=combined_embeddings.device,
+        )
+        cu_seqlens_padded = torch.arange(
+            0,
+            (batch_size + 1) * (combined_padded_seqlen),
+            step=(combined_padded_seqlen),
+            dtype=torch.int32,
+            device=combined_embeddings.device,
+        )
+
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            max_seqlen_q=combined_padded_seqlen,
+            max_seqlen_kv=combined_padded_seqlen,
+            qkv_format='thd',
+        )
+
+        combined_embeddings, new_labels, new_loss_mask, packed_seq_params = (
+            self.model._process_embedding_token_parallel(
+                combined_embeddings, new_labels, new_loss_mask, packed_seq_params
+            )
+        )
+
+        # Calculate the expected padded seq length
+        if self.cp_size > 1 and self.sequence_parallel:
+            padding_factor = self.tp_size * self.cp_size * 2
+        elif self.cp_size > 1:
+            padding_factor = self.cp_size * 2
+        elif self.sequence_parallel:
+            padding_factor = self.tp_size
+
+        padded_seq_len = int(
+            (combined_padded_seqlen + (padding_factor - 1)) // padding_factor * padding_factor
+        )
+
+        # Check if output shape is as expected
+        if self.cp_size > 1 and self.sequence_parallel:
+            # THD format
+            assert combined_embeddings.shape[0] == batch_size * (
+                padded_seq_len / (self.tp_size * self.cp_size)
+            )
+            assert combined_embeddings.shape[1] == 1
+        elif self.cp_size > 1:
+            # THD format
+            assert combined_embeddings.shape[0] == batch_size * (padded_seq_len / self.cp_size)
+            assert combined_embeddings.shape[1] == 1
+        else:
+            # SBHD format
+            assert combined_embeddings.shape[0] == padded_seq_len / self.tp_size
+            assert combined_embeddings.shape[1] == batch_size
 
 
 def count_parameters(model):
