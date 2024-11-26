@@ -599,8 +599,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         if is_te_min_version("0.12.0", check_equality=False):
             self.te_forward_mask_type = True
 
-        # Only Transformer-Engine version >= 1.0.0 supports context parallelism
-        if is_te_min_version("1.0.0"):
+        # This check is important as CP config can be disabled while having a valid CP group
+        # Example - Disabling CP for encoder while a valid CP group exists for decoder
+        if self.config.context_parallel_size > 1:
+            assert is_te_min_version(
+                "1.0.0"
+            ), "Only Transformer-Engine version >= 1.0.0 supports context parallelism!"
             if getattr(TEDotProductAttention, "cp_stream") is None:
                 TEDotProductAttention.cp_stream = torch.cuda.Stream()
             extra_kwargs["cp_group"] = get_context_parallel_group(check_initialized=False)
@@ -622,10 +626,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                     )
                 else:
                     extra_kwargs["cp_comm_type"] = cp_comm_type
-        else:
-            assert (
-                self.config.context_parallel_size == 1
-            ), "Only Transformer-Engine version >= 1.0.0 supports context parallelism!"
 
         if self.config.deterministic_mode:
             if int(os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")) != 0:
