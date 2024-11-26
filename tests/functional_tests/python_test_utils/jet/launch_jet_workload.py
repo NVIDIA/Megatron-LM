@@ -1,3 +1,4 @@
+import json
 import os
 import pathlib
 import re
@@ -84,6 +85,7 @@ def launch_and_wait_for_completion(
             },
         },
         wait_for_validation=True,
+        max_wait_time=(60 * 60),
     )
 
     register_pipeline_terminator(pipeline=pipeline)
@@ -98,7 +100,7 @@ def launch_and_wait_for_completion(
         try:
             pipeline.wait(max_wait_time=60 * 60 * 24 * 7, interval=60 * 3)
             break
-        except requests.exceptions.ConnectionError as e:
+        except (requests.exceptions.ConnectionError, json.decoder.JSONDecodeError) as e:
             print(e)
             time.sleep(60 * 3**n_wait_attempts)
             pipeline = workloads.get_pipeline(pipeline.jet_id)
@@ -236,7 +238,7 @@ def main(
                 logs = extract_logs_to_string(logs=jet_log)
                 download_job_assets(logs=jet_log, iteration=n_iteration)
                 break
-            except requests.exceptions.ConnectionError as e:
+            except (requests.exceptions.ConnectionError, json.decoder.JSONDecodeError) as e:
                 print(e)
                 time.sleep((3**n_download_attempt) * 60)
                 n_download_attempt += 1
@@ -259,7 +261,8 @@ def main(
                 print("Detected NCCL failure, attempt restart.")
                 n_attempts += 1
                 continue
-            else:
+
+            if "FAILED tests/functional_tests/python_test_utils/test_ci_pipeline.py" in concat_logs:
                 print("Non-determinism, let's try another node.")
                 n_nondeterminism_attemps += 1
                 continue
