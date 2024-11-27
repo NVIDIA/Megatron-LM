@@ -314,7 +314,7 @@ class CheckpointType(Enum):
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
-                    train_data_iterator=None, ft_client=None):
+                    train_data_iterator=None, ft_client=None, preprocess_common_state_dict_fn = None):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
     Checkpointing context is used to persist some checkpointing state
@@ -401,7 +401,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     # Collect args, model, RNG.
     if not torch.distributed.is_initialized() \
-            or mpu.get_data_modulo_expert_parallel_rank(with_context_parallel=True) == 0 \
+            or mpu.get_expert_data_parallel_rank() == 0 \
             or ckpt_type != CheckpointType.LEGACY:
         optim_sd_kwargs = {}
         if ckpt_type != CheckpointType.LEGACY and args.use_distributed_optimizer:
@@ -449,7 +449,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             async_save_request = dist_checkpointing.save(state_dict, checkpoint_name, save_strategy,
                                                          async_sharded_save=args.async_save,
                                                          validate_access_integrity=validate_sharding_integrity,
-                                                         process_group=mpu.get_default_process_group())
+                                                         process_group=mpu.get_default_process_group(),
+                                                         preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn)
             # [ModelOpt]: save sharded modelopt_state
             if has_nvidia_modelopt:
                 save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))
@@ -962,6 +963,7 @@ def load_args_from_checkpoint(
         else:
             print_rank_0(f"Checkpoint did not provide arguments {arg_name}")
 
+    # Model args.
     _set_arg('num_layers')
     _set_arg('hidden_size')
     _set_arg('ffn_hidden_size')
@@ -974,24 +976,54 @@ def load_args_from_checkpoint(
     _set_arg('position_embedding_type', force=True)
     _set_arg('add_position_embedding', force=True)
     _set_arg('use_rotary_position_embeddings', force=True)
+    _set_arg('rotary_base', force=True)
     _set_arg('rotary_percent', force=True)
     _set_arg('rotary_interleaved', force=True)
     _set_arg('add_bias_linear', force=True)
     _set_arg('add_qkv_bias', force=True)
+    _set_arg('squared_relu', force=True)
     _set_arg('swiglu', force=True)
     _set_arg('untie_embeddings_and_output_weights', force=True)
     _set_arg('apply_layernorm_1p', force=True)
     _set_arg('normalization', force=True)
-    _set_arg('tokenizer_type')
-    _set_arg('padded_vocab_size')
     _set_arg('apply_query_key_layer_scaling', force=True)
-    if checkpoint_version < 3.0:
-        _set_arg('tensor_model_parallel_size', 'model_parallel_size')
-    else:
-        _set_arg('tensor_model_parallel_size', force=True)
-        _set_arg('pipeline_model_parallel_size', force=True)
-        _set_arg('virtual_pipeline_model_parallel_size', force=True)
-        _set_arg('num_layers_per_virtual_pipeline_stage')
+    _set_arg('attention_dropout', force=True)
+    _set_arg('hidden_dropout', force=True)
+
+    _set_arg('hybrid_override_pattern', force=True)
+    _set_arg('spec', force=True)
+    _set_arg('hybrid_attention_ratio', force=True)
+    _set_arg('hybrid_mlp_ratio', force=True)
+
+    _set_arg('num_experts', force=True)
+    _set_arg('moe_router_topk', force=True)
+    _set_arg('moe_token_dispatcher_type', force=True)
+    _set_arg('moe_router_pre_softmax', force=True)
+    _set_arg('moe_grouped_gemm', force=True)
+    _set_arg('moe_shared_expert_intermediate_size', force=True)
+
+    # Tokenizer args.
+    _set_arg('tokenizer_type', force=True)
+    # Using checkpoint version might not always be safe (e.g., if running on different cluster).
+    if args.use_tokenizer_model_from_checkpoint_args:
+        _set_arg('tokenizer_model', force=True)
+    _set_arg('tiktoken_pattern', force=True)
+    _set_arg('padded_vocab_size')
+
+    # Checkpoint args.
+    _set_arg('ckpt_format')
+
+    # Model parallelism args.
+    if args.use_mp_args_from_checkpoint_args:
+        if checkpoint_version < 3.0:
+            _set_arg('tensor_model_parallel_size', 'model_parallel_size')
+        else:
+            _set_arg('tensor_model_parallel_size', force=True)
+            _set_arg('pipeline_model_parallel_size', force=True)
+            _set_arg('virtual_pipeline_model_parallel_size', force=True)
+            _set_arg('num_layers_per_virtual_pipeline_stage')
+            _set_arg('expert_model_parallel_size', force=True)
+
     return args, checkpoint_args
 
 
@@ -1010,11 +1042,15 @@ def fix_fp8_params_lose_precision_when_loading_dist_ckpt(state_dict):
 
 
 def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
-                    ft_client=None, checkpointing_context=None):
+                    ft_client=None, checkpointing_context=None, skip_load_to_model_and_opt=False):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
         :attr:`state_dict` of the checkpoint match the names of
         parameters and buffers in model.
+    skip_load_to_model_and_opt (bool): whether to call `load_state_dict`
+        for :attr:`model` and :attr:`optimizer`. In case of running FSDP2
+        or other torch features that uses DTensor in state dict, the tensors
+        are already loaded in-place by `_load_base_checkpoint`.
     """
     args = get_args()
     load_dir = getattr(args, load_arg)
@@ -1185,12 +1221,13 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
 
     # Model.
     strict = False if args.retro_add_retriever else strict
-    if len(model) == 1:
-        model[0].load_state_dict(state_dict['model'], strict=strict)
-    else:
-        for i in range(len(model)):
-            mpu.set_virtual_pipeline_model_parallel_rank(i)
-            model[i].load_state_dict(state_dict['model%d' % i], strict=strict)
+    if not skip_load_to_model_and_opt:
+        if len(model) == 1:
+            model[0].load_state_dict(state_dict['model'], strict=strict)
+        else:
+            for i in range(len(model)):
+                mpu.set_virtual_pipeline_model_parallel_rank(i)
+                model[i].load_state_dict(state_dict['model%d' % i], strict=strict)
 
     # Fix up query/key/value matrix ordering if needed.
     checkpoint_version = get_checkpoint_version()
@@ -1201,7 +1238,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     if not release and not args.finetune and not args.no_load_optim:
         try:
             # Load state dict.
-            if optimizer is not None:
+            if not skip_load_to_model_and_opt and optimizer is not None:
                 optimizer.load_state_dict(state_dict['optimizer'])
 
             # Load distributed optimizer's custom parameter state.

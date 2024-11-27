@@ -1,5 +1,4 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from argparse import Namespace
 from typing import List, Tuple
 
 import torch
@@ -7,20 +6,26 @@ import torch
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
+)
 from megatron.core.models.gpt import GPTModel
 
 
+# pylint: disable=line-too-long
 class GPTInferenceWrapper(AbstractModelInferenceWrapper):
-    def __init__(self, model: GPTModel, args: Namespace):
+    """Inference wrapper for GPT model"""
+
+    def __init__(self, model: GPTModel, inference_wrapper_config: InferenceWrapperConfig):
         """Constructor for the model inference wrapper
 
         The wrapper prepares the model for inference, provides the required input data, and runs the forward pass
 
         Args:
             model (GPTModel): The GPT model (MCore or legacy)
-            args (Namespace): The command line arguments that were passed
+            inference_wrapper_config (InferenceWrapperConfig): Has info like hidden size, vocab size etc
         """
-        super().__init__(model, args)
+        super().__init__(model, inference_wrapper_config)
 
     def prep_model_for_inference(self, prompts_tokens: torch.Tensor):
         """A utility function for preparing model for inference

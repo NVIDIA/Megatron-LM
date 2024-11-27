@@ -126,6 +126,7 @@ OPTIONS=" \
     --disable-vision-class-token \
     ${EXTRA_ARGS} \
     --distributed-timeout-minutes 60 \
+    --ckpt-format torch
 "
 
 export NVTE_APPLY_QK_LAYER_SCALING=0

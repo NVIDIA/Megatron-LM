@@ -8,7 +8,7 @@ import torch
 
 try:
     from megatron.core.extensions.transformer_engine import (
-            TEDotProductAttention as DotProductAttention, TENorm as WrappedTorchLayerNorm
+            TEDotProductAttention as DotProductAttention, TENorm as WrappedTorchNorm
     )
 except ImportError:
     import warnings
@@ -17,7 +17,7 @@ except ImportError:
         warnings.warn('Transformer Engine is not installed. Falling back to Megatron Local')
     
     from megatron.core.transformer.dot_product_attention import DotProductAttention
-    from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
 
 from megatron.core.transformer.enums import AttnMaskType
@@ -56,7 +56,7 @@ def get_gpt_layer_modelopt_spec(
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
-            input_layernorm=WrappedTorchLayerNorm,
+            input_layernorm=WrappedTorchNorm,
             self_attention=ModuleSpec(
                 module=SelfAttention,
                 params={"attn_mask_type": AttnMaskType.causal},
@@ -64,12 +64,12 @@ def get_gpt_layer_modelopt_spec(
                     linear_qkv=ColumnParallelLinear,
                     core_attention=DotProductAttention,
                     linear_proj=RowParallelLinear,
-                    q_layernorm=WrappedTorchLayerNorm if qk_layernorm else IdentityOp,
-                    k_layernorm=WrappedTorchLayerNorm if qk_layernorm else IdentityOp,
+                    q_layernorm=WrappedTorchNorm if qk_layernorm else IdentityOp,
+                    k_layernorm=WrappedTorchNorm if qk_layernorm else IdentityOp,
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=WrappedTorchLayerNorm,
+            pre_mlp_layernorm=WrappedTorchNorm,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
             # Map TE-layernorm-fusion keys back

@@ -14,6 +14,7 @@ from torch.utils.checkpoint import detach_variable
 
 from megatron.core.parallel_state import (
     get_expert_model_parallel_rank,
+    get_expert_tensor_parallel_rank,
     get_tensor_model_parallel_rank,
 )
 from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_data
@@ -171,13 +172,16 @@ def model_parallel_device_manual_seed(seed):
     initialized. Also, no set_manual_seed should be called
     after this function. Basically, this is replacement for that
     function.
-    Two set of RNG states are tracked:
+    Three set of RNG states are tracked:
     default state: This is for data parallelism and is the same among a set of model parallel GPUs
     but different across different model parallel groups. This is used for example for dropout
     in the non-tensor-model-parallel regions.
     tensor-model-parallel state: This state is different among a set of model parallel GPUs,
     but the same across data parallel groups. This is used for example for dropout
     in model parallel regions.
+    expert-parallel-seed: This state is only used for the expert layer of MoE models.
+    It is different among expert-tensor and expert-model parallel GPUs, and the same
+    across expert-data parallel groups.
     """
     # 2718 is just for fun and any POSITIVE value will work.
     offset = seed + 2718
@@ -195,7 +199,7 @@ def model_parallel_device_manual_seed(seed):
     _DEVICE_RNG_STATE_TRACKER.add(_MODEL_PARALLEL_RNG_TRACKER_NAME, tensor_model_parallel_seed)
 
     expert_parallel_seed = (
-        seed + 1024 + 100 * get_expert_model_parallel_rank() + get_tensor_model_parallel_rank()
+        seed + 1024 + 100 * get_expert_model_parallel_rank() + get_expert_tensor_parallel_rank()
     )
     _DEVICE_RNG_STATE_TRACKER.add(_EXPERT_PARALLEL_RNG_TRACKER_NAME, expert_parallel_seed)
 

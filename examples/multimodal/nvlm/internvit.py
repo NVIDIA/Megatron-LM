@@ -11,9 +11,12 @@ Additionally, InternViT introduces some unique features like Layer Scaling.
 Those code changes are gathered here.
 """
 from functools import partial
+from typing import Dict, Optional
 
 import torch
 
+from megatron.core.device_utils import get_xla_model
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
     TEDotProductAttention,
@@ -21,6 +24,7 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
+    get_tensor_model_parallel_groups,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -29,12 +33,15 @@ from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubm
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
 
-class InternViTRMSNorm(torch.nn.Module):
+xm = get_xla_model()
+
+class InternViTRMSNorm(MegatronModule):
 
     def __init__(
         self,
@@ -54,7 +61,7 @@ class InternViTRMSNorm(torch.nn.Module):
               this marks the weights as needing to be allreduced.
             compute_var (bool): Indicator to compute statistic manually.
         """
-        super().__init__()
+        super().__init__(config=config)
         self.config = config
         self.eps = eps
         self.weight = torch.nn.Parameter(torch.ones(hidden_size))
@@ -104,14 +111,32 @@ class InternViTRMSNorm(torch.nn.Module):
         else:
             var = input_.sum(-1, keepdim=True) * 0.0  # Zero-out the dummy heads.
 
-        tensor_list = [torch.empty_like(var) for _ in range(world_size)]
-        tensor_list[rank] = var
-        torch.distributed.all_gather(tensor_list, var, group=get_tensor_model_parallel_group())
-
-        output = torch.cat(tensor_list, dim=last_dim).contiguous()
+        if xm:
+            output = xm.all_gather(var, groups=get_tensor_model_parallel_groups())
+        else:
+            tensor_list = [torch.empty_like(var) for _ in range(world_size)]
+            tensor_list[rank] = var
+            torch.distributed.all_gather(tensor_list, var, group=get_tensor_model_parallel_group())
+            output = torch.cat(tensor_list, dim=last_dim).contiguous()
 
         return output.sum(-1, keepdim=True)
 
+    def sharded_state_dict(
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[Dict] = None
+        ) -> ShardedStateDict:
+            """Get sharded state dict.
+
+            Args:
+                prefix (str): Module name prefix.
+                sharded_offsets (tuple): Offsets of local shard within global tensor.
+                metadata (Optional[Dict]): Shard metadata.
+
+            Returns:
+                A <ShardedStateDict> ?
+            """
+            metadata = metadata or {}
+            metadata['non_homogeneous_layers'] = True
+            return super().sharded_state_dict(prefix, sharded_offsets, metadata)
 
 def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
     # Dense MLP w/ or w/o TE modules.

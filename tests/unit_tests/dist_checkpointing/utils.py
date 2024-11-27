@@ -121,6 +121,7 @@ def init_basic_mock_args(args, tp, pp, bf16=True):
     args.encoder_tensor_model_parallel_size = 0
     args.encoder_pipeline_model_parallel_size = 0
     args.enable_ft_package = False
+    args.use_torch_fsdp2 = False
     return args
 
 

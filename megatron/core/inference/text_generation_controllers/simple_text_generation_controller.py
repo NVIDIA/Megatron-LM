@@ -308,7 +308,7 @@ class SimpleTextGenerationController:
                     context_length = context_end_position - context_start_position
                     logits = broadcast_from_last_pipeline_stage(
                         [batch_size, context_length, self.tokenizer.vocab_size],
-                        dtype=torch.float32,
+                        dtype=self.inference_wrapped_model.inference_wrapper_config.params_dtype,
                         tensor=logits,
                     )
 

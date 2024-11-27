@@ -23,7 +23,8 @@ from megatron.core import parallel_state
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.inference.text_generation.api import generate_and_post_process
 from megatron.inference.text_generation.forward_step import ForwardStep
-from megatron.training import get_args, get_model
+from megatron.inference.text_generation.communication import broadcast_int_list
+from megatron.training import get_args, get_model, get_tokenizer, print_rank_0
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
 
@@ -148,6 +149,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         args.disable_vision_class_token,
         1,
         args.pixel_shuffle,
+        args.use_tile_tags,
     )
 
     for idx, (imgs, num_tiles, sample_id, question, answers, metadata) in enumerate(dataloader):
@@ -156,7 +158,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
 
         conv = get_conversation(config.task, question)
 
-        forward_step = partial(VLMForwardStep, num_img_embeddings_per_tile, imgs, num_tiles)
+        forward_step = partial(VLMForwardStep, num_img_embeddings_per_tile, imgs, num_tiles, args.decoder_seq_length)
 
         if is_first_rank():
             resp_sentences, _, _, _ = generate_and_post_process(
@@ -316,6 +318,7 @@ class VLMForwardStep(ForwardStep):
         num_img_embeddings_per_tile,
         images,
         num_tiles,
+        decoder_seq_length,
         model,
         max_batch_size,
         max_sequence_length,
@@ -327,6 +330,18 @@ class VLMForwardStep(ForwardStep):
         super().__init__(model, max_batch_size, max_sequence_length + num_img_embeddings)
         self._images = images
         self._num_tiles = num_tiles
+        self._num_img_embeddings = num_img_embeddings
+        self.decoder_seq_length = decoder_seq_length
+
+        self._recv_only_vision_embeds = False
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        # Checks if the previous stage only has a vision encoder, and that the current stage has part of the LM decoder.
+        # In this case, the current stage should only receive vision embeddings.
+        if pp_rank > 0:
+            self._recv_only_vision_embeds = parallel_state.is_inside_encoder(pp_rank - 1) and (not parallel_state.is_inside_decoder(pp_rank - 1)) and parallel_state.is_inside_decoder()
+
+        # Checks if the current stage only has a vision encoder
+        self._encoder_only = parallel_state.is_inside_encoder() and not parallel_state.is_inside_decoder()
 
     def _forward(self, tokens, position_ids, attention_mask):
         return self.model(
@@ -340,16 +355,44 @@ class VLMForwardStep(ForwardStep):
         )
 
     def __call__(self, tokens, position_ids, attention_mask):
-        logits = super().__call__(tokens, position_ids, attention_mask)
+        num_image_tokens = (tokens == self.model.image_token_index).sum().item()
+        num_tokens = tokens.size(1)
+        recv_buffer_seq_length = None
+        if num_image_tokens > 0:
+            # When there are image tokens and this stage only receives vision embeddings, adjust the recv buffer seq length to match the image embeddings sequence length.
+            # If there are image tokens and this stage receives full embeddings, make sure we compensate for expansion of image tokens.
+            # Note that this will set a recv_buffer_seq_length for the encoder stage, this length is irrelevant since that recv buffer is never allocated.
+            if self._recv_only_vision_embeds:
+                recv_buffer_seq_length = self._num_img_embeddings
+            else:
+                recv_buffer_seq_length = min(self._num_img_embeddings + num_tokens - num_image_tokens, self.decoder_seq_length)
+        elif self._recv_only_vision_embeds:
+            # If this stage only receives vision embeddings and there are no image tokens we won't run the encoder and therefore shouldn't try to recv.
+            recv_buffer_seq_length = 0
+
+        # If the pipeline stage only has a vision encoder, then it only needs to run when there are image tokens
+        if not (self._encoder_only and num_image_tokens == 0):
+            output = super().__call__(tokens, position_ids, attention_mask, recv_buffer_seq_length=recv_buffer_seq_length)
+        else:
+            output = None
+        if isinstance(output, tuple):
+            logits, _ = output
+        else:
+            logits = output
 
         # On the first inference iteration, we compute image tokens.
-        # Update the sequence length offset by the number of image tokens.
-        num_image_tokens = (tokens == self.model.module.image_token_index).sum().item()
-        num_tokens = tokens.size(1)
+        # On every PP stage(although inference params should only matter for decoder),
+        # update the sequence length offset by the number of image tokens.
         if num_tokens > 1 and num_image_tokens > 0:
-            self.inference_params.sequence_len_offset += (
-                self.inference_params.key_value_memory_dict["image_tokens_count"] - num_image_tokens
-            )
+            if "image_tokens_count" not in self.inference_params.key_value_memory_dict:
+                self.inference_params.key_value_memory_dict["image_tokens_count"] = self._num_img_embeddings
+
+            if self._num_img_embeddings + num_tokens - num_image_tokens > self.decoder_seq_length:
+                self.inference_params.sequence_len_offset += self.decoder_seq_length - num_tokens
+            else:
+                self.inference_params.sequence_len_offset += (
+                    self.inference_params.key_value_memory_dict["image_tokens_count"] - num_image_tokens
+                )
 
         return logits
 
@@ -364,7 +407,7 @@ def get_conversation(task, question):
             {"role": "system", "content": "Answer the questions."},
             {
                 "role": "user",
-                "content": "<image>Provide a one-sentence caption for provided image.",
+                "content": "<image>\nProvide a one-sentence caption for provided image.",
             },
         ]
     elif task in ("TextVQA", "VQAv2", "ChartQA"):
@@ -419,6 +462,11 @@ def get_prompt_and_generated(prompt_and_generation, prompt_format):
         generated = generated.split("</s>")[0]
     elif prompt_format == "chatml":
         splitted = prompt_and_generation.split("<|im_start|> assistant\n")
+        prompt = splitted[0]
+        generated = splitted[1]
+        generated = generated.split("<|im_end|>")[0]
+    elif prompt_format in ("nvlm-yi-34b", "qwen2p0"):
+        splitted = prompt_and_generation.split("<|im_start|>assistant\n")
         prompt = splitted[0]
         generated = splitted[1]
         generated = generated.split("<|im_end|>")[0]

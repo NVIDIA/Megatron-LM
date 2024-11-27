@@ -15,6 +15,7 @@ from megatron.core.parallel_state import get_tensor_model_parallel_world_size
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import log_single_rank
 
 try:
     import transformer_engine  # pylint: disable=unused-import
@@ -66,6 +67,8 @@ class LLaVAModel(MegatronModule):
         language_rotary_base (int): RoPE base.
         language_rope_scaling (bool): Toggle RoPE scaling.
         image_token_index (int): Token ID for image token such as <image>.
+        pixel_shuffle (bool): Enable pixel shuffle.
+        tile_tags (list): Optional tile tags.
     """
 
     def __init__(
@@ -95,15 +98,17 @@ class LLaVAModel(MegatronModule):
         language_rope_scaling: bool = False,
         image_token_index: int = DEFAULT_IMAGE_TOKEN_INDEX,
         pixel_shuffle: bool = False,
+        tile_tags: Optional[list] = None,
     ) -> None:
         super().__init__(config=language_transformer_config)
 
         if has_config_logger_enabled(language_transformer_config):
             log_config_to_disk(language_transformer_config, locals(), prefix=type(self).__name__)
 
-        logging.getLogger(__name__).warning(
-            "LLaVA model is under active development. "
-            "It may be missing features and its methods may change."
+        log_single_rank(
+            logging.getLogger(__name__),
+            logging.WARNING,
+            "LLaVA is work in progress. Features are missing and methods can change.",
         )
 
         self.pre_process = pre_process
@@ -172,12 +177,16 @@ class LLaVAModel(MegatronModule):
                 model_subtype=vision_transformer_config.vision_model_type,
                 add_class_token=add_class_token,
             )
+
+            vision_projection_input_size = vision_transformer_config.hidden_size
+            vision_projection_input_size *= 4 if pixel_shuffle else 1
+
             # Map (intermediate) vision model outputs to the language model input dimension.
             self.vision_projection = MultimodalProjector(
                 vision_projection_config,
                 vision_projection_layer_spec,
                 vision_projection_type,
-                vision_transformer_config.hidden_size,  # input size to the projection.
+                vision_projection_input_size,
             )
             # Ignore missing weights for the vision projection during checkpoint loading.
             # This should be disabled by default but can be enabled if your checkpoint contains
@@ -200,10 +209,12 @@ class LLaVAModel(MegatronModule):
             drop_vision_class_token,
             class_token_len,
             pixel_shuffle,
+            tile_tags is not None,  # Tile tags enabled/disabled.
         )
 
         self.image_token_index = image_token_index
         self._pixel_shuffle = pixel_shuffle
+        self._tile_tags = tile_tags
 
     def shared_embedding_or_output_weight(self):
         """This is a convenience method to surface the language model's word embeddings, which is
@@ -261,6 +272,7 @@ class LLaVAModel(MegatronModule):
         loss_mask,
         labels,
         use_inference_kv_cache,
+        inference_params,
         image_token_index,
         num_image_tiles,
         attention_mask,
@@ -305,7 +317,7 @@ class LLaVAModel(MegatronModule):
         # No pre- or postprocessing needed.
         # With pipeline parallel > 2, this means a chunk in the middle of the model.
         if not self.pre_process and not self.post_process:
-            return language_embeddings, loss_mask, labels, attention_mask
+            return None, None, None, attention_mask
 
         # If using the inference KV cache, the image tokens are already computed.
         if use_inference_kv_cache:
@@ -340,6 +352,7 @@ class LLaVAModel(MegatronModule):
             if (
                 self._language_is_pipeline_parallel
                 and max_seq_len < self._language_max_sequence_length
+                and inference_params is None
             ):
                 max_seq_len = self._language_max_sequence_length
 
@@ -423,7 +436,7 @@ class LLaVAModel(MegatronModule):
 
         # Create the final labels and loss mask (if this is the last language model stage).
         final_labels, final_loss_mask = None, None
-        if has_labels:
+        if self.post_process and has_labels:
             final_labels = torch.full(
                 (batch_size, max_seq_len), IGNORE_INDEX, dtype=labels.dtype, device=labels.device
             )
@@ -465,12 +478,14 @@ class LLaVAModel(MegatronModule):
 
             final_loss_mask[valid_batch_image_indices, valid_before_image_indices] = 0
 
-        if final_embedding is not None and has_labels:
+        if final_embedding is not None and final_labels is not None:
             assert (
                 final_embedding.shape[:2] == final_labels.shape == final_loss_mask.shape
             ), "unexpected shapes after data preprocessing"
 
-        truncate_labels = has_labels and final_labels.shape[1] > self._language_max_sequence_length
+        truncate_labels = (
+            final_labels is not None and final_labels.shape[1] > self._language_max_sequence_length
+        )
         if truncate_labels:
             final_labels = final_labels[:, : self._language_max_sequence_length]
             final_loss_mask = final_loss_mask[:, : self._language_max_sequence_length]
@@ -509,6 +524,42 @@ class LLaVAModel(MegatronModule):
 
         return final_embedding, final_labels, final_loss_mask, attention_mask
 
+    def _apply_tile_tagging(self, image_embeddings, num_image_tiles):
+        """Apply tile tagging.
+
+        The image embeddings of multiple tiles are prepended with tile tags such as <tile_1>.
+        This implements the method used in NVLM https://arxiv.org/pdf/2409.11402.
+
+        Args:
+            image_embeddings (torch.Tensor): [img_seq_len, num_tiles, h_language].
+            num_image_tiles (torch.Tensor): Number of tiles for each input image [num_images].
+
+        Returns:
+            torch.Tensor: Tile tags prepended to image embeddings.
+                [tile_seq_len (=5) + img_seq_len, num_tiles, h_language]
+        """
+        assert (
+            num_image_tiles.shape[0] == 1 and len(num_image_tiles) == 1
+        ), "multiple input images are not supported yet."
+
+        num_tiles = num_image_tiles[0].item()
+        tile_tags = self._tile_tags[: num_tiles - 1] + [self._tile_tags[-1]]
+
+        # [num_tiles, tile_seq_len (=5)]
+        tile_tag_input_ids = torch.tensor(
+            tile_tags, dtype=torch.int64, device=num_image_tiles.device
+        )
+
+        # [tile_seq_len, num_tiles, h_language]
+        tile_tag_embeds = self.language_model.embedding(tile_tag_input_ids, position_ids=None)
+
+        # [num_tiles, dim] should be the same same
+        assert tile_tag_embeds.shape[1:] == image_embeddings.shape[1:]
+
+        image_embeddings = torch.cat([tile_tag_embeds, image_embeddings])
+
+        return image_embeddings  # [tile_seq_len + img_seq_len, num_tiles, h_language]
+
     def forward(
         self,
         images: torch.Tensor,
@@ -531,7 +582,8 @@ class LLaVAModel(MegatronModule):
             input_ids (torch.Tensor): input text ids [batch, text_seq_len].
             position_ids (torch.Tensor): input text position ids [batch, text_seq_len].
             attention_mask (torch.Tensor): Language model attention mask
-                [batch, 1, 1, combined_seq_len].
+                [batch, 1, 1, combined_seq_len]. NOTE: attention_mask is typically None and
+                attn_mask_type in layer specs determines the attention mask used.
             labels (torch.Tensor): Optional target text labels [batch, combined_seq_len].
             loss_mask (torch.Tensor): Text loss mask [batch, text_seq_len].
             inference_params (InferenceParams): Inference-time parameters including KV cache.
@@ -550,7 +602,7 @@ class LLaVAModel(MegatronModule):
             inference_params is not None
             and "image_tokens_count" in inference_params.key_value_memory_dict
         )
-        has_images = images.shape[0] > 0
+        has_images = images is not None and images.shape[0] > 0
 
         # If running inference, we can skip image token computation
         # if they were computed already earlier for this sample.
@@ -580,6 +632,10 @@ class LLaVAModel(MegatronModule):
             image_embeddings = self.vision_projection(
                 image_embeddings
             )  # [img_seq_len, num_tiles, h_language]
+
+            # Apply tile tagging if enabled and an image token is present.
+            if self._tile_tags is not None and torch.any(input_ids == self.image_token_index):
+                image_embeddings = self._apply_tile_tagging(image_embeddings, num_image_tiles)
 
             # TODO: Support batched inference.
             # In inference, the language model KV cache will be updated for image token positions.
@@ -646,6 +702,7 @@ class LLaVAModel(MegatronModule):
             loss_mask,
             labels,
             use_inference_kv_cache,
+            inference_params,
             image_token_index if image_token_index is not None else self.image_token_index,
             num_image_tiles,
             attention_mask,
@@ -660,9 +717,6 @@ class LLaVAModel(MegatronModule):
             inference_params=inference_params,
             runtime_gather_output=runtime_gather_output,
         )
-
-        if labels is None or loss_mask is None:
-            return output
 
         return output, new_loss_mask
 

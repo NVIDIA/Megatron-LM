@@ -2,24 +2,18 @@
 import torch
 from torch import Tensor
 
+from megatron.core.fusions.fused_layer_norm import HAVE_FUSED_LAYER_NORM, FusedLayerNorm
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import get_linear_layer
 
-try:
-    import apex  # pylint: disable=unused-import
-
-    from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
-
-    HAVE_APEX = True
+if HAVE_FUSED_LAYER_NORM:
     LNImpl = FusedLayerNorm
-except ImportError:
+else:
     import warnings
 
-    from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
-
-    warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
-    LNImpl = WrappedTorchLayerNorm
+    warnings.warn(f'Apex is not installed. Falling back to Torch Norm')
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm as LNImpl
 
 class BertLMHead(MegatronModule):
     """Masked LM head for Bert.
@@ -47,6 +41,8 @@ class BertLMHead(MegatronModule):
         self.gelu = torch.nn.functional.gelu
 
     def forward(self, hidden_states: Tensor) -> Tensor:
+        """forward pass"""
+
         hidden_states = self.dense(hidden_states)
         hidden_states = self.gelu(hidden_states)
         hidden_states = self.layer_norm(hidden_states)

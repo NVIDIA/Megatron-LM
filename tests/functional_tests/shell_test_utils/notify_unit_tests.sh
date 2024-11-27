@@ -11,7 +11,7 @@ collect_jobs () {
                   -s \
                   --globoff \
                   --header "PRIVATE-TOKEN: $RO_API_TOKEN" \
-                  "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/pipelines/${DOWNSTREAM_PIPELINE_ID}/jobs?page=$PAGE&per_page=$PER_PAGE"
+                  "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/pipelines/${CI_PIPELINE_ID}/jobs?page=$PAGE&per_page=$PER_PAGE"
               )
     # Combine the results
     RESULTS=$(jq -s '.[0] + .[1]' <<< "$RESULTS $RESPONSE")
@@ -36,19 +36,12 @@ CONTEXT="unit-tests-extended"
 
 # Fetch Elastic logs
 set +x
-PIPELINE_JSON=$(curl \
-                  --fail \
-                  --silent \
-                  --header "PRIVATE-TOKEN: ${RO_API_TOKEN}" \
-                  "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/pipelines/${CI_PIPELINE_ID}/jobs"
-                ) || ret_code=$?
+UNIT_TESTS_JOBS=$(collect_jobs | jq '[.[] | select(.name | startswith("test:pyt"))]')
 set -x
 if [[ ${ret_code:-0} -ne 0 ]]; then
     echo CI_PIPELINE_ID=$CI_PIPELINE_ID does not exist
     exit 1
 fi
-
-UNIT_TESTS_JOBS=$(echo -E $PIPELINE_JSON | jq '[.[] | select(.name | startswith("test:pyt"))]')
 
 if [[ $UNIT_TESTS_JOBS == null ]]; then
     FAILED_JOBS=$(curl \

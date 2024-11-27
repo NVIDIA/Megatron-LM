@@ -20,7 +20,7 @@ try :
     HAVE_TE=True
 except ImportError:
     from megatron.core.transformer.dot_product_attention import DotProductAttention
-    from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
     from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
     import warnings
 
@@ -45,10 +45,10 @@ try:
 except ImportError:
     import warnings
 
-    from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-    warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
-    LNImpl = WrappedTorchLayerNorm
+    warnings.warn(f'Apex is not installed. Falling back to Torch Norm')
+    LNImpl = WrappedTorchNorm
 
 def decoder_model_with_transformer_engine_default_spec(
     num_experts: int = None, moe_grouped_gemm: bool = False, qk_layernorm: bool = False

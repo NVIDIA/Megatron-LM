@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import math
-from typing import List, Union
+from typing import List, Optional, Union
 
 from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
@@ -232,7 +232,7 @@ def sort_chunks_by_idxs(input: torch.Tensor, split_sizes: torch.Tensor, sorted_i
 def topk_softmax_with_capacity(
     logits: torch.Tensor,
     topk: int,
-    capacity_factor: float = None,
+    capacity_factor: Optional[float] = None,
     pad_to_capacity: bool = False,
     drop_policy: str = "probs",
     use_pre_softmax: bool = False,
@@ -372,8 +372,9 @@ def reduce_aux_losses_tracker_across_ranks():
                 torch.distributed.all_reduce(values, group=tracker[name].get('reduce_group'))
         if tracker[name].get('avg_group') is not None:
             if xm:
-                xm.all_reduce(xm.REDUCE_AVG, [values], 
+                xm.all_reduce(xm.REDUCE_SUM, [values], 
                                         groups=tracker[name].get('avg_group'))
+                values = values / parallel_state.get_pipeline_model_parallel_world_size()
             else:
                 torch.distributed.all_reduce(
                     values, group=tracker[name]['avg_group'], op=torch.distributed.ReduceOp.AVG

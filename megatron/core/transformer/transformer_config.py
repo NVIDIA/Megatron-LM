@@ -312,13 +312,16 @@ class TransformerConfig(ModelParallelConfig):
     """Inter-gpu communication type for context parallelism.
     str: all layers share same communication type.
     List[str]: each layer has its separate communication type.
-    cp_comm_type of each layer can be "p2p" or "all_gather" or "a2a".
+    cp_comm_type of each layer can be "p2p" or "all_gather" or "a2a" or "a2a+p2p".
     "p2p": Exchange KV chunks with P2P communications in ring topology. P2P is async and can be
     overlapped with attention compute.
     "all_gather": All-gather to get full sequence of KV before attention. The all-gather is not
     async, and cannot be overlapped.
     "a2a": Like DeepSpeed Ulysses, scatter attention heads across the CP group, and gather to get
     full sequence of QKV.
+    "a2a+p2p": A hierarchical implementation of context parallelism to attention. 
+    It uses A2A communications in low-level CP groups (e.g., via NVLink),
+    and P2P communications in high-level CP groups (e.g., via IBLink).
     """
 
     ####################
@@ -544,17 +547,13 @@ class TransformerConfig(ModelParallelConfig):
                 self.init_method_std, self.num_layers
             )
 
-        if self.moe_extended_tp:
-            if self.moe_token_dispatcher_type != 'allgather':
-                raise ValueError(
-                    "Moe extended TP parallelism only applies to allgather based token dispatcher."
-                )
-            extended_tp_size = self.tensor_model_parallel_size * self.expert_model_parallel_size
-            if self.ffn_hidden_size % extended_tp_size != 0:
-                raise ValueError(
-                    f'ffn_hidden_size: {self.ffn_hidden_size} must be divisible by '
-                    f'extended_tp_size {extended_tp_size}'
-                )
+        if (
+            self.moe_token_dispatcher_type == "alltoall_seq"
+            and self.tensor_model_parallel_size != self.expert_tensor_parallel_size
+        ):
+            raise ValueError(
+                "alltoall_seq dispatcher not support different TP size for MoE and Dense layer."
+            )
 
         if self.num_moe_experts and self.fp8:
             # TE version below 1.7.0 will raise Error when handle zeros tokens for expert

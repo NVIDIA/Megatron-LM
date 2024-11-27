@@ -76,7 +76,7 @@ class DistributedTRTLLMModelWeightsConverter:
             self.trtllm_model_weights[layer_name] = torch.empty(
                 val.size(), dtype=val.dtype, layout=val.layout, device="cpu", pin_memory=True
             )
-        self.trtllm_model_weights[layer_name] = val
+        self.trtllm_model_weights[layer_name].copy_(val, non_blocking=True)
 
     def _convert_transformer_layer(self, layer_name: str, val: torch.Tensor):
         """Convert Transformer layers to TRTLLM weights
@@ -233,6 +233,8 @@ class DistributedTRTLLMModelWeightsConverter:
 
         # Convert the non transformer layers
         for layer_name in NON_TRANSFORMER_LAYERS_NAMES:
+            if layer_name not in model_state_dict:
+                continue
             if (
                 layer_name in TRTLLMLayers.vocab_embedding.value
                 or layer_name in TRTLLMLayers.lm_head.value
@@ -249,6 +251,13 @@ class DistributedTRTLLMModelWeightsConverter:
                     self.tp_rank
                 ]
                 model_state_dict[layer_name] = req_position_embedding.T
+            if layer_name == TRTLLMLayers.final_layernorm_weight.value:
+                # Same as layernorm1p in NeMo
+                if (
+                    self.transformer_config.layernorm_zero_centered_gamma
+                    and self.transformer_config.normalization == "LayerNorm"
+                ):
+                    model_state_dict[layer_name] = model_state_dict[layer_name] + 1.0
             self._convert_non_transformer_layer(
                 model_state_dict=model_state_dict, layer_name=layer_name
             )

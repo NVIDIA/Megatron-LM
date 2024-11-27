@@ -27,7 +27,7 @@ pre:mirror_to_github:
   stage: .pre
   image: python:3.10
   variables:
-    GIT_STRATEGY: "clone"
+    GIT_STRATEGY: 'clone'
   script:
     - git checkout $CI_COMMIT_BRANCH
     - git remote add github https://ko3n1g:$GH_TOKEN@github.com/NVIDIA/Megatron-LM.git || true
@@ -49,7 +49,7 @@ pre:create_ci_branches:
   stage: .pre
   image: python:3.10
   variables:
-    GIT_STRATEGY: "clone"
+    GIT_STRATEGY: 'clone'
   script:
     - git remote set-url origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/adlr/megatron-lm.git"
     - git switch --force-create $branch
@@ -81,17 +81,15 @@ pre:maybe_cherry_pick_commit:
     - when: never
   tags: [mcore-docker-node-small]
   stage: .pre
-  image:
-    name: registry.gitlab.com/gitlab-ci-utils/curl-jq
-    entrypoint: [""]
+  image: badouralix/curl-jq
   variables:
-    GIT_STRATEGY: "clone"
-  script: 
+    GIT_STRATEGY: 'clone'
+  script:
     - set -x
     - set +e
     - SHA=$(git rev-list --no-merges -n 1 HEAD)
     - MESSAGE=$(git log -n 1 --pretty=format:%s $SHA)
-    - MR_ID=$(echo $MESSAGE | awk -F'!' '{print $2}' | awk '{print $1}' )  
+    - MR_ID=$(echo $MESSAGE | awk -F'!' '{print $2}' | awk '{print $1}' )
     - git remote set-url origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
     - git config --global user.email "mcore-bot@nvidia.com"
     - git config --global user.name "Mcore Bot"
@@ -109,10 +107,10 @@ pre:maybe_cherry_pick_commit:
         echo Nothing to cherry pick
         exit 0
       fi
-      
+
       echo $TARGET_BRANCHES | while read -r RELEASE_BRANCH ; do
         TARGET_BRANCH_EXISTS_OK=$([[ "$(git ls-remote --heads origin refs/heads/$RELEASE_BRANCH)" != "" ]] && echo true || echo false)
-      
+
         if [[ "$TARGET_BRANCH_EXISTS_OK" == "false" ]]; then
           echo Release branch does not yet exist, will not  cherry-pick
           continue
@@ -164,7 +162,7 @@ pre:maybe_cherry_pick_commit:
 
 pre:check_milestone:
   extends: [.pre_rules]
-  image: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_ci:buildcache
+  image: badouralix/curl-jq
   tags: [mcore-docker-node-small]
   script:
     - env
@@ -175,4 +173,3 @@ pre:check_milestone:
         echo Please assign a Milestone to this MR!
         exit 1
       fi
-  

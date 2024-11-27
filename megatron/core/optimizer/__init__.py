@@ -330,11 +330,11 @@ def _get_megatron_optimizer_based_on_param_groups(
             )
         else:
             optimizer = Float16OptimizerWithFloat16Params(*optimizer_args)
-            setattr(optimizer, 'model_parallel_group', model_parallel_group)
+            setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
     else:
         # FP32 optimizer.
         optimizer = FP32Optimizer(optimizer, config, init_state_fn)
-        setattr(optimizer, 'model_parallel_group', model_parallel_group)
+        setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
     return optimizer
 
@@ -421,23 +421,19 @@ def get_megatron_optimizer(
         buffer_name='expert_parallel_buffers',
     )
     if len(moe_param_groups) > 0:
-        model_parallel_world_size = torch.distributed.get_world_size(mpu.get_model_parallel_group())
-        expert_parallel_rank = mpu.get_expert_model_parallel_rank()
+        model_parallel_rank = torch.distributed.get_rank(
+            mpu.get_expert_tensor_model_pipeline_parallel_group()
+        )
         optimizers.append(
             _get_megatron_optimizer_based_on_param_groups(
                 config,
                 model_chunks=model_chunks,
                 param_groups=moe_param_groups,
                 per_model_buffers=moe_buffers,
-                model_parallel_group=mpu.get_model_parallel_group(with_expert_parallel=True),
-                data_parallel_group=mpu.get_data_modulo_expert_parallel_group(
-                    with_context_parallel=True
-                ),
-                data_parallel_group_gloo=mpu.get_data_modulo_expert_parallel_group_gloo(
-                    with_context_parallel=True
-                ),
-                data_parallel_group_idx=expert_parallel_rank * model_parallel_world_size
-                + model_parallel_rank,
+                model_parallel_group=mpu.get_expert_tensor_model_pipeline_parallel_group(),
+                data_parallel_group=mpu.get_expert_data_parallel_group(),
+                data_parallel_group_gloo=mpu.get_expert_data_parallel_group_gloo(),
+                data_parallel_group_idx=model_parallel_rank,
             )
         )
 

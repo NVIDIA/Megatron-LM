@@ -45,7 +45,7 @@ RUN pip3 uninstall -y nvidia-modelopt[torch] && \
     mamba_ssm-*.whl \
     grouped_gemm-*.whl \
     tensorstore==0.1.45 \
-    nvidia-modelopt[torch]>=0.19.0 && \
+    "nvidia-modelopt[torch]>=0.19.0" && \
     rm *.whl
 
 # Since megatron does not have any dependencies (and isn't a dependency to any other package), we can install it separately to make everything a bit quicker
@@ -82,7 +82,6 @@ FROM main as jet
 ARG CACHEBUST=0
 RUN --mount=type=secret,id=JET_INDEX_URLS \
     JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS) && \
-    pip install jet-client --upgrade $JET_INDEX_URLS && \
-    /opt/jet/bin/pip install jet-api --upgrade $JET_INDEX_URLS 
+    pip install jet-client jet-api --upgrade $JET_INDEX_URLS
 ENV PATH="$PATH:/opt/jet/bin"
 ###

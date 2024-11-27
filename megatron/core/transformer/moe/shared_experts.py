@@ -7,6 +7,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from megatron.core.device_utils import get_current_device
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
@@ -120,19 +121,32 @@ class SharedExpertMLP(MLP):
         """
         assert self.config.moe_shared_expert_overlap
         assert self.cached_output is None
-        self.stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self.stream):
+        if torch.cuda.is_available():
+            self.stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.stream):
+                if self.use_shared_expert_gate:
+                    logits = torch.nn.functional.linear(input, self.gate_weight)
+                    self.gate_score = torch.nn.functional.sigmoid(logits)
+                if self.config.sequence_parallel:
+                    self.cached_fc1_input = gather_from_sequence_parallel_region(
+                        input, tensor_parallel_output_grad=True
+                    )
+                else:
+                    self.cached_fc1_input = copy_to_tensor_model_parallel_region(input)
+                set_tensor_grad_fn_sequence_sr(self.cached_fc1_input, 
+                                               torch.iinfo(torch.int, device=get_current_device()).max)
+        else:
             if self.use_shared_expert_gate:
-                logits = torch.nn.functional.linear(input, self.gate_weight)
-                self.gate_score = torch.nn.functional.sigmoid(logits)
+                    logits = torch.nn.functional.linear(input, self.gate_weight)
+                    self.gate_score = torch.nn.functional.sigmoid(logits)
             if self.config.sequence_parallel:
                 self.cached_fc1_input = gather_from_sequence_parallel_region(
                     input, tensor_parallel_output_grad=True
                 )
             else:
                 self.cached_fc1_input = copy_to_tensor_model_parallel_region(input)
-            set_tensor_grad_fn_sequence_sr(self.cached_fc1_input, torch.iinfo(torch.int).max)
-
+            set_tensor_grad_fn_sequence_sr(self.cached_fc1_input, 
+                                            torch.iinfo(torch.int, device=get_current_device()).max)
     def linear_fc1_forward_and_act(self, overlapped_comm_output=None):
         """
         Do Linear FC1 and activation function forward.
@@ -231,7 +245,8 @@ class SharedExpertMLP(MLP):
             else:
                 output = self.cached_output
             self.cached_output = None
-        torch.cuda.current_stream().wait_stream(self.stream)
+        if torch.cuda.is_available():
+            torch.cuda.current_stream().wait_stream(self.stream)
         return output
 
 

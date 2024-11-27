@@ -66,10 +66,12 @@ products:
     - gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_untied_dgx_a100_1N8G
+    # - gpt3_mr_mcore_te_tp2_pp1_fsdp2_resume_torch_dist_dgx_a100_1N8G # torch >= 2.4.0
     - gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_tunable_overlap_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_groupedGEMM_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_top2router_dgx_a100_1N8G
+    - gpt3_mr_mcore_te_tp2_pp1_te_8experts_etp1_ep4_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM_dgx_a100_1N8G
     - gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_top2router_dgx_a100_1N8G
@@ -106,6 +108,8 @@ products:
     - gpt3_mr_mcore_te_tp2_pp2_cp2_nondeterministic_dgx_a100_1N8G  # cp and attention
     - gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G  # cp and attention
     - gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G  # cp and attention    
+    - gpt3_mr_mcore_te_tp1_pp2_cp4_a2a_p2p_nondeterministic_dgx_a100_1N8G  # cp and attention with a2a+p2p comm type
+    - gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_cp4_a2a_p2p_nondeterministic_dgx_a100_1N8G  # cp and attention with a2a+p2p comm type 
   - environment: [lts, dev]
     scope: [nightly]
     platforms: [dgx_a100]
@@ -113,6 +117,7 @@ products:
     n_repeat: [5]
     test_case:
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_dist_optimizer_overlap_grad_reduce_param_gather
+    # - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_fsdp2_resume_torch_dist_te # torch >= 2.4.0
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp2
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp2_resume_torch_dist
@@ -144,7 +149,7 @@ products:
     n_repeat: [5]
     test_case:
     - gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_resume_torch_dist_te_4experts2parallel  # non-determinism in dev
-  - environment: [lts]
+  - environment: [lts, dev]
     scope: [weekly]
     platforms: [dgx_h100]
     time_limit: [9000]
@@ -152,8 +157,8 @@ products:
     - gpt3_345m_weekly_dgx_h100_1N8G_mcore_nondet_tp1_pp1_fp8_no_model_parallel
     - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp1_pp1_bf16_baseline
     - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp1_pp1_fp8_no_model_parallel
-    - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp1_pp2_fp8_pp
+    # - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp1_pp2_fp8_pp
     - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp2_pp2_fp8_tp_pp
-    - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp2_pp2_fp8_tp_pp_sp
-    - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp2_pp2_native_fp8_tp_pp_sp
-    - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp4_pp2_fp8_tp_pp
+    # - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp2_pp2_fp8_tp_pp_sp
+    # - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp2_pp2_native_fp8_tp_pp_sp
+    # - gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp4_pp2_fp8_tp_pp

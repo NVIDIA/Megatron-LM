@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 #  dict (StateDict) from a state dict with tensors replaced with ShardedTensors
 #  (ShardedStateDict).
 StateDict = Dict[str, Any]
+CommonStateDict = Dict[str, Any]
 ShardedStateDict = Dict[str, Any]
 ReplicaId = Union[int, Tuple[int, ...]]
 

@@ -39,14 +39,23 @@ class ModelParallelConfig:
     context_parallel_size: int = 1
     """Splits network input along sequence dimension across GPU ranks."""
 
+    hierarchical_context_parallel_sizes: Optional[list[int]] = None
+    """Degrees of the hierarchical context parallelism. Users should provide a list to specify 
+       the sizes for different levels. Taking the a2a+p2p cp comm type as example, it contains
+       groups of two levels, so the first value of the list indicates the group size of the a2a
+       communication type, and the second value indicates the group size of the p2p communication
+       type.
+    """
+
     expert_model_parallel_size: int = 1
     """Distributes Moe Experts across sub data parallel dimension."""
 
+    expert_tensor_parallel_size: Optional[int] = None
+    """Intra-layer tensor model parallelsm for expert layer. Splits tensors across GPU ranks."""
+
     moe_extended_tp: bool = False
-    """Alternative parallelization strategy for expert parallelism. Instead of distributing experts
-       across expert_model_parallel_size, each expert is sharded along extendended tensor parallel
-       domain (tensor_model_paralle_size * expert_model_parallel_size). It avoids the load balancing
-       problem with MOE training.
+    """NOTE: Deprecated from MCore v0.10. This flag is ignored.
+      Its functionality is replaced by expert_tensor_parallel_size.
     """
 
     ###################
@@ -75,33 +84,33 @@ class ModelParallelConfig:
     params_dtype: torch.dtype = torch.float32
     """dtype used when intializing the weights."""
 
-    timers: Callable = None
+    timers: Optional[Callable] = None
     """Timers object to call for various timing functions. See megatron.core.timers.Timers"""
 
-    finalize_model_grads_func: Callable = None
+    finalize_model_grads_func: Optional[Callable] = None
     """Function that finalizes gradients on all workers. Could include ensuring that grads are
        all-reduced across data parallelism, pipeline parallelism, and sequence parallelism
        dimensions.
     """
 
-    grad_scale_func: Callable = None
+    grad_scale_func: Optional[Callable] = None
     """If using loss scaling, this function should take the loss and return the scaled loss. If
        None, no function is called on the loss.
     """
 
-    no_sync_func: Callable = None
+    no_sync_func: Optional[Callable] = None
     """Function that creates a context that suppresses asynchronous data-parallel communication. If
        the model is an instance of core.distributed.DistributedDataParallel, the default is to use
        core.distributed.DistributedDataParallel.no_sync.
     """
 
-    grad_sync_func: Callable = None
+    grad_sync_func: Optional[Callable] = None
     """Function that launches asynchronous gradient reductions (e.g. distributed optimizer gradient
        reduce-scatters). The function should take one argument: an iterable of parameters whose
        gradients are to be synchronized.
     """
 
-    param_sync_func: Callable = None
+    param_sync_func: Optional[Callable] = None
     """Function that launches asynchronous parameter synchronizations (e.g. distributed optimizer
        parameter all-gathers). The function should take one argument: an iterable of parameters to
        be synchronized.
@@ -114,7 +123,7 @@ class ModelParallelConfig:
     enable_autocast: bool = False
     """If true runs the forward step function inside torch.autocast context."""
 
-    autocast_dtype: torch.dtype = None
+    autocast_dtype: Optional[torch.dtype] = None
     """dtype to pass to torch.amp.autocast when enabled. If None, is set to pipeline_dtype."""
 
     num_microbatches_with_partial_activation_checkpoints: Optional[int] = None
@@ -302,7 +311,7 @@ class ModelParallelConfig:
     cpu_offloading_num_layers: int = 0
     """Tells the number of transformer layers for which activations has to be offloaded."""
 
-    _cpu_offloading_context: ContextManager = (
+    _cpu_offloading_context: Optional[ContextManager] = (
         None
         # Used for internal use only, not to be set by a user.
         # TODO: Need to move to the 'right' place when possible.
@@ -332,6 +341,9 @@ class ModelParallelConfig:
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:
                 raise ValueError("Can not use sequence paralllelism without tensor parallelism")
+
+        if self.expert_tensor_parallel_size is None:
+            self.expert_tensor_parallel_size = self.tensor_model_parallel_size
 
         if self.pipeline_model_parallel_size > 1:
             if self.pipeline_dtype is None:
@@ -371,5 +383,5 @@ class ModelParallelConfig:
             if not self.overlap_p2p_comm or self.batch_p2p_comm:
                 raise ValueError(
                     "Pipeline parallel communication overlapping in warmup and flush is only "
-                    "compatible with overlap_p2p_comm but not batch_p2p_comm"
+                    "compatible with overlap_p2p_comm but not batch_p2p_comm."
                 )

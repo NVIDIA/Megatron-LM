@@ -142,6 +142,7 @@ class Attention(MegatronModule, ABC):
         attention_mask,
         rotary_pos_emb=None,
         attn_mask_type=None,
+        attention_bias=None,
         packed_seq_params=None,
     ):
         """Forward method with selective activation checkpointing."""
@@ -159,6 +160,7 @@ class Attention(MegatronModule, ABC):
                 value,
                 attention_mask,
                 attn_mask_type=attn_mask_type,
+                attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
             )
             return output_
@@ -342,6 +344,7 @@ class Attention(MegatronModule, ABC):
         rotary_pos_emb=None,
         rotary_pos_cos=None,
         rotary_pos_sin=None,
+        attention_bias=None,
         packed_seq_params=None,
     ):
         """
@@ -443,6 +446,7 @@ class Attention(MegatronModule, ABC):
                 value,
                 attention_mask,
                 attn_mask_type=attn_mask_type,
+                attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
             )
         else:
@@ -452,6 +456,7 @@ class Attention(MegatronModule, ABC):
                 value,
                 attention_mask,
                 attn_mask_type=attn_mask_type,
+                attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
             )
 

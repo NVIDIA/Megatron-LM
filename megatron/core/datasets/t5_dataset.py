@@ -1,10 +1,13 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import os
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
 import numpy
+import torch
+from packaging.version import Version as PkgVersion
 
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.masked_dataset import (
@@ -12,8 +15,13 @@ from megatron.core.datasets.masked_dataset import (
     MaskedWordPieceDatasetConfig,
 )
 from megatron.core.datasets.utils import Split
+from megatron.core.utils import get_te_version
 
-
+try:
+    import transformer # pylint: disable=unused-import
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 @dataclass
 class T5MaskedWordPieceDatasetConfig(MaskedWordPieceDatasetConfig):
     """Configuration object for Megatron Core T5 WordPiece datasets
@@ -45,13 +53,15 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
     """The T5 dataset that assumes WordPiece tokenization
 
     Args:
-        indexed_dataset (IndexedDataset): The IndexedDataset around which to build the MegatronDataset
+        indexed_dataset (IndexedDataset): The IndexedDataset around
+            which to build the MegatronDataset
 
         dataset_path (str): The real path on disk to the dataset, for bookkeeping
 
         indexed_indices (numpy.ndarray): The set of the documents indices to expose
 
-        num_samples (Optional[int]): The number of samples to draw from the indexed dataset. When None, build as many samples as correspond to one epoch.
+        num_samples (Optional[int]): The number of samples to draw from the indexed
+            dataset. When None, build as many samples as correspond to one epoch.
 
         index_split (Split): The indexed_indices Split
 
@@ -85,6 +95,135 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
         return super(
             T5MaskedWordPieceDataset, T5MaskedWordPieceDataset
         )._key_config_attributes() + ["sequence_length_decoder"]
+
+    @staticmethod
+    def _build_b1ss_attention_mask(
+        source_block: torch.tensor, target_block: torch.tensor, make_history_mask: bool = False
+    ) -> torch.tensor:
+        """Build an attention-mask having shape (bs, 1, q_len, kv_len)
+        from source_block and target_block
+
+        Args:
+            source_block (torch.tensor): A 2-D array of tokens (bs, q_len)
+            target_block (torch.tensor): A 2-D array of tokens (bs, kv_len)
+            make_history_mask (bool): Whether to turn mask into causal mask
+
+        Returns:
+            torch.tensor: The 4-D attention mask (bs, 1, q_len, kv_len)
+        """
+        batch_size = source_block.shape[0]
+        attention_mask = []
+        for i in range(batch_size):
+            source_sample = source_block[i]
+            target_sample = target_block[i]
+            mask = (target_sample[None, :] >= 1) * (source_sample[:, None] >= 1)
+            if make_history_mask:
+                arange = numpy.arange(source_sample.shape[0])
+                history_mask = arange[None,] <= arange[:, None]
+                history_mask = torch.tensor(history_mask).to(mask.device)
+                mask = mask * history_mask
+            mask = ~(mask)  # flip True to False
+            attention_mask.append(mask)
+        attention_mask = torch.stack(attention_mask)
+        attention_mask = attention_mask.unsqueeze(1)
+        return attention_mask
+
+    @staticmethod
+    def config_attention_mask(
+        encoder_tokens: torch.tensor,
+        decoder_tokens: torch.tensor,
+        encoder_mask: torch.tensor,
+        decoder_mask: torch.tensor,
+        use_local: bool = False,
+        test_te_version: str = None,
+    ) -> torch.tensor:
+        """Config attention-mask for encoder_mask, decoder_mask, encoder_decoder_mask
+        conditioned on transformer-implementation (e.g. TE vs local), TE versions,
+        and TE backends
+
+        Args:
+            encoder_tokens (torch.tensor): A 2-D array of tokens (bs, kv_len)
+            decoder_tokens (torch.tensor): A 2-D array of tokens (bs, q_len)
+            encoder_mask (torch.tensor): A 2-D array of tokens (bs, kv_len)
+            decoder_mask (torch.tensor): A 2-D array of tokens (bs, q_len)
+            use_local (bool): Whether the current T5 model uses local (vs TE)
+                transformer implmentation
+
+        Returns:
+            Configured encoder_mask, decoder_mask, encoder_decoder_mask
+            torch.tensor: configured encoder attention mask
+            torch.tensor: configured decoder attention mask
+            torch.tensor: configured encoder-decoder attention mask
+        """
+        # If using local transformer implementation (not transformer_engine):
+        # re-organize all attention masks, because local and transformer_engine
+        # backbones use different masks shapes. E.g.:
+        # (local: b1ss - transformer_engine: b11s)
+        if use_local:
+            encoder_mask = T5MaskedWordPieceDataset._build_b1ss_attention_mask(
+                encoder_tokens, encoder_tokens
+            )
+            decoder_mask = T5MaskedWordPieceDataset._build_b1ss_attention_mask(
+                decoder_tokens, decoder_tokens, make_history_mask=True
+            )
+            encoder_decoder_mask = T5MaskedWordPieceDataset._build_b1ss_attention_mask(
+                decoder_tokens, encoder_tokens
+            )
+
+        else:
+            # If using transformer_engine transformer implementation:
+            # 1. For TE version >= 1.10, across all 3 backends,
+            #    The padding mask is configued as
+            #    [bs, 1, 1, seq_len] for self-attention and
+            #    ([bs, 1, 1, q_len], [bs, 1, 1, kv_len]) for cross-attention
+            # 2. For TE version >=1.7 and <1.10, when using Non-fused backend,
+            #    The padding mask is configued as
+            #    [bs, 1, q_len, kv_len] for both self-attention and for cross-attention
+            # 3. For TE version <1.7, only support Non-fused backend
+            #    The padding mask is configued as
+            #    [bs, 1, q_len, kv_len] for both self-attention and for cross-attention
+
+            # Process for Flash/Fused
+            encoder_mask = encoder_mask.unsqueeze(1).unsqueeze(1)
+            decoder_mask = decoder_mask.unsqueeze(1).unsqueeze(1)
+            encoder_decoder_mask = (decoder_mask, encoder_mask)
+            # set decoder_mask to None because decoder uses AttnMaskType.causal
+            decoder_mask = None
+
+            # get TE version, using test TE version if not None
+            if test_te_version is not None:
+                te_version = PkgVersion(test_te_version)
+            else:
+                te_version = get_te_version()
+
+            # Check for older TE version than 1.10, adjust attention mask accordingly
+            flash_attention_enabled = os.getenv('NVTE_FLASH_ATTN') == '1'
+            fused_attention_enabled = os.getenv('NVTE_FUSED_ATTN') == '1'
+            if (te_version and te_version < PkgVersion("1.10.0")) and (te_version >= PkgVersion("1.7.0")):
+                if not (flash_attention_enabled) and not (fused_attention_enabled):
+                    encoder_mask = T5MaskedWordPieceDataset._build_b1ss_attention_mask(
+                        encoder_tokens, encoder_tokens
+                    )
+                    encoder_decoder_mask = T5MaskedWordPieceDataset._build_b1ss_attention_mask(
+                        decoder_tokens, encoder_tokens
+                    )
+                else:
+                    pass
+            elif te_version and te_version < PkgVersion("1.7.0"):
+                if not (flash_attention_enabled) and not (fused_attention_enabled):
+                    encoder_mask = T5MaskedWordPieceDataset._build_b1ss_attention_mask(
+                        encoder_tokens, encoder_tokens
+                    )
+                    encoder_decoder_mask = T5MaskedWordPieceDataset._build_b1ss_attention_mask(
+                        decoder_tokens, encoder_tokens
+                    )
+                else:
+                    assert not flash_attention_enabled and not fused_attention_enabled, (
+                        "Flash and fused attention is not supported with transformer "
+                        "engine version < 1.7. Set NVTE_FLASH_ATTN=0 and NVTE_FUSED_ATTN=0"
+                        "or upgrade transformer engine >= 1.7"
+                    )
+        return encoder_mask, decoder_mask, encoder_decoder_mask
 
     def __getitem__(self, idx: int) -> Dict[str, Union[int, numpy.ndarray]]:
         """Abstract method implementation
@@ -160,10 +299,9 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
         )
 
         # Create attention and history masks
-        mask_encoder = self._make_attention_mask(encoder_input, encoder_input)
-        mask_encoder_decoder = self._make_attention_mask(decoder_input, encoder_input)
-        mask_decoder = self._make_attention_mask(decoder_input, decoder_input)
-        mask_decoder = mask_decoder * self._make_history_mask(decoder_input)
+        mask_encoder = numpy.array([1] * length_toks_encoder + [0] * length_pads_encoder)
+        mask_decoder = numpy.array([1] * length_toks_decoder + [0] * length_pads_decoder)
+        mask_encoder_decoder = None
 
         # Mask the labels
         decoder_output = numpy.array(decoder_output, dtype=numpy.int64)
@@ -181,38 +319,7 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
             "truncated": int(truncated),
             "enc_mask": mask_encoder,
             "dec_mask": mask_decoder,
-            "enc_dec_mask": mask_encoder_decoder,
         }
-
-    @staticmethod
-    def _make_attention_mask(
-        source_block: numpy.ndarray, target_block: numpy.ndarray
-    ) -> numpy.ndarray:
-        """Return a 2-D attention mask
-
-        Args:
-            source_block (numpy.ndarray): A 1-D array
-            target_block (numpy.ndarray): A 1-D array
-
-        Returns:
-            numpy.ndarray: The 2-D attention mask
-        """
-        mask = (target_block[None, :] >= 1) * (source_block[:, None] >= 1)
-        return mask.astype(numpy.int64)
-
-    @staticmethod
-    def _make_history_mask(block: numpy.ndarray) -> numpy.ndarray:
-        """Return a 2-D history (lower-left-triangular) mask
-
-        Args:
-            block (numpy.ndarray): A 1-D array
-
-        Returns:
-            numpy.ndarray: The 2-D history (lower-left-triangular) mask
-        """
-        arange = numpy.arange(block.shape[0])
-        mask = arange[None,] <= arange[:, None]
-        return mask.astype(numpy.int64)
 
     def _get_token_mask(self, numpy_random_state: numpy.random.RandomState) -> int:
         """Abstract method implementation

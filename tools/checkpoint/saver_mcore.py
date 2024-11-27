@@ -7,7 +7,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pkg_resources import packaging
 
 from setter import ModelSetter
-from utils import get_mcore_transformer_block_key, print_memory_usage
+from utils import get_mcore_transformer_block_key
 
 
 class MCoreSetter(ModelSetter):

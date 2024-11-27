@@ -18,7 +18,7 @@ try:
 
 except ImportError:
     from megatron.core.transformer.dot_product_attention import DotProductAttention
-    from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
     from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
     import warnings
 
@@ -92,7 +92,7 @@ else:
             mamba_layer=ModuleSpec(
                 module=MambaLayer,
                 submodules=MambaLayerSubmodules(
-                    norm=WrappedTorchLayerNorm,
+                    norm=WrappedTorchNorm,
                     mixer=ModuleSpec(
                         module=MambaMixer,
                         submodules=MambaMixerSubmodules(
@@ -109,7 +109,7 @@ else:
             attention_layer=ModuleSpec(
                 module=TransformerLayer,
                 submodules=TransformerLayerSubmodules(
-                    input_layernorm=WrappedTorchLayerNorm,
+                    input_layernorm=WrappedTorchNorm,
                     self_attention=ModuleSpec(
                         module=SelfAttention,
                         params={"attn_mask_type": AttnMaskType.causal},
@@ -128,7 +128,7 @@ else:
             mlp_layer=ModuleSpec(
                 module=TransformerLayer,
                 submodules=TransformerLayerSubmodules(
-                    input_layernorm=WrappedTorchLayerNorm,
+                    input_layernorm=WrappedTorchNorm,
                     mlp=ModuleSpec(
                         module=MLP,
                         submodules=MLPSubmodules(

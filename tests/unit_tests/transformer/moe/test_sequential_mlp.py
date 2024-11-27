@@ -115,6 +115,7 @@ class TestTEParallelSequentialMLP:
             self.num_local_experts, self.transformer_config, self.te_mlp_spec
         )
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_te_min_version("1.7.0"),
         reason="Transformer Engine under v1.7.0 doesn't support MoE training.",
@@ -131,6 +132,7 @@ class TestTEParallelSequentialMLP:
                 self.te_sequential_mlp.local_experts[i].linear_fc2.weight,
             )
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_te_min_version("1.7.0"),
         reason="Transformer Engine under v1.7.0 doesn't support MoE training.",
@@ -153,6 +155,7 @@ class TestTEParallelSequentialMLP:
         output_te, _ = self.te_sequential_mlp(hidden_states, tokens_per_expert)
         assert torch.equal(output_local, output_te)
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_te_min_version("1.7.0"),
         reason="Transformer Engine under v1.7.0 doesn't support MoE training.",
@@ -177,6 +180,7 @@ class TestTEParallelSequentialMLP:
         output_te, _ = te_sequential_mlp(hidden_states, tokens_per_expert)
         assert torch.equal(output_local, output_te)
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_te_min_version("1.7.0"),
         reason="Transformer Engine under v1.7.0 doesn't support MoE training.",

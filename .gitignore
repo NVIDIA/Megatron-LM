@@ -11,3 +11,6 @@ local/
 *.sh
 *.log
 .gitmodules
+*.out
+=*
+test_dist*.py

@@ -4,7 +4,7 @@
 
 import logging
 from time import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -13,10 +13,12 @@ from megatron.core.device_utils import get_current_device
 from .dict_utils import dict_list_map_inplace, extract_matching_values, merge, nested_values
 from .exchange_utils import determine_main_replica_uniform_distribution, exchange_by_distribution
 from .mapping import (
+    CommonStateDict,
     ShardedObject,
     ShardedStateDict,
     ShardedTensor,
     ShardedTensorFactory,
+    StateDict,
     apply_factories,
     apply_factory_merges,
 )
@@ -33,7 +35,8 @@ logger = logging.getLogger(__name__)
 
 def save_preprocess(sharded_state_dict: ShardedStateDict, 
                     validate_access_integrity: bool = True, 
-                    process_group: torch.distributed.ProcessGroup = None):
+                    process_group: torch.distributed.ProcessGroup = None,
+                    preprocess_common_before_consistancy_check: Callable[[CommonStateDict], StateDict] = None):
     """Preprocesses the given state dictionary by applying factories,
     discarding non-persistent data and extracting the common state dictionary.
     Optionally, it can validate sharding integrity.
@@ -41,6 +44,9 @@ def save_preprocess(sharded_state_dict: ShardedStateDict,
     Args:
         sharded_state_dict (ShardedStateDict): The initial state dictionary to be preprocessed.
         validate_access_integrity (bool): If True, triggers validation of sharding integrity.
+        preprocess_common_before_consistancy_check (callable, None): A callable function
+            that will preprocess the common state dict (i.e can be used  to remove keys
+            that we expect to be different in the state dict)
 
     Returns:
         Tuple[ShardedStateDict, dict]:
@@ -50,7 +56,15 @@ def save_preprocess(sharded_state_dict: ShardedStateDict,
     _, sharded_state_dict = extract_nonpersistent(sharded_state_dict)
     sharded_part, common_state_dict = extract_sharded_base(sharded_state_dict)
     if validate_access_integrity:
-        validate_sharding_integrity(determine_global_metadata(sharded_part, process_group=process_group)[1])
+        preprocessed_common_state_dict = common_state_dict
+        if preprocess_common_before_consistancy_check:
+            preprocessed_common_state_dict = preprocess_common_before_consistancy_check(
+                common_state_dict
+            )
+        validate_sharding_integrity(
+            determine_global_metadata(sharded_part, process_group=process_group)[1],
+            common_state_dict=preprocessed_common_state_dict,
+        )
     return sharded_part, common_state_dict
 
 

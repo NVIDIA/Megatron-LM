@@ -5,12 +5,14 @@ import signal
 import sys
 import tempfile
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import click
 import jetclient
 import requests
 import yaml
+from jet import workloads
+from jetclient.facades.objects import log as jet_log
 from jetclient.services.dtos.pipeline import PipelineStatus
 
 from tests.functional_tests.python_test_utils.jet import common
@@ -46,7 +48,7 @@ def launch_and_wait_for_completion(
     environment: str,
     n_repeat: int,
     time_limit: int,
-    container_image: str,
+    container_image: Optional[str],
     container_tag: str,
     cluster: str,
     account: str,
@@ -66,7 +68,7 @@ def launch_and_wait_for_completion(
         ),
         config_id=resolve_cluster_config(cluster),
         custom_config={
-            "launchers": {cluster: {"account": account}},
+            "launchers": {cluster: {"account": account, "ntasks_per_node": 8}},
             "executors": {
                 "jet-ci": {
                     "environments": {
@@ -91,14 +93,22 @@ def launch_and_wait_for_completion(
         flush=True,
     )
 
-    pipeline.wait(max_wait_time=60 * 60 * 24 * 7)
+    n_wait_attempts = 0
+    while n_wait_attempts < 3:
+        try:
+            pipeline.wait(max_wait_time=60 * 60 * 24 * 7, interval=60 * 3)
+            break
+        except requests.exceptions.ConnectionError as e:
+            print(e)
+            time.sleep(60 * 3**n_wait_attempts)
+            pipeline = workloads.get_pipeline(pipeline.jet_id)
+            n_wait_attempts += 1
 
     print(f"Pipeline terminated; status: {pipeline.get_status()}")
     return pipeline
 
 
-def download_job_assets(job: jetclient.JETJob, iteration: int = 0) -> List[str]:
-    logs = job.get_logs()
+def download_job_assets(logs: List[jet_log.JETLog], iteration: int = 0) -> List[str]:
     if not logs:
         return [""]
 
@@ -111,10 +121,10 @@ def download_job_assets(job: jetclient.JETJob, iteration: int = 0) -> List[str]:
         for log_filename in assets.keys():
             with open(assets_path / log_filename, "w") as fh:
                 assets[log_filename].download(pathlib.Path(fh.name))
+    return assets
 
 
-def download_job_logs(job: jetclient.JETJob) -> List[str]:
-    logs = job.get_logs()
+def extract_logs_to_string(logs: List[jet_log.JETLog]) -> List[str]:
     if not logs:
         return [""]
 
@@ -201,8 +211,9 @@ def main(
         sys.exit(1)
 
     n_attempts = 0
+    n_nondeterminism_attemps = 0
     n_iteration = 0
-    while True and n_attempts < 3:
+    while True and n_attempts < 3 and n_nondeterminism_attemps < 2:
         pipeline = launch_and_wait_for_completion(
             test_case=test_case,
             environment=environment,
@@ -218,15 +229,40 @@ def main(
 
         main_job = [job for job in pipeline.get_jobs() if job.name.startswith("basic")][0]
 
-        logs = download_job_logs(job=main_job)
+        n_download_attempt = 0
+        while n_download_attempt < 3:
+            try:
+                jet_log = main_job.get_logs()
+                logs = extract_logs_to_string(logs=jet_log)
+                download_job_assets(logs=jet_log, iteration=n_iteration)
+                break
+            except requests.exceptions.ConnectionError as e:
+                print(e)
+                time.sleep((3**n_download_attempt) * 60)
+                n_download_attempt += 1
+
         concat_logs = "\n".join(logs)
         print(f"Logs:\n{concat_logs}")
 
-        download_job_assets(job=main_job, iteration=n_iteration)
-
         if test_type != "release":
             success = pipeline.get_status() == PipelineStatus.SUCCESS
-            sys.exit(int(not success))  # invert for exit 0
+
+            if success:
+                sys.exit(int(not success))  # invert for exit 0
+
+            if (
+                "Some NCCL operations have failed or timed out." in concat_logs
+                or "uncorrectable ECC error encountered" in concat_logs
+                or "illegal memory access" in concat_logs
+                or "illegal instruction" in concat_logs
+            ):
+                print("Detected NCCL failure, attempt restart.")
+                n_attempts += 1
+                continue
+            else:
+                print("Non-determinism, let's try another node.")
+                n_nondeterminism_attemps += 1
+                continue
 
         if parse_failed_job(logs=logs):
             n_attempts += 1

@@ -23,7 +23,7 @@ def test_load_fused_kernels():
         raise e
 
 def test_fused_softmax():
-    bert = BertModel.from_pretrained("bert-base-cased").cuda().half()
+    bert = BertModel.from_pretrained("bert-base-cased").to(device=get_current_device()).half()
     tokenizer = BertTokenizer.from_pretrained("bert-base-cased")
     test_text = (
         "Hello. How are you? I am fine thank you and you? yes Good. "
@@ -36,16 +36,16 @@ def test_fused_softmax():
     )
 
     embedding_output = bert.embeddings(
-        input_ids=tokens["input_ids"].cuda(),
+        input_ids=tokens["input_ids"].to(device=get_current_device()),
         position_ids=None,
-        token_type_ids=tokens["token_type_ids"].cuda(),
+        token_type_ids=tokens["token_type_ids"].to(device=get_current_device()),
         inputs_embeds=None,
         past_key_values_length=0,
     )
 
     # (bsz, 1, 1, seq_len)
     mask = bert.get_extended_attention_mask(
-        attention_mask=tokens["attention_mask"].cuda(),
+        attention_mask=tokens["attention_mask"].to(device=get_current_device()),
         input_shape=tokens["input_ids"].shape,
         device=bert.device,
     )
@@ -69,7 +69,7 @@ def test_fused_softmax():
             attn_mask_type=AttnMaskType.padding,
             scaled_masked_softmax_fusion=True,
         )
-        .cuda()
+        .to(device=get_current_device())
         .half()
     )
 
@@ -88,7 +88,7 @@ def test_fused_softmax():
             attn_mask_type=AttnMaskType.padding,
             scaled_masked_softmax_fusion=False,
         )
-        .cuda()
+        .to(device=get_current_device())
         .half()
     )
 
@@ -121,7 +121,7 @@ def test_fused_softmax():
 
 
 def test_fused_upper_triangle_mask_softmax():
-    gpt = GPT2Model.from_pretrained("gpt2").cuda().half()
+    gpt = GPT2Model.from_pretrained("gpt2").to(device=get_current_device()).half()
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
     test_text = (
         "Hello. How are you? I am fine thank you and you? yes Good. "
@@ -133,14 +133,14 @@ def test_fused_upper_triangle_mask_softmax():
         return_tensors="pt",
     )
 
-    attention_mask = tokens["attention_mask"].cuda()
+    attention_mask = tokens["attention_mask"].to(device=get_current_device())
     attention_mask = attention_mask.view(attention_mask.size(0), -1)
     attention_mask = attention_mask[:, None, None, :]
     attention_mask = (1.0 - attention_mask) * -10000.0
     attention_mask = attention_mask.repeat(1, 1, attention_mask.size()[-1], 1)
     attn = gpt.h[0]
 
-    hidden_states = gpt.wte(tokens["input_ids"].cuda())
+    hidden_states = gpt.wte(tokens["input_ids"].to(device=get_current_device()))
     q, k, v = attn.attn.c_attn(hidden_states).split(768, dim=-1)
     q = attn.attn._split_heads(q, attn.attn.num_heads, attn.attn.head_dim)
     k = attn.attn._split_heads(k, attn.attn.num_heads, attn.attn.head_dim)
@@ -169,7 +169,7 @@ def test_fused_upper_triangle_mask_softmax():
             attn_mask_type=AttnMaskType.causal,
             scaled_masked_softmax_fusion=True,
         )
-        .cuda()
+        .to(device=get_current_device())
         .half()
     )
 
@@ -188,7 +188,7 @@ def test_fused_upper_triangle_mask_softmax():
             attn_mask_type=AttnMaskType.causal,
             scaled_masked_softmax_fusion=False,
         )
-        .cuda()
+        .to(device=get_current_device())
         .half()
     )
 
@@ -221,7 +221,7 @@ def test_fused_upper_triangle_mask_softmax():
 
 
 def test_layer_norm():
-    bert = BertModel.from_pretrained("bert-base-cased").cuda().half()
+    bert = BertModel.from_pretrained("bert-base-cased").to(device=get_current_device()).half()
     tokenizer = BertTokenizer.from_pretrained("bert-base-cased")
     test_text = (
         "Hello. How are you? I am fine thank you and you? yes Good. "
@@ -236,22 +236,22 @@ def test_layer_norm():
     # [bsz, seq_len, d_model]
     embedding_output = (
         bert.embeddings(
-            input_ids=tokens["input_ids"].cuda(),
+            input_ids=tokens["input_ids"].to(device=get_current_device()),
             position_ids=None,
-            token_type_ids=tokens["token_type_ids"].cuda(),
+            token_type_ids=tokens["token_type_ids"].to(device=get_current_device()),
             inputs_embeds=None,
             past_key_values_length=0,
         )
-        .cuda()
+        .to(device=get_current_device())
         .half()
     )
 
     fused_layernorm_layer = (
-        MixedFusedLayerNorm(normalized_shape=embedding_output.size(-1)).cuda().half()
+        MixedFusedLayerNorm(normalized_shape=embedding_output.size(-1)).to(device=get_current_device()).half()
     )
 
     torch_layernorm_layer = (
-        LayerNorm(normalized_shape=embedding_output.size(-1)).cuda().half()
+        LayerNorm(normalized_shape=embedding_output.size(-1)).to(device=get_current_device()).half()
     )
 
     fused_output = fused_layernorm_layer(embedding_output)

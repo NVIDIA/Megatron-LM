@@ -8,9 +8,19 @@ import pytest
 import torch
 from torch.distributed.checkpoint import CheckpointException as PyTCheckpointingException
 
+from megatron.core.device_utils import get_current_device_type
+
+try:
+    from torch.distributed import DeviceMesh
+    from torch.distributed._tensor import DTensor
+
+    HAVE_DTENSOR = True
+except ImportError:
+    HAVE_DTENSOR = False
+
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
-from megatron.core.dist_checkpointing.core import CheckpointingException
+from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_load_config
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensorFactory
 from megatron.core.dist_checkpointing.serialization import (
@@ -42,15 +52,27 @@ class TestSerialization:
             ),
         }
 
+        if HAVE_DTENSOR:
+            mesh = DeviceMesh.from_group(
+                parallel_state.get_data_parallel_group(with_context_parallel=True), 
+                get_current_device_type()
+            )
+            sharded_state_dict['sd_keyD'] = ShardedTensor.from_rank_offsets(
+                'keyD',
+                DTensor.from_local(torch.ones(3, 5, 7), mesh)._local_tensor,
+                replica_id=Utils.rank,
+            )
+
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
         with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_single_process_save_load', sync=True, 
+            tmp_path_dist_ckpt / 'test_single_process_save_load', sync=True,
             process_group=parallel_state.get_default_process_group()
         ) as ckpt_dir:
             save(sharded_state_dict, ckpt_dir, 
                  process_group=parallel_state.get_default_process_group())
             torch.distributed.barrier(group=parallel_state.get_default_process_group())
-            
+
+            saved_config = maybe_load_config(ckpt_dir)
 
             load_ssd = {
                 'load_sd_keyA': ShardedTensor.from_rank_offsets(
@@ -67,7 +89,7 @@ class TestSerialization:
 
         Utils.destroy_model_parallel()
 
-    
+
     def test_multi_process_save(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(2, 4)
 
@@ -78,14 +100,64 @@ class TestSerialization:
             'sd_keyB': ShardedTensor.from_rank_offsets(
                 'keyB', torch.ones(3, 5, 7), (2, Utils.rank, Utils.world_size)
             ),
+            'lr': 0.01,
+            'rank': torch.distributed.get_rank(),
         }
+
+        def preprocess_fn(x):
+            del x['rank']
+            return x
 
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
         with TempNamedDir(tmp_path_dist_ckpt / 'test_multi_process_save', sync=True,
-            process_group=parallel_state.get_default_process_group()) as ckpt_dir:
-            save(state_dict, ckpt_dir, 
-                 process_group=parallel_state.get_default_process_group())
+                          process_group=parallel_state.get_default_process_group()) as ckpt_dir:
+            save(
+                state_dict,
+                ckpt_dir,
+                validate_access_integrity=True,
+                process_group=parallel_state.get_default_process_group(),
+                preprocess_common_before_consistancy_check=preprocess_fn,
+            )
             torch.distributed.barrier(group=parallel_state.get_default_process_group())
+
+        Utils.destroy_model_parallel()
+
+    def test_multi_process_save_log_difference(self, tmp_path_dist_ckpt, caplog):
+        Utils.initialize_model_parallel(2, 4)
+
+        state_dict = {
+            'sd_keyA': ShardedTensor.from_rank_offsets(
+                'keyA', torch.ones(2, 4), (0, Utils.rank, Utils.world_size)
+            ),
+            'sd_keyB': ShardedTensor.from_rank_offsets(
+                'keyB', torch.ones(3, 5, 7), (2, Utils.rank, Utils.world_size)
+            ),
+            'rank': torch.distributed.get_rank(),
+        }
+
+        def preprocess_fn(x):
+            return x
+
+        with caplog.at_level(logging.WARNING):
+            # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
+            with TempNamedDir(
+                tmp_path_dist_ckpt / 'test_multi_process_save', sync=True,
+                process_group=parallel_state.get_default_process_group()
+            ) as ckpt_dir:
+                save(
+                    state_dict,
+                    ckpt_dir,
+                    validate_access_integrity=True,
+                    process_group=parallel_state.get_default_process_group(),
+                    preprocess_common_before_consistancy_check=preprocess_fn,
+                )
+            # pylint: disable=line-too-long
+            if torch.distributed.get_rank() == 0:
+                assert (
+                    "There is difference in the common state dict in different ranks. The differences are {1: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 2: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 3: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 4: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 5: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 6: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 7: ([], [], [(('rank',), <class 'int'>, <class 'int'>)])}"
+                    in caplog.text
+                )
+
         Utils.destroy_model_parallel()
 
     def test_partition_change_save_load(self, tmp_path_dist_ckpt, strategy=None):
@@ -301,7 +373,7 @@ class TestSerialization:
             torch.distributed.barrier(group=parallel_state.get_default_process_group())
             loaded_state_dict = load(get_sharded_state_dict(10), ckpt_dir, 
                                      process_group=parallel_state.get_default_process_group())
-    
+
         expected_sd = {
             'all': [
                 torch.arange(2),
@@ -338,7 +410,8 @@ class TestSerialization:
                      process_group=parallel_state.get_default_process_group())
             assert f'is not a distributed checkpoint' in str(exc_info.value)
 
-            # Missing Zarr arrays
+
+            torch.distributed.barrier(group=parallel_state.get_default_process_group())
             save(state_dict, ckpt_dir, 
                  process_group=parallel_state.get_default_process_group())
             torch.distributed.barrier(group=parallel_state.get_default_process_group())
@@ -348,7 +421,7 @@ class TestSerialization:
                      process_group=parallel_state.get_default_process_group())
             assert "different_key" in str(exc_info.value)
 
-    
+
     def test_sharded_object_serialization(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(1, 1)
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
@@ -653,7 +726,7 @@ class TestNonStrictLoad:
         with TempNamedDir(tmp_path_dist_ckpt / 'test_exact_load_handling', sync=True,
                           process_group=parallel_state.get_default_process_group()) as ckpt_dir:
             save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, save_format, 1)
-            save(sharded_state_dict, ckpt_dir, save_strategy,
+            save(sharded_state_dict, ckpt_dir, save_strategy, 
                  process_group=parallel_state.get_default_process_group())
             torch.distributed.barrier(group=parallel_state.get_default_process_group())
 
@@ -700,7 +773,7 @@ class TestNonStrictLoad:
         with TempNamedDir(tmp_path_dist_ckpt / 'test_exact_load_handling', sync=True,
                           process_group=parallel_state.get_default_process_group()) as ckpt_dir:
             save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, save_format, 1)
-            save(sharded_state_dict, ckpt_dir, save_strategy, 
+            save(sharded_state_dict, ckpt_dir, save_strategy,
                  process_group=parallel_state.get_default_process_group())
             torch.distributed.barrier(group=parallel_state.get_default_process_group())
             sharded_metadata = load_sharded_metadata(ckpt_dir)

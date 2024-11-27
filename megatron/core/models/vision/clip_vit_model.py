@@ -19,8 +19,8 @@ try:
 
     NORM_IMPL = TENorm
 except:
-    from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
-    NORM_IMPL = WrappedTorchLayerNorm
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
+    NORM_IMPL = WrappedTorchNorm
 
 
 # Note: This is under development and is missing features like position embedding interpolation.
@@ -196,6 +196,7 @@ def get_num_image_embeddings(
     disable_vision_class_token,
     class_token_len,
     pixel_shuffle=False,
+    use_tile_tags=False,
 ):
     """Get the number of image embeddings per image tile."""
     if vision_model_type == "siglip":
@@ -212,5 +213,9 @@ def get_num_image_embeddings(
 
     if pixel_shuffle:
         num_image_embeddings_per_tile = int(num_image_embeddings_per_tile * (0.5**2))
+
+    if use_tile_tags:
+        # The length of tile tags tokenized. Currently, the same across tokenizers used.
+        num_image_embeddings_per_tile += 5
 
     return num_image_embeddings_per_tile

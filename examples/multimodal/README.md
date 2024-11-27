@@ -16,7 +16,8 @@ You can build a docker container using `examples/multimodal/Dockerfile` to run t
 
 ### Language model
 
-Follow the instructions in `megatron-lm/docs/llama_mistral.md` to download weights for Mistral-7B-Instruct-v0.3 and convert to mcore format with tensor parallel size 4
+Follow the instructions in [Mistral](../../docs/llama_mistral.md#mistral-7b) to download weights for Mistral-7B-Instruct-v0.3 (Base or Instruct) from HuggingFace and convert to mcore format with tensor parallel size 4.
+Please use the tokenizer from HuggingFace.
 
 ### Vision model
 
@@ -31,7 +32,7 @@ python examples/multimodal/model_converter/clip_converter.py --download-root /so
 Update the paths to point to the mcore converted CLIP and Mistral models and run the following script to combine the Mistral and CLIP models into a single multimodal checkpoint folder:
 
 ```
-examples/multimodal/combine_mistral_clip.sh /path/to/mistral/model /path/to/clip/model /output/dir
+examples/multimodal/combine_lm_vision_checkpoints.sh /path/to/mistral/model /path/to/clip/model /output/dir
 ```
 
 ## Training
@@ -57,7 +58,7 @@ examples/multimodal/combine_mistral_clip.sh /path/to/mistral/model /path/to/clip
 
     ```
     cd <LLaVA-Pretrain dir>/wds
-    energon ./
+    energon prepare ./
     ```
 
     select the following values for the presented options:
@@ -112,7 +113,7 @@ Run the following script:
 
 ```
 examples/multimodal/text_generation_mistral_clip.sh --input-image-path /path/to/input/images --output-path /some/output/directory \
-    --model-path /path/to/model.pt --tokenizer-path /path/to/tokenizer.model --gt-path /path/to/groundtruth/file --task generation-task-name
+    --model-path /path/to/model.pt --tokenizer-path /path/to/tokenizer/ --gt-path /path/to/groundtruth/file --task generation-task-name
 ```
 
 where `--task generation-task-name` is the name of the evaluation benchmark such as `captioning` or `MMMU`.

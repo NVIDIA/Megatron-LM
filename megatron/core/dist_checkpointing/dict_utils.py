@@ -104,7 +104,10 @@ def diff(x1: Any, x2: Any, prefix: Tuple = ()) -> Tuple[list, list, list]:
         only_left = []
         only_right = []
         if isinstance(x1, torch.Tensor) and isinstance(x2, torch.Tensor):
-            _is_mismatch = not torch.all(x1 == x2)
+            if x1.device != x2.device:
+                _is_mismatch = not torch.all(x1.cpu() == x2.cpu())
+            else:
+                _is_mismatch = not torch.all(x1 == x2)
         # TODO: change with concrete type that has both replica_id and data attrs
         elif hasattr(x1, 'replica_id') and hasattr(x2, 'replica_id'):
             assert type(x1) == type(x2)

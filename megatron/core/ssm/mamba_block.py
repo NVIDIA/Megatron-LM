@@ -22,10 +22,10 @@ from megatron.core.tensor_parallel import get_device_rng_tracker
 
 try:
     from megatron.core.extensions.transformer_engine import (
-            TENorm as WrappedTorchLayerNorm
+            TENorm as WrappedTorchNorm
     )
 except ImportError:
-    from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
     import warnings
 
     if torch.cuda.is_available():
@@ -180,7 +180,7 @@ class MambaStack(MegatronModule):
                 # Transformer layers apply their own pp_layer_offset
                 layer = build_module(submodules.mlp_layer, config=self.config, layer_number=i + 1)
             else:
-                assert True, "unexpected layer_type"
+                assert False, "unexpected layer_type"
             self.layers.append(layer)
 
         # Required for activation recomputation
@@ -188,7 +188,7 @@ class MambaStack(MegatronModule):
 
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
-            self.final_norm = WrappedTorchLayerNorm(
+            self.final_norm = WrappedTorchNorm(
                 config=self.config,
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,

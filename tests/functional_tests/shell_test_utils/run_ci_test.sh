@@ -55,10 +55,17 @@ do
 
     # Maybe checkpoint resume training
     if [[ "$TEST_TYPE" == "ckpt-resume" ]]; then 
-        rm -rf $CHECKPOINT_PATH/iter_0000100; 
-        echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt;
+        if [[ ${SLURM_PROCID} -eq 0 ]]; then
+            rm -rf $CHECKPOINT_PATH/iter_0000100; 
+            echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt;
+        fi
+
         export RUN_NUMBER=2
         bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
+    fi
+
+    if [[ ${SLURM_PROCID} -gt 0 ]]; then
+        continue
     fi
 
     # Save run results

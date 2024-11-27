@@ -30,9 +30,11 @@ class TestTransformerLayerInterface:
             'context',
             'context_mask',
             'rotary_pos_emb',
+            'rotary_pos_cos',
+            'rotary_pos_sin',
+            'attention_bias',
             'inference_params',
             'packed_seq_params',
-            'kwargs',
         ]
         # Check if the parameter names match the expected names
         assert (

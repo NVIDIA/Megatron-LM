@@ -4,7 +4,7 @@ from copy import deepcopy
 
 import torch
 from config import get_language_model_config, get_vision_model_config, get_vision_projection_config
-from layer_specs import get_layer_spec, get_layer_spec_te, get_mlp_module_spec
+from layer_specs import get_layer_spec, get_layer_spec_te, get_mlp_module_spec, get_norm_mlp_module_spec_te
 
 from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN, LLaVAModel
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
@@ -30,14 +30,22 @@ def model_provider(
         model: A multimodal model.
     """
     args = get_args()
+    assert args.ckpt_format == 'torch', "Only ckpt-format torch is supported for VLM training currently."
+    assert args.encoder_pipeline_model_parallel_size <= 1, "LLaVA does not support pp>1 for encoder on it's own pipeline rank"
 
     use_te = args.use_te
 
     print_rank_0('building a multimodal model ...')
 
     num_image_embeddings = get_num_image_embeddings(
-        args.img_h, args.img_w, args.patch_dim, args.vision_model_type,
-        args.disable_vision_class_token, 1, args.pixel_shuffle,
+        args.img_h,
+        args.img_w,
+        args.patch_dim,
+        args.vision_model_type,
+        args.disable_vision_class_token,
+        1,
+        args.pixel_shuffle,
+        args.use_tile_tags,
     )
     old_seq_length = args.seq_length
     args.seq_length = args.encoder_seq_length = num_image_embeddings
@@ -103,21 +111,35 @@ def model_provider(
         vision_projection_config, language_config.hidden_size
     )
 
+    # --encoder-pipeline-model-parallel-size 1 will enable a separate pipeline stage for the vision model.
     if args.encoder_pipeline_model_parallel_size > 0:
         assert (
             args.encoder_pipeline_model_parallel_size == 1
         ), "vision model and projection can only live on 1 pipeline stage."
-        vision_config.pipeline_model_parallel_size = args.encoder_pipeline_model_parallel_size
-        vision_projection_config.pipeline_model_parallel_size = (
-            args.encoder_pipeline_model_parallel_size
-        )
+
         if args.encoder_tensor_model_parallel_size > 0:
             vision_config.tensor_model_parallel_size = args.encoder_tensor_model_parallel_size
             vision_projection_config.tensor_model_parallel_size = (
                 args.encoder_tensor_model_parallel_size
             )
 
-    vision_projection_layer_spec = get_mlp_module_spec(use_te=use_te).submodules
+    # Make sure vision model pipeline parallel size is not inherited from the language model pipeline parallel size.
+    # 0 is not a valid for the config value, hence max(1, ).
+    vision_config.pipeline_model_parallel_size = max(1, args.encoder_pipeline_model_parallel_size)
+    vision_projection_config.pipeline_model_parallel_size = vision_config.pipeline_model_parallel_size
+
+    # Make sure the vision model does not inherit first and last pipeline num layers from the language model.
+    vision_config.first_pipeline_num_layers = vision_config.last_pipeline_num_layers = None
+
+    if vision_projection_config.normalization:
+        vision_projection_layer_spec = get_norm_mlp_module_spec_te().submodules
+    else:
+        vision_projection_layer_spec = get_mlp_module_spec(use_te=use_te).submodules
+
+    tokenizer = get_tokenizer()
+    image_token_index = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
+
+    tile_tags = _get_tile_tags(args, tokenizer)
 
     model = LLaVAModel(
         language_transformer_config=language_config,
@@ -143,8 +165,9 @@ def model_provider(
         patch_dim=args.patch_dim,
         language_rotary_base=args.rotary_base,
         language_rope_scaling=args.use_rope_scaling,
-        image_token_index=get_tokenizer().convert_tokens_to_ids(IMAGE_TOKEN),
+        image_token_index=image_token_index,
         pixel_shuffle=args.pixel_shuffle,
+        tile_tags=tile_tags,
     )
 
     model.freeze(
@@ -154,3 +177,26 @@ def model_provider(
     )
 
     return model
+
+
+def _get_tile_tags(args, tokenizer):
+    """Tile tags are used in NVLM to surround image tiles with text tags."""
+    if not args.use_tile_tags:
+        return None
+
+    # We expect the tokenized length of the tags is same.
+    thumbnail_tag_text = "<tile_global_thumbnail>"
+    if args.tokenizer_prompt_format == "nvlm-yi-34b":
+        thumbnail_tag_text = "<tile_global>"
+
+    assert args.max_num_tiles <= 6, "Up to 6 tile tags used"
+    tile_tags_text = [f"<tile_{i}>" for i in range(1, args.max_num_tiles + 1)] + [thumbnail_tag_text]
+
+    start_idx = 0
+    if tokenizer._prompt_config.has_bos:
+        start_idx = 1
+
+    # Convert to tokens [num_tiles, tile_seq_len].
+    tile_tags = [tokenizer.tokenize(t)[start_idx:] for t in tile_tags_text]
+
+    return tile_tags

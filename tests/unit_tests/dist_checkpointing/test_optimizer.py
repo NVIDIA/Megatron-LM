@@ -428,6 +428,16 @@ class TestFP32Optimizer:
     )
     def test_fp32_optimizer_resharding(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp):
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
+
+        def preprocess_fn(optim_common_dict):
+            import copy
+
+            preprocessed_optimzier_common_dict = copy.deepcopy(optim_common_dict)
+            list = preprocessed_optimzier_common_dict['optimizer']['param_groups']
+            for dict_item in list:
+                del dict_item['wd_mult']
+            return preprocessed_optimzier_common_dict
+
         Utils.initialize_model_parallel(*src_tp_pp)
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=True,
@@ -448,8 +458,12 @@ class TestFP32Optimizer:
                     dist_opt=dist_opt
                 )
 
-                save(optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()), ckpt_dir_A,
-                     process_group=parallel_state.get_default_process_group())
+                save(
+                    optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()),
+                    ckpt_dir_A,
+                    process_group=parallel_state.get_default_process_group(),
+                    preprocess_common_before_consistancy_check=preprocess_fn,
+                )
                 Utils.destroy_model_parallel()
 
                 # Load checkpoint A with different TP/PP and save as checkpoint B

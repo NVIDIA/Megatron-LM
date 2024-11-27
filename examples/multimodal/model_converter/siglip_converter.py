@@ -61,9 +61,9 @@ def convert(output_path, tensor_parallel_size, use_te):
     head_dim = 72
     num_head = 16
     for layer_idx in range(27):
-        origin_base = f"vision_tower.vision_model.encoder.layers.{layer_idx}" 
+        origin_base = f"vision_tower.vision_model.encoder.layers.{layer_idx}"
         target_base = f"decoder.layers.{layer_idx}"
-        
+
         for param_type in ["weight", "bias"]:
             # QKV
             q_proj_params = state_dict[f"{origin_base}.self_attn.q_proj.{param_type}"]
@@ -135,7 +135,7 @@ Convert SigLIP weights to megatron format.
 Example usage:
 python siglip_converter.py --tensor-parallel-size 4 --output google_paligemma_3b_pt_44_mcore_tp_4 --use-te
 
-examples/multimodal/combine_mistral_clip.sh /lustre/fsw/portfolios/llmservice/users/jbarker/workspace/checkpoints/Mistral-7B-Instruct-v0.3-mcore-tp4 google_paligemma_3b_pt_44_mcore_tp_4 mistral_7b_instruct_v0p3_google_paligemma_3b_pt_44_mcore_tp_4
+examples/multimodal/combine_mistral_clip.sh Mistral-7B-Instruct-v0.3-mcore-tp4 google_paligemma_3b_pt_44_mcore_tp_4 mistral_7b_instruct_v0p3_google_paligemma_3b_pt_44_mcore_tp_4
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

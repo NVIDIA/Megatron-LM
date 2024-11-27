@@ -1,15 +1,12 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
+from typing import List, Union
 import torch.distributed
 from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 from megatron.core.parallel_state import (
-    get_expert_model_parallel_group,
-    get_expert_model_parallel_groups,
     get_global_memory_buffer,
-    get_tensor_and_expert_parallel_group,
-    get_tensor_and_expert_parallel_groups,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_groups,
     get_tensor_model_parallel_rank,
@@ -17,7 +14,7 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.utils import is_torch_min_version
 
-from .utils import split_tensor_along_last_dim
+from .utils import get_group_world_size_and_rank, split_tensor_along_last_dim
 
 xm = get_xla_model()
 if is_torch_min_version("1.13.0"):
@@ -64,11 +61,17 @@ def _split_along_last_dim(input_):
     return output
 
 
-def _split_along_first_dim(input_):
+def _split_along_first_dim(input_, group: Union[torch.distributed.ProcessGroup, List[List[int]]]=None):
     """Split the tensor along its first dimension and keep the
     corresponding slice."""
+    if group is None:
+        group = get_tensor_model_parallel_group() if xm is None else get_tensor_model_parallel_groups()
+        world_size = get_tensor_model_parallel_world_size()
+        rank = get_tensor_model_parallel_rank()
+    else:
+        world_size, rank = get_group_world_size_and_rank(group=group)
 
-    world_size = get_tensor_model_parallel_world_size()
+
     # Bypass the function if we are using only 1 GPU.
     if world_size == 1:
         return input_
@@ -79,7 +82,6 @@ def _split_along_first_dim(input_):
         dim_size % world_size == 0
     ), "First dimension of the tensor should be divisible by tensor parallel size"
     local_dim_size = dim_size // world_size
-    rank = get_tensor_model_parallel_rank()
     dim_offset = rank * local_dim_size
 
     output = input_[dim_offset : dim_offset + local_dim_size].contiguous()
@@ -99,14 +101,14 @@ def _gather_along_last_dim(input_):
     dim_size[0] = dim_size[0] * world_size
 
     if xm:
-        output = xm.all_gather(input_.contiguous(), groups=get_tensor_model_parallel_groups())
+        output = xm.all_gather(input_.contiguous(), dim=-1, groups=get_tensor_model_parallel_groups())
     else:
         output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
         torch.distributed.all_gather_into_tensor(
             output, input_.contiguous(), group=get_tensor_model_parallel_group()
         )
-    tensor_list = output.chunk(world_size, dim=0)
-    output = torch.cat(tensor_list, dim=-1).contiguous()
+        tensor_list = output.chunk(world_size, dim=0)
+        output = torch.cat(tensor_list, dim=-1).contiguous()
 
     return output
 
@@ -125,7 +127,7 @@ def _reduce_scatter_along_last_dim(input_):
     return output
 
 
-def _gather_along_first_dim(input_, output_split_sizes=None):
+def _gather_along_first_dim(input_, group: Union[torch.distributed.ProcessGroup, List[List[int]]]=None, output_split_sizes=None, use_global_buffer=False):
     """Gather tensors and concatenate along the first dimension.
 
     Args:
@@ -139,7 +141,9 @@ def _gather_along_first_dim(input_, output_split_sizes=None):
         torch.Tensor: Gathered tensor.
     """
 
-    world_size = get_tensor_model_parallel_world_size()
+    if group is None:
+        group = get_tensor_model_parallel_group() if xm is None else get_tensor_model_parallel_groups()
+    world_size, _ = get_group_world_size_and_rank(group)
     # Bypass the function if we are using only 1 GPU.
     if world_size == 1:
         return input_
@@ -147,31 +151,35 @@ def _gather_along_first_dim(input_, output_split_sizes=None):
     dim_size = list(input_.size())
     if output_split_sizes is None:
         dim_size[0] = dim_size[0] * world_size
-
+    
         if xm:
-            output = xm.all_gather(input_.contiguous(), groups=get_tensor_model_parallel_groups())
+            output = xm.all_gather(input_.contiguous(), dim=0, groups=group)
         else:
-            output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
-            dist_all_gather_func(
-                output, input_.contiguous(), group=get_tensor_model_parallel_group()
-            )
+            if use_global_buffer:
+                output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
+            else:
+                output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
+            dist_all_gather_func(output, input_.contiguous(), group=group)
     else:
         dim_size[0] = sum(output_split_sizes)
-
         if xm:
-            output = xm.all_gather(input_.contiguous(), groups=get_tensor_model_parallel_groups())
+            output = xm.all_gather(input_.contiguous(), groups=group)
             output_tensor_list = list(torch.split(output, output_split_sizes, dim=0))
         else:
-            output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
+            if use_global_buffer:
+                output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
+            else:
+                output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
             output_tensor_list = list(torch.split(output, output_split_sizes, dim=0))
-            dist_all_gather_func(
-                output_tensor_list, input_, group=get_tensor_model_parallel_group()
-            )
+            torch.distributed.all_gather(output_tensor_list, input_, group=group)
+        output = torch.cat(output_tensor_list, dim=0).contiguous()
 
     return output
 
 
-def _reduce_scatter_along_first_dim(input_, input_split_sizes=None):
+def _reduce_scatter_along_first_dim(
+    input_, group: Union[torch.distributed.ProcessGroup, List[List[int]]]=None, input_split_sizes=None, use_global_buffer=False
+):
     """Reduce-scatter the input tensor across model parallel group.
 
     Args:
@@ -180,7 +188,9 @@ def _reduce_scatter_along_first_dim(input_, input_split_sizes=None):
             the input splits along the first dimension for each rank. If None,
             equal splitting is assumed. Default: None.
     """
-    world_size = get_tensor_model_parallel_world_size()
+    if group is None:
+        group = get_tensor_model_parallel_group() if xm is None else get_tensor_model_parallel_groups()
+    world_size, rank = get_group_world_size_and_rank(group)
     # Bypass the function if we are using only 1 GPU.
     if world_size == 1:
         return input_
@@ -193,91 +203,31 @@ def _reduce_scatter_along_first_dim(input_, input_split_sizes=None):
 
         dim_size[0] = dim_size[0] // world_size
 
+    
         if xm:
             output = xm.reduce_scatter(xm.REDUCE_SUM, input_.contiguous(), 1.0, 0, world_size,
-                                       groups=get_tensor_model_parallel_groups())
+                                       groups=group)
         else:
-            output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
-            dist_reduce_scatter_func(
-                output, input_.contiguous(), group=get_tensor_model_parallel_group()
-            )
+            if use_global_buffer:
+                output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
+            else:
+                output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
+            dist_reduce_scatter_func(output, input_.contiguous(), group=group)
     else:
-        rank = torch.distributed.get_rank(get_tensor_model_parallel_group())
         input_tensor_list = list(torch.split(input_, input_split_sizes, dim=0))
+
         if xm:
-            output = xm.reduce_scatter(xm.REDUCE_SUM, input_tensor_list, groups=get_tensor_model_parallel_groups())
+            output_tensor_list = xm.reduce_scatter(xm.REDUCE_SUM, input_tensor_list, 1.0, 0, world_size,
+                                       groups=group)
+            output = output_tensor_list[rank]
         else:
-            output = torch.empty_like(input_tensor_list[rank])
-            dist_reduce_scatter_func(
-                output, input_tensor_list, group=get_tensor_model_parallel_group()
-            )
-    return output
-
-
-def _gather_along_first_dim_moe(input_, use_global_buffer=False):
-    """Gather tensors and concatenate along the first dimension."""
-    group = get_tensor_and_expert_parallel_group()
-    world_size = torch.distributed.get_world_size(group=group)
-    # Bypass the function if we are using only 1 GPU.
-    if world_size == 1:
-        return input_
-
-    dim_size = list(input_.size())
-    dim_size[0] = dim_size[0] * world_size
-
-    if xm:
-        output = xm.all_gather(input, groups=get_tensor_and_expert_parallel_groups())
-    else:
-        if use_global_buffer:
-            output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
-        else:
-            output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
-        dist_all_gather_func(output, input_.contiguous(), group=group)
-
-    return output
-
-
-def _reduce_scatter_along_first_dim_moe(input_, use_global_buffer=False):
-    """Reduce-scatter the input tensor across model parallel group."""
-    group = get_tensor_and_expert_parallel_group()
-    world_size = torch.distributed.get_world_size(group=group)
-    # Bypass the function if we are using only 1 GPU.
-    if world_size == 1:
-        return input_
-
-    dim_size = list(input_.size())
-    assert dim_size[0] % world_size == 0
-    dim_size[0] = dim_size[0] // world_size
-
-    if xm:
-        output = xm.reduce_scatter(xm.REDUCE_SUM, input_.contiguous(), 1.0, 0, world_size,
-                                   groups=get_tensor_and_expert_parallel_groups())
-    else:
-        if use_global_buffer:
-            output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
-        else:
-            output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
-        dist_reduce_scatter_func(output, input_.contiguous(), group=group)
-    return output
-
-
-def _gather_along_first_dim_expert_parallel(input_):
-    """Gather tensors and concatenate along the first dimension."""
-    group = get_expert_model_parallel_group()
-    world_size = torch.distributed.get_world_size(group=group)
-    # Bypass the function if we are using only 1 GPU.
-    if world_size == 1:
-        return input_
-
-    dim_size = list(input_.size())
-    dim_size[0] = dim_size[0] * world_size
-
-    if xm:
-        output = xm.all_gather(input, groups=get_expert_model_parallel_groups())
-    else:
-        output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
-        dist_all_gather_func(output, input_.contiguous(), group=group)
-
+            if use_global_buffer:
+                output = get_global_memory_buffer().get_tensor(
+                    input_tensor_list[rank].shape, input_.dtype, "mpu"
+                )
+            else:
+                output = torch.empty_like(input_tensor_list[rank])
+            torch.distributed.reduce_scatter(output, input_tensor_list, group=group)
     return output
 
 
@@ -380,16 +330,32 @@ class _GatherFromSequenceParallelRegion(torch.autograd.Function):
     """Gather the input from sequence parallel region and concatinate."""
 
     @staticmethod
-    def symbolic(graph, input_, tensor_parallel_output_grad=True, output_split_sizes=None):
+    def symbolic(
+        graph,
+        input_,
+        tensor_parallel_output_grad=True,
+        group: Union[torch.distributed.ProcessGroup, List[List[int]]]=None,
+        output_split_sizes=None,
+        use_global_buffer=False,
+    ):
         """Symbolic function for tracing."""
-        return _gather_along_first_dim(input_, output_split_sizes)
+        return _gather_along_first_dim(input_, group, output_split_sizes, use_global_buffer)
 
     @staticmethod
-    def forward(ctx, input_, tensor_parallel_output_grad=True, output_split_sizes=None):
+    def forward(
+        ctx,
+        input_,
+        tensor_parallel_output_grad=True,
+        group: Union[torch.distributed.ProcessGroup, List[List[int]]]=None,
+        output_split_sizes=None,
+        use_global_buffer=False,
+    ):
         """Forward function."""
         ctx.tensor_parallel_output_grad = tensor_parallel_output_grad
+        ctx.group = group
         ctx.output_split_sizes = output_split_sizes
-        return _gather_along_first_dim(input_, ctx.output_split_sizes)
+        ctx.use_global_buffer = use_global_buffer
+        return _gather_along_first_dim(input_, group, output_split_sizes, use_global_buffer)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -402,76 +368,46 @@ class _GatherFromSequenceParallelRegion(torch.autograd.Function):
         # output gradients need to be scattered.
         if tensor_parallel_output_grad:
             return (
-                _reduce_scatter_along_first_dim(grad_output, ctx.output_split_sizes),
+                _reduce_scatter_along_first_dim(
+                    grad_output, ctx.group, ctx.output_split_sizes, ctx.use_global_buffer
+                ),
+                None,
+                None,
                 None,
                 None,
             )
         else:
             assert ctx.output_split_sizes is None
-            return _split_along_first_dim(grad_output), None, None
+            return _split_along_first_dim(grad_output, ctx.group), None, None, None, None
 
 
 class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
     """Reduce scatter the input from the model parallel region."""
 
     @staticmethod
-    def symbolic(graph, input_, input_split_sizes=None):
+    def symbolic(graph, input_, group: Union[torch.distributed.ProcessGroup, List[List[int]]]=None, input_split_sizes=None, use_global_buffer=False):
         """Symbolic function for tracing."""
-        return _reduce_scatter_along_first_dim(input_, input_split_sizes)
+        return _reduce_scatter_along_first_dim(input_, group, input_split_sizes, use_global_buffer)
 
     @staticmethod
-    def forward(ctx, input_, input_split_sizes=None):
+    def forward(ctx, input_, group: Union[torch.distributed.ProcessGroup, List[List[int]]]=None, input_split_sizes=None, use_global_buffer=False):
         """Forward function."""
+        ctx.group = group
         ctx.input_split_sizes = input_split_sizes
-        return _reduce_scatter_along_first_dim(input_, input_split_sizes)
+        ctx.use_global_buffer = use_global_buffer
+        return _reduce_scatter_along_first_dim(input_, group, input_split_sizes, use_global_buffer)
 
     @staticmethod
     def backward(ctx, grad_output):
         """Backward function."""
         input_split_sizes = ctx.input_split_sizes
-        return _gather_along_first_dim(grad_output, input_split_sizes), None
-
-
-class _GatherFromSequenceParallelRegionToMOE(torch.autograd.Function):
-    """Gather the input from model parallel region and concatenate."""  # TODO
-
-    @staticmethod
-    def symbolic(graph, input_, use_global_buffer=False):
-        """Symbolic function for tracing."""
-        return _gather_along_first_dim_moe(input_, use_global_buffer)
-
-    @staticmethod
-    def forward(ctx, input_, use_global_buffer=False):
-        """Forward function."""
-        ctx.use_global_buffer = use_global_buffer
-        return _gather_along_first_dim_moe(input_, use_global_buffer)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Backward function."""
         use_global_buffer = ctx.use_global_buffer
-        return _reduce_scatter_along_first_dim_moe(grad_output, use_global_buffer), None
-
-
-class _ReduceScatterToSequenceParallelRegionFromMOE(torch.autograd.Function):
-    """Reduce scatter the input from the model parallel region."""
-
-    @staticmethod
-    def symbolic(graph, input_, use_global_buffer=False):
-        """Symbolic function for tracing."""
-        return _reduce_scatter_along_first_dim_moe(input_, use_global_buffer)
-
-    @staticmethod
-    def forward(ctx, input_, use_global_buffer=False):
-        """Forward function."""
-        ctx.use_global_buffer = use_global_buffer
-        return _reduce_scatter_along_first_dim_moe(input_, use_global_buffer)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Backward function."""
-        use_global_buffer = ctx.use_global_buffer
-        return _gather_along_first_dim_moe(grad_output, use_global_buffer), None
+        return (
+            _gather_along_first_dim(grad_output, ctx.group, input_split_sizes, use_global_buffer),
+            None,
+            None,
+            None,
+        )
 
 
 class _AllGatherFromTensorParallelRegion(torch.autograd.Function):
@@ -514,35 +450,39 @@ class _ReduceScatterToTensorParallelRegion(torch.autograd.Function):
 
 class _AllToAll(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, group, input, output_split_sizes, input_split_sizes):
+    def forward(ctx, group: Union[torch.distributed.ProcessGroup, List[List[int]]], input, output_split_sizes, input_split_sizes):
         """Forward function."""
         ctx.group = group
         ctx.output_split_sizes = output_split_sizes
         ctx.input_split_sizes = input_split_sizes
 
-        world_size = torch.distributed.get_world_size(group=group)
+        world_size, _ = get_group_world_size_and_rank(group=group)
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input
 
         input = input.contiguous()
-        if output_split_sizes is None:
-            # Equal split (all2all)
-            output = torch.empty_like(input)
+        if xm:
+            output = xm.all_gather(input, dim=0, groups=group)
+            xm.all_reduce(xm.REDUCE_SUM, [output], groups=group)
         else:
-            # Unequal split (all2all-v)
-            output = input.new_empty(
-                size=[sum(output_split_sizes)] + list(input.size()[1:]),
-                dtype=input.dtype,
-                device=get_current_device(),
+            if output_split_sizes is None:
+                # Equal split (all2all)
+                output = torch.empty_like(input)
+            else:
+                # Unequal split (all2all-v)
+                output = input.new_empty(
+                    size=[sum(output_split_sizes)] + list(input.size()[1:]),
+                    dtype=input.dtype,
+                    device=get_current_device(),
+                )
+            torch.distributed.all_to_all_single(
+                output,
+                input,
+                output_split_sizes=output_split_sizes,
+                input_split_sizes=input_split_sizes,
+                group=group,
             )
-        torch.distributed.all_to_all_single(
-            output,
-            input,
-            output_split_sizes=output_split_sizes,
-            input_split_sizes=input_split_sizes,
-            group=group,
-        )
         return output
 
     @staticmethod
@@ -562,65 +502,63 @@ class _AllToAll(torch.autograd.Function):
 
 
 def copy_to_tensor_model_parallel_region(input_):
-    """Wrapper for autograd function"""
+    """Wrapper for autograd function: forward: copy, backward allreduce"""
     return _CopyToModelParallelRegion.apply(input_)
 
 
 def reduce_from_tensor_model_parallel_region(input_):
-    """Wrapper for autograd function"""
+    """Wrapper for autograd function: forward: all reduce, backward copy"""
     return _ReduceFromModelParallelRegion.apply(input_)
 
 
 def scatter_to_tensor_model_parallel_region(input_):
-    """Wrapper for autograd function"""
+    """Wrapper for autograd function: forward: RS, backward: AG <last dim>"""
     return _ScatterToModelParallelRegion.apply(input_)
 
 
 def gather_from_tensor_model_parallel_region(input_):
-    """Wrapper for autograd function"""
+    """Wrapper for autograd function: forward: AG, backward: split <last dim>"""
     return _GatherFromModelParallelRegion.apply(input_)
 
 
 def scatter_to_sequence_parallel_region(input_):
-    """Wrapper for autograd function"""
+    """Wrapper for autograd function: forward: split, backward: AG <last dim>"""
     return _ScatterToSequenceParallelRegion.apply(input_)
 
 
 def gather_from_sequence_parallel_region(
-    input_, tensor_parallel_output_grad=True, output_split_sizes=None
+    input_,
+    tensor_parallel_output_grad=True,
+    group: Union[torch.distributed.ProcessGroup, List[List[int]]]=None,
+    output_split_sizes=None,
+    use_global_buffer=False,
 ):
-    """Wrapper for autograd function"""
+    """Wrapper for autograd function: forward: AG, backward: RS <first dim>"""
     return _GatherFromSequenceParallelRegion.apply(
-        input_, tensor_parallel_output_grad, output_split_sizes
+        input_, tensor_parallel_output_grad, group, output_split_sizes, use_global_buffer
     )
 
 
-def reduce_scatter_to_sequence_parallel_region(input_, input_split_sizes=None):
-    """Wrapper for autograd function"""
-    return _ReduceScatterToSequenceParallelRegion.apply(input_, input_split_sizes)
-
-
-def gather_from_sequence_parallel_region_to_moe(input_, use_global_buffer=False):
-    """Wrapper for autograd function"""
-    return _GatherFromSequenceParallelRegionToMOE.apply(input_, use_global_buffer)
-
-
-def reduce_scatter_to_sequence_parallel_region_from_moe(input_, use_global_buffer=False):
-    """Wrapper for autograd function"""
-    return _ReduceScatterToSequenceParallelRegionFromMOE.apply(input_, use_global_buffer)
+def reduce_scatter_to_sequence_parallel_region(
+    input_, group: Union[torch.distributed.ProcessGroup, List[List[int]]]=None, input_split_sizes=None, use_global_buffer=False
+):
+    """Wrapper for autograd function: forward: RS, backward AG <fisrt dim>"""
+    return _ReduceScatterToSequenceParallelRegion.apply(
+        input_, group, input_split_sizes, use_global_buffer
+    )
 
 
 def all_gather_last_dim_from_tensor_parallel_region(input_):
-    """Wrapper for autograd function"""
+    """Wrapper for autograd function: forward: AG, backward RS <last dim>"""
     return _AllGatherFromTensorParallelRegion.apply(input_)
 
 
 def reduce_scatter_last_dim_to_tensor_parallel_region(input_):
-    """Wrapper for autograd function"""
+    """Wrapper for autograd function: forward: RS, backward AG: AG <last dim>"""
     return _ReduceScatterToTensorParallelRegion.apply(input_)
 
 
-def all_to_all(group, input_, output_split_sizes_=None, input_split_sizes=None):
+def all_to_all(group: Union[torch.distributed.ProcessGroup, List[List[int]]], input_, output_split_sizes_=None, input_split_sizes=None):
     """Wrapper for autograd function"""
     return _AllToAll.apply(group, input_, output_split_sizes_, input_split_sizes)
 

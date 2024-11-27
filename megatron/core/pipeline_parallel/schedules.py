@@ -1516,7 +1516,7 @@ def get_tensor_shapes(
             )
 
     if model_type == ModelType.encoder_and_decoder:
-        if parallel_state.is_inside_encoder(rank):
+        if parallel_state.is_inside_encoder(rank) and not parallel_state.is_inside_decoder(rank):
             tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
         elif encoder_decoder_xattn:
             tensor_shapes.append((decoder_seq_length, micro_batch_size, config.hidden_size))

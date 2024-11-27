@@ -2,13 +2,13 @@
 
 """Gradient clipping."""
 
-import os
 from typing import List, Optional, Union
 
 import torch
 from torch import inf
 
 from megatron.core.device_utils import get_current_device, get_xla_model
+from megatron.core.parallel_state import get_data_parallel_groups
 
 try:
     from transformer_engine.pytorch.optimizers import (
@@ -49,12 +49,14 @@ except ImportError:
 
 from ..tensor_parallel import param_is_not_tensor_parallel_duplicate
 from ..transformer.module import param_is_not_shared
+from ..utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
 
+xm = get_xla_model()
 
 def get_grad_norm_fp32(
     grads_for_norm: Union[List[torch.Tensor], torch.Tensor],
     norm_type: Union[int, float] = 2,
-    model_parallel_group: Optional[Union[torch.distributed.ProcessGroup, List[List[int]]]] = None,
+    grad_stats_parallel_group: Optional[Union[torch.distributed.ProcessGroup, List[List[int]]]] = None,
 ) -> float:
     """Calculate the norm of gradients in fp32.
 
@@ -66,8 +68,9 @@ def get_grad_norm_fp32(
             Tensor that will be used for calculating the grad norm.
         norm_type (float or int): type of the used p-norm. Can be ``'inf'`` for
             infinity norm.
-        model_parallel_group (group): given the nature of the distributed
-            optimizer, this is passed as an argument.
+        grad_stats_parallel_group (group): Process group for reducing the grad norms. This is
+            generally the model-parallel group for non-distributed optimizers, and the entire
+            world for the distributed optimizer.
 
     Returns:
         Total norm of the parameters (viewed as a single vector).
@@ -75,6 +78,12 @@ def get_grad_norm_fp32(
 
     if isinstance(grads_for_norm, torch.Tensor):
         grads_for_norm = [grads_for_norm]
+
+    data_parallel_group = None
+    for grad in grads_for_norm:
+        data_parallel_group = get_data_parallel_group_if_dtensor(grad, data_parallel_group)
+
+    grads_for_norm = [to_local_if_dtensor(grad) for grad in grads_for_norm]
 
     # Norm parameters.
     norm_type = float(norm_type)
@@ -85,15 +94,21 @@ def get_grad_norm_fp32(
         total_norm = max(grad.abs().max() for grad in grads_for_norm)
         total_norm_device = torch.tensor([float(total_norm)], dtype=torch.float, device=get_current_device())
         # Take max across all model-parallel GPUs.
-        xm = get_xla_model()
+        if data_parallel_group:
+            if xm:
+                xm.all_reduce(xm.REDUCE_MAX, [total_norm_device], groups=get_data_parallel_groups())
+            else:
+                torch.distributed.all_reduce(
+                    total_norm_device, op=torch.distributed.ReduceOp.MAX, group=data_parallel_group
+                )
+
         if xm:
-            xm.all_reduce(xm.REDUCE_MAX, [total_norm_device], groups=model_parallel_group)
+            xm.all_reduce(xm.REDUCE_MAX, [total_norm_device], groups=grad_stats_parallel_group)
         else:
             torch.distributed.all_reduce(
-                total_norm_device, op=torch.distributed.ReduceOp.MAX, group=model_parallel_group
+                total_norm_device, op=torch.distributed.ReduceOp.MAX, group=grad_stats_parallel_group
             )
         total_norm = total_norm_device[0].item()
-
     else:
         if norm_type == 2.0:
             dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device=get_current_device())
@@ -118,12 +133,19 @@ def get_grad_norm_fp32(
                 grad_norm = torch.norm(grad, norm_type)
                 total_norm += grad_norm**norm_type
 
-        # Sum across all model-parallel GPUs.
+        # Sum across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
+        if data_parallel_group:
+            if xm:
+                xm.all_reduce(xm.REDUCE_SUM, [total_norm], groups=get_data_parallel_groups())
+            else:
+                torch.distributed.all_reduce(
+                    total_norm, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
+                )
         if xm:
-            xm.all_reduce(xm.REDUCE_SUM, [total_norm], groups=model_parallel_group)
+            xm.all_reduce(xm.REDUCE_SUM, [total_norm], groups=grad_stats_parallel_group)
         else:
             torch.distributed.all_reduce(
-                total_norm, op=torch.distributed.ReduceOp.SUM, group=model_parallel_group
+                total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
             )
         total_norm = total_norm.item() ** (1.0 / norm_type)
 
@@ -146,12 +168,14 @@ def clip_grad_by_total_norm_fp32(
         total_norm (float): total norm of the gradients.
     """
     # Grads.
+    params = []
     grads = []
     for param in parameters:
         if param.grad is not None:
             param_type = param.type().split('.')[-1]
             assert param_type == 'FloatTensor'
-            grads.append(param.grad.detach())
+            params.append(param)
+            grads.append(to_local_if_dtensor(param.grad).detach())
 
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
@@ -164,7 +188,7 @@ def clip_grad_by_total_norm_fp32(
 
 def count_zeros_fp32(
     parameters: Union[List[torch.Tensor], torch.Tensor],
-    model_parallel_group: torch.distributed.ProcessGroup,
+    grad_stats_parallel_group: torch.distributed.ProcessGroup,
 ) -> float:
     """Counts the number of zeros in gradients associated with the passed-in list of
     parameters.
@@ -173,8 +197,9 @@ def count_zeros_fp32(
         parameters (Iterable[Tensor] or Tensor): an iterable of Tensors or a
             single Tensor that will have the number of zeros in its corresponding
             gradient counted.
-        model_parallel_group (torch.distributed.ProcessGroup, optional): model-parallel
-            group over which grad norm needs to be aggregated.
+        grad_stats_parallel_group (group): Process group for reducing the num_zeros count. This is
+            generally the model-parallel group for non-distributed optimizers, and the entire
+            world for the distributed optimizer.
     """
 
     if isinstance(parameters, torch.Tensor):
@@ -185,24 +210,34 @@ def count_zeros_fp32(
     #   - parameter should not be shared
     #   - should not be a replica due to tensor model parallelism
     total_num_zeros = torch.tensor([0.0], dtype=torch.float, device=get_current_device())
+    data_parallel_group = None
     for param in parameters:
         grad_not_none = param.grad is not None
         is_not_shared = param_is_not_shared(param)
         is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
         if grad_not_none and is_not_shared and is_not_tp_duplicate:
-            grad = param.grad.detach()
+            data_parallel_group = get_data_parallel_group_if_dtensor(
+                param.grad, data_parallel_group
+            )
+            grad = to_local_if_dtensor(param.grad).detach()
             num_zeros = grad.numel() - torch.count_nonzero(grad)
             total_num_zeros = num_zeros + total_num_zeros
 
+    # Sum across all data-parallel GPUs if using FSDP.
+    if data_parallel_group:
+        if xm:
+            xm.all_reduce(xm.REDUCE_SUM, [total_num_zeros], groups=get_data_parallel_groups())
+        else:
+            torch.distributed.all_reduce(
+                total_num_zeros, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
+            )
     # Sum across all model-parallel GPUs.
-    xm = get_xla_model()
     if xm:
-        xm.all_reduce(xm.REDUCE_SUM, [total_num_zeros], groups=model_parallel_group)
+        xm.all_reduce(xm.REDUCE_SUM, [total_num_zeros], groups=grad_stats_parallel_group)
     else:
         torch.distributed.all_reduce(
-            total_num_zeros, op=torch.distributed.ReduceOp.SUM, group=model_parallel_group
+            total_num_zeros, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
         )
-
     total_num_zeros = total_num_zeros.item()
 
     return total_num_zeros

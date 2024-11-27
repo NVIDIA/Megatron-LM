@@ -98,7 +98,7 @@ class TestBertModel:
         assert logits[0].shape[1] == sequence_length
         assert logits[0].shape[2] == self.bert_model.vocab_size
 
-@pytest.mark.skipif(not HAVE_TE, reason="TE required for this test")
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine required for this test")
 class TestBertModelAttentionDimensions:
 
     def teardown_method(self, method):
@@ -164,8 +164,8 @@ class TestBertModelAttentionDimensions:
             attn_mask_dimensions == "b11s"
         ), f"Expected b11s for attn_mask_dimensions but got {attn_mask_dimensions}"
 
-    @pytest.mark.skipif(reason="Not applicable")
     @pytest.mark.internal
+    @pytest.mark.skip("Not applicable to code")
     def test_transformer_engine_version_1_7_to_1_10_rng_error(self, mocker):
         os.environ['NVTE_FLASH_ATTN'] = '0'
         os.environ['NVTE_FUSED_ATTN'] = '0'

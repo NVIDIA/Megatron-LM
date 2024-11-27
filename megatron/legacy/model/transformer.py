@@ -25,16 +25,16 @@ from megatron.core.models.common.embeddings import apply_rotary_pos_emb
 from megatron.core.jit import jit_fuser
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.parallel_state import (
-    get_tensor_and_expert_parallel_group,
-    get_tensor_model_parallel_group,
+    get_expert_tensor_and_model_parallel_group,
 )
 from megatron.core.tensor_parallel import (
-    gather_from_sequence_parallel_region_to_moe,
-    reduce_scatter_to_sequence_parallel_region_from_moe,
     get_device_rng_tracker,
-    get_data_parallel_rng_tracker_name
+    get_data_parallel_rng_tracker_name,
+    gather_from_sequence_parallel_region,
+    reduce_scatter_to_sequence_parallel_region,
+    get_device_rng_tracker,
+    get_data_parallel_rng_tracker_name,
 )
-from megatron.core.parallel_state import get_tensor_and_expert_parallel_groups, get_tensor_model_parallel_group, get_tensor_and_expert_parallel_group
 from megatron.core.jit import jit_fuser
 
 from megatron.legacy.model.enums import AttnMaskType, AttnType, LayerType
@@ -231,10 +231,11 @@ class SwitchMLP(MegatronModule):
         for i in range(self.num_local_experts):
             self.local_experts.append(ParallelMLP(config, is_expert=True))
 
+        self.tp_ep_group = get_expert_tensor_and_model_parallel_group()
+
     def gather_indices(self, local_indices):
         """ Gather tensors and concatinate along the first dimension."""
-        group = get_tensor_and_expert_parallel_group()
-        world_size = torch.distributed.get_world_size(group=group)
+        world_size = torch.distributed.get_world_size(group=self.tp_ep_group)
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return local_indices
@@ -242,16 +243,12 @@ class SwitchMLP(MegatronModule):
         dim_size = list(local_indices.size())
         dim_size[0] = dim_size[0] * world_size
 
-        if xm:
-            groups = get_tensor_and_expert_parallel_groups()
-            output = xm.all_gather(local_indices.contiguous(), groups=groups)
-        else:
-            # TODO pre allocate memory
-            output = torch.empty(dim_size, dtype=local_indices.dtype,
-                                device=get_current_device())
-            torch.distributed.all_gather_into_tensor(
-                output, local_indices.contiguous(), group=group
-            )
+        # TODO pre allocate memory
+        output = torch.empty(dim_size, dtype=local_indices.dtype,
+                             device=torch.cuda.current_device())
+        torch.distributed._all_gather_base(
+            output, local_indices.contiguous(), group=self.tp_ep_group
+        )
         return output
 
     def forward(self, hidden_states):
@@ -283,7 +280,7 @@ class SwitchMLP(MegatronModule):
         # Each vector could be routed differently
         if self.sequence_parallel or (self.expert_parallel_size > 1):
             global_hidden_states = \
-                gather_from_sequence_parallel_region_to_moe(hidden_states)
+                gather_from_sequence_parallel_region(hidden_states, group=self.tp_ep_group)
             global_indices = self.gather_indices(max_ind)
         else:
             global_hidden_states = hidden_states
@@ -305,10 +302,10 @@ class SwitchMLP(MegatronModule):
 
         if self.sequence_parallel or (self.expert_parallel_size > 1):
             output_total = \
-                reduce_scatter_to_sequence_parallel_region_from_moe(output_total)
+                reduce_scatter_to_sequence_parallel_region(output_total, group=self.tp_ep_group)
             if self.add_bias:
                 output_bias_total = \
-                    reduce_scatter_to_sequence_parallel_region_from_moe(output_bias_total)
+                    reduce_scatter_to_sequence_parallel_region(output_bias_total, group=self.tp_ep_group)
 
                 # bias is duplicated across tensor parallelism ranks;
                 # reduce scatter reduces bias across tensor parallel_ranks

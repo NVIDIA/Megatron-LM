@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from megatron.core.tensor_parallel import mappings
@@ -95,6 +96,7 @@ def test_ScatterToSequenceParallelRegion():
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.internal
 def test_GatherFromSequenceParallelRegion():
     Utils.initialize_model_parallel(4,2)
     input_data = torch.ones(4).to(device=get_current_device()) * Utils.rank
@@ -116,6 +118,8 @@ def test_GatherFromSequenceParallelRegion():
     class Ctx:
         tensor_parallel_output_grad = True
         output_split_sizes = None
+        group = None
+        use_global_buffer = False
 
     output_data = mappings._GatherFromSequenceParallelRegion.backward(Ctx(), input_data)
     expected_output = torch.ones((1,4)).to(device=get_current_device()) * 4 * int(Utils.rank % 4)
@@ -123,6 +127,7 @@ def test_GatherFromSequenceParallelRegion():
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.internal
 def test_ReduceScatterToSequenceParallelRegion():
     Utils.initialize_model_parallel(4,2)
     input_data = torch.vstack((
@@ -138,14 +143,14 @@ def test_ReduceScatterToSequenceParallelRegion():
 
     class Ctx:
         input_split_sizes = None
+        group = None
+        use_global_buffer = False
 
-    output_data, _ = mappings._ReduceScatterToSequenceParallelRegion.backward(Ctx(),input_data)
-    expected_output = torch.concat((
-        torch.ones(4)*0,
-        torch.ones(4)*1,
-        torch.ones(4)*2,
-        torch.ones(4)*3)).to(device=get_current_device())
-    if (Utils.rank >= 4):
+    output_data = mappings._ReduceScatterToSequenceParallelRegion.backward(Ctx(), input_data)
+    expected_output = torch.concat(
+        (torch.ones(4) * 0, torch.ones(4) * 1, torch.ones(4) * 2, torch.ones(4) * 3)
+    ).to(device=get_current_device())
+    if Utils.rank >= 4:
         expected_output = expected_output + 4
-    assert torch.equal(output_data, expected_output)
+    assert torch.equal(output_data[0], expected_output)
     Utils.destroy_model_parallel()

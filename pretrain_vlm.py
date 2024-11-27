@@ -49,9 +49,17 @@ def model_provider(
     args = get_args()
     vision_model_type = "clip"
 
+    assert args.ckpt_format == 'torch', "Only ckpt-format torch is supported for VLM training currently."
+
+    if args.pipeline_model_parallel_size > 1:
+        assert not args.freeze_LM, "Freezing a pipeline parallel language model is not currently supported"
+
+    if args.encoder_pipeline_model_parallel_size == 1:
+        assert not args.freeze_ViT, "Freezing a vision encoder on its own pipeline rank is not currently supported"
+
     num_image_embeddings = get_num_image_embeddings(
         args.img_h, args.img_w, args.patch_dim, vision_model_type, args.disable_vision_class_token,
-        class_token_len=1, pixel_shuffle=False,
+        class_token_len=1, pixel_shuffle=False, use_tile_tags=False
     )
 
     old_seq_length = args.seq_length
