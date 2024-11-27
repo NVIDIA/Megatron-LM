@@ -192,6 +192,15 @@ class TRTLLMHelper:
                                            * config["state_size"])
             config["use_bias"] = config["bias"]
             config["hybrid_override_pattern"] = self.hybrid_override_pattern
+            layer_types = []
+            for k in config['hybrid_override_pattern']:
+                if k == '*':
+                    layer_types.append('attention')
+                elif k == 'M':
+                    layer_types.append('recurrent')
+                else:
+                    layer_types.append('-')
+            config['layer_types'] = layer_types
             config["ssm_rmsnorm"] =  True
 
         if self.seq_len_interpolation_factor is not None:
