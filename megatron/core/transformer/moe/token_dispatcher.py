@@ -5,9 +5,16 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from megatron.core import parallel_state, tensor_parallel
-from megatron.core.tensor_parallel.mappings import (
-    _gather_along_first_dim_moe,
+from megatron.core.parallel_state import (
+    get_expert_model_parallel_group,
+    get_expert_model_parallel_world_size,
+    get_expert_tensor_and_model_parallel_group,
+    get_expert_tensor_parallel_group,
+    get_expert_tensor_parallel_rank,
+    get_expert_tensor_parallel_world_size,
+)
+from megatron.core.tensor_parallel import (
+    all_to_all,
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
@@ -42,6 +49,14 @@ class MoETokenDispatcher:
         """
         self.config = config
         self.shared_experts: Optional[SharedExpertMLP] = None
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            self.ep_group = get_expert_model_parallel_group()
+            self.ep_size = get_expert_model_parallel_world_size()
+            self.tp_group = get_expert_tensor_parallel_group()
+            self.tp_size = get_expert_tensor_parallel_world_size()
+            self.tp_rank = get_expert_tensor_parallel_rank()
+            self.tp_ep_group = get_expert_tensor_and_model_parallel_group()
 
     @abstractmethod
     def token_permutation(
@@ -131,25 +146,23 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
         # Permute the tokens across the expert parallel devices.
-        if (self.config.tensor_model_parallel_size > 1) or (
-            self.config.expert_model_parallel_size > 1
-        ):
+        if self.tp_size > 1 or self.ep_size > 1:
             ## local_indices calculation
             with torch.no_grad():
                 # [num_local_tokens, num_experts] -> [num_global_tokens, num_experts], where:
                 #     num_local_tokens=(S/TP)*B, num_global_tokens=S*B*EP
-                routing_map = tensor_parallel.gather_from_sequence_parallel_region_to_moe(
-                    routing_map
+                routing_map = gather_from_sequence_parallel_region(
+                    routing_map, group=self.tp_ep_group
                 )
 
             ## local_probs calculation
             # max_prob: [S/TP*B, num_experts] -> global_probs: [S*B*EP, num_experts]
-            probs = tensor_parallel.gather_from_sequence_parallel_region_to_moe(probs)
+            probs = gather_from_sequence_parallel_region(probs, group=self.tp_ep_group)
 
             # Note that this allgather spans the communication domain of TP*EP.
             #  [(S/TP)*B, H] -> [((S/TP)*B)*(TP*EP), H] = [S*B*EP, H]
-            hidden_states = tensor_parallel.gather_from_sequence_parallel_region_to_moe(
-                hidden_states, use_global_buffer=True
+            hidden_states = gather_from_sequence_parallel_region(
+                hidden_states, group=self.tp_ep_group, use_global_buffer=True
             )
         self.hidden_shape_before_permute = hidden_states.shape
 
@@ -210,20 +223,18 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         output_bias_total = unpermuted_local_bias
 
         # Unpermute the tokens across ranks.
-        if (self.config.tensor_model_parallel_size > 1) or (
-            self.config.expert_model_parallel_size > 1
-        ):
-            output_total = tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
-                output_total
+        if self.tp_size > 1 or self.ep_size > 1:
+            output_total = reduce_scatter_to_sequence_parallel_region(
+                output_total, group=self.tp_ep_group
             )
             if self.add_bias:
                 # Unpermute the bias across expert parallel devices.
                 # bias is duplicated across tensor parallelism ranks;
                 output_bias_total = (
-                    tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
-                        output_bias_total
+                    reduce_scatter_to_sequence_parallel_region(
+                        output_bias_total, group=self.tp_ep_group
                     )
-                    / parallel_state.get_tensor_model_parallel_world_size()
+                    / self.tp_size
                 )
 
         output_total = output_total.view(self.hidden_shape)
@@ -236,6 +247,11 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
 class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
     """
     AlltoAll-based token dispatcher.
+
+    The workflow of AlltoAll token dispatcher is as follows:
+    (1) preprocess(): calculate necessary metadata for communication and permute
+    (2) token_permutation(): permute->A2A(EP)->AG(TP)->sort_chunk(if num_local_experts>1)
+    (3) token_unpermutation(): sort_chunk(if num_local_experts>1)->RS(TP)->A2A(EP)->unpermute
     """
 
     def __init__(
@@ -262,8 +278,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             assert (
                 self.local_expert_indices[i] == self.local_expert_indices[i + 1] - 1
             ), "local_expert_indices must be continous"
-        self.ep_size = config.expert_model_parallel_size
-        self.tp_size = config.tensor_model_parallel_size
         self.probs = None
 
         # [ep_size]. Represents the number of tokens sent by the current rank to other
@@ -324,7 +338,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # [num_experts], number of tokens assigned to each expert from the current rank's input.
         num_local_tokens_per_expert = routing_map.sum(dim=0).long()
 
-        tp_rank = parallel_state.get_tensor_model_parallel_rank()
         if self.drop_and_pad:
             # Drop and pad the input to capacity.
             num_tokens = routing_map.size(0) * self.config.moe_router_topk
@@ -380,7 +393,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             # expert by all ranks.
             # [tp_size, ep_size, num_experts]
             num_global_tokens_per_expert = (
-                _gather_along_first_dim_moe(num_local_tokens_per_expert)
+                gather_from_sequence_parallel_region(
+                    num_local_tokens_per_expert, group=self.tp_ep_group
+                )
                 .reshape(self.ep_size, self.tp_size, self.num_experts)
                 .transpose(0, 1)
             )
@@ -394,7 +409,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             # self.output_splits represents the number of tokens received by the current rank
             # from other EP rank.
             self.output_splits = (
-                num_global_tokens_per_rank[tp_rank]
+                num_global_tokens_per_rank[self.tp_rank]
                 .to(torch.device("cpu"), non_blocking=True)
                 .numpy()
             )
@@ -471,18 +486,16 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # Perform expert parallel AlltoAll communication
         if self.cuda_sync_point == "before_ep_alltoall":
             torch.cuda.current_stream().synchronize()
-        global_input_tokens = tensor_parallel.all_to_all(
-            parallel_state.get_expert_model_parallel_group(),
-            permutated_local_input_tokens,
-            self.output_splits,
-            self.input_splits,
+        global_input_tokens = all_to_all(
+            self.ep_group, permutated_local_input_tokens, self.output_splits, self.input_splits
         )
         if self.shared_experts is not None:
             self.shared_experts.linear_fc1_forward_and_act(global_input_tokens)
 
-        if parallel_state.get_tensor_model_parallel_world_size() > 1:
+        if self.tp_size > 1:
             global_input_tokens = gather_from_sequence_parallel_region(
                 global_input_tokens,
+                group=self.tp_group,
                 output_split_sizes=(
                     self.output_splits_tp.tolist() if self.output_splits_tp is not None else None
                 ),
@@ -502,7 +515,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         return global_input_tokens, tokens_per_expert
 
     def token_unpermutation(
-        self, hidden_states: torch.Tensor, bias: torch.Tensor = None
+        self, hidden_states: torch.Tensor, bias: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Reverse the token permutation to restore the original order.
@@ -531,9 +544,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 self.restore_output_by_local_experts,
             )
 
-        if parallel_state.get_tensor_model_parallel_world_size() > 1:
+        if self.tp_size > 1:
             hidden_states = reduce_scatter_to_sequence_parallel_region(
                 hidden_states,
+                group=self.tp_group,
                 input_split_sizes=(
                     self.output_splits_tp.tolist() if self.output_splits_tp is not None else None
                 ),
@@ -541,11 +555,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         # Perform expert parallel AlltoAll communication
         # hidden_states: [SEQL, H] -> [SEQL, H/TP]
-        permutated_local_input_tokens = tensor_parallel.all_to_all(
-            parallel_state.get_expert_model_parallel_group(),
-            hidden_states,
-            self.input_splits,
-            self.output_splits,
+        permutated_local_input_tokens = all_to_all(
+            self.ep_group, hidden_states, self.input_splits, self.output_splits
         )
         if self.shared_experts is not None:
             self.shared_experts.linear_fc2_forward(permutated_local_input_tokens)

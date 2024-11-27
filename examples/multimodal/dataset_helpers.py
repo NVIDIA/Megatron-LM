@@ -10,7 +10,7 @@ from image_processing import get_visual_transform
 import numpy as np
 import torch
 
-from megatron.core.models.multimodal.llava_model import IGNORE_INDEX
+from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN
 from megatron.energon import (
     Batch,
     CaptioningSample,
@@ -64,7 +64,8 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
         self.args = get_args()
 
         self.tokenizer = get_tokenizer()
-        self.manual_prompts = json.load(open(self.args.prompt_path))
+        with open(self.args.prompt_path, "r") as f:
+            self.manual_prompts = json.load(f)
         self.seq_len = self.args.dataloader_seq_length
 
         self.txt_to_token_dict = {}
@@ -169,16 +170,11 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
     def encode_llava_sft(self, sample: SimilarityInterleavedSample):
         """Encode SFT sample."""
         augment = sample.__subflavors__['augmentation'] if 'augmentation' in sample.__subflavors__ else False
-        has_image = sample.__subflavors__['has_image'] if 'has_image' in sample.__subflavors__ else False
         has_video = sample.__subflavors__['has_video'] if 'has_video' in sample.__subflavors__ else False
+        has_image = sample.__subflavors__['has_image'] if 'has_image' in sample.__subflavors__ else False
+        has_image = has_image or (hasattr(sample, "images") and len(sample.images) > 0)
 
-        if has_image:
-            imgs = get_visual_transform(
-                sample.images[0], self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles, self.args.use_thumbnail, augment,
-                self.args.vision_model_type,
-            )
-            num_tiles = [len(imgs)]
-        elif has_video:
+        if has_video:
             # Grab the selected frames of the video as a tensor with shape
             # fhwc: (num_frames, height, width, num_channels).
             video_fhwc = sample.images[0].permute(0, 2, 3, 1)
@@ -192,6 +188,12 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
                     self.args.use_tiling, self.args.max_num_tiles,
                     self.args.use_thumbnail, augment, self.args.vision_model_type)
             num_tiles = [len(imgs)]
+        elif has_image:
+            imgs = get_visual_transform(
+                sample.images[0], self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles, self.args.use_thumbnail, augment,
+                self.args.vision_model_type,
+            )
+            num_tiles = [len(imgs)]
         else:
             imgs = num_tiles = []
             sample.__key__ = "{}-{}".format("no-image", sample.__key__)
@@ -200,7 +202,12 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
         # Note: Some tokenizers may ignore the system prompt.
         conversation.append({"role": "system", "content": "Answer the questions."})
 
+        has_image_token = False
+
         for text in sample.texts:
+            if IMAGE_TOKEN in text["value"]:
+                has_image_token = True
+
             if text["from"] == "human":
                 role = "user"
             elif text["from"] == "gpt":
@@ -210,6 +217,14 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatch, dict]
 
             turn = {"role": role, "content": text["value"]}
             conversation.append(turn)
+
+        # If the sample contains an image but none of the user messages has an image token,
+        # then add it to the first user message.
+        if len(imgs) > 0 and not has_image_token:
+            for turn in conversation:
+                if turn["role"] == "user":
+                    turn["content"] = f"{IMAGE_TOKEN}\n" + turn["content"]
+                    break
 
         input_ids, target = self.tokenizer.tokenize_conversation(conversation, True, False)
 

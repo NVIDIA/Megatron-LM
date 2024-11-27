@@ -49,7 +49,7 @@ def add_multimodal_extra_args(parser):
     group.add_argument(
         "--tokenizer-prompt-format",
         type=str,
-        choices=["mistral", "llama3", "chatml"],
+        choices=["mistral", "llama3", "chatml", "nvlm-yi-34b", "qwen2p0"],
         required=True,
         help="Prompt format to use with the tokenizer.",
     )

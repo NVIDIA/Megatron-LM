@@ -50,6 +50,9 @@ class GPTModel(LanguageModule):
             Base period for rotary position embeddings. Ignored unless
             position_embedding_type is 'rope'.
             Defaults to 10000.
+        scatter_embedding_sequence_parallel (bool, optional):
+            Whether embeddings should be scattered across sequence parallel
+            region or not. Defaults to True.
         seq_len_interpolation_factor (Optional[float], optional):
             scale of linearly interpolating RoPE for longer sequences.
             The value must be a float larger than 1.0. Defaults to None.
@@ -70,6 +73,7 @@ class GPTModel(LanguageModule):
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
         rope_scaling: bool = False,
+        scatter_embedding_sequence_parallel: bool = True,
         seq_len_interpolation_factor: Optional[float] = None,
     ) -> None:
         super().__init__(config=config)
@@ -103,6 +107,7 @@ class GPTModel(LanguageModule):
                 vocab_size=self.vocab_size,
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type=position_embedding_type,
+                scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
             )
 
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:

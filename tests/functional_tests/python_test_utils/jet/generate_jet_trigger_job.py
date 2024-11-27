@@ -45,7 +45,7 @@ def main(
     run_name: Optional[str] = None,
     wandb_experiment: Optional[str] = None,
 ):
-    test_cases = [
+    list_of_test_cases = [
         test_case
         for test_case in common.load_workloads(
             scope=scope, container_tag=container_tag, environment=environment, test_cases=test_cases
@@ -62,7 +62,7 @@ def main(
         "team/megatron",
     ]
 
-    if not test_cases:
+    if not list_of_test_cases:
         gitlab_pipeline = {
             "stages": ["empty-pipeline-placeholder"],
             "default": {"interruptible": True},
@@ -83,11 +83,11 @@ def main(
 
     else:
         gitlab_pipeline = {
-            "stages": list(set([test_case.spec.model for test_case in test_cases])),
+            "stages": list(set([test_case.spec.model for test_case in list_of_test_cases])),
             "default": {"interruptible": True},
         }
 
-        for test_case in test_cases:
+        for test_case in list_of_test_cases:
             if test_case.spec.platforms == "dgx_a100":
                 cluster = a100_cluster
             elif test_case.spec.platforms == "dgx_h100":

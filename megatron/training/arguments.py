@@ -5,13 +5,12 @@
 import argparse
 import dataclasses
 import json
-import logging
 import os
-import torch
 import types
 import warnings
 from packaging.version import Version as PkgVersion
 
+import torch
 import torch.nn.functional as F
 
 from megatron.core.dist_checkpointing.validation import StrictHandling
@@ -199,7 +198,6 @@ def validate_args(args, defaults={}):
 
     args.data_parallel_size = args.world_size // total_model_size
 
-    # Checks.
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
               'context-parallel size: {}, '
@@ -216,7 +214,9 @@ def validate_args(args, defaults={}):
                   args.pipeline_model_parallel_size,
                   args.encoder_pipeline_model_parallel_size), flush=True)
 
-    # backwards compatibility.
+    # Checks.
+
+    # Backwards compatibility.
     if args.pipeline_model_parallel_split_rank is not None:
         args.encoder_pipeline_model_parallel_size = args.pipeline_model_parallel_split_rank
         args.pipeline_model_parallel_size -= args.encoder_pipeline_model_parallel_size
@@ -229,7 +229,10 @@ def validate_args(args, defaults={}):
         assert args.hierarchical_context_parallel_sizes is not None, \
         "--hierarchical-context-parallel-sizes must be set when a2a+p2p is used in cp comm"
 
-    # Deprecated arguments
+    if args.expert_tensor_parallel_size is None:
+        args.expert_tensor_parallel_size = args.tensor_model_parallel_size
+
+    # Deprecated arguments.
     assert args.batch_size is None, '--batch-size argument is no longer ' \
         'valid, use --micro-batch-size instead'
     del args.batch_size
@@ -271,6 +274,20 @@ def validate_args(args, defaults={}):
             print('WARNING: Please specify --split when using --data-path. Using legacy default value '
                   f'of "{legacy_default_split_value}"')
         args.split = legacy_default_split_value
+
+    use_data_path = (args.data_path is not None) or (args.data_args_path is not None)
+    if use_data_path:
+        # Exactly one of the two has to be None if we use it.
+        assert (args.data_path is None) or (args.data_args_path is None)
+    use_per_split_data_path = any(
+        elt is not None
+        for elt in [args.train_data_path, args.valid_data_path, args.test_data_path]) or \
+            args.per_split_data_args_path is not None
+    if use_per_split_data_path:
+         # Exactly one of the two has to be None if we use it.
+        assert any(elt is not None
+                   for elt in [args.train_data_path, args.valid_data_path, args.test_data_path]) is False or \
+            args.per_split_data_args_path is None
 
     # Batch size.
     assert args.micro_batch_size is not None
@@ -1477,8 +1494,12 @@ def _add_checkpointing_args(parser):
                        'checkpoint',
                        dest='perform_initialization')
     group.add_argument('--use-checkpoint-args', action='store_true',
-                       help='Override any command line arguments with arguments '
-                       'from the checkpoint')
+                       help='Override model-related command-line arguments with arguments from checkpoint')
+    group.add_argument('--use-mp-args-from-checkpoint-args', action='store_true',
+                       help='Copy model parallelism command-line arguments from checkpoint')
+    group.add_argument('--no-use-tokenizer-model-from-checkpoint-args', action='store_false',
+                       dest='use_tokenizer_model_from_checkpoint_args',
+                       help='If set, do not use tokenizer model path from checkpoint')
     group.add_argument('--exit-on-missing-checkpoint', action='store_true',
                        help="If '--load' is set, but checkpoint is not found "
                        "(e.g., path typo), then exit instead of random "
@@ -1771,6 +1792,17 @@ def _add_data_args(parser):
     group.add_argument('--test-data-path', nargs='*', default=None,
                        help='The weight and prefix list for an independent test dataset. '
                        'Follows the same pattern rules as --data-path.')
+    group.add_argument('--data-args-path', type=str, default=None,
+                       help='Path to data-args. Instead of feeding `--data-path` '
+                       'with weighted dataset, we pass in a file path from which '
+                       'we read that argument. This is useful when the list of data is '
+                       'too big.')
+    group.add_argument('--per-split-data-args-path', type=str, default=None,
+                       help='Path to per-split-data-args. Instead of feeding '
+                       '`--(train|valid|test)-data-path` with weighted dataset, '
+                       'we pass in a file path from which we read those arguments. '
+                       'This is useful when the list of data is too big. Format is a '
+                       'json file with `train`, `valid, `test` keys')
     group.add_argument('--data-cache-path', default=None,
                        help='Path to a directory to hold cached index files.')
     group.add_argument('--no-mmap-bin-files', action='store_false',
@@ -1959,6 +1991,8 @@ def _add_moe_args(parser):
     group = parser.add_argument_group(title="moe")
     group.add_argument('--expert-model-parallel-size', type=int, default=1,
                        help='Degree of expert model parallelism.')
+    group.add_argument('--expert-tensor-parallel-size', type=int, default=None,
+                       help='Degree of expert model parallelism. Default is None, which will be set to the value of --tensor-model-paralle-size.')
     group.add_argument('--num-experts', type=int, default=None,
                        help='Number of Experts in MoE (None means no MoE)')
     group.add_argument('--moe-shared-expert-intermediate-size', type=int, default=None,
@@ -2001,7 +2035,7 @@ def _add_moe_args(parser):
     group.add_argument('--moe-layer-recompute', action='store_true',
                        help='Enable checkpointing for moe_layer, should be used when memory is not sufficient.')
     group.add_argument('--moe-extended-tp', action='store_true',
-                       help='Alternative to expert parallelism, all experts are sharded across TPXEP domain.')
+                       help='Deprecated. Use --expert-tensor-parallel-size instead.')
     group.add_argument('--moe-use-upcycling', action='store_true',
                        help='Load a checkpoint of a dense model, convert it into an MoE model, and save the converted model to the path specified by --save. '
                        'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.')

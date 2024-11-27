@@ -44,6 +44,7 @@ class TestTop2Router:
         num_weights = sum([p.numel() for p in self.router.parameters()])
         assert num_weights == 12 * 4, num_weights
 
+    @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.parametrize("moe_router_pre_softmax", [(True), (False)])
@@ -56,6 +57,7 @@ class TestTop2Router:
             hidden_states = hidden_states.cuda()
             scores, indices = self.router(hidden_states)
 
+    @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     def test_aux_loss(self):

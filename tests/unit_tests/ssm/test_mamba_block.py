@@ -20,8 +20,8 @@ class TestMambaBlock:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
-        # Note that test_layer_types verifies these types and the ordering
-        hybrid_override_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
+
+    def get_mamba_block(self, hybrid_override_pattern):
         transformer_config = TransformerConfig(
             hidden_size=256,  # The Mamba layer places several constraints on this
             # Need to specify num_attention_heads and num_layers or TransformerConfig
@@ -31,7 +31,7 @@ class TestMambaBlock:
             use_cpu_initialization=True,
         )
         modules = mamba_stack_spec.submodules
-        self.block = MambaStack(
+        return MambaStack(
             transformer_config, modules, hybrid_override_pattern=hybrid_override_pattern
         )
 
@@ -39,7 +39,8 @@ class TestMambaBlock:
         Utils.destroy_model_parallel()
 
     def test_gpu_forward(self):
-        block = self.block
+        hybrid_override_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
+        block = self.get_mamba_block(hybrid_override_pattern)
         block.cuda()
         micro_batch_size = 2
         sequence_length = 32
@@ -60,7 +61,8 @@ class TestMambaBlock:
         Make sure that the layer types specified with hybrid_override_pattern
         were honored.
         """
-        block = self.block
+        hybrid_override_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
+        block = self.get_mamba_block(hybrid_override_pattern)
         layers = block.layers
         # Note that this matches the order specified by hybrid_override_pattern in setup_method
         assert type(layers[0]) == MambaLayer
@@ -68,3 +70,11 @@ class TestMambaBlock:
         assert type(layers[1].self_attention) == SelfAttention
         assert type(layers[2]) == TransformerLayer
         assert type(layers[2].mlp) == MLP
+
+    def test_invalid_layer_types_cause_failure(self):
+        invalid_symbol = '+'
+        assert invalid_symbol not in Symbols.VALID  # sanity check.
+        hybrid_override_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP + invalid_symbol
+        # _allocate_override() in mamba_hybrid_layer_allocation.py throws a ValueError.
+        with pytest.raises(ValueError):
+            block = self.get_mamba_block(hybrid_override_pattern)

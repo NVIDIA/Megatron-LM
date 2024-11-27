@@ -322,6 +322,13 @@ class SingleDeviceTRTLLMModelWeightsConverter:
                     pad_width = vocab_size_padded - vocab_size
                     val = torch.nn.functional.pad(val, (0, 0, 0, pad_width), value=0)
                     model_state_dict[layer_name] = val
+            if layer_name == TRTLLMLayers.final_layernorm_weight.value:
+                # Same as layernorm1p in NeMo
+                if (
+                    self.transformer_config.layernorm_zero_centered_gamma
+                    and self.transformer_config.normalization == "LayerNorm"
+                ):
+                    model_state_dict[layer_name] = model_state_dict[layer_name] + 1.0
 
             self._convert_non_transformer_layer(
                 model_state_dict=model_state_dict, layer_name=layer_name

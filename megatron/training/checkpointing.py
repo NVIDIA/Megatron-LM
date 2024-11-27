@@ -391,7 +391,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     # Collect args, model, RNG.
     if not torch.distributed.is_initialized() \
-            or mpu.get_data_modulo_expert_parallel_rank(with_context_parallel=True) == 0 \
+            or mpu.get_expert_data_parallel_rank() == 0 \
             or ckpt_type != CheckpointType.LEGACY:
         optim_sd_kwargs = {}
         if ckpt_type != CheckpointType.LEGACY and args.use_distributed_optimizer:
@@ -944,6 +944,7 @@ def load_args_from_checkpoint(
         else:
             print_rank_0(f"Checkpoint did not provide arguments {arg_name}")
 
+    # Model args.
     _set_arg('num_layers')
     _set_arg('hidden_size')
     _set_arg('ffn_hidden_size')
@@ -956,24 +957,54 @@ def load_args_from_checkpoint(
     _set_arg('position_embedding_type', force=True)
     _set_arg('add_position_embedding', force=True)
     _set_arg('use_rotary_position_embeddings', force=True)
+    _set_arg('rotary_base', force=True)
     _set_arg('rotary_percent', force=True)
     _set_arg('rotary_interleaved', force=True)
     _set_arg('add_bias_linear', force=True)
     _set_arg('add_qkv_bias', force=True)
+    _set_arg('squared_relu', force=True)
     _set_arg('swiglu', force=True)
     _set_arg('untie_embeddings_and_output_weights', force=True)
     _set_arg('apply_layernorm_1p', force=True)
     _set_arg('normalization', force=True)
-    _set_arg('tokenizer_type')
-    _set_arg('padded_vocab_size')
     _set_arg('apply_query_key_layer_scaling', force=True)
-    if checkpoint_version < 3.0:
-        _set_arg('tensor_model_parallel_size', 'model_parallel_size')
-    else:
-        _set_arg('tensor_model_parallel_size', force=True)
-        _set_arg('pipeline_model_parallel_size', force=True)
-        _set_arg('virtual_pipeline_model_parallel_size', force=True)
-        _set_arg('num_layers_per_virtual_pipeline_stage')
+    _set_arg('attention_dropout', force=True)
+    _set_arg('hidden_dropout', force=True)
+
+    _set_arg('hybrid_override_pattern', force=True)
+    _set_arg('spec', force=True)
+    _set_arg('hybrid_attention_ratio', force=True)
+    _set_arg('hybrid_mlp_ratio', force=True)
+
+    _set_arg('num_experts', force=True)
+    _set_arg('moe_router_topk', force=True)
+    _set_arg('moe_token_dispatcher_type', force=True)
+    _set_arg('moe_router_pre_softmax', force=True)
+    _set_arg('moe_grouped_gemm', force=True)
+    _set_arg('moe_shared_expert_intermediate_size', force=True)
+
+    # Tokenizer args.
+    _set_arg('tokenizer_type', force=True)
+    # Using checkpoint version might not always be safe (e.g., if running on different cluster).
+    if args.use_tokenizer_model_from_checkpoint_args:
+        _set_arg('tokenizer_model', force=True)
+    _set_arg('tiktoken_pattern', force=True)
+    _set_arg('padded_vocab_size')
+
+    # Checkpoint args.
+    _set_arg('ckpt_format')
+
+    # Model parallelism args.
+    if args.use_mp_args_from_checkpoint_args:
+        if checkpoint_version < 3.0:
+            _set_arg('tensor_model_parallel_size', 'model_parallel_size')
+        else:
+            _set_arg('tensor_model_parallel_size', force=True)
+            _set_arg('pipeline_model_parallel_size', force=True)
+            _set_arg('virtual_pipeline_model_parallel_size', force=True)
+            _set_arg('num_layers_per_virtual_pipeline_stage')
+            _set_arg('expert_model_parallel_size', force=True)
+
     return args, checkpoint_args
 
 
