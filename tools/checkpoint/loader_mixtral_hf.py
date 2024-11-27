@@ -188,7 +188,8 @@ def _load_checkpoint(queue, args):
                 '--no-initialization',
                 '--mock-data', # To pass the "blend data checks" in arguments.py
                 '--transformer-impl', 'transformer_engine',
-                '--load', args.load_dir
+                '--load', args.load_dir,
+                '--no-one-logger',
                 ]
 
     margs = parse_args()

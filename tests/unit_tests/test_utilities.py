@@ -27,7 +27,7 @@ class TestModel(torch.nn.Module):
 
 class Utils:
 
-    world_size = torch.cuda.device_count()
+    world_size = int(os.environ['WORLD_SIZE'])
     rank = int(os.environ['LOCAL_RANK'])
     inited = False
     store = None
