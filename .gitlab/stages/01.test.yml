@@ -313,6 +313,7 @@ test:pypi_build_wheel:
   tags: [mcore-docker-node-small]
   variables:
     PUBLISH_DRYRUN: 'yes'
+    PY_ENV: pytorch:24.07
   script:
     - echo $PUBLISH_DRYRUN
     - >
