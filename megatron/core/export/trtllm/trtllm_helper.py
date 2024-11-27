@@ -172,6 +172,7 @@ class TRTLLMHelper:
             'tp_size': export_config.inference_tp_size,
             'pp_size': export_config.inference_pp_size,
             'gpus_per_node': gpus_per_node,
+            'norm_type': self.transformer_config.normalization.lower(),
         }
 
         if self.model_type == ModelType.falcon:
