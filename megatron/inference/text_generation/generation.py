@@ -50,7 +50,7 @@ def score_and_return_on_first_stage(model, tokens: torch.Tensor, lengths: torch.
         )
 
     # forward step.
-    forward_step = ForwardStep(model, batch_size, max_prompt_length)
+    forward_step = ForwardStep(model, batch_size, args.inference_max_seq_length)
 
     # ===================
     # Pre-allocate memory
@@ -166,7 +166,7 @@ def generate_tokens_probs_and_return_on_first_stage(
         raise ValueError("Too many tokens.  " + str(max_sequence_length*batch_size)+ " is greater than "+str(args.max_tokens_to_oom))
 
     # forward step.
-    forward_step = forward_step(model, batch_size, max_sequence_length)
+    forward_step = forward_step(model, batch_size, args.inference_max_seq_length)
 
     # Added termination_id to support the case that we want to terminate the
     # generation once that id is generated.
