@@ -28,30 +28,20 @@ def mamba_preprocess_weight(model_state_dict: dict):
 
 
 MAMBA_HYBRID_DICT = {
-    # INPUT
-    'model.embedding.word_embeddings.weight': TRTLLMLayers.vocab_embedding,
-    # ATTENTION
-    'model.decoder.layers.self_attention.linear_qkv.weight': TRTLLMLayers.attention_qkv_weight,
-    'model.decoder.layers.self_attention.linear_qkv.layer_norm_weight': TRTLLMLayers.input_layernorm_weight,
-    'model.decoder.layers.self_attention.linear_proj.weight': TRTLLMLayers.attention_dense_weight,
     # MLP
-    'model.decoder.layers.mlp.linear_fc1.weight': TRTLLMLayers.mlp_fc_weight,
-    'model.decoder.layers.mlp.linear_fc2.weight': TRTLLMLayers.mlp_projection_weight,
-    'model.decoder.layers.mlp.linear_fc1.layer_norm_weight': TRTLLMLayers.input_layernorm_weight,
+    'decoder.layers.mlp.linear_fc1.layer_norm_weight': TRTLLMLayers.input_layernorm_weight,
     # Mixer
-    'model.decoder.layers.mixer.dt_bias': TRTLLMLayers.mixer_dt_bias,
-    'model.decoder.layers.mixer.A_log': TRTLLMLayers.mixer_A_log,
-    'model.decoder.layers.mixer.D': TRTLLMLayers.mixer_D,
-    'model.decoder.layers.mixer.in_proj.layer_norm_weight': TRTLLMLayers.input_layernorm_weight,
-    'model.decoder.layers.mixer.in_proj.weight': TRTLLMLayers.mixer_in_proj_weight,
-    'model.decoder.layers.mixer.conv1d.weight':TRTLLMLayers.mixer_conv_weight,
-    'model.decoder.layers.mixer.conv1d.bias': TRTLLMLayers.mixer_conv_bias,
-    'model.decoder.layers.mixer.out_proj.weight': TRTLLMLayers.mixer_out_proj_weight,
-    'model.decoder.layers.mixer.norm.weight': TRTLLMLayers.mixer_norm_weight,
+    'decoder.layers.mixer.dt_bias': TRTLLMLayers.mixer_dt_bias,
+    'decoder.layers.mixer.A_log': TRTLLMLayers.mixer_A_log,
+    'decoder.layers.mixer.D': TRTLLMLayers.mixer_D,
+    'decoder.layers.mixer.in_proj.layer_norm_weight': TRTLLMLayers.input_layernorm_weight,
+    'decoder.layers.mixer.in_proj.weight': TRTLLMLayers.mixer_in_proj_weight,
+    'decoder.layers.mixer.conv1d.weight':TRTLLMLayers.mixer_conv_weight,
+    'decoder.layers.mixer.conv1d.bias': TRTLLMLayers.mixer_conv_bias,
+    'decoder.layers.mixer.out_proj.weight': TRTLLMLayers.mixer_out_proj_weight,
+    'decoder.layers.mixer.norm.weight': TRTLLMLayers.mixer_norm_weight,
     # FINAL LAYER NORM
-    'model.decoder.final_norm.weight': TRTLLMLayers.final_layernorm_weight,
-    # OUTPUT LAYER
-    'model.output_layer.weight': TRTLLMLayers.lm_head,
+    'decoder.final_norm.weight': TRTLLMLayers.final_layernorm_weight,
 
     'preprocess_weight': mamba_preprocess_weight,
 }
