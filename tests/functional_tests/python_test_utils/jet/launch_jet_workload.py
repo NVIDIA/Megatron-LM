@@ -56,37 +56,45 @@ def launch_and_wait_for_completion(
     run_name: Optional[str],
     wandb_experiment: Optional[str],
 ) -> jetclient.JETPipeline:
-    pipeline = jetclient.JETClient(
-        customer='mcore', gitlab_ci_token=os.getenv("RO_API_TOKEN"), env="prod"
-    ).workloads.submit(
-        workloads=common.load_workloads(
-            test_case=test_case,
-            n_repeat=n_repeat,
-            time_limit=time_limit,
-            container_image=container_image,
-            container_tag=container_tag,
-            environment=environment,
-        ),
-        config_id=resolve_cluster_config(cluster),
-        custom_config={
-            "launchers": {cluster: {"account": account, "ntasks_per_node": 8}},
-            "executors": {
-                "jet-ci": {
-                    "environments": {
-                        cluster: {
-                            "variables": {
-                                "RUN_NAME": run_name or "",
-                                "WANDB_API_KEY": os.getenv("WANDB_API_KEY") or "",
-                                "WANDB_EXPERIMENT": wandb_experiment or "",
+    n_submit_errors = 0
+
+    while n_submit_errors < 3:
+        pipeline = jetclient.JETClient(
+            customer='mcore', gitlab_ci_token=os.getenv("RO_API_TOKEN"), env="prod"
+        ).workloads.submit(
+            workloads=common.load_workloads(
+                test_case=test_case,
+                n_repeat=n_repeat,
+                time_limit=time_limit,
+                container_image=container_image,
+                container_tag=container_tag,
+                environment=environment,
+            ),
+            config_id=resolve_cluster_config(cluster),
+            custom_config={
+                "launchers": {cluster: {"account": account, "ntasks_per_node": 8}},
+                "executors": {
+                    "jet-ci": {
+                        "environments": {
+                            cluster: {
+                                "variables": {
+                                    "RUN_NAME": run_name or "",
+                                    "WANDB_API_KEY": os.getenv("WANDB_API_KEY") or "",
+                                    "WANDB_EXPERIMENT": wandb_experiment or "",
+                                }
                             }
                         }
                     }
-                }
+                },
             },
-        },
-        wait_for_validation=True,
-        max_wait_time=(60 * 60),
-    )
+            wait_for_validation=True,
+            max_wait_time=(60 * 60),
+        )
+        if pipeline.get_status() == PipelineStatus.SUBMISSION_FAILED:
+            n_submit_errors += 1
+            print(f"Failed submitting pipeline. Let's try again ({n_submit_errors}/3)")
+            continue
+        break
 
     register_pipeline_terminator(pipeline=pipeline)
 
