@@ -23,6 +23,14 @@ RUN apt-get update && \
     wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq && \
     chmod a+x /usr/local/bin/yq
 
+COPY --from=build_causal_conv1d /opt/causal_conv1d-*.whl ./
+COPY --from=build_grouped_gemm /opt/grouped_gemm-*.whl ./
+COPY --from=build_mamba_ssm /opt/mamba_ssm-*.whl ./
+
+RUN pip install causal_conv1d-*.whl \
+    mamba_ssm-*.whl \
+    grouped_gemm-*.whl
+
 # Since megatron does not have any dependencies (and isn't a dependency to any other package), we can install it separately to make everything a bit quicker
 ARG MCORE_REPO
 ARG MCORE_REF
@@ -46,14 +54,6 @@ git fetch origin $MCORE_BACKWARDS_REF
 git checkout $MCORE_BACKWARDS_REF
 rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
 EOF
-
-COPY --from=build_causal_conv1d /opt/causal_conv1d-*.whl ./
-COPY --from=build_grouped_gemm /opt/grouped_gemm-*.whl ./
-COPY --from=build_mamba_ssm /opt/mamba_ssm-*.whl ./
-
-RUN pip install causal_conv1d-*.whl \
-    mamba_ssm-*.whl \
-    grouped_gemm-*.whl
 
 RUN PY_ENV=pytorch:24.07 pip install -e /opt/megatron-lm
 ENV PYTHONPATH="/opt/megatron-lm:$PYTHONPATH"

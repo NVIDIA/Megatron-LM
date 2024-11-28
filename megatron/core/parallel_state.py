@@ -1533,6 +1533,7 @@ def set_expert_model_parallel_rank(rank):
 
 
 def get_expert_tensor_parallel_group(check_initialized=True):
+    """Get the expert-tensor-parallel group the caller rank belongs to."""
     if check_initialized:
         assert (
             _EXPERT_TENSOR_PARALLEL_GROUP is not None
@@ -1577,7 +1578,7 @@ def set_expert_tensor_parallel_rank(rank):
 
 
 def get_expert_tensor_and_model_parallel_group(check_initialized=True):
-    """Get the tensor- and expert-parallel group the caller rank belongs to."""
+    """Get the expert-tensor and expert-model group the caller rank belongs to."""
     if check_initialized:
         assert (
             _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP is not None
@@ -1605,6 +1606,7 @@ def get_expert_tensor_and_model_parallel_rank():
 
 
 def get_expert_tensor_model_pipeline_parallel_group():
+    """Get expert tensor-model-pipeline parallel group."""
     assert (
         _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP is not None
     ), 'Expert tensor-model-pipeline parallel group is not initialized'
@@ -1612,11 +1614,23 @@ def get_expert_tensor_model_pipeline_parallel_group():
 
 
 def get_expert_data_parallel_group():
+    """Get expert data parallel group."""
     assert _EXPERT_DATA_PARALLEL_GROUP is not None, 'Expert data parallel group is not initialized'
     return _EXPERT_DATA_PARALLEL_GROUP
 
 
+def get_data_modulo_expert_parallel_group():
+    """[Deprecated] Get expert data parallel group."""
+    warnings.warn(
+        "get_data_modulo_expert_parallel_group is deprecated, please use "
+        "get_expert_data_parallel_group instead.",
+        DeprecationWarning,
+    )
+    return get_expert_data_parallel_group()
+
+
 def get_expert_data_parallel_group_gloo():
+    """Get expert data parallel group-gloo."""
     assert (
         _EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
     ), 'Expert data parallel group-gloo is not initialized'
@@ -1624,6 +1638,7 @@ def get_expert_data_parallel_group_gloo():
 
 
 def get_expert_data_parallel_rank():
+    """Return caller's rank in the expert data parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_rank(group=get_expert_data_parallel_group())
     else:
