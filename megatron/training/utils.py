@@ -337,6 +337,8 @@ def get_blend_and_blend_per_split(args):
 
     blend = None
     blend_per_split = None
+    if args.mock_data:
+        pass
     if use_data_path:
         if args.data_args_path is not None:
             assert args.data_path is None
