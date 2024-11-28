@@ -31,7 +31,6 @@ def test_allreduce_conditional_embedding_grads():
     for i, chunk in enumerate(model):
         for param in chunk.parameters():
             param.main_grad = torch.ones_like(param) * (pp_rank * 10.0 + i)
-
     _allreduce_conditional_embedding_grads(model, config)
 
     expect_value = 0

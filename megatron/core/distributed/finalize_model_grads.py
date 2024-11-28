@@ -4,6 +4,7 @@ from typing import List, Optional, Union
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+import torch.distributed
 
 from megatron.core.device_utils import get_xla_model
 
@@ -97,13 +98,14 @@ def _allreduce_conditional_embedding_grads(model: List[torch.nn.Module], config:
             grads = [param_grad[0] for _, param_grad in grads_dict.items()]
             coalesced = _flatten_dense_tensors(grads)
             if xm:
-                xm.all_reduce(xm.REDUCE_SUM, [coalesced], 
-                        groups=parallel_state.get_pipeline_model_parallel_groups())
+                coalesced=xm.all_reduce(xm.REDUCE_SUM, coalesced, 
+                                        groups=parallel_state.get_pipeline_model_parallel_groups())
             else:
                 torch.distributed.all_reduce(
                     coalesced, group=parallel_state.get_pipeline_model_parallel_group()
                 )
-            for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
+            unflatten_tensor = _unflatten_dense_tensors(coalesced, grads)
+            for buf, synced in zip(grads, unflatten_tensor):
                 buf.copy_(synced)
 
             # Update the gradients on other VPP ranks.

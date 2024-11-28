@@ -8,7 +8,7 @@ import pytest
 import torch
 from torch.distributed.checkpoint import CheckpointException as PyTCheckpointingException
 
-from megatron.core.device_utils import get_current_device_type
+from megatron.core.device_utils import get_current_device, get_current_device_type, get_xla_model
 
 try:
     from torch.distributed import DeviceMesh
@@ -32,6 +32,7 @@ from megatron.core.dist_checkpointing.validation import StrictHandling
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
+xm = get_xla_model()
 
 class TestSerialization:
     def setup_method(self, method):
@@ -53,13 +54,18 @@ class TestSerialization:
         }
 
         if HAVE_DTENSOR:
+            device_type = "cpu" if xm else get_current_device_type()
+            device = torch.device("cpu") if xm else get_current_device()
             mesh = DeviceMesh.from_group(
-                parallel_state.get_data_parallel_group(with_context_parallel=True), 
-                get_current_device_type()
+                parallel_state.get_data_parallel_group(with_context_parallel=True) if xm is None else
+                    parallel_state.get_data_parallel_group_gloo(with_context_parallel=True),
+                device_type
             )
+            local_tensor = torch.ones(3, 5, 7, device=device)
+            dtensor = DTensor.from_local(local_tensor, mesh)
             sharded_state_dict['sd_keyD'] = ShardedTensor.from_rank_offsets(
                 'keyD',
-                DTensor.from_local(torch.ones(3, 5, 7), mesh)._local_tensor,
+                dtensor._local_tensor,
                 replica_id=Utils.rank,
             )
 
@@ -71,8 +77,6 @@ class TestSerialization:
             save(sharded_state_dict, ckpt_dir, 
                  process_group=parallel_state.get_default_process_group())
             torch.distributed.barrier(group=parallel_state.get_default_process_group())
-
-            saved_config = maybe_load_config(ckpt_dir)
 
             load_ssd = {
                 'load_sd_keyA': ShardedTensor.from_rank_offsets(

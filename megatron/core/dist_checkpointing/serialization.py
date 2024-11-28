@@ -126,8 +126,7 @@ def load(
             str(checkpoint_dir), sharded_strategy, common_strategy
         )
     if validate_access_integrity or StrictHandling.requires_global_app_metadata(strict):
-        local_metadata, global_metadata = determine_global_metadata(sharded_state_dict, 
-                                                                    process_group=process_group)
+        local_metadata, global_metadata = determine_global_metadata(sharded_state_dict, process_group=process_group)
 
     sharded_state_dict, missing_keys, unexpected_keys = validate_integrity_and_strict_load(
         sharded_state_dict,
@@ -136,6 +135,7 @@ def load(
         local_metadata,
         global_metadata,
         ckpt_sharded_metadata,
+        process_group=process_group
     )
 
     # ShardedBase loading

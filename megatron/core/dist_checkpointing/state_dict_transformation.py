@@ -61,10 +61,10 @@ def save_preprocess(sharded_state_dict: ShardedStateDict,
             preprocessed_common_state_dict = preprocess_common_before_consistancy_check(
                 common_state_dict
             )
-        validate_sharding_integrity(
-            determine_global_metadata(sharded_part, process_group=process_group)[1],
-            common_state_dict=preprocessed_common_state_dict,
-        )
+        global_metadata = determine_global_metadata(sharded_part, process_group=process_group)[1]
+        validate_sharding_integrity(global_metadata=global_metadata, 
+                                    common_state_dict=preprocessed_common_state_dict, 
+                                    process_group=process_group)
     return sharded_part, common_state_dict
 
 
@@ -225,7 +225,8 @@ def recreate_state_dict_after_load(
 
     sharded_part, _ = extract_sharded_base(sharded_state_dict)
     if validate_access_integrity:
-        validate_sharding_integrity(determine_global_metadata(sharded_part, process_group=process_group)[1])
+        validate_sharding_integrity(determine_global_metadata(sharded_part, process_group=process_group)[1],
+                                    process_group=process_group)
 
     # load sharded tensors and sharded objects to sharded_part
     loaded_tensors = loaded_state_dict['raw_tensors']

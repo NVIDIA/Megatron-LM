@@ -120,8 +120,11 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
         )
         if self.cached_distribution is None:
             # First time applying the parallelization
-            validate_sharding_integrity(determine_global_metadata(sharded_state_dict, 
-                                                                  process_group=self.process_group)[1])
+            global_metadata = determine_global_metadata(sharded_state_dict, process_group=self.process_group)[1]
+            validate_sharding_integrity(
+                global_metadata=global_metadata,
+                process_group=self.process_group
+            )
         if self.do_cache_distribution:
             self.cached_distribution = precomputed_distribution
         end = time()

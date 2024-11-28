@@ -433,9 +433,13 @@ class TestFP32Optimizer:
             import copy
 
             preprocessed_optimzier_common_dict = copy.deepcopy(optim_common_dict)
-            list = preprocessed_optimzier_common_dict['optimizer']['param_groups']
-            for dict_item in list:
-                del dict_item['wd_mult']
+            try:
+                list = preprocessed_optimzier_common_dict['optimizer']['param_groups']
+                for dict_item in list:
+                    del dict_item['wd_mult']
+            except KeyError:
+                pass
+            
             return preprocessed_optimzier_common_dict
 
         Utils.initialize_model_parallel(*src_tp_pp)

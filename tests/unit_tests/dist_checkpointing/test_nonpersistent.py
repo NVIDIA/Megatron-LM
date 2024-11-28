@@ -7,6 +7,7 @@ from unittest import mock
 
 import pytest
 import torch
+import torch.distributed
 
 from megatron.core.device_utils import get_xla_model
 from megatron.core.parallel_state import get_default_process_group
@@ -42,7 +43,8 @@ class TestNonPersistentSaveAndLoad:
 
         mock_args = SimpleNamespace()
         with TempNamedDir(
-            tmp_path_dist_ckpt / "test_non_persistent"
+            tmp_path_dist_ckpt / "test_non_persistent",
+            sync=True, process_group=get_default_process_group()
         ) as non_persistent_ckpt_dir, mock.patch(
             'megatron.training.checkpointing.get_args', new=lambda: mock_args
         ), mock.patch(
@@ -63,9 +65,11 @@ class TestNonPersistentSaveAndLoad:
                 {},
                 non_persistent_ckpt=True,
             )
+            torch.distributed.barrier(group=get_default_process_group())
             save_checkpoint(
                 3, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, {},
             )
+            torch.distributed.barrier(group=get_default_process_group())
             save_checkpoint(
                 4,
                 model,
@@ -75,12 +79,16 @@ class TestNonPersistentSaveAndLoad:
                 {},
                 non_persistent_ckpt=True,
             )
+            torch.distributed.barrier(group=get_default_process_group())
             iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler)
+            torch.distributed.barrier(group=get_default_process_group())
             assert iteration == 4
             save_checkpoint(
                 6, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, {}, 
             )
+            torch.distributed.barrier(group=get_default_process_group())
             iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler)
+            torch.distributed.barrier(group=get_default_process_group())
             assert iteration == 6
             save_checkpoint(
                 8,
@@ -91,7 +99,9 @@ class TestNonPersistentSaveAndLoad:
                 {},
                 non_persistent_ckpt=True,
             )
+            torch.distributed.barrier(group=get_default_process_group())
             iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler)
+            torch.distributed.barrier(group=get_default_process_group())
             assert iteration == 8
             assert "iter_0000003" in os.listdir(non_persistent_ckpt_dir)
             assert "iter_0000006" in os.listdir(non_persistent_ckpt_dir)
@@ -119,7 +129,10 @@ class TestNonPersistentSaveAndLoad:
                                 os.path.join(non_persistent_ckpt_dir, ckpt_b, filename),
                                 shallow=False,
                             ), [filename, ckpt_a, ckpt_b]
+            torch.distributed.barrier(group=get_default_process_group())
+
         Utils.destroy_model_parallel()
+
 
 class TestLegacySaveAndLoad:
     @pytest.mark.parametrize(('tp,pp'), [(2, 4)])
@@ -131,7 +144,8 @@ class TestLegacySaveAndLoad:
         opt_param_scheduler = None
 
         mock_args = SimpleNamespace()
-        with TempNamedDir(tmp_path_dist_ckpt / "test_legacy") as legacy_ckpt_dir, mock.patch(
+        with TempNamedDir(tmp_path_dist_ckpt / "test_legacy", sync=True,
+                          process_group=get_default_process_group()) as legacy_ckpt_dir, mock.patch(
             'megatron.training.checkpointing.get_args', new=lambda: mock_args
         ), mock.patch("megatron.training.checkpointing.update_num_microbatches"):
             init_basic_mock_args(mock_args, tp, pp)
@@ -140,8 +154,11 @@ class TestLegacySaveAndLoad:
             save_checkpoint(
                 2, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, {}
             )
+            torch.distributed.barrier(group=get_default_process_group())
             iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler)
+            torch.distributed.barrier(group=get_default_process_group())
             assert iteration == 2
             assert "iter_0000002" in os.listdir(legacy_ckpt_dir)
+            torch.distributed.barrier(group=get_default_process_group())
 
         Utils.destroy_model_parallel()

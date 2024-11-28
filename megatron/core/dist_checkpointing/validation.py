@@ -9,7 +9,6 @@ import numpy as np
 import torch
 import torch.distributed
 
-from megatron.core.device_utils import get_xla_model
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_load_config
 from megatron.core.dist_checkpointing.dict_utils import (
@@ -132,6 +131,7 @@ def validate_integrity_and_strict_load(
     local_metadata: Optional[_LocalMetadata] = None,
     global_metadata: Optional[_GlobalMetadata] = None,
     ckpt_sharded_metadata: Optional['CkptShardedMetadata'] = None,
+    process_group: torch.distributed.ProcessGroup = None
 ) -> Tuple[ShardedStateDict, Set[str], Set[str]]:
     """Validates sharding integrity and potential mismatches with the checkpoint.
 
@@ -198,7 +198,7 @@ def validate_integrity_and_strict_load(
             raise CheckpointingException(
                 'Cannot check sharding intergrity without global_metadata (None).'
             )
-        validate_sharding_integrity(global_metadata)
+        validate_sharding_integrity(global_metadata, process_group=process_group)
 
     return sharded_state_dict, missing_keys, unexpected_keys
 
@@ -366,7 +366,8 @@ def maybe_report_missing_and_unexpected_keys(
         logger.warning(error_msg)
 
 
-def _validate_common_state_dict(common_state_dict: CommonStateDict):
+def _validate_common_state_dict(common_state_dict: CommonStateDict,
+                                 process_group: torch.distributed.ProcessGroup = None):
     """Validate consistancy across ranks for the common state dict
 
     We save the common state dict only on rank 0. We validate to make sure that the common dict is consistant across ranks before saving.
@@ -374,10 +375,10 @@ def _validate_common_state_dict(common_state_dict: CommonStateDict):
     Args:
         common_state_dict: The common state dict present in all ransk
     """
-    other_rank_state_dicts = [None] * torch.distributed.get_world_size()
-    torch.distributed.all_gather_object(other_rank_state_dicts, common_state_dict)
+    other_rank_state_dicts = [None] * torch.distributed.get_world_size(group=process_group)
+    torch.distributed.all_gather_object(other_rank_state_dicts, common_state_dict, group=process_group)
     common_state_dict_diff = {}
-    if torch.distributed.get_rank() == 0:
+    if torch.distributed.get_rank(group=process_group) == 0:
         main_rank_state_dict = common_state_dict
         for rank, rank_state_dict in enumerate(other_rank_state_dicts[1:], 1):
             only_left, only_right, mismatch = diff(main_rank_state_dict, rank_state_dict)
@@ -391,7 +392,8 @@ def _validate_common_state_dict(common_state_dict: CommonStateDict):
 
 
 def validate_sharding_integrity(
-    global_metadata: _GlobalMetadata, common_state_dict: CommonStateDict = None
+    global_metadata: _GlobalMetadata, common_state_dict: CommonStateDict = None,
+     process_group: torch.distributed.ProcessGroup = None
 ) -> None:
     """Validate if the ShardedTensors and ShardedObjects from multiple processes define correct sharding.
 
@@ -412,7 +414,7 @@ def validate_sharding_integrity(
     """
 
     if common_state_dict:
-        _validate_common_state_dict(common_state_dict)
+        _validate_common_state_dict(common_state_dict, process_group=process_group)
 
     if torch.distributed.get_rank() != 0:
         return
