@@ -11,17 +11,12 @@ NUM_NODES=2
 NODE_RANK=$1
 WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 
-CHECKPOINT_PATH=/workspace/checkpoints/gpt345m #<Specify path>
-TENSORBOARD_LOGS_PATH=/workspace/logs #<Specify path>
 VOCAB_FILE=/workspace/Megatron-LM/gpt2-vocab.json #<Specify path to file>/gpt2-vocab.json
 MERGE_FILE=/workspace/Megatron-LM/gpt2-merges.txt #<Specify path to file>/gpt2-merges.txt
 
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE
     --nnodes $NUM_NODES --node-rank $NODE_RANK
-   # --master_addr 10.10.10.12
-    #--master_port 29504
-
   --rdzv_id 456
    --rdzv_backend c10d --rdzv_endpoint 10.10.10.12:29603
 )
@@ -53,7 +48,6 @@ MODEL_PARALLEL_ARGS=(
 )
 
 DATA_ARGS=(
-    #--data-path $DATA_PATH
     --mock-data
     --vocab-file $VOCAB_FILE
     --merge-file $MERGE_FILE
@@ -61,13 +55,7 @@ DATA_ARGS=(
 )
 
 EVAL_AND_LOGGING_ARGS=(
-    #--log-interval 100
-    #--save-interval 10000
-    #--eval-interval 1000
-    #--save $CHECKPOINT_PATH
-    #--load $CHECKPOINT_PATH
     --eval-iters 10
-    #--tensorboard-dir $TENSORBOARD_LOGS_PATH
 )
 
 torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
