@@ -1,12 +1,9 @@
 #!/bin/bash
 
-# Runs the "175B" parameter model
-
 export OMP_NUM_THREADS=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 GPUS_PER_NODE=2
-# Change for multinode config
 NUM_NODES=2
 NODE_RANK=$1
 WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
