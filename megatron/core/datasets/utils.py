@@ -60,7 +60,7 @@ def get_cu_seqlens(token_ids: torch.Tensor, delim_bos: Optional[int], delim_eos:
 
     Returns:
         torch.Tensor: The cumulative sequence lengths for tokens according to bos/eos
-    
+
     """
     dim_b = token_ids.shape[0]
     dim_s = token_ids.shape[1]
@@ -75,7 +75,7 @@ def get_cu_seqlens(token_ids: torch.Tensor, delim_bos: Optional[int], delim_eos:
         cu_seqlens = cu_seqlens[1:]
         cu_seqlens = torch.concat(
             [
-                cu_seqlens, 
+                cu_seqlens,
                 torch.tensor([dim_b * dim_s], dtype=cu_seqlens.dtype, device=cu_seqlens.device)
             ]
         )
@@ -87,12 +87,16 @@ def get_cu_seqlens(token_ids: torch.Tensor, delim_bos: Optional[int], delim_eos:
         end_mask = torch.logical_or(end_mask, token_ids == delim_eos)
         cu_seqlens = torch.argwhere(end_mask)
         cu_seqlens = cu_seqlens[:, 1] + (cu_seqlens[:, 0] * dim_s) + 1
+        cu_seqlens = torch.concat([
+            torch.tensor([0], dtype=cu_seqlens.dtype, device=cu_seqlens.device),
+            cu_seqlens
+        ])
 
     # We don't care about intra-sequence inter-document breaks
     else:
-        cu_seqlens = (torch.arange(dim_b, device=token_ids.device) + 1) * dim_s
+        cu_seqlens = torch.arange(dim_b + 1, device=token_ids.device) * dim_s
 
-    return cu_seqlens
+    return cu_seqlens.to(torch.int32)
 
 
 def get_blend_from_list(
