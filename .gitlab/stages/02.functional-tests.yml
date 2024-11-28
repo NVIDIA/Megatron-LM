@@ -133,6 +133,7 @@ functional:run_dev:
     RO_API_TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}
     CONTEXT: $FUNCTIONAL_TEST_SCOPE
   script:
+    - apk add bash
     - env
     - export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
