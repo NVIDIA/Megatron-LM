@@ -5,11 +5,7 @@ from abc import ABC, abstractmethod
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.tensor_parallel import (
-    gather_from_sequence_parallel_region,
-    get_cuda_rng_tracker,
-    get_data_parallel_rng_tracker_name,
-)
+from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
@@ -39,14 +35,11 @@ class Router(ABC, MegatronModule):
         self.layer_number = None
 
         # Initialize the gate weights.
+        # TODO: Add support for GPU initialization, which requires updating the golden values.
         self.weight = torch.nn.Parameter(
             torch.empty((self.config.num_moe_experts, self.config.hidden_size), dtype=torch.float32)
         )
         if config.perform_initialization:
-            if get_cuda_rng_tracker().is_initialized():
-                with get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
-                    config.init_method(self.weight)
-        else:
             config.init_method(self.weight)
         self.weight.data = self.weight.data.to(dtype=config.params_dtype)
         setattr(self.weight, 'sequence_parallel', config.sequence_parallel)
