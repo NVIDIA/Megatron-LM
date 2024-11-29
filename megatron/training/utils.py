@@ -337,38 +337,37 @@ def get_blend_and_blend_per_split(args):
 
     blend = None
     blend_per_split = None
-    if args.mock_data:
-        pass
-    if use_data_path:
-        if args.data_args_path is not None:
-            assert args.data_path is None
-            with open(args.data_args_path, 'r') as f:
-                blend = get_blend_from_list(f.read().split())
+    if not args.mock_data:
+        if use_data_path:
+            if args.data_args_path is not None:
+                assert args.data_path is None
+                with open(args.data_args_path, 'r') as f:
+                    blend = get_blend_from_list(f.read().split())
+            else:
+                assert args.data_path is not None
+                blend = get_blend_from_list(args.data_path)
         else:
-            assert args.data_path is not None
-            blend = get_blend_from_list(args.data_path)
-    else:
-        assert use_per_split_data_path
-        if args.per_split_data_args_path is not None:
-            with open(args.per_split_data_args_path, 'r') as f:
-                per_split_data_args = json.load(f)
-                # Each element in blend_per_split should be a list of files (and optional
-                # weights), so split string if needed.
-                for split in ["train", "valid", "test"]:
-                    if isinstance(per_split_data_args[split], str):
-                        per_split_data_args[split] = per_split_data_args[split].split()
-
+            assert use_per_split_data_path
+            if args.per_split_data_args_path is not None:
+                with open(args.per_split_data_args_path, 'r') as f:
+                    per_split_data_args = json.load(f)
+                    # Each element in blend_per_split should be a list of files (and optional
+                    # weights), so split string if needed.
+                    for split in ["train", "valid", "test"]:
+                        if isinstance(per_split_data_args[split], str):
+                            per_split_data_args[split] = per_split_data_args[split].split()
+    
+                    blend_per_split = [
+                        get_blend_from_list(per_split_data_args["train"]),
+                        get_blend_from_list(per_split_data_args["valid"]),
+                        get_blend_from_list(per_split_data_args["test"])
+                    ]
+            else:
                 blend_per_split = [
-                    get_blend_from_list(per_split_data_args["train"]),
-                    get_blend_from_list(per_split_data_args["valid"]),
-                    get_blend_from_list(per_split_data_args["test"])
+                    get_blend_from_list(args.train_data_path),
+                    get_blend_from_list(args.valid_data_path),
+                    get_blend_from_list(args.test_data_path)
                 ]
-        else:
-            blend_per_split = [
-                get_blend_from_list(args.train_data_path),
-                get_blend_from_list(args.valid_data_path),
-                get_blend_from_list(args.test_data_path)
-            ]
 
     return blend, blend_per_split
 
