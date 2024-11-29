@@ -355,8 +355,10 @@ def check_param_hashes_across_dp_replicas(
     """
 
     # Compute per-parameter hashes on this rank.
-    params = []
-    local_param_hashes = []
+    # Keep track of expert and non-expert parameters separately since they need to be
+    # all-gathered across different sets of ranks.
+    non_expert_params, expert_params = [], []
+    local_non_expert_param_hashes, local_expert_param_hashes = [], []
     for model_chunk_id, model_chunk in enumerate(model):
         for param_name, param in model_chunk.named_parameters():
             param_hash = torch.frombuffer(
@@ -364,41 +366,57 @@ def check_param_hashes_across_dp_replicas(
                     'B', hashlib.sha1(param.data.to("cpu").float().numpy(force=True)).digest()
                 ),
                 dtype=torch.uint8,
-            ).to(device=get_current_device())
-            params.append((model_chunk_id, param_name, param))
-            local_param_hashes.append(param_hash)
-    local_param_hashes = torch.stack(local_param_hashes)
+            )
+            
+            if getattr(param, 'allreduce', True):
+                non_expert_params.append((model_chunk_id, param_name, param))
+                local_non_expert_param_hashes.append(param_hash)
+            else:
+                expert_params.append((model_chunk_id, param_name, param))
+                local_expert_param_hashes.append(param_hash)
 
-    if xm:
-        xm.mark_step()
-        all_param_hashes = xm.all_gather(local_param_hashes, groups=parallel_state.get_data_parallel_groups())
-        xm.mark_step()
-        all_param_hashes = list(torch.split(all_param_hashes, 1, dim=0))
-    else:
-        # Collect per-parameter hashes across all ranks in DP group.
+    # Use data-modulo-expert parallel group to all-gather expert param hashes, regular
+    # data-parallel group for non-expert param hashes.
+    all_param_hashes_match = True
+    for params, local_param_hashes, all_gather_group in zip(
+        [non_expert_params, expert_params],
+        [local_non_expert_param_hashes, local_expert_param_hashes],
+        [
+            parallel_state.get_data_parallel_group_gloo(),
+            parallel_state.get_expert_data_parallel_group_gloo(),
+        ],
+    ):
+        # Collect per-parameter hashes across all ranks in group.
+        assert len(params) == len(local_param_hashes)
+        if len(params) == 0:
+            continue
+
+        local_param_hashes = torch.stack(local_param_hashes)
         all_param_hashes = [
             torch.zeros_like(local_param_hashes)
-            for _ in range(parallel_state.get_data_parallel_world_size())
+            for _ in range(torch.distributed.get_world_size(all_gather_group))
         ]
-        torch.distributed.all_gather(
-            all_param_hashes, local_param_hashes, group=parallel_state.get_data_parallel_group()
-        )
+        torch.distributed.all_gather(all_param_hashes, local_param_hashes, group=all_gather_group)
 
-    # Make sure local per-parameter hash matches DP rank 0.
-    param_hashes_match = torch.equal(local_param_hashes, all_param_hashes[0])
-    if not param_hashes_match:
-        for i, (model_chunk_id, param_name, param) in enumerate(params):
-            if not torch.equal(local_param_hashes[i], all_param_hashes[0][i]):
-                rank = torch.distributed.get_rank()
-                logger.info(
-                    f"[Rank {rank}] Hash not matching for {param_name} in model chunk"
-                    f"{model_chunk_id}"
-                )
-    if cross_check:
-        # Make sure all ranks have the same hash.
-        return all(map(lambda x: torch.equal(local_param_hashes, x), all_param_hashes))
-    else:
-        return param_hashes_match
+        # END Make sure local per-parameter hash matches DP rank 0.
+        param_hashes_match = torch.equal(local_param_hashes, all_param_hashes[0])
+        if not param_hashes_match:
+            for i, (model_chunk_id, param_name, param) in enumerate(params):
+                if not torch.equal(local_param_hashes[i], all_param_hashes[0][i]):
+                    rank = torch.distributed.get_rank()
+                    logger.info(
+                        f"[Rank {rank}] Hash not matching for {param_name} in model chunk"
+                        f"{model_chunk_id}"
+                    )
+        if cross_check:
+            # Make sure all ranks have the same hash.
+            all_param_hashes_match &= all(
+                map(lambda x: torch.equal(local_param_hashes, x), all_param_hashes)
+            )
+        else:
+            all_param_hashes_match &= param_hashes_match
+
+    return all_param_hashes_match
 
 
 def make_tp_sharded_tensor_for_checkpoint(

@@ -1682,6 +1682,7 @@ def set_expert_model_parallel_rank(rank):
 
 
 def get_expert_tensor_parallel_group(check_initialized=True) -> ProcessGroup:
+    """Get the expert-tensor-parallel group the caller rank belongs to."""
     if check_initialized:
         assert (
             _EXPERT_TENSOR_PARALLEL_GROUP is not None
@@ -1768,6 +1769,7 @@ def get_expert_tensor_and_model_parallel_rank() -> int:
 
 
 def get_expert_tensor_model_pipeline_parallel_group() -> ProcessGroup:
+    """Get expert tensor-model-pipeline parallel group."""
     assert (
         _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP is not None
     ), 'Expert tensor-model-pipeline parallel group is not initialized'
@@ -1780,6 +1782,7 @@ def get_expert_tensor_model_pipeline_parallel_groups() -> List[List[int]]:
     return _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUPS
 
 def get_expert_data_parallel_group() -> ProcessGroup:
+    """Get expert data parallel group."""
     assert _EXPERT_DATA_PARALLEL_GROUP is not None, 'Expert data parallel group is not initialized'
     return _EXPERT_DATA_PARALLEL_GROUP
 
@@ -1788,6 +1791,7 @@ def get_expert_data_parallel_groups() -> List[List[int]]:
     return _EXPERT_DATA_PARALLEL_GROUPS
 
 def get_expert_data_parallel_group_gloo() -> ProcessGroup:
+    """Get expert data parallel group-gloo."""
     assert (
         _EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
     ), 'Expert data parallel group-gloo is not initialized'
@@ -1795,6 +1799,7 @@ def get_expert_data_parallel_group_gloo() -> ProcessGroup:
 
 
 def get_expert_data_parallel_rank() -> int:
+    """Return caller's rank in the expert data parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_rank(group=get_expert_data_parallel_group())
     else:

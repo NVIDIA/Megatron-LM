@@ -800,7 +800,7 @@ def train_step(forward_step_func, data_iterator,
         skipped_iter = 1
 
     # Empty unused memory.
-    if args.empty_unused_memory_level >= 2:
+    if args.empty_unused_memory_level >= 2 and torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
@@ -1267,7 +1267,7 @@ def checkpoint_and_decide_exit(model, optimizer, opt_param_scheduler, iteration,
         train_time = (time.time() - _TRAIN_START_TIME) / 60.0
         done_cuda = torch.tensor(
             [train_time > args.exit_duration_in_mins],
-            dtype=torch.int, device='cuda')
+            dtype=torch.int, device=get_current_device())
         torch.distributed.all_reduce(
             done_cuda, op=torch.distributed.ReduceOp.MAX)
         done = done_cuda.item()
@@ -1602,7 +1602,7 @@ def evaluate(forward_step_func,
             config.timers = get_timers()
 
             # Empty unused memory
-            if args.empty_unused_memory_level >= 1:
+            if args.empty_unused_memory_level >= 1 and torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
             if mpu.is_pipeline_last_stage(ignore_virtual=True):

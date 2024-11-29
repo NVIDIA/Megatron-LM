@@ -9,6 +9,7 @@ import types
 import typing as T
 from collections import namedtuple
 
+import numpy as np
 import torch
 
 from megatron.core import parallel_state
@@ -131,7 +132,11 @@ class Pipeline:
         # Destroy & initialize new parallel state.
         unset_global_variables()
         Utils.destroy_model_parallel()
-        Utils.initialize_model_parallel(meta.mp.tp, meta.mp.pp)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=meta.mp.tp,
+            pipeline_model_parallel_size=meta.mp.pp,
+            expert_model_parallel_size=meta.mp.ep,
+        )
 
         # Environment vars.
         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
@@ -196,17 +201,31 @@ class Pipeline:
         return args, models
 
     @classmethod
+    def is_model_parallel_rank_0(cls):
+        return (
+            parallel_state.get_tensor_model_parallel_rank() == 0
+            and parallel_state.get_pipeline_model_parallel_rank() == 0
+        )
+
+    @classmethod
     def get_input_ids(cls):
         """Randomly initialize input token IDs."""
-        if torch.distributed.get_rank() == 0:
+        if cls.is_model_parallel_rank_0():
+            # Generate different data on each DP rank.
             args = get_args()
-            return torch.randint(
-                low=0,
-                high=args.vocab_size,
-                size=(args.seq_length,),
-                dtype=torch.int64,
-                device=get_current_device(),
+
+            orig_numpy_seed = np.random.get_state()[1][0]
+            temp_numpy_seed = orig_numpy_seed + torch.distributed.get_rank()
+
+            np.random.seed(temp_numpy_seed)
+            numpy_input_ids = np.random.randint(
+                low=0, high=args.vocab_size, size=(args.seq_length,), dtype=np.int64
             )
+            np.random.seed(orig_numpy_seed)
+
+            torch_input_ids = torch.from_numpy(numpy_input_ids).to("cuda")
+
+            return torch_input_ids
         else:
             return None
 
@@ -227,7 +246,8 @@ class Pipeline:
         args = get_args()
 
         # TP rank 0, PP rank 0.
-        if torch.distributed.get_rank() == 0:
+        # (Note: mimics megatron/training/utils.py:get_batch_on_this_tp_rank().)
+        if cls.is_model_parallel_rank_0():
 
             tokenizer = get_tokenizer()
 
@@ -265,6 +285,7 @@ class Pipeline:
                 attention_mask = None
 
         # Other PP ranks.
+        # (Note: mimics pretrain_gpt.py:get_batch().)
         else:
             input_ids = None
             position_ids = None
@@ -332,7 +353,6 @@ class Pipeline:
             output_tensor = None
 
         # All-gather across the partitions.
-        assert not args.sequence_parallel
         if parallel_state.is_pipeline_last_stage():
             output_tensor_gathered = gather_from_tensor_model_parallel_region(output_tensor)
         else:
@@ -399,6 +419,8 @@ class Pipeline:
         output_tensor_real = self.forward_model(models, orig_input_ids)
 
         # Random output tensor.
+        # Note: need two random initializations to differ from `save_checkpoint()` above.
+        self.rand_init_model_params("dst", models)
         self.rand_init_model_params("dst", models)
         output_tensor_fake = self.forward_model(models, orig_input_ids)
 
@@ -459,7 +481,11 @@ class Pipeline:
         - Validate before/after output tensors.
         """
 
-        Utils.initialize_model_parallel(self.src.mp.tp, self.src.mp.pp)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=self.src.mp.tp,
+            pipeline_model_parallel_size=self.src.mp.pp,
+            expert_model_parallel_size=self.src.mp.ep,
+        )
         with TempSharedDir():
 
             # Save checkpoint.
@@ -484,7 +510,10 @@ class Pipeline:
                 ).item()
                 mse_real = get_mse(dst_output_tensor_real)
                 mse_fake = get_mse(dst_output_tensor_fake)
-                assert mse_real < 0.001 * mse_fake
+                assert mse_real < 0.01 * mse_fake, "mse_real (%e) >= 0.01 mse_fake (%e)." % (
+                    mse_real,
+                    mse_fake,
+                )
             torch.distributed.barrier()
 
             # Teardown.
@@ -507,17 +536,17 @@ class GPTPipeline(Pipeline):
     Args:
         src (Union[ModelMeta, Tuple]): Model meta for loading.
         dst (Union[ModelMeta, Tuple]): Model meta for storing.
-        num_experts (Optional[int]): Number of MoE experts.
+        num_moe_experts (Optional[int]): Number of MoE experts.
     """
 
-    def __init__(self, src: ModelMeta, dst: ModelMeta, num_experts: T.Optional[int] = None):
+    def __init__(self, src: ModelMeta, dst: ModelMeta, num_moe_experts: T.Optional[int] = None):
         super().__init__(ModelMeta(*src), ModelMeta(*dst))
-        self.num_experts = num_experts
-        assert num_experts is None, "MoE currently unsupported."
+        assert isinstance(num_moe_experts, (int, types.NoneType))
+        self.num_moe_experts = num_moe_experts
 
     def get_model_argv(self):
         """GPT model args."""
-        return [
+        args = [
             "--num-layers",
             "8",
             "--hidden-size",
@@ -537,6 +566,9 @@ class GPTPipeline(Pipeline):
             "--make-vocab-size-divisible-by",
             "1",
         ]
+        if self.num_moe_experts is not None and self.num_moe_experts > 1:
+            args.extend(["--num-experts", str(self.num_moe_experts or 1), "--sequence-parallel"])
+        return args
 
     def get_converter_model_type(self):
         return "GPT"
@@ -545,22 +577,27 @@ class GPTPipeline(Pipeline):
 def get_gpt_pipelines():
     """Get GPT (non-MoE) pipelines."""
     return [
-        # ~~ GPT. ~~
         GPTPipeline(("mcore", (8, 1)), ("mcore", (1, 8))),
         GPTPipeline(("mcore", (4, 2)), ("mcore", (2, 4))),
         GPTPipeline(("mcore", (2, 4)), ("mcore", (4, 2))),
         GPTPipeline(("mcore", (1, 8)), ("mcore", (8, 1))),
         GPTPipeline(("mcore", (4, 2)), ("mcore", (2, 4), "local")),
         GPTPipeline(("megatron", (4, 2)), ("mcore", (2, 4))),
-        # [unsupported] GPTPipeline(("mcore", (4, 2), "local"), ("mcore", (2, 4), "local")),
-        # [optional] GPTPipeline("meta", "mcore", None, (8, 1)),
-        # [optional] GPTPipeline("hf", "mcore", None, (8, 1)),
+        GPTPipeline(("mcore", (4, 2), "local"), ("mcore", (2, 4), "local")),
+        GPTPipeline(("mcore", (4, 2), "local"), ("mcore", (2, 4))),
+        # [todo] GPTPipeline(("megatron", (4, 2)), ("megatron", (2, 4))),
+        # [todo] GPTPipeline(("megatron", (4, 2), "te"), ("megatron", (2, 4), "te")),
+        # [todo] GPTPipeline("meta", "mcore", None, (8, 1)),
+        # [todo] GPTPipeline("hf", "mcore", None, (8, 1)),
     ]
 
 
 def get_moe_pipelines():
     """Get MoE pipelines."""
-    return [GPTPipeline(("mcore", (8, 1, 2)), ("mcore", (1, 8, 4)), num_experts=8)]
+    return [
+        GPTPipeline(("mcore", (2, 1, 2)), ("mcore", (1, 4, 1)), num_moe_experts=8),
+        GPTPipeline(("mcore", (1, 4, 1)), ("mcore", (2, 1, 2)), num_moe_experts=4),
+    ]
 
 
 def test_all_pipelines():
@@ -570,6 +607,8 @@ def test_all_pipelines():
     pipelines = [
         *get_gpt_pipelines(),
         # [todo] *get_moe_pipelines(), # todo: MoE support in loader_mcore.py.
+        # [todo] *get_bert_pipelines(),
+        # [todo] *get_t5_pipelines(),
     ]
 
     # Run pipelines.

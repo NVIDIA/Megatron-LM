@@ -8,11 +8,9 @@ import torch
 
 from megatron.core.parallel_state import (
     get_expert_model_parallel_group,
-    get_expert_model_parallel_world_size,
     get_expert_tensor_and_model_parallel_group,
     get_expert_tensor_parallel_group,
     get_expert_tensor_parallel_rank,
-    get_expert_tensor_parallel_world_size,
 )
 from megatron.core.tensor_parallel import (
     all_to_all,
@@ -51,13 +49,28 @@ class MoETokenDispatcher:
         self.config = config
         self.shared_experts: Optional[SharedExpertMLP] = None
 
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            self.ep_group = get_expert_model_parallel_group()
-            self.ep_size = get_expert_model_parallel_world_size()
-            self.tp_group = get_expert_tensor_parallel_group()
-            self.tp_size = get_expert_tensor_parallel_world_size()
-            self.tp_rank = get_expert_tensor_parallel_rank()
-            self.tp_ep_group = get_expert_tensor_and_model_parallel_group()
+        self.tp_size = config.expert_tensor_parallel_size
+        self.ep_size = config.expert_model_parallel_size
+
+    @property
+    def ep_group(self):
+        """Get expert model parallel group."""
+        return get_expert_model_parallel_group()
+
+    @property
+    def tp_group(self):
+        """Get expert tensor parallel group."""
+        return get_expert_tensor_parallel_group()
+
+    @property
+    def tp_rank(self):
+        """Get expert tensor parallel rank."""
+        return get_expert_tensor_parallel_rank()
+
+    @property
+    def tp_ep_group(self):
+        """Get expert tensor and model parallel group."""
+        return get_expert_tensor_and_model_parallel_group()
 
     @abstractmethod
     def token_permutation(

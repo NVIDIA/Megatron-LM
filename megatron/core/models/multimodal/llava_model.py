@@ -11,7 +11,8 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel, get_num_image_embeddings
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
-from megatron.core.parallel_state import get_tensor_model_parallel_world_size
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.parallel_state import get_context_parallel_group, get_context_parallel_world_size
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -19,6 +20,7 @@ from megatron.core.utils import log_single_rank
 
 try:
     import transformer_engine  # pylint: disable=unused-import
+    from transformer_engine.pytorch.distributed import gather_along_first_dim
 
     from megatron.core.extensions.transformer_engine import TEDotProductAttention
     from megatron.core.utils import is_te_min_version
@@ -26,6 +28,8 @@ try:
     HAVE_TE = True
 except:
     HAVE_TE = False
+    if get_context_parallel_world_size() > 1:
+        raise RuntimeError("ContextParallelism requires TransformerEngine support, but not found.")
 
 
 IGNORE_INDEX = -100  # ID for labels that should be ignored.
@@ -122,13 +126,19 @@ class LLaVAModel(MegatronModule):
         self.language_model = None
 
         self.sequence_parallel_lm = language_transformer_config.sequence_parallel
-        if self.sequence_parallel_lm:
+        self.tp_comm_overlap_lm = language_transformer_config.tp_comm_overlap
+        self.context_parallel_lm = language_transformer_config.context_parallel_size
+        if self.sequence_parallel_lm or self.context_parallel_lm > 1:
             assert (
                 language_transformer_layer_spec.submodules.self_attention.submodules.core_attention
                 == TEDotProductAttention
                 and HAVE_TE
-            ), "Sequence Parallelism is supported only with Transformer Engine DotProductAttention."
-        self.tp_comm_overlap_lm = language_transformer_config.tp_comm_overlap
+            ), "Sequence/Context Parallelism is supported only with TE DotProductAttention."
+            if self.context_parallel_lm > 1:
+                assert is_te_min_version(
+                    "1.10.0"
+                ), "Context Parallelism in LLaVA requires TE v1.10 or higher"
+        self.tensor_model_parallel_size_lm = language_transformer_config.tensor_model_parallel_size
 
         # This attribute is needed to check if an all-reduce is required
         # on the word embeddings inside `finalize_model_grads._allreduce_word_embedding_grads`.
@@ -146,6 +156,7 @@ class LLaVAModel(MegatronModule):
                 post_process=self.post_process,
                 rotary_base=language_rotary_base,
                 rope_scaling=language_rope_scaling,
+                scatter_embedding_sequence_parallel=False,
             )
             self.share_embeddings_and_output_weights = (
                 self.language_model.share_embeddings_and_output_weights
@@ -275,7 +286,7 @@ class LLaVAModel(MegatronModule):
         inference_params,
         image_token_index,
         num_image_tiles,
-        attention_mask,
+        image_token_mask=None,
     ):
         """Preprocess input data before input to language model.
 
@@ -317,14 +328,17 @@ class LLaVAModel(MegatronModule):
         # No pre- or postprocessing needed.
         # With pipeline parallel > 2, this means a chunk in the middle of the model.
         if not self.pre_process and not self.post_process:
-            return None, None, None, attention_mask
+            return None, None, None
 
         # If using the inference KV cache, the image tokens are already computed.
         if use_inference_kv_cache:
-            return language_embeddings, loss_mask, labels, attention_mask
+            return language_embeddings, loss_mask, labels
 
         img_seq_len = self._img_seq_len
         batch_size, text_seq_len = input_ids.shape
+        # input_ids seq len is expected to be sharded by CP size
+        if self.context_parallel_lm:
+            text_seq_len *= self.context_parallel_lm
 
         has_labels = labels is not None
         if has_labels:
@@ -334,7 +348,12 @@ class LLaVAModel(MegatronModule):
 
         # Create indices for new text and label positions.
         with torch.no_grad():
-            image_token_mask = input_ids == image_token_index
+            if image_token_mask is None:
+                assert (
+                    self.context_parallel_lm <= 1
+                ), "image_token_mask cannot be inferred from input_ids if using \
+                        Context Parallelism. Please provide in forward_step"
+                image_token_mask = input_ids == image_token_index
             num_images_per_sample = torch.sum(image_token_mask, dim=-1)
 
             # Number of tiles per sample.
@@ -356,24 +375,10 @@ class LLaVAModel(MegatronModule):
             ):
                 max_seq_len = self._language_max_sequence_length
 
-            if self.sequence_parallel_lm:
-                if self.tp_comm_overlap_lm:
-                    # If shorter: Pad to language_max_sequence_length to use TP Comm overlap.
-                    # If longer: Gets truncated later.
-                    if max_seq_len < self._language_max_sequence_length:
-                        padded_seq_len = self._language_max_sequence_length
-                else:
-                    # Pad to multiple of tp size for sequence parallelism
-                    tp_world_size = get_tensor_model_parallel_world_size()
-                    padded_seq_len = int(
-                        (max_seq_len + (tp_world_size - 1)) // tp_world_size * tp_world_size
-                    )
-                sp_padding_needed = padded_seq_len - max_seq_len
-                max_seq_len = padded_seq_len
-            batch_indices, non_image_indices = torch.where(input_ids != image_token_index)
+            batch_indices, non_image_indices = torch.where(image_token_mask != True)
             batch_indices = batch_indices.to(torch.int32)
             non_image_indices = non_image_indices.to(torch.int32)
-            
+
             # New position ids for the text tokens, shifted by the image sequence length.
             # E.g. for input_ids = [-200, 1, 2, 3] and img_seq_len = 576, we get
             # new_position_ids = [576, 577, 578, 579]. text_position_ids are then [577, 578, 579].
@@ -483,6 +488,14 @@ class LLaVAModel(MegatronModule):
                 final_embedding.shape[:2] == final_labels.shape == final_loss_mask.shape
             ), "unexpected shapes after data preprocessing"
 
+        if final_embedding is not None:
+            # Truncate if exceeding the language model's max sequence length.
+            if final_embedding.shape[1] > self._language_max_sequence_length:
+                final_embedding = final_embedding[:, : self._language_max_sequence_length]
+            # Transpose to [s,b,h] if not using CP because CP Sharding expects seq in dim=1
+            if self.context_parallel_lm == 1:
+                final_embedding = final_embedding.transpose(1, 0).contiguous()
+
         truncate_labels = (
             final_labels is not None and final_labels.shape[1] > self._language_max_sequence_length
         )
@@ -490,39 +503,180 @@ class LLaVAModel(MegatronModule):
             final_labels = final_labels[:, : self._language_max_sequence_length]
             final_loss_mask = final_loss_mask[:, : self._language_max_sequence_length]
 
-        if final_embedding is not None:
-            final_embedding = final_embedding.transpose(1, 0).contiguous()
-            # Truncate if exceeding the language model's max sequence length.
-            if final_embedding.shape[0] > self._language_max_sequence_length:
-                final_embedding = final_embedding[: self._language_max_sequence_length]
-            if self.sequence_parallel_lm:
-                # Create an attention mask. This ensures correct computation.
-                # This is done even when no padding was done as we set mask_type to
-                # 'padding' or 'padding_causal' when using SP.
-                if attention_mask is None:
-                    # Create base attention mask with original seq len to indicate valid tokens
-                    attention_mask = (
-                        torch.ones(
-                            (
-                                final_embedding.shape[1],
-                                final_embedding.shape[0] - sp_padding_needed,
-                            ),
-                            device=final_embedding.device,
-                        )
-                        .unsqueeze(1)
-                        .unsqueeze(1)
-                    )  # [b, 1, 1, final seq len - sp_padding_needed]
-                if sp_padding_needed > 0:
-                    # Add the padding portion of the mask
-                    attention_mask = torch.nn.functional.pad(attention_mask, (0, sp_padding_needed))
-                if is_te_min_version("1.7.0"):
-                    # Attention mask True/False meaning flipped in 1.7.0
-                    attention_mask = attention_mask < 0.5
-                final_embedding = tensor_parallel.scatter_to_sequence_parallel_region(
-                    final_embedding
-                )
+        return final_embedding, final_labels, final_loss_mask
 
-        return final_embedding, final_labels, final_loss_mask, attention_mask
+    def _process_embedding_token_parallel(
+        self, combined_embeddings, new_labels, new_loss_mask, packed_seq_params
+    ):
+        """Processes the input data for model parallelism support.
+
+        When using sequence parallelism (SP) or context parallelism (CP), the sequence is sharded
+        across different GPUs. This function helps ensure that the sharding is done correctly by
+        1. Calculates `padding_factor` which determines based on how many chunks we expect to shard
+           the sequence
+        2. Calculates and pads the inputs to necessary length to ensure equal sized chunks
+        3. Creates/Modifies PackedSeqParams which helps mask padded tokens during calculations
+        4. Performs any layout changes if necessary
+        5. Distributes the sequence across GPUs for SP and CP
+
+        Context Parallelism is a feature that helps improve memory efficiency for
+        long sequence training by distributing sequence across CP ranks.
+        It requires token length to be divisible by (CP size *2) to ensure proper load balance.
+        Please refer to `get_batch_on_this_cp_rank` function for more details.
+
+        Sequence Parallelism is a feature that helps improve memory efficiency for
+        long sequence training by distributing sequence across TP ranks.
+        It requires token length to be divisible by TP size.
+
+        Returns:
+            combined_embeddings (torch.Tensor): image and text embeddings combined and distributed.
+            new_labels (torch.Tensor): Distributed labels for image and text positions.
+            new_loss_mask (torch.Tensor): Distributed loss mask.
+            packed_seq_params (PackedSeqParams): Dict with padded token information.
+
+        """
+        # combined_embeddings - `s,b,h` if not using CP, `b,s,h` if using CP
+        batch_size = (
+            combined_embeddings.shape[0]
+            if self.context_parallel_lm > 1
+            else combined_embeddings.shape[1]
+        )
+        seq_dim = 1 if self.context_parallel_lm > 1 else 0
+
+        padding_mask_type = 'padding' in str(
+            self.language_model.transformer_layer_spec.submodules.self_attention.params.get(
+                'attn_mask_type', ''
+            )
+        )
+        if self.sequence_parallel_lm and self.tp_comm_overlap_lm:
+            assert (
+                combined_embeddings.shape[seq_dim] == self._language_max_sequence_length
+            ) or padding_mask_type, f"TP Comm overlap either requires Vision+Text token length \
+             == language_max_sequence_length or mask type to be set to padding/padding_causal"
+
+        if padding_mask_type:
+            # Calculate the padded sequence length needed to support SP and CP
+            # SP and CP are used to distributed the sequence across GPUs to improve
+            # memory efficiency and enable very long context training.
+            # To distribute workload equally, we need to ensure that the sequence is
+            # divisible by the appropriate padding factor calculated below.
+            padding_factor = None
+            padded_seq_len = None
+            mp_padding_needed = 0
+            if self.context_parallel_lm > 1 and self.sequence_parallel_lm:
+                padding_factor = self.tensor_model_parallel_size_lm * self.context_parallel_lm * 2
+            elif self.context_parallel_lm > 1:
+                padding_factor = self.context_parallel_lm * 2
+            elif self.sequence_parallel_lm:
+                padding_factor = self.tensor_model_parallel_size_lm
+
+            padded_seq_len = int(
+                (combined_embeddings.shape[seq_dim] + (padding_factor - 1))
+                // padding_factor
+                * padding_factor
+            )
+
+            assert (
+                padded_seq_len <= self._language_max_sequence_length
+            ), f"Sequence length after padding {padded_seq_len} for SP/CP has exceeded \
+                language_max_sequence_length. Ensure language_max_sequence_length is \
+                divisible by SP/CP factor: {padding_factor}"
+
+            if self.sequence_parallel_lm and self.tp_comm_overlap_lm:
+                # TP Comm overlap initializes the user buffer shape used for communication
+                # at the beginning of training run and the same shape is expected to be
+                # used throughout the training.
+                # Pad to language_max_sequence_length to use TP Comm overlap.
+                assert (
+                    self._language_max_sequence_length % padding_factor == 0
+                ), f"TP Comm overlap uses language_max_sequence_length \
+                    which needs to be divisible by SP/CP factor {padding_factor}"
+                padded_seq_len = self._language_max_sequence_length
+
+            assert (
+                packed_seq_params is not None
+            ), "Please provide PackedSeqParams dict when using SP or CP with padding"
+            valid_seqlens = packed_seq_params.cu_seqlens_q[1:] - packed_seq_params.cu_seqlens_q[:-1]
+            valid_seq_len = max(valid_seqlens)
+            assert (
+                padded_seq_len >= valid_seq_len
+            ), f"Padded Seq Len calculated for model parallelism: {padded_seq_len} \
+                    is shorter than expected valid token len {valid_seq_len} provided."
+
+            mp_padding_needed = padded_seq_len - combined_embeddings.shape[seq_dim]
+            if mp_padding_needed > 0:
+                new_labels = torch.nn.functional.pad(
+                    new_labels, (0, mp_padding_needed), value=IGNORE_INDEX
+                )
+                new_loss_mask = torch.nn.functional.pad(new_loss_mask, (0, mp_padding_needed))
+                if self.context_parallel_lm > 1:
+                    combined_embeddings = torch.nn.functional.pad(
+                        combined_embeddings, (0, 0, 0, mp_padding_needed)
+                    )
+                else:
+                    combined_embeddings = torch.nn.functional.pad(
+                        combined_embeddings, (0, 0, 0, 0, 0, mp_padding_needed)
+                    )
+
+                # Update PackedSeqParams if padding needed beyond user provided PackedSeqParams
+                packed_seq_params.max_seqlen_q = padded_seq_len
+                packed_seq_params.max_seqlen_kv = padded_seq_len
+                cu_seqlens_padded = None
+                # We need cu_seqlens_q_padded/cu_seqlens_kv_padded when doing
+                # CP+Padding to support accurate Attention with THD format.
+                if self.context_parallel_lm > 1:
+                    cu_seqlens_padded = torch.arange(
+                        0,
+                        (batch_size + 1) * (padded_seq_len),
+                        step=(padded_seq_len),
+                        dtype=torch.int32,
+                        device=combined_embeddings.device,
+                    )
+                    packed_seq_params.cu_seqlens_q_padded = cu_seqlens_padded
+                    packed_seq_params.cu_seqlens_kv_padded = cu_seqlens_padded
+                    packed_seq_params.qkv_format = 'thd'
+                else:
+                    packed_seq_params.qkv_format = 'sbhd'
+
+        if self.context_parallel_lm > 1:
+            # Distribute sequence across CP ranks
+            from megatron.training.utils import get_batch_on_this_cp_rank
+
+            batch = get_batch_on_this_cp_rank(
+                {
+                    "combined_embeddings": combined_embeddings,
+                    "new_labels": new_labels,
+                    "new_loss_mask": new_loss_mask,
+                }
+            )
+
+            combined_embeddings = batch["combined_embeddings"]  # [B, S/CP, H]
+            new_labels = batch["new_labels"]
+            new_loss_mask = batch["new_loss_mask"]
+
+            if getattr(packed_seq_params, 'qkv_format', None) == 'thd':
+                # If PackedSeqParams requires THD format,
+                # reshape embedding from [B,S,H] to [T,1,H] where T=B*S
+                combined_embeddings = (
+                    combined_embeddings.contiguous()
+                    .view(combined_embeddings.shape[0] * combined_embeddings.shape[1], -1)
+                    .unsqueeze(1)
+                )
+                new_labels = new_labels.view(new_labels.shape[0] * new_labels.shape[1]).unsqueeze(0)
+                new_loss_mask = new_loss_mask.view(
+                    new_loss_mask.shape[0] * new_loss_mask.shape[1]
+                ).unsqueeze(0)
+            else:
+                combined_embeddings = combined_embeddings.transpose(
+                    1, 0
+                ).contiguous()  # [B,S/CP,H] -> [S/CP,B,H]
+
+        if self.sequence_parallel_lm:
+            combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
+                combined_embeddings
+            )  # [S/(CP*TP),B,H]
+
+        return combined_embeddings, new_labels, new_loss_mask, packed_seq_params
 
     def _apply_tile_tagging(self, image_embeddings, num_image_tiles):
         """Apply tile tagging.
@@ -572,6 +726,8 @@ class LLaVAModel(MegatronModule):
         num_image_tiles: Optional[List[int]] = None,
         image_token_index: Optional[int] = None,
         runtime_gather_output: Optional[bool] = None,
+        image_token_mask: Optional[torch.Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> torch.Tensor:
         """Forward function of the LLaVA model.
 
@@ -592,6 +748,10 @@ class LLaVAModel(MegatronModule):
                 arg in the constructor will be used.
             runtime_gather_output (bool): Gather output at runtime. Default None means
                 `parallel_output` arg in the constructor will be used.
+            image_token_mask (torch.Tensor): Tensor indicating the location of
+                image token index in input_ids.
+            packed_seq_params (PackedSeqParams): Dict with padded token information.
+                Required for using SP/CP with padding mask type.
 
         Returns:
             output (torch.Tensor): Loss of shape [b, s] if labels are provided,
@@ -657,35 +817,15 @@ class LLaVAModel(MegatronModule):
             # Note: This adds absolute position embedding but not RoPE.
             # Each image is counted as one position.
             # RoPE is added in language_model forward. Each image embedding is one position.
-            if self.sequence_parallel_lm:
-                # Pad to nearest multiple of TP world size for embedding.
-                tp_world_size = get_tensor_model_parallel_world_size()
-                padded_seq_len = (
-                    int(
-                        (input_ids_text.shape[1] + tp_world_size - 1)
-                        // tp_world_size
-                        * tp_world_size
-                    )
-                    - input_ids_text.shape[1]
-                )
-                if padded_seq_len != 0:
-                    input_ids_text = torch.nn.functional.pad(input_ids_text, (0, padded_seq_len))
-                    if position_ids is not None:
-                        position_ids = torch.nn.functional.pad(position_ids, (0, padded_seq_len))
             language_embeddings = self.language_model.embedding(
                 input_ids=input_ids_text, position_ids=position_ids
             )  # [text_seq_len, b, h_language]
-            if self.sequence_parallel_lm:
-                # Gather the language embeddings back.
-                # We use the full embedding to insert image embeddings
-                # and then scatter to avoid load imbalance.
-                language_embeddings = tensor_parallel.gather_from_sequence_parallel_region(
-                    language_embeddings, tensor_parallel_output_grad=False
-                )
-                # Remove the padding done for SP as we'll need new padding calculation
-                # after image embeddings are inserted.
-                if padded_seq_len != 0:
-                    language_embeddings = language_embeddings[:-padded_seq_len]
+            # Gather the language embeddings back. We need the full embedding to insert
+            # image embeddings and then scatter again to avoid load imbalance.
+            if self.context_parallel_lm > 1:
+                cp_group = get_context_parallel_group()
+                language_embeddings, _ = gather_along_first_dim(language_embeddings, cp_group)
+
             language_embeddings = language_embeddings.transpose(
                 1, 0
             ).contiguous()  # [b, text_seq_len, h_language]
@@ -694,8 +834,7 @@ class LLaVAModel(MegatronModule):
         if num_image_tiles is None:
             num_image_tiles = torch.ones(images.shape[0], dtype=torch.int, device=input_ids.device)
 
-        # Preprocess input, labels and loss mask.
-        combined_embeddings, new_labels, new_loss_mask, attention_mask = self._preprocess_data(
+        combined_embeddings, new_labels, new_loss_mask = self._preprocess_data(
             image_embeddings,
             language_embeddings,
             input_ids,
@@ -705,8 +844,15 @@ class LLaVAModel(MegatronModule):
             inference_params,
             image_token_index if image_token_index is not None else self.image_token_index,
             num_image_tiles,
-            attention_mask,
+            image_token_mask,
         )  # [combined_seq_len, b, h_language], [b, combined_seq_len], [b, combined_seq_len]
+
+        if self.context_parallel_lm > 1 or self.sequence_parallel_lm:
+            combined_embeddings, new_labels, new_loss_mask, packed_seq_params = (
+                self._process_embedding_token_parallel(
+                    combined_embeddings, new_labels, new_loss_mask, packed_seq_params
+                )
+            )
 
         output = self.language_model(
             input_ids=None,
@@ -716,6 +862,7 @@ class LLaVAModel(MegatronModule):
             labels=new_labels,
             inference_params=inference_params,
             runtime_gather_output=runtime_gather_output,
+            packed_seq_params=packed_seq_params,
         )
 
         return output, new_loss_mask

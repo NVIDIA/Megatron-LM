@@ -268,7 +268,8 @@ class CudaGraphManager(torch.nn.Module):
         backward passes. Finally wraps this cudagraph function with a CudaGraphRunner.
         """
 
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         torch.cuda.set_stream(self.stream)
         start = time.time()
 

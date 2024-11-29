@@ -68,7 +68,7 @@ def test_completions(
     Utils.initialize_distributed()
 
     # set up the mocks
-    args = argparse.Namespace(max_position_embeddings=1024, max_tokens_to_oom=1_000_000)
+    args = argparse.Namespace(max_position_embeddings=1024, max_tokens_to_oom=1_000_000, inference_max_seq_length=2560)
     mock_get_args_1.return_value = args
     mock_get_tokenizer1.return_value = gpt2_tiktoken_tokenizer
     mock_get_tokenizer2.return_value = gpt2_tiktoken_tokenizer

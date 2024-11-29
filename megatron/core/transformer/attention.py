@@ -460,7 +460,7 @@ class Attention(MegatronModule, ABC):
                 packed_seq_params=packed_seq_params,
             )
 
-        if packed_seq_params is not None:
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
             # t is the pack size = sum (sq_i)

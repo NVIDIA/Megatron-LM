@@ -127,7 +127,8 @@ def _send_and_recv_from_last_to_first_pipeline_stage(tensor=None):
         for req in reqs:
             req.wait()
         # To protect against race condition when using batch_isend_irecv().
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         return tensor
 

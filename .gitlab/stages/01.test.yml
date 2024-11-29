@@ -14,7 +14,7 @@ test:build_image:
   tags:
     - arch/amd64
     - origin/jet-fleet
-    - env/dev
+    - env/prod
     - ${TAG}
   services:
     - name: docker:24.0.5-dind
@@ -212,6 +212,7 @@ test:notify_unit_tests:
   tags:
     - mcore-docker-node-small
   script:
+    - apk add bash
     - env
     - export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
@@ -312,6 +313,7 @@ test:pypi_build_wheel:
   tags: [mcore-docker-node-small]
   variables:
     PUBLISH_DRYRUN: 'yes'
+    PY_ENV: pytorch:24.07
   script:
     - echo $PUBLISH_DRYRUN
     - >
