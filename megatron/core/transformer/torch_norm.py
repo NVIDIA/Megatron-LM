@@ -2,8 +2,7 @@
 import torch
 
 from megatron.core.transformer import TransformerConfig
-
-TORCH_VERSION = torch.__version__.split('.')
+from megatron.core.utils import is_torch_min_version
 
 
 class WrappedTorchNorm:
@@ -36,10 +35,9 @@ class WrappedTorchNorm:
         if config.normalization == "LayerNorm":
             norm_cls = torch.nn.LayerNorm
         elif config.normalization == "RMSNorm":
-            version_geq_2_4 = int(TORCH_VERSION[0]) > 2 or (
-                int(TORCH_VERSION[0]) == 2 and int(TORCH_VERSION[1]) >= 4
-            )
-            assert version_geq_2_4, 'Torch RMSNorm requires PyTorch version >= 2.4.0'
+            assert is_torch_min_version(
+                "2.4.0a0"
+            ), 'Torch RMSNorm requires PyTorch version >= 2.4.0'
 
             norm_cls = torch.nn.RMSNorm
         else:
