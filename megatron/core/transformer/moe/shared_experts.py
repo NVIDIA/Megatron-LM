@@ -17,14 +17,10 @@ from megatron.core.tensor_parallel.mappings import (
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
-from megatron.core.tensor_parallel.random import (
-    get_cuda_rng_tracker,
-    get_data_parallel_rng_tracker_name,
-)
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import make_sharded_tensor_for_checkpoint
+from megatron.core.utils import is_torch_min_version, make_sharded_tensor_for_checkpoint
 
 
 class SharedExpertMLP(MLP):
@@ -46,12 +42,9 @@ class SharedExpertMLP(MLP):
 
         self.use_shared_expert_gate = spec.params.get("gate", False)
         if self.use_shared_expert_gate:
+            # TODO: Add support for GPU initialization, which requires updating the golden values.
             self.gate_weight = torch.nn.Parameter(torch.empty((1, self.config.hidden_size)))
             if config.perform_initialization:
-                if get_cuda_rng_tracker().is_initialized():
-                    with get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
-                        config.init_method(self.gate_weight)
-            else:
                 config.init_method(self.gate_weight)
             self.gate_weight.data = self.gate_weight.data.to(dtype=config.params_dtype)
             setattr(self.gate_weight, 'sequence_parallel', self.config.sequence_parallel)
@@ -235,28 +228,17 @@ class SharedExpertMLP(MLP):
         return output
 
 
-TORCH_MAJOR = int(torch.__version__.split(".")[0])
-TORCH_MINOR = int(torch.__version__.split(".")[1])
-TORCH_LAST = torch.__version__.split(".")[2]
-
-
 def set_tensor_grad_fn_sequence_sr(tensor, value):
     """
     Set sequence_sr for the grad_fn of a tensor to control the backward order.
     For older PyTorch version, do nothing (backward order is not changed).
     The bigger the value is, the earlier the grad_fn is scheduled.
     """
-    if (
-        (TORCH_MAJOR > 2)
-        or (TORCH_MAJOR == 2 and TORCH_MINOR > 2)
-        or (TORCH_MAJOR == 2 and TORCH_MINOR == 2 and '+' not in TORCH_LAST)
-    ):
-        # In NVIDIA PyTorch container 24.01, the PyTorch version is 2.2.0a0+81ea7a4,
-        # which does not contian the set_sequence_nr commit.
+    if is_torch_min_version("2.2.0"):
         if tensor is not None and tensor.grad_fn is not None:
             tensor.grad_fn._set_sequence_nr(value)
     else:
         warnings.warn(
             "WARNING : PyTorch is too old to set sequence_sr and the performance may not "
-            "optimal. Please use PyTorch >= 2.2.0 for better performance."
+            "be optimal. Please use PyTorch >= 2.2.0 for better performance."
         )
