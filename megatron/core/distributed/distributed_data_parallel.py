@@ -154,7 +154,7 @@ class DistributedDataParallel(_BaseDataParallel):
                     # Collective is averaging gradients in collective with data_parallel_group.
                     assert (
                         gradient_scaling_factor
-                        / torch.distributed.get_world_size(group=data_parallel_group)
+                        / parallel_state.get_data_parallel_world_size(with_context_parallel=True)
                         == target_gradient_scaling_factor
                     )
                 else:
@@ -188,6 +188,17 @@ class DistributedDataParallel(_BaseDataParallel):
             # bucket group.
             bucket_groups = partition_buckets(buffers, force_single_bucket_group=disable_bucketing)
 
+            if self.ddp_config.num_distributed_optimizer_instances > 1:
+                assert (
+                    self.ddp_config.use_distributed_optimizer
+                ), 'Partial DistOpt cannot be used without DistOpt'
+                communication_stream = torch.cuda.Stream(device=torch.cuda.current_device())
+                for bucket_group in bucket_groups:
+                    bucket_group.inter_distributed_optimizer_instance_group = (
+                        parallel_state.get_inter_partial_data_parallel_group()
+                    )
+                    bucket_group.communication_stream = communication_stream
+
             # Set `next_param_gather_bucket_group` for different bucket groups by iterating through
             # buckets in reverse order (since all-gathers happen in reverse order of buckets).
             if self.ddp_config.use_distributed_optimizer and self.ddp_config.overlap_param_gather:
@@ -218,13 +229,16 @@ class DistributedDataParallel(_BaseDataParallel):
                 data_parallel_world_size = parallel_state.get_data_parallel_world_size(
                     with_context_parallel=True
                 )
+
                 gradient_scaling_factor = 1.0 / data_parallel_world_size
                 expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
 
         # Allocate the param+grad buffers for dense params' grads.
         self.buffers, self.bucket_groups = _allocate_buffers_for_parameters(
             dense_params,
-            parallel_state.get_data_parallel_group(with_context_parallel=True),
+            parallel_state.get_data_parallel_group(
+                with_context_parallel=True, partial_data_parallel=True
+            ),
             gradient_scaling_factor=gradient_scaling_factor,
         )
 
@@ -443,7 +457,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 data_parallel_group = parallel_state.get_expert_data_parallel_group()
             else:
                 data_parallel_group = parallel_state.get_data_parallel_group(
-                    with_context_parallel=True
+                    with_context_parallel=True, partial_data_parallel=True
                 )
             torch.distributed.broadcast(
                 param.data,
