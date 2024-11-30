@@ -9,6 +9,18 @@ import yaml
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
 
 
+def resolve_cluster_config(cluster: str) -> str:
+    if cluster == "dgxh100_eos":
+        return "eos"
+    if cluster == "dgxa100_dracooci":
+        return "draco-oci-iad"
+    if cluster == "dgxa100_dracooci-ord":
+        return "draco-oci-ord"
+    if cluster == "dgxh100_coreweave":
+        return "coreweave"
+    raise ValueError(f"Unknown cluster {cluster} provided.")
+
+
 def flatten_products(
     workload_manifest: jetclient.JETWorkloadManifest,
 ) -> jetclient.JETWorkloadManifest:

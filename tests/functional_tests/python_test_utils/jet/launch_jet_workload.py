@@ -21,18 +21,6 @@ from tests.functional_tests.python_test_utils.jet import common
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
 
 
-def resolve_cluster_config(cluster: str) -> str:
-    if cluster == "dgxh100_eos":
-        return "mcore/eos"
-    if cluster == "dgxa100_dracooci":
-        return "mcore/draco-oci"
-    if cluster == "dgxa100_dracooci-ord":
-        return "mcore/draco-oci-ord"
-    if cluster == "dgxh100_coreweave":
-        return "mcore/coreweave"
-    raise ValueError(f"Unknown cluster {cluster} provided.")
-
-
 def register_pipeline_terminator(pipeline: jetclient.JETPipeline):
     def sigterm_handler(_signo, _stack_frame):
         print(f"Trying to terminate pipeline {pipeline.jet_id}")
@@ -70,7 +58,7 @@ def launch_and_wait_for_completion(
                 container_tag=container_tag,
                 environment=environment,
             ),
-            config_id=resolve_cluster_config(cluster),
+            config_id=f"mcore/{common.resolve_cluster_config(cluster)}",
             custom_config={
                 "launchers": {cluster: {"account": account, "ntasks_per_node": 8}},
                 "executors": {

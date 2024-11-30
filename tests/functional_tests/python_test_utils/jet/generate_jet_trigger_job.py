@@ -95,6 +95,12 @@ def main(
             else:
                 raise ValueError(f"Platform {test_case.spec.platforms} unknown")
 
+            job_tags = list(tags)
+            cluster = common.resolve_cluster_config(cluster)
+            # Todo: remove after all runners are onboarded
+            if cluster == "draco-oci-ord" or cluster == "draco-oci-iad":
+                job_tags.append(f"cluster/{cluster}")
+
             script = [
                 "export PYTHONPATH=$(pwd); "
                 "python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py",
@@ -117,7 +123,7 @@ def main(
             gitlab_pipeline[test_case.spec.test_case] = {
                 "stage": f"{test_case.spec.model}",
                 "image": f"{container_image}:{container_tag}",
-                "tags": tags,
+                "tags": job_tags,
                 "rules": [
                     {"if": '$CI_PIPELINE_SOURCE == "parent_pipeline"'},
                     {"if": '$CI_MERGE_REQUEST_ID'},
