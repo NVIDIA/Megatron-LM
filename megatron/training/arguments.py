@@ -298,21 +298,29 @@ def validate_args(args, defaults={}):
             print('setting global batch size to {}'.format(
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
+    if args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None:
+        # Divisibility check not applicable for T5 models which specify encoder_num_layers
+        # and decoder_num_layers.
+        if args.num_layers is not None:
+            assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
+                'Number of layers should be divisible by the pipeline-model-parallel size'
     if args.num_layers_per_virtual_pipeline_stage is not None:
         if args.overlap_p2p_comm:
             assert args.pipeline_model_parallel_size > 1, \
-                'when interleaved schedule is used, pipeline-model-parallel size '\
+                'When interleaved schedule is used, pipeline-model-parallel size '\
                 'should be greater than 1'
         else:
             assert args.pipeline_model_parallel_size > 2, \
-                'when interleaved schedule is used and p2p communication overlap is disabled, '\
+                'When interleaved schedule is used and p2p communication overlap is disabled, '\
                 'pipeline-model-parallel size should be greater than 2 to avoid having multiple '\
                 'p2p sends and recvs between same 2 ranks per communication batch'
+        assert args.num_layers is not None
+        # Double check divisibility check here since check above is if guarded.
         assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
-            'number of layers should be divisible by the pipeline parallel size'
+            'Number of layers should be divisible by the pipeline-model-parallel size'
         num_layers_per_pipeline_stage = args.num_layers // args.transformer_pipeline_model_parallel_size
         assert num_layers_per_pipeline_stage % args.num_layers_per_virtual_pipeline_stage == 0, \
-            'number of layers per pipeline stage must be divisible number of layers per virtual pipeline stage'
+            'Number of layers per pipeline stage must be divisible by number of layers per virtual pipeline stage'
         args.virtual_pipeline_model_parallel_size = num_layers_per_pipeline_stage // \
             args.num_layers_per_virtual_pipeline_stage
     else:
