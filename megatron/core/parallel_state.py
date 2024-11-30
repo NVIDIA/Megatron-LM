@@ -105,6 +105,11 @@ _DATA_PARALLEL_GROUP_WITH_CP = None
 _DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
 _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = None
 
+# Partial Data parallel group information with context parallel combined.
+_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
+_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
+_INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
+
 # combined parallel group of TP and CP
 _TENSOR_AND_CONTEXT_PARALLEL_GROUP = None
 
@@ -391,6 +396,7 @@ def initialize_model_parallel(
     context_parallel_size: int = 1,
     hierarchical_context_parallel_sizes: Optional[List[int]] = None,
     expert_model_parallel_size: int = 1,
+    num_distributed_optimizer_instances: int = 1,
     expert_tensor_parallel_size: Optional[int] = None,
     nccl_communicator_config_path: Optional[str] = None,
     distributed_timeout_minutes: int = 30,
@@ -472,6 +478,10 @@ def initialize_model_parallel(
         expert_model_parallel_size (int, default = 1):
             The number of Mixture of Experts parallel GPUs in each expert
             parallel group.
+
+        num_distributed_optimizer_instances (int, default = 1):
+            The number of distributed optimizer replicas across the data-
+            parallel domain.
 
         expert_tensor_parallel_size (int, default = tp_size):
             The number of GPUs to split individual tensors of expert.
@@ -699,6 +709,9 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GROUP_WITH_CP
     global _DATA_PARALLEL_GROUP_WITH_CP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
+    global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+    global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
+    global _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     assert _DATA_PARALLEL_GROUP is None, 'data parallel group is already initialized'
 
     for ranks in generator_wrapper('dp'):
@@ -711,6 +724,11 @@ def initialize_model_parallel(
             _DATA_PARALLEL_GROUP_GLOO = group_gloo
             _DATA_PARALLEL_GLOBAL_RANKS = ranks
 
+    assert (
+        data_parallel_size % num_distributed_optimizer_instances == 0
+    ), 'Data parallel size should be divisible by partial DistOpt shard factor'
+    intra_partial_data_parallel_size = data_parallel_size // num_distributed_optimizer_instances
+
     for ranks_with_cp in generator_wrapper('dp-cp'):
         group_with_cp = torch.distributed.new_group(
             ranks_with_cp, timeout=timeout, pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs)
@@ -718,10 +736,57 @@ def initialize_model_parallel(
         group_with_cp_gloo = torch.distributed.new_group(
             ranks_with_cp, timeout=timeout, backend="gloo"
         )
+
         if rank in ranks_with_cp:
             _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
             _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
             _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = ranks_with_cp
+
+        if num_distributed_optimizer_instances > 1:
+            # Create groups for Partial DistOpt, one for intra-partial DP domain
+            # Another for inter-partial DP domain
+            for i in range(num_distributed_optimizer_instances):
+                intra_partial_data_parallel_ranks_with_cp = ranks_with_cp[
+                    (i * intra_partial_data_parallel_size) : (
+                        (i + 1) * intra_partial_data_parallel_size
+                    )
+                ]
+
+                intra_partial_data_parallel_group_with_cp = torch.distributed.new_group(
+                    intra_partial_data_parallel_ranks_with_cp,
+                    timeout=timeout,
+                    pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs),
+                )
+                intra_partial_data_parallel_group_with_cp_gloo = torch.distributed.new_group(
+                    intra_partial_data_parallel_ranks_with_cp, timeout=timeout, backend="gloo"
+                )
+
+                if rank in intra_partial_data_parallel_ranks_with_cp:
+                    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = (
+                        intra_partial_data_parallel_group_with_cp
+                    )
+                    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = (
+                        intra_partial_data_parallel_group_with_cp_gloo
+                    )
+
+            for i in range(intra_partial_data_parallel_size):
+                inter_partial_data_parallel_ranks_with_cp = ranks_with_cp[
+                    i::intra_partial_data_parallel_size
+                ]
+
+                inter_partial_data_parallel_group_with_cp = torch.distributed.new_group(
+                    inter_partial_data_parallel_ranks_with_cp,
+                    timeout=timeout,
+                    pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs),
+                )
+
+                if rank in inter_partial_data_parallel_ranks_with_cp:
+                    _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = (
+                        inter_partial_data_parallel_group_with_cp
+                    )
+        else:
+            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = _DATA_PARALLEL_GROUP_WITH_CP
+            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = _DATA_PARALLEL_GROUP_WITH_CP_GLOO
 
     # Apply SHARP to DP process groups
     if use_sharp:
@@ -985,28 +1050,48 @@ def get_pipeline_model_parallel_group():
     return _PIPELINE_MODEL_PARALLEL_GROUP
 
 
-def get_data_parallel_group(with_context_parallel=False):
+def get_data_parallel_group(with_context_parallel=False, partial_data_parallel=False):
     """Get the data-parallel group the caller rank belongs to."""
     if with_context_parallel:
+        if partial_data_parallel:
+            assert (
+                _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP is not None
+            ), 'Intra partial data parallel group is not initialized'
+            return _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
         assert (
             _DATA_PARALLEL_GROUP_WITH_CP is not None
         ), 'data parallel group with context parallel combined is not initialized'
         return _DATA_PARALLEL_GROUP_WITH_CP
     else:
         assert _DATA_PARALLEL_GROUP is not None, 'data parallel group is not initialized'
+        assert partial_data_parallel == False, 'Partial DP for Optimizer needs to include CP'
         return _DATA_PARALLEL_GROUP
 
 
-def get_data_parallel_group_gloo(with_context_parallel=False):
+def get_data_parallel_group_gloo(with_context_parallel=False, partial_data_parallel=False):
     """Get the Gloo data-parallel group the caller rank belongs to."""
     if with_context_parallel:
+        if partial_data_parallel:
+            assert (
+                _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
+            ), 'Intra partial data parallel group is not initialized'
+            return _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
         assert (
             _DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
         ), 'data parallel group-gloo with context parallel combined is not initialized'
         return _DATA_PARALLEL_GROUP_WITH_CP_GLOO
     else:
         assert _DATA_PARALLEL_GROUP_GLOO is not None, 'data parallel group-gloo is not initialized'
+        assert partial_data_parallel == False, 'Partial DP for Optimizer needs to include CP'
         return _DATA_PARALLEL_GROUP_GLOO
+
+
+def get_inter_partial_data_parallel_group():
+    """Get the group spanning the different partial data-parallel groups."""
+    assert (
+        _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP is not None
+    ), 'Inter partial data parallel group is not initialized'
+    return _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
 
 
 def get_context_parallel_group(check_initialized=True):
@@ -1423,14 +1508,17 @@ def get_pipeline_model_parallel_prev_rank():
         return _PIPELINE_GLOBAL_RANKS[(rank_in_pipeline - 1) % world_size]
 
 
-def get_data_parallel_world_size(with_context_parallel=False):
+def get_data_parallel_world_size(with_context_parallel=False, partial_data_parallel=False):
     """Return world size for the data parallel group."""
     global _MPU_DATA_PARALLEL_WORLD_SIZE
     if _MPU_DATA_PARALLEL_WORLD_SIZE is not None:
         return _MPU_DATA_PARALLEL_WORLD_SIZE
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_world_size(
-            group=get_data_parallel_group(with_context_parallel=with_context_parallel)
+            group=get_data_parallel_group(
+                with_context_parallel=with_context_parallel,
+                partial_data_parallel=partial_data_parallel,
+            )
         )
     else:
         return 0
@@ -1442,14 +1530,17 @@ def set_data_parallel_rank(rank):
     _MPU_DATA_PARALLEL_RANK = rank
 
 
-def get_data_parallel_rank(with_context_parallel=False):
+def get_data_parallel_rank(with_context_parallel=False, partial_data_parallel=False):
     """Return caller's rank in the data-parallel group."""
     global _MPU_DATA_PARALLEL_RANK
     if _MPU_DATA_PARALLEL_RANK is not None:
         return _MPU_DATA_PARALLEL_RANK
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_rank(
-            group=get_data_parallel_group(with_context_parallel=with_context_parallel)
+            group=get_data_parallel_group(
+                with_context_parallel=with_context_parallel,
+                partial_data_parallel=partial_data_parallel,
+            )
         )
     else:
         return 0

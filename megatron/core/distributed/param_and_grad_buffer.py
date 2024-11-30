@@ -3,6 +3,7 @@
 import logging
 import math
 import os
+from contextlib import nullcontext
 from enum import Enum
 from typing import Dict, List, Optional
 
@@ -94,22 +95,29 @@ class _ParamAndGradBucketGroup:
     Args:
         buckets: A list of buckets.
         ddp_config: DistributedDataParallel config object.
-        data_parallel_group: Data-parallel process group.
-        data_parallel_world_size: World size using the data-parallel group group.
+        collective_group: intra_distributed_optimizer_instance_group if using distributed
+            optimizer, data_parallel_group if not.
+        collective_group_size: World size using the intra data-parallel group.
     """
 
     def __init__(
         self,
         buckets: List[_ParamAndGradBucket],
         ddp_config: DistributedDataParallelConfig,
-        data_parallel_group: torch.distributed.ProcessGroup,
-        data_parallel_world_size: int,
+        collective_group: torch.distributed.ProcessGroup,
+        collective_group_size: int,
     ):
         self.buckets = buckets
         self.ddp_config = ddp_config
-        self.data_parallel_group = data_parallel_group
-        self.data_parallel_world_size = data_parallel_world_size
-        self.data_parallel_rank = torch.distributed.get_rank(group=data_parallel_group)
+
+        if self.ddp_config.use_distributed_optimizer:
+            self.intra_distributed_optimizer_instance_group = collective_group
+            self.intra_distributed_optimizer_instance_size = collective_group_size
+            self.intra_distributed_optimizer_instance_rank = torch.distributed.get_rank(
+                group=collective_group
+            )
+        else:
+            self.data_parallel_group = collective_group
 
         # State for bookkeeping: params is the set of parameters this bucket group is
         # responsible for, params_with_grad is the set of parameters with grads
@@ -123,6 +131,10 @@ class _ParamAndGradBucketGroup:
                 self.params.add(param)
 
         self.next_param_gather_bucket_group = None
+
+        if self.ddp_config.num_distributed_optimizer_instances > 1:
+            self.inter_distributed_optimizer_instance_group = None
+            self.communication_stream = None
 
         self.reset()
         self.param_gather_handle = None
@@ -175,15 +187,17 @@ class _ParamAndGradBucketGroup:
 
         async_op = self.ddp_config.overlap_param_gather and not force_sync
         # Coalesce communication kernels across buckets in the bucket group.
-        with _coalescing_manager(self.data_parallel_group, async_ops=async_op) as cm:
+        with _coalescing_manager(
+            self.intra_distributed_optimizer_instance_group, async_ops=async_op
+        ) as cm:
             for bucket in self.buckets:
-                local_data_view = shard_buffer(bucket.param_data, self.data_parallel_world_size)[
-                    self.data_parallel_rank
-                ]
+                local_data_view = shard_buffer(
+                    bucket.param_data, self.intra_distributed_optimizer_instance_size
+                )[self.intra_distributed_optimizer_instance_rank]
                 dist_all_gather_func(
                     bucket.param_data,
                     local_data_view,
-                    group=self.data_parallel_group,
+                    group=self.intra_distributed_optimizer_instance_group,
                     async_op=async_op,
                 )
         if async_op:
@@ -254,20 +268,51 @@ class _ParamAndGradBucketGroup:
         if self.ddp_config.average_in_collective:
             reduce_op = torch.distributed.ReduceOp.AVG
 
+        # Stream synchronization logic of the CUDA streams that is
+        # implemented below for the gradient reduction within and across
+        # distributed optimizer instances.
+
+        # Compute Stream - -------------Gradient Compute-------------------
+        # Comm. Stream   - ------(wait for nccl)-----(wait for nccl)-------
+        # NCCL Stream    -       -------RS------     -------AR------
+
         # Use async communications only when overlap_grad_reduce is True.
-        async_op = self.ddp_config.overlap_grad_reduce
+        async_op = (
+            self.ddp_config.overlap_grad_reduce
+            and self.ddp_config.num_distributed_optimizer_instances == 1
+        )
+        if (
+            self.ddp_config.num_distributed_optimizer_instances > 1
+            and self.ddp_config.overlap_grad_reduce
+        ):
+            # Assign a communication stream if we use partial DP DistOpt and we
+            # need to overlap communication
+            stream_context = torch.cuda.stream(self.communication_stream)
+
+            # The RS/AR communication stream needs to wait for the default stream
+            # to complete its gradient computation before launching the next
+            # gradient reduction collective
+            self.communication_stream.wait_stream(torch.cuda.default_stream())
+        else:
+            stream_context = nullcontext()
+
+        if self.ddp_config.use_distributed_optimizer:
+            communication_group = self.intra_distributed_optimizer_instance_group
+        else:
+            communication_group = self.data_parallel_group
+
         # Coalesce communication kernels across buckets in the bucket group.
-        with _coalescing_manager(self.data_parallel_group, async_ops=async_op) as cm:
+        with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
             for bucket in self.buckets:
                 if self.ddp_config.use_distributed_optimizer:
-                    local_data_view = shard_buffer(bucket.grad_data, self.data_parallel_world_size)[
-                        self.data_parallel_rank
-                    ]
+                    local_data_view = shard_buffer(
+                        bucket.grad_data, self.intra_distributed_optimizer_instance_size
+                    )[self.intra_distributed_optimizer_instance_rank]
                     dist_reduce_scatter_func(
                         local_data_view,
                         bucket.grad_data,
                         op=reduce_op,
-                        group=self.data_parallel_group,
+                        group=self.intra_distributed_optimizer_instance_group,
                         async_op=async_op,
                     )
                 else:
@@ -277,6 +322,29 @@ class _ParamAndGradBucketGroup:
                         group=self.data_parallel_group,
                         async_op=async_op,
                     )
+
+        # When enabling partial DP domain DistOpt, we need to All-Reduce across all partial domains
+        if (
+            self.ddp_config.use_distributed_optimizer
+            and self.ddp_config.num_distributed_optimizer_instances > 1
+        ):
+
+            # Create a new coalescing facility for the inter partial DP-AllReduce here
+            with stream_context, _coalescing_manager(
+                self.inter_distributed_optimizer_instance_group, async_ops=async_op
+            ) as cm:
+                for bucket in self.buckets:
+                    local_data_view = shard_buffer(
+                        bucket.grad_data, self.intra_distributed_optimizer_instance_size
+                    )[self.intra_distributed_optimizer_instance_rank]
+
+                    torch.distributed.all_reduce(
+                        local_data_view,
+                        op=reduce_op,
+                        group=self.inter_distributed_optimizer_instance_group,
+                        async_op=async_op,
+                    )
+
         if async_op:
             self.grad_reduce_handle = cm
         else:
@@ -300,6 +368,11 @@ class _ParamAndGradBucketGroup:
         self.param_gather_dispatched = False
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync()
+            return
+        # When using partial DP DistOpt, we don't need to sync as we launch comms on a separate
+        # communication stream
+        if self.ddp_config.num_distributed_optimizer_instances > 1:
+            torch.cuda.default_stream().wait_stream(self.communication_stream)
             return
         assert self.grad_reduce_handle is not None, (
             f'Communication call has not been issued for this bucket '

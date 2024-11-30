@@ -1686,6 +1686,8 @@ def _add_distributed_args(parser):
                        'affects the encoder embedding.)')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
+    group.add_argument('--num-distributed-optimizer-instances', type=int, default=1,
+                       help='Number of Distributed Optimizer copies across Data Parallel domain.')
     group.add_argument('--use-torch-fsdp2', action='store_true',
                        help="Use the torch FSDP2 implementation. FSDP2 is not currently working with Pipeline Parallel."
                        "It is still not in a stable release stage, and may therefore contain bugs or other potential issues.")

@@ -241,6 +241,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group_gloo: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group_idx: Optional[int] = None,
+    distributed_optimizer_instance_id: Optional[int] = 0,
 ) -> MegatronOptimizer:
     """Get Megatron optimizer based on parameter groups.
 
@@ -255,6 +256,8 @@ def _get_megatron_optimizer_based_on_param_groups(
             group for distributed optimizer. Defaults to None.
         data_parallel_group_idx (int, optional): data-parallel group index for distributed
             optimizer. Defaults to None.
+        distributed_optimizer_instance_id (int, optional): Distributed optimizer instance. Defaults
+            0.
 
     Returns:
         Instance of MegatronOptimizer.
@@ -325,6 +328,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 data_parallel_group=data_parallel_group,
                 data_parallel_group_gloo=data_parallel_group_gloo,
                 data_parallel_group_idx=data_parallel_group_idx,
+                distributed_optimizer_instance_id=distributed_optimizer_instance_id,
             )
         else:
             optimizer = Float16OptimizerWithFloat16Params(*optimizer_args)
@@ -373,6 +377,17 @@ def get_megatron_optimizer(
         overlap_param_gather_with_optimizer_step_flags = [False]
     model_parallel_rank = torch.distributed.get_rank(mpu.get_model_parallel_group())
 
+    if torch.distributed.get_world_size(
+        mpu.get_data_parallel_group(with_context_parallel=True, partial_data_parallel=False)
+    ) > torch.distributed.get_world_size(
+        mpu.get_data_parallel_group(with_context_parallel=True, partial_data_parallel=True)
+    ):
+        distributed_optimizer_instance_id = torch.distributed.get_rank(
+            mpu.get_inter_partial_data_parallel_group()
+        )
+    else:
+        distributed_optimizer_instance_id = 0
+
     optimizers = []
     model_chunk_offset = 0
     for dense_model_chunks, overlap_param_gather_with_optimizer_step in zip(
@@ -399,11 +414,14 @@ def get_megatron_optimizer(
                 param_groups=param_groups,
                 per_model_buffers=buffers,
                 model_parallel_group=mpu.get_model_parallel_group(),
-                data_parallel_group=mpu.get_data_parallel_group(with_context_parallel=True),
+                data_parallel_group=mpu.get_data_parallel_group(
+                    with_context_parallel=True, partial_data_parallel=True
+                ),
                 data_parallel_group_gloo=mpu.get_data_parallel_group_gloo(
-                    with_context_parallel=True
+                    with_context_parallel=True, partial_data_parallel=True
                 ),
                 data_parallel_group_idx=model_parallel_rank,
+                distributed_optimizer_instance_id=distributed_optimizer_instance_id,
             )
         )
         model_chunk_offset += 1
