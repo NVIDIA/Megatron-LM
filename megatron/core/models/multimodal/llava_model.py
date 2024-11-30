@@ -746,8 +746,9 @@ class LLaVAModel(MegatronModule):
                 `parallel_output` arg in the constructor will be used.
             image_token_mask (torch.Tensor): Tensor indicating the location of
                 image token index in input_ids.
-            packed_seq_params (PackedSeqParams): Dict with padded token information.
-                Required for using SP/CP with padding mask type.
+            packed_seq_params (PackedSeqParams): 1) If using sequence packing, must contain
+                subsample length information. 2) If using SP/CP with padding mask type,
+                must contain padded token information.
 
         Returns:
             output (torch.Tensor): Loss of shape [b, s] if labels are provided,
