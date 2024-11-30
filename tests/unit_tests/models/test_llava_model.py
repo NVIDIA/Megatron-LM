@@ -317,6 +317,28 @@ class TestLLaVAModel:
         max_seq_len = img_seq_len * 3 - 2 + 1024
         assert loss.shape == new_loss_mask.shape == torch.Size((5, max_seq_len))
 
+        # Try with labels and PackedSeqParams. Only micro batch size 1 is supported in this mode.
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=[0, 512, 1024, 1600],  # Just example values.
+            cu_seqlens_kv=[0, 512, 1024, 1600],
+            max_seqlen_q=[1600],
+            max_seqlen_kv=[1600],
+        )
+
+        loss, new_loss_mask = self.model.forward(
+            img[:1],
+            input_ids[:1],
+            position_ids[:1],
+            attention_mask,
+            labels[:1],
+            loss_mask[:1],
+            num_image_tiles=num_image_tiles[:1],
+        )
+
+        # 1600 = 577 (img_seq_len) + 1024 (text tokens in the first sample) - 1 (image token).
+        assert loss.shape == new_loss_mask.shape == torch.Size((1, 1600))
+
         # Try text-only input.
         loss, new_loss_mask = self.model.forward(
             torch.tensor([], dtype=torch.float).cuda(),
