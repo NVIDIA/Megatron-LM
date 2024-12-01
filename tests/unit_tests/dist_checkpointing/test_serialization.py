@@ -2,11 +2,13 @@
 
 import io
 import logging
+import os
 
 import numpy as np
 import pytest
 import torch
 from torch.distributed.checkpoint import CheckpointException as PyTCheckpointingException
+from torch.distributed.checkpoint import FileSystemReader
 
 try:
     from torch.distributed import DeviceMesh
@@ -17,7 +19,7 @@ except ImportError:
     HAVE_DTENSOR = False
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing import ShardedTensor, load, save
+from megatron.core.dist_checkpointing import ShardedTensor, load, remove_sharded_tensors, save
 from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_load_config
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensorFactory
@@ -26,7 +28,9 @@ from megatron.core.dist_checkpointing.serialization import (
     load_tensors_metadata,
 )
 from megatron.core.dist_checkpointing.strategies.base import StrategyAction, get_default_strategy
+from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
 from megatron.core.dist_checkpointing.validation import StrictHandling
+from megatron.core.utils import is_torch_min_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -508,6 +512,59 @@ class TestSerialization:
                 assert pp_rank == 3, pp_rank
                 expected_tensor[:, 5:] = 0  # padding with 0s
             assert torch.all(loaded_state_dict['flexible'] == expected_tensor)
+
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.3.0"),
+        reason="remove_sharded_tensors relies on Torch APIs introduced in v2.3.0",
+    )
+    def test_remove_sharded_tensors(self, tmp_path_dist_ckpt):
+        Utils.initialize_model_parallel(2, 4)
+
+        # Global tensor is just a range(32) repeated twice over the first dimension
+        global_tensor = torch.arange(4).unsqueeze(0).expand(2, 4)
+        state_dict = {
+            'sd_keyA': ShardedTensor.from_rank_offsets(
+                'keyA', torch.ones(2, 4), (0, Utils.rank, Utils.world_size)
+            ),
+            'sd_prefix_key_to_remove': ShardedTensor.from_rank_offsets(
+                'prefix_key_to_remove', torch.ones(3, 5, 7), (2, Utils.rank, Utils.world_size)
+            ),
+        }
+
+        prefix_name = "prefix"  ## we will drop all tensors whose keys begin with "prefix"
+
+        # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_remove_sharded_tensor_prefix', sync=True
+        ) as ckpt_dir:
+            save_strategy = TorchDistSaveShardedStrategy(
+                "torch_dist", 1, separation_hint=prefix_name
+            )
+            save(state_dict, ckpt_dir, save_strategy)
+
+            files = os.listdir(ckpt_dir)
+            prefix_files = [f for f in files if f.startswith(prefix_name)]
+            assert len(prefix_files) == torch.distributed.get_world_size()
+
+            fs_reader = FileSystemReader(ckpt_dir)
+            original_metadata = fs_reader.read_metadata()
+            assert set(original_metadata.state_dict_metadata.keys()) == {
+                'keyA',
+                'prefix_key_to_remove',
+            }
+
+            if torch.distributed.get_rank() == 0:
+                remove_sharded_tensors(ckpt_dir, key_prefix=prefix_name)
+            torch.distributed.barrier()
+
+            files = os.listdir(ckpt_dir)
+            prefix_files = [f for f in files if f.startswith(prefix_name)]
+            assert len(prefix_files) == 0
+
+            new_metadata = fs_reader.read_metadata()
+            assert set(new_metadata.state_dict_metadata.keys()) == {'keyA'}
 
         Utils.destroy_model_parallel()
 
