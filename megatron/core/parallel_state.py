@@ -1837,16 +1837,26 @@ def destroy_model_parallel():
     _GLOBAL_MEMORY_BUFFER = None
 
     global _DATA_PARALLEL_GROUP_GLOO
-    if _DATA_PARALLEL_GROUP_GLOO is not None:
+    if (
+        _DATA_PARALLEL_GROUP_GLOO is not None
+        and torch.distributed.distributed_c10d._world.pg_map.get(_DATA_PARALLEL_GROUP_GLOO, None)
+        is not None
+    ):
         torch.distributed.destroy_process_group(_DATA_PARALLEL_GROUP_GLOO)
     _DATA_PARALLEL_GROUP_GLOO = None
 
     global _DATA_PARALLEL_GROUP_WITH_CP_GLOO
-    if _DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None:
+    if (
+        _DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
+        and torch.distributed.distributed_c10d._world.pg_map.get(
+            _DATA_PARALLEL_GROUP_WITH_CP_GLOO, None
+        )
+        is not None
+    ):
         torch.distributed.destroy_process_group(_DATA_PARALLEL_GROUP_WITH_CP_GLOO)
     _DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
 
-    ### Expert-related parallel states destory
+    # Destroy parallel state related to expert parallelism.
     global _EXPERT_MODEL_PARALLEL_GROUP
     _EXPERT_MODEL_PARALLEL_GROUP = None
 
@@ -1875,10 +1885,16 @@ def destroy_model_parallel():
     _EXPERT_DATA_PARALLEL_GROUP = None
 
     global _EXPERT_DATA_PARALLEL_GROUP_GLOO
-    if _EXPERT_DATA_PARALLEL_GROUP_GLOO is not None:
+    if (
+        _EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
+        and torch.distributed.distributed_c10d._world.pg_map.get(
+            _EXPERT_DATA_PARALLEL_GROUP_GLOO, None
+        )
+        is not None
+    ):
         torch.distributed.destroy_process_group(_EXPERT_DATA_PARALLEL_GROUP_GLOO)
     _EXPERT_DATA_PARALLEL_GROUP_GLOO = None
-    ### End of expert-related parallel states destory
+    # End of expert parallelism destroy.
 
     global _MOE_LAYER_WISE_LOGGING_TRACKER
     _MOE_LAYER_WISE_LOGGING_TRACKER = {}

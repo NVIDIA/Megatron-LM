@@ -96,10 +96,10 @@ def main(
                 raise ValueError(f"Platform {test_case.spec.platforms} unknown")
 
             job_tags = list(tags)
-            cluster = common.resolve_cluster_config(cluster)
+            runner_for_cluster = common.resolve_cluster_config(cluster)
             # Todo: remove after all runners are onboarded
-            if cluster == "draco-oci-ord" or cluster == "draco-oci-iad":
-                job_tags.append(f"cluster/{cluster}")
+            if runner_for_cluster == "draco-oci-ord" or runner_for_cluster == "draco-oci-iad":
+                job_tags.append(f"cluster/{runner_for_cluster}")
 
             script = [
                 "export PYTHONPATH=$(pwd); "
