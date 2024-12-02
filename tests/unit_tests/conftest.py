@@ -13,6 +13,13 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.fixture(scope="session", autouse=True)
+def cleanup():
+    yield
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+
+
 def pytest_sessionfinish(session, exitstatus):
     if exitstatus == 5:
         session.exitstatus = 0
