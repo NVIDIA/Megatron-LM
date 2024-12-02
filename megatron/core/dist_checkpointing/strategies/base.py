@@ -171,6 +171,10 @@ class LoadShardedStrategy(LoadStrategyBase):
             f'Loading only sharded metadata not implemented for {self.__class__.__name__}'
         )
 
+    def remove_sharded_tensors(self, checkpoint_dir: str, key_prefix: str):
+        """Remove all tensors whose key starts with key_prefix"""
+        raise NotImplementedError
+
 
 class SaveCommonStrategy(SaveStrategyBase):
     """Save strategy for common (non-sharded) objects"""

@@ -2,6 +2,9 @@
 
 """ Strategies using PyTorch distributed.checkpoint as an underlying format. """
 import io
+import os
+import pickle
+import warnings
 from collections import ChainMap, defaultdict
 from dataclasses import dataclass
 from itertools import product
@@ -22,6 +25,7 @@ from torch.distributed.checkpoint import (
     DefaultLoadPlanner,
     DefaultSavePlanner,
     FileSystemReader,
+    FileSystemWriter,
     LoadPlan,
     Metadata,
     ReadItem,
@@ -34,9 +38,7 @@ from torch.distributed.checkpoint._traverse import OBJ_PATH, traverse_state_dict
 from torch.distributed.checkpoint.metadata import Metadata
 from torch.distributed.checkpoint.planner_helpers import _create_write_items
 
-from megatron.core.device_utils import get_current_device_type
-
-from ...utils import get_torch_version
+from ...utils import get_torch_version, is_torch_min_version
 from ..core import CheckpointingException
 from ..dict_utils import nested_values
 from ..mapping import (
@@ -79,6 +81,10 @@ try:
     HAVE_DTENSOR = True
 except ImportError:
     HAVE_DTENSOR = False
+
+from megatron.core.device_utils import get_current_device_type
+
+_metadata_fn: str = ".metadata"
 
 
 def register_default_torch_strategies(process_group: torch.distributed.ProcessGroup=None):
@@ -593,7 +599,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         keep_only_main_replica: bool = True,
         thread_count: int = 2,
         cached_metadata: bool = False,
-        process_group:  torch.distributed.ProcessGroup=None
+        process_group:  torch.distributed.ProcessGroup=None,
+        separation_hint: str = None,
     ):
         """Adds parameters specific to PyT Distributed format
         Args:
@@ -606,6 +613,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 Affects the number of files in the checkpoint (saving ranks * num_threads).
             cached_metadata (bool, optional): Enables using cached global metadata to avoid
                 gathering local metadata every checkpointing invocation
+            separation_hint(str, optional): If provided, all tensors whose keys have this
+                prefix will be saved to a separate file.
         """
         super().__init__(backend, version)
         self.keep_only_main_replica = keep_only_main_replica
@@ -628,6 +637,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
 
         self.process_group = process_group
         
+        self.separation_hint = separation_hint
+
     def async_save(
         self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path
     ) -> AsyncRequest:
@@ -647,7 +658,9 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
         # Use PyT saving mechanism
-        writer = FileSystemWriterAsync(checkpoint_dir, thread_count=self.thread_count)
+        writer = FileSystemWriterAsync(
+            checkpoint_dir, separation_hint=self.separation_hint, thread_count=self.thread_count
+        )
         # This should be set differently if we run in a smaller process group than the default
         coordinator = 0
         # Try twice to validate the generated `central_plan` is the same across iterations
@@ -850,6 +863,84 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
 
         sharded_metadata.update(self.load_tensors_metadata(checkpoint_dir, metadata))
         return sharded_metadata
+
+    def remove_sharded_tensors(self, checkpoint_dir: str, key_prefix: str):
+        """Removes checkpoint files whose keys have the given prefix.
+
+        Performs the following steps:
+        1. checks whether there are files that start with the key_prefix
+        2. loads metadata
+        3. removes all entries from the metadata that start with the key_prefix
+        4. resaves the new metadata and removes the old metadata
+        5. removes the relevant files
+        """
+
+        assert is_torch_min_version(
+            "2.3.0"
+        ), f'torch >= 2.3.0 is required for remove_sharded_tensors'
+
+        distckpt_files = [f for f in os.listdir(checkpoint_dir) if f.endswith("distcp")]
+        files_to_remove = [f for f in distckpt_files if f.startswith(key_prefix)]
+
+        if not files_to_remove:
+            warnings.warn(
+                f'There are no files in {checkpoint_dir} that begin with "{key_prefix}".'
+                f' Skipping removal.'
+            )
+            return
+
+        fs_reader = FileSystemReader(checkpoint_dir)
+        original_metadata = fs_reader.read_metadata()
+
+        new_state_dict_metadata = {}
+        new_planner_data = {}
+        new_storage_data = {}
+        for k in original_metadata.state_dict_metadata.keys():
+            if k.startswith(key_prefix):
+                continue
+            new_state_dict_metadata[k] = original_metadata.state_dict_metadata[k]
+        for k in original_metadata.planner_data.keys():
+            if k.startswith(key_prefix):
+                continue
+            new_planner_data[k] = original_metadata.planner_data[k]
+        for k in original_metadata.storage_data.keys():
+            if k.fqn.startswith(key_prefix):
+                continue
+            new_storage_data[k] = original_metadata.storage_data[k]
+        metadata = Metadata(
+            state_dict_metadata=new_state_dict_metadata,
+            planner_data=new_planner_data,
+            storage_data=new_storage_data,
+        )
+        fs_writer = FileSystemWriter(checkpoint_dir)
+        metadata_filename = cast(Path, fs_writer.fs.concat_path(fs_writer.path, _metadata_fn))
+        tmp_path = cast(
+            Path, fs_writer.fs.concat_path(fs_writer.path, f"{_metadata_fn}.tmp")
+        )
+        old_path = cast(
+            Path, fs_writer.fs.concat_path(fs_writer.path, f"{_metadata_fn}.bck")
+        )
+        ## save the new metadata
+        with fs_writer.fs.create_stream(tmp_path, "wb") as metadata_file:
+            pickle.dump(metadata, metadata_file)
+            try:
+                os.fsync(metadata_file.fileno())
+            except AttributeError:
+                os.sync()
+        ## move the old metadata
+        fs_writer.fs.rename(fs_writer.metadata_path, old_path)
+        try:
+            ## rename the new metadata
+            fs_writer.fs.rename(tmp_path, fs_writer.metadata_path)
+
+            ## finally, remove the files we want to drop
+            for f in files_to_remove:
+                fs_writer.fs.rm_file(checkpoint_dir / f)
+        except Exception as e:
+            fs_writer.fs.rename(old_path, fs_writer.metadata_path)
+            raise e
+        else:
+            fs_writer.fs.rm_file(old_path)
 
     def can_handle_sharded_objects(self):
         return True
