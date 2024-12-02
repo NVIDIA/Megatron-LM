@@ -202,6 +202,7 @@ class TRTLLMHelper:
                     layer_types.append('-')
             config['layer_types'] = layer_types
             config["ssm_rmsnorm"] =  True
+            config["residual_in_fp32"] = False
 
         if self.seq_len_interpolation_factor is not None:
             config["rotary_scaling"] = {
