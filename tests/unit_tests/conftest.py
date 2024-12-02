@@ -13,6 +13,11 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
+def pytest_sessionfinish(session, exitstatus):
+    if exitstatus == 5:
+        session.exitstatus = 0
+
+
 @pytest.fixture(scope="session", autouse=True)
 def set_env():
     if is_te_min_version("1.3"):
