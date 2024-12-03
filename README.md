@@ -158,6 +158,7 @@ python tools/preprocess_data.py \
        --vocab-file gpt2-vocab.json \
        --tokenizer-type GPT2BPETokenizer \
        --merge-file gpt2-merges.txt \
+	--workers 27 \
        --append-eod
 </pre>
 
