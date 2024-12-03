@@ -176,7 +176,8 @@ test:unit_tests_configure:
   needs:
     - test:formatting
     - test:copyright
-    - test:secret_detection
+    - job: test:secret_detection
+      optional: true
     - test:unit_tests_configure
   extends: [.test_rules]
   trigger:
