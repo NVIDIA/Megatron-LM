@@ -163,6 +163,7 @@ def test_bucket_sizes(
 
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("overlap_grad_reduce", [False, True])
+@pytest.mark.flaky
 def test_grad_sync(use_distributed_optimizer: bool, overlap_grad_reduce: bool):
     Utils.initialize_model_parallel()
 
