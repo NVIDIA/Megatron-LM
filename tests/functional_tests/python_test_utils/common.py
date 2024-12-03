@@ -84,6 +84,9 @@ def read_tb_logs_as_list(path, index=0):
 def load_expected_data():
     expected_metrics_file = os.getenv("EXPECTED_METRICS_FILE")
 
+    if expected_metrics_file is None:
+        raise ValueError("Unknown EXPECTED_METRICS_FILE")
+
     with open(expected_metrics_file) as f:
         if os.path.exists(expected_metrics_file):
             with open(expected_metrics_file) as f:
