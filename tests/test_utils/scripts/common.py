@@ -149,6 +149,23 @@ def filter_by_model(
     return workload_manifests
 
 
+def filter_by_tag(
+    workload_manifests: List[jetclient.JETWorkloadManifest], tag: str
+) -> List[jetclient.JETWorkloadManifest]:
+    """Returns all workload with matching tag."""
+    workload_manifests = list(
+        workload_manifest
+        for workload_manifest in workload_manifests
+        if hasattr(workload_manifest.spec, "tag") and workload_manifest.spec.tag == tag
+    )
+
+    if len(workload_manifests) == 0:
+        print("No test_case found!")
+        return []
+
+    return workload_manifests
+
+
 def filter_by_test_cases(
     workload_manifests: List[jetclient.JETWorkloadManifest], test_cases: str
 ) -> List[jetclient.JETWorkloadManifest]:
@@ -171,6 +188,7 @@ def load_workloads(
     container_tag: str,
     n_repeat: int = 1,
     time_limit: int = 1800,
+    tag: Optional[str] = None,
     environment: Optional[str] = None,
     test_cases: str = "all",
     scope: Optional[str] = None,
@@ -179,8 +197,8 @@ def load_workloads(
     container_image: Optional[str] = None,
 ) -> List[jetclient.JETWorkloadManifest]:
     """Return all workloads from disk that match scope and platform."""
-    recipes_dir = BASE_PATH / ".." / ".." / "jet_recipes"
-    local_dir = BASE_PATH / ".." / ".." / "local_recipes"
+    recipes_dir = BASE_PATH / ".." / "recipes"
+    local_dir = BASE_PATH / ".." / "local_recipes"
 
     workloads: List[jetclient.JETWorkloadManifest] = []
     build_workloads: List[jetclient.JETClient] = []
@@ -197,6 +215,9 @@ def load_workloads(
 
     if workloads and model:
         workloads = filter_by_model(workload_manifests=workloads, model=model)
+
+    if workloads and tag:
+        workloads = filter_by_tag(workload_manifests=workloads, tag=tag)
 
     if workloads and test_cases != "all":
         workloads = filter_by_test_cases(workload_manifests=workloads, test_cases=test_cases)
