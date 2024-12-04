@@ -196,7 +196,14 @@ def main(
     wandb_experiment: Optional[str] = None,
 ):
     model_config_path = pathlib.Path(
-        BASE_PATH / ".." / ".." / "test_cases" / model / test_case / "model_config.yaml"
+        BASE_PATH
+        / ".."
+        / ".."
+        / "functional_tests"
+        / "test_cases"
+        / model
+        / test_case
+        / "model_config.yaml"
     )
 
     if model_config_path.exists():
