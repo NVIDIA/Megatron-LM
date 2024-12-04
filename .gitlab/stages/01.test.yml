@@ -105,7 +105,7 @@ test:unit_tests_configure:
       H100_CLUSTER=$([[ "$FUNCTIONAL_TEST_CLUSTER_H100" != "" ]] && echo $FUNCTIONAL_TEST_CLUSTER_H100 || echo $DEFAULT_H100_CLUSTER)
     - |
       export PYTHONPATH=$(pwd)
-      python tests/test_utils/scripts/generate_jet_trigger_job.py \
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
         --scope "unit-tests" \
         --environment lts \
         --n-repeat "${UNIT_TEST_REPEAT}" \
@@ -120,7 +120,7 @@ test:unit_tests_configure:
         --output-path "unit-test-job-lts-legacy.yaml"
     - |
       export PYTHONPATH=$(pwd)
-      python tests/test_utils/scripts/generate_jet_trigger_job.py \
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
         --scope "unit-tests" \
         --environment lts \
         --n-repeat "${UNIT_TEST_REPEAT}" \
@@ -135,7 +135,7 @@ test:unit_tests_configure:
         --output-path "unit-test-job-lts-latest.yaml"
     - |
       export PYTHONPATH=$(pwd)
-      python tests/test_utils/scripts/generate_jet_trigger_job.py \
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
         --scope "unit-tests" \
         --environment dev \
         --n-repeat "${UNIT_TEST_REPEAT}" \
@@ -150,7 +150,7 @@ test:unit_tests_configure:
         --output-path "unit-test-job-dev-legacy.yaml"
     - |
       export PYTHONPATH=$(pwd)
-      python tests/test_utils/scripts/generate_jet_trigger_job.py \
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
         --scope "unit-tests" \
         --environment dev \
         --n-repeat "${UNIT_TEST_REPEAT}" \
@@ -239,8 +239,9 @@ test:notify_unit_tests:
     - export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
+    - export CONTEXT="unit-tests-extended"
     - export DATE=$(date +"%Y-%m-%d")
-    - bash tests/functional_tests/shell_test_utils/notify_unit_tests.sh ${CI_PIPELINE_ID}
+    - bash tests/test_utils/shell_scripts/notify.sh ${CI_PIPELINE_ID} "test:unit_tests_pyt"
   artifacts:
     when: always
     paths:
