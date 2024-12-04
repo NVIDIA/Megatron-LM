@@ -1,3 +1,5 @@
+import pytest
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -5,6 +7,7 @@ from torch.optim import SGD, Adam
 from transformer_engine.pytorch.optimizers import FusedAdam, FusedSGD
 
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+from megatron.core.optimizer import _get_param_groups
 
 
 class Net(nn.Module):
@@ -27,12 +30,26 @@ class Net(nn.Module):
         return x
 
 
-def test_multi_device_hybrid_optimizer():
+@pytest.mark.parametrize('with_param_groups', [False, True])
+def test_multi_device_hybrid_optimizer(with_param_groups):
     net = Net().cuda()
 
+    params = list(net.parameters())
+    if with_param_groups:
+        param_groups = [
+            {"params": params[: len(params) // 2],
+            "wd_mult": 0.1,
+            "lr_mult": 0.1,
+            },
+            {"params": params[len(params) // 2 :],
+            "wd_mult": 0.2,
+            "lr_mult": 0.2,},
+        ]
+        params = param_groups
+
     hdo = HybridDeviceOptimizer(
-        list(net.parameters()),
-        offload_ratio=0.5,
+        params,
+        offload_fraction=0.5,
         cpu_optimizer_cls=Adam,
         gpu_optimizer_cls=FusedAdam,
         lr=0.1,
@@ -46,8 +63,8 @@ def test_multi_device_hybrid_optimizer():
     hdo.step()
     assert len(hdo.state_dict()["state"]) != 0
 
-    print(hdo.state_dict())
-
     # 2. check the state is on right device
-    assert not hdo.state_dict()["state"][0]["exp_avg"].is_cuda
-    assert hdo.state_dict()["state"][len(list(net.parameters())) - 1]["exp_avg"].is_cuda
+    first_param_id = hdo.state_dict()["param_groups"][0]["params"][0]
+    last_param_id = hdo.state_dict()["param_groups"][-1]["params"][-1]
+    assert not hdo.state_dict()["state"][first_param_id]["exp_avg"].is_cuda
+    assert hdo.state_dict()["state"][last_param_id]["exp_avg"].is_cuda
