@@ -457,7 +457,8 @@ def _load_checkpoint(queue, args):
                 '--no-save-rng',
                 '--mock-data', # To pass the "blend data checks" in arguments.py
                 '--no-initialization',
-                '--load', args.load_dir
+                '--load', args.load_dir,
+                '--no-one-logger',
                 ]
 
     if args.make_vocab_size_divisible_by is not None:

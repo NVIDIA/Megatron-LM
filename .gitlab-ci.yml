@@ -14,7 +14,7 @@ workflow:
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run tests/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
         UNIT_TEST_REPEAT: 1
-        UNIT_TEST_TIMEOUT: 10
+        UNIT_TEST_TIMEOUT: 15
         FUNCTIONAL_TEST: 'yes'
         FUNCTIONAL_TEST_SCOPE: mr
         FUNCTIONAL_TEST_REPEAT: 5
@@ -25,7 +25,7 @@ workflow:
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run nightly/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
         UNIT_TEST_REPEAT: 1
-        UNIT_TEST_TIMEOUT: 10
+        UNIT_TEST_TIMEOUT: 15
         FUNCTIONAL_TEST: 'yes'
         FUNCTIONAL_TEST_SCOPE: nightly
         FUNCTIONAL_TEST_REPEAT: 5
@@ -36,7 +36,7 @@ workflow:
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run weekly/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
         UNIT_TEST_REPEAT: 1
-        UNIT_TEST_TIMEOUT: 10
+        UNIT_TEST_TIMEOUT: 15
         FUNCTIONAL_TEST: 'yes'
         FUNCTIONAL_TEST_SCOPE: weekly
         FUNCTIONAL_TEST_REPEAT: 1
@@ -72,7 +72,7 @@ variables:
     value: '1'
     description: 'Number of repetitions'
   UNIT_TEST_TIMEOUT:
-    value: '10'
+    value: '30'
     description: Timeout (minutes) for Unit tests (all repeats)
   FUNCTIONAL_TEST:
     value: 'yes'

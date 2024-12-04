@@ -4,7 +4,7 @@ from typing import Optional
 import click
 import yaml
 
-from tests.functional_tests.python_test_utils.jet import common
+from tests.test_utils.scripts import common
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
 
@@ -20,8 +20,15 @@ BASE_PATH = pathlib.Path(__file__).parent.resolve()
 @click.option("--a100-cluster", required=True, type=str, help="A100 Cluster to run on")
 @click.option("--h100-cluster", required=True, type=str, help="H100 Cluster to run on")
 @click.option("--output-path", required=True, type=str, help="Path to write GitLab job to")
-@click.option("--container-image", required=True, type=str, help="LTS Container tag to use")
+@click.option("--container-image", required=True, type=str, help="LTS Container image to use")
 @click.option("--container-tag", required=True, type=str, help="Container tag to use")
+@click.option(
+    "--dependent-job",
+    required=True,
+    type=str,
+    help="Name of job that created the downstream pipeline",
+)
+@click.option("--tag", required=False, type=str, help="Tag (only relevant for unit tests)")
 @click.option(
     "--run-name", required=False, type=str, help="Run name (only relevant for release tests)"
 )
@@ -42,13 +49,19 @@ def main(
     output_path: str,
     container_image: str,
     container_tag: str,
+    dependent_job: str,
+    tag: Optional[str] = None,
     run_name: Optional[str] = None,
     wandb_experiment: Optional[str] = None,
 ):
     list_of_test_cases = [
         test_case
         for test_case in common.load_workloads(
-            scope=scope, container_tag=container_tag, environment=environment, test_cases=test_cases
+            scope=scope,
+            container_tag=container_tag,
+            environment=environment,
+            test_cases=test_cases,
+            tag=tag,
         )
         if test_case.type != "build"
     ]
@@ -95,17 +108,23 @@ def main(
             else:
                 raise ValueError(f"Platform {test_case.spec.platforms} unknown")
 
+            job_tags = list(tags)
+            job_tags.append(f"cluster/{common.resolve_cluster_config(cluster)}")
+
             script = [
                 "export PYTHONPATH=$(pwd); "
-                "python tests/functional_tests/python_test_utils/jet/launch_jet_workload.py",
+                "python tests/test_utils/scripts/launch_jet_workload.py",
                 f"--model {test_case.spec.model}",
                 f"--environment {test_case.spec.environment}",
                 f"--n-repeat {n_repeat}",
                 f"--time-limit {time_limit}",
-                f"--test-case {test_case.spec.test_case}",
+                f"--test-case '{test_case.spec.test_case}'",
                 f"--container-tag {container_tag}",
                 f"--cluster {cluster}",
             ]
+
+            if tag is not None:
+                script.append(f"--tag {tag}")
 
             if run_name is not None and wandb_experiment is not None:
                 script.append(f"--run-name {run_name}")
@@ -117,13 +136,13 @@ def main(
             gitlab_pipeline[test_case.spec.test_case] = {
                 "stage": f"{test_case.spec.model}",
                 "image": f"{container_image}:{container_tag}",
-                "tags": tags,
+                "tags": job_tags,
                 "rules": [
                     {"if": '$CI_PIPELINE_SOURCE == "parent_pipeline"'},
                     {"if": '$CI_MERGE_REQUEST_ID'},
                 ],
                 "timeout": "7 days",
-                "needs": [{"pipeline": '$PARENT_PIPELINE_ID', "job": "functional:configure"}],
+                "needs": [{"pipeline": '$PARENT_PIPELINE_ID', "job": dependent_job}],
                 "script": [" ".join(script)],
                 "artifacts": {"paths": ["results/"], "when": "always"},
             }

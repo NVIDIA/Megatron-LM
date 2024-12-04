@@ -426,6 +426,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_group: torch.distributed.ProcessGroup,
         data_parallel_group_gloo: torch.distributed.ProcessGroup,
         data_parallel_group_idx: int,
+        distributed_optimizer_instance_id: int,
     ):
         """
         Distributed optimizer, for all data types (fp16, bf16, and fp32).
@@ -456,6 +457,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 (used in checkpoint loading and saving).
             data_parallel_group_idx (int): index in data-parallel group (used by
                 distributed checkpointing logic).
+            distributed_optimizer_instance_id (int): index of the Distributed Optimizer instance.
         """
 
         if has_config_logger_enabled(config):
@@ -478,6 +480,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.data_parallel_group = data_parallel_group
         self.data_parallel_group_gloo = data_parallel_group_gloo
         self.data_parallel_group_idx = data_parallel_group_idx
+        self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
 
         self.gbuf_idx_to_model_idx_map = {}
         gbuf_idx = 0
@@ -942,10 +945,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if is_loading:
             param_state_data = None
         else:
-            # Gather on rank 0
-            param_state_data = self.get_parameter_state_dp_zero()
+            if self.distributed_optimizer_instance_id == 0:
+                # Gather on rank 0
+                param_state_data = self.get_parameter_state_dp_zero()
 
-        if torch.distributed.get_rank(self.data_parallel_group) == 0:
+        if (
+            torch.distributed.get_rank(self.data_parallel_group) == 0
+            and self.distributed_optimizer_instance_id == 0
+        ):
             # Fixed TPxPP. Save on DP rank 0 only
             param_state = ShardedObject(
                 f'optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}.param_state',
@@ -1121,7 +1128,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         assert (
                             len(sharded_metadata.replica_id) == 3
                         ), f'Expected replica_id format (PP, TP, DP), got: {sharded_metadata}'
-                        replica_id = (*sharded_metadata.replica_id[:2], 0)
+                        replica_id = (
+                            *sharded_metadata.replica_id[:2],
+                            self.distributed_optimizer_instance_id,
+                        )
 
                         # Instantiate ShardedTensor (or ShardedTensorFactory) for optimizer
                         # params.

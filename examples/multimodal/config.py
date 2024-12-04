@@ -180,13 +180,14 @@ def get_vision_projection_config(config, hidden_size):
     elif config.language_model_type == "mistral_7b":
         config.ffn_hidden_size = 14336
         config.activation_func = torch.nn.functional.gelu
+        config.normalization = None
     elif config.language_model_type == "yi-34b":
         config.ffn_hidden_size = 20480
-        config.normalization = 'LayerNorm'
+        config.normalization = "LayerNorm"
         config.activation_func = torch.nn.functional.gelu
     elif config.language_model_type == "qwen2.0_72B":
         config.ffn_hidden_size = 29568
-        config.normalization = 'LayerNorm'
+        config.normalization = "LayerNorm"
         config.activation_func = torch.nn.functional.gelu
     else:
         raise ValueError(f"unknown language model type {config.language_model_type}")

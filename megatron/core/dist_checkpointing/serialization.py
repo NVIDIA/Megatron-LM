@@ -281,6 +281,12 @@ def load_plain_tensors(checkpoint_dir: str) -> StateDict:
 #     return load(sharded_state_dict, checkpoint_dir, validate_access_integrity=False)
 
 
+def remove_sharded_tensors(checkpoint_dir: str, key_prefix: str):
+    """determine the appropriate sharding strategy and delegate removal to the sharded strategy"""
+    sharded_strategy, common_strategy = verify_checkpoint_and_load_strategy(checkpoint_dir)
+    sharded_strategy.remove_sharded_tensors(checkpoint_dir, key_prefix)
+
+
 def save(
     sharded_state_dict: ShardedStateDict,
     checkpoint_dir: str,

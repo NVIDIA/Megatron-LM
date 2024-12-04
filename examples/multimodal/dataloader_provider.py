@@ -23,15 +23,16 @@ from megatron.training.checkpointing import get_checkpoint_name
 def datasets_provider(worker_config=None):
     """Create multimodal train, validation and test datasets."""
     args = get_args()
+
     dname = args.data_path[0] if type(args.data_path) is list else args.data_path
     train_dataset = get_train_dataset(
         dname,
         batch_size=args.micro_batch_size,
         task_encoder=TaskEncoder(),
         worker_config=worker_config,
-        virtual_epoch_length=1000,
-        max_samples_per_sequence=100,
-        shuffle_buffer_size=100,
+        max_samples_per_sequence=None,
+        shuffle_buffer_size=None,
+        packing_buffer_size=args.packing_buffer_size,
         handler=print_error_handler,
         image_decode="pil",
     )
@@ -43,6 +44,7 @@ def datasets_provider(worker_config=None):
         # limit=args.eval_iters * get_num_microbatches(),
         task_encoder=TaskEncoder(),
         worker_config=worker_config,
+        packing_buffer_size=args.packing_buffer_size,
         handler=print_error_handler,
         image_decode="pil",
     )

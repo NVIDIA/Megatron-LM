@@ -325,7 +325,7 @@ def append_to_progress_log(string, barrier=True):
 
 
 def get_blend_and_blend_per_split(args):
-    """Get blend or blend_per_split from passed-in arguments."""
+    """Get blend and blend_per_split from passed-in arguments."""
     use_data_path = args.data_path is not None or \
         args.data_args_path is not None
     use_per_split_data_path = any(
@@ -345,8 +345,7 @@ def get_blend_and_blend_per_split(args):
         else:
             assert args.data_path is not None
             blend = get_blend_from_list(args.data_path)
-    else:
-        assert use_per_split_data_path
+    elif use_per_split_data_path:
         if args.per_split_data_args_path is not None:
             with open(args.per_split_data_args_path, 'r') as f:
                 per_split_data_args = json.load(f)
@@ -367,6 +366,8 @@ def get_blend_and_blend_per_split(args):
                 get_blend_from_list(args.valid_data_path),
                 get_blend_from_list(args.test_data_path)
             ]
+    else:
+        blend, blend_per_split = None, None
 
     return blend, blend_per_split
 

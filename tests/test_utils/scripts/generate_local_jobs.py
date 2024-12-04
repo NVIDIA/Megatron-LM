@@ -12,13 +12,13 @@ import click
 import jetclient
 import yaml
 
-from tests.functional_tests.python_test_utils.jet import common
+from tests.test_utils.scripts import common
 
 
 def load_script(config_path: str) -> str:
     with open(config_path) as stream:
         try:
-            jetclient.JETWorkloadManifest(**yaml.safe_load(stream)).spec.script
+            return jetclient.JETWorkloadManifest(**yaml.safe_load(stream)).spec.script
         except yaml.YAMLError as exc:
             raise exc
 

@@ -298,21 +298,29 @@ def validate_args(args, defaults={}):
             print('setting global batch size to {}'.format(
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
+    if args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None:
+        # Divisibility check not applicable for T5 models which specify encoder_num_layers
+        # and decoder_num_layers.
+        if args.num_layers is not None:
+            assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
+                'Number of layers should be divisible by the pipeline-model-parallel size'
     if args.num_layers_per_virtual_pipeline_stage is not None:
         if args.overlap_p2p_comm:
             assert args.pipeline_model_parallel_size > 1, \
-                'when interleaved schedule is used, pipeline-model-parallel size '\
+                'When interleaved schedule is used, pipeline-model-parallel size '\
                 'should be greater than 1'
         else:
             assert args.pipeline_model_parallel_size > 2, \
-                'when interleaved schedule is used and p2p communication overlap is disabled, '\
+                'When interleaved schedule is used and p2p communication overlap is disabled, '\
                 'pipeline-model-parallel size should be greater than 2 to avoid having multiple '\
                 'p2p sends and recvs between same 2 ranks per communication batch'
+        assert args.num_layers is not None
+        # Double check divisibility check here since check above is if guarded.
         assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
-            'number of layers should be divisible by the pipeline parallel size'
+            'Number of layers should be divisible by the pipeline-model-parallel size'
         num_layers_per_pipeline_stage = args.num_layers // args.transformer_pipeline_model_parallel_size
         assert num_layers_per_pipeline_stage % args.num_layers_per_virtual_pipeline_stage == 0, \
-            'number of layers per pipeline stage must be divisible number of layers per virtual pipeline stage'
+            'Number of layers per pipeline stage must be divisible by number of layers per virtual pipeline stage'
         args.virtual_pipeline_model_parallel_size = num_layers_per_pipeline_stage // \
             args.num_layers_per_virtual_pipeline_stage
     else:
@@ -580,6 +588,10 @@ def validate_args(args, defaults={}):
     if not args.add_bias_linear:
         args.bias_gelu_fusion = False
 
+    # Keep the 'add bias' args in sync; add_qkv_bias is more targeted.
+    if args.add_bias_linear:
+        args.add_qkv_bias = True
+
     # Retro checks.
     if args.retro_add_retriever:
 
@@ -798,7 +810,6 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--fp8-param-gather', action='store_true',
                        help='Keep the compute param in fp8 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp8.')
-
     return parser
 
 def _add_inference_args(parser):
@@ -825,7 +836,9 @@ def _add_inference_args(parser):
                        'Bert embedder.')
     group.add_argument('--flash-decode', default=False, action="store_true",
                        help='Whether to use the flash decoding kernel.')
-
+    group.add_argument('--inference-max-seq-length', type=int, default=2560,
+                       help='Maximum sequence length allocated for prefill during inference.',
+                       dest='inference_max_seq_length')
     return parser
 
 
@@ -1681,6 +1694,8 @@ def _add_distributed_args(parser):
                        'affects the encoder embedding.)')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
+    group.add_argument('--num-distributed-optimizer-instances', type=int, default=1,
+                       help='Number of Distributed Optimizer copies across Data Parallel domain.')
     group.add_argument('--use-torch-fsdp2', action='store_true',
                        help="Use the torch FSDP2 implementation. FSDP2 is not currently working with Pipeline Parallel."
                        "It is still not in a stable release stage, and may therefore contain bugs or other potential issues.")

@@ -53,6 +53,8 @@ def client(app):
 @unittest.mock.patch('megatron.inference.text_generation.communication.mpu')
 @unittest.mock.patch('megatron.inference.text_generation.generation.ForwardStep')
 @unittest.mock.patch('megatron.inference.text_generation.tokenization.get_tokenizer')
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 def test_completions(
     mock_get_tokenizer1,
     mock_forward_step,

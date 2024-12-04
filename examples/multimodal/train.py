@@ -18,7 +18,12 @@ from multimodal_args import add_multimodal_extra_args
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, LLaVAModel
-from megatron.core.parallel_state import get_tensor_model_parallel_rank, get_pipeline_model_parallel_world_size, is_pipeline_last_stage
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.parallel_state import (
+    get_tensor_model_parallel_rank,
+    get_pipeline_model_parallel_world_size,
+    is_pipeline_last_stage,
+)
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain
 from megatron.training.utils import is_last_rank
 
@@ -35,6 +40,7 @@ def get_batch(data_iterator):
     attention_mask = None
     position_ids = None
     num_tiles = None
+    packed_seq_params = None
 
     args = get_args()
 
@@ -51,11 +57,14 @@ def get_batch(data_iterator):
     else:
         data = None
 
-    data_text = tensor_parallel.broadcast_data(["text"], data, torch.int64)["text"]
-    target = tensor_parallel.broadcast_data(["target"], data, torch.int64)["target"]
+    data_text = tensor_parallel.broadcast_data(["tokens"], data, torch.int64)["tokens"]
+    labels = tensor_parallel.broadcast_data(["labels"], data, torch.int64)["labels"]
 
     imgs = tensor_parallel.broadcast_data(["imgs"], data, torch.float32)["imgs"]
-    num_tiles = tensor_parallel.broadcast_data(["num_tiles"], data, torch.int)["num_tiles"]
+    num_tiles = tensor_parallel.broadcast_data(["num_tiles"], data, torch.int32)["num_tiles"]
+
+    cu_lengths = tensor_parallel.broadcast_data(["cu_lengths"], data, torch.int32)["cu_lengths"]
+    max_lengths = tensor_parallel.broadcast_data(["max_lengths"], data, torch.int32)["max_lengths"]
 
     # Dummy image, no image.
     if imgs.shape == torch.Size([1, 1]):
@@ -67,6 +76,22 @@ def get_batch(data_iterator):
     if pp_size > 1 and is_pipeline_last_stage():
         imgs = None
 
+    # If cu_lengths and max_lengths are non-dummy, construct PackedSeqParams. Otherwise, leave it at None.
+    if cu_lengths.shape != torch.Size([1, 1]):
+        assert (
+            cu_lengths.shape[0] == max_lengths.shape[0] == 1
+        ), "micro-batch-size must be 1 for packing"
+        cu_lengths = cu_lengths[0]
+        max_lengths = max_lengths[0]
+
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_lengths,
+            cu_seqlens_kv=cu_lengths,
+            max_seqlen_q=max_lengths,
+            max_seqlen_kv=max_lengths,
+        )
+
     torch.cuda.nvtx.range_pop()
 
     tokens_ = data_text.long()
@@ -75,18 +100,25 @@ def get_batch(data_iterator):
     tokenizer = get_tokenizer()
     text_length = tokens_.shape[1]
     tokens = tokens_[:, :text_length].contiguous()
-    labels = target[:, 1 : text_length + 1].contiguous()
+    labels = labels[:, 1 : text_length + 1].contiguous()
 
     assert tokens.shape == labels.shape, f"tokens: {tokens.shape} != labels: {labels.shape}"
     torch.cuda.nvtx.range_pop()
 
     torch.cuda.nvtx.range_push("get_ltor_masks_and_position_ids")
-    loss_mask, position_ids = get_ltor_masks_and_position_ids(
-        tokens, labels, tokenizer.pad
-    )
+    loss_mask, position_ids = get_ltor_masks_and_position_ids(tokens, labels, tokenizer.pad)
     torch.cuda.nvtx.range_pop()
 
-    return tokens, labels, loss_mask, attention_mask, position_ids, imgs, num_tiles
+    return (
+        tokens,
+        labels,
+        loss_mask,
+        attention_mask,
+        position_ids,
+        imgs,
+        num_tiles,
+        packed_seq_params,
+    )
 
 
 def get_ltor_masks_and_position_ids(input_ids, target, pad_token):
@@ -137,9 +169,16 @@ def forward_step(data_iterator, model: LLaVAModel):
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()
-    tokens, labels, loss_mask, attention_mask, position_ids, images, num_image_tiles = get_batch(
-        data_iterator
-    )
+    (
+        tokens,
+        labels,
+        loss_mask,
+        attention_mask,
+        position_ids,
+        images,
+        num_image_tiles,
+        packed_seq_params,
+    ) = get_batch(data_iterator)
     timers('batch-generator').stop()
 
     output_tensor, loss_mask = model(
@@ -150,6 +189,7 @@ def forward_step(data_iterator, model: LLaVAModel):
         labels,
         loss_mask,
         num_image_tiles=num_image_tiles,
+        packed_seq_params=packed_seq_params,
     )
 
     return output_tensor, partial(loss_func, loss_mask)
@@ -224,6 +264,7 @@ def run_online_eval(model):
     # Run evaluation.
     if config.task == "TextVQA":
         from evaluate_textvqa import textvqa_eval
+
         avg_acc = textvqa_eval(config.output_path)
 
         return [{"TextVQA accuracy": avg_acc}]
