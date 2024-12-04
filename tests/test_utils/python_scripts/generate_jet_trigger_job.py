@@ -4,7 +4,7 @@ from typing import Optional
 import click
 import yaml
 
-from tests.test_utils.scripts import common
+from tests.test_utils.python_scripts import common
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
 
@@ -113,7 +113,7 @@ def main(
 
             script = [
                 "export PYTHONPATH=$(pwd); "
-                "python tests/test_utils/scripts/launch_jet_workload.py",
+                "python tests/test_utils/python_scripts/launch_jet_workload.py",
                 f"--model {test_case.spec.model}",
                 f"--environment {test_case.spec.environment}",
                 f"--n-repeat {n_repeat}",

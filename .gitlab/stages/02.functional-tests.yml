@@ -49,7 +49,7 @@ functional:configure:
       fi
     - |
       export PYTHONPATH=$(pwd)
-      python tests/test_utils/scripts/generate_jet_trigger_job.py \
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
         --scope $FUNCTIONAL_TEST_SCOPE \
         --environment dev \
         --n-repeat "$FUNCTIONAL_TEST_REPEAT" \
@@ -64,7 +64,7 @@ functional:configure:
         ${RELEASE_ARGS[@]}
     - |
       export PYTHONPATH=$(pwd)
-      python tests/test_utils/scripts/generate_jet_trigger_job.py \
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
         --scope $FUNCTIONAL_TEST_SCOPE \
         --environment lts \
         --n-repeat "$FUNCTIONAL_TEST_REPEAT" \
@@ -111,7 +111,7 @@ functional:run_dev:
   variables:
     ENVIRONMENT: dev
 
-.notify:
+functional:notify:
   extends: [.functional_tests_rules]
   image: badouralix/curl-jq
   needs:
@@ -132,7 +132,7 @@ functional:run_dev:
     - export GITLAB_ENDPOINT
     - export CONTEXT=$FUNCTIONAL_TEST_SCOPE
     - export DATE=$(date +"%Y-%m-%d")
-    - bash tests/functional_tests/shell_test_utils/notify.sh ${CI_PIPELINE_ID} ${ENVIRONMENT}
+    - bash tests/test_utils/shell_scripts/notify.sh ${CI_PIPELINE_ID} "functional:run_"
   artifacts:
     when: always
     paths:
@@ -141,13 +141,3 @@ functional:run_dev:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $FUNCTIONAL_TEST == "yes"
       when: always
     - when: never
-
-functional:notify-lts:
-  extends: [.notify]
-  variables:
-    ENVIRONMENT: lts
-
-functional:notify-dev:
-  extends: [.notify]
-  variables:
-    ENVIRONMENT: dev
