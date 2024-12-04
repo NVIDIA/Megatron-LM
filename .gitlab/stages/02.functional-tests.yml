@@ -18,6 +18,7 @@ include:
 
 functional:configure:
   needs:
+    - test:build_image
     - job: test:unit_tests_pyt(DEV)_mcore(latest)
       optional: true
     - job: test:unit_tests_pyt(LTS)_mcore(latest)
