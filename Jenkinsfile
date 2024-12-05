@@ -25,7 +25,7 @@ pipeline {
     }
 
     environment {
-        REPO_NAME = 'rocm/megatron-lm'
+        REPO_NAME = 'rocm/megatron-lm-private'
         CONTAINER_NAME = "megatron-lm-container"
         DOCKER_RUN_ARGS = "-v \$(pwd):/workspace/Megatron-LM/output --workdir /workspace/Megatron-LM \
         --entrypoint /workspace/Megatron-LM/run_unit_tests.sh"
