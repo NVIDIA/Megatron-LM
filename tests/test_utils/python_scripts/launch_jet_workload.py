@@ -16,7 +16,7 @@ from jet import workloads
 from jetclient.facades.objects import log as jet_log
 from jetclient.services.dtos.pipeline import PipelineStatus
 
-from tests.test_utils.scripts import common
+from tests.test_utils.python_scripts import common
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
 
