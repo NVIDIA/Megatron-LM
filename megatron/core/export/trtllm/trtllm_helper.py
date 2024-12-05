@@ -1,6 +1,9 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+from typing import Union
+
 import tensorrt_llm
+import torch
 from tensorrt_llm.functional import non_gated_version
 from tensorrt_llm.layers import MoeConfig
 
@@ -13,6 +16,7 @@ from megatron.core.export.trtllm.model_to_trllm_mapping.default_conversion_dict 
 )
 from megatron.core.export.trtllm.trt_model_config import TRT_MODEL_CONFIG
 from megatron.core.export.trtllm.trt_model_type import TRT_MODEL_TYPE_STRING
+from megatron.core.export.trtllm.trtllm_layers import TRTLLMLayers
 
 # pylint: disable=line-too-long
 from megatron.core.export.trtllm.trtllm_weights_converter.distributed_trtllm_model_weights_converter import (
@@ -92,6 +96,8 @@ class TRTLLMHelper:
         gpus_per_node: int,
         vocab_size_padded: int,
         dtype: DataType,
+        fp8_quantized: bool = False,
+        fp8_kvcache: bool = False,
     ):
         """Get TRTLLM Config
 
@@ -137,7 +143,10 @@ class TRTLLMHelper:
             'use_parallel_embedding': export_config.use_parallel_embedding,
             'embedding_sharding_dim': 0,
             'share_embedding_table': export_config.use_embedding_sharing,
-            'quantization': {'quant_algo': None, 'kv_cache_quant_algo': None},
+            'quantization': {
+                'quant_algo': "FP8" if fp8_quantized else None,
+                'kv_cache_quant_algo': "FP8" if fp8_kvcache else None,
+            },
             'bias': self.transformer_config.add_bias_linear,
             'apply_query_key_layer_scaling': False,
             'rotary_pct': self.rotary_percentage,
@@ -173,6 +182,59 @@ class TRTLLMHelper:
         config_cls = TRT_MODEL_CONFIG[self.model_type]
         return config_cls(**config)
 
+    def _load_scaling_factors(self, model_state_dict: dict) -> dict:
+        """Loads scaling factors from model state dictionary.
+
+        Args:
+            model_state_dict (dict): Model state dictionary
+        Returns:
+            dict: Maps scaling factor key, to its value and the inverse. The inverse is used for casting the quantized weights.
+        """
+        weight_scaling_suffix = '.weights_scaling_factor'
+        activation_scaling_suffix = '.activation_scaling_factor'
+        mock_scales_dict = {}
+        extra_state_infix = "._extra_state"
+        mock_suffix = '.weight'
+
+        for key, val in model_state_dict.items():
+            if extra_state_infix in key and not key.endswith("core_attention._extra_state"):
+                mock_key = key.split(extra_state_infix)[0] + mock_suffix
+                mock_scales_dict[mock_key] = val
+
+        mock_scales_dict = TRTLLMLayers.rename_input_layer_names_to_trtllm_layer_names(
+            mock_scales_dict, self.trtllm_conversion_dict, False
+        )
+        split_gated_activation = self.activation in ["swiglu", "geglu", "fast-swiglu", "fast-geglu"]
+
+        scales = {}
+        for key, val in mock_scales_dict.items():
+            if val is None:
+                continue
+
+            val.seek(0)
+            extra_states = torch.load(val)
+
+            activation_scaling_factor_key = key.replace(mock_suffix, activation_scaling_suffix)
+            weight_scaling_factor_key = key.replace(mock_suffix, weight_scaling_suffix)
+
+            activation_scales = {
+                'trt_llm_scale': extra_states['scale_inv_fwd'][0].view(1),
+                'weight_multiplier': extra_states['scale_fwd'][0].view(1),
+            }
+
+            weight_scales = {
+                'trt_llm_scale': extra_states['scale_inv_fwd'][1].view(1),
+                'weight_multiplier': extra_states['scale_fwd'][1].view(1),
+            }
+
+            scales[activation_scaling_factor_key] = activation_scales
+            scales[weight_scaling_factor_key] = weight_scales
+            if split_gated_activation and ".mlp.fc" in key:
+                scales[activation_scaling_factor_key.replace("fc", "gate")] = activation_scales
+                scales[weight_scaling_factor_key.replace("fc", "gate")] = weight_scales
+
+        return scales
+
     # pylint: disable=line-too-long
     def get_trtllm_pretrained_config_and_model_weights(
         self,
@@ -183,6 +245,8 @@ class TRTLLMHelper:
         vocab_size: int = None,
         gpus_per_node: int = None,
         state_dict_split_by_layer_numbers: bool = True,
+        fp8_quantized: bool = False,
+        fp8_kvcache: bool = False,
     ):
         """Get TRTLLM Config and Converted Model Weights
 
@@ -204,22 +268,34 @@ class TRTLLMHelper:
         Returns:
             Two lists . First list of trtllm converted model weights(Either on device, or a list of weights for each gpu) and the trtllm_model_configs.
         """
+        assert model_state_dict is not None, "Model state dict is not set"
+
+        scales = self._load_scaling_factors(model_state_dict) if fp8_quantized else {}
+        model_state_dict = {k: v for k, v in model_state_dict.items() if 'extra_state' not in k}
+
         if on_device_distributed_conversion:
-            assert (vocab_size is not None, "Need to pass in vocab_size for on device")
+            assert vocab_size is not None, "Need to pass in vocab_size for on device"
+            supported_model = self.model_type in [ModelType.gpt, ModelType.gptnext, ModelType.llama]
             assert (
-                self.model_type in [ModelType.gpt, ModelType.gptnext, ModelType.llama],
-                "On device conversion only supported for model types gptnext and llama",
+                supported_model
+            ), "On device conversion only supported for model types gptnext and llama"
+            assert export_config is None, (
+                "Export config is inferred based on the parallel state. "
+                "If you want to set inference tp 2, then load the model with this TP2 setting and just pass in the model state dict."
             )
-            assert (
-                export_config is None,
-                "Export config is inferred based on the parallel state. If you want to set inference tp 2, then load the model with this TP2 setting and just pass in the model state dict. ",
-            )
+
             assert (
                 gpus_per_node is not None
             ), "Need to pass in gpus_per_node for on device conversion"
             trtllm_model_weights_on_device, trtllm_model_config = (
                 self._get_trtllm_pretrained_config_and_model_weights_in_distributed_setting(
-                    model_state_dict, dtype, vocab_size, gpus_per_node
+                    model_state_dict,
+                    dtype,
+                    vocab_size,
+                    gpus_per_node,
+                    scales,
+                    fp8_quantized,
+                    fp8_kvcache,
                 )
             )
             return [trtllm_model_weights_on_device], [trtllm_model_config]
@@ -238,13 +314,48 @@ class TRTLLMHelper:
                     dtype,
                     gpus_per_node,
                     state_dict_split_by_layer_numbers,
+                    scales,
+                    fp8_quantized,
+                    fp8_kvcache,
                 )
             )
 
             return trtllm_model_weights_list, trtllm_model_config_list
 
+    def _add_scales_to_converter(
+        self,
+        converter: Union[
+            SingleDeviceTRTLLMModelWeightsConverter, DistributedTRTLLMModelWeightsConverter
+        ],
+        scales: dict,
+        fp8_kvcache: bool,
+    ):
+        """Adds scaling factors to the distributed and single device converters.
+
+        Args:
+            converter (ModelWeightConverter): Converter, holding the TRT-LLM model weights.
+            scales (dict): Dictionary holding TRT-LLM scaling factors
+            fp8_kvcache (bool): If true, creates scaling factors (equal to 1.0) for kv_cache quantization
+        """
+        trt_scales = {key: scale['trt_llm_scale'] for key, scale in scales.items()}
+        kv_scales = {}
+        if fp8_kvcache:
+            for key in converter.trtllm_model_weights:
+                if '.attention.qkv.weight' in key:
+                    kv_key = key.split('.qkv')[0] + '.kv_cache_scaling_factor'
+                    kv_scales[kv_key] = torch.tensor([1.0], dtype=torch.float32)
+
+        converter.trtllm_model_weights |= trt_scales | kv_scales
+
     def _get_trtllm_pretrained_config_and_model_weights_in_distributed_setting(
-        self, model_state_dict: dict, dtype: DataType, vocab_size: int, gpus_per_node: int
+        self,
+        model_state_dict: dict,
+        dtype: DataType,
+        vocab_size: int,
+        gpus_per_node: int,
+        scales: dict,
+        fp8_quantized: bool,
+        fp8_kvcache: bool,
     ):
         """Get the TRTLLM Pretrained config and model weights list in a distributed setting
 
@@ -257,7 +368,9 @@ class TRTLLMHelper:
             dtype (DataType): The data type or model precision
             vocab_size (int): Tokenizer vocab size
             gpus_per_node (int): The number of gpus per node
-
+            scales (dict): Dictionary with fp8 scaling factors
+            fp8_quantized (bool): True for fp8 checkpoint export
+            fp8_kvcache (bool): True for fp8 KV-cache quantization
         Returns:
             Two lists . List of trtllm converted model weights and trtllm model configs (One for each gpu).
         """
@@ -267,12 +380,14 @@ class TRTLLMHelper:
             dtype=dtype,
             multi_query_mode=self.multi_query_mode,
             activation=self.activation,
+            scales=scales,
         )
         self.weights_converter.convert(
             model_state_dict=model_state_dict,
             trtllm_conversion_dict=self.trtllm_conversion_dict,
             tokenizer_vocab_size=vocab_size,
         )
+        self._add_scales_to_converter(self.weights_converter, scales, fp8_kvcache)
 
         export_config = ExportConfig(
             inference_pp_size=self.weights_converter.inference_pp_size,
@@ -289,6 +404,8 @@ class TRTLLMHelper:
             gpus_per_node=gpus_per_node,
             vocab_size_padded=vocab_size,
             dtype=dtype,
+            fp8_quantized=fp8_quantized,
+            fp8_kvcache=fp8_kvcache,
         )
 
         model_parallel_rank = (
@@ -310,8 +427,11 @@ class TRTLLMHelper:
         export_config: ExportConfig,
         model_state_dict: dict,
         dtype: DataType,
-        gpus_per_node=None,
-        state_dict_split_by_layer_numbers=True,
+        gpus_per_node,
+        state_dict_split_by_layer_numbers,
+        scales: dict,
+        fp8_quantized: bool,
+        fp8_kvcache: bool,
     ):
         """Get the TRTLLM Pretrained config and model weights list (one per gpu rank) on single device (CPU/GPU)
 
@@ -323,6 +443,9 @@ class TRTLLMHelper:
             dtype (DataType): The data type or model precision
             gpus_per_node (int, optional): Number of gpus per node
             state_dict_split_by_layer_numbers (bool, optional): Are the model layers split by layer numbers in state dict. For example : mlp.fc1.weight can be represented like mlp.fc1.weight of shape [num_layers, hidden_dim, ffn_hidden_dim]} or it can be like mlp.fc1.layers.0.weight of shape [hidden_dim, ffn_hidden_dim], then mlp.fc1.layers.1.weight ... for all layers. If you use represenation 2 set this to True. Defaults to True
+            scales (dict): Dictionary with fp8 scaling factors
+            fp8_quantized (bool): True for fp8 checkpoint export
+            fp8_kvcache (bool): True for fp8 KV-cache quantization
 
         Returns:
             Two lists . List of trtllm converted model weights and trtllm model configs (One for each gpu).
@@ -336,6 +459,7 @@ class TRTLLMHelper:
             dtype=dtype,
             activation=self.activation,
             multi_query_mode=self.multi_query_mode,
+            scales=scales,
         )
         # Convert the input model state dict to trtllm model weights dictionary
         self.weights_converter.convert(
@@ -343,6 +467,8 @@ class TRTLLMHelper:
             trtllm_conversion_dict=self.trtllm_conversion_dict,
             state_dict_split_by_layer_numbers=state_dict_split_by_layer_numbers,
         )
+
+        self._add_scales_to_converter(self.weights_converter, scales, fp8_kvcache)
 
         vocab_size_padded = self.weights_converter.get_padded_vocab_size()
         world_size = export_config.inference_tp_size * export_config.inference_pp_size
@@ -363,6 +489,8 @@ class TRTLLMHelper:
                 gpus_per_node=gpus_per_node,
                 vocab_size_padded=vocab_size_padded,
                 dtype=dtype,
+                fp8_quantized=fp8_quantized,
+                fp8_kvcache=fp8_kvcache,
             )
             trtllm_model_config.mapping = mapping
             trtllm_model_configs_list.append(trtllm_model_config)
