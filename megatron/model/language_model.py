@@ -545,7 +545,10 @@ class TransformerLanguageModel(MegatronModule):
                 if args.curriculum_learning_legacy or args.data_efficiency_curriculum_learning:
                     rotary_pos_emb = self.rotary_pos_emb(args.curriculum_seqlen)
                 else:
-                    rotary_pos_emb = self.rotary_pos_emb(self.seq_length)
+                    rotary_pos_emb_cos, rotary_pos_emb_sin = self.rotary_pos_emb(self.seq_length)
+                    rotary_pos_emb_cos.no_checkpointing = True
+                    rotary_pos_emb_sin.no_checkpointing = True
+                    rotary_pos_emb = (rotary_pos_emb_cos.to(encoder_input.dtype), rotary_pos_emb_sin.to(encoder_input.dtype))
 
         # Run encoder.
         if enc_hidden_states is None:

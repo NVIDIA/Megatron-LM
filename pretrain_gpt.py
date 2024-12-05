@@ -21,6 +21,7 @@ from megatron.arguments import core_transformer_config_from_args
 import deepspeed
 from deepspeed.runtime.utils import see_memory_usage
 from deepspeed.accelerator.real_accelerator import get_accelerator
+from deepspeed.sequence.fpdt_layer import FPDT_InputConstruct
 import os
 import subprocess
 
@@ -124,6 +125,9 @@ def get_batch(data_iterator):
     # For DS's sequence parallel
     seq_parallel_world_size = mpu.get_sequence_parallel_world_size()
     seq_parallel_world_rank = mpu.get_sequence_parallel_rank()
+
+    if args.ds_sequence_parallel_fpdt:
+        return FPDT_InputConstruct(tokens, labels, loss_mask, attention_mask, position_ids, args, seq_parallel_world_size, seq_parallel_world_rank).generate()
 
     # For Megatron's sequence parallel
     if args.sequence_parallel:

@@ -350,9 +350,12 @@ def _warmup_jit_function():
         dtype = torch.float32
 
     # Warmup fused bias+gelu
+    seq_length = args.seq_length
+    if args.ds_sequence_parallel_fpdt: # when using FPDT on extremly long sequence, we use the chunk length in FPDT to warmup instead of the ordinary SP sequence length which will cause OOM.
+        seq_length = args.ds_sequence_parallel_fpdt_chunk_size
     bias = torch.rand(args.ffn_hidden_size // args.tensor_model_parallel_size,
                       dtype=dtype, device='cuda')
-    input = torch.rand((args.seq_length // args.ds_sequence_parallel_size, args.micro_batch_size,
+    input = torch.rand((seq_length // args.ds_sequence_parallel_size, args.micro_batch_size,
                         args.ffn_hidden_size // args.tensor_model_parallel_size),
                        dtype=dtype, device='cuda')
     # Warmup JIT fusions with the input grad_enable state of both forward
@@ -365,9 +368,8 @@ def _warmup_jit_function():
 
     # Warmup fused bias+dropout+add
     if args.sequence_parallel:
-        seq_length = args.seq_length // mpu.get_tensor_model_parallel_world_size()
-    else:
-        seq_length = args.seq_length
+        seq_length = seq_length // mpu.get_tensor_model_parallel_world_size()
+        
     input = torch.rand((seq_length // args.ds_sequence_parallel_size, args.micro_batch_size, args.hidden_size),
                        dtype=dtype, device='cuda')
     residual = torch.rand((seq_length // args.ds_sequence_parallel_size, args.micro_batch_size, args.hidden_size),
