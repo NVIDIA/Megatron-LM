@@ -32,7 +32,6 @@ class TestTRTLLMHelper:
                 model_state_dict=None,
                 dtype=None,
                 on_device_distributed_conversion=True,
-                ModelType=ModelType.falcon,
                 vocab_size=100,
                 gpus_per_node=2,
             )

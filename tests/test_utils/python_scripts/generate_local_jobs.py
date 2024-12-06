@@ -12,7 +12,7 @@ import click
 import jetclient
 import yaml
 
-from tests.functional_tests.python_test_utils.jet import common
+from tests.test_utils.python_scripts import common
 
 
 def load_script(config_path: str) -> str:

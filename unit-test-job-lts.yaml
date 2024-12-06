@@ -1,0 +1,107 @@
+default:
+  interruptible: true
+other:
+  artifacts:
+    paths:
+      - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_utility:20283570
+  needs:
+    - job: functional:configure
+      pipeline: $PARENT_PIPELINE_ID
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+    - if: $CI_MERGE_REQUEST_ID
+  script:
+    - export PYTHONPATH=$(pwd); python tests/test_utils/python_scripts/launch_jet_workload.py
+      --model unit-tests --environment lts --n-repeat 1 --time-limit 1800 --test-case
+      other --container-tag 20283570 --cluster dgxh100_coreweave
+  stage: unit-tests
+  tags: &id001
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/jet-client
+    - team/megatron
+  timeout: 7 days
+stages:
+  - unit-tests
+tests/unit_tests/data/:
+  artifacts:
+    paths:
+      - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_utility:20283570
+  needs:
+    - job: functional:configure
+      pipeline: $PARENT_PIPELINE_ID
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+    - if: $CI_MERGE_REQUEST_ID
+  script:
+    - export PYTHONPATH=$(pwd); python tests/test_utils/python_scripts/launch_jet_workload.py
+      --model unit-tests --environment lts --n-repeat 1 --time-limit 1800 --test-case
+      tests/unit_tests/data/ --container-tag 20283570 --cluster dgxh100_coreweave
+  stage: unit-tests
+  tags: *id001
+  timeout: 7 days
+tests/unit_tests/dist_checkpointing/:
+  artifacts:
+    paths:
+      - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_utility:20283570
+  needs:
+    - job: functional:configure
+      pipeline: $PARENT_PIPELINE_ID
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+    - if: $CI_MERGE_REQUEST_ID
+  script:
+    - export PYTHONPATH=$(pwd); python tests/test_utils/python_scripts/launch_jet_workload.py
+      --model unit-tests --environment lts --n-repeat 1 --time-limit 1800 --test-case
+      tests/unit_tests/dist_checkpointing/ --container-tag 20283570 --cluster dgxh100_coreweave
+  stage: unit-tests
+  tags: *id001
+  timeout: 7 days
+tests/unit_tests/distributed/:
+  artifacts:
+    paths:
+      - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_utility:20283570
+  needs:
+    - job: functional:configure
+      pipeline: $PARENT_PIPELINE_ID
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+    - if: $CI_MERGE_REQUEST_ID
+  script:
+    - export PYTHONPATH=$(pwd); python tests/test_utils/python_scripts/launch_jet_workload.py
+      --model unit-tests --environment lts --n-repeat 1 --time-limit 1800 --test-case
+      tests/unit_tests/distributed/ --container-tag 20283570 --cluster dgxh100_coreweave
+  stage: unit-tests
+  tags: *id001
+  timeout: 7 days
+? tests/unit_tests/test_inference.py tests/unit_tests/test_tokenizer.py tests/unit_tests/test_utilities.py
+  tests/unit_tests/test_training.py
+: artifacts:
+    paths:
+      - results/
+    when: always
+  image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/mcore_utility:20283570
+  needs:
+    - job: functional:configure
+      pipeline: $PARENT_PIPELINE_ID
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+    - if: $CI_MERGE_REQUEST_ID
+  script:
+    - export PYTHONPATH=$(pwd); python tests/test_utils/python_scripts/launch_jet_workload.py
+      --model unit-tests --environment lts --n-repeat 1 --time-limit 1800 --test-case
+      tests/unit_tests/test_inference.py tests/unit_tests/test_tokenizer.py tests/unit_tests/test_utilities.py
+      tests/unit_tests/test_training.py --container-tag 20283570 --cluster dgxh100_coreweave
+  stage: unit-tests
+  tags: *id001
+  timeout: 7 days

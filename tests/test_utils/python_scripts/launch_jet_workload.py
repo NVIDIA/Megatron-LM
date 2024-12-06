@@ -16,7 +16,7 @@ from jet import workloads
 from jetclient.facades.objects import log as jet_log
 from jetclient.services.dtos.pipeline import PipelineStatus
 
-from tests.functional_tests.python_test_utils.jet import common
+from tests.test_utils.python_scripts import common
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
 
@@ -41,6 +41,7 @@ def launch_and_wait_for_completion(
     container_tag: str,
     cluster: str,
     account: str,
+    tag: Optional[str],
     run_name: Optional[str],
     wandb_experiment: Optional[str],
 ) -> jetclient.JETPipeline:
@@ -54,6 +55,7 @@ def launch_and_wait_for_completion(
                 test_case=test_case,
                 n_repeat=n_repeat,
                 time_limit=time_limit,
+                tag=tag,
                 container_image=container_image,
                 container_tag=container_tag,
                 environment=environment,
@@ -94,7 +96,7 @@ def launch_and_wait_for_completion(
     n_wait_attempts = 0
     while n_wait_attempts < 3:
         try:
-            pipeline.wait(max_wait_time=60 * 60 * 24 * 7, interval=60 * 3)
+            pipeline.wait(max_wait_time=60 * 60 * 24 * 7, interval=60 * 1)
             break
         except (requests.exceptions.ConnectionError, json.decoder.JSONDecodeError) as e:
             print(e)
@@ -169,6 +171,7 @@ def parse_finished_training(logs: List[str]) -> Optional[bool]:
 @click.option("--cluster", required=True, type=str, help="Cluster to run on")
 @click.option("--container-tag", required=True, type=str, help="Base image of Mcore image")
 @click.option("--container-image", required=False, type=str, help="Base image of Mcore image")
+@click.option("--tag", required=False, type=str, help="Tag (only relevant for unit tests)")
 @click.option(
     "--run-name", required=False, type=str, help="Run name (only relevant for release tests)"
 )
@@ -187,22 +190,32 @@ def main(
     account: str,
     cluster: str,
     container_tag: str,
+    tag: Optional[str] = None,
     container_image: Optional[str] = None,
     run_name: Optional[str] = None,
     wandb_experiment: Optional[str] = None,
 ):
+    model_config_path = pathlib.Path(
+        BASE_PATH
+        / ".."
+        / ".."
+        / "functional_tests"
+        / "test_cases"
+        / model
+        / test_case
+        / "model_config.yaml"
+    )
 
-    with open(
-        pathlib.Path(
-            BASE_PATH / ".." / ".." / "test_cases" / model / test_case / "model_config.yaml"
-        )
-    ) as stream:
-        try:
-            test_case_dict = yaml.safe_load(stream)
-        except yaml.YAMLError as exc:
-            print(exc)
+    if model_config_path.exists():
+        with open(model_config_path) as stream:
+            try:
+                test_case_dict = yaml.safe_load(stream)
+            except yaml.YAMLError as exc:
+                print(exc)
 
-    test_type = test_case_dict['TEST_TYPE']
+        test_type = test_case_dict['TEST_TYPE']
+    else:
+        test_type = "unit_test"
 
     if test_type == "release" and (run_name is None or wandb_experiment is None):
         print(f"Not all arguments provided ({run_name=}, {wandb_experiment=})")
@@ -221,6 +234,7 @@ def main(
             container_tag=container_tag,
             cluster=cluster,
             account=account,
+            tag=tag,
             run_name=run_name,
             wandb_experiment=wandb_experiment,
         )
@@ -242,9 +256,19 @@ def main(
         concat_logs = "\n".join(logs)
         print(f"Logs:\n{concat_logs}")
 
-        if test_type != "release":
-            success = pipeline.get_status() == PipelineStatus.SUCCESS
+        success = pipeline.get_status() == PipelineStatus.SUCCESS
 
+        if test_type == "unit_test":
+            success = success and (
+                (
+                    re.search(r'=.*?\bpassed\b.*?=', concat_logs)
+                    and not re.search(r'=.*?\bfailed\b.*?=', concat_logs)
+                )
+                or "0 selected" in concat_logs
+            )
+            sys.exit(int(not success))  # invert for exit 0
+
+        if test_type != "release":
             if success:
                 sys.exit(int(not success))  # invert for exit 0
 

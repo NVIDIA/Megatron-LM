@@ -16,31 +16,20 @@ include:
     ref: main
     file: downstreams.yml
 
-functional:build_image:
-  extends: [test:build_image, .functional_tests_rules]
-  needs:
-    - test:build_image
-    - test:docs_build
-    - test:formatting
-    - test:copyright
-  variables:
-    STAGE: jet
-    TAG: purpose/builder-small
-
 functional:configure:
   needs:
-    - functional:build_image
-    - job: test:pyt(LTS)_mcore(latest)
+    - test:build_image
+    - job: test:unit_tests_pyt(DEV)_mcore(latest)
       optional: true
-    - job: test:pyt(DEV)_mcore(latest)
+    - job: test:unit_tests_pyt(LTS)_mcore(latest)
       optional: true
   extends: [.functional_tests_rules]
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   tags: [mcore-docker-node-small]
   before_script:
-    - git rm -r tests/functional_tests/local_recipes || true
-    - git submodule add --force https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/ADLR/megatron-lm-convergence-tests.git tests/functional_tests/local_recipes
-    - ls tests/functional_tests/local_recipes
+    - git rm -r tests/test_utils/local_recipes || true
+    - git submodule add --force https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/ADLR/megatron-lm-convergence-tests.git tests/test_utils/local_recipes
+    - ls tests/test_utils/local_recipes
   script:
     - set -x
     - |
@@ -60,7 +49,7 @@ functional:configure:
       fi
     - |
       export PYTHONPATH=$(pwd)
-      python tests/functional_tests/python_test_utils/jet/generate_jet_trigger_job.py \
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
         --scope $FUNCTIONAL_TEST_SCOPE \
         --environment dev \
         --n-repeat "$FUNCTIONAL_TEST_REPEAT" \
@@ -70,11 +59,12 @@ functional:configure:
         --h100-cluster $H100_CLUSTER \
         --container-image ${UTILITY_IMAGE} \
         --container-tag ${CI_PIPELINE_ID} \
-        --output-path "jet-trigger-job-dev.yaml" \
+        --dependent-job "functional:configure" \
+        --output-path "functional-test-job-dev.yaml" \
         ${RELEASE_ARGS[@]}
     - |
       export PYTHONPATH=$(pwd)
-      python tests/functional_tests/python_test_utils/jet/generate_jet_trigger_job.py \
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
         --scope $FUNCTIONAL_TEST_SCOPE \
         --environment lts \
         --n-repeat "$FUNCTIONAL_TEST_REPEAT" \
@@ -84,13 +74,14 @@ functional:configure:
         --h100-cluster $H100_CLUSTER \
         --container-image ${UTILITY_IMAGE} \
         --container-tag ${CI_PIPELINE_ID} \
-        --output-path "jet-trigger-job-lts.yaml" \
+        --dependent-job "functional:configure" \
+        --output-path "functional-test-job-lts.yaml" \
         ${RELEASE_ARGS[@]}
   artifacts:
     paths:
-      - jet-trigger-job-lts.yaml
-      - jet-trigger-job-dev.yaml
-      - tests/functional_tests/local_recipes
+      - functional-test-job-lts.yaml
+      - functional-test-job-dev.yaml
+      - tests/test_utils/local_recipes
 
 .run:
   stage: functional_tests
@@ -98,7 +89,7 @@ functional:configure:
   extends: [.functional_tests_rules]
   trigger:
     include:
-      - artifact: jet-trigger-job-$ENVIRONMENT.yaml
+      - artifact: functional-test-job-$ENVIRONMENT.yaml
         job: functional:configure
     strategy: depend
   variables:
@@ -120,7 +111,7 @@ functional:run_dev:
   variables:
     ENVIRONMENT: dev
 
-.notify:
+functional:notify:
   extends: [.functional_tests_rules]
   image: badouralix/curl-jq
   needs:
@@ -141,7 +132,7 @@ functional:run_dev:
     - export GITLAB_ENDPOINT
     - export CONTEXT=$FUNCTIONAL_TEST_SCOPE
     - export DATE=$(date +"%Y-%m-%d")
-    - bash tests/functional_tests/shell_test_utils/notify.sh ${CI_PIPELINE_ID} ${ENVIRONMENT}
+    - bash tests/test_utils/shell_scripts/notify.sh ${CI_PIPELINE_ID} "functional:run_"
   artifacts:
     when: always
     paths:
@@ -150,13 +141,3 @@ functional:run_dev:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $FUNCTIONAL_TEST == "yes"
       when: always
     - when: never
-
-functional:notify-lts:
-  extends: [.notify]
-  variables:
-    ENVIRONMENT: lts
-
-functional:notify-dev:
-  extends: [.notify]
-  variables:
-    ENVIRONMENT: dev

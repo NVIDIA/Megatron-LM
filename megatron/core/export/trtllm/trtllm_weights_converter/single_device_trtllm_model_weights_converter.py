@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import re
+from typing import Optional
 
 import torch
 from tqdm import tqdm
@@ -39,6 +40,7 @@ class SingleDeviceTRTLLMModelWeightsConverter:
         dtype: DataType,
         multi_query_mode: bool = False,
         activation: str = "gelu",
+        scales: Optional[dict] = None,
     ):
         """Constructor for the TRTLLMModelWeightsConverterCPU class
 
@@ -50,12 +52,17 @@ class SingleDeviceTRTLLMModelWeightsConverter:
             dtype (DataType): The data type or model precision
             multi_query_mode (bool, optional): Defaults to False.
             activation (str, optional): Defaults to "gelu".
+            scales (dict, optional): Dictionary with fp8 scaling factors.
         """
+        if scales is None:
+            scales = {}
+
         self.export_config = export_config
         self.transformer_config = transformer_config
         self.trtllm_model_weights = {}
         self.storage_type = str_dtype_to_torch(dtype)
         self.activation = activation
+        self.scales = scales
         num_kv_heads = self.transformer_config.num_query_groups
         if num_kv_heads == 0:
             if multi_query_mode:
@@ -77,6 +84,25 @@ class SingleDeviceTRTLLMModelWeightsConverter:
             val = model_state_dict.pop(layer_name)
             val = val.to(self.storage_type).detach().contiguous()
             self.trtllm_model_weights[layer_name] = val
+
+    def _cast_value(self, val: torch.Tensor, layer_name: str) -> torch.Tensor:
+        """Casts weights to the expected datatype.
+            When appropriate scaling factor is found inside self.scales, the weight gets scaled before the cast.
+
+        Args:
+            val (torch.Tensor): Model weight
+            layer_name (str): Layer name, used for determining the scaling factor dictionary key
+        Returns:
+            torch.Tensor: The casted weight
+        """
+        storage = self.storage_type
+
+        scale_key = '.'.join(layer_name.split('.')[:-1]) + '.weights_scaling_factor'
+        if scale_key in self.scales and layer_name.endswith("weight"):
+            storage = torch.float8_e4m3fn
+            val = val * self.scales[scale_key]['weight_multiplier'].to(val.device)
+
+        return val.to(storage)
 
     def _convert_transformer_layer(self, layer_name: str, val: torch.Tensor):
         """Convert Transformer layers to TRTLLM weights
@@ -101,7 +127,7 @@ class SingleDeviceTRTLLMModelWeightsConverter:
             if split_type == 'expert_split':
                 for split_num, split_val in enumerate(val):
                     self.trtllm_model_weights[f'{layer_name}.{split_num}.bin'] = (
-                        split_val.to(self.storage_type).detach().contiguous()
+                        self._cast_value(split_val, layer_name).detach().contiguous()
                     )
             elif split_type == 'tensor_split':
                 for split_num, split_val in enumerate(val):
@@ -109,13 +135,14 @@ class SingleDeviceTRTLLMModelWeightsConverter:
                         split_val = torch.transpose(split_val.reshape(split_val.shape[0], -1), 1, 0)
 
                     self.trtllm_model_weights[f'{layer_name}.{split_num}.bin'] = (
-                        split_val.to(self.storage_type).detach().contiguous()
+                        self._cast_value(split_val, layer_name).detach().contiguous()
                     )
             else:
                 if val.ndim >= 2:
                     val = torch.transpose(val.reshape(val.shape[0], -1), 1, 0)
+
                 self.trtllm_model_weights[layer_name] = (
-                    val.to(self.storage_type).detach().contiguous()
+                    self._cast_value(val, layer_name).detach().contiguous()
                 )
 
         if val.ndim == 2:
