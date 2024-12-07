@@ -1,5 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+from typing import Optional
+
 import torch
 from tqdm import tqdm
 
@@ -32,6 +34,7 @@ class DistributedTRTLLMModelWeightsConverter:
         dtype: DataType,
         multi_query_mode: bool = False,
         activation: str = "gelu",
+        scales: Optional[dict] = None,
     ):
         """Constructor for the TRTLLMModelWeightsConverterGPU class
 
@@ -42,11 +45,15 @@ class DistributedTRTLLMModelWeightsConverter:
             dtype (DataType): The data type or model precision
             multi_query_mode (bool, optional): Defaults to False.
             activation (str, optional): Defaults to "gelu".
+            scales (dict, optional): Dictionary with fp8 scaling factors.
         """
+        if scales is None:
+            scales = {}
         self.transformer_config = transformer_config
         self.trtllm_model_weights = {}
         self.storage_type = str_dtype_to_torch(dtype)
         self.activation = activation
+        self.scales = scales
         num_kv_heads = self.transformer_config.num_query_groups
         if num_kv_heads == 0:
             if multi_query_mode:
@@ -68,7 +75,13 @@ class DistributedTRTLLMModelWeightsConverter:
 
     def _add_to_trtllm_model_weights(self, val: torch.Tensor, layer_name: str):
         assert torch.is_tensor(val), f"Expected a tensor for {layer_name} but got {type(val)}"
-        val = val.to(self.storage_type)
+        scale_key = '.'.join(layer_name.split('.')[:-1]) + '.weights_scaling_factor'
+        storage = self.storage_type
+        if scale_key in self.scales and layer_name.endswith("weight"):
+            storage = torch.float8_e4m3fn
+            val = val * self.scales[scale_key]['weight_multiplier'].to(val.device)
+
+        val = val.to(storage)
         val = val.detach().contiguous()
         if val.ndim >= 2:
             val = torch.transpose(val.reshape(val.shape[0], -1), 0, 1)
