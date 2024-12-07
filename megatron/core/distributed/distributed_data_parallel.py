@@ -152,8 +152,25 @@ class DistributedDataParallel(_BaseDataParallel):
                 )
                 if self.ddp_config.average_in_collective:
                     # Collective is averaging gradients in collective with data_parallel_group.
-                    assert (
-                        gradient_scaling_factor
+                    # Hence the gradient_scaling_factor should be equal to 1 when data_parallel_group is DP*EP
+                    # and gradient_scaling_factor should be 1/EP when data_parallel_group is DP
+                    if torch.distributed.get_world_size(
+                        group=data_parallel_group
+                    ) == parallel_state.get_data_parallel_world_size(with_context_parallel=True):
+                        assert gradient_scaling_factor == 1.0
+                    else:
+                        assert gradient_scaling_factor == (
+                            1.0
+                            / (
+                                parallel_state.get_data_parallel_world_size(
+                                    with_context_parallel=True
+                                )
+                                // torch.distributed.get_world_size(group=data_parallel_group)
+                            )
+                        )
+                else:
+                    target_gradient_scaling_factor = (
+                        1.0
                         / parallel_state.get_data_parallel_world_size(with_context_parallel=True)
                         == target_gradient_scaling_factor
                     )
