@@ -59,7 +59,7 @@ class TransformerConfig(ModelParallelConfig):
 
     # @jcasper should we keep this option?
     apply_residual_connection_post_layernorm: bool = False
-    """If True, uses the original BERT residule connection ordering."""
+    """If True, uses the original BERT residual connection ordering."""
 
     layernorm_epsilon: float = 1e-5
     """Epsilon value for any LayerNorm operations."""
