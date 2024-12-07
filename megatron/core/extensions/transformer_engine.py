@@ -9,6 +9,8 @@ from typing import Callable
 
 import torch
 import transformer_engine as te
+import transformer_engine.pytorch.ops as te_ops
+import torch.nn.functional as F
 from packaging.version import Version as PkgVersion
 from torch import Tensor
 from torch.nn.parameter import Parameter
@@ -56,6 +58,30 @@ def _get_extra_te_kwargs(config: TransformerConfig):
 def condition_init_method(config, init_method):
     """Condition TE init_method on config.perform_initialization."""
     return init_method if config.perform_initialization else (lambda w: None)
+
+class TEActivationOp:
+    """
+    A conditional wrapper to initialize an instance of Transformer-Engine's activation
+    function operators (e.g. Silu, SwiGLU, etc)
+    """
+    def __new__(cls, config: TransformerConfig):
+        layer = None
+        if config.gated_linear_unit:
+            if config.activation_func == F.silu:
+                layer = te_ops.SwiGLU()
+            elif config.activation_func == F.gelu:
+                layer = te_ops.GEGLU()
+            elif config.activation_func == F.silu:
+                layer = te_ops.ReGLU()
+        else:
+            if config.activation_func == F.gelu:
+                layer = te_ops.GELU()
+            elif config.activation_func == F.silu:
+                layer = te_ops.ReLU()
+        if layer is None:
+            raise Exception('Only SwiGLU, GEGLU, ReGLU, GELU, ReLU are supported by '
+            'transformer engine. Consider setting use_te_activation_func=False')
+        return layer
 
 
 class TENorm:

@@ -28,6 +28,7 @@ try:
         TENorm,
         TERowParallelGroupedLinear,
         TERowParallelLinear,
+        TEActivationOp,
     )
 
     HAVE_TE = True
@@ -209,6 +210,10 @@ def _get_mlp_module_spec(
     fp8: Optional[str] = None,
 ) -> ModuleSpec:
     """Helper function to get module spec for MLP/MoE"""
+    if use_te:
+        activation_func = TEActivationOp
+    else:
+        activation_func = None
     if num_experts is None:
         # Dense MLP w/ or w/o TE modules.
         return ModuleSpec(
@@ -216,6 +221,7 @@ def _get_mlp_module_spec(
             submodules=MLPSubmodules(
                 linear_fc1=TELayerNormColumnParallelLinear if use_te else ColumnParallelLinear,
                 linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
+                activation_func=activation_func,
             ),
         )
     else:
@@ -236,7 +242,7 @@ def _get_mlp_module_spec(
             module=MoELayer,
             submodules=MoESubmodules(
                 experts=(
-                    MLPSubmodules(linear_fc1=linear_fc1, linear_fc2=linear_fc2)
+                    MLPSubmodules(linear_fc1=linear_fc1, linear_fc2=linear_fc2, activation_func=activation_func)
                     if not moe_grouped_gemm or use_te_grouped_gemm
                     else None
                 ),
@@ -246,6 +252,7 @@ def _get_mlp_module_spec(
                     submodules=MLPSubmodules(
                         linear_fc1=TEColumnParallelLinear if use_te else ColumnParallelLinear,
                         linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
+                        activation_func=activation_func,
                     ),
                 ),
             ),

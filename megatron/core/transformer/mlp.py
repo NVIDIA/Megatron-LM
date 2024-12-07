@@ -20,10 +20,10 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-
 @dataclass
 class MLPSubmodules:
     linear_fc1: Union[ModuleSpec, type] = None
+    activation_func: Union[ModuleSpec, type] = None
     linear_fc2: Union[ModuleSpec, type] = None
 
 
@@ -76,7 +76,13 @@ class MLP(MegatronModule):
             tp_comm_buffer_name='fc1',
         )
 
-        self.activation_func = self.config.activation_func
+        if self.config.use_te_activation_func:
+            self.activation_func = build_module(
+                submodules.activation_func,
+                config=self.config,
+            )
+        else:
+            self.activation_func = self.config.activation_func
 
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
@@ -96,7 +102,11 @@ class MLP(MegatronModule):
         # [s, b, 4 * h/p]
         intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
 
-        if self.config.bias_activation_fusion:
+        if self.config.use_te_activation_func:
+            if bias_parallel is not None:
+                intermediate_parallel = intermediate_parallel + bias_parallel
+            intermediate_parallel = self.activation_func(intermediate_parallel)
+        elif self.config.bias_activation_fusion:
             if self.activation_func == F.gelu:
                 if self.config.gated_linear_unit:
                     intermediate_parallel = bias_geglu_impl(intermediate_parallel, bias_parallel)
