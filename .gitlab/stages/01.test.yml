@@ -482,3 +482,4 @@ test:notify_release:
       else
         eval "$CMD"
       fi
+      

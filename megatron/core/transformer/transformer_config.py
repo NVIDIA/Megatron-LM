@@ -5,6 +5,8 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import torch.nn.functional as F
 
+from megatron.core.transformer.enums import AttnBackend
+
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import get_te_version, init_method_normal, is_te_min_version, scaled_init_method_normal
 
@@ -36,6 +38,12 @@ class TransformerConfig(ModelParallelConfig):
 
     num_attention_heads: int = 0
     """Number of transformer attention heads."""
+
+    attention_backend: AttnBackend = AttnBackend.auto
+    """Attention backend to run. By default we let transformer engine
+    decide the best backend to run (except in the case of local).
+    If attention backend is local we use the local pytorch implementation in mcore. 
+    Users can specify exact backend by changing this config. """
 
     num_query_groups: int = None
     """Number of query groups for group query attention. If None, normal attention is used."""
