@@ -18,6 +18,7 @@ from megatron.core.models.T5.t5_spec import (
     get_t5_encoder_with_transformer_engine_block_spec,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -42,6 +43,7 @@ class TestT5InferenceWrapper:
             num_attention_heads=12,
             tensor_model_parallel_size=tensor_parallel_size,
             pipeline_model_parallel_size=pipeline_parallel_size,
+            attention_backend=AttnBackend.unfused,
         )
 
         encoder_config = deepcopy(transformer_config)

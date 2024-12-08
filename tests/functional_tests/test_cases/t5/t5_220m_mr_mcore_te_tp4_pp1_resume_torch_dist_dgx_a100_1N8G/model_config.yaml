@@ -51,4 +51,5 @@ MODEL_ARGS:
   --encoder-pipeline-model-parallel-size: 0
   --deterministic-mode: true
   --ckpt-format: torch_dist
+  --attention-backend: unfused
 TEST_TYPE: ckpt-resume

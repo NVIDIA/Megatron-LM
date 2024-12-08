@@ -19,7 +19,8 @@ from megatron.core.models.retro.utils import (
     get_gpt_data_dir as get_retro_data_dir,
 )
 from megatron.core.transformer import TransformerConfig, MLATransformerConfig
-from megatron.core.utils import get_torch_version, is_torch_min_version
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.utils import is_torch_min_version
 from megatron.training.activations import squared_relu
 from megatron.training.utils import update_use_dist_ckpt
 
@@ -214,6 +215,9 @@ def validate_args(args, defaults={}):
     assert args.world_size % total_model_size == 0, (
         f"world size ({args.world_size}) is not divisible by total_model_size ({encoder_model_size=} + {decoder_model_size=})"
     )
+
+    if args.attention_backend == AttnBackend.local:
+        assert args.spec[0] == 'local' , '--attention-backend local is only supported with --spec local'
 
     # Pipeline model parallel size.
     args.transformer_pipeline_model_parallel_size = (
@@ -935,6 +939,7 @@ def _add_network_size_args(parser):
                        'This is set to 4*hidden-size if not provided')
     group.add_argument('--num-attention-heads', type=int, default=None,
                        help='Number of transformer attention heads.')
+    group.add_argument('--attention-backend', type=lambda attn_backend: AttnBackend[attn_backend], default=AttnBackend.auto, choices = list(AttnBackend), help='Attention backend to use (flash,fused,unfused,local,auto). Defaults to auto')
     group.add_argument('--kv-channels', type=int, default=None,
                        help='Projection weights dimension in multi-head '
                        'attention. This is set to '

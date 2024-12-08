@@ -1,7 +1,5 @@
 ENV_VARS:
   CUDA_DEVICE_MAX_CONNECTIONS: 1
-  NVTE_FLASH_ATTN: 0
-  NVTE_FUSED_ATTN: 0
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Tree
   CUBLAS_WORKSPACE_CONFIG: :4096:8
@@ -48,4 +46,5 @@ MODEL_ARGS:
   --fp16: true
   --apply-query-key-layer-scaling: true
   --ckpt-format: torch
+  --attention-backend: unfused
 TEST_TYPE: ckpt-resume
