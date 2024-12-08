@@ -55,6 +55,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_one_logger_args(parser)
     parser = _add_ft_package_args(parser)
     parser = _add_config_logger_args(parser)
+    parser = _add_rerun_machine_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -1186,6 +1187,9 @@ def _add_training_args(parser):
     group.add_argument('--no-check-for-nan-in-loss-and-grad', action='store_false',
                        help='Check for NaNs in loss and grad',
                        dest='check_for_nan_in_loss_and_grad')
+    group.add_argument('--check-for-spiky-loss', action='store_true',
+                       help='Check for spiky loss',
+                       dest='check_for_spiky_loss')
     group.add_argument('--distribute-saved-activations',
                        action='store_true',
                        help='If set, distribute recomputed activations '
@@ -1377,6 +1381,24 @@ def _add_training_args(parser):
     group.add_argument('--disable-tp-comm-split-rs', action='store_false',
                        help='Disables the Reduce-Scatter overlap with fprop GEMM.',
                        dest='tp_comm_split_rs')
+
+    return parser
+
+
+def _add_rerun_machine_args(parser):
+    group = parser.add_argument_group(title='rerun engine')
+
+    group.add_argument('--error-injection-rate', type=int, default=0,
+                       help='Rate at which to inject unexpected results, '
+                       'e.g. 1000 means once every 1000 result validations')
+    group.add_argument('--error-injection-type', type=str, default='transient_error',
+                       choices=['correct_result', 'transient_error', 'persistent_error'],
+                       help='Type of error to inject. ')
+    group.add_argument('--rerun-mode', type=str, default='disabled',
+                       choices=['disabled', 'validate_results', 'report_stats'],
+                       help='Use re-run engine to validate results (default) '
+                       'or to emit stats on variability of computations due to '
+                       'non-deterministic algorithms.')
 
     return parser
 
