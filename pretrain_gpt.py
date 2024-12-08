@@ -30,6 +30,7 @@ from megatron.training.utils import (
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
@@ -80,14 +81,19 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
         if args.spec is not None:
             transformer_layer_spec = import_module(args.spec)
         else:
-            if use_te:
-                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                    args.num_experts, args.moe_grouped_gemm,
-                    args.qk_layernorm, args.multi_latent_attention, args.fp8)
+            if args.num_experts:
+                # Define the decoder block spec
+                transformer_layer_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=use_te)
             else:
-                transformer_layer_spec = get_gpt_layer_local_spec(
-                    args.num_experts, args.moe_grouped_gemm,
-                    args.qk_layernorm, args.multi_latent_attention)
+                # Define the decoder layer spec
+                if use_te:
+                    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                        args.num_experts, args.moe_grouped_gemm,
+                        args.qk_layernorm, args.multi_latent_attention, args.fp8)
+                else:
+                    transformer_layer_spec = get_gpt_layer_local_spec(
+                        args.num_experts, args.moe_grouped_gemm,
+                        args.qk_layernorm, args.multi_latent_attention)
 
         build_model_context = nullcontext
         build_model_context_args = {}

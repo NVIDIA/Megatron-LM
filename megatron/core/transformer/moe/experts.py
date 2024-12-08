@@ -117,14 +117,14 @@ class GroupedMLP(MegatronModule):
         tp_size = parallel_state.get_expert_tensor_parallel_world_size()
         tp_rank = parallel_state.get_expert_tensor_parallel_rank()
 
-        fc1_output_size = self.config.ffn_hidden_size * self.num_local_experts
+        fc1_output_size = self.config.moe_ffn_hidden_size * self.num_local_experts
         if config.gated_linear_unit:
             # Project to 4h. If using swiglu double the output width,
             # see https://arxiv.org/pdf/2002.05202.pdf
             fc1_output_size *= 2
         fc1_output_size_per_partition = divide(fc1_output_size, tp_size)
 
-        fc2_input_size = self.config.ffn_hidden_size * self.num_local_experts
+        fc2_input_size = self.config.moe_ffn_hidden_size * self.num_local_experts
         fc2_input_size_per_partition = divide(fc2_input_size, tp_size)
 
         # Note: The current kernel implementations of grouped_gemm
@@ -601,7 +601,7 @@ class TEGroupedMLP(MegatronModule):
         self.input_size = self.config.hidden_size
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
-        ffn_hidden_size = self.config.ffn_hidden_size
+        ffn_hidden_size = self.config.moe_ffn_hidden_size
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
@@ -623,7 +623,7 @@ class TEGroupedMLP(MegatronModule):
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
             self.num_local_experts,
-            self.config.ffn_hidden_size,
+            self.config.moe_ffn_hidden_size,
             self.config.hidden_size,
             config=self.config,
             init_method=self.config.output_layer_init_method,
@@ -753,6 +753,11 @@ class SequentialMLP(MegatronModule):
         self.add_bias = config.add_bias_linear
         self.num_local_experts = num_local_experts
         self.local_experts = torch.nn.ModuleList()
+
+        assert (
+            self.config.moe_ffn_hidden_size == self.config.ffn_hidden_size
+        ), "Please use GroupedMLP or TEGroupedMLP when moe_ffn_hidden_size is \
+                different from ffn_hidden_size"
         for _ in range(self.num_local_experts):
             expert = MLP(self.config, submodules, is_expert=True)
             self.local_experts.append(expert)
