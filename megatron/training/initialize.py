@@ -16,6 +16,7 @@ from megatron.training import get_adlr_autoresume
 from megatron.training import get_args
 from megatron.training import get_tensorboard_writer
 from megatron.core import mpu, tensor_parallel
+from megatron.core.rerun_state_machine import initialize_rerun_state_machine, RerunErrorInjector, RerunDiagnostic, RerunMode
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.yaml_arguments import validate_yaml
 from megatron.training.checkpointing import load_args_from_checkpoint
@@ -74,6 +75,27 @@ def initialize_megatron(
 
     # set logging level
     setup_logging()
+
+    # init rerun state
+    def state_save_func():
+        return {
+            'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states()
+        }
+    
+    def state_restore_func(state_dict):
+        if state_dict['rng_tracker_states']:
+            tensor_parallel.get_cuda_rng_tracker().set_states(state_dict['rng_tracker_states'])
+
+    args = get_args()
+    initialize_rerun_state_machine(
+        state_save_func=state_save_func,
+        state_restore_func=state_restore_func,
+        mode=RerunMode(args.rerun_mode),
+        error_injector=RerunErrorInjector(
+            error_injection_rate=args.error_injection_rate,
+            error_injection_type=RerunDiagnostic(args.error_injection_type),
+        ),
+    )
 
     # torch.distributed initialization
     def finish_mpu_init():
