@@ -69,10 +69,9 @@ def is_first_or_last_stage(pp_size, encoder_pipeline_model_parallel_size):
         return True
 
     is_valid_rank = False
-
+    pp_rank = get_pipeline_model_parallel_rank()
     if encoder_pipeline_model_parallel_size == 0:
         # No separate pipeline stage for the vision model. Run the dataloader on the first and last pipeline stage.
-        pp_rank = get_pipeline_model_parallel_rank()
         is_valid_rank = pp_rank in (0, pp_size-1)
     elif encoder_pipeline_model_parallel_size == 1:
         # Separate pipeline stage for the vision model. Run the dataloader on the first vision and LM stage and last LM stage.
