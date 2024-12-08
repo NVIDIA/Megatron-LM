@@ -16,6 +16,11 @@ from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttentionSubmodules,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_block import (
+    TransformerBlockSubmodules,
+    get_num_layers_to_build,
+)
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.utils import is_te_min_version
 
@@ -77,6 +82,7 @@ def get_gpt_layer_with_transformer_engine_spec(
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
+                input_layernorm=TENorm,
                 self_attention=ModuleSpec(
                     module=MLASelfAttention,
                     params={"attn_mask_type": AttnMaskType.causal},
@@ -94,7 +100,6 @@ def get_gpt_layer_with_transformer_engine_spec(
                 ),
                 self_attn_bda=get_bias_dropout_add,
                 pre_mlp_layernorm=TENorm if num_experts else IdentityOp,
-                input_layernorm=TENorm if num_experts else IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
             ),
@@ -145,13 +150,16 @@ def get_gpt_layer_local_spec(
     Returns:
         ModuleSpec: Module specification with Megatron-Core modules
     """
+
     mlp = _get_mlp_module_spec(
         use_te=False, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
     )
+
     if multi_latent_attention:
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
+                input_layernorm=LNImpl,
                 self_attention=ModuleSpec(
                     module=MLASelfAttention,
                     params={"attn_mask_type": AttnMaskType.causal},
@@ -168,8 +176,7 @@ def get_gpt_layer_local_spec(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
-                pre_mlp_layernorm=LNImpl if num_experts else IdentityOp,
-                input_layernorm=LNImpl if num_experts else IdentityOp,
+                pre_mlp_layernorm=LNImpl,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
             ),
@@ -208,45 +215,143 @@ def _get_mlp_module_spec(
     moe_grouped_gemm: Optional[bool] = False,
     fp8: Optional[str] = None,
 ) -> ModuleSpec:
-    """Helper function to get module spec for MLP/MoE"""
+    """Helper function to get module spec for MLP"""
+    if num_experts is not None:
+        moe_spec = _get_moe_module_spec(
+            use_te=True, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm, fp8=fp8
+        )
+        return moe_spec
+
+    return ModuleSpec(
+        module=MLP,
+        submodules=MLPSubmodules(
+            linear_fc1=TELayerNormColumnParallelLinear if use_te else ColumnParallelLinear,
+            linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
+        ),
+    )
+
+
+def _get_moe_module_spec(
+    use_te: Optional[bool] = True,
+    num_experts: Optional[int] = None,
+    moe_grouped_gemm: Optional[bool] = False,
+    fp8: Optional[str] = None,
+) -> ModuleSpec:
+    """Helper function to get module spec for MoE"""
     if num_experts is None:
-        # Dense MLP w/ or w/o TE modules.
-        return ModuleSpec(
-            module=MLP,
-            submodules=MLPSubmodules(
-                linear_fc1=TELayerNormColumnParallelLinear if use_te else ColumnParallelLinear,
-                linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
+        return None
+    if use_te and moe_grouped_gemm:
+        linear_fc1 = TEColumnParallelGroupedLinear
+        linear_fc2 = TERowParallelGroupedLinear
+    elif use_te and fp8:
+        linear_fc1 = TEColumnParallelLinear
+        linear_fc2 = TERowParallelLinear
+    else:
+        linear_fc1 = ColumnParallelLinear
+        linear_fc2 = RowParallelLinear
+
+    use_te_grouped_gemm = use_te and TEColumnParallelGroupedLinear is not None
+
+    return ModuleSpec(
+        module=MoELayer,
+        submodules=MoESubmodules(
+            experts=(
+                MLPSubmodules(linear_fc1=linear_fc1, linear_fc2=linear_fc2)
+                if not moe_grouped_gemm or use_te_grouped_gemm
+                else None
             ),
+            shared_experts=ModuleSpec(
+                module=SharedExpertMLP,
+                params={"gate": False},
+                submodules=MLPSubmodules(
+                    linear_fc1=TEColumnParallelLinear if use_te else ColumnParallelLinear,
+                    linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
+                ),
+            ),
+        ),
+    )
+
+
+def get_gpt_decoder_block_spec(
+    config: TransformerConfig, use_transformer_engine: bool
+) -> TransformerBlockSubmodules:
+    """GPT block spec."""
+    if use_transformer_engine:
+        layer_norm_impl = TENorm
+    else:
+        layer_norm_impl = LNImpl
+
+    # Layer specs.
+    dense_layer_spec = (
+        get_gpt_layer_with_transformer_engine_spec(
+            num_experts=None,
+            moe_grouped_gemm=False,
+            qk_layernorm=config.qk_layernorm,
+            multi_latent_attention=config.multi_latent_attention,
+            fp8=config.fp8,
+        )
+        if use_transformer_engine
+        else get_gpt_layer_local_spec(
+            num_experts=None,
+            moe_grouped_gemm=False,
+            qk_layernorm=config.qk_layernorm,
+            multi_latent_attention=config.multi_latent_attention,
+        )
+    )
+    moe_layer_spec = (
+        get_gpt_layer_with_transformer_engine_spec(
+            num_experts=config.num_moe_experts,
+            moe_grouped_gemm=config.moe_grouped_gemm,
+            qk_layernorm=config.qk_layernorm,
+            multi_latent_attention=config.multi_latent_attention,
+            fp8=config.fp8,
+        )
+        if use_transformer_engine
+        else get_gpt_layer_local_spec(
+            num_experts=config.num_moe_experts,
+            moe_grouped_gemm=config.moe_grouped_gemm,
+            qk_layernorm=config.qk_layernorm,
+            multi_latent_attention=config.multi_latent_attention,
+        )
+    )
+
+    # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
+    # 0 stands for dense layers, 1 stands for expert layers.
+    # For integer N: Creates a pattern with one expert layer every N layers.
+    # For string pattern: Evaluates the str directly (e.g. "[1,0,1]" for alternating expert/dense).
+    if isinstance(config.moe_layer_freq, int):
+        moe_layer_pattern = [
+            1 if (i % config.moe_layer_freq == 0) else 0 for i in range(config.num_layers)
+        ]
+    elif isinstance(config.moe_layer_freq, list):
+        moe_layer_pattern = config.moe_layer_freq
+        assert len(moe_layer_pattern) == config.num_layers, (
+            f"Invalid length of moe_layer_pattern: {len(moe_layer_pattern)}, "
+            f"expected {config.num_layers}, "
+            f"current moe layer pattern: {config.moe_layer_freq}"
         )
     else:
-        # Mixture of experts with modules in megatron core.
-        if use_te and moe_grouped_gemm:
-            linear_fc1 = TEColumnParallelGroupedLinear
-            linear_fc2 = TERowParallelGroupedLinear
-        elif use_te and fp8:
-            linear_fc1 = TEColumnParallelLinear
-            linear_fc2 = TERowParallelLinear
-        else:
-            linear_fc1 = ColumnParallelLinear
-            linear_fc2 = RowParallelLinear
-
-        use_te_grouped_gemm = use_te and TEColumnParallelGroupedLinear is not None
-
-        return ModuleSpec(
-            module=MoELayer,
-            submodules=MoESubmodules(
-                experts=(
-                    MLPSubmodules(linear_fc1=linear_fc1, linear_fc2=linear_fc2)
-                    if not moe_grouped_gemm or use_te_grouped_gemm
-                    else None
-                ),
-                shared_experts=ModuleSpec(
-                    module=SharedExpertMLP,
-                    params={"gate": False},
-                    submodules=MLPSubmodules(
-                        linear_fc1=TEColumnParallelLinear if use_te else ColumnParallelLinear,
-                        linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
-                    ),
-                ),
-            ),
+        raise ValueError(
+            f"Invalid moe_layer_freq: {type(config.moe_layer_freq)}, {config.moe_layer_freq}"
         )
+
+    # Create the layer specs for the model.
+    layer_specs = []
+    for layer_number in range(config.num_layers):
+        if moe_layer_pattern[layer_number] == 1:
+            layer_specs.append(moe_layer_spec)
+        elif moe_layer_pattern[layer_number] == 0:
+            layer_specs.append(dense_layer_spec)
+        else:
+            raise ValueError(f"Invalid layer pattern: {moe_layer_pattern}")
+
+    # Slice the layer specs to only include the layers that are built in this pipeline stage.
+    # Note: MCore layer_number starts at 1
+    offset = TransformerLayer._get_layer_offset(config)
+    num_layers_to_build = get_num_layers_to_build(config)
+    layer_specs = layer_specs[offset : offset + num_layers_to_build]
+
+    # Block spec.
+    block_spec = TransformerBlockSubmodules(layer_specs=layer_specs, layer_norm=layer_norm_impl)
+
+    return block_spec

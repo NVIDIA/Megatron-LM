@@ -38,6 +38,7 @@ class TestTop2Router:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     def test_constructor(self):
         assert isinstance(self.router, Router)
 
