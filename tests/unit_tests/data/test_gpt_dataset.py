@@ -1,5 +1,7 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
 ##
-# Compile megatron.core.datasets.helpers dependencies before BlendedDataset import
+# Compile megatron.core.datasets.helpers_cpp dependencies before BlendedDataset import
 ##
 
 import random
