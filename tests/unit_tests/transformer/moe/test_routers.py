@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.router import Router
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -27,7 +27,7 @@ class TestTop2Router:
             moe_router_topk=2,
             moe_aux_loss_coeff=0,
         )
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+        transformer_layer_spec = get_gpt_layer_local_spec(
             num_experts=num_moe_experts, moe_grouped_gemm=False
         )
         self.sequential_mlp = MoELayer(
