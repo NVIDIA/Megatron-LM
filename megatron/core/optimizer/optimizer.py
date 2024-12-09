@@ -213,13 +213,6 @@ class MegatronOptimizer(ABC):
         """Simple scaling."""
         return self.get_loss_scale() * loss
 
-    def start_param_sync(self, model_index: int, *unused):
-        """
-        Start parameter synchronization for all optimizers.
-        This is a no-op for all non-distributed optimizers.
-        """
-        pass
-
     @abstractmethod
     def reload_model_params(self):
         """Refreshes any internal state from the current model parameters.
@@ -1062,8 +1055,3 @@ class ChainedOptimizer(MegatronOptimizer):
             optimizer.load_parameter_state_from_dp_zero(
                 state_dict, update_legacy_format=update_legacy_format
             )
-
-    def start_param_sync(self, model_index: int, *unused):
-        """Start parameter synchronization for all optimizers."""
-        for optimizer in self.chained_optimizers:
-            optimizer.start_param_sync(model_index, *unused)
