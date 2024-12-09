@@ -65,6 +65,9 @@ class Utils:
 
     @staticmethod
     def destroy_model_parallel():
+        os.environ.pop('NVTE_FLASH_ATTN', None)
+        os.environ.pop('NVTE_FUSED_ATTN', None)
+        os.environ.pop('NVTE_UNFUSED_ATTN', None)
         if not Utils.inited:
             return
         torch.distributed.barrier()
@@ -79,6 +82,12 @@ class Utils:
         virtual_pipeline_model_parallel_size=None,
         **kwargs,
     ):
+        # Need to unset these variables to make sure previous
+        # tests setting them doesn't interfere current test.
+        os.environ.pop('NVTE_FLASH_ATTN', None)
+        os.environ.pop('NVTE_FUSED_ATTN', None)
+        os.environ.pop('NVTE_UNFUSED_ATTN', None)
+
         ps.destroy_model_parallel()
         Utils.initialize_distributed()
         ps.initialize_model_parallel(

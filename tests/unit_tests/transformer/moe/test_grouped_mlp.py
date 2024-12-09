@@ -25,15 +25,7 @@ if torch.cuda.is_available():
     DEVICE_CAPABILITY = torch.cuda.get_device_capability()
 
 
-try:
-    _te_version = packaging.version.Version(version("transformer-engine"))
-except PackageNotFoundError:
-    _te_version = None
-    
-@pytest.mark.skipif(
-    _te_version is None,
-    reason="TE is not installed.",
-)
+@pytest.mark.skipif(is_te_min_version("1.9.0.dev0"), reason="Switch to TEGroupedMLP when TE>1.9.")
 class TestParallelGroupedMLP:
 
     def setup_method(self, method, use_cpu_initialization=False, swiglu=True):

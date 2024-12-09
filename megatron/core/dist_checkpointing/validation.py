@@ -375,10 +375,13 @@ def _validate_common_state_dict(common_state_dict: CommonStateDict,
     Args:
         common_state_dict: The common state dict present in all ransk
     """
-    other_rank_state_dicts = [None] * torch.distributed.get_world_size(group=process_group)
-    torch.distributed.all_gather_object(other_rank_state_dicts, common_state_dict, group=process_group)
+
+    # Gather the common state dict across ranks onto rank 0 for comparison
+    rank = torch.distributed.get_rank(group=process_group)
+    other_rank_state_dicts = [None] * torch.distributed.get_world_size(group=process_group) if rank == 0 else None
+    torch.distributed.gather_object(common_state_dict, other_rank_state_dicts, group=process_group)
     common_state_dict_diff = {}
-    if torch.distributed.get_rank(group=process_group) == 0:
+    if rank == 0:
         main_rank_state_dict = common_state_dict
         for rank, rank_state_dict in enumerate(other_rank_state_dicts[1:], 1):
             only_left, only_right, mismatch = diff(main_rank_state_dict, rank_state_dict)

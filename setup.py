@@ -102,7 +102,7 @@ setuptools.setup(
     packages=setuptools.find_namespace_packages(include=["megatron.core", "megatron.core.*"]),
     ext_modules=[
         Extension(
-            "megatron.core.datasets.helpers",
+            "megatron.core.datasets.helpers_cpp",
             sources=["megatron/core/datasets/helpers.cpp"],
             language="c++",
             extra_compile_args=(

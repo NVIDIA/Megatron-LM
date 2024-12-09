@@ -18,6 +18,7 @@ from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
+from megatron.core.rerun_state_machine import get_rerun_state_machine
 import megatron.legacy.model
 from megatron.core.models.gpt import GPTModel
 from megatron.training import pretrain
@@ -31,6 +32,7 @@ from megatron.training.utils import (
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
@@ -81,14 +83,19 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
         if args.spec is not None:
             transformer_layer_spec = import_module(args.spec)
         else:
-            if use_te:
-                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                    args.num_experts, args.moe_grouped_gemm,
-                    args.qk_layernorm, args.multi_latent_attention, args.fp8)
+            if args.num_experts:
+                # Define the decoder block spec
+                transformer_layer_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=use_te)
             else:
-                transformer_layer_spec = get_gpt_layer_local_spec(
-                    args.num_experts, args.moe_grouped_gemm,
-                    args.qk_layernorm, args.multi_latent_attention)
+                # Define the decoder layer spec
+                if use_te:
+                    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                        args.num_experts, args.moe_grouped_gemm,
+                        args.qk_layernorm, args.multi_latent_attention, args.fp8)
+                else:
+                    transformer_layer_spec = get_gpt_layer_local_spec(
+                        args.num_experts, args.moe_grouped_gemm,
+                        args.qk_layernorm, args.multi_latent_attention)
 
         build_model_context = nullcontext
         build_model_context_args = {}
@@ -141,6 +148,10 @@ def get_batch(data_iterator):
     return batch.values()
 
 
+# define spiky loss as a variation of 20% or more
+SPIKY_LOSS_PERC = 0.2
+
+
 def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     """Loss function.
 
@@ -169,13 +180,24 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
             torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
+    rerun_state_machine = get_rerun_state_machine()
     if args.check_for_nan_in_loss_and_grad:
-        global_rank = torch.distributed.get_rank()
-        assert not loss[0].isnan(), (
-            f'Rank {global_rank}: found NaN in local forward loss calculation. '
-            f'Device: {get_current_device()}, node: {os.uname()[1]}'
+        rerun_state_machine.validate_result(
+            result=loss[0],
+            rejection_func=torch.isnan,
+            message="found NaN in local forward loss calculation",
+            tolerance=0.0,        # forward pass calculations are determinisic
+            fatal=True,
         )
-
+    # Check for spiky loss
+    if args.check_for_spiky_loss:
+        rerun_state_machine.validate_result(
+            result=loss[0],
+            rejection_func=partial(rerun_state_machine.is_spiky_loss, threshold=SPIKY_LOSS_PERC),
+            message="Spiky loss",
+            tolerance=0.0,        # forward pass calculations are determinisic
+            fatal=False,
+        )
     # Reduce loss for logging.
     reporting_loss = loss.clone().detach()
     if xm:

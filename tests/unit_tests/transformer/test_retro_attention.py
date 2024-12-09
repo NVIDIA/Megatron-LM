@@ -2,6 +2,7 @@
 
 from megatron.core.device_utils import get_current_device
 import torch
+import os
 import types
 
 import pytest
@@ -79,6 +80,9 @@ class TestRetroAttention:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1,1)
         model_parallel_device_manual_seed(123)
+        os.environ['NVTE_FLASH_ATTN'] = "0"
+        os.environ['NVTE_FUSED_ATTN'] = "0"
+
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()

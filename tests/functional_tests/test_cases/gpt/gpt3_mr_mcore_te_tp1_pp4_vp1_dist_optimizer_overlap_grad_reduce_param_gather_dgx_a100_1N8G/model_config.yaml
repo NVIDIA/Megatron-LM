@@ -52,4 +52,5 @@ MODEL_ARGS:
   --ckpt-format: torch_dist
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
+  --attention-backend: unfused
 TEST_TYPE: regular

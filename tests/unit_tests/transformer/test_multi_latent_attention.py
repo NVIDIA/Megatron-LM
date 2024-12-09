@@ -10,6 +10,7 @@ import transformer_engine as te
 from megatron.core.device_utils import get_current_device
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -32,6 +33,7 @@ class TestParallelMLAAttention:
             v_head_dim=128,
             qk_pos_emb_head_dim=64,
             rotary_base=10000,
+            max_position_embeddings=32,
         )
         self.parallel_attention = MLASelfAttention(
             self.transformer_config,
@@ -39,6 +41,7 @@ class TestParallelMLAAttention:
                 multi_latent_attention=True
             ).submodules.self_attention.submodules,
             layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
         )
 
     def teardown_method(self, method):
@@ -84,45 +87,11 @@ class TestParallelMLAAttention:
             assert output.shape[2] == config.hidden_size
             assert bias.shape[0] == config.hidden_size
 
-    def test_fused_rope_gpu_forward(self):
-        if is_te_min_version("1.10.0"):
-            # use flash attention for hopper, future may support fused attention for ampere
-            os.environ['NVTE_FUSED_ATTN'] = "0"
-            os.environ['NVTE_FLASH_ATTN'] = "1"
-
-            self.parallel_attention.config.apply_rope_fusion = True
-            config = self.parallel_attention.config
-            sequence_length = 32
-            micro_batch_size = 2
-
-            self.parallel_attention.to(device=get_current_device())
-
-            # [sequence length, batch size, hidden size]
-            hidden_states = torch.ones(
-                (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size)
-            )
-            hidden_states = hidden_states.to(device=get_current_device())
-
-            attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).to(device=get_current_device())
-            rotary_pos_emb = torch.ones(
-                sequence_length, 1, 1, self.parallel_attention.config.kv_channels
-            ).to(device=get_current_device())
-            output, bias = self.parallel_attention(
-                hidden_states, attention_mask, rotary_pos_emb=rotary_pos_emb
-            )
-
-            assert config.recompute_granularity is None
-            assert output.shape[0] == sequence_length
-            assert output.shape[1] == micro_batch_size
-            assert output.shape[2] == config.hidden_size
-            assert bias.shape[0] == config.hidden_size
-            self.parallel_attention.config.apply_rope_fusion = False
-
     def test_checkpointed_gpu_forward(self):
         if is_te_min_version("1.10.0"):
             # use flash attention for hopper, future may support fused attention for ampere
-            os.environ['NVTE_FUSED_ATTN'] = "0"
-            os.environ['NVTE_FLASH_ATTN'] = "1"
+            os.environ['NVTE_FUSED_ATTN'] = "1"
+            os.environ['NVTE_FLASH_ATTN'] = "0"
 
             transformer_config = self.transformer_config
             transformer_config.recompute_granularity = 'selective'
@@ -132,6 +101,7 @@ class TestParallelMLAAttention:
                     multi_latent_attention=True
                 ).submodules.self_attention.submodules,
                 layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
             )
             config = checkpointed_parallel_attention.config
 

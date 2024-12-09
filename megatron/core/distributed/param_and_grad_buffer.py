@@ -2,7 +2,6 @@
 
 import logging
 import math
-import os
 from contextlib import nullcontext
 from enum import Enum
 from typing import Dict, List, Optional
@@ -10,6 +9,8 @@ from typing import Dict, List, Optional
 from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 from torch.distributed import _coalescing_manager
+
+from megatron.core.rerun_state_machine import get_rerun_state_machine
 
 from ..utils import is_float8tensor, is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
@@ -156,15 +157,16 @@ class _ParamAndGradBucketGroup:
         Make sure norm of grads in bucket are not NaN prior to data-parallel
         all-reduce / reduce-scatter.
         """
-        global_rank = torch.distributed.get_rank()
-        norm_is_nan = self.buckets[0].grad_data.norm(p=2).isnan()
-        for i in range(1, len(self.buckets)):
-            norm_is_nan.logical_or_(self.buckets[i].grad_data.norm(p=2).isnan())
-        assert not norm_is_nan, (
-            f'Rank {global_rank}: found NaN in local grad norm in '
-            f'backward pass before data-parallel communication collective. '
-            f'Device: {get_current_device() if xm is None else torch.device("cpu")}, node: {os.uname()[1]}'
-        )
+        rerun_state_machine = get_rerun_state_machine()
+        for i in range(len(self.buckets)):
+            rerun_state_machine.validate_result(
+                result=self.buckets[i].grad_data.norm(p=2),
+                rejection_func=torch.isnan,
+                message=f"found NaN in local grad norm for bucket #{i} "
+                f"in backward pass before data-parallel communication collective",
+                tolerance=0.001,  # 0.1% tolerance to account for non-deterministic FA backward
+                fatal=True,
+            )
 
     def start_param_sync(self, force_sync: bool = False):
         """

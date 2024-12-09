@@ -1,3 +1,4 @@
+import os
 import random
 import string
 import time
@@ -25,6 +26,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.parallel_state import is_pipeline_first_stage, is_pipeline_last_stage
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -43,6 +45,7 @@ class TestSimpleTextGenerationController:
             hidden_size=self.hidden_size,
             num_attention_heads=4,
             use_cpu_initialization=True,
+            attention_backend=AttnBackend.local,
         )
 
         gpt_model = GPTModel(

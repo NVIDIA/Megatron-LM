@@ -49,4 +49,5 @@ MODEL_ARGS:
   --bf16: true
   --decoder-first-pipeline-num-layers: 2
   --decoder-last-pipeline-num-layers: 2
+  --attention-backend: unfused
 TEST_TYPE: regular

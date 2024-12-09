@@ -1,9 +1,13 @@
 CXXFLAGS += -O3 -Wall -shared -std=c++11 -fPIC -fdiagnostics-color
 CPPFLAGS += $(shell python3 -m pybind11 --includes)
-LIBNAME = helpers
+
+LIBNAME = helpers_cpp
 LIBEXT = $(shell python3-config --extension-suffix)
 
-default: $(LIBNAME)$(LIBEXT)
+OUT = $(LIBNAME)$(LIBEXT)
+SRC = helpers.cpp
 
-%$(LIBEXT): %.cpp
+default: $(OUT)
+
+$(OUT): $(SRC)
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $< -o $@

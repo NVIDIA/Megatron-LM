@@ -16,6 +16,7 @@ from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
+from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.models.mamba import MambaModel
 from megatron.training import pretrain
 from megatron.core.utils import StragglerDetector
@@ -103,6 +104,11 @@ def get_batch(data_iterator):
 
     return batch.values()
 
+
+# define spiky loss as a variation of 20% or more
+SPIKY_LOSS_PERC = 0.2
+
+
 def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     """Loss function.
 
@@ -131,6 +137,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
             torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
+    rerun_state_machine = get_rerun_state_machine()
     if args.check_for_nan_in_loss_and_grad:
         global_rank = torch.distributed.get_rank()
         assert not loss[0].isnan(), (

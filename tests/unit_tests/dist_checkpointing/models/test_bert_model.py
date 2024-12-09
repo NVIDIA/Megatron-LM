@@ -11,6 +11,7 @@ from megatron.core.models.bert.bert_layer_specs import (
     bert_layer_with_transformer_engine_spec,
 )
 from megatron.core.models.bert.bert_model import BertModel
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing.models.common import (
     common_test_parallel_reconfiguration_e2e,
@@ -26,8 +27,6 @@ from megatron.core.models.bert.bert_layer_specs import bert_layer_local_spec, be
 def initialize_bert_model(
     seed, layer_spec_fn=bert_layer_with_transformer_engine_spec, vocab_size=128, **config_kwargs
 ):
-    os.environ['NVTE_FLASH_ATTN'] = '0'
-    os.environ['NVTE_FUSED_ATTN'] = '0'
     torch.manual_seed(seed)
     model_parallel_device_manual_seed(seed)
 
@@ -39,6 +38,7 @@ def initialize_bert_model(
         num_attention_heads=8,
         use_cpu_initialization=True,
         pipeline_dtype=torch.bfloat16,
+        attention_backend=AttnBackend.auto,
     )
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs)
@@ -67,6 +67,7 @@ class TestBertModel:
     @pytest.mark.parametrize(
         'dst_layer_spec', [bert_layer_with_transformer_engine_spec, bert_layer_local_spec]
     )
+    @pytest.mark.internal
     def test_sharded_state_dict_save_load(self, tmp_path_dist_ckpt, src_layer_spec, dst_layer_spec):
         common_test_simple_sharded_state_dict_save_load(
             initialize_bert_model, tmp_path_dist_ckpt, src_layer_spec, dst_layer_spec
