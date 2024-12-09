@@ -17,8 +17,7 @@ from megatron.core.tensor_parallel.mappings import (
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
-from megatron.core.transformer.mlp import MLP
-from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version, make_sharded_tensor_for_checkpoint
 
@@ -32,15 +31,15 @@ class SharedExpertMLP(MLP):
     # The shared experts are scheduled into this stream to be overlapped with the dispatcher.
     stream = None
 
-    def __init__(self, config: TransformerConfig, spec: ModuleSpec):
+    def __init__(self, config: TransformerConfig, submodules: MLPSubmodules, gate: bool):
         config = deepcopy(config)
         assert config.add_bias_linear == False, "bias is not supported in the shared experts, "
         "please set '--disable-bias-linear' instead."
 
         config.ffn_hidden_size = config.moe_shared_expert_intermediate_size
-        super().__init__(config=config, submodules=spec.submodules)
+        super().__init__(config=config, submodules=submodules)
 
-        self.use_shared_expert_gate = spec.params.get("gate", False)
+        self.use_shared_expert_gate = gate
         if self.use_shared_expert_gate:
             # TODO: Add support for GPU initialization, which requires updating the golden values.
             self.gate_weight = torch.nn.Parameter(torch.empty((1, self.config.hidden_size)))
