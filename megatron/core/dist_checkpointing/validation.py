@@ -242,7 +242,7 @@ def verify_checkpoint_and_load_strategy(
             saved_config.common_backend_version,
         )
     elif isinstance(common_strategy, tuple):
-        sharded_strategy = get_default_strategy(StrategyAction.LOAD_COMMON, *common_strategy)
+        common_strategy = get_default_strategy(StrategyAction.LOAD_COMMON, *common_strategy)
 
     sharded_strategy.check_backend_compatibility(saved_config.sharded_backend)
     sharded_strategy.check_version_compatibility(saved_config.sharded_backend_version)
