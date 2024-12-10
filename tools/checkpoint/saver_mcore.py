@@ -26,6 +26,9 @@ def add_arguments(parser):
                        help='Which Transformer implementation to use.')
     group.add_argument('--target-expert-parallel-size', type=int, default=1,
                        help='Target expert model parallel size, default to 1')
+    parser.add_argument('--target-ckpt-format', default='torch',
+                        choices=['torch', 'torch_dist', 'zarr'],
+                        help='Checkpoint format to use.')
 
 
 def save_checkpoint(queue, args):
@@ -47,6 +50,7 @@ def save_checkpoint(queue, args):
         from megatron.training.arguments import (parse_args, validate_args)
         from megatron.training.checkpointing import save_checkpoint
         from megatron.training.global_vars import set_global_variables, get_args
+        from megatron.core.parallel_state import initialize_model_parallel
         from megatron.core.enums import ModelType
         from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
         from megatron.legacy import fused_kernels
@@ -98,6 +102,10 @@ def save_checkpoint(queue, args):
                   "Default to 1.")
             args.target_pipeline_parallel_size = 1
 
+    if args.target_ckpt_format == "torch_dist":
+        assert args.target_tensor_parallel_size == 1, "Please setting --target-tensor-parallel-size to 1 to use dist ckpt"
+        assert args.target_pipeline_parallel_size == 1, "Please setting --target-pipeline-parallel-size to 1 to use dist ckpt"
+        assert args.target_expert_parallel_size == 1, "Please setting --target-expert-parallel-size to 1 to use dist ckpt"
 
     # Arguments do sanity checks on the world size, but we don't care,
     # so trick it into thinking we are plenty of processes
@@ -133,7 +141,7 @@ def save_checkpoint(queue, args):
                 '--no-initialization',
                 '--save-interval', '1',
                 '--save', args.save_dir,
-                '--ckpt-format', 'torch', # only 'torch' supported for conversion
+                '--ckpt-format', str(args.target_ckpt_format),
                 '--no-one-logger',
                 ]
 
@@ -226,14 +234,25 @@ def save_checkpoint(queue, args):
         margs.model_type = ModelType.encoder_or_decoder
     else:
         raise Exception(f'unrecognized model type: {args.model_type}')
-
+    print(f"saver's margs {margs}")
     # fake initializing distributed
-    mpu.set_tensor_model_parallel_world_size(args.target_tensor_parallel_size)
-    mpu.set_pipeline_model_parallel_world_size(args.target_pipeline_parallel_size)
-    mpu.set_expert_model_parallel_world_size(args.target_expert_parallel_size)
-    mpu.set_tensor_model_parallel_rank(0)
-    mpu.set_pipeline_model_parallel_rank(0)
-    mpu.set_expert_model_parallel_rank(0)
+    if args.target_ckpt_format == "torch_dist":
+        torch.distributed.init_process_group(
+            backend=margs.distributed_backend,
+            world_size=margs.world_size,
+            rank=margs.rank,
+        )
+        initialize_model_parallel()
+        print(f"real initializing distributed")
+    else:
+        print(f"fake initializing distributed")
+        # fake initializing distributed
+        mpu.set_tensor_model_parallel_world_size(args.target_tensor_parallel_size)
+        mpu.set_pipeline_model_parallel_world_size(args.target_pipeline_parallel_size)
+        mpu.set_expert_model_parallel_world_size(args.target_expert_parallel_size)
+        mpu.set_tensor_model_parallel_rank(0)
+        mpu.set_pipeline_model_parallel_rank(0)
+        mpu.set_expert_model_parallel_rank(0)
     fused_kernels.load(margs)
 
     # Embeddings
@@ -366,7 +385,23 @@ def save_checkpoint(queue, args):
             # Split up the parallel tensors
             qkv_weight = chunk_weight(msg.pop("qkv weight"), "column", args.target_tensor_parallel_size)
             dense_weight = chunk_weight(msg.pop("dense weight"), "row", args.target_tensor_parallel_size)
-            mlp_l1_weight = chunk_weight(msg.pop("mlp l1 weight"), "row", args.target_tensor_parallel_size, args.target_expert_parallel_size)
+            mlp_l1_weight = chunk_weight(msg.pop("mlp l1 weight"), "row", args.target_tensor_parallel_size,
+                                         args.target_expert_parallel_size)
+
+            if margs.moe_shared_expert_intermediate_size:
+                if md.swiglu:
+                    shared_mlp_l0_weight_W = chunk_weight(msg.pop("shared mlp l0 weight W"), "column",
+                                                          args.target_tensor_parallel_size)
+                    shared_mlp_l0_weight_V = chunk_weight(msg.pop("shared mlp l0 weight V"), "column",
+                                                          args.target_tensor_parallel_size)
+                    shared_mlp_l0_weight = torch.cat((shared_mlp_l0_weight_W, shared_mlp_l0_weight_V), dim=-2)
+                else:
+                    shared_mlp_l0_weight = chunk_weight(msg.pop("shared mlp l0 weight"), "column",
+                                                        args.target_tensor_parallel_size)
+                shared_mlp_l1_weight = chunk_weight(msg.pop("shared mlp l1 weight"), "row",
+                                                    args.target_tensor_parallel_size)
+                if hasattr(md, "moe_shared_experts_gate") and md.moe_shared_experts_gate:
+                    shared_experts_gate = msg.pop("shared mlp gate weight")
 
             if margs.num_experts:
                 router = msg.pop("router weight")
@@ -400,11 +435,15 @@ def save_checkpoint(queue, args):
                         "self_attn_proj_weight" : dense_weight[tp_rank],
                         "mlp_norm_weight" : post_norm_weight
                     }
-                    if margs.num_experts:
+                    if margs.moe_shared_expert_intermediate_size:
                         params_dict.update({
-                            "mlp_fc1_weight" : mlp_l0_weight[ep_rank][tp_rank],
-                            "mlp_fc2_weight" : mlp_l1_weight[ep_rank][tp_rank]
+                            "shared_mlp_fc1_weight" : shared_mlp_l0_weight[tp_rank],
+                            "shared_mlp_fc2_weight" : shared_mlp_l1_weight[tp_rank]
                         })
+                    if margs.num_experts:
+                        num_local_experts = margs.num_experts // args.target_expert_parallel_size
+                        params_dict.update(**{f"mlp_fc1_weight.{expert_idx}" : mlp_l0_weight[ep_rank][tp_rank][expert_idx] for expert_idx in range(num_local_experts) },
+                                           **{f"mlp_fc2_weight.{expert_idx}" : mlp_l1_weight[ep_rank][tp_rank][expert_idx] for expert_idx in range(num_local_experts) })
                     else:
                         params_dict.update({
                             "mlp_fc1_weight" : mlp_l0_weight[tp_rank],
@@ -436,6 +475,10 @@ def save_checkpoint(queue, args):
                         params_dict.update({
                             "router_weight":  router
                         })
+                        if hasattr(md, "moe_shared_experts_gate") and md.moe_shared_experts_gate:
+                            params_dict.update({
+                                "shared_mlp_gate_weight": shared_experts_gate
+                            })
                     model = get_local_model(pp_rank, ep_rank, tp_rank)
                     schema.set_layer(model, layer_id, params_dict)
 
