@@ -312,9 +312,10 @@ class DistributedDataParallel(_BaseDataParallel):
                 self._make_forward_pre_hook()
             )
 
-    def disable_forward_pre_hook(self):
+    def disable_forward_pre_hook(self, param_sync: bool = True):
         """
         Disable forward pre-hooks needed for param all-gather overlap with forward compute.
+        Skip synchronous param all-gather if `param_sync` is False.
         """
         assert self.use_forward_hook
         # De-register forward pre-hook for all sub-modules.
@@ -325,7 +326,8 @@ class DistributedDataParallel(_BaseDataParallel):
         assert len(self.remove_forward_pre_hook_handles) == 0
 
         # Force synchronize parameters.
-        self.start_param_sync(force_sync=True)
+        if param_sync:
+            self.start_param_sync(force_sync=True)
 
     def _make_forward_pre_hook(self):
         """

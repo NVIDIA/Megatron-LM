@@ -8,7 +8,10 @@ import torch
 from megatron.core import InferenceParams
 from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core import parallel_state as ps
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_local_spec
+)
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -48,7 +51,7 @@ class TestLLaVAModel:
             use_cpu_initialization=False,
         )
 
-        language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        language_layer_spec = get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
         vision_layer_spec = deepcopy(language_layer_spec)
         vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
 
@@ -438,7 +441,7 @@ class TestLLaVAModelSigLIP:
             use_cpu_initialization=False,
         )
 
-        language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        language_layer_spec = get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
         vision_layer_spec = deepcopy(language_layer_spec)
         vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
 
@@ -526,7 +529,7 @@ class TestLLaVAModelTokenParallel:
             context_parallel_size=1,
         )
 
-        language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        language_layer_spec = get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
         # SP/CP either requires user to ensure token lengths do not require padding OR change mask type to padding
         if (
             language_layer_spec.submodules.self_attention.params.get('attn_mask_type', '')
@@ -724,7 +727,7 @@ def test_llava_model_parallelism(dtp, dpp, etp, epp):
     vision_projection_config.tensor_model_parallel_size = etp
     vision_projection_config.pipeline_model_parallel_size = 1
 
-    language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+    language_layer_spec = get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
     vision_layer_spec = get_vit_layer_with_transformer_engine_spec()
     vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
 
@@ -796,7 +799,7 @@ def test_llava_model_parallelism(dtp, dpp, etp, epp):
     vision_projection_config.tensor_model_parallel_size = etp
     vision_projection_config.pipeline_model_parallel_size = 1
 
-    language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+    language_layer_spec = get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
     vision_layer_spec = get_vit_layer_with_transformer_engine_spec()
     vision_projection_spec = deepcopy(vision_layer_spec.submodules.mlp.submodules)
 

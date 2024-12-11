@@ -5,7 +5,10 @@ import pytest
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_local_spec
+)
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -14,6 +17,12 @@ from megatron.core.tensor_parallel.random import model_parallel_device_manual_se
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 def initialize_mlp(glu=True):
     model_parallel_device_manual_seed(123)
@@ -25,8 +34,9 @@ def initialize_mlp(glu=True):
         use_cpu_initialization=True,
         gated_linear_unit=glu,
     )
+    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
     return MLP(
-        transformer_config, get_gpt_layer_with_transformer_engine_spec().submodules.mlp.submodules
+        transformer_config, transformer_layer_spec.submodules.mlp.submodules
     )
 
 

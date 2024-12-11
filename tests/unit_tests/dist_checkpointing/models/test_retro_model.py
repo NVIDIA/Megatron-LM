@@ -14,6 +14,12 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 def initialize_retro_model(seed, decoder_spec_fn, spec_type, num_layers=9, **config_kwargs):
     torch.manual_seed(seed)
@@ -75,6 +81,10 @@ class TestRetroModel:
         os.environ["NVTE_FLASH_ATTN"] = "0"
         os.environ["NVTE_FUSED_ATTN"] = "0"
         
+        if not HAVE_TE:
+            src_spec_type = 'local'
+            dst_spec_type = 'local'
+            
         decoder_spec_fn = get_retro_decoder_block_spec
 
         Utils.initialize_model_parallel(1, 1)
