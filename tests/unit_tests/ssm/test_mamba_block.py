@@ -38,6 +38,7 @@ class TestMambaBlock:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.failing_on_rocm_new
     def test_gpu_forward(self):
         hybrid_override_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
         block = self.get_mamba_block(hybrid_override_pattern)

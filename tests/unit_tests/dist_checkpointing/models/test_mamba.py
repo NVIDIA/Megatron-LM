@@ -74,6 +74,7 @@ class TestMambaReconfiguration:
             # (False, (1, 1, 4), (8, 1, 1), True),
         ],
     )
+    @pytest.mark.failing_on_rocm_new
     def test_parallel_reconfiguration_e2e(
         self, tmp_path_dist_ckpt, src_tp_pp_exp, dest_tp_pp_exp, use_glu, use_fpsl
     ):

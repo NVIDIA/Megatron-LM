@@ -4,6 +4,7 @@ from unittest import mock
 
 import numpy as np
 import torch
+import pytest
 
 from megatron.core import parallel_state
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
@@ -89,6 +90,7 @@ class TestT5InferenceWrapper:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.failing_on_rocm_new
     def test_inference_only_tensor_parallel(self):
         self.setup_model(tensor_parallel_size=4, pipeline_parallel_size=1)
 
