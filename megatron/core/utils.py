@@ -1413,3 +1413,41 @@ except (ImportError, ModuleNotFoundError):
 def is_float8tensor(tensor: torch.Tensor) -> bool:
     """Check if a tensor is a Transformer Engine Float8Tensor"""
     return HAVE_TE_FLOAT8TENSOR and isinstance(tensor, Float8Tensor)
+
+
+########################
+### context parallel ###
+########################
+
+
+def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
+    """Slice batch input along sequence dimension into multiple chunks,
+    which are parallelized across GPUs in a context parallel group.
+    """
+
+    # With causal masking, each token only attends to its prior tokens. Simply split
+    # sequence into CP chunks can result in severe load imbalance. That's to say, chunks
+    # at the end of sequence have bigger workload than others. To address this issue,
+    # we split sequence into 2*CP ranks. Assuming CP=2, we then get 4 chunks, chunk_0
+    # and chunk_3 are assigned to GPU0, chunk_1 and chunk_2 are assigned to GPU1, so
+    # that we can get balanced workload among GPUs in a context parallel group.
+    cp_size = parallel_state.get_context_parallel_world_size()
+    if cp_size > 1:
+        cp_rank = parallel_state.get_context_parallel_rank()
+        for key, val in batch.items():
+            if val is not None:
+                seq_dim = 1 if key != 'attention_mask' else 2
+                val = val.view(
+                    *val.shape[0:seq_dim],
+                    2 * cp_size,
+                    val.shape[seq_dim] // (2 * cp_size),
+                    *val.shape[(seq_dim + 1) :],
+                )
+                index = torch.tensor(
+                    [cp_rank, (2 * cp_size - cp_rank - 1)], device="cpu", pin_memory=True
+                ).cuda(non_blocking=True)
+                val = val.index_select(seq_dim, index)
+                val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
+                batch[key] = val
+
+    return batch
