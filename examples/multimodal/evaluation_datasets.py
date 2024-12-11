@@ -188,7 +188,7 @@ class MMMUDataset(torch.utils.data.Dataset):
         use_tiling,
         max_num_tiles,
         use_thumbnail,
-        single_image,
+        prompt_style,
         vision_model_type,
     ):
         import datasets
@@ -246,7 +246,7 @@ class MMMUDataset(torch.utils.data.Dataset):
         self._use_tiling = use_tiling
         self._max_num_tiles = max_num_tiles
         self._use_thumbnail = use_thumbnail
-        self._single_image = single_image
+        self._prompt_style = prompt_style
         self._vision_model_type = vision_model_type
 
     def __len__(self):
@@ -258,7 +258,7 @@ class MMMUDataset(torch.utils.data.Dataset):
         sample = self._dataset[idx]
 
         # Use the single image approach from the MMMU repo.
-        if self._single_image:
+        if self._prompt_style == "single_image":
             sample = process_single_sample(sample)
             sample = construct_prompt(sample, self._config)
 
@@ -274,7 +274,69 @@ class MMMUDataset(torch.utils.data.Dataset):
                 vision_model_type=self._vision_model_type,
             )
             sample_num_tiles = [len(sample_imgs)]
-        else:
+
+            prompt = sample["final_input_prompt"]
+            for i in range(8):
+                prompt = prompt.replace(f"<image {i}>", "")
+            sample["final_input_prompt"] = f"<image>\n{prompt}"
+        elif self._prompt_style == "vlmevalkit":
+            sample = construct_prompt(sample, self._config)
+
+            if sample["question_type"] == "multiple-choice":
+                question = sample["question"]
+
+                options = ""
+                for k, v in sample["index2ans"].items():
+                    options += f"{k}. {v}\n"
+
+                final_prompt = f"{question}\n"
+                if "hint" in sample:
+                    final_prompt += f"Hint: {sample['hint']}\n"
+
+                if "task_instructions" in sample:
+                    final_prompt += f"Task instructions: {sample['task_instructions']}\n"
+
+                final_prompt += options
+                final_prompt += "Answer with the option's letter from the given choices directly."
+
+                sample["final_input_prompt"] = final_prompt.rstrip()
+            else:
+                question = sample["question"]
+                final_prompt = f"{question}\n"
+                final_prompt += "Answer the question directly."
+                sample["final_input_prompt"] = final_prompt.rstrip()
+
+            sample_imgs = []
+            sample_num_tiles = []
+
+            img_indices = sorted(list(set(re.findall(r"<image (\d+)", sample["final_input_prompt"]))))
+            # If there are multiple input images, we need to avoid the number of image embeddings getting too large.
+            adjusted_max_num_tiles = max(1, self._max_num_tiles // len(img_indices))
+            adjusted_max_num_tiles = min(adjusted_max_num_tiles, self._max_num_tiles)
+
+            for img_idx in img_indices:
+                img_key = f"image_{img_idx}"
+                img_str = f"<image {img_idx}>"
+
+                img = sample[img_key]
+                assert img is not None, f"{img_str} is in prompt but not in sample images"
+
+                imgs = get_visual_transform(
+                    img,
+                    self._img_h,
+                    self._img_w,
+                    self._use_tiling,
+                    adjusted_max_num_tiles,
+                    self._use_thumbnail,
+                    augment=False,
+                    vision_model_type=self._vision_model_type,
+                )  # List of tiles.
+
+                sample_imgs.extend(imgs)
+                sample_num_tiles.append(len(imgs))
+
+            sample["final_input_prompt"] = " ".join([f'<image {i + 1}><image>' for i in range(len(img_indices))]) + "\n" + sample["final_input_prompt"]
+        elif self._prompt_style == "multi_image":
             sample = construct_prompt(sample, self._config)
 
             sample_imgs = []
@@ -315,6 +377,8 @@ class MMMUDataset(torch.utils.data.Dataset):
                 assert (
                     f"<image {i}>" not in sample["final_input_prompt"]
                 ), "prompt contains unhandled image tags"
+        else:
+            raise ValueError(f"unknown prompt style {self._prompt_style}")
 
         # MMMU specific metadata.
         metadata = {"question_type": sample["question_type"]}
@@ -323,10 +387,6 @@ class MMMUDataset(torch.utils.data.Dataset):
             metadata["all_choices"] = sample["all_choices"]
 
         prompt = sample['final_input_prompt']
-        if self._single_image:
-            for i in range(8):
-                prompt = prompt.replace(f"<image {i}>", "")
-            prompt = f"<image>\n{prompt}"
 
         tile_count = torch.tensor(sample_num_tiles, dtype=torch.int)
 
@@ -780,8 +840,10 @@ def get_evaluation_dataset(
             vision_model_type,
         )
     elif task == 'MMMU':
-        # Note: single_image=True uses only one image like in the MMMU repo example.
-        # single_image=False uses all images in the sample.
+        # Note:
+        # - prompt_style="single_image" uses only one image like in the MMMU repo example.
+        # - prompt_style="multi_image" uses multiple input images.
+        # - prompt_style="vlmevalkit" is similar to https://github.com/open-compass/VLMEvalKit/blob/5d3cebcf18ef4bfbadc3bd3ef80bdc7aad2c6557/vlmeval/vlm/internvl_chat.py#L499
         dataset = MMMUDataset(
             input_image_path,
             num_samples_per_partition,
@@ -792,7 +854,7 @@ def get_evaluation_dataset(
             use_tiling,
             max_num_tiles,
             use_thumbnail,
-            single_image=True,
+            prompt_style="single_image",
             vision_model_type=vision_model_type,
         )
     elif task == "VideoMME":

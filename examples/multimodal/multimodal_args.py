@@ -49,7 +49,7 @@ def add_multimodal_extra_args(parser):
     group.add_argument(
         "--tokenizer-prompt-format",
         type=str,
-        choices=["mistral", "llama3", "chatml", "nvlm-yi-34b", "qwen2p0"],
+        choices=["mistral", "llama3", "chatml", "nvlm-yi-34b", "qwen2p0", "qwen2p5"],
         required=True,
         help="Prompt format to use with the tokenizer.",
     )
@@ -71,5 +71,9 @@ def add_multimodal_extra_args(parser):
     group.add_argument(
         "--packing-seq-length", type=int, default=0, help="Packing sequence length. Must be > 0 if using packing."
     )
+    group.add_argument(
+        "--recompute-vision", action="store_true", default=False, help="Enable activation checkpointing in the vision model"
+    )
+
 
     return parser

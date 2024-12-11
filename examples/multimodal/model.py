@@ -136,6 +136,20 @@ def model_provider(
     else:
         vision_projection_layer_spec = get_mlp_module_spec(use_te=use_te).submodules
 
+    # Toggle --recompute* for the vision and language model separately.
+    if args.recompute_vision:
+        if vision_config.recompute_method is not None and vision_config.recompute_granularity is not None:
+            vision_config.recompute_num_layers = vision_config.num_layers
+    else:
+        vision_config.recompute_granularity = None
+        vision_config.recompute_method = None
+        vision_config.recompute_num_layers = None
+
+    vision_projection_config.recompute_granularity = None
+    vision_projection_config.recompute_method = None
+    vision_projection_config.recompute_num_layers = None
+
+
     tokenizer = get_tokenizer()
     image_token_index = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
 
