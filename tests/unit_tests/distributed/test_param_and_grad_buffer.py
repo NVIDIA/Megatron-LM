@@ -6,8 +6,9 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.distributed.param_and_grad_buffer import partition_buckets
+from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import TestModel, Utils
 
 
@@ -25,6 +26,7 @@ def get_model_and_buffers(
         grad_reduce_in_fp32=True,
         use_distributed_optimizer=use_distributed_optimizer,
         overlap_grad_reduce=overlap_grad_reduce,
+        bucket_size=bucket_size,
     )
     model = TestModel(
         input_dim=input_dim,
@@ -32,24 +34,16 @@ def get_model_and_buffers(
         num_layers=num_layers,
         bias=bias,
         shared_embedding=shared_embedding,
-    )
-    params = list(model.parameters())
-    param_to_name = {}
-    for name, param in model.named_parameters():
-        param_to_name[param] = name
-    param_indices = list(range(len(params)))
+    ).bfloat16()
 
-    param_and_grad_buffer = _ParamAndGradBuffer(
-        ddp_config,
-        param_dtype=torch.bfloat16,
-        grad_dtype=torch.float32,
-        params=params,
-        data_parallel_group=parallel_state.get_data_parallel_group(),
-        bucket_size=bucket_size,
-        param_to_name=param_to_name,
-        gradient_scaling_factor=1.0,
-        param_indices=param_indices,
+    # Wrap with DistributedDataParallel, and get underlying buffer.
+    # Use dummy TransformerConfig with mostly default values. Avoid divide-by-zero
+    # errors for num_attention_heads and num_layers.
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config=ddp_config, module=model
     )
+    assert len(model.buffers) == 1
+    param_and_grad_buffer = model.buffers[0]
 
     return model, param_and_grad_buffer
 
@@ -58,7 +52,6 @@ def get_model_and_buffers(
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("shared_embedding", [False, True])
-@pytest.mark.flaky
 def test_bucket_sizes(
     bucket_size: Optional[int], use_distributed_optimizer: bool, bias: bool, shared_embedding: bool
 ):
@@ -79,7 +72,7 @@ def test_bucket_sizes(
         shared_embedding=shared_embedding,
         bucket_size=bucket_size,
         use_distributed_optimizer=use_distributed_optimizer,
-        overlap_grad_reduce=False,
+        overlap_grad_reduce=True,
     )
 
     actual_numel_in_each_bucket = [
@@ -163,6 +156,7 @@ def test_bucket_sizes(
 
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("overlap_grad_reduce", [False, True])
+@pytest.mark.flaky
 def test_grad_sync(use_distributed_optimizer: bool, overlap_grad_reduce: bool):
     Utils.initialize_model_parallel()
 
@@ -190,6 +184,8 @@ def test_grad_sync(use_distributed_optimizer: bool, overlap_grad_reduce: bool):
     expected_grad_data_value_after_collective = 1
     if torch.distributed.get_rank() == 0 or not use_distributed_optimizer:
         expected_grad_data_value_after_collective = parallel_state.get_data_parallel_world_size()
+    # Default scaling behavior in DDP involves dividing by the data-parallel size.
+    expected_grad_data_value_after_collective /= parallel_state.get_data_parallel_world_size()
 
     params = list(model.parameters())
     for i, param in enumerate(params):
@@ -214,7 +210,7 @@ def test_grad_sync(use_distributed_optimizer: bool, overlap_grad_reduce: bool):
         expected_grad_data_value = expected_grad_data_value_after_collective
         if overlap_grad_reduce and i < (len(params) - 1):
             expected_grad_data_value = 1
-        assert int(param_and_grad_buffer.grad_data[0]) == expected_grad_data_value
+        assert param_and_grad_buffer.grad_data[0] == expected_grad_data_value
 
         if not overlap_grad_reduce:
             # Reset grad_data for subsequent collectives.

@@ -91,8 +91,9 @@ do
         --max-position-embeddings 4096 \
         --no-masked-softmax-fusion \
         --load ${MODEL_PATH} \
-        --tokenizer-type HuggingFaceTokenizer \
+        --tokenizer-type MultimodalTokenizer \
         --tokenizer-model ${TOKENIZER_PATH} \
+        --tokenizer-prompt-format mistral \
         --bf16 \
         --micro-batch-size 1 \
         --seq-length 2048 \
@@ -112,6 +113,6 @@ do
         --gt-path ${GROUNDTRUTH_PATH} \
         --task ${TASK} \
         --disable-vision-class-token \
-        --prompt-format mistral \
-        --num-frames ${NUM_FRAMES}
+        --num-frames ${NUM_FRAMES} \
+        --ckpt-format torch
 done

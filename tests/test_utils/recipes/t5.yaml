@@ -1,0 +1,61 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: "{test_case}"
+  model: t5
+  build: mcore-pyt-{environment}
+  nodes: 1
+  gpus: 8
+  platforms: dgx_a100
+  artifacts:
+    /workspace/data/t5_data: text/the_pile/t5_shard00
+  script: |-
+    ls
+    cd /opt/megatron-lm
+
+    ARGUMENTS=(
+        "DATA_PATH=/workspace/data/t5_data"
+        "DATA_CACHE_PATH=/workspace/data/cache"
+        "OUTPUT_PATH={assets_dir}"
+        "TENSORBOARD_PATH={assets_dir}/tensorboard"
+        "CHECKPOINT_PATH=/workspace/checkpoints"
+        "TRAINING_SCRIPT_PATH=pretrain_t5.py"
+        "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}.json"
+        "N_REPEAT={n_repeat}"
+    )
+
+    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
+
+products:
+  - environment: [lts, dev]
+    scope: [mr]
+    time_limit: [1800]
+    n_repeat: [5]
+    test_case:
+    - t5_220m_mr_mcore_te_tp4_pp1_dgx_a100_1N8G
+    - t5_220m_mr_mcore_te_tp4_pp1_resume_torch_dist_dgx_a100_1N8G
+    - t5_220m_mr_mcore_te_tp2_pp2_resume_torch_dgx_a100_1N8G
+    - t5_220m_mr_mcore_tp4_pp1_resume_torch_dist_dgx_a100_1N8G
+    - t5_220m_mr_mcore_tp2_pp2_resume_torch_dgx_a100_1N8G
+    - t5_220m_mr_mcore_tp4_pp1_dgx_a100_1N8G
+    - t5_220m_mr_mcore_te_tp2_pp2_dgx_a100_1N8G
+  - environment: [lts]
+    scope: [mr]
+    time_limit: [1800]
+    n_repeat: [5]
+    test_case:
+    - t5_220m_mr_mcore_tp2_pp2_dgx_a100_1N8G
+  - environment: [lts, dev]
+    scope: [nightly]
+    time_limit: [9000]
+    n_repeat: [1]
+    test_case:
+    - t5_220m_nightly_dgx_a100_1N8G_mcore_te_tp1_pp1_vp1_resume_torch
+    - t5_220m_nightly_dgx_a100_1N8G_mcore_te_tp2_pp1_vp1
+    - t5_220m_nightly_dgx_a100_1N8G_mcore_te_tp2_pp1_vp1_sequence_parallel
+    - t5_220m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_vp1
+    - t5_220m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_vp1_resume_torch
+    - t5_220m_nightly_dgx_a100_1N8G_mcore_tp2_pp1_vp1

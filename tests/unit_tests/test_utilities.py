@@ -27,13 +27,18 @@ class TestModel(torch.nn.Module):
 
 class Utils:
 
-    world_size = torch.cuda.device_count()
+    world_size = int(os.environ['WORLD_SIZE'])
     rank = int(os.environ['LOCAL_RANK'])
     inited = False
     store = None
 
     @staticmethod
     def initialize_distributed():
+
+        os.environ.pop('NVTE_FLASH_ATTN', None)
+        os.environ.pop('NVTE_FUSED_ATTN', None)
+        os.environ.pop('NVTE_UNFUSED_ATTN', None)
+
         if not torch.distributed.is_initialized() and Utils.rank >= 0:
             print(
                 f'Initializing torch.distributed with rank: {Utils.rank}, '
@@ -80,6 +85,9 @@ class Utils:
 
     @staticmethod
     def destroy_model_parallel():
+        os.environ.pop('NVTE_FLASH_ATTN', None)
+        os.environ.pop('NVTE_FUSED_ATTN', None)
+        os.environ.pop('NVTE_UNFUSED_ATTN', None)
         if not Utils.inited:
             return
         torch.distributed.barrier()
@@ -93,6 +101,12 @@ class Utils:
         virtual_pipeline_model_parallel_size=None,
         **kwargs,
     ):
+        # Need to unset these variables to make sure previous
+        # tests setting them doesn't interfere current test.
+        os.environ.pop('NVTE_FLASH_ATTN', None)
+        os.environ.pop('NVTE_FUSED_ATTN', None)
+        os.environ.pop('NVTE_UNFUSED_ATTN', None)
+
         ps.destroy_model_parallel()
         Utils.initialize_distributed()
         ps.initialize_model_parallel(
@@ -102,3 +116,22 @@ class Utils:
             **kwargs,
         )
         Utils.inited = True
+
+    @staticmethod
+    def fake_initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        virtual_pipeline_model_parallel_size=None,
+        expert_model_parallel_size=1,
+    ):
+        """Used for layer-wise UT as a proxy for NeMo-style intialization."""
+        ps.set_tensor_model_parallel_world_size(tensor_model_parallel_size)
+        ps.set_tensor_model_parallel_rank(0)
+
+        ps.set_expert_model_parallel_world_size(expert_model_parallel_size)
+        ps.set_expert_model_parallel_rank(0)
+        if virtual_pipeline_model_parallel_size is not None:
+            ps.set_virtual_pipeline_model_parallel_world_size(virtual_pipeline_model_parallel_size)
+        ps.set_virtual_pipeline_model_parallel_rank(0)
+
+        ps.set_pipeline_model_parallel_world_size(pipeline_model_parallel_size)

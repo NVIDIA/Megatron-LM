@@ -1,4 +1,4 @@
-.jet_common:
+.functional_tests_rules:
   stage: functional_tests
   rules:
     - if: $FUNCTIONAL_TEST == "yes" && ($CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true")
@@ -16,27 +16,28 @@ include:
     ref: main
     file: downstreams.yml
 
-jet-build:
-  extends: [build_image, .jet_common]
-  variables:
-    STAGE: jet
-
-jet-generate:
-  needs: [jet-build]
-  extends: [.jet_common]
-  image: ${CI_MCORE_IMAGE}:${CI_PIPELINE_ID}
+functional:configure:
+  needs:
+    - test:build_image
+    - job: test:unit_tests_pyt(DEV)_mcore(latest)
+      optional: true
+    - job: test:unit_tests_pyt(LTS)_mcore(latest)
+      optional: true
+  extends: [.functional_tests_rules]
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   tags: [mcore-docker-node-small]
   before_script:
-    - git rm -r tests/functional_tests/local_recipes || true
-    - git submodule add --force https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/ADLR/megatron-lm-convergence-tests.git tests/functional_tests/local_recipes
-    - ls tests/functional_tests/local_recipes
-  script: 
+    - git rm -r tests/test_utils/local_recipes || true
+    - git submodule add --force https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/ADLR/megatron-lm-convergence-tests.git tests/test_utils/local_recipes
+    - ls tests/test_utils/local_recipes
+  script:
     - set -x
     - |
       A100_CLUSTER=$([[ "$FUNCTIONAL_TEST_CLUSTER_A100" != "" ]] && echo $FUNCTIONAL_TEST_CLUSTER_A100 || echo $DEFAULT_A100_CLUSTER)
       H100_CLUSTER=$([[ "$FUNCTIONAL_TEST_CLUSTER_H100" != "" ]] && echo $FUNCTIONAL_TEST_CLUSTER_H100 || echo $DEFAULT_H100_CLUSTER)
     - |
       if [[ "$FUNCTIONAL_TEST_SCOPE" == "release" || "$FUNCTIONAL_TEST_SCOPE" == "pre-release" ]]; then
+        FUNCTIONAL_TEST_NAME=$(eval echo $FUNCTIONAL_TEST_NAME)
         RELEASE_ARGS=(
           "--run-name"
           $FUNCTIONAL_TEST_NAME
@@ -46,57 +47,92 @@ jet-generate:
       else
         RELEASE_ARGS=()
       fi
-
     - |
       export PYTHONPATH=$(pwd)
-      python tests/functional_tests/python_test_utils/jet/generate_jet_trigger_job.py \
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
         --scope $FUNCTIONAL_TEST_SCOPE \
+        --environment dev \
+        --n-repeat "$FUNCTIONAL_TEST_REPEAT" \
+        --time-limit "$FUNCTIONAL_TEST_TIME_LIMIT" \
+        --test-cases $FUNCTIONAL_TEST_CASES \
         --a100-cluster $A100_CLUSTER \
         --h100-cluster $H100_CLUSTER \
+        --container-image ${UTILITY_IMAGE} \
         --container-tag ${CI_PIPELINE_ID} \
-        --container-image ${CI_MCORE_IMAGE} \
-        --container-image-dev ${CI_MCORE_DEV_IMAGE} \
-        --output-path "jet-trigger-job.yaml" \
+        --dependent-job "functional:configure" \
+        --output-path "functional-test-job-dev.yaml" \
+        ${RELEASE_ARGS[@]}
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        --scope $FUNCTIONAL_TEST_SCOPE \
+        --environment lts \
+        --n-repeat "$FUNCTIONAL_TEST_REPEAT" \
+        --time-limit "$FUNCTIONAL_TEST_TIME_LIMIT" \
+        --test-cases $FUNCTIONAL_TEST_CASES \
+        --a100-cluster $A100_CLUSTER \
+        --h100-cluster $H100_CLUSTER \
+        --container-image ${UTILITY_IMAGE} \
+        --container-tag ${CI_PIPELINE_ID} \
+        --dependent-job "functional:configure" \
+        --output-path "functional-test-job-lts.yaml" \
         ${RELEASE_ARGS[@]}
   artifacts:
     paths:
-      - jet-trigger-job.yaml
-      - tests/functional_tests/local_recipes
+      - functional-test-job-lts.yaml
+      - functional-test-job-dev.yaml
+      - tests/test_utils/local_recipes
 
-jet-trigger:
+.run:
   stage: functional_tests
-  needs: [jet-generate]
-  extends: [.jet_common]
+  needs: [functional:configure]
+  extends: [.functional_tests_rules]
   trigger:
     include:
-      - artifact: jet-trigger-job.yaml
-        job: jet-generate
+      - artifact: functional-test-job-$ENVIRONMENT.yaml
+        job: functional:configure
     strategy: depend
   variables:
     RO_API_TOKEN: $PAT
     CONTAINER_TAG: $CI_PIPELINE_ID
-    CI_MCORE_IMAGE: $CI_MCORE_IMAGE
+    CI_MCORE_LTS_IMAGE: $CI_MCORE_LTS_IMAGE
     GITLAB_ENDPOINT: $GITLAB_ENDPOINT
     PARENT_PIPELINE_ID: $CI_PIPELINE_ID
   inherit:
     variables: true
-      
-jet-results-notify:
-  extends: [.jet_common]
-  image: ${GITLAB_ENDPOINT}:5005/dl/jet/api:latest
-  needs: [jet-trigger]
+
+functional:run_lts:
+  extends: [.run]
+  variables:
+    ENVIRONMENT: lts
+
+functional:run_dev:
+  extends: [.run]
+  variables:
+    ENVIRONMENT: dev
+
+functional:notify:
+  extends: [.functional_tests_rules]
+  image: badouralix/curl-jq
+  needs:
+    - functional:run_lts
+    - functional:run_dev
   tags:
     - mcore-docker-node-small
-  before_script:
-    - jet secrets jwt-login jwt/nvidia/gitlab-master adlr-megatron-lm-ci $VAULT_JWT_TOKEN
+  variables:
+    WEBHOOK_URL: ${MCORE_NOTIFICATION_HOOK}
+    RO_API_TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}
+    CONTEXT: $FUNCTIONAL_TEST_SCOPE
   script:
+    - apk add bash
+    - apk add --update coreutils
     - env
     - export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
     - export CONTEXT=$FUNCTIONAL_TEST_SCOPE
     - export DATE=$(date +"%Y-%m-%d")
-    - bash tests/functional_tests/shell_test_utils/notify.sh ${CI_PIPELINE_ID}
+    - bash tests/test_utils/shell_scripts/notify.sh ${CI_PIPELINE_ID} "functional:run_"
   artifacts:
     when: always
     paths:
@@ -105,4 +141,3 @@ jet-results-notify:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $FUNCTIONAL_TEST == "yes"
       when: always
     - when: never
-

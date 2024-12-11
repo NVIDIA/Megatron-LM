@@ -178,7 +178,6 @@ class TestDistributedOptimizer:
             # ((2, 1), 2, 2),
         ],
     )
-    @pytest.mark.flaky
     def test_dp_sharding(self, tmp_path_dist_ckpt, tp_pp, src_dp, dest_dp, use_fpsl, initialize_fn):
         src_world_size = tp_pp[0] * tp_pp[1] * src_dp
         dest_world_size = tp_pp[0] * tp_pp[1] * dest_dp
@@ -256,7 +255,6 @@ class TestDistributedOptimizer:
         ('src_tp_pp', 'dest_tp_pp', 'use_glu'),
         [((2, 2), (2, 4), False), ((1, 8), (4, 1), True), ((2, 4), (4, 2), False)],
     )
-    @pytest.mark.flaky
     def test_finetune_doesnt_load_optimizer(
         self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_glu
     ):
@@ -281,6 +279,8 @@ class TestDistributedOptimizer:
                 Utils.destroy_model_parallel()
 
                 Utils.initialize_model_parallel(*dest_tp_pp)
+                mock_args.tensor_model_parallel_size = dest_tp_pp[0]
+                mock_args.pipeline_model_parallel_size = dest_tp_pp[1]
                 model, optimizer = setup_model_and_optimizer(
                     seed=3,
                     tp=dest_tp_pp[0],
@@ -293,7 +293,10 @@ class TestDistributedOptimizer:
                 # Load with different TPxPP should raise DistributeOptimizer error
                 with pytest.raises(RuntimeError) as exc_info:
                     load_checkpoint_no_arg_checks(model, optimizer, None)
-                assert "(TP, PP) mismatch" in str(exc_info.value)
+                # "(TP, PP) mismatch" check is for backwards compatibility tests
+                assert "(TP, PP) mismatch" in str(
+                    exc_info.value
+                ) or "(TP, PP, encoder TP, encoder PP) mismatch" in str(exc_info.value)
 
                 # Check that the state didn't change
                 assert not any(diff(model[0].state_dict(), model_unloaded_state_dict))
@@ -329,7 +332,6 @@ class TestDistributedOptimizer:
                 assert not diffs[0] and not diffs[1] and diffs[2]
                 assert not any(diff(optimizer.state_dict(), optim_unloaded_state_dict))
 
-    @pytest.mark.flaky
     def test_can_load_deprecated_bucket_space_format(self, tmp_path_dist_ckpt):
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
         tp = 4
@@ -398,9 +400,18 @@ class TestFP32Optimizer:
     @pytest.mark.parametrize(
         ('src_tp_pp', 'dest_tp_pp'), [((2, 4), (2, 4)), ((2, 4), (4, 2)), ((8, 1), (1, 2))]
     )
-    @pytest.mark.flaky
     def test_fp32_optimizer_resharding(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp):
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
+
+        def preprocess_fn(optim_common_dict):
+            import copy
+
+            preprocessed_optimzier_common_dict = copy.deepcopy(optim_common_dict)
+            list = preprocessed_optimzier_common_dict['optimizer']['param_groups']
+            for dict_item in list:
+                del dict_item['wd_mult']
+            return preprocessed_optimzier_common_dict
+
         Utils.initialize_model_parallel(*src_tp_pp)
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=True
@@ -417,7 +428,11 @@ class TestFP32Optimizer:
                     bf16=False,
                 )
 
-                save(optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()), ckpt_dir_A)
+                save(
+                    optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()),
+                    ckpt_dir_A,
+                    preprocess_common_before_consistancy_check=preprocess_fn,
+                )
                 Utils.destroy_model_parallel()
 
                 # Load checkpoint A with different TP/PP and save as checkpoint B
@@ -465,7 +480,6 @@ class TestOptimizerResharding:
         ('src_tp_pp', 'dest_tp_pp'),
         [((2, 4), (2, 4)), ((2, 4), (2, 2)), ((2, 4), (4, 2)), ((8, 1), (1, 2))],
     )
-    @pytest.mark.flaky
     def test_optimizer_resharding(
         self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_dist_opt, bf16
     ):

@@ -7,9 +7,12 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.core.transformer.transformer_block import TransformerBlock
+    from megatron.core.inference_params import InferenceParams
+    from megatron.core.packed_seq_params import PackedSeqParams
 
 import logging
 import math
+from functools import lru_cache
 
 import torch
 from torch import Tensor, nn
@@ -109,19 +112,9 @@ class RotaryEmbedding(nn.Module):
 
         return inv_freq_llama
 
-    def forward(self, max_seq_len: int, offset: int = 0) -> Tensor:
-        """Forward pass of RoPE embedding.
-
-        Args:
-            max_seq_len (int): Maximum size of sequence
-            offset (int, optional): _description_. Defaults to 0.
-
-        Returns:
-            Tensor: Embeddings after applying RoPE.
-        """
-        if self.inv_freq.device.type == 'cpu':
-            # move `inv_freq` to GPU once at the first micro-batch forward pass
-            self.inv_freq = self.inv_freq.to(device=torch.cuda.current_device())
+    def get_freqs_non_repeated(self, max_seq_len: int, offset: int = 0) -> Tensor:
+        """Generates matrix of frequencies based on positions in the sequence,
+        used to create positional encodings"""
         seq = (
             torch.arange(max_seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
             + offset
@@ -130,7 +123,35 @@ class RotaryEmbedding(nn.Module):
         if self.seq_len_interpolation_factor is not None:
             seq *= 1 / self.seq_len_interpolation_factor
 
-        freqs = torch.outer(seq, self.inv_freq)
+        freqs = torch.outer(seq, self.inv_freq)  # [seq len, dim]
+
+        return freqs
+
+    def get_cos_sin(self, max_seq_len: int, offset: int = 0) -> (Tensor, Tensor):
+        """Cosine and sine values for RoPE are precomputed for all positions up to the maximum
+        sequence length"""
+        freqs = self.get_freqs_non_repeated(max_seq_len, offset)
+        cos = torch.cos(freqs)
+        sin = torch.sin(freqs)
+        return cos, sin
+
+    @lru_cache(maxsize=32)
+    def forward(self, max_seq_len: int, offset: int = 0, packed_seq: bool = False) -> Tensor:
+        """Forward pass of RoPE embedding.
+
+        Args:
+            max_seq_len (int): Maximum size of sequence
+            offset (int, optional): RoPE offset. Defaults to 0.
+            packed_seq (bool, optional): Whether to use packed sequence. Defaults to False.
+
+        Returns:
+            Tensor: Embeddings after applying RoPE.
+        """
+        if self.inv_freq.device.type == 'cpu':
+            # move `inv_freq` to GPU once at the first micro-batch forward pass
+            self.inv_freq = self.inv_freq.to(device=torch.cuda.current_device())
+
+        freqs = self.get_freqs_non_repeated(max_seq_len, offset)
         # first part even vector components, second part odd vector components,
         #  2 * dim in dimension size
         if not self.rotary_interleaved:
@@ -141,7 +162,7 @@ class RotaryEmbedding(nn.Module):
             )
         # emb [seq_length, .., dim]
         emb = emb[:, None, None, :]
-        if parallel_state.get_context_parallel_world_size() > 1:
+        if parallel_state.get_context_parallel_world_size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension and select the parition of the current
             # CP rank
             emb = get_pos_emb_on_this_cp_rank(emb, 0)
@@ -153,10 +174,11 @@ class RotaryEmbedding(nn.Module):
 
     def get_rotary_seq_len(
         self,
-        inference_params,
+        inference_params: InferenceParams,
         transformer: TransformerBlock,
         transformer_input: Tensor,
         transformer_config: TransformerConfig,
+        packed_seq_params: PackedSeqParams,
     ) -> float:
         """Function to get the rotary sequence length.
 
@@ -166,11 +188,16 @@ class RotaryEmbedding(nn.Module):
                 by the model
             transformer_input (Tensor): Input tensor to the transformer
             transformer_config (TransformerConfig): Transformer config used by the model
+            packed_seq_params (PackedSeqParams): Packed sequence params
 
         Returns:
             float: The rotary sequence length
         """
-        if inference_params is not None:
+        if packed_seq_params is not None:
+            # max_seqlen are the max sequence length in the packed sequence before being divived
+            # by the tp and cp size.
+            return max(packed_seq_params.max_seqlen_q, packed_seq_params.max_seqlen_kv)
+        elif inference_params is not None:
             rotary_seq_len = inference_params.max_sequence_length
         else:
             if transformer.input_tensor is not None:

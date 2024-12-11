@@ -19,9 +19,9 @@ def add_arguments(parser):
 
     # TODO(jbarker): Need assertion to make sure *exactly* one of these is used
     parser.add_argument('--model-size', type=str, required=True,
-                        choices=['llama2-7B', 'llama2-13B', 'llama2-70B', 'llama2-7Bf', 'llama2-13Bf', 'llama2-70Bf', 'llama3-8B', 'llama3-70B', 'llama3-8Bf', 'llama3-70Bf', 'mistral-7B', 'mistral-7Bf', 'yi-34B'],
-                        help='Model size can be `llama2-7B`, `llama2-13B`, `llama2-70B`, `llama3-8B`, `llama3-70B`, `mistral-7B` (for pretrained models), '
-                        'and `llama2-7Bf`, `llama2-13Bf`, `llama2-70Bf`, `llama3-8Bf`, `llama3-70bf` and `mistral-7Bf` (for chat-finetuned models).')
+                        choices=['llama2-7B', 'llama2-13B', 'llama2-70B', 'llama2-7Bf', 'llama2-13Bf', 'llama2-70Bf', 'llama3-8B', 'llama3-70B', 'llama3-8Bf', 'llama3-70Bf', 'mistral-7B', 'mistral-7Bf', 'yi-34B', 'qwen2.5-7B', 'qwen2.5-72B', 'qwen2.5-7Bf', 'qwen2.5-72Bf'],
+                        help='Model size can be `llama2-7B`, `llama2-13B`, `llama2-70B`, `llama3-8B`, `llama3-70B`, `mistral-7B`, `qwen2.5-7B`, `qwen2.5-72B` (for pretrained models), '
+                        'and `llama2-7Bf`, `llama2-13Bf`, `llama2-70Bf`, `llama3-8Bf`, `llama3-70bf`, `mistral-7Bf`, `qwen2.5-7Bf`, and `qwen2.5-72Bf` (for chat-finetuned models).')
     parser.add_argument('--checkpoint-type', type=str, required=True,
                         help='Type of checkpoint to convert, options are "meta" or "hf"')
     parser.add_argument('--bf16', action='store_true', help='Whether to load weights in bf16.')
@@ -35,6 +35,7 @@ def add_arguments(parser):
                        help='Tokenizer model file.')
     group.add_argument('--megatron-path', type=str, default=None,
                        help='Base directory of Megatron repository')
+    group.add_argument("--make-vocab-size-divisible-by", type=int, default=None, help="Make vocab size divisible by")
     group.add_argument('--loader-transformer-impl', default='local',
                        choices=['local', 'transformer_engine'],
                        help='Which Transformer implementation to use.')
@@ -59,6 +60,10 @@ NUM_SHARDS = {
     "mistral-7B": 1,
     "mistral-7Bf": 1,
     "yi-34B": 8,
+    "qwen2.5-7B": 1,
+    "qwen2.5-7Bf": 1,
+    "qwen2.5-72B": 8,
+    "qwen2.5-72Bf": 8,
 }
 
 
@@ -353,6 +358,13 @@ def set_attn_state(args, layer, hf_layer):
         hf_attn.k_proj.weight.reshape((ng, dim, -1)),
         hf_attn.v_proj.weight.reshape((ng, dim, -1)),
     ], dim=1).reshape((-1, args.hidden_size)))
+    if args.add_qkv_bias:
+        attn.query_key_value.bias.data.copy_(torch.cat([
+            hf_attn.q_proj.bias.reshape((ng, dim*nh//ng)),
+            hf_attn.k_proj.bias.reshape((ng, dim)),
+            hf_attn.v_proj.bias.reshape((ng, dim)),
+        ], dim=1).reshape(-1))
+
     attn.dense.weight.data.copy_(hf_attn.o_proj.weight)
 
 
@@ -445,19 +457,28 @@ def _load_checkpoint(queue, args):
                 '--no-save-rng',
                 '--mock-data', # To pass the "blend data checks" in arguments.py
                 '--no-initialization',
-                '--load', args.load_dir
+                '--load', args.load_dir,
+                '--no-one-logger',
                 ]
+
+    if args.make_vocab_size_divisible_by is not None:
+        sys.argv.extend(["--make-vocab-size-divisible-by", str(args.make_vocab_size_divisible_by)])
 
     margs = parse_args()
     margs.tokenizer_model = args.tokenizer_model
     load_args_from_checkpoint(margs)
 
-    if "llama2" in args.model_size or "yi" in args.model_size:
+    if "llama2" in args.model_size:
         margs.tokenizer_type = "Llama2Tokenizer"
+    elif "yi" in args.model_size:
+        margs.tokenizer_type = "HuggingFaceTokenizer"
     elif "llama3" in args.model_size:
         margs.tokenizer_type = "HuggingFaceTokenizer"
     elif "mistral" in args.model_size:
         margs.tokenizer_type = "HuggingFaceTokenizer"
+    elif "qwen2.5" in args.model_size:
+        margs.tokenizer_type = "HuggingFaceTokenizer"
+        margs.add_qkv_bias = True
 
     # Arguments do sanity checks on the world size, but we don't care,
     # so trick it into thinking we are plenty of processes.
@@ -530,11 +551,12 @@ def _load_checkpoint(queue, args):
     md.output_layer = margs.untie_embeddings_and_output_weights
     md.position_embedding_type = margs.position_embedding_type
     md.linear_bias = margs.add_bias_linear
+    md.qkv_bias = margs.add_qkv_bias
     md.norm_has_bias = False
     md.swiglu = margs.swiglu
     md.previous_tensor_parallel_size = margs.tensor_model_parallel_size
     md.previous_pipeline_parallel_size = margs.pipeline_model_parallel_size
-    md.make_vocab_size_divisible_by = None
+    md.make_vocab_size_divisible_by = margs.make_vocab_size_divisible_by
     md.checkpoint_args = margs
     md.consumed_train_samples = 0
     md.consumed_valid_samples = 0
@@ -591,8 +613,10 @@ def _load_checkpoint(queue, args):
         dense_weight.append(layer.self_attention.dense.weight.data)
         mlp_l0_weight.append(layer.mlp.dense_h_to_4h.weight.data)
         mlp_l1_weight.append(layer.mlp.dense_4h_to_h.weight.data)
-        if md.linear_bias:
+
+        if md.qkv_bias:
             qkv_bias.append(layer.self_attention.query_key_value.bias.data)
+        if md.linear_bias:
             mlp_l0_bias.append(layer.mlp.dense_h_to_4h.bias.data)
 
         # Handle gated linear units.
@@ -609,8 +633,9 @@ def _load_checkpoint(queue, args):
         message["qkv weight"] = torch.cat(qkv_weight, dim=0)
         message["dense weight"] = torch.cat(dense_weight, dim=1)
         message["mlp l1 weight"] = torch.cat(mlp_l1_weight, dim=1)
-        if md.linear_bias:
+        if md.qkv_bias:
             message["qkv bias"] = torch.cat(qkv_bias, dim=0)
+        if md.linear_bias:
             if md.swiglu:
                 for tp_rank in range(tp_size):
                     mlp_l0_bias[tp_rank] = torch.chunk(mlp_l0_bias[tp_rank], 2, dim=0)

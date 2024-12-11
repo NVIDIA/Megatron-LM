@@ -251,3 +251,45 @@ python examples/export/ptq_and_trtllm_export/trtllm_text_generation.py --tokeniz
 python examples/export/ptq_and_trtllm_export/trtllm_text_generation.py --tokenizer meta-llama/Meta-Llama-3.1-8B
 #For llama-3.1
 ```
+
+
+### Mixtral-8x7B FP8 Quantization and TensorRT-LLM Deployment
+First download the nemotron checkpoint from https://catalog.ngc.nvidia.com/orgs/nvidia/teams/nemo/models/mixtral-8x7b-v01, extract the
+sharded checkpoint from the `.nemo` tarbal.
+
+```sh
+ngc registry model download-version "nvidia/nemo/mixtral-8x7b-v01:1.0"
+cd mixtral-8x7b-v01_v1.0
+tar -xvf mixtral.nemo
+cd ..
+```
+
+Then log in to huggingface so that you can access to model
+
+> **NOTE:** You need a token generated from huggingface.co/settings/tokens and access to mistralai/Mixtral-8x7B-v0.1 on huggingface
+
+```sh
+pip install -U "huggingface_hub[cli]"
+huggingface-cli login
+```
+
+Now launch the PTQ + TensorRT-LLM checkpoint export script,
+
+```sh
+bash examples/export/ptq_and_trtllm_export/ptq_trtllm_mixtral_8x7b.sh ./mixtral-8x7b-v01_v1.0/
+```
+
+Then build TensorRT engine and run text generation example using the newly built TensorRT engine
+
+```sh
+export trtllm_options=" \
+    --checkpoint_dir /tmp/trtllm_ckpt \
+    --output_dir /tmp/trtllm_engine \
+    --max_input_len 2048 \
+    --max_seq_len 512 \
+    --max_batch_size 8 "
+
+trtllm-build ${trtllm_options}
+
+python examples/export/ptq_and_trtllm_export/trtllm_text_generation.py --tokenizer mistralai/Mixtral-8x7B-v0.1
+```

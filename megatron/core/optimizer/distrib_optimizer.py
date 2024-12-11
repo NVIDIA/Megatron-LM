@@ -4,7 +4,6 @@
 
 
 import itertools
-import warnings
 from dataclasses import replace
 from logging import getLogger
 from typing import Callable, Dict, List, Optional, Tuple
@@ -18,7 +17,7 @@ except ImportError:
     try:
         from apex.optimizers import FusedAdam as Adam
     except ImportError:
-        from torch.optim import Adam
+        from torch.optim import AdamW as Adam
 
         HAVE_APEX_OR_TE = False
 
@@ -427,6 +426,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_group: torch.distributed.ProcessGroup,
         data_parallel_group_gloo: torch.distributed.ProcessGroup,
         data_parallel_group_idx: int,
+        distributed_optimizer_instance_id: int,
     ):
         """
         Distributed optimizer, for all data types (fp16, bf16, and fp32).
@@ -446,7 +446,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 always require a grad scaler.
             init_state_fn (Callable, optional): function to initialize state in the optimizer.
             model_chunks (List[MegatronModule]): list of model chunks.
-            per_model_buffers (Dict[int, List[ParamAndGradBuffer]]): the implementation of the
+            per_model_buffers (Dict[int, List[_ParamAndGradBuffer]]): the implementation of the
                 distributed optimizer is centered on using a contiguous buffer for
                 communicating grads & params between the model state and the optimizer state.
                 You can find a more detailed description in
@@ -457,14 +457,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 (used in checkpoint loading and saving).
             data_parallel_group_idx (int): index in data-parallel group (used by
                 distributed checkpointing logic).
+            distributed_optimizer_instance_id (int): index of the Distributed Optimizer instance.
         """
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
-
-        assert (
-            HAVE_APEX_OR_TE
-        ), f'Please install Apex or Transformer Engine to use DistributedOptimizer.'
 
         super().__init__(optimizer, config, grad_scaler, init_state_fn)
         self.model_chunks = model_chunks
@@ -483,6 +480,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.data_parallel_group = data_parallel_group
         self.data_parallel_group_gloo = data_parallel_group_gloo
         self.data_parallel_group_idx = data_parallel_group_idx
+        self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
 
         self.gbuf_idx_to_model_idx_map = {}
         gbuf_idx = 0
@@ -539,28 +537,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
         self.optimizer.load_state_dict(self.optimizer.state_dict())
 
-    def enable_pre_hook(self):
-        """
-        Enable forward pre-hook needed for param all-gather overlap with forward compute.
-        """
-        warnings.warn(
-            "`DistributedOptimizer.enable_pre_hook` will be deprecated in a future release. "
-            "Use `DistributedDataParallel.enable_forward_pre_hook` directly."
-        )
-        for model_chunk in self.model_chunks:
-            model_chunk.enable_forward_pre_hook()
-
-    def disable_pre_hook(self):
-        """
-        Disable forward pre-hook needed for param all-gather overlap with forward compute.
-        """
-        warnings.warn(
-            "`DistributedOptimizer.disable_pre_hook` will be deprecated in a future release. "
-            "Use `DistributedDataParallel.disable_forward_pre_hook` directly."
-        )
-        for model_chunk in self.model_chunks:
-            model_chunk.disable_forward_pre_hook()
-
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """
         Given a model param, get the index sub-range of the param that this
@@ -571,10 +547,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         param_range_map = gbuf_range_map["param_map"][param]
         return param_range_map
 
-    def get_model_parallel_group(self) -> torch.distributed.ProcessGroup:
+    def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
         """
-        With the distributed optimizer, the model parallel group is the
-        entire world.
+        With the distributed optimizer, gradient statistics (num_zeros & norm) are reduced over
+        all ranks (versus only the model-parallel ranks with the non-distributed optimizer).
         """
         return None
 
@@ -969,10 +945,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if is_loading:
             param_state_data = None
         else:
-            # Gather on rank 0
-            param_state_data = self.get_parameter_state_dp_zero()
+            if self.distributed_optimizer_instance_id == 0:
+                # Gather on rank 0
+                param_state_data = self.get_parameter_state_dp_zero()
 
-        if torch.distributed.get_rank(self.data_parallel_group) == 0:
+        if (
+            torch.distributed.get_rank(self.data_parallel_group) == 0
+            and self.distributed_optimizer_instance_id == 0
+        ):
             # Fixed TPxPP. Save on DP rank 0 only
             param_state = ShardedObject(
                 f'optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}.param_state',
@@ -1148,7 +1128,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         assert (
                             len(sharded_metadata.replica_id) == 3
                         ), f'Expected replica_id format (PP, TP, DP), got: {sharded_metadata}'
-                        replica_id = (*sharded_metadata.replica_id[:2], 0)
+                        replica_id = (
+                            *sharded_metadata.replica_id[:2],
+                            self.distributed_optimizer_instance_id,
+                        )
 
                         # Instantiate ShardedTensor (or ShardedTensorFactory) for optimizer
                         # params.
@@ -1481,11 +1464,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def split_state_dict_if_needed(self, state_dict):
         """
         When "--fp8-param-gather" is disabled, weights and biases are stored in the same
-        `ParamAndGradBuffer`. So, when saving a checkpoint, the optimizer's main parameters are
+        `_ParamAndGradBuffer`. So, when saving a checkpoint, the optimizer's main parameters are
         saved in a single continuous tensor (this also applies to "exp_avg" and "exp_avg_sq").
 
         However, when "--fp8-param-gather" is enabled, weights(in fp8 dtype) and biases(in bf16/fp16
-        dtype) are stored in separate `ParamAndGradBuffer`. Therefore, when we enabled
+        dtype) are stored in separate `_ParamAndGradBuffer`. Therefore, when we enabled
         "--fp8-param-gather", and want to load a checkpoint saved without "--fp8-param-gather", we
         need to split the weights(fp8) and biases(bf16/fp16) in the static_dict into two separate
         tensors.
@@ -1561,7 +1544,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             non_fp8_idx = len(non_fp8_buffer.params) - 1
             offsets, fp8_offsets, non_fp8_offsets = [0], [0], [0]
 
-            # Because the parameters in `ParamAndGradBuffer` are traversed in reverse order, the
+            # Because the parameters in `_ParamAndGradBuffer` are traversed in reverse order, the
             # flag here also needs to be traversed in reverse order.
             for fp8_flag in fp8_flags[::-1]:
                 if fp8_flag:

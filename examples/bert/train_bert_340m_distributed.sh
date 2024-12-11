@@ -30,6 +30,7 @@ BERT_MODEL_ARGS=(
     --num-attention-heads 16 
     --seq-length 512 
     --max-position-embeddings 512 
+    --attention-backend auto # Can use (flash/fused/unfused/local)
 )
 
 TRAINING_ARGS=(

@@ -6,7 +6,8 @@ import sys
 import torch
 import types
 
-from utils import get_mcore_transformer_block_key, print_memory_usage
+from schema_mcore import get_model_schema
+from utils import print_memory_usage
 
 
 def add_arguments(parser):
@@ -68,6 +69,7 @@ def _load_checkpoint(queue, args):
                 '--load', args.load_dir,
                 '--position-embedding-type', args.position_embedding_type,
                 '--exit-on-missing-checkpoint',
+                '--no-one-logger',
                 ]
 
     margs = parse_args()
@@ -80,6 +82,10 @@ def _load_checkpoint(queue, args):
     # Explicitly copy data types from checkpoint.
     margs.fp16 = checkpoint_args.fp16
     margs.bf16 = checkpoint_args.bf16
+
+    # Expert parallelism requires sequence parallelism.
+    if margs.expert_model_parallel_size > 1:
+        margs.sequence_parallel = True
 
     # Validate margs.
     margs = validate_args(margs)
@@ -180,6 +186,7 @@ def _load_checkpoint(queue, args):
     mpu.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
+    mpu.set_expert_model_parallel_world_size(margs.expert_model_parallel_size)
     fused_kernels.load(margs)
 
     # Get true (non-padded) vocab size
@@ -209,7 +216,7 @@ def _load_checkpoint(queue, args):
         # older models only supported LayerNorm
         norm_has_bias = True
 
-    # metadata
+    # Metadata.
     md = types.SimpleNamespace()
     md.model_type = args.model_type
     md.num_layers = margs.num_layers
@@ -224,6 +231,7 @@ def _load_checkpoint(queue, args):
     md.output_layer = margs.untie_embeddings_and_output_weights
     md.position_embedding_type = margs.position_embedding_type
     md.linear_bias = margs.add_bias_linear
+    md.qkv_bias = margs.add_qkv_bias
     md.norm_has_bias = norm_has_bias
     md.swiglu = margs.swiglu
     md.previous_tensor_parallel_size = margs.tensor_model_parallel_size
@@ -233,12 +241,7 @@ def _load_checkpoint(queue, args):
     md.checkpoint_args = checkpoint_args
     md.use_legacy_models = margs.use_legacy_models
 
-    # Get transformer block (named either 'encoder' or 'decoder').
-    transformer_block_key = get_mcore_transformer_block_key(md.model_type)
-    def get_transformer_block(_model):
-        return getattr(_model, transformer_block_key)
-
-    # Get first pipe stage
+    # Get first pipe stage.
     mpu.set_pipeline_model_parallel_rank(0)
     all_models = [get_models(tp_size, md.params_dtype)]
     models = all_models[0][0]
@@ -252,19 +255,26 @@ def _load_checkpoint(queue, args):
         msg["name"] = name
         queue.put(msg)
 
-    # Send embeddings
+    # Model schema.
+    schema = get_model_schema(
+        md.model_type,
+        margs.transformer_impl,
+        margs.num_experts,
+        margs.expert_model_parallel_size,
+    )
+
+    # Send embeddings.
+    embeddings = [ schema.get("embeddings", model) for model in models ]
     message = {
-        "word embeddings": torch.cat(
-            [models[tp_rank].embedding.word_embeddings.weight.data for tp_rank in range(tp_size)],
-            dim = 0)
+        "word embeddings": torch.cat([ e["word"] for e in embeddings ], dim=0)
     }
     if md.position_embedding_type == 'learned_absolute':
-        message["position embeddings"] = models[0].embedding.position_embeddings.weight.data
+        message["position embeddings"] = embeddings[0]["pos"]
     else:
-        assert not hasattr(models[0].embedding, 'position_embeddings')
-
+        assert embeddings[0]["pos"] is None
     queue_put("embeddings", message)
 
+    # Send layers.
     total_layer_num = 0
     for vp_rank in range(vp_size):
         mpu.set_virtual_pipeline_model_parallel_rank(vp_rank)
@@ -274,20 +284,19 @@ def _load_checkpoint(queue, args):
                 if vp_rank == 0:
                     all_models.append(get_models(tp_size, md.params_dtype))
             models = all_models[pp_rank][vp_rank]
-            for layer_num in range(len(get_transformer_block(models[0]).layers)):
+            for layer_num in range(schema.get_num_layers(models[0])):
                 message = {}
 
                 # Get non-parallel tensors from tp_rank 0
-                layer = get_transformer_block(models[0]).layers[layer_num]
-                message["input norm weight"] = layer.self_attention.linear_qkv.layer_norm_weight.data
+                layer = schema.get_layer(models[0], layer_num)
+                message["input norm weight"] = layer["self_attn_norm_weight"]
+                message["post norm weight"] = layer["mlp_norm_weight"]
                 if norm_has_bias:
-                    message["input norm bias"] = layer.self_attention.linear_qkv.layer_norm_bias.data
-                message["post norm weight"] = layer.mlp.linear_fc1.layer_norm_weight.data
-                if norm_has_bias:
-                    message["post norm bias"] = layer.mlp.linear_fc1.layer_norm_bias.data
+                    message["input norm bias"] = layer["self_attn_norm_bias"]
+                    message["post norm bias"] = layer["mlp_norm_bias"]
                 if md.linear_bias:
-                    message["dense bias"] = layer.self_attention.linear_proj.bias.data
-                    message["mlp l1 bias"] = layer.mlp.linear_fc2.bias.data
+                    message["dense bias"] = layer["self_attn_proj_bias"]
+                    message["mlp l1 bias"] = layer["mlp_fc2_bias"]
 
                 # Grab all parallel tensors for this layer
                 qkv_weight = []
@@ -297,14 +306,15 @@ def _load_checkpoint(queue, args):
                 mlp_l0_bias = []
                 mlp_l1_weight = []
                 for tp_rank, model in enumerate(models):
-                    layer = get_transformer_block(model).layers[layer_num]
-                    qkv_weight.append(layer.self_attention.linear_qkv.weight.data)
-                    dense_weight.append(layer.self_attention.linear_proj.weight.data)
-                    mlp_l0_weight.append(layer.mlp.linear_fc1.weight.data)
-                    mlp_l1_weight.append(layer.mlp.linear_fc2.weight.data)
+                    layer = schema.get_layer(model, layer_num)
+                    qkv_weight.append(layer["self_attn_qkv_weight"])
+                    dense_weight.append(layer["self_attn_proj_weight"])
+                    mlp_l0_weight.append(layer["mlp_fc1_weight"])
+                    mlp_l1_weight.append(layer["mlp_fc2_weight"])
+                    if md.qkv_bias:
+                        qkv_bias.append(layer["self_attn_qkv_bias"])
                     if md.linear_bias:
-                        qkv_bias.append(layer.self_attention.linear_qkv.bias.data)
-                        mlp_l0_bias.append(layer.mlp.linear_fc1.bias.data)
+                        mlp_l0_bias.append(layer["mlp_fc1_bias"])
 
                 # Handle gated linear units
                 if md.swiglu:
@@ -320,8 +330,9 @@ def _load_checkpoint(queue, args):
                 message["qkv weight"] = torch.cat(qkv_weight, dim=0)
                 message["dense weight"] = torch.cat(dense_weight, dim=1)
                 message["mlp l1 weight"] = torch.cat(mlp_l1_weight, dim=1)
-                if md.linear_bias:
+                if md.qkv_bias:
                     message["qkv bias"] = torch.cat(qkv_bias, dim=0)
+                if md.linear_bias:
                     if md.swiglu:
                         for tp_rank in range(tp_size):
                             mlp_l0_bias[tp_rank] = torch.chunk(mlp_l0_bias[tp_rank], 2, dim=0)
@@ -334,46 +345,55 @@ def _load_checkpoint(queue, args):
 
                 total_layer_num = total_layer_num + 1
 
-    # Send final norm from tp_rank 0
+    # Send final norm from tp_rank 0.
+    final_norm = schema.get("final_norm", models[0])
     message = {
-        "weight": get_transformer_block(models[0]).final_layernorm.weight.data,
+        "weight": final_norm["weight"],
     }
     if norm_has_bias:
-        message["bias"] = get_transformer_block(models[0]).final_layernorm.bias.data
+        message["bias"] = final_norm["bias"]
     queue_put("final norm", message)
 
+    # Send output layer.
     if md.output_layer:
+        output_layer_ranks = [ schema.get("output_layer", m) for m in models ]
         message = {
-            "weight": torch.cat(
-                [models[tp_rank].output_layer.weight.data for tp_rank in range(tp_size)],
-                dim = 0)
+            "weight": torch.cat([r["weight"] for r in output_layer_ranks], dim=0),
         }
         queue_put("output layer", message)
 
-
-    # Send BERT lm head and binary head if it exists
+    # Send BERT params.
     if md.model_type == 'BERT':
+
+        # Pooler.
+        pooler = schema.get("pooler", models[0])
         message = {
-            "weight": models[0].pooler.dense.weight.data,
-            "bias": models[0].pooler.dense.bias.data
+            "weight": pooler["weight"],
+            "bias": pooler["bias"],
         }
         queue_put("pooler", message)
 
+        # LM head.
+        lm_head = schema.get("lm_head", models[0])
         message = {
-            "dense weight": models[0].lm_head.dense.weight.data,
-            "dense bias": models[0].lm_head.dense.bias.data,
-            "norm weight": models[0].lm_head.layer_norm.weight.data,
+            "dense weight": lm_head["dense_weight"],
+            "dense bias": lm_head["dense_bias"],
+            "norm weight": lm_head["norm_weight"],
         }
         if norm_has_bias:
-            message["norm bias"] = models[0].lm_head.layer_norm.bias.data
+            message["norm bias"] = lm_head["norm_bias"],
         queue_put("lm head", message)
 
+        # Binary head.
         if md.bert_binary_head:
+            binary_head = schema.get("binary_head", models[0])
             message = {
-                "weight": models[0].binary_head.weight.data,
-                "bias": models[0].binary_head.bias.data
+                "weight": binary_head["weight"],
+                "bias": binary_head["bias"],
             }
             queue_put("binary head", message)
+
+    # Done.
     queue.put("done")
 
 def load_checkpoint(queue, args):

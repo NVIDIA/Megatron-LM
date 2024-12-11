@@ -52,8 +52,6 @@ class TestFP8:
             (False, (2, 4), (2, 4), None),
         ],
     )
-    @pytest.mark.flaky
-    @pytest.mark.failing_on_rocm
     def test_fp8_save_load(
         self, tmp_path_dist_ckpt, use_fpsl, src_tp_pp, dest_tp_pp, load_exchange_algo
     ):

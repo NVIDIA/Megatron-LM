@@ -1,0 +1,77 @@
+# syntax=docker/dockerfile:1.3-labs
+
+ARG FROM_IMAGE_NAME
+FROM $FROM_IMAGE_NAME as build_causal_conv1d
+WORKDIR /opt
+RUN CAUSAL_CONV1D_FORCE_BUILD=TRUE pip3 wheel -v git+https://github.com/Dao-AILab/causal-conv1d.git@v1.2.2.post1
+
+FROM $FROM_IMAGE_NAME as build_grouped_gemm
+WORKDIR /opt
+RUN pip3 wheel -v git+https://github.com/fanshiqing/grouped_gemm@v1.1.2
+
+FROM $FROM_IMAGE_NAME as build_mamba_ssm
+WORKDIR /opt
+RUN MAMBA_FORCE_BUILD=TRUE pip3 wheel -v git+https://github.com/state-spaces/mamba.git@v2.0.3
+
+ARG FROM_IMAGE_NAME
+FROM $FROM_IMAGE_NAME as main
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gettext python3-venv && \
+    apt-get clean && \
+    python -m venv /opt/jet && \
+    wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq && \
+    chmod a+x /usr/local/bin/yq
+
+COPY --from=build_causal_conv1d /opt/causal_conv1d-*.whl ./
+COPY --from=build_grouped_gemm /opt/grouped_gemm-*.whl ./
+COPY --from=build_mamba_ssm /opt/mamba_ssm-*.whl ./
+
+RUN \
+    --mount=type=bind,source=requirements,target=requirements \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    --mount=type=bind,source=setup.py,target=setup.py \
+    --mount=type=bind,source=megatron/core/package_info.py,target=megatron/core/package_info.py \
+    --mount=type=bind,source=megatron/core/README.md,target=megatron/core/README.md \
+    --mount=type=bind,source=megatron/core/__init__.py,target=megatron/core/__init__.py <<"EOF" bash -ex
+
+pip install causal_conv1d-*.whl mamba_ssm-*.whl grouped_gemm-*.whl
+PY_ENV=pytorch:24.07 pip install .
+EOF
+
+# Since megatron does not have any dependencies (and isn't a dependency to any other package), we can install it separately to make everything a bit quicker
+ARG MCORE_REPO
+ARG MCORE_REF
+ARG MCORE_BACKWARDS_REF
+RUN <<"EOF" bash -exu
+# Checkout latest
+cd /opt
+rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+git init
+git remote add origin ${MCORE_REPO}
+git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+git fetch origin $MCORE_REF
+git checkout $MCORE_REF
+
+# Checkout backwards-ref
+cd /opt
+rm -rf /opt/megatron-lm-legacy; mkdir megatron-lm-legacy; cd megatron-lm-legacy
+git init
+git remote add origin ${MCORE_REPO}
+git fetch origin $MCORE_BACKWARDS_REF
+git checkout $MCORE_BACKWARDS_REF
+rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
+EOF
+
+RUN PY_ENV=pytorch:24.01 pip install -e /opt/megatron-lm
+ENV PYTHONPATH="/opt/megatron-lm:$PYTHONPATH"
+
+##### For NVIDIANS only #####
+FROM main as jet
+ARG CACHEBUST=0
+RUN --mount=type=secret,id=JET_INDEX_URLS \
+    JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS) && \
+    pip install jet-api jet-client --upgrade $JET_INDEX_URLS
+ENV PATH="$PATH:/opt/jet/bin"
+###

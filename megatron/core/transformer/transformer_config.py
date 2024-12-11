@@ -1,9 +1,11 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch.nn.functional as F
+
+from megatron.core.transformer.enums import AttnBackend
 
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import get_te_version, init_method_normal, is_te_min_version, scaled_init_method_normal
@@ -36,6 +38,12 @@ class TransformerConfig(ModelParallelConfig):
 
     num_attention_heads: int = 0
     """Number of transformer attention heads."""
+
+    attention_backend: AttnBackend = AttnBackend.auto
+    """Attention backend to run. By default we let transformer engine
+    decide the best backend to run (except in the case of local).
+    If attention backend is local we use the local pytorch implementation in mcore. 
+    Users can specify exact backend by changing this config. """
 
     num_query_groups: int = None
     """Number of query groups for group query attention. If None, normal attention is used."""
@@ -247,6 +255,16 @@ class TransformerConfig(ModelParallelConfig):
     """Enable overlapping between shared expert computations and dispatcher communications.
     Without this, the shared epxerts execute after the routed experts."""
 
+    moe_layer_freq: int = 1
+    """Frequency between MoE layers and Dense layers. Accepts either:
+    - An integer N: Represents a 1:N ratio, meaning one expert layer for every N-1 dense layers.
+    - A string containing a Python list expression that defines a custom pattern, e.g.:
+    "([1]*3+[0]*1)*3" evaluates to [1,1,1,0,1,1,1,0,1,1,1,0]
+    where 1 indicates an expert layer and 0 indicates a dense layer."""
+
+    moe_ffn_hidden_size: int = None
+    """MoE Feed-Forward Network hidden size"""
+
     moe_router_load_balancing_type: str = "aux_loss"
     """Determines the load balancing strategy for the router. "aux_loss" corresponds to the load
     balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing
@@ -264,6 +282,10 @@ class TransformerConfig(ModelParallelConfig):
     in a single kernel launch to improve the utilization and performance by leveraging the Grouped
     GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
     """
+
+    moe_use_legacy_grouped_gemm: bool = False
+    """Use legacy GroupedMLP rather than TEGroupedMLP.
+    Note: The legacy one will be deprecated soon."""
 
     moe_aux_loss_coeff: float = 0  # 1e-2 would be a good start value for load balance loss.
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended."""
@@ -304,6 +326,25 @@ class TransformerConfig(ModelParallelConfig):
     moe_layer_recompute: bool = False
     """Memory optimization: checkpointing moe_layer to save actiavtion memory."""
 
+    ##################
+    # Context Parallel
+    ##################
+    cp_comm_type: Union[str, List[str]] = None
+    """Inter-gpu communication type for context parallelism.
+    str: all layers share same communication type.
+    List[str]: each layer has its separate communication type.
+    cp_comm_type of each layer can be "p2p" or "all_gather" or "a2a" or "a2a+p2p".
+    "p2p": Exchange KV chunks with P2P communications in ring topology. P2P is async and can be
+    overlapped with attention compute.
+    "all_gather": All-gather to get full sequence of KV before attention. The all-gather is not
+    async, and cannot be overlapped.
+    "a2a": Like DeepSpeed Ulysses, scatter attention heads across the CP group, and gather to get
+    full sequence of QKV.
+    "a2a+p2p": A hierarchical implementation of context parallelism to attention. 
+    It uses A2A communications in low-level CP groups (e.g., via NVLink),
+    and P2P communications in high-level CP groups (e.g., via IBLink).
+    """
+
     ####################
     # miscellaneous
     ####################
@@ -322,6 +363,9 @@ class TransformerConfig(ModelParallelConfig):
 
     config_logger_dir: str = ""
     """When non-empty, dumps entry-point configs to config_logger_dir"""
+
+    flash_decode: bool = False
+    """ Use the optimized flash decoding kernel during inference. """
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
@@ -363,6 +407,9 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError('num_moe_experts must be non-negative.')
+
+        if self.moe_ffn_hidden_size is None:
+            self.moe_ffn_hidden_size = self.ffn_hidden_size
 
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:
@@ -477,11 +524,24 @@ class TransformerConfig(ModelParallelConfig):
                     "When bias_activation_fusion is True, gated_linear_unit is False, "
                     "and activation function is gelu, add_bias_linear must also be True."
                 )
+
         if self.activation_func_fp8_input_store:
             if self.activation_func != F.silu or not self.gated_linear_unit:
                 raise ValueError("Storing activation input in FP8 is supported only for SwiGLU.")
-        if self.apply_rope_fusion and self.rotary_interleaved:
-            raise ValueError('rotary_interleaved does not work with apply_rope_fusion.')
+
+        if self.apply_rope_fusion:
+            if self.rotary_interleaved:
+                raise ValueError("rotary_interleaved does not work with apply_rope_fusion.")
+
+            from megatron.core.models.common.embeddings.rope_utils import HAVE_APPLY_ROPE_FUSION
+
+            if not HAVE_APPLY_ROPE_FUSION:
+                raise ValueError(
+                    "apply_rope_fusion is not available. Please install TE >= 1.4 or Apex."
+                )
+
+        if self.multi_latent_attention and self.rotary_interleaved:
+            raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
 
         if self.init_method is None:
             self.init_method = init_method_normal(self.init_method_std)
@@ -491,17 +551,13 @@ class TransformerConfig(ModelParallelConfig):
                 self.init_method_std, self.num_layers
             )
 
-        if self.moe_extended_tp:
-            if self.moe_token_dispatcher_type != 'allgather':
-                raise ValueError(
-                    "Moe extended TP parallelism only applies to allgather based token dispatcher."
-                )
-            extended_tp_size = self.tensor_model_parallel_size * self.expert_model_parallel_size
-            if self.ffn_hidden_size % extended_tp_size != 0:
-                raise ValueError(
-                    f'ffn_hidden_size: {self.ffn_hidden_size} must be divisible by '
-                    f'extended_tp_size {extended_tp_size}'
-                )
+        if (
+            self.moe_token_dispatcher_type == "alltoall_seq"
+            and self.tensor_model_parallel_size != self.expert_tensor_parallel_size
+        ):
+            raise ValueError(
+                "alltoall_seq dispatcher not support different TP size for MoE and Dense layer."
+            )
 
         if self.num_moe_experts and self.fp8:
             # TE version below 1.7.0 will raise Error when handle zeros tokens for expert
@@ -511,8 +567,32 @@ class TransformerConfig(ModelParallelConfig):
                     f"but your version is {get_te_version()}."
                 )
 
-            if self.moe_grouped_gemm:
-                raise ValueError("Grouped GEMM of MoE not support fp8 for now.")
+            if self.moe_grouped_gemm and not is_te_min_version("1.11.0"):
+                raise ValueError(
+                    "Only transformer-engine>=1.11.0 supports FP8 grouped gemm, "
+                    f"but your version is {get_te_version()}."
+                )
+
+        if self.flash_decode and self.fp8:
+            raise ValueError("FP8 inference is currently not support with flash decoding.")
+
+        if self.moe_token_dispatcher_type in ['allgather', 'alltoall_seq']:
+            if self.variable_seq_lengths is True:
+                raise ValueError(
+                    f"Token dispatcher type: {self.moe_token_dispatcher_type} does not support "
+                    f"variable sequence length, please use alltoall dispatcher instead."
+                )
+
+        if self.cp_comm_type is not None:
+            if isinstance(self.cp_comm_type, list):
+                assert len(self.cp_comm_type) == self.num_layers, (
+                    f"Length of cp_comm_type ({len(self.cp_comm_type)}) should equal to "
+                    f"the total number of transformer layers ({self.num_layers})!"
+                )
+            else:
+                assert isinstance(
+                    self.cp_comm_type, str
+                ), "Unsupported communication type for context parallelism!"
 
 
 @dataclass

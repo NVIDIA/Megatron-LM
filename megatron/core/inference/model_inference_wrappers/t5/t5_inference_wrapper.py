@@ -1,5 +1,4 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from argparse import Namespace
 from collections import deque
 from typing import Any, List, Tuple
 
@@ -11,9 +10,13 @@ from megatron.core.datasets.t5_dataset import T5MaskedWordPieceDataset
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
+)
 from megatron.core.models.T5 import T5Model
 
 
+# pylint: disable=line-too-long
 class T5InferenceWrapper(AbstractModelInferenceWrapper):
     """Constructor for the model inference wrapper
 
@@ -22,11 +25,19 @@ class T5InferenceWrapper(AbstractModelInferenceWrapper):
 
     Args:
         model (T5Model): The T5 model (MCore or legacy)
-        args (Namespace): The command line arguments that were passed
+        inference_wrapper_config (InferenceWrapperConfig): The command line arguments that were passed
+        use_local (bool): Whether  the T5 model's transformer impl
+            is local (vs transformer_engine)
     """
 
-    def __init__(self, model: T5Model, args: Namespace):
-        super().__init__(model, args)
+    def __init__(
+        self,
+        model: T5Model,
+        inference_wrapper_config: InferenceWrapperConfig,
+        use_local: bool = False,
+    ):
+        super().__init__(model, inference_wrapper_config)
+        self.use_local = use_local
 
     def prep_model_for_inference(
         self, prompts_tokens: torch.Tensor, encoder_prompts: List[str] = None, tokenizer: Any = None
@@ -45,12 +56,18 @@ class T5InferenceWrapper(AbstractModelInferenceWrapper):
 
         super().prep_model_for_inference(prompts_tokens=prompts_tokens)
 
+        # get max_sequence_length
+        if hasattr(self.model, "module"):  # if self.model is Float16Module
+            max_sequence_length = self.model.module.max_sequence_length
+        else:
+            max_sequence_length = self.model.max_sequence_length
+
         encoder_prompts_tokens_list = [
             self.tokenize_encoder_prompt(encoder_prompt, tokenizer)
             for encoder_prompt in encoder_prompts
         ]
         self.batch_encoder_prompts_tokens = self.pad_encoder_prompts_tokens(
-            encoder_prompts_tokens_list, self.model.max_sequence_length, tokenizer
+            encoder_prompts_tokens_list, max_sequence_length, tokenizer
         )
 
         # create batch mask for encoder_prompt (self.batch_input_tokens) and
@@ -59,32 +76,13 @@ class T5InferenceWrapper(AbstractModelInferenceWrapper):
         encoder_prompts_tokens = self.batch_encoder_prompts_tokens.cpu().numpy()
         self.batch_mask_encoder = []
         self.batch_mask_decoder = []
-        self.batch_mask_encoder_decoder = []
         for i in range(len(self.prompts_tokens)):
-            self.batch_mask_encoder.append(
-                T5MaskedWordPieceDataset._make_attention_mask(
-                    encoder_prompts_tokens[i], encoder_prompts_tokens[i]
-                )
-            )
-            self.batch_mask_decoder.append(
-                T5MaskedWordPieceDataset._make_attention_mask(
-                    decoder_prompts_tokens[i], decoder_prompts_tokens[i]
-                )
-                * T5MaskedWordPieceDataset._make_history_mask(decoder_prompts_tokens[i])
-            )
-            self.batch_mask_encoder_decoder.append(
-                T5MaskedWordPieceDataset._make_attention_mask(
-                    decoder_prompts_tokens[i], encoder_prompts_tokens[i]
-                )
-            )
+            mask_encoder = encoder_prompts_tokens[i] == tokenizer.pad
+            mask_decoder = decoder_prompts_tokens[i] == tokenizer.pad
+            self.batch_mask_encoder.append(mask_encoder)
+            self.batch_mask_decoder.append(mask_decoder)
         self.batch_mask_encoder = torch.tensor(numpy.array(self.batch_mask_encoder)).cuda()
         self.batch_mask_decoder = torch.tensor(numpy.array(self.batch_mask_decoder)).cuda()
-        self.batch_mask_encoder_decoder = torch.tensor(
-            numpy.array(self.batch_mask_encoder_decoder)
-        ).cuda()
-        self.batch_mask_encoder = self.batch_mask_encoder < 0.5
-        self.batch_mask_decoder = self.batch_mask_decoder < 0.5
-        self.batch_mask_encoder_decoder = self.batch_mask_encoder_decoder < 0.5
 
     def tokenize_encoder_prompt(
         self, encoder_prompt: str, tokenizer
@@ -112,6 +110,7 @@ class T5InferenceWrapper(AbstractModelInferenceWrapper):
             if masks_count > 0:
                 sentinel = sentinels.popleft()
                 encoder_prompt_tokens.extend([sentinel])
+                masks_count -= 1
 
         return encoder_prompt_tokens
 
@@ -156,13 +155,24 @@ class T5InferenceWrapper(AbstractModelInferenceWrapper):
             List: A list of inputs that will be used by your model in the forward step
         """
 
-        # rerun encoder every step
         # T5 inference not yet support kv_cache
         encoder_tokens2use = self.batch_encoder_prompts_tokens
         decoder_tokens2use = self.prompts_tokens[:, :context_end_position]
         encoder_mask2use = self.batch_mask_encoder
-        decoder_mask2use = self.batch_mask_decoder[:, :context_end_position, :context_end_position]
-        encoder_decoder_mask2use = self.batch_mask_encoder_decoder[:, :context_end_position, :]
+        decoder_mask2use = self.batch_mask_decoder[:, :context_end_position]
+
+        # Configure attention mask based on different conditions
+        # (e.g., transformer-impl, TE versions, TE backends)
+        [encoder_mask2use, decoder_mask2use, encoder_decoder_mask2use] = (
+            T5MaskedWordPieceDataset.config_attention_mask(
+                encoder_tokens2use,
+                decoder_tokens2use,
+                encoder_mask2use,
+                decoder_mask2use,
+                self.use_local,
+            )
+        )
+
         data_at_step_idx = [
             encoder_tokens2use,
             decoder_tokens2use,

@@ -3,16 +3,20 @@ import json
 from argparse import Namespace
 from pathlib import Path
 
+import numpy as np
 import pytest
 import requests
 
 from megatron.training import tokenizer
 from megatron.training.tokenizer.gpt2_tokenization import PRETRAINED_VOCAB_ARCHIVE_MAP
+from megatron.training.tokenizer.multimodal_tokenizer import MultimodalTokenizer
 
 TOKENIZER_DIR = Path("~/data/tokenizers").expanduser()
 
 # Copied over from test_preprocess_data.py
-__LOCAL_GPT2_VOCAB = "/home/gitlab-runner/data/gpt3_data/gpt2-vocab.json"
+from tests.unit_tests.data.test_preprocess_data import __LOCAL_GPT2_VOCAB
+
+GPT2_VOCAB_SIZE = 32768
 
 
 def offsets_to_substrs(offsets, string):
@@ -117,14 +121,11 @@ def gpt2_tiktok_vocab(tmp_path_factory):
     )
 
 
-def specs():
-    if TOKENIZER_DIR.exists():
-        return local_test_specs()
-    return []
-
-
-@pytest.mark.parametrize("args", specs())
+@pytest.mark.parametrize("args", local_test_specs())
 def test_tokenizer(args):
+    if not TOKENIZER_DIR.exists():
+        pytest.skip("Skipping tokenizer tests because the tokenizer directory does not exist")
+
     tok = tokenizer.build_tokenizer(args)
     run_tokenizer_tests(tok)
 
@@ -191,3 +192,85 @@ def test_null_tokenizer():
         detok_str == test_string
     ), f"Detokenized string {detok_str} does not match original {test_string}"
     assert len(toks) == len(offsets), f"Tokenized string {toks} does not match original {offsets}"
+
+
+class MockUnderlyingTokenizer:
+    """Mock tokenizer for testing purposes."""
+
+    def __init__(self):
+        self.pad_token_id = 256
+
+    def __len__(self):
+        return 256
+
+    def encode(self, text: str) -> list[int]:
+        """Convert text to a list of token IDs."""
+        return [ord(c) for c in text]
+
+    def decode(self, tokens: list[int]) -> str:
+        """Convert list of token IDs to plaintext."""
+        return "".join([chr(t) for t in tokens])
+
+    def apply_chat_template(self, conversation: list[dict], *args, **kwargs) -> list[int]:
+        """Convert a conversation to token IDs."""
+        out = []
+        for turn in conversation:
+            turn_tokens = self.encode(f"{turn['role']}:{turn['content']}")
+            out.extend(turn_tokens)
+
+        if kwargs.get("return_tensors", None) == "np":
+            return [np.array(out)]
+
+        return out
+
+    def convert_tokens_to_ids(self, text: str) -> list[int]:
+        """Convert plaintext to token IDs."""
+        return self.encode(text)
+
+    def add_tokens(self, extra_tokens: list[str], *args, **kwargs) -> int:
+        """Add tokens to the tokenizer. No-op for this mock tokenizer."""
+        return len(extra_tokens)
+
+
+def test_multimodal_tokenizer():
+    """Test MultimodalTokenizer."""
+    underlying = MockUnderlyingTokenizer()
+    prompt_format = "chatml"
+    special_tokens = ["<image>"]
+    image_tag_type = ""
+    tokenizer = MultimodalTokenizer(underlying, prompt_format, special_tokens, image_tag_type)
+
+    # Simple encode - decode roundtrip.
+    assert (
+        tokenizer.detokenize(tokenizer.tokenize("abc")) == "abc"
+    ), "encode-decode roundtrip failed"
+
+    # Apply chat template.
+    conversation = [
+        {"role": "system", "content": "abc"},
+        {"role": "user", "content": "123<image>"},
+        {"role": "assistant", "content": "xyz"},
+    ]
+    conv_tokens = tokenizer.tokenize_conversation(
+        conversation, return_target=False, add_generation_prompt=False
+    )
+    assert len(conv_tokens) > 0, "failed to tokenize conversation"
+
+    conv_tokens, target_tokens = tokenizer.tokenize_conversation(
+        conversation, return_target=True, add_generation_prompt=True
+    )
+    assert len(conv_tokens) > 0 and len(conv_tokens) == len(
+        target_tokens
+    ), "failed to tokenize conversation and return target tokens"
+
+    # Try converting tokens to ids.
+    assert tokenizer.convert_tokens_to_ids("a"), "failed to convert tokens to ids."
+
+    # Try image tags.
+    image_tag_type = "nvlm"
+    tokenizer = MultimodalTokenizer(underlying, prompt_format, special_tokens, image_tag_type)
+
+    assert tokenizer._apply_image_tag("<image>hello") == "<Image><image></Image>hello"
+    assert tokenizer._apply_image_tag([{"role": "user", "content": "<image>hello"}]) == [
+        {"role": "user", "content": "<Image><image></Image>hello"}
+    ]

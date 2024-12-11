@@ -5,6 +5,11 @@ import pytest
 from megatron.core.dist_checkpointing.strategies.base import StrategyAction, get_default_strategy
 
 
+def pytest_sessionfinish(session, exitstatus):
+    if exitstatus == 5:
+        session.exitstatus = 0
+
+
 @pytest.fixture(scope='session', autouse=True)
 def set_default_dist_ckpt_strategy():
     def get_pyt_dist_save_sharded_strategy():

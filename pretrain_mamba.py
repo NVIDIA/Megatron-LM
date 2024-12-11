@@ -4,18 +4,18 @@
 import os
 import torch
 from functools import partial
+from typing import List, Optional, Tuple, Union
 
 from megatron.training import get_args
 from megatron.training import print_rank_0
 from megatron.training import get_timers
 from megatron.training import get_tokenizer
 from megatron.core import mpu
-# from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
+from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.models.mamba import MambaModel
 from megatron.training import pretrain
 from megatron.core.utils import StragglerDetector
@@ -23,6 +23,7 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
+    get_blend_and_blend_per_split,
 )
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -102,6 +103,11 @@ def get_batch(data_iterator):
 
     return batch.values()
 
+
+# define spiky loss as a variation of 20% or more
+SPIKY_LOSS_PERC = 0.2
+
+
 def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     """Loss function.
 
@@ -126,11 +132,23 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
         torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
+    rerun_state_machine = get_rerun_state_machine()
     if args.check_for_nan_in_loss_and_grad:
-        global_rank = torch.distributed.get_rank()
-        assert not loss[0].isnan(), (
-            f'Rank {global_rank}: found NaN in local forward loss calculation. '
-            f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
+        rerun_state_machine.validate_result(
+            result=loss[0],
+            rejection_func=torch.isnan,
+            message="found NaN in local forward loss calculation",
+            tolerance=0.0,        # forward pass calculations are determinisic
+            fatal=True,
+        )
+    # Check for spiky loss
+    if args.check_for_spiky_loss:
+        rerun_state_machine.validate_result(
+            result=loss[0],
+            rejection_func=partial(rerun_state_machine.is_spiky_loss, threshold=SPIKY_LOSS_PERC),
+            message="Spiky loss",
+            tolerance=0.0,        # forward pass calculations are determinisic
+            fatal=False,
         )
 
     # Reduce loss for logging.
@@ -179,15 +197,16 @@ def is_dataset_built_on_rank():
 def core_gpt_dataset_config_from_args(args):
     tokenizer = get_tokenizer()
 
+    # Sometimes --data-path is too long, instead we parse it from a file.
+    blend: Optional[Tuple[List[str], Optional[List[float]]]]
+    blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
+    blend, blend_per_split = get_blend_and_blend_per_split(args)
+
     return GPTDatasetConfig(
         random_seed=args.seed,
         sequence_length=args.seq_length,
-        blend=get_blend_from_list(args.data_path),
-        blend_per_split=[
-            get_blend_from_list(args.train_data_path),
-            get_blend_from_list(args.valid_data_path),
-            get_blend_from_list(args.test_data_path)
-        ],
+        blend=blend,
+        blend_per_split=blend_per_split,
         renormalize_blend_weights=args.renormalize_blend_weights,
         split=args.split,
         num_dataset_builder_threads=args.num_dataset_builder_threads,
@@ -198,6 +217,7 @@ def core_gpt_dataset_config_from_args(args):
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
         create_attention_mask=args.create_attention_mask_in_dataloader,
+        s3_cache_path=args.s3_cache_path,
     )
 
 

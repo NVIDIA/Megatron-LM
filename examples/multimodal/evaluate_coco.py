@@ -11,20 +11,28 @@ def convert_to_coco_format(input_path):
     """Convert input files to COCO compatible format."""
     input_file_paths, output_file_path = get_input_output_paths(input_path, task="captioning")
 
-    captions = []
+    results = dict()
 
     for input_file_path in input_file_paths:
         with open(input_file_path, "r") as input_file:
             for line in input_file:
                 res = json.loads(line)
+                sample_id = res["sample_id"]
 
-                question_id = res['sample_id']
-                caption = res['caption'].rstrip('.').lower()
+                # Ignore possible duplicates.
+                if sample_id in results:
+                    continue
 
-                captions.append({"image_id": question_id, "caption": caption})
+                caption = res["caption"].rstrip(".").lower()
+                results[sample_id] = {
+                    "image_id": sample_id,
+                    "caption": caption,
+                }
+
+    results = list(results.values())
 
     with open(output_file_path, "w") as output_file:
-        json.dump(captions, output_file, indent=4)
+        json.dump(results, output_file, indent=4)
 
     return output_file_path
 

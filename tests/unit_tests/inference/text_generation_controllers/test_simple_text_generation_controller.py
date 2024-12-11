@@ -1,3 +1,4 @@
+import os
 import random
 import string
 import time
@@ -22,6 +23,7 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -42,6 +44,7 @@ class TestSimpleTextGenerationController:
             hidden_size=self.hidden_size,
             num_attention_heads=4,
             use_cpu_initialization=True,
+            attention_backend=AttnBackend.local,
         )
 
         gpt_model = GPTModel(
@@ -54,7 +57,7 @@ class TestSimpleTextGenerationController:
 
         inference_wrapper_config = InferenceWrapperConfig(
             hidden_size=self.hidden_size,
-            inference_batch_times_seqlen_threshold=20,
+            inference_batch_times_seqlen_threshold=-1,
             fp32_residual_connection=False,
             params_dtype=torch.float,
             padded_vocab_size=self.vocab_size,
