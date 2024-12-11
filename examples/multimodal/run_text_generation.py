@@ -19,6 +19,8 @@ from model import model_provider
 from multimodal_args import add_multimodal_extra_args
 
 from megatron.core import parallel_state
+from megatron.core.enums import ModelType
+from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.inference.text_generation.api import generate_and_post_process
 from megatron.inference.text_generation.forward_step import ForwardStep
@@ -36,7 +38,7 @@ def add_text_generation_args(parser):
     group.add_argument("--top_p", type=float, default=0.0, help='Top p sampling.')
     group.add_argument("--top_k", type=int, default=0, help='Top k sampling.')
     group.add_argument(
-        "--out-seq-length", type=int, default=1024, help='Length of the output generated text.'
+        "--out-seq-length", type=int, default=128, help='Length of the output generated text.'
     )
     group.add_argument("--output-path", type=str, help='Output file path')
     group.add_argument('--input-image-path', type=str, help="Input image directory")
@@ -206,8 +208,8 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                 if config.task == "VideoMME":
                     output["questions"][0][output_name] = generated
                 else:
-                    output[output_name] = generated
                     output["prompt"] = prompt
+                    output[output_name] = generated
 
                 if config.task == "captioning":
                     output["ground_truth"] = answers
@@ -354,7 +356,7 @@ class VLMForwardStep(ForwardStep):
         )
 
     def __call__(self, tokens, position_ids, attention_mask):
-        num_image_tokens = (tokens == self.model.image_token_index).sum().item()
+        num_image_tokens = (tokens == self.model.module.image_token_index).sum().item()
         num_tokens = tokens.size(1)
         recv_buffer_seq_length = None
         if num_image_tokens > 0:
@@ -406,7 +408,7 @@ def get_conversation(task, question):
             {"role": "system", "content": "Answer the questions."},
             {
                 "role": "user",
-                "content": "<image>\nProvide a one-sentence caption for provided image.",
+                "content": f"{IMAGE_TOKEN}\nProvide a one-sentence caption for provided image.",
             },
         ]
     elif task in ("TextVQA", "VQAv2", "ChartQA"):
@@ -414,13 +416,13 @@ def get_conversation(task, question):
             {"role": "system", "content": "Answer the questions."},
             {
                 "role": "user",
-                "content": f"<image>\n{question}\nAnswer the question using a single word or phrase.",
+                "content": f"{IMAGE_TOKEN}\n{question}\nAnswer the question using a single word or phrase.",
             },
         ]
     elif task in ("OCRBench", "MathVista", "AI2D"):
         conversation = [
             {"role": "system", "content": "Answer the questions."},
-            {"role": "user", "content": f"<image>\n{question}"},
+            {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}"},
         ]
     elif task == "MMMU":
         conversation = [
@@ -441,7 +443,7 @@ def get_conversation(task, question):
 
         conversation = [
             {"role": "system", "content": "Answer the questions."},
-            {"role": "user", "content": f"<image>\n{question}"},
+            {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}"},
         ]
 
     return conversation
@@ -464,11 +466,13 @@ def get_prompt_and_generated(prompt_and_generation, prompt_format):
         prompt = splitted[0]
         generated = splitted[1]
         generated = generated.split("<|im_end|>")[0]
-    elif prompt_format in ("nvlm-yi-34b", "qwen2p0"):
+    elif prompt_format in ("nvlm-yi-34b", "qwen2p0", "qwen2p5"):
         splitted = prompt_and_generation.split("<|im_start|>assistant\n")
         prompt = splitted[0]
         generated = splitted[1]
         generated = generated.split("<|im_end|>")[0]
+    else:
+        raise ValueError(f"Prompt format {prompt_format} is not supported.")
 
     # Remove possible garbage.
     generated = generated.strip()
@@ -489,11 +493,11 @@ def main():
 
     args = get_args()
 
-    def wrapped_model_provider(pre_process, post_process):
-        return model_provider(pre_process, post_process, parallel_output=False)
+    def wrapped_model_provider(pre_process, post_process, add_encoder, add_decoder):
+        return model_provider(pre_process, post_process, add_encoder, add_decoder, parallel_output=False)
 
     # Set up model and load checkpoint.
-    model = get_model(wrapped_model_provider, wrap_with_ddp=False)
+    model = get_model(wrapped_model_provider, model_type=ModelType.encoder_and_decoder, wrap_with_ddp=False)
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None)

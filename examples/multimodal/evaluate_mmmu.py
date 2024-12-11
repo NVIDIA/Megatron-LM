@@ -48,6 +48,10 @@ def convert_to_mmmu_format(input_path):
                     )
 
                 # MMMU eval script expects just a sample_id to prediction mapping.
+                # Skip possible duplicates.
+                if sample_id in output:
+                    continue
+
                 output[sample_id] = prediction
 
     with open(output_file_path, "w") as output_file:
