@@ -121,7 +121,7 @@ class MultimodalTokenizer(MegatronTokenizer):
                 has_bos=False,
                 has_system_role=True,
             )
-        elif prompt_format == "qwen2p0":
+        elif prompt_format in ("qwen2p0", "qwen2p5"):
             # "<|im_start|>assistant\n" is the prefix for assistant messages
             self._prompt_config = PromptConfig(
                 assistant_prefix_len=3,
