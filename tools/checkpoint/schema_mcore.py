@@ -123,6 +123,9 @@ class MCoreMoETESchema(MCoreSchema):
             **{f"mlp_fc1_weight.{expert_idx}" : f"mlp.experts.local_experts.{expert_idx}.linear_fc1.weight" for expert_idx in range(num_local_experts) },
             **{f"mlp_fc2_weight.{expert_idx}" : f"mlp.experts.local_experts.{expert_idx}.linear_fc2.weight" for expert_idx in range(num_local_experts) },
 
+            "shared_mlp_fc1_weight": "mlp.shared_experts.linear_fc1.weight",
+            "shared_mlp_fc2_weight": "mlp.shared_experts.linear_fc2.weight",
+            "shared_mlp_gate_weight": "mlp.shared_experts.gate_weight",
         })
 
 
