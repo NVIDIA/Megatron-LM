@@ -13,7 +13,7 @@ from packaging.version import Version as PkgVersion
 from torch import Tensor
 from torch.nn.parameter import Parameter
 
-from megatron.core import ModelParallelConfig
+from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
