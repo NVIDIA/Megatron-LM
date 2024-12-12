@@ -834,8 +834,8 @@ class RerunDataIterator:
         replay_data_iterator = RerunDataIterator(data_iterator)
     """
 
-    def __init__(self, iterable: Any, make_iterable: bool = True) -> None:
-        self.iterable: Iterable[Any] = iter(iterable) if make_iterable else iterable
+    def __init__(self, iterable: Iterable[Any]) -> None:
+        self.iterable: Iterable[Any] = iterable
         self.saved_microbatches: list[Any] = []
         self.replaying: bool = False
         self.replay_pos: int = 0
