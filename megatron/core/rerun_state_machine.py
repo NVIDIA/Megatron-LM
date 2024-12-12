@@ -252,8 +252,7 @@ class RerunStateMachine:
             for d in data_iterators:
                 assert (
                     isinstance(d, RerunDataIterator),
-                    "data iterator is not wrapped with RerunDataIterator",
-                )
+                ), "data iterator is not wrapped with RerunDataIterator"
 
         # Are we about to start the initial run?
         if self.state == RerunState.NOT_RUNNING_YET:
@@ -263,8 +262,7 @@ class RerunStateMachine:
             if self.data_iterator_checkpoints is not None:
                 assert (
                     len(self.data_iterator_checkpoints) == len(data_iterators),
-                    "data_iterator has different length than checkpointed data iterator",
-                )
+                ), "data iterator has different length than checkpointed data iterator"
                 for i, d in enumerate(data_iterators):
                     d.set_checkpoint_state(self.data_iterator_checkpoints[i])
                 self.data_iterator_checkpoints = None
@@ -667,8 +665,7 @@ class RerunStateMachine:
         for d in data_iterators:
             assert (
                 isinstance(d, RerunDataIterator),
-                "data iterator is not wrapped with RerunDataIterator",
-            )
+            ), "data iterator is not wrapped with RerunDataIterator"
 
         state: dict[str, Any] = {
             'mode': self.mode,
