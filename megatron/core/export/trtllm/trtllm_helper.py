@@ -142,7 +142,7 @@ class TRTLLMHelper:
             'hidden_act': hidden_act,
             'use_parallel_embedding': export_config.use_parallel_embedding,
             'embedding_sharding_dim': 0,
-            'share_embedding_table': export_config.use_embedding_sharing,
+            'share_embedding_table': self.share_embeddings_and_output_weights,
             'quantization': {
                 'quant_algo': "FP8" if fp8_quantized else None,
                 'kv_cache_quant_algo': "FP8" if fp8_kvcache else None,
@@ -301,9 +301,6 @@ class TRTLLMHelper:
             return [trtllm_model_weights_on_device], [trtllm_model_config]
 
         else:
-            assert not (
-                self.share_embeddings_and_output_weights and not export_config.use_embedding_sharing
-            ), "Found share_embeddings_and_output_weights is True in the model. So set export_config.use_embedding_sharing to True"
             assert (
                 vocab_size is None
             ), "Vocab size is inferred from the input layer for cpu conversion. So leave it as None"
@@ -393,7 +390,6 @@ class TRTLLMHelper:
             inference_pp_size=self.weights_converter.inference_pp_size,
             inference_tp_size=self.weights_converter.inference_tp_size,
             use_parallel_embedding=True,
-            use_embedding_sharing=self.share_embeddings_and_output_weights,
         )
 
         world_size = export_config.inference_tp_size * export_config.inference_pp_size

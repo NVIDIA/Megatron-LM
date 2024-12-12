@@ -15,5 +15,3 @@ class ExportConfig:
     inference_pp_size: int = 1
 
     use_parallel_embedding: bool = False
-
-    use_embedding_sharing: bool = False
