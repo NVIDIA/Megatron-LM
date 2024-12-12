@@ -35,8 +35,6 @@ done
 TIME_STAMP=$(date +"%Y-%m-%d_%H-%M-%S")
 EXP_NAME="${EXP_NAME:-perf}"
 
-NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-ens50f0np0}"
-GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-ens50f0np0}"
 TEE_OUTPUT="${TEE_OUTPUT:-1}"
 USE_FLASH_ATTN="${USE_FLASH_ATTN:-1}"
 NO_TRAINING="${NO_TRAINING:-0}" # NO_TRAINING=1: for computing metrics only
@@ -54,6 +52,14 @@ MASTER_PORT="${MASTER_PORT:-6000}"
 NNODES="${NNODES:-1}"
 NODE_RANK="${NODE_RANK:-0}"
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
+
+if [ "${NNODES:-1}" -gt 1 ]; then
+    export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-ens5}"
+    export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-ens50f0}"
+    echo "NCCL and GLOO socket interfaces set."
+else
+    echo "Single node setup, skipping NCCL and GLOO socket interface settings."
+fi
 
 MODEL_SIZE="${MODEL_SIZE:-70}"
 TP="${TP:-8}"
