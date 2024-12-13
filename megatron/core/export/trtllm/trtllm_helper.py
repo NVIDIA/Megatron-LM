@@ -204,7 +204,10 @@ class TRTLLMHelper:
         mock_scales_dict = TRTLLMLayers.rename_input_layer_names_to_trtllm_layer_names(
             mock_scales_dict, self.trtllm_conversion_dict, False
         )
-        split_gated_activation = self.activation in ["swiglu", "geglu", "fast-swiglu", "fast-geglu"]
+        split_gated_activation = (
+            self.activation in ["swiglu", "geglu", "fast-swiglu", "fast-geglu"] or
+            self.transformer_config.gated_linear_unit
+        )
 
         scales = {}
         for key, val in mock_scales_dict.items():

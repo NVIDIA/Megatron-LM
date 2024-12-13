@@ -179,12 +179,10 @@ class SingleDeviceTRTLLMModelWeightsConverter:
         elif layer_name.endswith(suffix(TRTLLMLayers.mlp_fc_weight)) or layer_name.endswith(
             suffix(TRTLLMLayers.mlp_fc_bias)
         ):
-            split_gated_activation = self.activation in [
-                "swiglu",
-                "geglu",
-                "fast-swiglu",
-                "fast-geglu",
-            ]
+            split_gated_activation = (
+                self.activation in ["swiglu", "geglu", "fast-swiglu", "fast-geglu"] or
+                self.transformer_config.gated_linear_unit
+            )
             if split_gated_activation:
                 val, gate = torch.chunk(val, 2, axis=-1)
                 gate_layer_name = layer_name.replace("fc", "gate")

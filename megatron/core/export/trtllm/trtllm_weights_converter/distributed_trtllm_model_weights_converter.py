@@ -128,12 +128,10 @@ class DistributedTRTLLMModelWeightsConverter:
             suffix(TRTLLMLayers.mlp_fc_bias)
         ):
 
-            split_gated_activation = self.activation in [
-                "swiglu",
-                "geglu",
-                "fast-swiglu",
-                "fast-geglu",
-            ]
+            split_gated_activation = (
+                self.activation in ["swiglu", "geglu", "fast-swiglu", "fast-geglu"] or
+                self.transformer_config.gated_linear_unit
+            )
             if split_gated_activation:
                 vals, gates = [[n] for n in torch.chunk(val, 2, axis=-1)]
                 gate_layer_name = layer_name.replace("fc", "gate")
