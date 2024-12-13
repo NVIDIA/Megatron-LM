@@ -654,6 +654,23 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         else:
             kv_channels = self.config.kv_channels
 
+        self.kept_packed_seq_params = set(
+            field.name for field in dataclasses.fields(PackedSeqParams)
+        )
+        if get_te_version() < PkgVersion("1.3.0"):
+            # TE 1.3.0 introduces precomputing max_seqlen to remove unnecessary kernels and D2H
+            # copies (#555)
+            # These two arguments did not exist prior to 1.3.0
+            self.kept_packed_seq_params.discard("max_seqlen_q")
+            self.kept_packed_seq_params.discard("max_seqlen_kv")
+
+        if get_te_version() < PkgVersion("1.10.0"):
+            # TE 1.8.0 introduces cu_seqlens_padded which is the cu_seqlens with paddings counted
+            # in each individual sequence in THD format dataset
+            # These two arguments did not exist prior to 1.8.0. Full support added in 1.10.0 (#1012)
+            self.kept_packed_seq_params.discard("cu_seqlens_q_padded")
+            self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
+
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
             kv_channels=kv_channels,
@@ -683,7 +700,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
     ):
         """Forward."""
         packed_seq_kwargs = (
-            dataclasses.asdict(packed_seq_params) if packed_seq_params is not None else {}
+            {key: getattr(packed_seq_params, key) for key in self.kept_packed_seq_params}
+            if packed_seq_params is not None
+            else {}
         )
         # overwrite self.qkv_format depending on self.config.apply_rope_fusion, which can be set
         # after init
@@ -691,20 +710,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.qkv_format = 'bshd'
 
         qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
-
-        if get_te_version() < PkgVersion("1.3.0"):
-            # TE 1.3.0 introduces precomputing max_seqlen to remove unnecessary kernels and D2H
-            # copies (#555)
-            # These two arguments did not exist prior to 1.3.0
-            packed_seq_kwargs.pop("max_seqlen_q", None)
-            packed_seq_kwargs.pop("max_seqlen_kv", None)
-
-        if get_te_version() < PkgVersion("1.10.0"):
-            # TE 1.8.0 introduces cu_seqlens_padded which is the cu_seqlens with paddings counted
-            # in each individual sequence in THD format dataset
-            # These two arguments did not exist prior to 1.8.0.Full support added in 1.10.0 (#1012)
-            packed_seq_kwargs.pop("cu_seqlens_q_padded", None)
-            packed_seq_kwargs.pop("cu_seqlens_kv_padded", None)
 
         # WAR for peak memory usage.
         # See https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/2388
