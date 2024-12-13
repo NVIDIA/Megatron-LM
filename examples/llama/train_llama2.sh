@@ -141,8 +141,6 @@ GPT_ARGS="
     --seq-length $SEQ_LENGTH \
     --max-position-embeddings $MAX_POSITION_EMBEDDINGS \
     --untie-embeddings-and-output-weights \
-    --position-embedding-type rope \
-    --no-position-embedding \
     --disable-bias-linear \
     --swiglu \
     --init-method-std 0.02 \
