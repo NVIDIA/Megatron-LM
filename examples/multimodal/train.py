@@ -49,7 +49,7 @@ def get_batch(data_iterator):
     pp_size = get_pipeline_model_parallel_world_size()
     if not is_first_or_last_stage(pp_size, args.encoder_pipeline_model_parallel_size):
         # Note these are all set to None above.
-        return tokens, labels, loss_mask, attention_mask, position_ids, imgs, num_tiles
+        return tokens, labels, loss_mask, attention_mask, position_ids, imgs, num_tiles, packed_seq_params
 
     # Broadcast data.
     torch.cuda.nvtx.range_push("get_data")
@@ -67,7 +67,7 @@ def get_batch(data_iterator):
     cu_lengths = tensor_parallel.broadcast_data(["cu_lengths"], data, torch.int32)["cu_lengths"]
     max_lengths = tensor_parallel.broadcast_data(["max_lengths"], data, torch.int32)["max_lengths"]
 
-    # Dummy image, no image.
+    # No image input (text-only sample) if the dataloader produced a dummy image.
     if imgs.shape == torch.Size([1, 1]):
         # FIXME: text-only data can cause a hang if the vision model is own its own pipeline rank and --freeze-ViT is enabled.
         imgs = torch.tensor([], dtype=torch.float32, device=data_text.device)

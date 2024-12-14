@@ -830,7 +830,7 @@ class LLaVAModel(MegatronModule):
             ).contiguous()  # [b, text_seq_len, h_language]
 
         # Assume 1 tile per image if the number of tiles is not provided.
-        if num_image_tiles is None:
+        if num_image_tiles is None and images is not None:
             num_image_tiles = torch.ones(images.shape[0], dtype=torch.int, device=input_ids.device)
 
         combined_embeddings, new_labels, new_loss_mask = self._preprocess_data(
