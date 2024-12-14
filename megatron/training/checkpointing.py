@@ -361,6 +361,12 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     # Collect rng state across data parallel ranks.
     rng_state = get_rng_state(ckpt_type != CheckpointType.LEGACY)
 
+    # Collect rerun state across all ranks
+    rerun_state_machine = get_rerun_state_machine()
+    rerun_state = rerun_state_machine.state_dict(
+        data_iterator=train_data_iterator, use_dist_ckpt=ckpt_type != CheckpointType.LEGACY
+    )
+
     # Checkpoint name.
     return_base_dir = (ckpt_type != CheckpointType.LEGACY)
     checkpoint_name = get_checkpoint_name(save_dir, iteration, release=False, pipeline_parallel=pipeline_parallel,
@@ -409,7 +415,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             use_dist_ckpt=ckpt_type != CheckpointType.LEGACY,
             iteration=iteration,
             optim_sd_kwargs=optim_sd_kwargs,
-            train_data_iterator=train_data_iterator,
+            rerun_state=rerun_state,
         )
 
         if args.enable_ft_package and ft_client is not None:
@@ -593,7 +599,7 @@ def save_dataloader_state(train_iterator, iteration, dataloader_save_path):
 
 def generate_state_dict(args, model, optimizer, opt_param_scheduler,
                         rng_state, use_dist_ckpt=False, iteration=None,
-                        optim_sd_kwargs=None, train_data_iterator=None):
+                        optim_sd_kwargs=None, rerun_state=None):
     # Arguments, iteration, and model.
     state_dict = {}
     state_dict['args'] = args
@@ -623,10 +629,7 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
                 opt_param_scheduler.state_dict()
 
     # Rerun state
-    rerun_state_machine = get_rerun_state_machine()
-    state_dict['rerun_state_machine'] = rerun_state_machine.get_checkpoint_state(
-        train_data_iterator
-    )
+    state_dict['rerun_state_machine'] = rerun_state
 
     # RNG states.
     if not args.no_save_rng:
@@ -1136,6 +1139,17 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 gen_sd_optim = None
                 gen_sd_opt_param_scheduler = None
 
+            # Determine if rerun state will be loaded
+            if (ckpt_tp_pp == run_tp_pp and not release and not args.finetune):
+                rerun_state_machine = get_rerun_state_machine()
+                gen_sd_rerun_state = rerun_state_machine.state_dict(
+                    data_iterator=None, use_dist_ckpt=True
+                )
+            else:
+                gen_sd_rerun_state = None
+                if ckpt_tp_pp != run_tp_pp:
+                    print_rank_0("{}: Rerun state will be ignored".format(mismatch_msg))
+
             # [ModelOpt]: Initial loading from non-resume sharded checkpoint to a Distillation Model
             # will result in key mismatch with loss modules potentially containing parameters, since
             # it requires generating a state_dict before loading. Here we hide those modules if present.
@@ -1145,7 +1159,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                         stack.enter_context(m.hide_loss_modules())
                 load_kwargs['sharded_state_dict'] = generate_state_dict(
                     args, model, gen_sd_optim, gen_sd_opt_param_scheduler, gen_sd_rng_state,
-                    use_dist_ckpt=True, optim_sd_kwargs=optim_sd_kwargs, train_data_iterator=None
+                    use_dist_ckpt=True, optim_sd_kwargs=optim_sd_kwargs, rerun_state=gen_sd_rerun_state
                 )
                                                                         
             # When "--fp8-param-gather" is disabled, this function doesn't modify anything.
@@ -1268,7 +1282,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     # rerun state
     try:
         if 'rerun_state_machine' in state_dict:
-            get_rerun_state_machine().set_checkpoint_state(state_dict['rerun_state_machine'])
+            get_rerun_state_machine().load_state_dict(state_dict['rerun_state_machine'])
     except Exception as e:
         print(f"Unable to restore RerunMachine from checkpoint: {e}")
         sys.exit()
