@@ -52,4 +52,5 @@ MODEL_ARGS:
   --deterministic-mode: true
   --attention-softmax-in-fp32: true
   --ckpt-format: torch
+  --attention-backend: unfused
 TEST_TYPE: regular
