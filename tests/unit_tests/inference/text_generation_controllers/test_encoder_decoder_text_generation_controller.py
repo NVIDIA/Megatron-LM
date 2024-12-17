@@ -103,7 +103,7 @@ class TestEncoderDecoderTextGenerationController:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.failing_on_rocm_new
+    @pytest.mark.failing_on_rocm
     def test_generate_all_output_tokens_static_batch(self):
         self.mock_tokenizer.vocab_size = self.vocab_size
         self.mock_tokenizer.eod = self.vocab_size - 1

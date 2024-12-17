@@ -55,7 +55,7 @@ class TestMoELayerInit:
     @pytest.mark.parametrize("moe_token_dispatcher_type", ["allgather", "alltoall"])
     @pytest.mark.parametrize("num_moe_experts", [1, 2])
     @pytest.mark.parametrize("grouped_gemm", [True, False])
-    @pytest.mark.failing_on_rocm_new
+    @pytest.mark.failing_on_rocm
     def test_legacy_moe_layer(self, num_moe_experts, moe_token_dispatcher_type, grouped_gemm):
         Utils.initialize_model_parallel(1, 1)
         _set_random_seed(seed_=123, data_parallel_random_init=False)

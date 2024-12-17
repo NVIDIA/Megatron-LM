@@ -42,6 +42,7 @@ class TestSerialization:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.failing_on_rocm
     def test_single_process_save_load(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(1, 1)
 

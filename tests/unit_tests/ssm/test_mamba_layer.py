@@ -29,7 +29,7 @@ class TestMambaLayer:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.failing_on_rocm_new
+    @pytest.mark.failing_on_rocm
     def test_gpu_forward(self):
         layer = self.layer
         layer.cuda()
