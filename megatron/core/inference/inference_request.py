@@ -5,7 +5,7 @@ from typing import List
 
 import torch
 
-from megatron.core.inference.common_inference_params import CommonInferenceParams
+from megatron.core.inference.sampling_params import SamplingParams
 
 
 # class syntax
@@ -28,7 +28,7 @@ class InferenceRequest:
 
     request_id: str
     prompt: str
-    inference_parameters: CommonInferenceParams
+    inference_parameters: SamplingParams
     prompt_tokens: List[int]
     arrival_time: float
     status: Status

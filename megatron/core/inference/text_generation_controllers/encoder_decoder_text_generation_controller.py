@@ -4,15 +4,15 @@ from typing import OrderedDict
 import torch
 
 from megatron.core.inference.inference_request import InferenceRequest
-from megatron.core.inference.text_generation_controllers.simple_text_generation_controller import (
-    SimpleTextGenerationController,
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
 )
 
 
-class EncoderDecoderTextGenerationController(SimpleTextGenerationController):
+class EncoderDecoderTextGenerationController(TextGenerationController):
     """The text generation controller for encoder-decoder architecture
 
-    This class ingherits from SimpleTextGenerationController, adding features
+    This class inherits from TextGenerationController, adding features
     relating to encoder input encoder_prompt
 
     """
