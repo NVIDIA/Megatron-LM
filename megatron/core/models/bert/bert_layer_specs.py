@@ -1,4 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+import warnings
+
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
@@ -28,38 +30,60 @@ try:
     HAVE_APEX = True
     LNImpl = FusedLayerNorm
 except ImportError:
-    import warnings
 
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-    warnings.warn(f'Apex is not installed. Falling back to Torch Norm')
+    warnings.warn('Apex is not installed. Falling back to Torch Norm')
     LNImpl = WrappedTorchNorm
 
-# Use this spec to use lower level Transformer Engine modules (required for fp8 training)
-bert_layer_with_transformer_engine_spec = ModuleSpec(
-    module=TransformerLayer,
-    submodules=TransformerLayerSubmodules(
-        self_attention=ModuleSpec(
-            module=SelfAttention,
-            params={"attn_mask_type": AttnMaskType.padding},
-            submodules=SelfAttentionSubmodules(
-                linear_qkv=TELayerNormColumnParallelLinear,
-                core_attention=TEDotProductAttention,
-                linear_proj=TERowParallelLinear,
-                q_layernorm=IdentityOp,
-                k_layernorm=IdentityOp,
+
+def get_bert_layer_with_transformer_engine_spec():
+    """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
+
+    Returns:
+        ModuleSpec: Module specification with TE modules
+    """
+    if not HAVE_TE:
+        raise ImportError(
+            "Transformer Engine is not installed. Please use local Bert layer spec instead."
+        )
+
+    return ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            self_attention=ModuleSpec(
+                module=SelfAttention,
+                params={"attn_mask_type": AttnMaskType.padding},
+                submodules=SelfAttentionSubmodules(
+                    linear_qkv=TELayerNormColumnParallelLinear,
+                    core_attention=TEDotProductAttention,
+                    linear_proj=TERowParallelLinear,
+                    q_layernorm=IdentityOp,
+                    k_layernorm=IdentityOp,
+                ),
             ),
-        ),
-        self_attn_bda=get_bias_dropout_add,
-        mlp=ModuleSpec(
-            module=MLP,
-            submodules=MLPSubmodules(
-                linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
+            self_attn_bda=get_bias_dropout_add,
+            mlp=ModuleSpec(
+                module=MLP,
+                submodules=MLPSubmodules(
+                    linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
+                ),
             ),
+            mlp_bda=get_bias_dropout_add,
         ),
-        mlp_bda=get_bias_dropout_add,
-    ),
-)
+    )
+
+
+def __getattr__(name):
+    if name == 'bert_layer_with_transformer_engine_spec':
+        warnings.warn(
+            """Attribute bert_layer_specs.bert_layer_with_transformer_engine_spec is on a
+            deprecation track and will be removed in future releases. Please migrate to
+            bert_layer_specs.get_bert_layer_with_transformer_engine_spec()."""
+        )
+
+        return get_bert_layer_with_transformer_engine_spec()
+
 
 # Use this spec for an implementation using only modules in megatron core
 bert_layer_local_spec = ModuleSpec(
