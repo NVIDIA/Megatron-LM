@@ -307,7 +307,7 @@ class SimpleTextGenerationController:
                 if self.model_is_pipeline_parallel:
                     context_length = context_end_position - context_start_position
                     logits = broadcast_from_last_pipeline_stage(
-                        [batch_size, context_length, self.tokenizer.vocab_size],
+                        [batch_size, context_length, self.inference_wrapped_model.model.vocab_size],
                         dtype=self.inference_wrapped_model.inference_wrapper_config.params_dtype,
                         tensor=logits,
                     )
@@ -318,7 +318,7 @@ class SimpleTextGenerationController:
                 generation_started = prompt_lengths_in_batch <= context_end_position
                 last_token_logits = logits[:, -1, :]
                 sampled_logits = self.sample_from_logits(
-                    last_token_logits, common_inference_params, self.tokenizer.vocab_size
+                    last_token_logits, common_inference_params, self.inference_wrapped_model.model.vocab_size
                 )
 
                 # Substitute the sampled logits only for only the prompts that

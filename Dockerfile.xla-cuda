@@ -1,0 +1,23 @@
+FROM us-central1-docker.pkg.dev/tpu-pytorch-releases/docker/xla:r2.5.0_3.10_cuda_12.4
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PJRT_DEVICE=CUDA
+
+RUN pip3 install --extra-index-url https://pypi.nvidia.com --no-cache-dir --upgrade-strategy only-if-needed -v \
+    einops \
+    flask-restful \
+    nltk \
+    pytest \
+    pytest-cov \
+    pytest_mock \
+    pytest-random-order \
+    sentencepiece \
+    tiktoken \
+    wrapt \
+    zarr \
+    wandb \
+    tensorstore==0.1.45 \
+    pynvml==11.5.3 \
+    triton==3.1.0
+
+WORKDIR /megatron
