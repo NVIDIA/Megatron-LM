@@ -60,6 +60,11 @@ RUN git clone --recursive https://github.com/ROCm/TransformerEngine.git &&\
     cd TransformerEngine &&\
     pip install .
 
+RUN git clone https://github.com/caaatch22/grouped_gemm.git &&\
+    git checkout rocm &&\
+    git submodule update --init --recursive &&\
+    pip install .
+
 WORKDIR $WORKSPACE_DIR
 COPY . Megatron-LM
 WORKDIR $WORKSPACE_DIR/Megatron-LM

@@ -115,7 +115,7 @@ class TestExpertLayerReconfiguration:
             (False, (1, 1, 4, 1), (8, 1, 1, 8), True),
         ],
     )
-    @pytest.mark.failing_on_rocm
+
     @pytest.mark.parametrize("expert_type", expert_type)
     @pytest.mark.parametrize(
         "load_order,store_order",
@@ -226,7 +226,7 @@ class TestExpertLayerReconfiguration:
         ],
     )
     @pytest.mark.parametrize("src_module,dest_module", src_dest_expert_type)
-    @pytest.mark.failing_on_rocm
+
     def test_sequential_grouped_mlp_interchangeable(
         self, tmp_path_dist_ckpt, src_tp_pp_exp, dest_tp_pp_exp, use_glu, src_module, dest_module
     ):
