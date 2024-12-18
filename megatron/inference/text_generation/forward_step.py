@@ -6,11 +6,10 @@ from collections.abc import Iterable
 
 import torch
 
+from megatron.core import InferenceParams, mpu
 from megatron.training import get_args
-from megatron.core import mpu, InferenceParams
-from .communication import (
-    send_to_next_pipeline_rank,
-    recv_from_prev_pipeline_rank_)
+
+from .communication import recv_from_prev_pipeline_rank_, send_to_next_pipeline_rank
 
 
 class ForwardStep:
@@ -46,7 +45,7 @@ class ForwardStep:
         # This runs only if current_batch_x_seqlen > args.inference_batch_times_seqlen_threshold
         # and requires setting args.pipeline_model_parallel > 1. The batch will be split into
         # smaller microbatches to be pipelined through the stages.
-        if self.pipeline_size_larger_than_one:
+        if self.pipeline_size_larger_than_one and self.pipelining_batch_x_seqlen != -1:
             seq_len = tokens.size(1) if recv_buffer_seq_length is None else recv_buffer_seq_length
             current_batch_x_seqlen = tokens.size(0) * seq_len
             if current_batch_x_seqlen >= self.pipelining_batch_x_seqlen:
