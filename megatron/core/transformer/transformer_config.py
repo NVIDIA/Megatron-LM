@@ -358,6 +358,11 @@ class TransformerConfig(ModelParallelConfig):
     enable_cuda_graph: bool = False
     """When set to true, TransformerLayer layers are swapped with a CUDA graphed version."""
 
+    cuda_graph_retain_backward_graph: bool = False
+    """When set to true, cudagraph backward passes will be graph captured with 'retain_grad=True'
+    This may enable cudagraphs for certain modules that are not completely cudagraph safe. For 
+    more details, see: https://pytorch.org/docs/stable/generated/torch.Tensor.backward.html."""
+
     external_cuda_graph: bool = False
     """When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
 
