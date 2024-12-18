@@ -16,7 +16,7 @@ You can build a docker container using `examples/multimodal/Dockerfile` to run t
 
 ### Language model
 
-Follow the instructions in [Mistral](../../docs/llama_mistral.md#mistral-7b) to download weights for Mistral-7B-Instruct-v0.3 (Base or Instruct) from HuggingFace and convert to mcore format with tensor parallel size 4.
+Follow the instructions in [Mistral](../../docs/llama_mistral.md#mistral-7b) to download weights for Mistral-7B-Instruct-v0.3 from HuggingFace and convert to mcore format with tensor parallel size 4.
 Please use the tokenizer from HuggingFace.
 
 ### Vision model
@@ -113,7 +113,7 @@ Run the following script:
 
 ```
 examples/multimodal/text_generation_mistral_clip.sh --input-image-path /path/to/input/images --output-path /some/output/directory \
-    --model-path /path/to/model.pt --tokenizer-path /path/to/tokenizer/ --gt-path /path/to/groundtruth/file --task generation-task-name
+    --model-path /path/to/model.pt --gt-path /path/to/groundtruth/file --task generation-task-name
 ```
 
 where `--task generation-task-name` is the name of the evaluation benchmark such as `captioning` or `MMMU`.

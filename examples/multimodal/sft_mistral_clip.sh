@@ -29,11 +29,6 @@ if [[ -z $LOAD_ITER ]]; then
     exit 1
 fi
 
-if [[ -z $TOKENIZER_MODEL ]]; then
-    echo "Please set TOKENIZER_MODEL for tokenizer model name."
-    exit 1
-fi
-
 CHECKPOINT_DIR="${WORKSPACE}/${LOAD_NAME}/checkpoints"
 
 DATA_TRAIN="${SOURCE}/examples/multimodal/sft_dataset.yaml"
@@ -98,7 +93,7 @@ OPTIONS=" \
     --eval-iters 10 \
     --eval-interval 500 \
     --tokenizer-type MultimodalTokenizer \
-    --tokenizer-model ${WORKSPACE}/${TOKENIZER_MODEL} \
+    --tokenizer-model mistralai/Mistral-7B-Instruct-v0.3 \
     --tokenizer-prompt-format mistral \
     --data-path ${DATA_TRAIN} \
     --prompt-path ${SOURCE}/examples/multimodal/manual_prompts.json \
