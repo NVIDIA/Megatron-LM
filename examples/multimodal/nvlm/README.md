@@ -32,7 +32,7 @@ NVLM 1.0 34B starts from [NousResearch/Nous-Hermes-2-Yi-34B](https://huggingface
 Please download it and run the following command to convert it to Megatron format.
 ```
 python tools/checkpoint/convert.py --bf16 --model-type GPT --loader llama_mistral --saver mcore --target-tensor-parallel-size 8 --checkpoint-type hf \
-    --load-dir <hf model directory> --save-dir <output dir> --tokenizer-model <hf model directory> \
+    --load-dir <hf model directory> --save-dir <output dir> --tokenizer-model <hf model name/directory> \
     --saver-transformer-impl transformer_engine --model-size yi-34B --make-vocab-size-divisible-by 1
 ```
 
@@ -42,7 +42,7 @@ NVLM 1.0 72B starts from [Qwen/Qwen2-72B-Instruct](https://huggingface.co/Qwen/Q
 Please download it and run the following command to convert it to Megatron format.
 ```
 python tools/checkpoint/convert.py --bf16 --model-type GPT --loader llama_mistral --saver mcore --target-tensor-parallel-size 8 --checkpoint-type hf \
-    --load-dir <hf model directory> --save-dir <output directory> --tokenizer-model <hf model directory> \
+    --load-dir <hf model directory> --save-dir <output directory> --tokenizer-model <hf model name/directory> \
     --saver-transformer-impl transformer_engine --model-size qwen2.5-72Bf
 ```
 
