@@ -143,7 +143,7 @@ class TestSpecCustomization:
             hidden_size=12,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            window_size=[10, 0],
+            window_size=(10, 0),
         )
         # Make sure DotProductAttention throws (swa unsupported).
         threw = False
