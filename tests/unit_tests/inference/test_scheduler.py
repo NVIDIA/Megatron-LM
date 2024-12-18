@@ -2,8 +2,8 @@ from typing import Dict
 
 import torch
 
-from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.inference_request import InferenceRequest, Status
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.scheduler import Scheduler
 
 
@@ -25,7 +25,7 @@ class TestScheduler:
     def test_scheduler(self):
         prompt = "sample prompt"
         prompt_tokens = torch.randn(5)
-        inference_parameters = CommonInferenceParams()
+        inference_parameters = SamplingParams()
 
         for i in range(self.max_batch_size):
             self.scheduler.add_request(prompt, prompt_tokens, inference_parameters)

@@ -6,10 +6,10 @@ import sys
 from argparse import Namespace
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines.mcore_engine import MCoreEngine
-from megatron.core.inference.common_inference_params import CommonInferenceParams
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import GPTInferenceWrapper
 from megatron.core.inference.inference_request import InferenceRequest
-from megatron.core.inference.text_generation_controllers.simple_text_generation_controller import SimpleTextGenerationController
+from megatron.core.inference.text_generation_controllers.text_generation_controller import TextGenerationController
 from megatron.core.transformer.module import MegatronModule
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir, os.path.pardir)))
@@ -66,7 +66,7 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
     )
 
     inference_wrapped_model = GPTInferenceWrapper(model, inference_wrapper_config)
-    text_generation_controller = SimpleTextGenerationController(inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer)
+    text_generation_controller = TextGenerationController(inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer)
     return MCoreEngine(text_generation_controller=text_generation_controller, max_batch_size=args.max_batch_size)
             
 def main():
@@ -89,7 +89,7 @@ def main():
 
     inference_engine = get_inference_engine(args, model)
 
-    common_inference_params = CommonInferenceParams(
+    sampling_params = SamplingParams(
         temperature=args.temperature, 
         top_k=args.top_k, 
         top_p=args.top_p, 
@@ -97,7 +97,7 @@ def main():
         num_tokens_to_generate=args.num_tokens_to_generate)
 
     results: List[InferenceRequest] = inference_engine.generate(
-        prompts=args.prompts, common_inference_params=common_inference_params
+        prompts=args.prompts, sampling_params=sampling_params
     )
     
     if torch.distributed.get_rank() == 0:

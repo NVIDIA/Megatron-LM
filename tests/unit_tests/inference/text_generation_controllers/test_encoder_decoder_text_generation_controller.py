@@ -10,7 +10,6 @@ import numpy as np
 import pytest
 import torch
 
-from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
@@ -18,6 +17,7 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
 from megatron.core.inference.model_inference_wrappers.t5.t5_inference_wrapper import (
     T5InferenceWrapper,
 )
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.encoder_decoder_text_generation_controller import (
     EncoderDecoderTextGenerationController,
 )
@@ -126,7 +126,7 @@ class TestEncoderDecoderTextGenerationController:
                 request_id=i,
                 prompt=prompt,
                 encoder_prompt=encoder_prompt,
-                inference_parameters=CommonInferenceParams(num_tokens_to_generate=10),
+                inference_parameters=SamplingParams(num_tokens_to_generate=10),
                 arrival_time=time.time(),
                 prompt_tokens=prompt_tokens,
                 status=Status.ACTIVE_BUT_NOT_GENERATING_TOKENS,

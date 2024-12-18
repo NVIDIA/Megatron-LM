@@ -3,12 +3,12 @@ from typing import Dict, List
 
 import torch
 
-from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.inference_request import InferenceRequest
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.scheduler import Scheduler
-from megatron.core.inference.text_generation_controllers.simple_text_generation_controller import (
-    SimpleTextGenerationController,
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
 )
 
 
@@ -19,7 +19,7 @@ class MCoreEngine(AbstractEngine):
     Supports any model that is callable (Accepts the inputs and outputs the tensor)
 
     Args:
-        text_generation_controller (SimpleTextGenerationController): A text generation
+        text_generation_controller (TextGenerationController): A text generation
             controller that will be used to define how to preprocess prompts, generate
             outputs and detokenizer the output tokens.
         max_batch_size : The maxinum number of requests to process at once
@@ -29,7 +29,7 @@ class MCoreEngine(AbstractEngine):
 
     def __init__(
         self,
-        text_generation_controller: SimpleTextGenerationController,
+        text_generation_controller: TextGenerationController,
         max_batch_size,
         random_seed: int = None,
     ):
@@ -42,7 +42,8 @@ class MCoreEngine(AbstractEngine):
         prompts: List[str],
         add_BOS: bool = False,
         encoder_prompts: List[str] = None,
-        common_inference_params: CommonInferenceParams = None,
+        common_inference_params: SamplingParams = None,
+        sampling_params: SamplingParams = None,
     ) -> dict:
         """The megatron core inference backend generate function
 
@@ -54,13 +55,19 @@ class MCoreEngine(AbstractEngine):
             prompts (List[str]): All the prompts as a list of strings
             add_BOS (bool): Whether to add BOS token to beginning of prompts
             encoder_prompts (List[dict]): All the encoder prompts as a list of strings
-            common_inference_params (CommonInferenceParams): The inference parameters
+            common_inference_params: Deprecated. Only used for backward compatibility with
+            MCore <= 0.9.0. Use `sampling_params` going forward.
+            sampling_params (SamplingParams): The request-level sampling parameters
 
         Returns:
             List[InferenceRequest]: The output is list of inference requests containing the
             generated tokens, texts and log probs if required
         """
         # TODO :M core- get rng state tracker
+
+        if common_inference_params:
+            sampling_params = common_inference_params
+
         if self.random_seed:
             torch.random.manual_seed(self.random_seed)
 
@@ -73,7 +80,7 @@ class MCoreEngine(AbstractEngine):
                 prompt=prompt,
                 prompt_tokens=prompt_tokens,
                 encoder_prompt=encoder_prompt,
-                inference_parameters=common_inference_params,
+                inference_parameters=sampling_params,
             )
 
         self.run_engine()
