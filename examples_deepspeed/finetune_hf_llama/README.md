@@ -10,9 +10,9 @@ The pre-trained weights can be found at [Hugging Face - LLAMA-7B](https://huggin
 
 #### 1. Converting Hugging Face Model Weights to Megatron-Deepspeed Model
 ```bash
-bash examples_deepspeed/finetune_hf_llama/finetune_llama.sh convert
+bash examples_deepspeed/finetune_hf_llama/finetune_llama.sh convert_hf2mds
 ```
-This command writes the Hugging Face model weights into the Megatron-Deepspeed model and saves it. You can adjust the parallel configuration in the script.
+This command writes the Hugging Face model weights into the Megatron-Deepspeed model and saves it. You can adjust the parallel configuration in the script.```convert_mds2hf``` can convert a Megatron-Deepspeed model into the Hugging Face format
 
 #### 2. Fine-tuning Process
 ```bash

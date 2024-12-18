@@ -193,28 +193,43 @@ class refactor:
         wk = self.hf_model[hf_wk_name]
         wv = self.hf_model[hf_wv_name]
 
-        hidden_size = wq.shape[0]
-        per_partition_size, start_index, end_index = compute_partition_range(
-            hidden_size, self.tp_rank, self.tp_size)
-        hidden_size_per_attention_head = divide(hidden_size,
+        query_hidden_size = wq.shape[0]
+        kv_hidden_size = wk.shape[0]
+
+        per_partition_size, start_qindex, end_index = compute_partition_range(
+            query_hidden_size, self.tp_rank, self.tp_size)
+        _,start_kvindex, _= compute_partition_range(
+            kv_hidden_size, self.tp_rank, self.tp_size)
+
+        hidden_size_per_attention_head = divide(query_hidden_size,
                                                 self.config.num_attention_heads)
         num_attention_heads_per_partition = divide(self.config.num_attention_heads,
                                                    self.tp_size)
 
-        new_w = torch.zeros((per_partition_size * 3, wq.shape[1]), dtype=wq.dtype)
+        num_kv_heads_per_partition= divide(self.config.num_key_value_heads,
+                                                   self.tp_size)
+        qkv_size=(num_attention_heads_per_partition+2*num_kv_heads_per_partition)*hidden_size_per_attention_head
+        num_qheads_per_group=divide(self.config.num_attention_heads,self.config.num_key_value_heads)
+        num_groups =divide(num_attention_heads_per_partition,num_qheads_per_group)
+        new_w = torch.zeros((qkv_size, wq.shape[1]), dtype=wq.dtype)
 
-        for i in range(num_attention_heads_per_partition):
-            current_index = start_index + i * hidden_size_per_attention_head
-            next_index = current_index + hidden_size_per_attention_head
-            new_w_index = i * (3 * hidden_size_per_attention_head)
-            new_w[new_w_index: new_w_index + (3 * hidden_size_per_attention_head), :] = \
+        for i in range(num_groups):
+            query_current_index=start_qindex+i*num_qheads_per_group*hidden_size_per_attention_head
+            query_next_index=query_current_index+num_qheads_per_group*hidden_size_per_attention_head
+            kv_current_index=start_kvindex+i*hidden_size_per_attention_head
+            kv_next_kvindex=kv_current_index+hidden_size_per_attention_head
+
+            new_w_index=i* (num_qheads_per_group+2)*hidden_size_per_attention_head
+
+            new_w[new_w_index:new_w_index+(num_qheads_per_group+2)*hidden_size_per_attention_head,:]=\
                 torch.cat([
-                    wq[current_index: next_index, :],
-                    wk[current_index: next_index, :],
-                    wv[current_index: next_index, :]
-                ], dim=0)
+                    wq[query_current_index:query_next_index,:],
+                    wk[kv_current_index:kv_next_kvindex,:],
+                    wv[kv_current_index:kv_next_kvindex,:]
+                ],dim=0)
+
         self.record_mapping_info(
-            f"mega-ds:{pname,p.data.shape}<--hf{hf_wq_name,hf_wk_name,hf_wv_name,}  cat q,k,v [{current_index}:{next_index},:]  of q,k,v{wq.shape}"
+            f"mega-ds:{pname,p.data.shape}<--hf{hf_wq_name,hf_wk_name,hf_wv_name,}  cat q,k,v [{query_current_index}:{query_next_index},:]  of q,k,v{wq.shape}"
         )
         return new_w
 
@@ -383,17 +398,18 @@ class refactor:
         hidden_size = oldshape[-1]
         hidden_size_per_attention_head = divide(hidden_size,
                                                 self.config.num_attention_heads)
-        num_attention_heads_per_partition = divide(self.config.num_attention_heads,
-                                                   self.tp_size)
-        newshape = (self.tp_size, num_attention_heads_per_partition, 3, hidden_size_per_attention_head, hidden_size)
+        # MHA & GQA
+        group = divide(self.config.num_attention_heads, self.config.num_key_value_heads)
+        newshape = (self.config.num_key_value_heads, group + 2, hidden_size_per_attention_head, hidden_size)
         ds_w_out = ds_w_all_rank.reshape(*newshape)
-        self.hf_dict[hf_q_name] = copy.deepcopy(ds_w_out[:, :, 0, :, :].reshape(-1, oldshape[-1]))
-        self.hf_dict[hf_k_name] = copy.deepcopy(ds_w_out[:, :, 1, :, :].reshape(-1, oldshape[-1]))
-        self.hf_dict[hf_v_name] = copy.deepcopy(ds_w_out[:, :, 2, :, :].reshape(-1, oldshape[-1]))
+        query_weight, key_weight, value_weight = torch.split(ds_w_out, [group, 1, 1], dim=1)
+        self.hf_dict[hf_q_name] = copy.deepcopy(query_weight.reshape(-1, hidden_size))
+        self.hf_dict[hf_k_name] = copy.deepcopy(key_weight.reshape(-1, hidden_size))
+        self.hf_dict[hf_v_name] = copy.deepcopy(value_weight.reshape(-1, hidden_size))
+        del query_weight, key_weight, value_weight
 
 
     def transform_from_megads_to_hf(self):
-        use_gqa = True if self.num_attention_heads != self.num_key_value_heads else False
 
         for pname, p in self.ds_model.named_parameters():
             if pname in [
@@ -411,11 +427,7 @@ class refactor:
                 subname = mobj.group(2)
                 hf_layer = layer_num - self.offset_num
                 if subname in ["self_attention.query_key_value.weight"]:
-                    if not use_gqa:
-                        self._qkv_refactor_to_hf(pname, p, hf_layer)
-                    else:
-                        #TODO(billishyahao): Not impl yet ...
-                        assert False
+                    self._qkv_refactor_to_hf(pname, p, hf_layer)
                 elif subname in ["mlp.dense_h_to_4h.weight"]:
                     self._mlphto4h_dense_refactor_to_hf(pname, p, hf_layer)
                 elif subname in [
