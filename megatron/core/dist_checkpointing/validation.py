@@ -412,7 +412,7 @@ def validate_sharding_integrity(
         CheckpointingException for invalid access pattern
     """
 
-    if common_state_dict:
+    if common_state_dict is not None:
         _validate_common_state_dict(common_state_dict)
 
     if torch.distributed.get_rank() != 0:
