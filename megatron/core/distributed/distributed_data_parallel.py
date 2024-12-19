@@ -152,12 +152,20 @@ class DistributedDataParallel(_BaseDataParallel):
                     with_context_parallel=True
                 )
                 if self.ddp_config.average_in_collective:
-                    # Collective is averaging gradients in collective with data_parallel_group.
-                    assert (
-                        gradient_scaling_factor
-                        / parallel_state.get_data_parallel_world_size(with_context_parallel=True)
-                        == target_gradient_scaling_factor
-                    )
+                    if self.ddp_config.num_distributed_optimizer_instances == 1:
+                        # Collective is averaging gradients in collective with data_parallel_group.
+                        assert (
+                            gradient_scaling_factor
+                            / torch.distributed.get_world_size(group=data_parallel_group)
+                            == target_gradient_scaling_factor
+                        )
+                    else:
+                        # For non-expert parameters, gradient_scaling_factor is 1.
+                        # For expert parameters, gradient_scaling_factor is 1/ep_size.
+                        assert (gradient_scaling_factor == 1) or (
+                            gradient_scaling_factor
+                            == (1.0 / parallel_state.get_expert_model_parallel_world_size())
+                        )
                 else:
                     assert gradient_scaling_factor == target_gradient_scaling_factor
 
