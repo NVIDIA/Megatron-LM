@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron distributed optimizer."""
@@ -17,6 +18,8 @@ except ImportError:
     try:
         from apex.optimizers import FusedAdam as Adam
     except ImportError:
+        from torch.optim import AdamW as Adam
+
         HAVE_APEX_OR_TE = False
 
 from .. import parallel_state, tensor_parallel
@@ -31,6 +34,7 @@ from ..dist_checkpointing.mapping import (
 from ..dist_checkpointing.optimizer import get_param_id_to_sharded_param_map
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
 from ..distributed import ParamAndGradBuffer, shard_buffer
+from ..utils import is_real_cuda_device_available
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper
 from .optimizer_config import OptimizerConfig
@@ -407,9 +411,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 distributed checkpointing logic).
         """
 
-        assert (
-            HAVE_APEX_OR_TE
-        ), f'Please install Apex or Transformer Engine to use DistributedOptimizer.'
+        if is_real_cuda_device_available():
+            assert HAVE_APEX_OR_TE, f'Please install Apex or Transformer Engine to use '
+            'DistributedOptimizer.'
 
         super().__init__(
             optimizer,
@@ -418,9 +422,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             init_state_fn,
         )
 
+        try:
+            from habana_frameworks.torch.hpex.optimizers import FusedAdamW
+        except:
+            FusedAdamW = None
         assert isinstance(
-            optimizer, Adam
-        ), "Only Adam currently supported, due to checkpointing requirements."
+            optimizer, (Adam, FusedAdamW)
+        ), "Only Adam and FusedAdamW currently supported, due to checkpointing requirements."
 
         # Model grad buffer ranges.
         assert per_model_buffers is not None, "per_model_buffers must be provided"
@@ -575,8 +583,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         return state_dict
 
-    def load_state_dict(self, state_dict):
-        """Load the state dict.
+    def load_state_dict(self, state_dict, iteration):
+        """Load the state dict and iteration.
 
         As detailed in state_dict(), the state dict contains all non-
         parameter-related variables. This method is notably longer than
@@ -603,6 +611,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         - group_order : The index of a parameter within its group.
         - state_order : The index of a parameter within the shared parameter
             list.
+        iteration: step is used in optimizer __setstate__ function
         """
 
         # Get the Torch optimizer's state dict.
@@ -644,6 +653,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             (
                                 state_order,
                                 {
+                                    "step": iteration,
                                     "exp_avg": init_shard(),
                                     "exp_avg_sq": init_shard(),
                                 },

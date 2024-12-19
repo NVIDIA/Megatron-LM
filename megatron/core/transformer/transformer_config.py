@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Intel Corporation
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import types
@@ -53,6 +54,11 @@ class TransformerConfig(ModelParallelConfig):
     apply_residual_connection_post_layernorm: bool = False
     """If True, uses the original BERT residule connection ordering."""
 
+    apply_norm_post_sub_block: bool = False
+    """If set, use the following normalization ordering:
+    hidden = x + attention_norm(attention(x))
+    output = hidden + ffn_norm(feed_forward(hidden))"""
+
     layernorm_epsilon: float = 1e-5
     """Epsilon value for any LayerNorm operations."""
 
@@ -101,6 +107,10 @@ class TransformerConfig(ModelParallelConfig):
     calculate_per_token_loss: bool = False
     """Whether cross entropy loss is calculated over the actual number of non-padded tokens in the
     global batch, versus the default behavior of assuming all tokens are non-padded."""
+
+    attention_z_loss_coeff: float = 0.0
+    """Attention z-loss auxiliary loss coefficient.
+    Applied to regularize the partition function Z of the softmax function"""
 
     ####################
     # initialization
@@ -153,6 +163,18 @@ class TransformerConfig(ModelParallelConfig):
 
     apply_rope_fusion: bool = False
     """If True, use fused RoPE kernel."""
+
+    use_fused_rmsnorm: bool = True
+    """If True, use Fused RMSNorm kernel."""
+
+    use_fused_sdpa: bool = True
+    """If True, Enable Fused Scaled Dot Product Attention."""
+
+    use_fused_sdpa_with_recompute: bool = False
+    """If True, Enable Fused Scaled Dot Product Attention with recompute."""
+
+    use_fast_softmax: bool = False
+    """If True, Enable fast softmax in Fused Scaled Dot Product Attention."""
 
     ####################
     # activation recomputation
@@ -218,6 +240,9 @@ class TransformerConfig(ModelParallelConfig):
     fp8_multi_head_attention: bool = False
     """When set to True, use the FP8 implementation of Multi Head Attention."""
 
+    fp8_amax_reduce: bool = False
+    """Sync amax between workers"""
+
     ####################
     # MoE related
     ####################
@@ -254,12 +279,30 @@ class TransformerConfig(ModelParallelConfig):
     currently unsupported so should remain False."""
 
     moe_token_dispatcher_type: str = "allgather"
-    """The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather' and 'alltoall'."""
+    """The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather', 'alltoall' and 'alltoall_seq'."""
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
     moe_expert_capacity_factor: float = None
     """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token will be dropped. The default is None."""
+
+    moe_capacity_bins_num: int = 0
+    """moe_capacity_bins_num (int): Number of capacity bins to use in case of moe_expert_capacity_factor = None. The default is 0."""
+
+    moe_capacity_bins_exp_base: float = 1.5
+    """moe_capacity_bins_exp_base (float): In case of capacity bins, exponential growing factor for bin width. The default is 1.5."""
+
+    moe_capacity_bins_optimize_interval: int = 300
+    """moe_capacity_bins_optimize_interval (int): Interval for capacity bins optimization. The default is 300."""
+
+    moe_capacity_bins_optimize_max_group: int = 4
+    """moe_capacity_bins_optimize_max_group (int): Maximum number of experts to be grouped for capacity bins optimization. The default is 4."""
+
+    moe_capacity_bins_alignment: int = 64
+    """moe_capacity_bins_alignment (int): In case of capacity bins, required bins alignment. The default is 64."""
+
+    moe_configured_bins: Optional[list] = None
+    """moe_configured_bins (list, optional): Explicit configuration of capacity bin edges. The default is None."""
 
     moe_pad_expert_input_to_capacity: bool = False
     """moe_pad_expert_input_to_capacity (bool): If True, pads the input for each expert to match the expert capacity length, effective only after the moe_expert_capacity_factor is set. The default setting is False."""
@@ -267,6 +310,7 @@ class TransformerConfig(ModelParallelConfig):
     moe_token_drop_policy: str = 'probs'
     """The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.
     """
+
     moe_layer_recompute: bool = False
     """Memory optimization: checkpointing moe_layer to save actiavtion memory."""
 
@@ -324,7 +368,7 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(f'num_moe_experts must be non-negative.')
 
         if self.moe_expert_capacity_factor is not None:
-            if self.moe_token_dispatcher_type != "alltoall":
+            if self.moe_token_dispatcher_type not in ["alltoall", "alltoall_seq"]:
                 raise ValueError(
                     f'moe_expert_capacity_factor only works with alltoall token dispatcher'
                 )
@@ -336,9 +380,16 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.moe_pad_expert_input_to_capacity:
-            if self.moe_expert_capacity_factor is None:
+            if self.moe_expert_capacity_factor is None and self.moe_capacity_bins_num == 0:
                 raise ValueError(
-                    f'moe_expert_capacity_factor must be set to use moe_pad_expert_input_to_capacity'
+                    f'moe_expert_capacity_factor or moe_capacity_bins_num > 0 must be set to use moe_pad_expert_input_to_capacity'
+                )
+
+        if self.moe_capacity_bins_num != 0:
+            self.moe_pad_expert_input_to_capacity = True
+            if self.moe_expert_capacity_factor is not None:
+                raise ValueError(
+                    f'moe_expert_capacity_factor must be set to None when using moe_capacty_bins > 0'
                 )
 
         if self.cpu_offloading and (

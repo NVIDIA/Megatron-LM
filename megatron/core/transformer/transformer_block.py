@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import re
@@ -14,13 +15,26 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.transformer.rmsnorm import RMSNorm
+
+try:
+    from megatron.core.transformer.custom_layers.intel_transformer_engine import (
+        IntelTEDelayedScaling,
+    )
+except:
+    print("Could not import Intel Transformer Engine")
+
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
+from megatron.core.utils import (
+    is_real_cuda_device_available,
+    make_sharded_tensor_for_checkpoint,
+    make_viewless_tensor,
+)
 
 try:
     from megatron.core.transformer.custom_layers.transformer_engine import (
@@ -102,9 +116,14 @@ def _get_block_submodules(
             return spec.submodules
         elif issubclass(spec.module, BaseTransformerLayer):
             num_layers = get_num_layers_to_build(config)
+            if config.normalization not in ('LayerNorm', 'RMSNorm'):
+                raise Exception(
+                    f'Only LayerNorm and RMSNorm are currently supported, configured {config.normalization}'
+                )
+            layer_norm = LayerNormImpl if config.normalization == "LayerNorm" else RMSNorm
             return TransformerBlockSubmodules(
                 layer_specs=[spec] * num_layers,
-                layer_norm=LayerNormImpl,
+                layer_norm=layer_norm,
             )
         else:
             raise Exception(f"specialize for {spec.module.__name__}.")
@@ -253,6 +272,8 @@ class TransformerBlock(MegatronModule):
 
         def checkpoint_handler(forward_func):
             if self.config.fp8:
+                if not is_real_cuda_device_available():
+                    from intel_transformer_engine.distributed import checkpoint as te_checkpoint
                 return te_checkpoint(
                     forward_func,
                     self.config.distribute_saved_activations,
@@ -370,30 +391,57 @@ class TransformerBlock(MegatronModule):
             rng_context = nullcontext()
 
         if self.config.fp8:
-            import transformer_engine  # To keep out TE dependency when not training in fp8
+            if is_real_cuda_device_available():
+                import transformer_engine  # To keep out TE dependency when not training in fp8
 
-            if self.config.fp8 == "e4m3":
-                fp8_format = transformer_engine.common.recipe.Format.E4M3
-            elif self.config.fp8 == "hybrid":
-                fp8_format = transformer_engine.common.recipe.Format.HYBRID
+                if self.config.fp8 == "e4m3":
+                    fp8_format = transformer_engine.common.recipe.Format.E4M3
+                elif self.config.fp8 == "hybrid":
+                    fp8_format = transformer_engine.common.recipe.Format.HYBRID
+                else:
+                    raise ValueError("E4M3 and HYBRID are the only supported FP8 formats.")
+
+                fp8_recipe = TEDelayedScaling(
+                    config=self.config,
+                    fp8_format=fp8_format,
+                    override_linear_precision=(False, False, not self.config.fp8_wgrad),
+                )
+                fp8_group = None
+                if parallel_state.model_parallel_is_initialized():
+                    fp8_group = parallel_state.get_amax_reduction_group(with_context_parallel=True)
+                fp8_context = transformer_engine.pytorch.fp8_autocast(
+                    enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group
+                )
             else:
-                raise ValueError("E4M3 and HYBRID are the only supported FP8 formats.")
+                try:
+                    import intel_transformer_engine as te
+                except:
+                    import habana_transformer_engine as te
 
-            fp8_recipe = TEDelayedScaling(
-                config=self.config,
-                fp8_format=fp8_format,
-                override_linear_precision=(False, False, not self.config.fp8_wgrad),
-            )
-            fp8_group = None
-            if parallel_state.model_parallel_is_initialized():
-                fp8_group = parallel_state.get_amax_reduction_group(with_context_parallel=True)
-            fp8_context = transformer_engine.pytorch.fp8_autocast(
-                enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group
-            )
+                if self.config.fp8 == "e5m2":
+                    fp8_format = te.recipe.Format.E5M2
+                elif self.config.fp8 == "hybrid":
+                    fp8_format = te.recipe.Format.HYBRID
+                else:
+                    raise ValueError("E5M2 and HYBRID are the only supported FP8 formats.")
+
+                fp8_recipe = IntelTEDelayedScaling(
+                    config=self.config,
+                    fp8_format=fp8_format,
+                    override_linear_precision=te.recipe._OverrideLinearPrecision(
+                        False, False, not self.config.fp8_wgrad
+                    ),
+                )
+                fp8_group = None
+                if parallel_state.model_parallel_is_initialized():
+                    fp8_group = parallel_state.get_amax_reduction_group(with_context_parallel=False)
+                fp8_context = te.fp8_autocast(
+                    enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group
+                )
         else:
             fp8_context = nullcontext()
 
-        with rng_context and fp8_context:
+        with rng_context, fp8_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = self._checkpointed_forward(

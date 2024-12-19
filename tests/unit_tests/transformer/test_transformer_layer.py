@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 
@@ -12,6 +13,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from tests.unit_tests.test_utilities import Utils
+from megatron.core.utils import is_real_cuda_device_available
 
 
 class TestParallelTransformerLayer:
@@ -90,17 +92,33 @@ class TestParallelTransformerLayer:
 
 def get_tensor_shapes_for_tp(transformer_config, tp_size):
     hs = transformer_config.hidden_size
-    return {
-        'mlp.linear_fc1.layer_norm_weight': (hs,),
-        'mlp.linear_fc1.layer_norm_bias': (hs,),
-        'mlp.linear_fc1.weight': (hs * 4 // tp_size, hs),
-        'mlp.linear_fc1.bias': (hs * 4 // tp_size,),
-        'mlp.linear_fc2.weight': (hs, hs * 4 // tp_size),
-        'mlp.linear_fc2.bias': (hs,),
-        'self_attention.linear_proj.weight': (hs, hs // tp_size),
-        'self_attention.linear_proj.bias': (hs,),
-        'self_attention.linear_qkv.layer_norm_weight': (hs,),
-        'self_attention.linear_qkv.layer_norm_bias': (hs,),
-        'self_attention.linear_qkv.weight': (hs * 3 // tp_size, hs),
-        'self_attention.linear_qkv.bias': (hs * 3 // tp_size,),
-    }
+    if is_real_cuda_device_available():
+        return {
+            'mlp.linear_fc1.layer_norm_weight': (hs,),
+            'mlp.linear_fc1.layer_norm_bias': (hs,),
+            'mlp.linear_fc1.weight': (hs * 4 // tp_size, hs),
+            'mlp.linear_fc1.bias': (hs * 4 // tp_size,),
+            'mlp.linear_fc2.weight': (hs, hs * 4 // tp_size),
+            'mlp.linear_fc2.bias': (hs,),
+            'self_attention.linear_proj.weight': (hs, hs // tp_size),
+            'self_attention.linear_proj.bias': (hs,),
+            'self_attention.linear_qkv.layer_norm_weight': (hs,),
+            'self_attention.linear_qkv.layer_norm_bias': (hs,),
+            'self_attention.linear_qkv.weight': (hs * 3 // tp_size, hs),
+            'self_attention.linear_qkv.bias': (hs * 3 // tp_size,),
+        }
+    else:
+        return {
+            'pre_mlp_layernorm.weight': (hs,),
+            'pre_mlp_layernorm.bias': (hs,),
+            'mlp.linear_fc1.weight': (hs * 4 // tp_size, hs),
+            'mlp.linear_fc1.bias': (hs * 4 // tp_size,),
+            'mlp.linear_fc2.weight': (hs, hs * 4 // tp_size),
+            'mlp.linear_fc2.bias': (hs,),
+            'self_attention.linear_proj.weight': (hs, hs // tp_size),
+            'self_attention.linear_proj.bias': (hs,),
+            'input_layernorm.weight': (hs,),
+            'input_layernorm.bias': (hs,),
+            'self_attention.linear_qkv.weight': (hs * 3 // tp_size, hs),
+            'self_attention.linear_qkv.bias': (hs * 3 // tp_size,),
+        }

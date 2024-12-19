@@ -15,6 +15,7 @@ class TestAlltoAllDispatcher:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [
         (1, 8),
@@ -36,12 +37,7 @@ class TestAlltoAllDispatcher:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.timeout(120)
-    @pytest.mark.parametrize("tp_size,ep_size", [
-        (1, 8),
-        (8, 1),
-        (4, 2),
-        (1, 1),
-    ])
+    @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2), (1, 1)])
     def test_capacity_forward_backward(self, tp_size, ep_size):
         container = MoEModelTestContainer(
             tp_size=tp_size,
@@ -58,6 +54,7 @@ class TestAlltoAllDispatcher:
         container.dispacher_capacity_test()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [
         (1, 8),
@@ -66,8 +63,6 @@ class TestAlltoAllDispatcher:
         (1, 1)
     ])
     def test_capacity_padding_forward_backward(self, tp_size, ep_size):
-        import time
-        time.sleep(5)
         container = MoEModelTestContainer(
             tp_size=tp_size,
             ep_size=ep_size,

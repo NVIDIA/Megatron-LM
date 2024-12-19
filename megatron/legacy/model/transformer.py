@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Transformer."""
@@ -515,6 +516,9 @@ class ParallelAttention(MegatronModule):
         self.group_query_attention = args.group_query_attention
         self.num_query_groups = args.num_query_groups
 
+        self.cos_cached = None
+        self.sin_cached = None
+
         query_projection_size = config.kv_channels * config.num_attention_heads
         if self.group_query_attention:
             kv_projection_size = args.kv_channels * args.num_query_groups
@@ -785,8 +789,8 @@ class ParallelAttention(MegatronModule):
         # apply relative positional encoding (rotary embedding)
         if rotary_pos_emb is not None:
             q_pos_emb, k_pos_emb = rotary_pos_emb
-            query_layer = apply_rotary_pos_emb(query_layer, q_pos_emb,self.config)
-            key_layer = apply_rotary_pos_emb(key_layer, k_pos_emb,self.config)
+            query_layer = apply_rotary_pos_emb(query_layer, q_pos_emb,self.config, self.cos_cached, self.sin_cached)
+            key_layer = apply_rotary_pos_emb(key_layer, k_pos_emb,self.config, self.cos_cached, self.sin_cached)
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect

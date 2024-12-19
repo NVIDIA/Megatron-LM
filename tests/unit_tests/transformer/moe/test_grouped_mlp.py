@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import pytest
@@ -21,7 +22,10 @@ DEVICE_CAPABILITY = None
 if torch.cuda.is_available():
     DEVICE_CAPABILITY = torch.cuda.get_device_capability()
 
-_te_version = packaging.version.Version(version("transformer-engine"))
+try:
+    _te_version = packaging.version.Version(version("transformer-engine"))
+except:
+    _te_version = None
 
 
 class TestParallelGroupedMLP:
@@ -186,7 +190,7 @@ class TestParallelGroupedMLP:
 
 
 @pytest.mark.skipif(
-    _te_version < packaging.version.Version("1.9.0.dev0"),
+    _te_version and _te_version < packaging.version.Version("1.9.0.dev0"),
     reason="TE Grouped MLP is only supported in TE 1.9.0.dev0 and later.",
 )
 class TestTEGroupedMLP:

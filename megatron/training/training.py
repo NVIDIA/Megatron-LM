@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Pretrain utilities."""
@@ -19,7 +20,14 @@ _TRAIN_START_TIME = time.time()
 import torch
 
 from megatron.core import mpu, tensor_parallel
-from megatron.core.utils import check_param_hashes_across_dp_replicas, get_model_config, StragglerDetector
+from megatron.core.utils import (
+    check_param_hashes_across_dp_replicas,
+    get_model_config,
+    StragglerDetector,
+    is_real_cuda_device_available,
+    found_kill_switch,
+    is_lazy_mode
+)
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.legacy.model import Float16Module
@@ -28,12 +36,16 @@ from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig
+from megatron.core.profiler import setup_profiler, trigger, on_step_begin, on_step_end
 from megatron.training.initialize import initialize_megatron
 from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
 from megatron.training.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.legacy.data.data_samplers import build_pretraining_data_loader
-from megatron.core.transformer.moe.moe_utils import track_moe_metrics
+from megatron.core.transformer.dot_product_attention import track_attention_z_loss_metrics
+from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_utils import track_moe_metrics, optimize_moe_capacity
+from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.num_microbatches_calculator import (
     get_current_global_batch_size,
@@ -199,8 +211,13 @@ def pretrain(train_valid_test_dataset_provider,
     if args.log_progress:
         append_to_progress_log("Starting job")
 
-    # Set pytorch JIT layer fusion options and warmup JIT functions.
-    set_jit_fusion_options()
+    if found_kill_switch(args):
+        print_datetime(f"Detected kill switch at {args.kill_switch_file}. Exiting")
+        sys.exit()
+
+    if is_real_cuda_device_available() or not is_lazy_mode():
+        # Set pytorch JIT layer fusion options and warmup JIT functions.
+        set_jit_fusion_options()
 
     # Adjust the startup time so it reflects the largest value.
     # This will be closer to what scheduler will see (outside of
@@ -435,7 +452,15 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     # GPU allocation.
     for model_module in model:
+        if is_lazy_mode():
+            # store param attributes as they are lost after moving to device in lazy
+            param_attr = {}
+            for name, param in model_module.named_parameters():
+                param_attr[name] = param.__dict__
         model_module.cuda(torch.cuda.current_device())
+        if is_lazy_mode():
+            for name, param in model_module.named_parameters():
+                param.__dict__ = param_attr[name]
 
     # Fp16 conversion.
     if args.fp16 or args.bf16:
@@ -551,7 +576,7 @@ def setup_model_and_optimizer(model_provider_func,
         })
         timers('load-checkpoint', log_level=0).start(barrier=True)
         args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
-            model, optimizer, opt_param_scheduler)
+            model, optimizer, opt_param_scheduler, strict=args.load_strict)
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics({
@@ -569,6 +594,9 @@ def setup_model_and_optimizer(model_provider_func,
         unwrapped_model[0].init_state_dict_from_bert()
         if args.fp16:
             optimizer.reload_model_params()
+
+    if args.use_torch_compile:
+        model[0] = torch.compile(model[0], backend='hpu_backend')
 
     return model, optimizer, opt_param_scheduler
 
@@ -609,6 +637,7 @@ def train_step(forward_step_func, data_iterator,
     # Update parameters.
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    assert grad_norm > 0. and grad_norm != float("inf"), f"{grad_norm=}"
     timers('optimizer').stop()
 
     # Vision momentum.
@@ -757,6 +786,13 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
             writer.add_scalar(key , loss_dict[key], iteration)
             writer.add_scalar(key + ' vs samples', loss_dict[key],
                               args.consumed_train_samples)
+            writer.add_scalar(key + ' vs tokens', loss_dict[key],
+                              args.consumed_train_samples * args.seq_length)
+            writer.add_scalar(f"lm-loss-training/{key}", loss_dict[key] , iteration)
+            writer.add_scalar(f"lm-loss-training/{key}" + ' vs samples', loss_dict[key],
+                            args.consumed_train_samples)
+            writer.add_scalar(f"lm-loss-training/{key}" + ' vs tokens', loss_dict[key],
+                            args.consumed_train_samples * args.seq_length)
             if wandb_writer:
                 wandb_writer.log({key: loss_dict[key]}, iteration)
         if args.log_loss_scale_to_tensorboard:
@@ -775,6 +811,13 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
             writer.add_scalar('grad-norm', grad_norm, iteration)
             writer.add_scalar('grad-norm vs samples', grad_norm,
                               args.consumed_train_samples)
+            writer.add_scalar('grad-norm vs tokens', grad_norm,
+                              args.consumed_train_samples * args.seq_length)
+            writer.add_scalar('grad-norm/grad-norm', grad_norm, iteration)
+            writer.add_scalar('grad-norm/grad-norm vs samples', grad_norm,
+                            args.consumed_train_samples)
+            writer.add_scalar('grad-norm/grad-norm vs tokens', grad_norm,
+                            args.consumed_train_samples * args.seq_length)
             if wandb_writer:
                 wandb_writer.log({'grad-norm': grad_norm}, iteration)
         if num_zeros_in_grad is not None:
@@ -806,9 +849,15 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                 mem_stats["allocation.all.current"],
                 iteration,
             )
+
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_moe_metrics(moe_loss_scale, iteration, writer, wandb_writer, total_loss_dict, args.moe_per_layer_logging)
+
+    if args.attention_z_loss_coeff > 0.0:
+        z_loss_scale = 1 / get_num_microbatches()
+        track_attention_z_loss_metrics(z_loss_scale, iteration, writer, wandb_writer, total_loss_dict,
+                                       per_layer_logging=args.attention_per_layer_logging)
 
     if iteration % args.log_interval == 0:
         elapsed_time = timers('interval-time').elapsed(barrier=True)
@@ -816,6 +865,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
 
         throughput = num_floating_point_operations(args, batch_size) / (
             elapsed_time_per_iteration * 10**12 * args.world_size)
+        samples_per_second = batch_size / elapsed_time_per_iteration
+        tokens_per_second = samples_per_second * args.seq_length
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
 
@@ -829,11 +880,14 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(
             iteration, args.train_iters)
+        log_string += ' actual seqlen: {:5d} |'.format(args.seq_length)
         log_string += ' consumed samples: {:12d} |'.format(
             args.consumed_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time_per_iteration * 1000.0)
         if args.log_throughput:
+            log_string += f' samples per second: {samples_per_second:.3f} |'
+            log_string += f' tokens per second: {tokens_per_second:.3f} |'
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
             if args.log_timers_to_tensorboard:
                 if writer:
@@ -1014,6 +1068,15 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     report_memory_flag = True
     exit = False
 
+    gate_modules = []
+    num_experts_list = []
+    if args.num_experts is not None:
+        for _, module in model[0].named_modules():
+            if isinstance(module, TopKRouter):
+                gate_modules.append(module)
+            elif isinstance(module, MoELayer):
+                num_experts_list.append(module.num_local_experts)
+
     if args.manual_gc:
         # Disable the default garbage collector and perform the collection manually.
         # This is to align the timing of garbage collection across ranks.
@@ -1057,7 +1120,14 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         with one_logger.get_context_manager():
             one_logger.store_set('get_e2e_base_metrics', get_e2e_base_metrics)
 
+    setup_profiler(args.profile_type,
+                   args.profile_ranks,
+                   args.profile_step_start,
+                   args.profile_step_end,
+                   args.tensorboard_dir)
+
     while iteration < args.train_iters:
+        trigger(on_step_begin)
         if args.profile and \
            iteration == args.profile_step_start and \
            torch.distributed.get_rank() in args.profile_ranks:
@@ -1133,6 +1203,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
             if args.use_distributed_optimizer and args.overlap_param_gather:
                 optimizer.enable_pre_hook()
+
+        if args.num_experts is not None and args.moe_capacity_bins_optimize_interval > 0 \
+            and iteration > 0 and iteration % args.moe_capacity_bins_optimize_interval == 0:
+            optimize_moe_capacity(global_rank=torch.distributed.get_rank(), gate_modules=gate_modules, num_experts=num_experts_list, step=iteration, max_grouped_experts=args.moe_capacity_bins_optimize_max_group)
 
         # Autoresume
         if args.adlr_autoresume and \
@@ -1219,6 +1293,18 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             exit = True
             break
 
+        # Exiting based on kill-switch
+        if found_kill_switch(args):
+            if args.save and not saved_checkpoint:
+                save_checkpoint_and_time(iteration, model, optimizer,
+                                         opt_param_scheduler,
+                                         num_floating_point_operations_so_far)
+            torch.distributed.barrier()
+            print_datetime(f"Detected kill switch at {args.kill_switch_path}, "
+                           f"iteration={iteration}. Exiting")
+            exit = True
+            break
+
         if args.profile and \
            iteration == args.profile_step_end and \
            torch.distributed.get_rank() in args.profile_ranks:
@@ -1227,6 +1313,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if args.manual_gc:
             if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:
                 gc.collect()
+        trigger(on_step_end)
 
     one_logger_utils.track_e2e_metrics()
 
@@ -1390,11 +1477,16 @@ def evaluate_and_print_results(prefix, forward_step_func,
             writer.add_scalar('{} validation vs samples'.format(key),
                               total_loss_dict[key].item(),
                               args.consumed_train_samples)
+            writer.add_scalar('{} validation vs tokens'.format(key),
+                              total_loss_dict[key].item(),
+                              args.consumed_train_samples * args.seq_length)
             if args.log_validation_ppl_to_tensorboard:
                 writer.add_scalar('{} validation ppl'.format(key), ppl,
                                   iteration)
                 writer.add_scalar('{} validation ppl vs samples'.format(key),
                                   ppl, args.consumed_train_samples)
+                writer.add_scalar('{} validation ppl vs tokens'.format(key), ppl,
+                                  args.consumed_train_samples * args.seq_length)
             if wandb_writer and is_last_rank():
                 wandb_writer.log({
                     '{} validation'.format(key): total_loss_dict[key].item()},

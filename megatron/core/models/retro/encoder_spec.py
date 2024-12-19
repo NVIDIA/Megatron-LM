@@ -1,7 +1,9 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 
 """Specs for Retro encoder."""
 
+from megatron.core.fusions.fused_dot_product_attention import FusedDotProductAttention
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -47,6 +49,16 @@ except ImportError:
     warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
     LNImpl = WrappedTorchLayerNorm
 
+try:
+    from megatron.core.transformer.custom_layers.intel_transformer_engine import (
+        IntelTEColumnParallelLinear,
+        IntelTEDotProductAttention,
+        IntelTENorm,
+        IntelTERowParallelLinear,
+    )
+except:
+    pass
+
 
 def get_retro_encoder_layer_te_spec() -> ModuleSpec:
     """Retro encoder TE spec (uses Transformer Engine components).
@@ -60,29 +72,55 @@ def get_retro_encoder_layer_te_spec() -> ModuleSpec:
         A module spec if Transformer Engine modules.
     """
     spec = get_gpt_layer_with_transformer_engine_spec()
-    spec.submodules.pre_cross_attn_layernorm = TENorm
+    if HAVE_TE:
+        core_attention_class = TEDotProductAttention
+        linear_fc1 = TEColumnParallelLinear
+        linear_fc2 = TERowParallelLinear
+        linear_kv = TEColumnParallelLinear
+        linear_proj = TERowParallelLinear
+        linear_q = TEColumnParallelLinear
+        normalization_class = TENorm
+    else:
+        enable_fsdpa = False
+        try:
+            from intel_transformer_engine.utils import is_gaudi3
+        except:
+            from habana_transformer_engine.utils import is_gaudi3
+        if is_gaudi3() and enable_fsdpa:
+            core_attention_class = IntelTEDotProductAttention
+        elif enable_fsdpa:
+            core_attention_class = FusedDotProductAttention
+        else:
+            core_attention_class = DotProductAttention
+        linear_fc1 = IntelTEColumnParallelLinear
+        linear_fc2 = IntelTERowParallelLinear
+        linear_kv = IntelTEColumnParallelLinear
+        linear_proj = IntelTERowParallelLinear
+        linear_q = IntelTEColumnParallelLinear
+        normalization_class = IntelTENorm
+    spec.submodules.pre_cross_attn_layernorm = normalization_class
     spec.submodules.cross_attention = ModuleSpec(
         module=RetroEncoderCrossAttention,
         params={
             "attn_mask_type": AttnMaskType.padding,
         },
         submodules=CrossAttentionSubmodules(
-            linear_q=TEColumnParallelLinear,
-            linear_kv=TEColumnParallelLinear,
-            core_attention=TEDotProductAttention,
-            linear_proj=TERowParallelLinear,
+            linear_q=linear_q,
+            linear_kv=linear_kv,
+            core_attention=core_attention_class,
+            linear_proj=linear_proj,
         ),
     )
     spec.submodules.cross_attn_bda = ModuleSpec(module=RetroEncoderBiasDropoutAdd)
     spec.submodules.pre_mlp_layernorm = ModuleSpec(
         module=RetroEncoderLayerNorm,
-        submodules=TENorm,
+        submodules=normalization_class,
     )
     spec.submodules.mlp = ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(
-            linear_fc1=TEColumnParallelLinear,
-            linear_fc2=TERowParallelLinear,
+            linear_fc1=linear_fc1,
+            linear_fc2=linear_fc2,
         ),
     )
     return spec
@@ -163,11 +201,28 @@ def get_retro_encoder_block_spec(
         else get_retro_encoder_layer_local_spec
     )
     retro_layer_spec = get_retro_encoder_layer_spec()
+    if use_transformer_engine:
+        if HAVE_TE:
+            module = TEDotProductAttention
+        else:
+            enable_fsdpa = False
+            try:
+                from intel_transformer_engine.utils import is_gaudi3
+            except:
+                from habana_transformer_engine.utils import is_gaudi3
+            if is_gaudi3() and enable_fsdpa:
+                module = IntelTEDotProductAttention
+            elif enable_fsdpa:
+                module = FusedDotProductAttention
+            else:
+                module = DotProductAttention
+    else:
+        module = DotProductAttention
     for spec in (gpt_layer_spec, retro_layer_spec):
         spec.params["hidden_dropout"] = config.retro_encoder_hidden_dropout
         spec.submodules.self_attention.params["attn_mask_type"] = AttnMaskType.padding
         spec.submodules.self_attention.submodules.core_attention = ModuleSpec(
-            module=TEDotProductAttention if use_transformer_engine else DotProductAttention,
+            module=module,
             params={
                 "attention_dropout": config.retro_encoder_attention_dropout,
             },

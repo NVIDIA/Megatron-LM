@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Processing large data for pretraining."""
@@ -94,7 +95,19 @@ class Encoder(object):
             doc_ids = []
             sentence_lens = []
             for sentence in sentences:
-                sentence_ids = Encoder.tokenizer.tokenize(sentence)
+                if self.args.binarize_only:
+                    if isinstance(sentence, str):
+                        # expected format: '0,23795,17282,55068,...'
+                        sentence_ids = sentence
+                        data_list = sentence_ids.split(",")
+                        sentence_ids = [int(element.strip()) for element in data_list]
+                    elif isinstance(sentence, list):
+                        # expected format: [0,23795,17282,55068,...]
+                        sentence_ids = list(sentence)
+                    else:
+                        assert False, f"Unsupported sentence format type for --binarize-only, type={type(sentence)}"
+                else:
+                    sentence_ids = Encoder.tokenizer.tokenize(sentence)
                 if len(sentence_ids) > 0:
                     doc_ids.extend(sentence_ids)
                     sentence_lens.append(len(sentence_ids))
@@ -191,6 +204,10 @@ def get_args():
                        help='Path to input JSON')
     group.add_argument('--json-keys', nargs='+', default=['text'],
                        help='space separate listed of keys to extract from json')
+    group.add_argument('--binarize-only', action='store_true',
+                       help='Input is already tokenized. Do binarize the tokens.')
+    group.add_argument('--read-only-input-path', action='store_true',
+                       help='When using partitions, avoid writing temp files to input path. Instead use output path.')
     group.add_argument('--split-sentences', action='store_true',
                        help='Split documents into sentences.')
     group.add_argument('--keep-newlines', action='store_true',
@@ -201,7 +218,8 @@ def get_args():
                        choices=['BertWordPieceLowerCase','BertWordPieceCase',
                                 'GPT2BPETokenizer', 'SentencePieceTokenizer',
                                 'GPTSentencePieceTokenizer', 'Llama2Tokenizer',
-                                'Llama3Tokenizer', 'MistralTokenizer', 'NullTokenizer'],
+                                'Llama3Tokenizer', 'MistralTokenizer',
+                                'ChameleonTokenizer', 'NullTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='YTTM tokenizer model.')
@@ -238,7 +256,7 @@ def get_args():
         print("Are you sure you don't want to split sentences?")
 
     # some default/dummy values for the tokenizer
-    args.rank = 1
+    args.rank = 0
     args.make_vocab_size_divisible_by = 128
     args.tensor_model_parallel_size = 1
     args.vocab_extra_ids = 0
@@ -248,9 +266,15 @@ def get_args():
 
 def get_file_name(args, file_id):
     file_name, extension = os.path.splitext(args.input)
-    input_file_name = file_name + "_" + str(file_id) + extension
-    sentence_split_file = file_name + "_ss_" + str(file_id) + extension
-    output_prefix = args.output_prefix + "_" + str(file_id)
+    if not args.read_only_input_path:
+        input_file_name = file_name + "_" + str(file_id) + extension
+        sentence_split_file = file_name + "_ss_" + str(file_id) + extension
+        output_prefix = args.output_prefix + "_" + str(file_id)
+    else:
+        # input path is RO, therefore use output path for partitioned files
+        input_file_name = os.path.join(args.output_prefix, "input_" + str(file_id))
+        sentence_split_file = os.path.join(args.output_prefix, "ss_" + str(file_id))
+        output_prefix = os.path.join(args.output_prefix, "output_" + str(file_id))
     file_names = {
         'partition': input_file_name,
         'sentence_split': sentence_split_file,
@@ -285,7 +309,8 @@ def main():
             'output_prefix': args.output_prefix}
         in_ss_out_names.append(file_names)
     else:
-        in_file_names = glob.glob(args.input)
+        pattern = args.input + '*' if args.read_only_input_path else args.input
+        in_file_names = glob.glob(pattern)
 
         # Count total number of lines across .jsonl files
         if args.keep_sequential_samples:
@@ -297,7 +322,7 @@ def main():
                 total_sample_count += (fc + 1)
             partition_size = math.ceil(total_sample_count / args.partitions)
 
-        # create .jsonl parition files
+        # create .jsonl partition files
         for idx in range(args.partitions):
             in_ss_out_name = get_file_name(args, idx)
             in_ss_out_names.append(in_ss_out_name)
@@ -312,6 +337,8 @@ def main():
             # populate .jsonl partition files from parent files
             partitioned_input_files = []
             for idx in range(args.partitions):
+                if args.read_only_input_path:
+                    os.makedirs(os.path.dirname(in_ss_out_names[idx]['partition']), exist_ok=True)
                 partitioned_input_file = open(in_ss_out_names[idx]['partition'], 'w')
                 partitioned_input_files.append(partitioned_input_file)
 

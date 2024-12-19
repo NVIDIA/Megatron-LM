@@ -1,3 +1,5 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+
 import json
 import os
 from typing import List, Union
@@ -70,6 +72,8 @@ class TestCIPipeline:
         if expected_metric in TYPE_OF_TEST_TO_METRIC[TypeOfTest.APPROX]:
             self._test_helper(expected_metric, expected_values, TypeOfTest.APPROX)
         else:
+            if not expected_values['values']:
+                pytest.skip(reason="skipping test as EXPECTED_METRICS_FILE is not set.")
             print(f"Skipping metric {expected_metric} for approximate as it is deterministic only.")
 
     @pytest.mark.skipif(allow_nondeterministic, reason="Cannot expect exact results")
@@ -79,6 +83,8 @@ class TestCIPipeline:
         if expected_metric in TYPE_OF_TEST_TO_METRIC[TypeOfTest.DETERMINISTIC]:
             self._test_helper(expected_metric, expected_values, TypeOfTest.DETERMINISTIC)
         else:
+            if not expected_values['values']:
+                pytest.skip(reason="skipping test as EXPECTED_METRICS_FILE is not set.")
             print(f"Skipping metric {expected_metric} for deterministic as it is approximate only.")
             
     # # @TODO: This is inactive, do we want to activate it?

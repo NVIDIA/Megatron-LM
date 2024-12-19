@@ -1,9 +1,18 @@
 #!/bin/bash
-set -euox pipefail
+
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+
+set -ex pipefail
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 CHECK_ONLY=${CHECK_ONLY:-false}
-CHANGED_FILES=$(git diff --name-only --diff-filter=d --merge-base origin/main megatron/core | grep '\.py$' || true)
+
+export BASE_REF='v1.19.0_next'
+if [ ! -z ${GIT_TARGET_BRANCH} ]; then
+    BASE_REF="${GIT_TARGET_BRANCH}"
+fi
+
+CHANGED_FILES=$(git diff --name-only --diff-filter=d --merge-base $(git remote)/${BASE_REF} megatron/core | grep '\.py$' || true)
 ADDITIONAL_ARGS=""
 ADDITIONAL_BLACK_ARGS=""
 

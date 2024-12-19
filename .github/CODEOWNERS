@@ -1,0 +1,16 @@
+# This is a comment.
+# Code owners are automatically requested for review
+# when someone opens a pull request that modifies code that they own.
+# Code owners are not automatically requested to review draft pull requests.
+#
+# To use a CODEOWNERS file, create a new file called CODEOWNERS
+# in the root, docs/, or .github/ directory of the repository,
+# in the branch where you'd like to add the code owners.
+# Each CODEOWNERS file assigns the code owners for a single branch in the repository.
+# Thus, you can assign different code owners for different branches.
+
+# Each line is a file pattern followed by one or more owners.
+# These owners will be the default owners for everything in
+# the repo. Unless a later match takes precedence,
+# below owners will be requested for review when someone opens a pull request.
+* @polisettyvarma

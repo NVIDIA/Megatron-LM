@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import json
@@ -10,8 +11,11 @@ except ImportError:
     raise ImportError("The 'transformers' package is not installed.")
 import gc
 import shutil
+from megatron.core.utils import is_real_cuda_device_available
 from tqdm import tqdm
 import types
+
+device = "cpu"
 
 
 def add_arguments(parser):
@@ -156,11 +160,11 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
     if num_shards == 1:
         # Not sharded
         # (The sharded implementation would also work, but this is simpler.)
-        loaded = torch.load(os.path.join(input_base_path, "consolidated.00.pth"), map_location="cpu")
+        loaded = torch.load(os.path.join(input_base_path, "consolidated.00.pth"), map_location=device)
     else:
         # Sharded
         loaded = [
-            torch.load(os.path.join(input_base_path, f"consolidated.{i:02d}.pth"), map_location="cpu")
+            torch.load(os.path.join(input_base_path, f"consolidated.{i:02d}.pth"), map_location=device)
             for i in range(num_shards)
         ]
     param_count = 0
@@ -332,14 +336,20 @@ def load_args_from_checkpoint(args):
 
 def set_preprocess_state(args, model, hf_model):
     '''Set embedding params.'''
-    model.language_model.embedding.word_embeddings.weight.data.copy_(
-        hf_model.model.embed_tokens.weight)
+    if args.use_legacy_models:
+        model.language_model.embedding.word_embeddings.weight.data.copy_(hf_model.model.embed_tokens.weight)
+    else:
+        model.embedding.word_embeddings.weight.data.copy_(hf_model.model.embed_tokens.weight)
 
 
 def set_postprocess_state(args, model, hf_model):
     '''Set output layer & norm params.'''
-    model.language_model.encoder.final_norm.weight.data.copy_(hf_model.model.norm.weight)
-    model.language_model.output_layer.weight.data.copy_(hf_model.lm_head.weight)
+    if args.use_legacy_models:
+        model.language_model.encoder.final_norm.weight.data.copy_(hf_model.model.norm.weight)
+        model.language_model.output_layer.weight.data.copy_(hf_model.lm_head.weight)
+    else:
+        model.decoder.final_layernorm.weight.data.copy_(hf_model.model.norm.weight)
+        model.output_layer.weight.data.copy_(hf_model.lm_head.weight)
 
 
 def set_attn_state(args, layer, hf_layer):
@@ -358,12 +368,25 @@ def set_attn_state(args, layer, hf_layer):
     assert nh % ng == 0
 
     # Copy weights (re-order dimensions for Megatron).
-    attn.query_key_value.weight.data.copy_(torch.cat([
-        hf_attn.q_proj.weight.reshape((ng, dim*nh//ng, -1)),
-        hf_attn.k_proj.weight.reshape((ng, dim, -1)),
-        hf_attn.v_proj.weight.reshape((ng, dim, -1)),
-    ], dim=1).reshape((-1, args.hidden_size)))
-    attn.dense.weight.data.copy_(hf_attn.o_proj.weight)
+    if args.use_legacy_models:
+        attn.query_key_value.weight.data.copy_(torch.cat([
+            hf_attn.q_proj.weight.reshape((ng, dim*nh//ng, -1)),
+            hf_attn.k_proj.weight.reshape((ng, dim, -1)),
+            hf_attn.v_proj.weight.reshape((ng, dim, -1)),
+        ], dim=1).reshape((-1, args.hidden_size)))
+        attn.dense.weight.data.copy_(hf_attn.o_proj.weight)
+    else:
+        attn.linear_qkv.weight.data.copy_(
+            torch.cat(
+                [
+                    hf_attn.q_proj.weight.reshape((ng, dim * nh // ng, -1)),
+                    hf_attn.k_proj.weight.reshape((ng, dim, -1)),
+                    hf_attn.v_proj.weight.reshape((ng, dim, -1)),
+                ],
+                dim=1,
+            ).reshape((-1, args.hidden_size))
+        )
+        attn.linear_proj.weight.data.copy_(hf_attn.o_proj.weight)
 
 
 def set_mlp_state(args, layer, hf_layer):
@@ -372,23 +395,44 @@ def set_mlp_state(args, layer, hf_layer):
     mlp = layer.mlp
     hf_mlp = hf_layer.mlp
 
-    mlp.dense_h_to_4h.weight.data.copy_(torch.cat([
-        hf_mlp.gate_proj.weight,
-        hf_mlp.up_proj.weight,
-    ], dim=0))
-    mlp.dense_4h_to_h.weight.data.copy_(hf_mlp.down_proj.weight)
+    if args.use_legacy_models:
+        mlp.dense_h_to_4h.weight.data.copy_(torch.cat([
+            hf_mlp.gate_proj.weight,
+            hf_mlp.up_proj.weight,
+        ], dim=0))
+        mlp.dense_4h_to_h.weight.data.copy_(hf_mlp.down_proj.weight)
+    else:
+        mlp.linear_fc1.weight.data.copy_(
+            torch.cat(
+                [
+                    hf_mlp.gate_proj.weight,
+                    hf_mlp.up_proj.weight,
+                ],
+                dim=0,
+            )
+        )
+        mlp.linear_fc2.weight.data.copy_(hf_mlp.down_proj.weight)
 
 
 def set_layer_state(args, model, hf_model, layer_idx):
     '''Set transformer layer params.'''
 
-    layer = model.language_model.encoder.layers[layer_idx]
+    if args.use_legacy_models:
+        layer = model.language_model.encoder.layers[layer_idx]
+    else:
+        layer = model.decoder.layers[layer_idx]
+
     hf_layer = hf_model.model.layers[layer_idx]
 
     set_attn_state(args, layer, hf_layer)
     set_mlp_state(args, layer, hf_layer)
-    layer.input_norm.weight.data.copy_(hf_layer.input_layernorm.weight)
-    layer.post_attention_norm.weight.data.copy_(hf_layer.post_attention_layernorm.weight)
+
+    if args.use_legacy_models:
+        layer.input_norm.weight.data.copy_(hf_layer.input_layernorm.weight)
+        layer.post_attention_norm.weight.data.copy_(hf_layer.post_attention_layernorm.weight)
+    else:
+        layer.input_layernorm.weight.data.copy_(hf_layer.input_layernorm.weight)
+        layer.pre_mlp_layernorm.weight.data.copy_(hf_layer.post_attention_layernorm.weight)
 
 
 def load_checkpoint_to_model(args):
@@ -403,16 +447,17 @@ def load_checkpoint_to_model(args):
         raise AttributeError(f"args.model_size={args.model_size} not supported")
 
     # Load Huggingface model.
-    hf_model = ModelForCausalLM.from_pretrained(args.load, torch_dtype=args.params_dtype, low_cpu_mem_usage=True, device_map="cpu")
+    hf_model = ModelForCausalLM.from_pretrained(args.load, torch_dtype=args.params_dtype, low_cpu_mem_usage=True, device_map=device)
 
     # Init Megatron model.
-    model = model_provider(True, True).to(args.params_dtype)
+    model = model_provider(True, True).to(args.params_dtype).to(device)
 
     # Set model state.
-    set_preprocess_state(args, model, hf_model)
-    set_postprocess_state(args, model, hf_model)
-    for layer_idx in tqdm(range(args.num_layers), "set layer states"):
-        set_layer_state(args, model, hf_model, layer_idx)
+    with torch.no_grad():
+        set_preprocess_state(args, model, hf_model)
+        set_postprocess_state(args, model, hf_model)
+        for layer_idx in tqdm(range(args.num_layers), "set layer states"):
+            set_layer_state(args, model, hf_model, layer_idx)
 
     return model
 
@@ -436,7 +481,7 @@ def _load_checkpoint(queue, args):
 
     try:
         from megatron.training.arguments import parse_args, validate_args
-        from megatron.training.global_vars import set_args, set_global_variables
+        from megatron.training.global_vars import set_args, set_global_variables, get_tokenizer
         from megatron.legacy.model import module
         from megatron.core import mpu
         from megatron.core.enums import ModelType
@@ -477,11 +522,40 @@ def _load_checkpoint(queue, args):
     # Arguments do sanity checks on the world size, but we don't care,
     # so trick it into thinking we are plenty of processes.
     margs.world_size = margs.tensor_model_parallel_size * margs.pipeline_model_parallel_size
+    margs.bf16 = args.bf16
+    margs.fp16 = args.fp16
 
     margs = validate_args(margs)
 
-    margs.use_legacy_models = True
-    margs.transformer_impl = args.loader_transformer_impl
+    # During MLM -> HF conversion, many training, model arguments are not saved in the final checkpoint or in config.json,
+    # so we need to load them from the source checkpoint.
+    # `source_megatron_args.json` is created during MLM to HF conversion, essential to make the final MLM, MLM (1) -> HF -> MLM (2) checkpoint consistent.
+    if args.source_margs_file is not None and os.path.exists(args.source_margs_file):
+        print(f"Loading arguments from {args.source_margs_file} ")
+        exclusions = {
+            "sequence_parallel",
+            "use_distributed_optimizer",
+            "verify_checkpoint",
+            "load",
+            "use_rotary_position_embeddings",
+            "tensor_model_parallel_size",
+            "pipeline_model_parallel_size",
+            "transformer_pipeline_model_parallel_size",
+            "consumed_train_samples",
+            "consumed_valid_samples",
+            "tokenizer_model"
+        }
+        with open(args.source_margs_file, "r") as f:
+            src_megatron_args = json.load(f)
+
+        for key, val in src_megatron_args.items():
+            if key not in exclusions and val is not None and getattr(margs, key, None) is not None and val != getattr(margs, key):
+                print(f"key: {key} replacing margs {getattr(margs, key)} with {val}")
+                setattr(margs, key, val)
+    else:
+        print("Argument `--source-margs-file` is not set or path doesn't exit. Default megatron arguments would be set.")
+
+    margs.params_dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
 
     def check_for_arg(arg_name, default=None):
         if getattr(margs, arg_name, None) is None:
@@ -510,16 +584,16 @@ def _load_checkpoint(queue, args):
     # Determine how to make our models.
     assert args.model_type == 'GPT', 'Llama-2, Llama-3 and Mistral are GPT models.'
     margs.model_type = ModelType.encoder_or_decoder
-    margs.params_dtype = torch.bfloat16 if args.bf16 else torch.float16 if args.fp16 else torch.float32
 
     # Suppress warning about torch.distributed not being initialized.
     module.MegatronModule.embedding_warning_printed = True
 
-    set_global_variables(margs, build_tokenizer=False)
+    set_global_variables(margs, build_tokenizer=True)
     mpu.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
-    fused_kernels.load(margs)
+    if is_real_cuda_device_available():
+        fused_kernels.load(margs)
 
     # Short aliases.
     tp_size = margs.tensor_model_parallel_size
@@ -560,7 +634,8 @@ def _load_checkpoint(queue, args):
             from llama.tokenizer import Tokenizer as Llama3Tokenizer
         except ImportError:
             raise AssertionError("Module 'llama' is required but not installed.")
-        tokenizer = Llama3Tokenizer(margs.tokenizer_model)
+
+        tokenizer = get_tokenizer()
         md.true_vocab_size = tokenizer.vocab_size
     else:
         md.true_vocab_size = None
@@ -578,13 +653,11 @@ def _load_checkpoint(queue, args):
         queue.put(msg)
 
     # Send embeddings.
-    message = {
-        "word embeddings": model.language_model.embedding.word_embeddings.weight.data
-    }
+    message = {"word embeddings": model.language_model.embedding.word_embeddings.weight.data if margs.use_legacy_models else model.embedding.word_embeddings.weight.data}
     if md.position_embedding_type == 'learned_absolute':
-        message["position embeddings"] = model.language_model.embedding.position_embeddings.weight.data
+        message["position embeddings"] = model.language_model.embedding.word_embeddings.weight.data if margs.use_legacy_models else model.embedding.word_embeddings.weight.data
     else:
-        assert not hasattr(model.language_model.embedding, 'position_embeddings')
+        assert not hasattr(model.language_model.embedding if margs.use_legacy_models else model.embedding, 'position_embeddings')
 
     queue_put("embeddings", message)
 
@@ -592,12 +665,18 @@ def _load_checkpoint(queue, args):
         message = {}
 
         # Get non-parallel tensors from tp_rank 0.
-        layer = model.language_model.encoder.layers[layer_num]
-        message["input norm weight"] = layer.input_norm.weight.data
-        message["post norm weight"] = layer.post_attention_norm.weight.data
+        if margs.use_legacy_models:
+            layer = model.language_model.encoder.layers[layer_num]
+            message["input norm weight"] = layer.input_norm.weight.data
+            message["post norm weight"] = layer.post_attention_norm.weight.data
+        else:
+            layer = model.decoder.layers[layer_num]
+            message["input norm weight"] = layer.input_layernorm.weight.data
+            message["post norm weight"] = layer.pre_mlp_layernorm.weight.data
+
         if md.linear_bias:
-            message["dense bias"] = layer.self_attention.dense.bias.data
-            message["mlp l1 bias"] = layer.mlp.dense_4h_to_h.bias.data
+            message["dense bias"] = layer.self_attention.dense.bias.data if margs.use_legacy_models else layer.self_attention.linear_proj.bias.data
+            message["mlp l1 bias"] = layer.mlp.dense_4h_to_h.bias.data if margs.use_legacy_models else layer.mlp.linear_fc2.bias.data
 
         # Grab all parallel tensors for this layer.
         qkv_weight = []
@@ -606,14 +685,23 @@ def _load_checkpoint(queue, args):
         mlp_l0_weight = []
         mlp_l0_bias = []
         mlp_l1_weight = []
-        layer = model.language_model.encoder.layers[layer_num]
-        qkv_weight.append(layer.self_attention.query_key_value.weight.data)
-        dense_weight.append(layer.self_attention.dense.weight.data)
-        mlp_l0_weight.append(layer.mlp.dense_h_to_4h.weight.data)
-        mlp_l1_weight.append(layer.mlp.dense_4h_to_h.weight.data)
+
+        if margs.use_legacy_models:
+            layer = model.language_model.encoder.layers[layer_num]
+            qkv_weight.append(layer.self_attention.query_key_value.weight.data)
+            dense_weight.append(layer.self_attention.dense.weight.data)
+            mlp_l0_weight.append(layer.mlp.dense_h_to_4h.weight.data)
+            mlp_l1_weight.append(layer.mlp.dense_4h_to_h.weight.data)
+        else:
+            layer = model.decoder.layers[layer_num]
+            qkv_weight.append(layer.self_attention.linear_qkv.weight.data)
+            dense_weight.append(layer.self_attention.linear_proj.weight.data)
+            mlp_l0_weight.append(layer.mlp.linear_fc1.weight.data)
+            mlp_l1_weight.append(layer.mlp.linear_fc2.weight.data)
+
         if md.linear_bias:
-            qkv_bias.append(layer.self_attention.query_key_value.bias.data)
-            mlp_l0_bias.append(layer.mlp.dense_h_to_4h.bias.data)
+            qkv_bias.append(layer.self_attention.query_key_value.bias.data if margs.use_legacy_models else layer.self_attention.linear_qkv.bias.data)
+            mlp_l0_bias.append(layer.mlp.dense_h_to_4h.bias.data if margs.use_legacy_models else layer.mlp.linear_fc1.bias.data)
 
         # Handle gated linear units.
         if md.swiglu:
@@ -643,14 +731,12 @@ def _load_checkpoint(queue, args):
 
     # Send final norm from tp_rank 0.
     message = {
-        "weight": model.language_model.encoder.final_norm.weight.data,
+        "weight": model.language_model.encoder.final_norm.weight.data if margs.use_legacy_models else model.decoder.final_layernorm.weight.data,
     }
     queue_put("final norm", message)
 
     if md.output_layer:
-        message = {
-            "weight": model.language_model.output_layer.weight.data
-        }
+        message = {"weight": model.language_model.output_layer.weight.data if margs.use_legacy_models else model.output_layer.weight.data}
         queue_put("output layer", message)
 
     queue.put("done")

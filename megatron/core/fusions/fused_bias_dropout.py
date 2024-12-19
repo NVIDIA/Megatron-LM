@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 from typing import Optional, Tuple
 
@@ -71,3 +72,38 @@ def get_bias_dropout_add(training, fused):
             return bias_dropout_add_fused_inference
     else:
         return bias_dropout_add_unfused(training)
+
+
+def _bias_dropout_norm_add_func(x_with_bias, residual, norm_op, prob, training):
+    # type: (Tuple[Tensor, Optional[Tensor]], Tensor, torch.nn.Module, float, bool) -> Tensor
+    """ Performs out = residual + norm(dropout(x + bias))
+
+        This method is based on _bias_dropout_add_func. Some comments were removed to avoid duplication.
+    """
+
+    x, bias = x_with_bias  # unpack
+
+    residual = residual if residual.dtype == x.dtype else residual.to(x.dtype)
+
+    if bias is not None:
+        x = x + bias
+        out = torch.nn.functional.dropout(x, p=prob, training=training)
+        out = norm_op(out)
+        out = residual + out
+        return out
+    else:
+        out = torch.nn.functional.dropout(x, p=prob, training=training)
+        out = norm_op(out)
+        out = residual + out
+        return out
+
+
+def bias_dropout_norm_add_unfused(training):
+    def _bias_dropout_norm_add(x_with_bias, residual, norm_op, prob):
+        return _bias_dropout_norm_add_func(x_with_bias, residual, norm_op, prob, training)
+
+    return _bias_dropout_norm_add
+
+
+def get_bias_dropout_norm_add(training):
+    return bias_dropout_norm_add_unfused(training)

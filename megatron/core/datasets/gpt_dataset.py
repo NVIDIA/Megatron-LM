@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import logging
@@ -50,6 +51,13 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
 
     s3_cache_path: str = None
     """Path for caching indices for s3 dataloading."""
+
+    shuffle_each_epoch_separately: bool = False
+    """Option to shuffle the dataset for each epoch separately.
+       When this option is False: all epochs except the last one are shuffled together.
+       The last epoch is shuffled with the others or separately based on its relative size.
+       When this option is True: all epochs are shuffled separately.
+    """
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
@@ -367,6 +375,7 @@ class GPTDataset(MegatronDataset):
             sequence_length = self.config.sequence_length
             num_tokens_per_epoch = self._get_num_tokens_per_epoch()
             num_epochs = self._get_num_epochs(num_tokens_per_epoch)
+            shuffle_each_epoch_separately = self.config.shuffle_each_epoch_separately and num_epochs > 1
 
             if num_epochs == 1:
                 separate_final_epoch = False
@@ -404,58 +413,89 @@ class GPTDataset(MegatronDataset):
                 )
 
             log_single_rank(
+                logger, logging.DEBUG, f"> shuffle_each_epoch_separately: {shuffle_each_epoch_separately}"
+            )
+
+            log_single_rank(
                 logger, logging.DEBUG, f"> separate_final_epoch: {separate_final_epoch}"
             )
 
             numpy_random_state = numpy.random.RandomState(self.config.random_seed)
 
-            # Build the document index
-            document_index = _build_document_index(
-                self.indices, num_epochs, numpy_random_state, separate_final_epoch
-            )
-
             drop_last_partial_sequence = True
             if self.index_split == Split.valid:
                 drop_last_partial_sequence = self.config.drop_last_partial_validation_sequence
 
-            # Build the sample index
+            assert self.dataset.sequence_lengths.dtype == numpy.int32
+
+            def get_sequence_lengths_for_cpp(_document_index):
+                if len(_document_index) * 2 > len(self.dataset.sequence_lengths):
+                    # Heuristic: if "access density" of sequence_lengths is relatively high,
+                    # force loading the mmap-ed array into memory by taking a copy.
+                    # System performance benefits come from two aspects:
+                    # 1. **sequentially** pre-loading the whole file if we're gonna read a large fraction anyways.
+                    # 2. GIL is held when calling into c++ code; making the c++ func faster improves parallelism.
+                    _sequence_lengths_for_cpp = self.dataset.sequence_lengths.copy()
+                else:
+                    _sequence_lengths_for_cpp = self.dataset.sequence_lengths
+                return _sequence_lengths_for_cpp
+
             from megatron.core.datasets import helpers
 
-            if self.index_split == Split.valid:
-                drop_last_partial_sequence = self.config.drop_last_partial_validation_sequence
-            else:
-                drop_last_partial_sequence = True
+            if shuffle_each_epoch_separately:
+                doc_idx_epochs, sample_idx_epochs, shuffle_idx_epochs = [], [], []
+                for _ in range(num_epochs):
+                    doc_idx_for_1epoch = _build_document_index(self.indices, 1, numpy_random_state, False)
+                    assert doc_idx_for_1epoch.dtype == numpy.int32
 
-            assert document_index.dtype == numpy.int32
-            assert self.dataset.sequence_lengths.dtype == numpy.int32
-            if len(document_index) * 2 > len(self.dataset.sequence_lengths):
-                # Heuristic: if "access density" of sequence_lengths is relatively high,
-                # force loading the mmap-ed array into memory by taking a copy.
-                # System performance benefits come from two aspects:
-                # 1. **sequentially** pre-loading the whole file if we're gonna read a large fraction anyways.
-                # 2. GIL is held when calling into c++ code; making the c++ func faster improves parallelism.
-                sequence_lengths_for_cpp = self.dataset.sequence_lengths.copy()
-            else:
-                sequence_lengths_for_cpp = self.dataset.sequence_lengths
-            sample_index = helpers.build_sample_idx(
-                sequence_lengths_for_cpp,
-                document_index,
-                sequence_length,
-                num_epochs,
-                num_tokens_per_epoch,
-                drop_last_partial_sequence,
-                self.config.add_extra_token_to_sequence,
-            )
+                    # Build the sample index
+                    sequence_lengths_for_cpp = get_sequence_lengths_for_cpp(doc_idx_for_1epoch)
+                    sample_idx = helpers.build_sample_idx(
+                        sequence_lengths_for_cpp, doc_idx_for_1epoch, sequence_length, 1, num_tokens_per_epoch,
+                        drop_last_partial_sequence, self.config.add_extra_token_to_sequence,
+                    )
 
-            # Build the shuffle index
-            if separate_final_epoch:
-                shuffle_index = _build_shuffle_index(
-                    num_samples_sans_final_epoch, sample_index.shape[0] - 1, numpy_random_state
-                )
+                    # Build the shuffle index
+                    shuffle_idx = _build_shuffle_index(
+                        sample_idx.shape[0] - 1, sample_idx.shape[0] - 1, numpy_random_state
+                    )
+
+                    doc_idx_epochs.append(doc_idx_for_1epoch)
+                    sample_idx_epochs.append(sample_idx)
+                    shuffle_idx_epochs.append(shuffle_idx)
+
+                # concat all epochs togather
+                document_index = numpy.concatenate(doc_idx_epochs)
+                sample_index = numpy.concatenate(sample_idx_epochs)
+                shuffle_index = numpy.concatenate(shuffle_idx_epochs)
             else:
-                shuffle_index = _build_shuffle_index(
-                    sample_index.shape[0] - 1, sample_index.shape[0] - 1, numpy_random_state
+                # Build the document index
+                document_index = _build_document_index(
+                    self.indices, num_epochs, numpy_random_state, separate_final_epoch
                 )
+                assert document_index.dtype == numpy.int32
+
+                # Build the sample index
+                sequence_lengths_for_cpp = get_sequence_lengths_for_cpp(document_index)
+                sample_index = helpers.build_sample_idx(
+                    sequence_lengths_for_cpp,
+                    document_index,
+                    sequence_length,
+                    num_epochs,
+                    num_tokens_per_epoch,
+                    drop_last_partial_sequence,
+                    self.config.add_extra_token_to_sequence,
+                )
+
+                # Build the shuffle index
+                if separate_final_epoch:
+                    shuffle_index = _build_shuffle_index(
+                        num_samples_sans_final_epoch, sample_index.shape[0] - 1, numpy_random_state
+                    )
+                else:
+                    shuffle_index = _build_shuffle_index(
+                        sample_index.shape[0] - 1, sample_index.shape[0] - 1, numpy_random_state
+                    )
 
             if path_to_cache:
                 os.makedirs(path_to_cache, exist_ok=True)

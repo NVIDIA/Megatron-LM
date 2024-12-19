@@ -1,11 +1,9 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import torch
 import torch.nn.functional as F
 
-try:
-    jit_fuser = torch.compile
-except:
-    jit_fuser = torch.jit.script
+from ..core.jit import jit_fuser
 
 
 @jit_fuser

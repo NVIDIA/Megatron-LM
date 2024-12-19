@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Model and data parallel groups."""
@@ -90,6 +91,9 @@ _GLOBAL_MEMORY_BUFFER = None
 
 # MOE logging
 _MOE_LAYER_WISE_LOGGING_TRACKER = {}
+
+# Attention z-loss logging
+_ATTENTION_Z_LOSS_LOGGING_TRACKER = {}
 
 
 def get_nccl_options(pg_name, nccl_comm_cfgs):
@@ -1291,6 +1295,12 @@ def get_moe_layer_wise_logging_tracker():
     """Return the moe layer wise tracker."""
     global _MOE_LAYER_WISE_LOGGING_TRACKER
     return _MOE_LAYER_WISE_LOGGING_TRACKER
+
+
+def get_attention_z_loss_tracker():
+    """Return the Attention z-loss logging tracker."""
+    global _ATTENTION_Z_LOSS_LOGGING_TRACKER
+    return _ATTENTION_Z_LOSS_LOGGING_TRACKER
 
 
 def destroy_model_parallel():

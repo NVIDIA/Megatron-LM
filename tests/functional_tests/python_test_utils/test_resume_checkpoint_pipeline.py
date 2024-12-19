@@ -1,3 +1,5 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+
 import os
 
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -14,6 +16,8 @@ STEP_INTERVAL = 5
 
 
 def collect_train_test_metrics(logs_dir, index):
+    if not logs_dir:
+        return
     train_loss_list = read_tb_logs_as_list(logs_dir, index)["lm loss"]
     train_loss_list = [round(elem, 3) for elem in train_loss_list]
     train_metrics = {
@@ -27,7 +31,6 @@ def collect_train_test_metrics(logs_dir, index):
 
 class TestCIPipeline:
     margin_loss = 0.005
-    allow_nondeterministic = bool(int(ALLOW_NONDETERMINISTIC))
     train_metrics_100 = collect_train_test_metrics(LOGS_DIR, 0)
     train_metrics_50_to_100 = collect_train_test_metrics(LOGS_DIR, 1)
 
@@ -59,12 +62,16 @@ class TestCIPipeline:
                     actual_val == expected_val
                 ), f"The value at step {step} should be {expected_val} but it is {actual_val}."
 
-    @pytest.mark.skipif(allow_nondeterministic, reason="Nondeterministic is allowed.")
+    @pytest.mark.skipif(not LOGS_DIR, reason="skipping as LOGS_DIR is not set.")
     def test_lm_loss_deterministic(self):
+        allow_nondeterministic = bool(int(ALLOW_NONDETERMINISTIC))
+        if allow_nondeterministic:
+            pytest.skip(reason="Nondeterministic is allowed.")
         self._test_helper("lm loss", TypeOfTest.DETERMINISTIC)
 
-    @pytest.mark.skipif(
-        not allow_nondeterministic, reason="Nondeterministic is not allowed."
-    )
+    @pytest.mark.skipif(not LOGS_DIR, reason="skipping as LOGS_DIR is not set.")
     def test_lm_loss_nondeterministic(self):
+        allow_nondeterministic = bool(int(ALLOW_NONDETERMINISTIC))
+        if not allow_nondeterministic:
+            pytest.skip(reason="Nondeterministic is not allowed.")
         self._test_helper("lm loss", TypeOfTest.APPROX)

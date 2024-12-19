@@ -1,9 +1,11 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron tokenizers."""
 
 from abc import ABC, abstractmethod
 import base64
+from collections import OrderedDict
 import json
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -68,6 +70,9 @@ def build_tokenizer(args):
             num_special_tokens=args.tiktoken_num_special_tokens,
             special_tokens=args.tiktoken_special_tokens,
         )
+    elif args.tokenizer_type == 'ChameleonTokenizer':
+        assert args.tokenizer_model is not None
+        tokenizer = _ChameleonTokenizer(args.tokenizer_model)
     elif args.tokenizer_type == 'NullTokenizer':
         assert args.vocab_size is not None
         tokenizer = _NullTokenizer(args.vocab_size)
@@ -76,6 +81,10 @@ def build_tokenizer(args):
                                   'implemented.'.format(args.tokenizer_type))
 
     # Add vocab size (if not already set from a checkpoint).
+    if getattr(args, "vocab_size", None) is None:
+        args.vocab_size = tokenizer.vocab_size
+
+    # Add padded vocab size (if not already set from a checkpoint).
     if getattr(args, "padded_vocab_size", None) is None:
         args.padded_vocab_size = _vocab_size_with_padding(tokenizer.vocab_size,
                                                           args)
@@ -566,6 +575,15 @@ def create_llama3_tokenizer(*args, **kwargs):
 
     class _Llama3Tokenizer(Llama3Tokenizer):
         def __init__(self, *args, **kwargs):
+
+            self.unique_identifiers = OrderedDict()
+            self.unique_identifiers["class"] = type(self).__name__
+            self.unique_identifiers["tokenizer_path"] = args if len(args) > 0 else ["n/a"]
+            for option in kwargs:
+                self.unique_identifiers[option] = str(kwargs[option])
+
+            self.unique_description = json.dumps(self.unique_identifiers, indent=4)
+
             super().__init__(*args, **kwargs)
 
         def instruct_tokenize(self, s: str, bos=True, eos=False):
@@ -853,6 +871,82 @@ class _NullTokenizer(MegatronTokenizer):
     @property
     def eod(self):
         return self._eod_id
+
+    @property
+    def additional_special_tokens_ids(self):
+        return None
+
+
+class _ChameleonTokenizer(MegatronTokenizer):
+    """Chameleon Tokenizer wrapper"""
+
+    def __init__(self, tokenizer_path):
+        super().__init__(tokenizer_path)
+        import json
+        from tokenizers import Tokenizer as _Tokenizer
+        self.tokenizer = _Tokenizer.from_file(tokenizer_path)
+        self._vocab = json.load(open(tokenizer_path))["model"]["vocab"]
+        self._inv_vocab = {i: v for v, i in self._vocab.items()}
+        self.n_words: int = len(self._vocab)
+        self.bos_id: int = self._vocab['<s>']
+        self.eos_id: int = self._vocab['</s>']
+        self.pad_id: int = self._vocab['<pad>']
+
+    def tokenize(self, s: str, bos=True, eos=False):
+        assert type(s) is str
+        assert bos
+        t = self.tokenizer.encode(s).ids
+        if bos:
+            t = [self.bos_id] + t
+        if eos:
+            t = t + [self.eos_id]
+        return t
+
+    def detokenize(self, ids):
+        return self.tokenizer.decode(ids)
+
+    @property
+    def vocab_size(self):
+        return self.n_words
+
+    @property
+    def vocab(self):
+        return self._vocab
+
+    @property
+    def inv_vocab(self):
+        return self._inv_vocab
+
+    @property
+    def bos(self):
+        return self.bos_id
+
+    @property
+    def eos(self):
+        return self.eos_id
+
+    @property
+    def pad(self):
+        return self.pad_id
+
+    @property
+    def eod(self):
+        return self.eos_id
+
+    @property
+    def cls(self):
+        # Typical implementation for unsupported is to return -1. Lets catch unsupported accesses.
+        raise NotImplementedError("Trying to access unsupported _ChameleonTokenizer.cls property.")
+
+    @property
+    def sep(self):
+        # Typical implementation for unsupported is to return -1. Lets catch unsupported accesses.
+        raise NotImplementedError("Trying to access unsupported _ChameleonTokenizer.sep property.")
+
+    @property
+    def mask(self):
+        # Typical implementation for unsupported is to return -1. Lets catch unsupported accesses.
+        raise NotImplementedError("Trying to access unsupported _ChameleonTokenizer.mask property.")
 
     @property
     def additional_special_tokens_ids(self):

@@ -1,3 +1,5 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+
 import enum
 import glob
 import json
@@ -31,7 +33,7 @@ METRIC_TO_THRESHOLD = {
     "lm loss": 0.05
 }
 
-ALLOW_NONDETERMINISTIC = bool(int(os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO")))
+ALLOW_NONDETERMINISTIC = bool(int(os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")))
 LOGS_DIR = os.getenv("LOGS_DIR")
 
 def read_tb_logs_as_list(path, index=0):
@@ -72,6 +74,9 @@ def read_tb_logs_as_list(path, index=0):
 
 def load_expected_data():
     expected_metrics_file = os.getenv("EXPECTED_METRICS_FILE")
+
+    if not expected_metrics_file:
+        return {"lm_loss": {"start_step": 0, "end_step": 0, "step_interval": 0, "values": []}}
 
     with open(expected_metrics_file) as f:
         if os.path.exists(expected_metrics_file):

@@ -1,0 +1,4 @@
+git+https://github.com/meta-llama/llama3
+regex
+sentencepiece
+tensorboard

@@ -1,4 +1,15 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+
+try:
+    import habana_frameworks.torch
+except:
+    pass
+
 import os
+import sys
+megatron_path = os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
+sys.path.insert(0, megatron_path)
+
 import torch
 from torch.optim import Adam
 from torch.utils.data import DataLoader

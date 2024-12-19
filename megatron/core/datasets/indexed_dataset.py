@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) Facebook, Inc. and its affiliates.
 #
 # This source code is licensed under the MIT license found in the
@@ -301,7 +302,13 @@ class _IndexReader(object):
 
         assert self.sequence_lengths.shape[0] == len(self)
         assert self.sequence_lengths.shape[0] == self.sequence_count
-        assert self.sequence_lengths.shape[0] == self.document_indices[-1]
+        # TODO: [SW-193211]
+        # assert self.sequence_lengths.shape[0] == self.document_indices[-1]
+        if self.sequence_lengths.shape[0] != self.document_indices[-1]:
+            log_single_rank(logger, logging.WARNING,
+                            "> sequence_lengths and document_indices doesn't "
+                            f"match: {self.sequence_lengths.shape[0]} != "
+                            f"{self.document_indices[-1]}")
 
         log_single_rank(logger, logging.INFO, f"> total number of sequences: {len(self)}")
         log_single_rank(

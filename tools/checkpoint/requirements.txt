@@ -1,0 +1,7 @@
+accelerate>=0.26.0
+git+https://github.com/meta-llama/llama3
+huggingface_hub
+protobuf==5.28.2
+tiktoken
+torch
+transformers

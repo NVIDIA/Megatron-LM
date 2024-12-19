@@ -105,6 +105,8 @@ def test_GatherFromSequenceParallelRegion():
         torch.ones(4)*3)).cuda()
     class Ctx:
         tensor_parallel_output_grad = True
+        output_split_sizes = None
+
     output_data = mappings._GatherFromSequenceParallelRegion.backward(Ctx(), input_data)
     expected_output = torch.ones((1,4)).cuda() * 4 * int(Utils.rank % 4)
     assert(torch.equal(output_data[0], expected_output))
@@ -122,13 +124,15 @@ def test_ReduceScatterToSequenceParallelRegion():
     assert(torch.equal(output_data[0], expected_output))
     assert(torch.equal(mappings._ReduceScatterToSequenceParallelRegion.symbolic(None, input_data) , expected_output.reshape((1,4))))
     input_data = torch.ones(4).cuda() * Utils.rank
-    output_data = mappings._ReduceScatterToSequenceParallelRegion.backward(None,input_data)
-    expected_output = torch.concat((
-        torch.ones(4)*0,
-        torch.ones(4)*1,
-        torch.ones(4)*2,
-        torch.ones(4)*3)).cuda()
-    if (Utils.rank >= 4):
+
+    class Ctx:
+        input_split_sizes = None
+
+    output_data, _ = mappings._ReduceScatterToSequenceParallelRegion.backward(Ctx(), input_data)
+    expected_output = torch.concat(
+        (torch.ones(4) * 0, torch.ones(4) * 1, torch.ones(4) * 2, torch.ones(4) * 3)
+    ).cuda()
+    if Utils.rank >= 4:
         expected_output = expected_output + 4
     assert(torch.equal(output_data, expected_output))
     Utils.destroy_model_parallel()

@@ -1,5 +1,13 @@
+# Copyright (C) 2024 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain GPT."""
+
+
+try:
+    import habana_frameworks.torch
+except:
+    pass
+
 
 import os
 import torch
@@ -16,6 +24,7 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
+from megatron.core.utils import is_real_cuda_device_available
 import megatron.legacy.model
 from megatron.core.models.gpt import GPTModel
 from megatron.training import pretrain
@@ -50,6 +59,8 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
     """
     args = get_args()
     use_te = args.transformer_impl == "transformer_engine"
+    if args.deterministic_mode and not is_real_cuda_device_available():
+        torch.use_deterministic_algorithms(True)
 
     print_rank_0('building GPT model ...')
     # Experimental loading arguments from yaml
@@ -57,6 +68,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
         config = core_transformer_config_from_yaml(args, "language_model")
     else:
         config = core_transformer_config_from_args(args)
+    print_rank_0(f'{config}')
 
     if args.use_legacy_models:
         model = megatron.legacy.model.GPTModel(
@@ -70,10 +82,23 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
         if args.spec is not None:
             transformer_layer_spec = import_module(args.spec)
         else:
+            enable_fused_sdpa = args.use_fused_sdpa or args.use_fused_sdpa_with_recompute
             if use_te:
-                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm, args.qk_layernorm)
+                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                                                            args.num_experts,
+                                                            args.moe_grouped_gemm,
+                                                            args.qk_layernorm,
+                                                            enable_fused_sdpa,
+                                                            args.fp8_coverage)
             else:
-                transformer_layer_spec = get_gpt_layer_local_spec(args.num_experts, args.moe_grouped_gemm, args.qk_layernorm)
+                use_pre_norm = not args.apply_norm_post_sub_block
+                transformer_layer_spec = get_gpt_layer_local_spec(
+                                                            args.num_experts,
+                                                            args.moe_grouped_gemm,
+                                                            args.qk_layernorm,
+                                                            args.normalization,
+                                                            enable_fused_sdpa,
+                                                            use_pre_norm)
 
         model = GPTModel(
             config=config,
@@ -204,7 +229,8 @@ def core_gpt_dataset_config_from_args(args):
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
         create_attention_mask=args.create_attention_mask_in_dataloader,
-        s3_cache_path = args.s3_cache_path
+        s3_cache_path = args.s3_cache_path,
+        shuffle_each_epoch_separately=args.shuffle_each_epoch_separately
     )
 
 

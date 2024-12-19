@@ -1,0 +1,15 @@
+flask-restful
+numpy==1.23.5
+pytest
+pytest-cov
+pytest_mock
+scipy
+wrapt
+einops
+flask-restful
+nltk
+pytest-random-order
+sentencepiece
+zarr
+tensorstore==0.1.45
+wandb

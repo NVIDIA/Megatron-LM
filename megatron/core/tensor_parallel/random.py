@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 # Parts of the code here are adapted from PyTorch
@@ -20,7 +21,11 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from megatron.core.utils import safely_set_viewless_tensor_data
+from megatron.core.utils import (
+    is_lazy_mode,
+    is_real_cuda_device_available,
+    safely_set_viewless_tensor_data,
+)
 
 from .utils import gather_split_1d_tensor, split_tensor_into_1d_equal_chunks
 
@@ -219,7 +224,7 @@ def model_parallel_cuda_manual_seed(seed):
 
 
 class CheckpointFunction(torch.autograd.Function):
-    """Checkpoint Function 
+    """Checkpoint Function
 
     This function is adapted from torch.utils.checkpoint with two main changes:
     1) torch.cuda.set_rng_state is replaced with `_set_cuda_rng_state`
@@ -244,7 +249,13 @@ class CheckpointFunction(torch.autograd.Function):
         if distribute_saved_activations:
             ctx.input_0_shape = args[0].data.shape
             safely_set_viewless_tensor_data(
-                args[0], split_tensor_into_1d_equal_chunks(args[0].data, new_buffer=True)
+                args[0],
+                split_tensor_into_1d_equal_chunks(
+                    args[0].data,
+                    new_buffer=(
+                        True if (not is_lazy_mode()) or is_real_cuda_device_available() else False
+                    ),
+                ),
             )
 
         # Store everything.

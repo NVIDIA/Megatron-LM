@@ -1,4 +1,7 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.fusions.fused_dot_product_attention import FusedDotProductAttention
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import (
     CrossAttention,
@@ -46,6 +49,46 @@ except ImportError:
     warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
     LNImpl = WrappedTorchLayerNorm
 
+try:
+    from megatron.core.transformer.custom_layers.intel_transformer_engine import (
+        IntelTEColumnParallelLinear,
+        IntelTEDotProductAttention,
+        IntelTENorm,
+        IntelTERowParallelLinear,
+    )
+except:
+    pass
+
+
+if HAVE_TE:
+    core_attention_class = TEDotProductAttention
+    linear_fc1 = TELayerNormColumnParallelLinear
+    linear_fc2 = TERowParallelLinear
+    linear_kv = TEColumnParallelLinear
+    linear_proj = TERowParallelLinear
+    linear_q = TEColumnParallelLinear
+    linear_qkv = TELayerNormColumnParallelLinear
+    normalization_class = TENorm
+else:
+    enable_fsdpa = False
+    try:
+        from intel_transformer_engine.utils import is_gaudi3
+    except:
+        from habana_transformer_engine.utils import is_gaudi3
+    if is_gaudi3() and enable_fsdpa:
+        core_attention_class = IntelTEDotProductAttention
+    elif enable_fsdpa:
+        core_attention_class = FusedDotProductAttention
+    else:
+        core_attention_class = DotProductAttention
+    linear_fc1 = IntelTEColumnParallelLinear
+    linear_fc2 = IntelTERowParallelLinear
+    linear_kv = IntelTEColumnParallelLinear
+    linear_proj = IntelTERowParallelLinear
+    linear_q = IntelTEColumnParallelLinear
+    linear_qkv = IntelTEColumnParallelLinear
+    normalization_class = IntelTENorm
+
 
 def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
     """T5 encoder TE spec (uses Transformer Engine components)."""
@@ -53,23 +96,25 @@ def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
+            input_layernorm=IdentityOp if HAVE_TE else normalization_class,
             self_attention=ModuleSpec(
                 module=SelfAttention,
                 params={"attn_mask_type": AttnMaskType.padding},
                 submodules=SelfAttentionSubmodules(
-                    linear_qkv=TELayerNormColumnParallelLinear,
-                    core_attention=TEDotProductAttention,
-                    linear_proj=TERowParallelLinear,
+                    linear_qkv=linear_qkv,
+                    core_attention=core_attention_class,
+                    linear_proj=linear_proj,
                     q_layernorm=IdentityOp,
                     k_layernorm=IdentityOp,
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
+            pre_mlp_layernorm=IdentityOp if HAVE_TE else normalization_class,
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(
-                    linear_fc1=TELayerNormColumnParallelLinear,
-                    linear_fc2=TERowParallelLinear,
+                    linear_fc1=linear_fc1,
+                    linear_fc2=linear_fc2,
                 ),
             ),
             mlp_bda=get_bias_dropout_add,
@@ -87,30 +132,30 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
                 module=SelfAttention,
                 params={"attn_mask_type": AttnMaskType.causal},
                 submodules=SelfAttentionSubmodules(
-                    linear_qkv=TELayerNormColumnParallelLinear,
-                    core_attention=TEDotProductAttention,
-                    linear_proj=TERowParallelLinear,
+                    linear_qkv=linear_qkv,
+                    core_attention=core_attention_class,
+                    linear_proj=linear_proj,
                     q_layernorm=IdentityOp,
                     k_layernorm=IdentityOp,
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_cross_attn_layernorm=TENorm,
+            pre_cross_attn_layernorm=normalization_class,
             cross_attention=ModuleSpec(
                 module=CrossAttention,
                 submodules=CrossAttentionSubmodules(
-                    linear_q=TEColumnParallelLinear,
-                    linear_kv=TEColumnParallelLinear,
-                    core_attention=TEDotProductAttention,
-                    linear_proj=TERowParallelLinear,
+                    linear_q=linear_q,
+                    linear_kv=linear_kv,
+                    core_attention=core_attention_class,
+                    linear_proj=linear_proj,
                 ),
             ),
             cross_attn_bda=get_bias_dropout_add,
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(
-                    linear_fc1=TELayerNormColumnParallelLinear,
-                    linear_fc2=TERowParallelLinear,
+                    linear_fc1=linear_fc1,
+                    linear_fc2=linear_fc2,
                 ),
             ),
             mlp_bda=get_bias_dropout_add,
@@ -211,7 +256,9 @@ def get_t5_encoder_with_transformer_engine_block_spec(
     """
 
     layer_spec = encoder_model_with_transformer_engine_default_spec()
-    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=TENorm)
+    block_spec = TransformerBlockSubmodules(
+        [layer_spec] * num_layers, layer_norm=normalization_class
+    )
     return block_spec
 
 
@@ -225,7 +272,9 @@ def get_t5_decoder_with_transformer_engine_block_spec(
     """
 
     layer_spec = decoder_model_with_transformer_engine_default_spec()
-    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=TENorm)
+    block_spec = TransformerBlockSubmodules(
+        [layer_spec] * num_layers, layer_norm=normalization_class
+    )
     return block_spec
 
 
@@ -237,7 +286,9 @@ def get_t5_encoder_with_local_block_spec(num_layers: int) -> TransformerBlockSub
     """
 
     layer_spec = encoder_model_with_local_spec()
-    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=TENorm)
+    block_spec = TransformerBlockSubmodules(
+        [layer_spec] * num_layers, layer_norm=normalization_class
+    )
     return block_spec
 
 
@@ -249,5 +300,7 @@ def get_t5_decoder_with_local_block_spec(num_layers: int) -> TransformerBlockSub
     """
 
     layer_spec = decoder_model_with_local_spec()
-    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=TENorm)
+    block_spec = TransformerBlockSubmodules(
+        [layer_spec] * num_layers, layer_norm=normalization_class
+    )
     return block_spec

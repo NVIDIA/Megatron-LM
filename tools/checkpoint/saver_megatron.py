@@ -1,8 +1,10 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import os
 import sys
 import torch
+from megatron.core.utils import is_real_cuda_device_available
 
 
 def add_arguments(parser):
@@ -203,7 +205,8 @@ def save_checkpoint(queue, args):
     mpu.set_pipeline_model_parallel_world_size(args.target_pipeline_parallel_size)
     mpu.set_tensor_model_parallel_rank(0)
     mpu.set_pipeline_model_parallel_rank(0)
-    fused_kernels.load(margs)
+    if is_real_cuda_device_available():
+        fused_kernels.load(margs)
 
     # Embeddings
     # -----------

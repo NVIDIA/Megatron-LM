@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Input/output checkpointing."""
@@ -23,6 +24,7 @@ from .utils import unwrap_model, print_rank_0, append_to_progress_log, is_last_r
 from ..core.dist_checkpointing.serialization import \
     get_default_save_sharded_strategy
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
+from tools.checkpoint import verify_checkpoint
 
 # [ModelOpt]: Import
 try:
@@ -285,6 +287,15 @@ def get_rng_state(use_dist_ckpt: bool = False):
     return rng_state_list
 
 
+def repair_checkpoint(state_dict):
+    in_state_dict = state_dict
+    out_state_dict = {}
+    for src_key in in_state_dict.keys():
+        dest_key = src_key[10:] if src_key.startswith("_orig_mod.") else src_key
+        out_state_dict[dest_key] = in_state_dict[src_key]
+    return out_state_dict
+
+
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, checkpointing_context=None,
                     pipeline_rank=None,expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None):
     """Save a model checkpoint.
@@ -385,6 +396,15 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     # And update the latest iteration
     if not torch.distributed.is_initialized() \
        or torch.distributed.get_rank() == 0:
+        if args.verify_checkpoint:
+            ckpt_folder = os.path.join(args.save, f"iter_{iteration:07d}")
+            ckpt_ok = verify_checkpoint(ckpt_folder,
+                                        args.verify_checkpoint_model_type,
+                                        args)
+            if not ckpt_ok:
+                raise RuntimeError(f"verify_checkpoint failed!!! {ckpt_folder}")
+            else:
+                print_rank_0(f"successfully passed ckpt validation: {ckpt_folder}")
         tracker_filename = get_checkpoint_tracker_filename(args.save)
 
         def iter_finalize_fn():
@@ -423,7 +443,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         torch.distributed.barrier()
 
     end_misc = time()
-    logger.debug(f"rank: {torch.distributed.get_rank()}, takes {end_misc - start_misc} to finalize ckpt save ")
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    logger.debug(f"rank: {rank}, takes {end_misc - start_misc} to finalize ckpt save ")
+
 
 def generate_state_dict(args, model, optimizer, opt_param_scheduler,
                         rng_state, use_dist_ckpt=False, iteration=None,
@@ -836,10 +859,12 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     # Model.
     strict = False if args.retro_add_retriever else strict
     if len(model) == 1:
+        state_dict['model'] = repair_checkpoint(state_dict['model'])
         model[0].load_state_dict(state_dict['model'], strict=strict)
     else:
         for i in range(len(model)):
             mpu.set_virtual_pipeline_model_parallel_rank(i)
+            state_dict['model%d' % i] = repair_checkpoint(state_dict['model%d' % i])
             model[i].load_state_dict(state_dict['model%d' % i], strict=strict)
 
     # Fix up query/key/value matrix ordering if needed.
@@ -852,7 +877,12 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         try:
             # Load state dict.
             if optimizer is not None:
-                optimizer.load_state_dict(state_dict['optimizer'])
+                if args.use_distributed_optimizer:
+                    tracker_filename = get_checkpoint_tracker_filename(load_dir)
+                    iteration, release = read_metadata(tracker_filename)
+                    optimizer.load_state_dict(state_dict['optimizer'], iteration)
+                else:
+                    optimizer.load_state_dict(state_dict['optimizer'])
 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above

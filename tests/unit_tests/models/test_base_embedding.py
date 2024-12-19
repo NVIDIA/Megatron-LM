@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import pytest
@@ -52,7 +53,7 @@ class TestBaseEmbedding:
         position_ids = torch.tensor(
             [0, 1, 2, 3], dtype=torch.int64).repeat((2, 1)).cuda()
         embeddings = self.base_embedding(input_ids, position_ids)
-        assert embeddings.device.type == 'cuda'
+        assert embeddings.device.type in ('cuda', 'hpu')
         assert embeddings.shape[0] == self.base_embedding.max_sequence_length
         assert embeddings.shape[1] == input_ids.shape[0]
         assert embeddings.shape[2] == self.base_embedding.config.hidden_size

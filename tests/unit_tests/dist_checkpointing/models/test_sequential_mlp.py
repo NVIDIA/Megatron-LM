@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import pytest
@@ -23,7 +24,10 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
-_te_version = packaging.version.Version(version("transformer-engine"))
+try:
+    _te_version = packaging.version.Version(version("transformer-engine"))
+except:
+    _te_version = None
 
 def initialize_expert_layer(seed, glu=True, moe_grouped_gemm=False, **config_kwargs):
     torch.manual_seed(seed)
@@ -62,7 +66,7 @@ def get_pp_offsets():
     return ((0, pp_rank, pp_size),)
 
 moe_grouped_gemm_options = [False]
-if _te_version >= packaging.version.Version("1.9.0.dev0"):
+if _te_version and _te_version >= packaging.version.Version("1.9.0.dev0"):
     moe_grouped_gemm_options.append(True)
 
 class TestExpertLayerReconfiguration:
@@ -141,7 +145,7 @@ class TestExpertLayerReconfiguration:
             assert not any(map(bool, diffs)), diffs
 
     @pytest.mark.skipif(
-        _te_version < packaging.version.Version("1.9.0.dev0"),
+        _te_version and _te_version < packaging.version.Version("1.9.0.dev0"),
         reason="TE Grouped MLP is only supported in TE 1.9.0.dev0 and later.",
     )
     @pytest.mark.parametrize(

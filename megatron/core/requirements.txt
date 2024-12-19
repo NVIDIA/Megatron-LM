@@ -1,1 +1,5 @@
+numpy==1.23.5
 torch
+pybind11
+tensorstore==0.1.45
+zarr

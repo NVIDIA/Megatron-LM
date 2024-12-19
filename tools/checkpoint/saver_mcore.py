@@ -1,13 +1,19 @@
+# Copyright (C) 2024 Intel Corporation
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import json
 import os
 import sys
 import torch
 from importlib.metadata import version
+from megatron.core.utils import is_real_cuda_device_available
 from pkg_resources import packaging
 
 from setter import ModelSetter
 from utils import get_mcore_transformer_block_key, print_memory_usage
+from verify_checkpoint_non_tp_consistency import verify_checkpoint
+
+device = "cpu"
 
 
 class MCoreSetter(ModelSetter):
@@ -121,6 +127,7 @@ class MCoreLocalSetter(MCoreSetter):
         mlp_fc1_bias=None,
         mlp_fc2_weight=None,
         mlp_fc2_bias=None,
+        use_legacy_models=False,
     ):
 
         block = cls.get_transformer_block(model)
@@ -172,15 +179,16 @@ class MCoreTESetter(MCoreSetter):
         mlp_fc1_bias=None,
         mlp_fc2_weight=None,
         mlp_fc2_bias=None,
+        use_legacy_models=False,
     ):
 
         block = cls.get_transformer_block(model)
         l = block.layers[layer_idx]
 
         # Self attention.
-        cls.set_tensor(l.self_attention.linear_qkv.layer_norm_weight, self_attn_norm_weight)
+        cls.set_tensor(l.self_attention.linear_qkv.layer_norm_weight if use_legacy_models else l.input_layernorm.weight, self_attn_norm_weight)
         if self_attn_norm_bias is not None:
-            cls.set_tensor(l.self_attention.linear_qkv.layer_norm_bias, self_attn_norm_bias)
+            cls.set_tensor(l.self_attention.linear_qkv.layer_norm_bias if use_legacy_models else l.layer_norm_bias, self_attn_norm_bias)
 
         cls.set_tensor(l.self_attention.linear_qkv.weight, self_attn_qkv_weight)
         if self_attn_qkv_bias is not None:
@@ -191,9 +199,9 @@ class MCoreTESetter(MCoreSetter):
             cls.set_tensor(l.self_attention.linear_proj.bias, self_attn_proj_bias)
 
         # MLP.
-        cls.set_tensor(l.mlp.linear_fc1.layer_norm_weight, mlp_norm_weight)
+        cls.set_tensor(l.mlp.linear_fc1.layer_norm_weight if use_legacy_models else l.pre_mlp_layernorm.weight, mlp_norm_weight)
         if mlp_norm_bias is not None:
-            cls.set_tensor(l.mlp.linear_fc1.layer_norm_bias, mlp_norm_bias)
+            cls.set_tensor(l.mlp.linear_fc1.layer_norm_bias if use_legacy_models else l.pre_mlp_layernorm.weight, mlp_norm_bias)
 
         cls.set_tensor(l.mlp.linear_fc1.weight, mlp_fc1_weight)
         if mlp_fc1_bias is not None:
@@ -223,6 +231,7 @@ class MCoreMoETESetter(MCoreSetter):
         mlp_fc1_bias=None,
         mlp_fc2_weight=None,
         mlp_fc2_bias=None,
+        use_legacy_models=False,
     ):
 
         block = cls.get_transformer_block(model)
@@ -285,12 +294,23 @@ def add_arguments(parser):
                        help='Target expert model parallel size, default to 1')
 
 
+def convert_to_json_serializable(o):
+    try:
+        return str(o)
+    except TypeError as e:
+        print(str(e))
+        print(f'Object of type {o.__class__.__name__} '
+              f'is not JSON serializable')
+    return None
+
+
 def save_checkpoint(queue, args):
 
     # Transformer engine >= 0.12.0, for CPU initialization.
-    te_version = packaging.version.Version(version("transformer-engine"))
-    assert te_version >= packaging.version.Version("0.12.0"), \
-        "transformer engine version: %s (>=0.12.0 required)." % te_version
+    if is_real_cuda_device_available():
+        te_version = packaging.version.Version(version("transformer-engine"))
+        assert te_version >= packaging.version.Version("0.12.0"), \
+            "transformer engine version: %s (>=0.12.0 required)." % te_version
 
     # Search in directory above this
     sys.path.append(os.path.abspath(
@@ -448,7 +468,6 @@ def save_checkpoint(queue, args):
     validate_args(margs)
 
     # Use M-core models & unset loaded paths.
-    margs.use_legacy_models = False
     margs.blendable_index_path = None
     margs.data_path = []
     margs.load = None
@@ -456,6 +475,22 @@ def save_checkpoint(queue, args):
     margs.tensorboard_dir = None
     margs.tokenizer_model = None
     margs.transformer_impl = args.saver_transformer_impl
+
+    # Define the list of margs attributes
+    margs_attributes = [
+        'use_legacy_models', 'rotary_base', 'add_position_embedding',
+        'attention_dropout', 'hidden_dropout', 'weight_decay', 'start_weight_decay',
+        'end_weight_decay', 'adam_beta2', 'adam_eps', 'recompute_granularity',
+        'deterministic_mode', 'sequence_parallel', 'lr', 'lr_decay_iters',
+        'lr_decay_style', 'lr_warmup_iters', 'min_lr', 'perform_initialization',
+        'bf16', 'fp16', 'data_parallel_size', 'params_dtype', 'padded_vocab_size',
+        'world_size'
+    ]
+
+    # loop over and set margs attribute if md has that attribute
+    for attr in margs_attributes:
+        if hasattr(md.checkpoint_args, attr):
+            setattr(margs, attr, getattr(md.checkpoint_args, attr))
 
     set_global_variables(margs, build_tokenizer=False)
 
@@ -487,7 +522,8 @@ def save_checkpoint(queue, args):
     mpu.set_tensor_model_parallel_rank(0)
     mpu.set_pipeline_model_parallel_rank(0)
     mpu.set_expert_model_parallel_rank(0)
-    fused_kernels.load(margs)
+    if is_real_cuda_device_available():
+        fused_kernels.load(margs)
 
     # Embeddings
     #-----------
@@ -544,7 +580,9 @@ def save_checkpoint(queue, args):
         if models[pp_rank][ep_rank][tp_rank] is None:
             pre_process = True if pp_rank == 0 else False
             post_process = True if pp_rank == args.target_pipeline_parallel_size - 1 else False
-            models[pp_rank][ep_rank][tp_rank] = model_provider(pre_process, post_process).to(md.params_dtype)
+            models[pp_rank][ep_rank][tp_rank] = model_provider(pre_process, post_process).to(device).to(
+                md.params_dtype
+            )
         return models[pp_rank][ep_rank][tp_rank]
 
     # Set embeddings.
@@ -570,14 +608,14 @@ def save_checkpoint(queue, args):
             else:
                 weight = weight.reshape(ep_size, num_experts // ep_size, out_features, tp_size, in_features // tp_size)
                 weight = weight.permute(0, 3, 1, 2, 4)
-            return weight # (ep_size, tp_size, local_eps, output_features, in_features)
+            return weight.to(device)  # (ep_size, tp_size, local_eps, output_features, in_features)
         else:
             out_features, in_features = weight.shape
             if parallel_mode == "column":
                 weight = weight.reshape(tp_size, out_features // tp_size, in_features)
             else:
                 weight = weight.reshape(out_features, tp_size, in_features // tp_size).permute(1, 0, 2)
-            return weight # (tp_size, output_features, in_features)
+            return weight.to(device)  # (tp_size, output_features, in_features)
 
     def chunk_bias(bias, parallel_mode, tp_size=1, ep_size=1):
         assert parallel_mode in ["row", "column"]
@@ -621,11 +659,11 @@ def save_checkpoint(queue, args):
 
             # Special handling for swiglu
             if md.swiglu:
-                mlp_l0_weight_W = chunk_weight(msg.pop("mlp l0 weight W"), "column", args.target_tensor_parallel_size, args.target_expert_parallel_size)
-                mlp_l0_weight_V = chunk_weight(msg.pop("mlp l0 weight V"), "column", args.target_tensor_parallel_size, args.target_expert_parallel_size)
+                mlp_l0_weight_W = chunk_weight(msg.pop("mlp l0 weight W"), "column", args.target_tensor_parallel_size, args.target_expert_parallel_size).to(device)
+                mlp_l0_weight_V = chunk_weight(msg.pop("mlp l0 weight V"), "column", args.target_tensor_parallel_size, args.target_expert_parallel_size).to(device)
                 mlp_l0_weight = torch.cat((mlp_l0_weight_W, mlp_l0_weight_V), dim=-2)
             else:
-                mlp_l0_weight = chunk_weight(msg.pop("mlp l0 weight"), "column", args.target_tensor_parallel_size, args.target_expert_parallel_size)
+                mlp_l0_weight = chunk_weight(msg.pop("mlp l0 weight"), "column", args.target_tensor_parallel_size, args.target_expert_parallel_size).to(device)
 
             if md.linear_bias:
                 dense_bias = msg.pop("dense bias")
@@ -681,7 +719,7 @@ def save_checkpoint(queue, args):
                             "router_weight":  router
                         })
                     model = get_local_model(pp_rank, ep_rank, tp_rank)
-                    setter.set_layer(model, layer_id, **params_dict)
+                    setter.set_layer(model, layer_id, **params_dict, use_legacy_models=margs.use_legacy_models)
 
             total_layer_num = total_layer_num + 1
             check_message(msg)
@@ -792,5 +830,19 @@ def save_checkpoint(queue, args):
                     tensor_rank=tp_rank)
                 # release the uselese model parts
                 models[pp_rank][ep_rank][tp_rank] = None
+
+    ckpt_ok = verify_checkpoint(
+        os.path.join(args.save_dir, f"iter_{md.iteration:07d}"),
+        margs.verify_checkpoint_model_type,
+        margs
+    )
+
+    if not ckpt_ok:
+        print("Checkpoint verification failed..")
+
+    target_megatron_args_path = os.path.join(args.save_dir, "target_megatron_args.json")
+    with open(target_megatron_args_path, "w") as f:
+        json.dump(vars(margs), f, indent=2, default=convert_to_json_serializable)
+        print("Saved target Megatron arguments to", target_megatron_args_path)
 
     print("Done!")

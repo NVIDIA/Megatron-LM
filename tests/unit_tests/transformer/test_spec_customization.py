@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import sys
@@ -6,19 +7,35 @@ from importlib.metadata import version
 
 import pytest
 import torch
-import transformer_engine as te
+try:
+    import transformer_engine as te
+except:
+    pass
 from pkg_resources import packaging
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
-from megatron.core.transformer.custom_layers.transformer_engine import (
-    TEDotProductAttention,
-    TELayerNormColumnParallelLinear,
-    TENorm,
-    TERowParallelLinear,
-)
+try:
+    from megatron.core.transformer.custom_layers.transformer_engine import (
+        TEDotProductAttention,
+        TELayerNormColumnParallelLinear,
+        TENorm,
+        TERowParallelLinear,
+    )
+    HAVE_TE = True
+except:
+    HAVE_TE = False
+try:
+    from megatron.core.transformer.custom_layers.intel_transformer_engine import (
+        IntelTEColumnParallelLinear,
+        IntelTEDotProductAttention,
+        IntelTENorm,
+        IntelTERowParallelLinear,
+    )
+except:
+    pass
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
@@ -45,18 +62,23 @@ class TestSpecCustomization:
             module=SelfAttention,
             params={"attn_mask_type": AttnMaskType.causal},
             submodules=SelfAttentionSubmodules(
-                linear_qkv=TELayerNormColumnParallelLinear,
-                core_attention=TEDotProductAttention,
-                linear_proj=TERowParallelLinear,
+                linear_qkv=TELayerNormColumnParallelLinear if HAVE_TE else IntelTEColumnParallelLinear, # TODO: Norm layer missing - not same
+                core_attention=TEDotProductAttention if HAVE_TE else IntelTEDotProductAttention,
+                linear_proj=TERowParallelLinear if HAVE_TE else IntelTERowParallelLinear,
                 q_layernorm=IdentityOp,
                 k_layernorm=IdentityOp,
             ),
         )
 
         # specify layernorm spec with module path to test dynamic importing
-        self.layernorm_spec = ModuleSpec(
-            module=("megatron.core.transformer.custom_layers.transformer_engine", "TENorm"),
-        )
+        if HAVE_TE:
+            self.layernorm_spec = ModuleSpec(
+                module=("megatron.core.transformer.custom_layers.transformer_engine", "TENorm"),
+            )
+        else:
+            self.layernorm_spec = ModuleSpec(
+                module=("megatron.core.transformer.custom_layers.intel_transformer_engine", "IntelTENorm"),
+            )
 
         # specify bias dropout add with module path
         self.bda_spec = ModuleSpec(
@@ -73,7 +95,8 @@ class TestSpecCustomization:
         assert id(self_attention_cls) == id(SelfAttention)
 
         layernorm_cls = import_module(module_path=self.layernorm_spec.module)
-        assert id(layernorm_cls) == id(TENorm)
+        norm_class = TENorm if HAVE_TE else IntelTENorm
+        assert id(layernorm_cls) == id(norm_class)
 
     def test_build_module(self):
         # Check NoOp TransformerLayer

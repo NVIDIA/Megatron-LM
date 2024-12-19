@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from typing import Optional, Union
@@ -5,11 +6,28 @@ from typing import Optional, Union
 import torch
 
 from megatron.core.models.common.vision_module.vision_module import VisionModule
-from megatron.core.transformer.custom_layers.transformer_engine import TENorm
+
+try:
+    from megatron.core.transformer.custom_layers.transformer_engine import TENorm
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
+try:
+    from megatron.core.transformer.custom_layers.intel_transformer_engine import IntelTENorm
+except:
+    pass
+
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+if HAVE_TE:
+    normalization_class = TENorm
+else:
+    normalization_class = IntelTENorm
 
 
 # Note: This is under development and is missing features like position embedding interpolation.
@@ -31,7 +49,7 @@ class CLIPViTModel(VisionModule):
         self,
         transformer_config: TransformerConfig,
         transformer_layer_spec: ModuleSpec,
-        ln_pre_impl: Union[ModuleSpec, type] = TENorm,
+        ln_pre_impl: Union[ModuleSpec, type] = normalization_class,
         patch_dim: int = 14,
         img_h: int = 336,
         img_w: int = 336,

@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from abc import ABC, abstractmethod
@@ -15,6 +16,7 @@ from megatron.core.tensor_parallel.random import (
     get_data_parallel_rng_tracker_name,
 )
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.capacity_bins import CapacityBins
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
     save_to_aux_losses_tracker,
@@ -108,6 +110,23 @@ class TopKRouter(Router):
         super().__init__(config=config)
         self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type
+        self.capacity_bins_num = self.config.moe_capacity_bins_num
+        self.capacity_bins_exp_base = self.config.moe_capacity_bins_exp_base
+        self.capacity_bins_alignment = self.config.moe_capacity_bins_alignment
+        self.configured_bins = self.config.moe_configured_bins
+        self.capacity_bins = None
+        if self.capacity_bins_num > 0:
+            assert (
+                self.capacity_bins_exp_base >= 1.0
+            ), f'capacity_bins_exp_base must be >= 1.0, but got {self.capacity_bins_exp_base}'
+            self.capacity_bins = CapacityBins(
+                self.topk,
+                self.num_experts,
+                self.capacity_bins_num,
+                self.capacity_bins_exp_base,
+                self.capacity_bins_alignment,
+                configured_bins=self.configured_bins,
+            )
         self.input_jitter = None
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
@@ -158,6 +177,7 @@ class TopKRouter(Router):
             pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             drop_policy=self.config.moe_token_drop_policy,
             use_pre_softmax=self.config.moe_router_pre_softmax,
+            capacity_bins=self.capacity_bins,
         )
 
         if self.training:
@@ -175,8 +195,10 @@ class TopKRouter(Router):
         """Applies auxiliary loss to the MoE layer.
 
         Args:
-            probs (torch.Tensor): The probs output by the router for each token. [num_tokens, num_experts]
-            num_local_tokens_per_expert (torch.Tensor): The number of tokens per expert. [num_experts]
+            probs (torch.Tensor): The probs output by the router for each token.
+                [num_tokens, num_experts]
+            num_local_tokens_per_expert (torch.Tensor): The number of tokens per expert.
+                [num_experts]
             activation (torch.Tensor): The activation tensor to attach the gradient function to.
 
         Returns:
@@ -184,11 +206,11 @@ class TopKRouter(Router):
         """
         moe_aux_loss_coeff = self.config.moe_aux_loss_coeff
         sequence_partition_group = None
-        if self.config.moe_token_dispatcher_type == "allgather":
-            sequence_partition_group = parallel_state.get_tensor_and_context_parallel_group()
-        elif self.config.moe_token_dispatcher_type == "alltoall":
+        if self.config.moe_token_dispatcher_type == "alltoall_seq":
             sequence_partition_group = parallel_state.get_context_parallel_group()
             moe_aux_loss_coeff /= parallel_state.get_tensor_model_parallel_world_size()
+        else:
+            sequence_partition_group = parallel_state.get_tensor_and_context_parallel_group()
 
         aux_loss = switch_load_balancing_loss_func(
             probs,
@@ -225,10 +247,7 @@ class TopKRouter(Router):
             z_loss = z_loss_func(logits, moe_z_loss_coeff)
             logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
             save_to_aux_losses_tracker(
-                "z_loss",
-                z_loss / moe_z_loss_coeff,
-                self.layer_number,
-                self.config.num_layers,
+                "z_loss", z_loss / moe_z_loss_coeff, self.layer_number, self.config.num_layers
             )
         return logits
 
@@ -268,10 +287,7 @@ class TopKRouter(Router):
         # Apply Z-Loss
         logits = self.apply_z_loss(logits)
 
-        if (
-            parallel_state.get_tensor_model_parallel_world_size() > 1
-            and self.config.moe_token_dispatcher_type == "alltoall"
-        ):
+        if self.config.moe_token_dispatcher_type == "alltoall_seq":
             # Gather the logits from the TP region
             logits = gather_from_sequence_parallel_region(logits)
 
@@ -288,6 +304,7 @@ class TopKRouter(Router):
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
                 drop_policy=self.config.moe_token_drop_policy,
                 use_pre_softmax=self.config.moe_router_pre_softmax,
+                capacity_bins=self.capacity_bins,
             )
         else:
             raise ValueError(f"Unsupported MoE routing type: {self.routing_type}")
@@ -311,3 +328,16 @@ class TopKRouter(Router):
         scores, indices = self.routing(logits)
 
         return scores, indices
+
+    def get_stats(self, incremental=True):
+        if self.capacity_bins is not None:
+            capacity_stats = self.capacity_bins.get_stats(incremental)
+            if capacity_stats is not None:
+                return {'capacity_bins': capacity_stats}
+        return None
+
+    def has_capacity_bins(self):
+        return self.capacity_bins is not None
+
+    def get_capacity_bins(self):
+        return self.capacity_bins

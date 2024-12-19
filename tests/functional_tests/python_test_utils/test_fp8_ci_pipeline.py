@@ -1,3 +1,5 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+
 import json
 import os
 
@@ -104,6 +106,7 @@ class TestFP8CIPipeline:
         self._setup()
         self._margin_test_helper("lm loss")
 
+    @pytest.mark.skipif(not EXPECTED_METRICS_FILE, reason="skipping test as EXPECTED_METRICS_FILE is not set.")
     def test_lm_loss_auc(self):
         self._setup()
         self._auc_test_helper("lm loss")

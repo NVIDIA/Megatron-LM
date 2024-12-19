@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import logging
 from typing import Callable, Dict, List, Optional
@@ -20,7 +21,8 @@ except ImportError:
 
         ## apex's FusedAdam is a drop-in replacement for torch's AdamW
         ## see https://github.com/NVIDIA/apex/blob/7b73b12361068a10b0f44844534613f252a5ea75/apex/optimizers/fused_adam.py#L16
-        from torch.optim import AdamW as Adam, SGD
+        from torch.optim import AdamW as Adam
+        from torch.optim import SGD as SGD
 
 from megatron.core import mpu
 
@@ -190,8 +192,15 @@ def _get_megatron_optimizer_based_on_param_groups(
     Returns:
         Instance of MegatronOptimizer.
     """
-    if config.optimizer == 'adam':
-        optimizer = Adam(
+    if config.optimizer in ['adam', 'fusedadamw']:
+        optimizer_class = None
+        if config.optimizer == 'adam':
+            optimizer_class = Adam
+        elif config.optimizer == 'fusedadamw':
+            from habana_frameworks.torch.hpex.optimizers import FusedAdamW
+
+            optimizer_class = FusedAdamW
+        optimizer = optimizer_class(
             param_groups,
             lr=config.lr,
             weight_decay=config.weight_decay,

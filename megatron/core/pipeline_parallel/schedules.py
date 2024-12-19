@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Intel Corporation
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import contextlib
@@ -7,6 +8,7 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
+from megatron.core.aux_loss import AuxLossAutoScaler
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import p2p_communication
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
@@ -289,9 +291,16 @@ def forward_step(
     if config.timers is not None:
         config.timers('forward-compute').stop()
 
-    # Set the loss scale for the auxiliary loss of the MoE layer.
-    # Since we use a trick to do backward on the auxiliary loss, we need to set the scale explicitly.
-    if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
+    # Set the loss scale for the auxiliary loss of the MoE layer / Attention.
+    # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
+    # explicitly.
+    use_moe_aux_loss_scaler = (
+        hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None
+    )
+    use_attention_aux_loss_scaler = (
+        hasattr(config, 'attention_z_loss_coeff') and config.attention_z_loss_coeff > 0.0
+    )
+    if use_moe_aux_loss_scaler or use_attention_aux_loss_scaler:
         # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
         loss_scale = (
             config.grad_scale_func(torch.ones(1, device=output_tensor.device))
@@ -299,7 +308,10 @@ def forward_step(
             else torch.tensor(1.0)
         )
         # Set the loss scale
-        MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+        if use_moe_aux_loss_scaler:
+            MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+        else:
+            AuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
 
     # If T5 model (or other model with encoder and decoder)
     # and in decoder stack, then send encoder_hidden_state

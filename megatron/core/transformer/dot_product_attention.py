@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 
@@ -7,11 +8,17 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.aux_loss import (
+    AuxLossAutoScaler,
+    aux_losses_tracker_save,
+    aux_losses_tracker_track_metrics
+)
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 from megatron.core.transformer.utils import attention_mask_func
 from megatron.core.utils import divide
 
@@ -87,6 +94,9 @@ class DotProductAttention(MegatronModule):
             self.config.attention_dropout if attention_dropout is None else attention_dropout
         )
 
+        # Z-loss coefficient
+        self.z_loss_coeff = self.config.attention_z_loss_coeff
+
     def forward(
         self,
         query: Tensor,
@@ -152,6 +162,10 @@ class DotProductAttention(MegatronModule):
         # change view to [b, np, sq, sk]
         attention_scores = matmul_result.view(*output_size)
 
+        # optionally apply z-loss
+        # TODO: optimization - support variant of softmax that returns also probs and z
+        attention_scores = self.apply_z_loss(attention_scores, attention_mask)
+
         # ===========================
         # Attention probs and dropout
         # ===========================
@@ -203,3 +217,62 @@ class DotProductAttention(MegatronModule):
         context = context.view(*new_context_shape)
 
         return context
+
+    def apply_z_loss(self, scores, mask, z=None):
+        """Encourages the SoftMax partition function Z (see below) to remain small to enhance stability.
+           SoftMax(logits)[i] = (e^logits[i]) / Z , where Z = SUM(e^logits[i])
+
+        Args:
+            scores (torch.Tensor): The attention logits.
+            mask (torch.Tensor): The attention mask.
+            z (torch.Tensor, optional): Softmax partition function, SUM(e^logits[i]). Defaults to None.
+
+        Returns:
+            torch.Tensor: The logits after applying the z-loss.
+        """
+        if self.z_loss_coeff > 0.0:
+            # calculate z
+            if z is None:
+                masked_scores = attention_mask_func(scores, mask) if mask is not None else scores
+                z = torch.logsumexp(masked_scores, dim=-1)
+
+            # calculate z-loss
+            z_loss_coeff = self.z_loss_coeff / parallel_state.get_tensor_model_parallel_world_size()
+            z_loss = torch.mean(z ** 2) * z_loss_coeff
+
+            # divide by dp here and then use "reduce_group" to reduce-sum over dp group
+            dp = parallel_state.get_data_parallel_world_size()
+            save_to_attention_z_loss_tracker(
+                "attention_z_loss",
+                z_loss / (z_loss_coeff * dp),
+                self.layer_number,
+                self.config.num_layers,
+            )
+
+            # handles z-loss backprop including applying required loss scaling
+            scores = AuxLossAutoScaler.apply(scores, z_loss)
+
+        return scores
+
+
+def save_to_attention_z_loss_tracker(name: str, loss: torch.Tensor, layer_number: int, num_layers: int):
+    """Save the attention z-loss tracker for logging.
+    Args:
+        name (str): The name of the loss.
+        loss (torch.Tensor): The loss tensor.
+        layer_number (int): Layer index of the loss.
+        num_layers (int): The number of total layers.
+    """
+    tracker = parallel_state.get_attention_z_loss_tracker()
+    layer_offset = get_transformer_layer_offset(num_layers)
+    global_layer_number = layer_offset + layer_number
+    aux_losses_tracker_save(tracker, name, loss, global_layer_number, num_layers,
+                            reduce_group=parallel_state.get_data_parallel_group())
+
+
+def track_attention_z_loss_metrics(
+    loss_scale, iteration, writer, wandb_writer=None, total_loss_dict=None, per_layer_logging=False
+):
+    tracker = parallel_state.get_attention_z_loss_tracker()
+    aux_losses_tracker_track_metrics(tracker, loss_scale, iteration, writer, wandb_writer, total_loss_dict,
+                                     per_layer_logging, per_layer_prefix='attention_z_loss/')

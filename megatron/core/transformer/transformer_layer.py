@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from abc import ABC
@@ -70,6 +71,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         self.layer_number = layer_number + self._get_layer_offset()
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
+        self.use_pre_norm = not config.apply_norm_post_sub_block
 
         ## [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
@@ -131,30 +133,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
     def _get_layer_offset(self):
-
-        pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
-
-        num_layers_per_pipeline_rank = (
-            self.config.num_layers // parallel_state.get_pipeline_model_parallel_world_size()
-        )
-
-        if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
-            vp_rank = parallel_state.get_virtual_pipeline_model_parallel_rank()
-            vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
-
-            total_num_layers = self.config.num_layers
-            num_layers_per_virtual_rank = num_layers_per_pipeline_rank // vp_size
-            total_virtual_chunks = total_num_layers // vp_size
-            offset = vp_rank * total_virtual_chunks + (pipeline_rank * num_layers_per_virtual_rank)
-
-        else:
-            # Each stage gets a contiguous set of layers.
-            if parallel_state.get_pipeline_model_parallel_world_size() > 1:
-                offset = pipeline_rank * num_layers_per_pipeline_rank
-            else:
-                offset = 0
-
-        return offset
+        return get_transformer_layer_offset(self.config.num_layers)
 
     def forward(
         self,
@@ -172,7 +151,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         residual = hidden_states
 
         # Optional Input Layer norm
-        input_layernorm_output = self.input_layernorm(hidden_states)
+        input_layernorm_output = self.input_layernorm(hidden_states) if self.use_pre_norm else hidden_states
 
         # Self attention.
         attention_output_with_bias = self.self_attention(
@@ -183,12 +162,20 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             packed_seq_params=packed_seq_params,
         )
 
-        # TODO: could we move `bias_dropout_add_exec_handler` itself
-        # inside the module provided in the `bias_dropout_add_spec` module?
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                attention_output_with_bias, residual, self.hidden_dropout
-            )
+        if self.use_pre_norm:
+            # TODO: could we move `bias_dropout_add_exec_handler` itself
+            # inside the module provided in the `bias_dropout_add_spec` module?
+            with self.bias_dropout_add_exec_handler():
+                # hidden = x + attention(norm(x))
+                hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
+                    attention_output_with_bias, residual, self.hidden_dropout
+                )
+        else:
+            with self.bias_dropout_add_exec_handler():
+                # hidden = x + norm(attention(x))
+                hidden_states = self.self_attn_bda(self.training)(
+                    attention_output_with_bias, residual, self.input_layernorm, self.hidden_dropout
+                )
 
         # Residual connection.
         residual = hidden_states
@@ -218,17 +205,25 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         residual = hidden_states
 
         # Optional Layer norm post the cross-attention.
-        pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+        pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states) if self.use_pre_norm else hidden_states
 
         # MLP.
         mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
 
-        # TODO: could we move `bias_dropout_add_exec_handler` itself
-        # inside the module provided in the `bias_dropout_add_spec` module?
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                mlp_output_with_bias, residual, self.hidden_dropout
-            )
+        if self.use_pre_norm:
+            # TODO: could we move `bias_dropout_add_exec_handler` itself
+            # inside the module provided in the `bias_dropout_add_spec` module?
+            with self.bias_dropout_add_exec_handler():
+                # hidden = x + mlp(norm(x))
+                hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
+                    mlp_output_with_bias, residual, self.hidden_dropout
+                )
+        else:
+            with self.bias_dropout_add_exec_handler():
+                # hidden = x + norm(mlp(x))
+                hidden_states = self.mlp_bda(self.training)(
+                    mlp_output_with_bias, residual, self.pre_mlp_layernorm, self.hidden_dropout
+                )
 
         # Jit compiled function creates 'view' tensor. This tensor
         # potentially gets saved in the MPU checkpoint function context,
@@ -253,3 +248,29 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         if prefixed_map:
             apply_prefix_mapping(sharded_state_dict, prefixed_map)
         return sharded_state_dict
+
+
+def get_transformer_layer_offset(num_layers):
+    pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
+
+    num_layers_per_pipeline_rank = (
+            num_layers // parallel_state.get_pipeline_model_parallel_world_size()
+    )
+
+    if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+        vp_rank = parallel_state.get_virtual_pipeline_model_parallel_rank()
+        vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+
+        total_num_layers = num_layers
+        num_layers_per_virtual_rank = num_layers_per_pipeline_rank // vp_size
+        total_virtual_chunks = total_num_layers // vp_size
+        offset = vp_rank * total_virtual_chunks + (pipeline_rank * num_layers_per_virtual_rank)
+
+    else:
+        # Each stage gets a contiguous set of layers.
+        if parallel_state.get_pipeline_model_parallel_world_size() > 1:
+            offset = pipeline_rank * num_layers_per_pipeline_rank
+        else:
+            offset = 0
+
+    return offset

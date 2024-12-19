@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import argparse
@@ -122,7 +123,9 @@ def main():
                         help='Directory to load model checkpoint from')
     parser.add_argument('--save-dir', type=str, required=True,
                         help='Directory to save model checkpoint to')
-    parser.add_argument('--max-queue-size', type=int, default=50,
+    parser.add_argument('--source-margs-file', type=str, default=None,
+                        help='Absolute path to `source_megatron_args.json` file created during MLM -> HF conversion (usually inside `load-dir`)')
+    parser.add_argument('--max-queue-size', type=int, default=200,
                         help='Maximum number of tensors in the queue')
     parser.add_argument('--no-checking', action='store_false',
                         help='Do not perform checking on the name and ordering of weights',

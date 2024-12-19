@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Sample Generate GPT"""
@@ -68,7 +69,10 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             if use_te:
                 transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm)
             else:
-                transformer_layer_spec = get_gpt_layer_local_spec(args.num_experts, args.moe_grouped_gemm)
+                use_pre_norm = not args.apply_norm_post_sub_block
+                transformer_layer_spec = get_gpt_layer_local_spec(args.num_experts, args.moe_grouped_gemm,
+                                                                  args.qk_layernorm, args.normalization,
+                                                                  use_pre_norm=use_pre_norm)
 
         model = GPTModel(
             config=config,

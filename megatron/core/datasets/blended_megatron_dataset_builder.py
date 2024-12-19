@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import logging
@@ -327,25 +328,35 @@ class BlendedMegatronDatasetBuilder(object):
             split: List[float],
             sizes_per_dataset: List[List[int]],
         ) -> None:
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                all_futures = []
-                for i in range(len(prefixes)):
-                    all_futures.append(
-                        executor.submit(
-                            self._build_megatron_dataset_splits,
-                            prefixes[i],
-                            split,
-                            sizes_per_dataset[i],
-                            False,  # synchronize_ranks, barrier is called in this function
+            if num_workers > 1:
+                with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                    all_futures = []
+                    for i in range(len(prefixes)):
+                        all_futures.append(
+                            executor.submit(
+                                self._build_megatron_dataset_splits,
+                                prefixes[i],
+                                split,
+                                sizes_per_dataset[i],
+                                False,  # synchronize_ranks, barrier is called in this function
+                            )
                         )
-                    )
-                for future in all_futures:
-                    try:
-                        megatron_datasets_split = future.result()
-                        for j in range(len(megatron_datasets_split)):
-                            megatron_datasets[j].append(megatron_datasets_split[j])
-                    except Exception as err:
-                        raise err
+                    for future in all_futures:
+                        try:
+                            megatron_datasets_split = future.result()
+                            for j in range(len(megatron_datasets_split)):
+                                megatron_datasets[j].append(megatron_datasets_split[j])
+                        except Exception as err:
+                            raise err
+            else:
+                for i in range(len(prefixes)):
+                    megatron_datasets_split = self._build_megatron_dataset_splits(
+                        prefixes[i],
+                        split,
+                        sizes_per_dataset[i],
+                        False)
+                    for j in range(len(megatron_datasets_split)):
+                        megatron_datasets[j].append(megatron_datasets_split[j])
             return megatron_datasets
 
         megatron_datasets = [[] for _ in range(len(Split))]

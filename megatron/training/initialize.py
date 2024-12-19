@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron initialization."""
@@ -10,6 +11,7 @@ import numpy as np
 import torch
 from datetime import timedelta
 
+from megatron.core.utils import is_real_cuda_device_available
 from megatron.legacy import fused_kernels
 from megatron.training import get_adlr_autoresume
 from megatron.training import get_args
@@ -157,26 +159,27 @@ def _compile_dependencies():
                 flush=True,
             )
 
-    # Always build on rank zero first.
-    if torch.distributed.get_rank() == 0:
-        start_time = time.time()
-        print("> compiling and loading fused kernels ...", flush=True)
-        fused_kernels.load(args)
+    if is_real_cuda_device_available():
+        # Always build on rank zero first.
+        if torch.distributed.get_rank() == 0:
+            start_time = time.time()
+            print("> compiling and loading fused kernels ...", flush=True)
+            fused_kernels.load(args)
+            torch.distributed.barrier()
+        else:
+            torch.distributed.barrier()
+            fused_kernels.load(args)
+        # Simple barrier to make sure all ranks have passed the
+        # compilation phase successfully before moving on to the
+        # rest of the program. We think this might ensure that
+        # the lock is released.
         torch.distributed.barrier()
-    else:
-        torch.distributed.barrier()
-        fused_kernels.load(args)
-    # Simple barrier to make sure all ranks have passed the
-    # compilation phase successfully before moving on to the
-    # rest of the program. We think this might ensure that
-    # the lock is released.
-    torch.distributed.barrier()
-    if torch.distributed.get_rank() == 0:
-        print(
-            ">>> done with compiling and loading fused kernels. "
-            "Compilation time: {:.3f} seconds".format(time.time() - start_time),
-            flush=True,
-        )
+        if torch.distributed.get_rank() == 0:
+            print(
+                ">>> done with compiling and loading fused kernels. "
+                "Compilation time: {:.3f} seconds".format(time.time() - start_time),
+                flush=True,
+            )
 
 def _initialize_tp_communicators():
     """ initializing the communicators with user buffers for high-performance tensor-model-parallel 

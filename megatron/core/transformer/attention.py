@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -78,6 +79,9 @@ class Attention(MegatronModule, ABC):
         self.layer_number = layer_number
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
+
+        self.cos_cached = None
+        self.sin_cached = None
 
         # For normal attention without groups, num_query_groups == num_attention_heads,
         # so these two will be the same
@@ -302,12 +306,16 @@ class Attention(MegatronModule, ABC):
                 q_pos_emb,
                 config=self.config,
                 cu_seqlens=cu_seqlens_q,
+                cos_cached=self.cos_cached,
+                sin_cached=self.sin_cached,
             )
             key = apply_rotary_pos_emb(
                 key,
                 k_pos_emb,
                 config=self.config,
                 cu_seqlens=cu_seqlens_kv,
+                cos_cached=self.cos_cached,
+                sin_cached=self.sin_cached,
             )
 
             # TODO, can apply positional embedding to value_layer so it has

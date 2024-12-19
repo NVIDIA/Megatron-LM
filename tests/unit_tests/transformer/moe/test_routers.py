@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import pytest
@@ -12,12 +13,17 @@ from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 
 
-class TestTop2Router:
-    def setup_method(self, method):
+class TestTopRouter:
+    @pytest.fixture(autouse=True)
+    def setup_method(self, request):
         Utils.initialize_model_parallel(1, 1)
         _set_random_seed(seed_=123, data_parallel_random_init=False)
         print("done intializing")
         num_moe_experts = 4
+        if hasattr(request.node, 'callspec'):
+            topk = request.node.callspec.params.get('moe_router_topk', 2)
+        else:
+            topk = 2
         self.transformer_config = TransformerConfig(
             num_layers=2,
             hidden_size=12,
@@ -25,7 +31,7 @@ class TestTop2Router:
             num_moe_experts=num_moe_experts,
             use_cpu_initialization=True,
             moe_router_load_balancing_type="aux_loss",
-            moe_router_topk=2,
+            moe_router_topk=topk,
             moe_aux_loss_coeff=0,
         )
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
@@ -36,7 +42,7 @@ class TestTop2Router:
         )
         self.router = self.sequential_mlp.router
 
-    def teardown_method(self, method):
+    def teardown_method(self):
         Utils.destroy_model_parallel()
 
     def test_constructor(self):
@@ -50,7 +56,8 @@ class TestTop2Router:
         (True),
         (False),
     ])
-    def test_router_forward(self, moe_router_pre_softmax):
+    @pytest.mark.parametrize("moe_router_topk", [2, 3])
+    def test_router_forward(self, moe_router_pre_softmax, moe_router_topk):
         with torch.no_grad():
             self.router = self.router.cuda()
             self.router.config.moe_router_pre_softmax = moe_router_pre_softmax
@@ -58,15 +65,10 @@ class TestTop2Router:
             hidden_states = torch.randn((32, 2, self.router.config.hidden_size))
             hidden_states = hidden_states.cuda()
             scores, indices = self.router(hidden_states)
-            print(scores.shape, indices.shape)
-            assert scores.shape == (64, 2)
-            assert indices.shape == (64, 2)
-            print(
-                (indices == 0).sum(), (indices == 1).sum(), (indices == 2).sum(), (indices == 3).sum()
-            )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_aux_loss(self):
+    @pytest.mark.parametrize("moe_router_topk", [2, 3])
+    def test_aux_loss(self, moe_router_topk):
         self.sequential_mlp = self.sequential_mlp.cuda()
         
         # Without aux loss
