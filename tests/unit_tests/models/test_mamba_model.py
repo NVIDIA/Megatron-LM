@@ -56,7 +56,6 @@ class TestMambaModel:
         assert self.model.decoder.input_tensor.shape[1] == micro_batch_size
         assert self.model.decoder.input_tensor.shape[2] == config.hidden_size
 
-    @pytest.mark.failing_on_rocm
     def test_forward(self):
         config: TransformerConfig = self.model.config
         sequence_length = self.model.max_sequence_length
@@ -79,7 +78,6 @@ class TestMambaModel:
         assert logits.shape[1] == sequence_length
         assert logits.shape[2] == self.model.vocab_size
 
-    @pytest.mark.failing_on_rocm
     def test_inference(self):
         config: TransformerConfig = self.model.config
         micro_batch_size = 2
