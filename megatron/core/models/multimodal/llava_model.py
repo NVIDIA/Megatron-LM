@@ -36,6 +36,7 @@ IGNORE_INDEX = -100  # ID for labels that should be ignored.
 # Image token index can be tokenizer dependent so the default value does not work in all cases.
 DEFAULT_IMAGE_TOKEN_INDEX = -200
 IMAGE_TOKEN = "<image>"
+VIDEO_TOKEN = "<video>"
 
 
 # Note: This is under development and may be missing features.
