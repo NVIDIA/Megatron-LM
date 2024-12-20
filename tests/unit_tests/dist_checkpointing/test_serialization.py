@@ -568,6 +568,39 @@ class TestSerialization:
 
         Utils.destroy_model_parallel()
 
+    def test_empty_load(self, tmp_path_dist_ckpt):
+        Utils.initialize_model_parallel(2, 4)
+
+        if Utils.rank == 0:
+            state_dict = {'common': 'common-value'}
+        elif Utils.rank == 1:
+            state_dict = {'a': 3}  # this is not saved at all (common saved by rank 0 only)
+        elif Utils.rank == 2:
+            state_dict = {'b': 3}  # this is not saved at all (common saved by rank 0 only)
+        else:
+            state_dict = {
+                'a': ShardedTensor.from_rank_offsets(
+                    'x', torch.ones((2,)) * Utils.rank, replica_id=Utils.rank - 3
+                )
+            }
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_empty_load', sync=True) as ckpt_dir:
+            save(state_dict, ckpt_dir)
+            torch.distributed.barrier()
+            loaded_state_dict = load(state_dict, ckpt_dir)
+            assert loaded_state_dict['common'] == 'common-value'
+
+            if Utils.rank <= 2:
+                assert loaded_state_dict.keys() == {'common'}
+            else:
+                assert loaded_state_dict.keys() == {'common', 'a'}
+                loaded_state_dict['a'].cpu().numpy().tolist() == [
+                    3,
+                    3,
+                ]  # rank 3 held the main replica so did the saving
+
+        Utils.destroy_model_parallel()
+
 
 class TestNonStrictLoad:
     def setup_method(self, method):
