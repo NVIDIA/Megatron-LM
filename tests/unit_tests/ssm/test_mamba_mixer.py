@@ -33,7 +33,6 @@ class TestMambaMixer:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("use_mem_eff_path", [True, False])
-    @pytest.mark.failing_on_rocm
     def test_gpu_forward(self, use_mem_eff_path):
         if use_mem_eff_path:
             mixer = self.mixer
