@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from megatron.core.device_utils import get_current_device
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_local_spec,
@@ -116,7 +117,7 @@ class TestMoELayerInit:
         )
         moe_layer = MoELayer(
             transformer_config, transformer_layer_spec.submodules.mlp.submodules
-        ).cuda()
+        ).to(device=get_current_device())
 
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size, expert_model_parallel_size=ep_size
@@ -171,13 +172,13 @@ class TestInterleaveTransformerBlock:
         config: TransformerConfig = parallel_transformer_block.config
         sequence_length = 32
         micro_batch_size = 2
-        parallel_transformer_block.cuda()
+        parallel_transformer_block.to(device=get_current_device())
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones((sequence_length, micro_batch_size, config.hidden_size))
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
 
-        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).to(device=get_current_device())
         hidden_states = parallel_transformer_block(
             hidden_states=hidden_states, attention_mask=attention_mask
         )

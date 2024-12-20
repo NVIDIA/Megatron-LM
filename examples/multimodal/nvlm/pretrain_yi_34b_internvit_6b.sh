@@ -75,7 +75,7 @@ OPTIONS=" \
     --decoder-seq-length ${DECODER_SEQ_LEN} \
     --max-position-embeddings ${MAX_POS_EMBED} \
     --tokenizer-type MultimodalTokenizer \
-    --tokenizer-model ${WORKSPACE}/<path to tokenizer> \
+    --tokenizer-model NousResearch/Nous-Hermes-2-Yi-34B \
     --tokenizer-prompt-format nvlm-yi-34b \
     --vocab-size 64000 \
     --make-vocab-size-divisible-by 1 \

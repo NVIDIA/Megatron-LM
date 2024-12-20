@@ -6,8 +6,8 @@ from typing import Dict
 
 import torch
 
-from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.inference_request import InferenceRequest, Status
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import Counter
 
 
@@ -33,7 +33,7 @@ class Scheduler:
         prompt: str,
         prompt_tokens: torch.Tensor,
         encoder_prompt: str = None,
-        inference_parameters: CommonInferenceParams = None,
+        inference_parameters: SamplingParams = None,
         arrival_time: float = None,
     ):
         """Add an incoming request
@@ -45,7 +45,7 @@ class Scheduler:
             prompt (str): Input prompt string
             prompt_tokens (torch.Tensor): A torch tensor having the input prompts tokenized
             encoder_prompt (str): Encoder input string
-            inference_parameters (CommonInferenceParams): The inference parameters
+            inference_parameters (SamplingParams): The inference parameters
             arrival_time (float, optional): The incoming request time. Defaults to None.
         """
         request_id = str(next(self.request_counter))

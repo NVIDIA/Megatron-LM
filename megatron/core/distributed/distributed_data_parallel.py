@@ -9,6 +9,7 @@ from megatron.core.device_utils import get_xla_model
 
 from .. import parallel_state
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
+from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import is_float8tensor, log_single_rank
 from .data_parallel_base import _BaseDataParallel
@@ -340,6 +341,9 @@ class DistributedDataParallel(_BaseDataParallel):
                 self.use_forward_hook
             ), "Should use pre-hook only when overlap_param_gather is True"
 
+            if is_graph_capturing():
+                return
+
             # Make sure all parameters in this module have been all-gathered as necessary.
             for param in module.parameters(recurse=False):
                 # Skip parameters without an associated buffer (such parameters have a
@@ -370,6 +374,9 @@ class DistributedDataParallel(_BaseDataParallel):
         """
 
         def hook(*unused):
+            if is_graph_capturing():
+                return
+
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
                 if self.ddp_config.overlap_grad_reduce:

@@ -119,7 +119,8 @@ class ShardedTensor(ShardedBase):
                     self.init_data(device='meta')
                     if self.data.shape != real_data.shape:
                         raise CheckpointingException(
-                            f'Data shape doesnt match expected {self.data.shape} for {self}'
+                            f'Data shape {real_data.shape} doesnt match'
+                            f' expected {self.data.shape} for {self}'
                         )
                 finally:
                     self.data = real_data

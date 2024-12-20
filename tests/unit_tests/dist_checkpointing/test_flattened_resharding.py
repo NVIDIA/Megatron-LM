@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import io
+from contextlib import nullcontext
 
 import numpy as np
 import pytest
@@ -18,6 +19,10 @@ from megatron.core.dist_checkpointing.strategies.resharding import (
     restore_nd_flattened_tensors_formulation,
 )
 from megatron.core.dist_checkpointing.strategies.torch import get_reformulation_metadata
+from megatron.core.dist_checkpointing.validation import (
+    determine_global_metadata,
+    validate_sharding_integrity,
+)
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -39,7 +44,7 @@ class TestFlattenedResharding:
             tmp_path_dist_ckpt / 'test_flattened_partition_change_save_load',
             process_group=parallel_state.get_default_process_group()
         ) as ckpt_dir:
-
+            
             state_dict = self._build_state_dict()
 
             save(state_dict, ckpt_dir, process_group=parallel_state.get_default_process_group())
@@ -204,3 +209,72 @@ class TestFlattenedResharding:
             ),
         }
         return state_dict
+
+    def test_flattened_tensors_are_properly_validated(self, tmp_path_dist_ckpt):
+        Utils.initialize_model_parallel()
+        # Global tensor of shape (6, 6) is built from:
+        # ranks 0, 1, 2 tensors of length 1, 2, 3
+        # and then ranks 3, ..., 7 tensors of length 6
+        local_flat_ten = torch.ones(Utils.rank + 1 if Utils.rank <= 2 else 6) * Utils.rank
+
+        global_flattened_len = 6 + (Utils.world_size - 3) * 6
+        if Utils.world_size == 8:
+            assert global_flattened_len == 1 + 2 + 3 + 5 * 6
+            local_ten_shape = (1, 6)
+        else:
+            local_ten_shape = (global_flattened_len,)
+
+        if Utils.rank == 0:
+            local_dp_slice_start = 0
+        elif Utils.rank == 1:
+            local_dp_slice_start = 1
+        elif Utils.rank == 2:
+            local_dp_slice_start = 3
+        else:
+            local_dp_slice_start = 0
+        local_dp_slice = slice(local_dp_slice_start, local_dp_slice_start + len(local_flat_ten))
+
+        state_dict = {
+            'sd_key_flat': ShardedTensor.from_rank_offsets_flat(
+                'flat',
+                local_flat_ten,
+                local_ten_shape,
+                *((0, max(0, Utils.rank - 2), 6),) if Utils.world_size == 8 else (),
+                flattened_range=local_dp_slice,
+                replica_id=0
+            )
+        }
+        validate_sharding_integrity(determine_global_metadata(state_dict, 
+                                                              process_group=parallel_state.get_default_process_group())[1],
+                                    process_group=parallel_state.get_default_process_group())
+        if Utils.rank == 1:
+            old_state_dict = state_dict
+            state_dict = {}
+
+        with (
+            pytest.raises(CheckpointingException) if Utils.rank == 0 else nullcontext()
+        ) as exc_info:
+            validate_sharding_integrity(determine_global_metadata(state_dict,
+                                                                  process_group=parallel_state.get_default_process_group())[1],
+                                        process_group=parallel_state.get_default_process_group())
+        if Utils.rank == 0:
+            assert 'Flattened ranges dont cover the whole shard ShardedTensor' in str(
+                exc_info.value
+            )
+
+        if Utils.rank == 1:
+            state_dict = old_state_dict
+
+        if Utils.rank == 4:
+            state_dict = {}
+
+        with (
+            pytest.raises(CheckpointingException) if Utils.rank == 0 else nullcontext()
+        ) as exc_info:
+            validate_sharding_integrity(determine_global_metadata(state_dict,
+                                                                  process_group=parallel_state.get_default_process_group())[1],
+                                        process_group=parallel_state.get_default_process_group())
+        if Utils.rank == 0:
+            assert 'Invalid access pattern' in str(exc_info.value)
+
+        Utils.destroy_model_parallel()
