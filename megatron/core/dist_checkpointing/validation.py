@@ -461,10 +461,15 @@ def _validate_sharding_for_key(rank_sharding: List[Tuple[int, ShardedTensor]]):
             lambda x: x[1],
             _validate_sharding_for_key_flattened,
         )
-    else:
-        if not torch.all(shard_access_cnt == 1):
-            logger.error(f'Invalid access pattern for {rank_sharding[0][1]}: {shard_access_cnt}')
-            raise CheckpointingException(f'Invalid access pattern for {rank_sharding[0][1]}')
+        # For each shard with at least 1 flattened tensor in it, the above
+        # `_validate_sharding_for_key_flattened` ensure a correct consistent pattern
+        # The only thing that can go wrong at this point is that some shard don't have
+        # *any* representatives which will be checked later by comparing `shard_access_cnt == 1`
+        shard_access_cnt = torch.minimum(shard_access_cnt, torch.tensor([1]))
+    if not torch.all(shard_access_cnt == 1):
+        raise CheckpointingException(
+            f'Invalid access pattern for {rank_sharding[0][1]}: {shard_access_cnt}'
+        )
 
 
 def _compute_shards_access(rank_sharding):
@@ -489,16 +494,10 @@ def _validate_sharding_for_key_flattened(tensors_by_shard):
         all_slices.append((sharding.flattened_range.start, sharding.flattened_range.stop))
 
     starts, stops = map(np.asarray, zip(*sorted(all_slices)))
-    if (
-        starts[0] != 0
-        or stops[-1] != np.product(local_shape)
-        or not np.all(starts[1:] == stops[:-1])
-    ):
-        logger.error(
-            f'Flattened ranges dont cover the whole shard {tensors_by_shard[0]}. Ranges: {(starts, stops)}'
-        )
+    expected_size = np.product(local_shape)
+    if starts[0] != 0 or stops[-1] != expected_size or not np.all(starts[1:] == stops[:-1]):
         raise CheckpointingException(
-            f'Flattened ranges dont cover the whole shard {tensors_by_shard[0]}. Ranges: {(starts, stops)}'
+            f'Flattened ranges dont cover the whole shard {tensors_by_shard[0]} of size {expected_size}. Ranges: {(starts, stops)}'
         )
 
 
