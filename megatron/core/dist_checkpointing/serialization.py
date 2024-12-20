@@ -106,8 +106,6 @@ def load(
 
     checkpoint_dir = Path(checkpoint_dir)
     common_state_dict = common_strategy.load_common(checkpoint_dir)
-    if not sharded_state_dict:
-        return common_state_dict
 
     sharded_state_dict, nonpersistent_state_dict, sh_ten_factories = load_preprocess(
         sharded_state_dict
