@@ -96,3 +96,47 @@ class TestAuxLoss:
             moe_aux_loss_coeff=0.1,
         )
         container.aux_loss_test(self.input, self.baseline_grad)
+
+
+class TestSeqAuxLoss:
+    def setup_method(self, method):
+        baseline_container = AuxlossTestContainer(
+            tp_size=1,
+            ep_size=1,
+            pp_size=1,
+            cp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="seq_aux_loss",
+            moe_token_dispatcher_type="alltoall",
+            moe_aux_loss_coeff=0.1,
+        )
+        moe_layer = baseline_container.moe_layer
+        self.input = torch.randn((32, 8, moe_layer.config.hidden_size)).cuda()
+        self.input.requires_grad = True
+        probs, indices = moe_layer.router(self.input)
+        probs.sum().mul_(0).backward()  # zero out the main gradients
+        self.baseline_grad = self.input.grad
+        self.input.grad = None
+        clear_aux_losses_tracker()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.parametrize("tp_size,ep_size,cp_size", [(1, 8, 1)])
+    def test_a2a_dispatcher(self, tp_size, ep_size, cp_size):
+        container = AuxlossTestContainer(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=1,
+            cp_size=cp_size,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="seq_aux_loss",
+            moe_token_dispatcher_type="alltoall",
+            moe_aux_loss_coeff=0.1,
+        )
+        container.aux_loss_test(self.input, self.baseline_grad)
