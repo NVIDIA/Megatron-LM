@@ -17,23 +17,24 @@ from megatron.core.utils import is_te_min_version
 
 logger = logging.getLogger(__name__)
 
+# Prefer fused RoPE from Apex as we need the `transpose_output_memory` argument for the bshd trick.
+# See https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/2469.
 try:
-    from megatron.core.extensions.transformer_engine import (
-        fused_apply_rotary_pos_emb,
-        fused_apply_rotary_pos_emb_thd,
-    )
-
-    HAVE_APPLY_ROPE_FUSION = True
+    from apex.transformer.functional import fused_apply_rotary_pos_emb
 except ImportError:
     try:
-        from apex.transformer.functional import (
-            fused_apply_rotary_pos_emb,
-            fused_apply_rotary_pos_emb_thd,
-        )
+        from megatron.core.extensions.transformer_engine import fused_apply_rotary_pos_emb
+    except:
+        fused_apply_rotary_pos_emb = None
 
-        HAVE_APPLY_ROPE_FUSION = True
+
+try:
+    from megatron.core.extensions.transformer_engine import fused_apply_rotary_pos_emb_thd
+except ImportError:
+    try:
+        from apex.transformer.functional import fused_apply_rotary_pos_emb_thd
     except ImportError:
-        HAVE_APPLY_ROPE_FUSION = False
+        fused_apply_rotary_pos_emb_thd = None
 
 
 try:
@@ -188,8 +189,10 @@ def apply_rotary_pos_emb(
 
     if config.apply_rope_fusion:
         if cu_seqlens is None:
-            return fused_apply_rotary_pos_emb(t, freqs)
+            assert fused_apply_rotary_pos_emb is not None, "apply_rope_fusion is not available."
+            return fused_apply_rotary_pos_emb(t, freqs, transpose_output_memory=True)
         else:
+            assert fused_apply_rotary_pos_emb_thd is not None, "apply_rope_fusion is not available."
             cp_size = parallel_state.get_context_parallel_world_size()
             if cp_size > 1:
                 if not is_te_min_version("1.11.0", check_equality=False):
