@@ -483,9 +483,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             assert self.ddp_config == model_chunk.ddp_config
 
-        assert isinstance(
-            optimizer, Adam
+        assert (
+            isinstance(optimizer, Adam) or optimizer is None
         ), "Only Adam currently supported, due to checkpointing requirements."
+
+        # when freezing sub-models we have no real optimizer
+        # but still need a stub DistributedOptimizer class
+        if optimizer is None:
+            self.is_stub_optimizer = True
+            return
 
         # Model grad buffer ranges.
         assert per_model_buffers is not None, "per_model_buffers must be provided"
@@ -550,6 +556,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         #   recast preexisting per-param state tensors.
         self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
         self.optimizer.load_state_dict(self.optimizer.state_dict())
+
+        self.is_stub_optimizer = False
 
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """
@@ -1635,6 +1643,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Args:
             filename (str): path to load parameter state from.
         """
+        if self.is_stub_optimizer:
+            return
         state_dict = None
         if torch.distributed.get_rank(self.data_parallel_group) == 0:
             state_dict = torch.load(filename)
@@ -1653,6 +1663,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Args:
             set_to_none (bool): if true, set grads to None.
         """
+        if self.is_stub_optimizer:
+            return
         total_groups = [
             self.model_float16_groups,
             self.model_fp32_groups,
@@ -1710,6 +1722,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         buffer, this method is responsible for copying the updated grads
         from the grad buffer to the main shard's grad field.
         """
+        if self.is_stub_optimizer:
+            return
 
         # Utility method for copying group grads.
         def copy_group_grads(model_groups, shard_main_groups):
@@ -1748,6 +1762,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         buffer, this method is responsible for copying the updated params
         from the main shards into the correct position in the grad buffer.
         """
+        if self.is_stub_optimizer:
+            return
 
         # Utility method for copying group params.
         def copy_group_params(shard_main_groups, model_groups):
@@ -1831,6 +1847,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         If detect FP8 parameters, update their `_scale_inv` and do reduce-max for their
         `amax_history`.
         """
+        if self.is_stub_optimizer:
+            return
         amaxes = []
         scales = []
         scale_invs = []

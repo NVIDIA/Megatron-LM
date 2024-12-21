@@ -40,6 +40,8 @@ products:
     test_case:
       - multimodal_llava_mr_mcore_te_tp1_pp1_dgx_a100_1N8G
       - multimodal_llava_mr_mcore_te_tp2_pp3_dgx_a100_1N8G
+      - multimodal_llava_mr_mcore_te_tp4_pp1_freeze_vit_freeze_lm_dgx_a100_1N8G
+      - multimodal_llava_mr_mcore_te_tp4_pp1_freeze_vit_freeze_lm_dist_opt_dgx_a100_1N8G
   - environment: [lts, dev]
     scope: [mr]
     n_repeat: [5]
