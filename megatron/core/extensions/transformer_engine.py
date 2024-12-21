@@ -16,6 +16,7 @@ from torch.nn.parameter import Parameter
 from megatron.core.device_utils import get_current_device
 from megatron.core import ModelParallelConfig
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
+from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_global_ranks,
@@ -715,7 +716,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         # WAR for peak memory usage.
         # See https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/2388
         if self.config.apply_rope_fusion and qkv_format == 'bshd':
-            query, key, value = [x.contiguous().transpose(0, 1) for x in (query, key, value)]
+            query, key, value = [x.transpose(0, 1).contiguous() for x in (query, key, value)]
             # In PyTorch, the following two tensors are in fact the same:
             #   Tensor with shape (1, S, H, D) and stride (S*H*D, H*D, D, 1)
             #   Tensor with shape (1, S, H, D) and stride (H*D, H*D, D, 1)
@@ -1235,8 +1236,14 @@ try:
 
     from transformer_engine.pytorch.attention import FusedRoPEFunc
 
-    def fused_apply_rotary_pos_emb(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    def fused_apply_rotary_pos_emb(
+        t: torch.Tensor, freqs: torch.Tensor, transpose_output_memory: bool = False
+    ) -> torch.Tensor:
         """Apply rotary positional embedding to input tensor T in `sbhd` format."""
+        if transpose_output_memory:
+            warnings.warn(
+                "transpose_output_memory is not supported by TE's fused RoPE and will be ignored."
+            )
         return FusedRoPEFunc.apply(t, freqs, "sbhd")
 
     def fused_apply_rotary_pos_emb_thd(
