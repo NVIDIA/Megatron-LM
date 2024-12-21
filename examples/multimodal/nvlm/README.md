@@ -5,6 +5,13 @@ Please refer to the [NVLM paper](https://arxiv.org/pdf/2409.11402) for details.
 
 *NOTE: VLMs in Megatron are under active development and are expected to change.*
 
+# Checkpoints
+
+NVLM 1.0 model weights are publicly available in HuggingFace and Megatron format.
+
+- NVLM-1.0-D 72B [HuggingFace version](https://huggingface.co/nvidia/NVLM-D-72B)
+- NVLM-1.0-D 72B [Megatron-Core version](https://huggingface.co/nvidia/NVLM-D-72B-mcore) 
+
 # Setup
 
 ## Docker image
