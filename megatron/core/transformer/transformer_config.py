@@ -266,16 +266,26 @@ class TransformerConfig(ModelParallelConfig):
     """MoE Feed-Forward Network hidden size"""
 
     moe_router_load_balancing_type: str = "aux_loss"
-    """Determines the load balancing strategy for the router. "aux_loss" corresponds to the load
-    balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing
-    algorithm used in S-BASE, and "none" implies no load balancing."""
+    """The load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss 
+    used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the loss used in DeepSeekV2, 
+    which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing 
+    algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss"."""
 
     moe_router_topk: int = 2
     """Number of experts to route to for each token."""
 
+    moe_router_topk_limited_devices: int = None
+    """Number of expert parallel ranks to consider for each token during routing. Perform top-k
+    routing on a subset of expert parallel ranks by first selecting N ranks for each token, then
+    conducting top-k selection among experts on these devices. None means no device limitation."""
+
     moe_router_pre_softmax: bool = False
     """Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. 
     By default, softmax is done after top-k."""
+
+    moe_router_topk_scaling_factor: float = None
+    """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax 
+    enabled. Defaults to None, which means no scaling."""
 
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
@@ -437,7 +447,7 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.moe_expert_capacity_factor < 0:
                 self.moe_expert_capacity_factor = None
-            if self.moe_router_load_balancing_type not in ["aux_loss", "none"]:
+            if self.moe_router_load_balancing_type not in ["aux_loss", "seq_aux_loss", "none"]:
                 raise ValueError(
                     'moe_expert_capacity_factor only works with aux_loss or none load balancing'
                 )
@@ -576,6 +586,14 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "Only transformer-engine>=1.11.0 supports FP8 grouped gemm, "
                     f"but your version is {get_te_version()}."
+                )
+
+        if self.moe_router_topk_limited_devices:
+            if self.moe_router_topk_limited_devices > self.expert_model_parallel_size:
+                raise ValueError(
+                    f"moe_router_topk_limited_devices: {self.moe_router_topk_limited_devices} "
+                    f"must be smaller than expert_model_parallel_size "
+                    f"{self.expert_model_parallel_size}"
                 )
 
         if self.flash_decode and self.fp8:

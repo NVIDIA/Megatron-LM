@@ -63,6 +63,7 @@ language_model:
   # MoE related
   moe_router_load_balancing_type: "aux_loss"
   moe_router_topk: 2
+  moe_router_topk_limited_devices: null
   moe_grouped_gemm: False
   moe_aux_loss_coeff: 0  # 1e-2 would be a good start value for load balance loss.
   moe_z_loss_coeff: null  # 1e-3 would be a good start value for z-loss
