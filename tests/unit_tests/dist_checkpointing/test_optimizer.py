@@ -523,10 +523,12 @@ class TestOptimizerResharding:
         use_dist_opt = use_dist_opt and xm is None
         Utils.initialize_model_parallel(*src_tp_pp)
         with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=False
+            tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=True,
+            process_group=parallel_state.get_default_process_group()
         ) as ckpt_dir_A:
             with TempNamedDir(
-                tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=False
+                tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=True,
+                process_group=parallel_state.get_default_process_group()
             ) as ckpt_dir_B:
 
                 model_A, optimizer_A = setup_model_and_optimizer(

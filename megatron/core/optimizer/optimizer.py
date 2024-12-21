@@ -58,21 +58,25 @@ logger = getLogger(__name__)
 
 xm = get_xla_model()
 
-def _zero_grad_group_helper(group: List[torch.nn.Parameter], set_to_none: bool):
+def _zero_grad_group_helper(
+    group: List[torch.nn.Parameter], set_to_none: bool, use_decoupled_grad: bool = False
+):
     """
     Zero out the gradient for a group of parameters.
     Note: copied from torch.optim.optimizer.
     """
     for param in group:
-        if param.grad is not None:
+        grad_attr = "decoupled_grad" if use_decoupled_grad else "grad"
+        if hasattr(param, grad_attr) and getattr(param, grad_attr) is not None:
             if set_to_none:
-                param.grad = None
+                setattr(param, grad_attr, None)
             else:
-                if param.grad.grad_fn is not None:
-                    param.grad.detach_()
+                grad_obj = getattr(param, grad_attr)
+                if grad_obj.grad_fn is not None:
+                    grad_obj.detach_()
                 else:
-                    param.grad.requires_grad_(False)
-                param.grad.zero_()
+                    grad_obj.requires_grad_(False)
+                grad_obj.zero_()
 
 
 def _multi_tensor_copy_this_to_that(
@@ -137,7 +141,10 @@ class MegatronOptimizer(ABC):
         params = self.get_parameters()
         grads_for_norm = []
         for param in params:
-            grad = param.grad
+            if self.config.use_precision_aware_optimizer:
+                grad = param.decoupled_grad if hasattr(param, "decoupled_grad") else None
+            else:
+                grad = param.grad
             grad_not_none = grad is not None
             is_not_shared = param_is_not_shared(param)
             is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(param)
@@ -192,14 +199,18 @@ class MegatronOptimizer(ABC):
         grad_norm = get_grad_norm_fp32(
             grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
         )
-        clip_grad_by_total_norm_fp32(params, clip_grad, grad_norm)
+        clip_grad_by_total_norm_fp32(
+            params, clip_grad, grad_norm, self.config.use_precision_aware_optimizer
+        )
         return grad_norm
 
     def count_zeros(self) -> float:
         """Count number of zeros in model's gradients."""
         params = self.get_parameters()
         return count_zeros_fp32(
-            params, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+            params,
+            grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
+            use_decoupled_grad=self.config.use_precision_aware_optimizer,
         )
 
     @abstractmethod
@@ -643,7 +654,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
     ):
 
         if is_loading:
-            self.init_state_fn(self.optimizer)
+            self.init_state_fn(self.optimizer, self.config)
 
         state_dict = self.state_dict()
 
@@ -839,7 +850,7 @@ class FP32Optimizer(MegatronOptimizer):
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
     ):
         if is_loading:
-            self.init_state_fn(self.optimizer)
+            self.init_state_fn(self.optimizer, self.config)
 
         state_dict = self.state_dict()
         id_to_sharded_param_map = get_param_id_to_sharded_param_map(
@@ -1012,6 +1023,7 @@ class ChainedOptimizer(MegatronOptimizer):
                     optimizer.get_parameters(),
                     max_norm=optimizer.config.clip_grad,
                     total_norm=grad_norm,
+                    use_decoupled_grad=optimizer.config.use_precision_aware_optimizer,
                 )
 
         # Count the zeros in the grads.

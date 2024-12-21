@@ -265,20 +265,36 @@ def _get_megatron_optimizer_based_on_param_groups(
         Instance of MegatronOptimizer.
     """
     if config.optimizer == 'adam':
-        optimizer = Adam(
-            param_groups,
-            lr=config.lr,
-            weight_decay=config.weight_decay,
-            betas=(config.adam_beta1, config.adam_beta2),
-            eps=config.adam_eps,
-        )
+        kwargs = {
+            "params": param_groups,
+            "lr": config.lr,
+            "weight_decay": config.weight_decay,
+            "betas": (config.adam_beta1, config.adam_beta2),
+            "eps": config.adam_eps,
+        }
 
-        def init_state_fn(opt):
+        if config.use_precision_aware_optimizer:
+            kwargs.update(
+                {
+                    "master_weights": True,
+                    "use_decoupled_grad": True,
+                    "master_weight_dtype": config.main_params_dtype,
+                    "exp_avg_dtype": config.exp_avg_dtype,
+                    "exp_avg_sq_dtype": config.exp_avg_sq_dtype,
+                }
+            )
+
+        optimizer = Adam(**kwargs)
+
+        def init_state_fn(opt, config=None):
             for group in opt.param_groups:
                 for p in group['params']:
                     if len(opt.state[p]) == 0:
-                        opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
-                        opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
+                        if config is None or not config.use_precision_aware_optimizer:
+                            opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
+                            opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
+                        else:
+                            opt.initialize_state(p)
 
     elif config.optimizer == 'sgd':
         optimizer = SGD(

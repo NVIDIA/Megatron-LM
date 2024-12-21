@@ -405,6 +405,14 @@ def validate_args(args, defaults={}):
         assert not args.use_dist_ckpt, \
             '--overlap-param-gather-with-optimizer-step not supported with distributed checkpointing yet'
 
+    dtype_map = {
+        'fp32': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16, 'fp8': torch.uint8,
+    }
+    args.main_grads_dtype = dtype_map[args.main_grads_dtype]
+    args.main_params_dtype = dtype_map[args.main_params_dtype]
+    args.exp_avg_dtype = dtype_map[args.exp_avg_dtype]
+    args.exp_avg_sq_dtype = dtype_map[args.exp_avg_sq_dtype]
+
     if args.fp8_param_gather:
         assert args.use_distributed_optimizer, \
             '--fp8-param-gather only supported with distributed optimizer'
@@ -426,7 +434,12 @@ def validate_args(args, defaults={}):
         args.params_dtype = torch.bfloat16
         # bfloat16 requires gradient accumulation and all-reduce to
         # be done in fp32.
-        if not args.accumulate_allreduce_grads_in_fp32:
+
+        if args.accumulate_allreduce_grads_in_fp32:
+            assert args.main_grads_dtype == torch.float32, \
+                "--main-grads-dtype can only be fp32 when --accumulate-allreduce-grads-in-fp32 is set"
+
+        if not args.accumulate_allreduce_grads_in_fp32 and args.main_grads_dtype == torch.float32:
             args.accumulate_allreduce_grads_in_fp32 = True
             if args.rank == 0:
                 print('accumulate and all-reduce gradients in fp32 for '
@@ -2173,4 +2186,18 @@ def _add_experimental_args(parser):
                        'the overidden pattern')
     group.add_argument('--yaml-cfg', type=str, default=None,
                        help = 'Config file to add additional arguments')
+
+    # Args of precision-aware optimizer
+    group.add_argument('--use-precision-aware-optimizer', action='store_true',
+                       help='Use the precision-aware optimizer in TransformerEngine, which allows '
+                       'setting the main params and optimizer states to lower precision, such as '
+                       'fp16 and fp8.')
+    group.add_argument('--main-grads-dtype', default='fp32', choices=['fp32', 'bf16'],
+                       help='Dtype of main grads when enabling precision-aware-optimizer')
+    group.add_argument('--main-params-dtype', default='fp32', choices=['fp32', 'fp16'],
+                       help='Dtype of main params when enabling precision-aware-optimizer')
+    group.add_argument('--exp-avg-dtype', default='fp32', choices=['fp32', 'fp16', 'fp8'],
+                       help='Dtype of exp_avg when enabling precision-aware-optimizer')
+    group.add_argument('--exp-avg-sq-dtype', default='fp32', choices=['fp32', 'fp16', 'fp8'],
+                       help='Dtype of exp_avg_sq when enabling precision-aware-optimizer')
     return parser
