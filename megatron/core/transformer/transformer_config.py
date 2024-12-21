@@ -521,9 +521,12 @@ class TransformerConfig(ModelParallelConfig):
             if self.rotary_interleaved:
                 raise ValueError("rotary_interleaved does not work with apply_rope_fusion.")
 
-            from megatron.core.models.common.embeddings.rope_utils import HAVE_APPLY_ROPE_FUSION
+            from megatron.core.models.common.embeddings.rope_utils import (
+                fused_apply_rotary_pos_emb,
+                fused_apply_rotary_pos_emb_thd,
+            )
 
-            if not HAVE_APPLY_ROPE_FUSION:
+            if fused_apply_rotary_pos_emb is None and fused_apply_rotary_pos_emb_thd is None:
                 raise ValueError(
                     "apply_rope_fusion is not available. Please install TE >= 1.4 or Apex."
                 )
