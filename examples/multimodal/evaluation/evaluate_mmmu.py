@@ -2,8 +2,14 @@ import argparse
 import glob
 import json
 import os
+import sys
 import re
 import subprocess
+
+# Get the absolute path of the parent directory
+parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
+# Add the parent directory to sys.path
+sys.path.insert(0, parent_dir)
 
 from run_text_generation import get_output_path
 from config import EvaluationConfig
