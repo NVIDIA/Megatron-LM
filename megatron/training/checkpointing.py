@@ -395,7 +395,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         optim_checkpoint_name = \
             get_distributed_optimizer_checkpoint_name(checkpoint_name)
         ensure_directory_exists(optim_checkpoint_name)
-        optimizer.save_parameter_state(optim_checkpoint_name)
+        if not optimizer.is_stub_optimizer:
+            optimizer.save_parameter_state(optim_checkpoint_name)
 
     async_save_request = None
     if args.async_save:
@@ -634,7 +635,7 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
                 model[i].state_dict_for_save_checkpoint())
     # Optimizer stuff.
     if not args.no_save_optim:
-        if optimizer is not None:
+        if optimizer is not None and not optimizer.is_stub_optimizer:
             state_dict['optimizer'] = (optimizer.sharded_state_dict(state_dict, **(optim_sd_kwargs or {}))
                                        if use_dist_ckpt else
                                        optimizer.state_dict())
@@ -1183,7 +1184,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                     args, model, gen_sd_optim, gen_sd_opt_param_scheduler, gen_sd_rng_state,
                     use_dist_ckpt=True, optim_sd_kwargs=optim_sd_kwargs, rerun_state=gen_sd_rerun_state
                 )
-                                                                        
+
             # When "--fp8-param-gather" is disabled, this function doesn't modify anything.
             fix_fp8_params_lose_precision_when_loading_dist_ckpt(load_kwargs['sharded_state_dict'])
 
@@ -1266,7 +1267,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     if not release and not args.finetune and not args.no_load_optim:
         try:
             # Load state dict.
-            if not skip_load_to_model_and_opt and optimizer is not None:
+            if not skip_load_to_model_and_opt and optimizer is not None and not optimizer.is_stub_optimizer:
                 optimizer.load_state_dict(state_dict['optimizer'])
 
             # Load distributed optimizer's custom parameter state.

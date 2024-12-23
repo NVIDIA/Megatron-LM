@@ -83,12 +83,6 @@ def model_provider(
 
     assert args.ckpt_format == 'torch', "Only ckpt-format torch is supported for VLM training currently."
 
-    if args.pipeline_model_parallel_size > 1:
-        assert not args.freeze_LM, "Freezing a pipeline parallel language model is not currently supported"
-
-    if args.encoder_pipeline_model_parallel_size == 1:
-        assert not args.freeze_ViT, "Freezing a vision encoder on its own pipeline rank is not currently supported"
-
     num_image_embeddings = get_num_image_embeddings(
         args.img_h, args.img_w, args.patch_dim, vision_model_type, args.disable_vision_class_token,
         class_token_len=1, pixel_shuffle=False, use_tile_tags=False
@@ -129,7 +123,7 @@ def model_provider(
         language_transformer_layer_spec = decoder_model_with_local_default_spec(
             args.num_experts, args.moe_grouped_gemm
         )
-    
+
     # Prepare mask type for any required padding to support CP/SP sequence sharding.
     if mp_padding_needed > 0:
         if language_transformer_layer_spec.submodules.self_attention.params.get('attn_mask_type', '') == AttnMaskType.causal:
@@ -351,10 +345,10 @@ def get_batch(data_iterator):
     labels = data_i["labels"].long()
     loss_mask = data_f["loss_mask"].float()
     images = data_f["image"].float()
-    
+
     if cp_size > 1 or args.sequence_parallel:
         vision_model_type = "clip"
-        # Calculate the number of image embedding tokens will be added to text tokens 
+        # Calculate the number of image embedding tokens will be added to text tokens
         num_image_embeddings_per_tile = get_num_image_embeddings(
             args.img_h, args.img_w, args.patch_dim, vision_model_type, args.disable_vision_class_token, 1
         )
@@ -367,7 +361,7 @@ def get_batch(data_iterator):
         num_images_per_sample = torch.sum(image_token_mask, dim=-1)
         img_seq_len = (num_image_embeddings_per_tile * num_images_per_sample - num_images_per_sample).max()
         packed_seq_params = _get_packed_seq_params(tokens, img_seq_len, mp_padding_needed_for_text)
-    
+
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank({"tokens": tokens, "position_ids": position_ids})
     attention_mask = None  # Use the attention mask type defined in layer spec. Typically no mask for the vision model and causal mask for the vision model.

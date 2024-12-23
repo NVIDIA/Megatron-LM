@@ -72,14 +72,16 @@ from megatron.core.num_microbatches_calculator import (
 
 from .async_utils import maybe_finalize_async_save
 from .utils import (
+    append_to_progress_log,
     calc_params_l2_norm,
     check_adlr_autoresume_termination,
+    logical_and_across_model_parallel_group,
+    reduce_max_stat_across_model_parallel_group,
     is_last_rank,
     print_rank_0,
     print_rank_last,
     report_memory,
     unwrap_model,
-    append_to_progress_log,
     update_use_dist_ckpt,
 )
 from .global_vars import (
@@ -89,7 +91,8 @@ from .global_vars import (
     get_timers,
     get_tensorboard_writer,
     get_wandb_writer,
-    get_one_logger)
+    get_one_logger,
+)
 from . import one_logger_utils
 
 from . import ft_integration
@@ -221,7 +224,7 @@ def get_start_time_from_progress_log():
 
 def preprocess_common_state_dict(common_state_dict):
     import copy
-    # Convert args key of type namespace to dictionary 
+    # Convert args key of type namespace to dictionary
     preprocessed_common_state_dict = copy.deepcopy(common_state_dict)
     preprocessed_common_state_dict['args'] = vars(preprocessed_common_state_dict['args'])
     # Remove rank and local rank from state dict if it exists, since they are expected to be different
@@ -755,7 +758,7 @@ def setup_model_and_optimizer(model_provider_func,
 
 
 def train_step(forward_step_func, data_iterator,
-               model, optimizer, opt_param_scheduler, config): 
+               model, optimizer, opt_param_scheduler, config):
     """Single training step."""
     args = get_args()
     timers = get_timers()
@@ -792,9 +795,19 @@ def train_step(forward_step_func, data_iterator,
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
     # Update parameters.
+
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     timers('optimizer').stop()
+
+    # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
+    # so we must gather across mp ranks
+    update_successful = logical_and_across_model_parallel_group(update_successful)
+    # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
+    # so we must gather across mp ranks
+    grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
+    if args.log_num_zeros_in_grad:
+        num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(num_zeros_in_grad)
 
     # Vision momentum.
     if getattr(args, 'vision_pretraining', False) and args.vision_pretraining_type == "dino":
@@ -834,7 +847,6 @@ def train_step(forward_step_func, data_iterator,
                     numerator += val
                     denominator += 1
             loss_reduced[key] = numerator / denominator
-        
         return loss_reduced, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad
     return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad
 
@@ -915,6 +927,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
     total_iterations = total_loss_dict[advanced_iters_key] + \
                        total_loss_dict[skipped_iters_key]
 
+    # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
+    learning_rate = reduce_max_stat_across_model_parallel_group(learning_rate)
     # Tensorboard values.
     # Timer requires all the ranks to call.
     if args.log_timers_to_tensorboard and \
@@ -932,12 +946,12 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
             wandb_writer.log({'samples vs steps': args.consumed_train_samples},
                              iteration)
         writer.add_scalar('learning-rate', learning_rate, iteration)
-        if args.decoupled_lr is not None:
-            writer.add_scalar('decoupled-learning-rate', decoupled_learning_rate, iteration)
         writer.add_scalar('learning-rate vs samples', learning_rate,
-                          args.consumed_train_samples)
+                            args.consumed_train_samples)
         if wandb_writer:
             wandb_writer.log({'learning-rate': learning_rate}, iteration)
+        if args.decoupled_lr is not None:
+            writer.add_scalar('decoupled-learning-rate', decoupled_learning_rate, iteration)
         if args.skipped_train_samples > 0:
             writer.add_scalar('skipped-train-samples', args.skipped_train_samples, iteration)
             if wandb_writer:
@@ -1037,7 +1051,6 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                     writer.add_scalar('throughput', throughput, iteration)
                 if wandb_writer:
                     wandb_writer.log({'throughput': throughput}, iteration)
-        assert learning_rate is not None
         # Decoupled_learning_rate should be not None only on first and last pipeline stage.
         log_string += f' learning rate: {learning_rate:.6E} |'
         if args.decoupled_lr is not None and (mpu.is_pipeline_first_stage(ignore_virtual=True) or
@@ -1070,7 +1083,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
         print_rank_last(log_string)
-        if report_memory_flag and learning_rate > 0.:
+        if report_memory_flag:
             # Report memory after optimizer state has been initialized.
             if torch.distributed.get_rank() == 0:
                 num_microbatches = get_num_microbatches()
@@ -1521,8 +1534,12 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
 
         # Logging.
-        loss_scale = optimizer.get_loss_scale().item()
+        if not optimizer.is_stub_optimizer:
+            loss_scale = optimizer.get_loss_scale().item()
+        else:
+            loss_scale = 1.0
         params_norm = None
+
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
         learning_rate = None
@@ -1725,7 +1742,9 @@ def evaluate(forward_step_func,
 
     timers('evaluate').stop()
     timers.log(['evaluate'])
-    
+
+    rerun_state_machine.set_mode(rerun_mode)
+
     rerun_state_machine.set_mode(rerun_mode)
 
     return total_loss_dict, collected_non_loss_data, False

@@ -96,15 +96,18 @@ def calc_params_l2_norm(model):
                     param = to_local_if_dtensor(param)
                     params_data.append(param.data.float() if args.bf16 else param.data)
 
-    # Calculate norm
+    # Calculate dense param norm
     dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device=get_current_device())
-    norm, _ = multi_tensor_applier(
-        multi_tensor_l2norm,
-        dummy_overflow_buf,
-        [params_data],
-        False # no per-parameter norm
-    )
-    norm_2 = norm * norm
+    if len(params_data) > 0:
+        norm, _ = multi_tensor_applier(
+            multi_tensor_l2norm,
+            dummy_overflow_buf,
+            [params_data],
+            False # no per-parameter norm
+        )
+        norm_2 = norm * norm
+    else:
+        norm_2 = torch.tensor([0.0], dtype=torch.float32, device=get_current_device())
 
     if data_parallel_group is not None:
         torch.distributed.all_reduce(norm_2,
@@ -155,6 +158,41 @@ def average_losses_across_data_parallel_group(losses):
         torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
 
     return averaged_losses
+
+
+def reduce_max_stat_across_model_parallel_group(stat: float) -> float:
+    """
+    Ranks without an optimizer will have no grad_norm or num_zeros_in_grad stats.
+    We need to ensure the logging and writer rank has those values.
+    This function reduces a stat tensor across the model parallel group.
+
+    We use an all_reduce max since the values have already been summed across optimizer ranks where possible
+    """
+    if stat is None:
+        stat = -1.0
+    stat = torch.tensor([stat], dtype=torch.float32, device=torch.cuda.current_device())
+    torch.distributed.all_reduce(
+        stat, op=torch.distributed.ReduceOp.MAX, group=mpu.get_model_parallel_group()
+    )
+    if stat.item() == -1.0:
+        return None
+    else:
+        return stat.item()
+
+
+def logical_and_across_model_parallel_group(input: bool) -> bool:
+    """
+    This function gathers a bool value across the model parallel group
+    """
+    if input is True:
+        input = 1
+    else:
+        input = 0
+    input = torch.tensor([input], dtype=torch.int, device=torch.cuda.current_device())
+    torch.distributed.all_reduce(
+        input, op=torch.distributed.ReduceOp.MIN, group=mpu.get_model_parallel_group()
+    )
+    return bool(input.item())
 
 
 def report_memory(name):
@@ -426,11 +464,11 @@ def get_batch_on_this_tp_rank(data_iterator):
            _broadcast(loss_mask)
            _broadcast(attention_mask)
            _broadcast(position_ids)
- 
+
        elif mpu.is_pipeline_first_stage():
            labels=None
            loss_mask=None
-   
+
            _broadcast(tokens)
            _broadcast(attention_mask)
            _broadcast(position_ids)
@@ -438,11 +476,11 @@ def get_batch_on_this_tp_rank(data_iterator):
        elif mpu.is_pipeline_last_stage():
            tokens=None
            position_ids=None
-    
+
            _broadcast(labels)
            _broadcast(loss_mask)
            _broadcast(attention_mask)
- 
+
        batch = {
            'tokens': tokens,
            'labels': labels,
