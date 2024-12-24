@@ -15,7 +15,7 @@ from megatron.core.device_utils import get_current_device
 import torch
 import yaml
 from config import EvaluationConfig
-from evaluation_datasets import get_evaluation_dataset
+from evaluation.evaluation_datasets import get_evaluation_dataset
 from model import model_provider
 from multimodal_args import add_multimodal_extra_args
 
