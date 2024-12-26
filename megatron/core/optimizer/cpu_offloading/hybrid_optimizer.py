@@ -287,6 +287,18 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 new_param_groups.append(new_group)
             optimizer.param_groups = new_param_groups
 
+    def _move_new_state_to_right_device(self):
+        for optimizer in self.sub_optimizers:
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if not isinstance(v, torch.Tensor):
+                        continue
+                    gpu_param = self.cpu_copys_map_gpu_param.get(k, k)
+                    if isinstance(optimizer, self.defaults["cpu_optimizer_cls"]):
+                        self.state[gpu_param] = state[k] = v.to("cpu")
+                    else:
+                        self.state[gpu_param] = state[k] = v.to("cuda")
+
     def _register_state_dict_hooks(self):
         def post_load_state_dict_hook(self):
             # After loading state_dict, the parameters may change, and we need to

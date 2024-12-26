@@ -1260,10 +1260,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             for key in src_tensors:
                                 if key not in dst_tensors:
                                     optim_state[key] = src_tensors[key]
-
                         param_idx += 1
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer._sync_hdo_state_to_sub_optimizers()
+            self.optimizer._move_new_state_to_right_device()
 
     @classmethod
     def _update_legacy_world_tensors(cls, old_tensors, new_numels):
