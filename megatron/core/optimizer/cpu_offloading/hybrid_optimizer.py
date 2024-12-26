@@ -71,11 +71,11 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
     def register_param_copy_back_gpu_hook(self):
         def param_copy_back_gpu_hook_closure():
             def param_copy_back_gpu_hook(optimizer, args, kwargs):
-                # self._data_stream.wait_stream(torch.cuda.current_stream())
-                # with torch.cuda.stream(self._data_stream):
-                for cpu_copy, gpu_param in self.cpu_copys_map_gpu_param.items():
-                    gpu_param.data.copy_(cpu_copy.data)
-                # self._data_stream.record_event().wait(torch.cuda.current_stream())
+                self._data_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self._data_stream):
+                    for cpu_copy, gpu_param in self.cpu_copys_map_gpu_param.items():
+                        gpu_param.data.copy_(cpu_copy.data)
+                self._data_stream.record_event().wait(torch.cuda.current_stream())
 
             return param_copy_back_gpu_hook
 
@@ -93,14 +93,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             self._data_event = None
         if self.cpu_optimizer:
             self.cpu_optimizer.step(closure)
-        torch.cuda.synchronize()
 
     def _init_sub_optimizers(self, params):
-        # params = self.params
-        # offload_fraction = self.offload_fraction
-        # cpu_optimizer_cls = self.cpu_optimizer_cls
-        # gpu_optimizer_cls = self.gpu_optimizer_cls
-        # kwargs = self.sub_optimizer_kwargs
         offload_fraction = self.defaults["offload_fraction"]
         cpu_optimizer_cls = self.defaults["cpu_optimizer_cls"]
         gpu_optimizer_cls = self.defaults["gpu_optimizer_cls"]
