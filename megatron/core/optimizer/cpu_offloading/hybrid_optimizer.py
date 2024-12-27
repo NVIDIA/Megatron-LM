@@ -31,8 +31,6 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.sub_optimizer_kwargs = kwargs
 
         self._init_sub_optimizers(params)
-
-        self._sync_sub_optimizers_param_groups_to_hdo()
         self._register_state_dict_hooks()
         self._register_optimizer_step_hooks()
 
@@ -190,40 +188,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
         return cpu_params, gpu_params, gpu_params_map_cpu_copy, cpu_copys_map_gpu_param
 
-    def _sync_sub_optimizers_param_groups_to_hdo(self):
-        """This function updates the latest sub-optimizer changes to
-        HybridDeviceOptimizer param_groups.
-        """
-        param_in_sub_optimizers_index = {}
-        for i, optimizer in enumerate(self.sub_optimizers):
-            for group_id, group in enumerate(optimizer.param_groups):
-                for param in group["params"]:
-                    gpu_param = self.cpu_copys_map_gpu_param.get(param, param)
-                    param_in_sub_optimizers_index[gpu_param] = (i, group_id)
-
-        # optimizer.param_groups:
-        # [
-        #    {
-        #        'params': [torch.nn.Parameter, ...],
-        #        str: Any,
-        #    },
-        #    ...
-        # ]
-        new_param_groups = []
-        for group in self.param_groups:
-            new_group = group.copy()
-            sub_optimizer_update_attrs = {}
-            for param_id, param in enumerate(new_group["params"]):
-                sub_opt_id, group_id = param_in_sub_optimizers_index[param]
-                update_group_attrs = self.sub_optimizers[sub_opt_id].param_groups[group_id].copy()
-                del update_group_attrs["params"]
-
-                sub_optimizer_update_attrs[param_id] = update_group_attrs
-            new_group["_param_sub_optimizer_attrs"] = sub_optimizer_update_attrs
-            new_param_groups.append(new_group)
-        self.param_groups = new_param_groups
-
-    def _sync_sub_optimizers_state_and_param_groups_to_hdo(self):
+    def _sync_sub_optimizers_state_to_hdo(self):
         """
         Update HDO state attribute to sub-optimizers.
         """
@@ -241,7 +206,6 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 gpu_param = self.cpu_copys_map_gpu_param.get(param, param)
                 new_state[gpu_param] = optimizer.state[param]
         self.state = new_state
-        self._sync_sub_optimizers_param_groups_to_hdo()
 
     def _sync_hdo_state_to_sub_optimizers(self):
         for optimizer in self.sub_optimizers:
@@ -264,11 +228,6 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             new_param_groups = []
             for group in optimizer.param_groups:
                 new_group = group.copy()
-                for param in new_group["params"]:
-                    group_id, param_id = param_in_param_group_index[param]
-                    hdo_group = self.param_groups[group_id]
-                    new_group.update(hdo_group["_param_sub_optimizer_attrs"][param_id])
-
                 # After sync-up the sub-optimizer last update, we need to sync-up the
                 # HDO new param_groups attributes to the sub-optimizer.
                 assert len(group["params"]) > 0, "param_groups should not be empty"
@@ -316,7 +275,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             # Sync state and param_groups to HDO after each step.
             # NOTE: It is possible for the optimizer to change the properties
             #   in param_groups.
-            self._sync_sub_optimizers_state_and_param_groups_to_hdo()
+            self._sync_sub_optimizers_state_to_hdo()
 
         self.register_step_post_hook(post_step_hook)
 

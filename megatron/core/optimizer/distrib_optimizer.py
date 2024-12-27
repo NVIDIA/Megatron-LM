@@ -1128,6 +1128,25 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         prefix = 'optimizer.state'
         state = {}
 
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            # Prepare a map of each parameter and layer offset to be used for
+            # dist-checkpoint sharded tensor creation for special state "step".
+            param_prepend_offsets = {}
+
+            # Initialize the map with zeros for all parameters.
+            for model_chunk in self.model_chunks:
+                for module in model_chunk.modules():
+                    for param in module.parameters():
+                        param_prepend_offsets[param] = []
+
+            # Update the map with the actual layer offset for TransformerLayer parameters.
+            for model_chunk in self.model_chunks:
+                for module in model_chunk.modules():
+                    if hasattr(module, 'layer_number'):
+                        offset = module.layer_number - 1
+                        for name, param in module.named_parameters():
+                            param_prepend_offsets[param] = [(0, offset, module.config.num_layers)]
+
         # Not stored in the checkpoint, used only to identify params in
         # `sharded_param_state_fs_model_space`.
         param_idx = 0
@@ -1161,19 +1180,27 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # params.
                         for state_key, state_ten in tensors.items():
                             if state_key == 'step':
-                                # Note that DP rank-0 does not necessarily go here,
-                                # where dp replica_id = 0 is determined by whether
-                                # it is the first dp rank of the participating
-                                # slice parameters.
-                                tensors["step"] = ShardedTensor.from_rank_offsets(
-                                    key=f'{prefix}.{state_key}.{sharded_metadata.key}',
-                                    data=state_ten,
+                                assert isinstance(self.optimizer, HybridDeviceOptimizer), (
+                                    f"Unexpected optimizer type: {type(self.optimizer).__name__}. "
+                                    "This branch is specifically designed for HybridDeviceOptimizer. "
+                                )
+                                # Note that step is a 0-dim tensor, unlike other
+                                # states have the same size as the parameter.
+                                # Here a specially constructed replica_id is used
+                                # to ensure that only one rank in the DP ranks
+                                # will hold the step tensor.
+                                prepend_offsets = param_prepend_offsets[model_param]
+                                tensors[state_key] = ShardedTensor.from_rank_offsets(
+                                    f'{prefix}.{state_key}.{sharded_metadata.key}',
+                                    state_ten,
+                                    *prepend_offsets,
                                     replica_id=(
                                         *replica_id[:2],
                                         0 if param_range.start == 0 else -1,
                                     ),
+                                    prepend_axis_num=len(prepend_offsets),
                                 )
-                                tensors["step"].validate_metadata_integrity()
+                                tensors[state_key].validate_metadata_integrity()
                                 continue
 
                             replace_kwargs = dict(
