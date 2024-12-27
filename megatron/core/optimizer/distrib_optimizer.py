@@ -22,6 +22,9 @@ except ImportError:
 
         HAVE_APEX_OR_TE = False
 
+from megatron.core import parallel_state
+from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+
 from .. import tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing import ShardedTensor
@@ -43,7 +46,6 @@ from .optimizer import (
     _zero_grad_group_helper,
 )
 from .optimizer_config import OptimizerConfig
-from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 
 try:
     # This will be used when "--fp8-param-gather" is enabled.
@@ -534,13 +536,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges
         )
 
-        # Update optimizer groups.
-        # - Also, leverage state_dict() and load_state_dict() to
-        #   recast preexisting per-param state tensors.
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer = HybridDeviceOptimizer(
-                params=[g["orig_group"] for g in self.opt_group_ranges],
-                **self.optimizer.defaults,
+                params=[g["orig_group"] for g in self.opt_group_ranges], **self.optimizer.defaults
             )
         else:
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
@@ -646,6 +644,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         - state_order : The index of a parameter within the shared parameter
             list.
         """
+        if isinstance(self.optimizer, HybridDeviceOptimizer) and len(self.optimizer.state) == 0:
+            self.optimizer.dummy_step()
 
         # Get the Torch optimizer's state dict.
         # - This 'inner' optimizer at this point is unallocated, and only
@@ -1128,6 +1128,25 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         prefix = 'optimizer.state'
         state = {}
 
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            # Prepare a map of each parameter and layer offset to be used for
+            # dist-checkpoint sharded tensor creation for special state "step".
+            param_prepend_offsets = {}
+
+            # Initialize the map with zeros for all parameters.
+            for model_chunk in self.model_chunks:
+                for module in model_chunk.modules():
+                    for param in module.parameters():
+                        param_prepend_offsets[param] = []
+
+            # Update the map with the actual layer offset for TransformerLayer parameters.
+            for model_chunk in self.model_chunks:
+                for module in model_chunk.modules():
+                    if hasattr(module, 'layer_number'):
+                        offset = module.layer_number - 1
+                        for name, param in module.named_parameters():
+                            param_prepend_offsets[param] = [(0, offset, module.config.num_layers)]
+
         # Not stored in the checkpoint, used only to identify params in
         # `sharded_param_state_fs_model_space`.
         param_idx = 0
@@ -1160,6 +1179,30 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # Instantiate ShardedTensor (or ShardedTensorFactory) for optimizer
                         # params.
                         for state_key, state_ten in tensors.items():
+                            if state_key == 'step':
+                                assert isinstance(self.optimizer, HybridDeviceOptimizer), (
+                                    f"Unexpected optimizer type: {type(self.optimizer).__name__}. "
+                                    "This branch is specifically designed for HybridDeviceOptimizer. "
+                                )
+                                # Note that step is a 0-dim tensor, unlike other
+                                # states have the same size as the parameter.
+                                # Here a specially constructed replica_id is used
+                                # to ensure that only one rank in the DP ranks
+                                # will hold the step tensor.
+                                prepend_offsets = param_prepend_offsets[model_param]
+                                tensors[state_key] = ShardedTensor.from_rank_offsets(
+                                    f'{prefix}.{state_key}.{sharded_metadata.key}',
+                                    state_ten,
+                                    *prepend_offsets,
+                                    replica_id=(
+                                        *replica_id[:2],
+                                        0 if param_range.start == 0 else -1,
+                                    ),
+                                    prepend_axis_num=len(prepend_offsets),
+                                )
+                                tensors[state_key].validate_metadata_integrity()
+                                continue
+
                             replace_kwargs = dict(
                                 key=f'{prefix}.{state_key}.{sharded_metadata.key}',
                                 data=state_ten,
@@ -1240,7 +1283,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         for key in dst_tensors:
                             dst_tensors[key].copy_(src_tensors[key])
 
+                        if isinstance(self.optimizer, HybridDeviceOptimizer):
+                            for key in src_tensors:
+                                if key not in dst_tensors:
+                                    optim_state[key] = src_tensors[key]
                         param_idx += 1
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            self.optimizer._sync_hdo_state_to_sub_optimizers()
+            self.optimizer._move_new_state_to_right_device()
 
     @classmethod
     def _update_legacy_world_tensors(cls, old_tensors, new_numels):
