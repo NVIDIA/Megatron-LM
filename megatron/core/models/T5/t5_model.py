@@ -315,7 +315,7 @@ class T5Model(LanguageModule):
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_params, self.encoder, encoder_input, self.config, packed_seq_params
+                inference_params, self.decoder, decoder_input, self.config, packed_seq_params
             )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
@@ -330,9 +330,11 @@ class T5Model(LanguageModule):
         )
 
         if self.post_process:
-            lm_logits = self.lm_head(
-                decoder_hidden_states, self.shared_embedding_or_output_weight()
-            )
+            output_weight = None
+            if self.share_embeddings_and_output_weights:
+                output_weight = self.shared_embedding_or_output_weight()
+            lm_logits = self.lm_head(decoder_hidden_states, word_embeddings_weight=output_weight)
+
             if lm_labels is None:
                 # [s b h] => [b s h]
                 return lm_logits.transpose(0, 1).contiguous()
