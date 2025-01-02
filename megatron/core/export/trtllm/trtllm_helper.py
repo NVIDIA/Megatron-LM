@@ -14,6 +14,8 @@ from megatron.core.export.trtllm.engine_builder.trtllm_engine_builder import TRT
 from megatron.core.export.trtllm.model_to_trllm_mapping.default_conversion_dict import (
     DEFAULT_CONVERSION_DICT,
 )
+from megatron.core.export.trtllm.model_to_trllm_mapping.mamba_hybrid_model import MAMBA_HYBRID_DICT
+
 from megatron.core.export.trtllm.trt_model_config import TRT_MODEL_CONFIG
 from megatron.core.export.trtllm.trt_model_type import TRT_MODEL_TYPE_STRING
 from megatron.core.export.trtllm.trtllm_layers import TRTLLMLayers
@@ -46,6 +48,7 @@ class TRTLLMHelper:
         seq_len_interpolation_factor: float = None,
         moe_renorm_mode=None,
         share_embeddings_and_output_weights=False,
+        hybrid_override_pattern: str=None,
     ):
         """Constructor for the TRTLLMHelper
 
@@ -76,7 +79,8 @@ class TRTLLMHelper:
         assert position_embedding_type in [
             'learned_absolute',
             'rope',
-        ], f"Position embedding type should be one of learned_absolute, rope. You entered {position_embedding_type}"
+            'none',
+        ], f"Position embedding type should be one of learned_absolute, rope, none. You entered {position_embedding_type}"
         self.position_embedding_type = position_embedding_type
         self.max_position_embeddings = max_position_embeddings
         self.rotary_percentage = rotary_percentage
@@ -87,7 +91,19 @@ class TRTLLMHelper:
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
         self.moe_renorm_mode = moe_renorm_mode
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
+        self.hybrid_override_pattern = hybrid_override_pattern
         self.weights_converter = None
+
+        if model_type == ModelType.mamba_hybrid:
+            mamba_hybrid_dict = MAMBA_HYBRID_DICT.copy()
+            for k in trtllm_conversion_dict:
+                if k.startswith('model'):
+                    mamba_hybrid_dict = {
+                        k if k == 'preprocess_weight' else f"model.{k}": v
+                        for k, v in mamba_hybrid_dict.items()
+                    }
+                break
+            self.trtllm_conversion_dict.update(mamba_hybrid_dict)
 
     def _get_trtllm_config(
         self,
@@ -165,6 +181,7 @@ class TRTLLMHelper:
             'tp_size': export_config.inference_tp_size,
             'pp_size': export_config.inference_pp_size,
             'gpus_per_node': gpus_per_node,
+            'norm_type': self.transformer_config.normalization.lower(),
         }
 
         if self.model_type == ModelType.falcon:
@@ -172,6 +189,29 @@ class TRTLLMHelper:
                 False if self.transformer_config.num_layers == 32 else True
             )
             config["parallel_attention"] = True
+        elif self.model_type == ModelType.mamba_hybrid:
+            config["mamba_version"] = "Mamba2"
+            config["rnn_hidden_size"] = 2 * self.transformer_config.hidden_size
+            config["state_size"] = 128
+            config["conv_kernel"] = 4
+            config["rnn_head_size"] = 64
+            config["ngroups"] = 8
+            config["chunk_size"] = 128
+            config["rnn_conv_dim_size"] = (config["rnn_hidden_size"] + 2 * config["ngroups"]
+                                           * config["state_size"])
+            config["use_bias"] = config["bias"]
+            config["hybrid_override_pattern"] = self.hybrid_override_pattern
+            layer_types = []
+            for k in config['hybrid_override_pattern']:
+                if k == '*':
+                    layer_types.append('attention')
+                elif k == 'M':
+                    layer_types.append('recurrent')
+                else:
+                    layer_types.append('-')
+            config['layer_types'] = layer_types
+            config["ssm_rmsnorm"] =  True
+            config["residual_in_fp32"] = False
 
         if self.seq_len_interpolation_factor is not None:
             config["rotary_scaling"] = {
