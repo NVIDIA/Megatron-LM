@@ -105,24 +105,77 @@ def compute_activation_memory(args, num_microbatches, verbose=False):
     # different from hidden_size.
 
     # Memory footprint from transformer layer (self-attention and MLP).
-    activation_memory = (args.seq_length * args.micro_batch_size * args.hidden_size) * (
-        18 + (4 * (args.ffn_hidden_size / args.hidden_size))
+    s = args.seq_length
+    h = args.hidden_size
+    b = args.micro_batch_size
+    a = args.num_attention_heads
+    k = args.num_query_groups
+
+    s = s / args.context_parallel_size
+    args.selective_activation_recomputation = (
+        args.recompute_granularity == 'selective'
+    )
+
+    activation_memory = (
+        2 * s * b * h  # LayerNorm
+        + (
+            # attention
+            2 * s * b * h  # input
+            + (2 * s * b * h)  # Q
+            + (2 * s * b * h) * (k / a)  # K
+            + (
+                0 if (
+                    args.selective_activation_recomputation or args.use_flash_attn
+                ) else (2 * b * s * s * a)  # QK^T
+            )
+            + (
+                0 if args.attention_dropout == 0.0 else 0 if (
+                    args.selective_activation_recomputation or args.use_flash_attn
+                ) else (1 * b * s * s * a)  # Dropout
+            )
+            + ((2 * b * s * h) * (k / a))  # V
+            + (
+                0 if (
+                    args.selective_activation_recomputation or args.use_flash_attn
+                ) else (2 * b * a * s * s)  # Dropout(softmax(QK^T)) * V
+            )
+            + (2 * b * s * h)  # linear
+        )
+        + (0 if args.hidden_dropout == 0.0 else (b * s * h))  # Dropout
+        + (2 * b * s * h)  # LayerNorm
+        + (
+            (
+                # SwiGLU
+                2 * b * s * h  # input
+                + 2 * b * s * args.ffn_hidden_size  # up_proj
+                + 2 * b * s * args.ffn_hidden_size  # gate_proj
+                + 2 * b * s * args.ffn_hidden_size  # act_fn
+                + 2 * b * s * args.ffn_hidden_size  # down_proj
+            ) if args.swiglu else (
+                2 * b * s * h  # h -> ffn_h
+                + 2 * b * s * args.ffn_hidden_size  # act
+                + 2 * b * s * args.ffn_hidden_size  # ffn_h  -> h
+            )
+        )
+        + (0 if args.hidden_dropout == 0.0 else (b * s * h))  # Dropout
     )
     if verbose:
         print(
             f"Activation memory footprint per transformer layer: "
             f"{activation_memory / NUM_BYTES_IN_GIGABYTE / args.tensor_model_parallel_size:.1f} GB"
         )
-    activation_memory *= args.num_layers
+    activation_memory = activation_memory * args.num_layers / args.tensor_model_parallel_size
 
     # Now add activation memory required for input embeddings, last LayerNorm and output layer.
 
     # Input to embedding (pp_size microbatches in flight).
     activation_memory += (
-        8 * args.seq_length * args.micro_batch_size * args.pipeline_model_parallel_size
-    )
+        # 8 bytes (int64)
+        8 * s * b * h * args.pipeline_model_parallel_size
+    ) / args.tensor_model_parallel_size
+
     # Dropout in embedding layer (pp_size microbatches in flight).
-    activation_memory += (
+    activation_memory += 0 if args.hidden_dropout == 0 else (
         args.seq_length
         * args.micro_batch_size
         * args.hidden_size
@@ -159,15 +212,13 @@ def compute_activation_memory(args, num_microbatches, verbose=False):
     if args.pipeline_model_parallel_size == 1:
         # Inputs to output layer and CE loss.
         activation_memory += (
-            args.seq_length
-            * args.micro_batch_size
-            * args.hidden_size
-            * 4
-            * (1 + (args.padded_vocab_size / args.hidden_size))
-        )
+            # lm-head cross entropy (FP32)
+            # output layer (layer norm) + output layer (linear)
+            4 * s * b * h * (1 + args.padded_vocab_size / h)
+        ) / args.tensor_model_parallel_size
 
     # Activation memory is partitioned by TP size due to tensor and sequence model parallelism.
-    return activation_memory / args.tensor_model_parallel_size
+    return activation_memory
 
 
 def report_theoretical_memory(args, num_microbatches=None, verbose=False):
