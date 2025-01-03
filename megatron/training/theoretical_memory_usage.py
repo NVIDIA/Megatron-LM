@@ -5,7 +5,7 @@
 
 import math
 
-NUM_BYTES_IN_MEGABYTE = 1024 * 1024
+NUM_BYTES_IN_GIGABYTE = 1024 * 1024 * 1024
 
 
 def compute_weight_and_optimizer_memory(args, verbose=False):
@@ -111,7 +111,7 @@ def compute_activation_memory(args, num_microbatches, verbose=False):
     if verbose:
         print(
             f"Activation memory footprint per transformer layer: "
-            f"{activation_memory / NUM_BYTES_IN_MEGABYTE / args.tensor_model_parallel_size:.1f} MB"
+            f"{activation_memory / NUM_BYTES_IN_GIGABYTE / args.tensor_model_parallel_size:.1f} GB"
         )
     activation_memory *= args.num_layers
 
@@ -172,23 +172,23 @@ def compute_activation_memory(args, num_microbatches, verbose=False):
 
 def report_theoretical_memory(args, num_microbatches=None, verbose=False):
     weight_and_optimizer_memory = (
-        compute_weight_and_optimizer_memory(args, verbose=verbose) / NUM_BYTES_IN_MEGABYTE
+        compute_weight_and_optimizer_memory(args, verbose=verbose) / NUM_BYTES_IN_GIGABYTE
     )
 
     # Formulae here assume sequence parallelism and selective activation recomputation.
     if not args.sequence_parallel or args.recompute_granularity != 'selective':
         print(
-            f"Theoretical memory footprints: weight and optimizer={weight_and_optimizer_memory:.2f} MB"
+            f"Theoretical memory footprints: weight and optimizer={weight_and_optimizer_memory:.2f} GB"
         )
         return
 
     activation_memory = (
         compute_activation_memory(args, num_microbatches=num_microbatches, verbose=verbose)
-        / NUM_BYTES_IN_MEGABYTE
+        / NUM_BYTES_IN_GIGABYTE
     )
     total_memory = weight_and_optimizer_memory + activation_memory
 
     print(
-        f"Theoretical memory footprints: weight and optimizer={weight_and_optimizer_memory:.2f} MB, "
-        f"activation={activation_memory:.2f} MB, total={total_memory:.2f} MB\n"
+        f"Theoretical memory footprints: weight and optimizer={weight_and_optimizer_memory:.2f} GB, "
+        f"activation={activation_memory:.2f} GB, total={total_memory:.2f} GB\n"
     )
