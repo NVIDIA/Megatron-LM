@@ -52,4 +52,5 @@ MODEL_ARGS:
   --attention-softmax-in-fp32: true
   --ckpt-format: torch
   --attention-backend: unfused
+  --log-memory-to-tensorboard: true
 TEST_TYPE: ckpt-resume

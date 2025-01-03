@@ -54,13 +54,13 @@ while IFS= read -r ARGUMENT; do
 
     export "$KEY"="$VALUE"
     echo "$KEY=$VALUE"
-done <<< "$ENV_VARS"
+done <<<"$ENV_VARS"
 
 # Run before script
 SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | yq '.BEFORE_SCRIPT')
 if [[ "$SCRIPT" != null ]]; then
     eval "$SCRIPT"
-fi;
+fi
 
 # Exit earlier to leave time for properly saving checkpoint
 if [[ $(echo "$TRAINING_SCRIPT_PATH" | tr '[:upper:]' '[:lower:]') == *nemo* ]]; then
@@ -68,13 +68,13 @@ if [[ $(echo "$TRAINING_SCRIPT_PATH" | tr '[:upper:]' '[:lower:]') == *nemo* ]];
     TRAINING_PARAMS_FROM_CONFIG=$(yq '... comments="" | .MODEL_ARGS | to_entries | .[] | with(select(.value == "true"); .value = "") | [.key + "=" + .value] | join("")' "$TRAINING_PARAMS_PATH" | tr '\n' ' ')
 
 else
-    # If this is a second run (of checkpoint-resume), we might want to use a 
+    # If this is a second run (of checkpoint-resume), we might want to use a
     # different model configuration than during first time. So if key `MODEL_ARGS_2`
     # exists we use it, otherwise we use the same as for the first run.
     if [[ $RUN_NUMBER -eq 2 && $(yq 'has("MODEL_ARGS_2")' "$TRAINING_PARAMS_PATH") == true ]]; then
         export KEY="MODEL_ARGS_2"
     else
-        export  KEY="MODEL_ARGS"
+        export KEY="MODEL_ARGS"
     fi
 
     TRAINING_PARAMS_FROM_CONFIG=$(yq '... comments="" | .[env(KEY)] | to_entries | .[] | with(select(.value == "true"); .value = "") | [.key + " " + .value] | join("")' "$TRAINING_PARAMS_PATH" | tr '\n' ' ')
@@ -90,4 +90,3 @@ export WANDB_API_KEY="${WANDB_API_KEY:-}"
 
 # Start training
 python $TRAINING_SCRIPT_PATH $PARAMS
-

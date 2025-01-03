@@ -60,6 +60,9 @@ stages:
 
 default:
   interruptible: true
+  retry:
+    max: 2
+    when: runner_system_failure
 
 variables:
   UNIT_TEST:

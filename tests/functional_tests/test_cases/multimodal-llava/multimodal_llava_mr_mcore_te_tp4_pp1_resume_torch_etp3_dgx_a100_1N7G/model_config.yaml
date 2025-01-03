@@ -53,4 +53,5 @@ MODEL_ARGS:
   --img-w: 336
   --patch-dim: 14
   --mock-data: true
+  --log-memory-to-tensorboard: true
 TEST_TYPE: ckpt-resume

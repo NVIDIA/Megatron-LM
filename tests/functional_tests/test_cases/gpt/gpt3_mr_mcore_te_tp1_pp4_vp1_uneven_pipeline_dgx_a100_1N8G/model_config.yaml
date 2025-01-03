@@ -50,4 +50,5 @@ MODEL_ARGS:
   --decoder-first-pipeline-num-layers: 2
   --decoder-last-pipeline-num-layers: 2
   --attention-backend: unfused
+  --log-memory-to-tensorboard: true
 TEST_TYPE: regular

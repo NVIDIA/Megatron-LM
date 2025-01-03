@@ -6,7 +6,7 @@ launchers:
   type:slurm:
     ntasks_per_node: '{gpus}'
 spec:
-  name: '{test_case}'
+  name: '{test_case}_{environment}'
   model: multimodal-llava
   build: mcore-pyt-{environment}
   nodes: 1
