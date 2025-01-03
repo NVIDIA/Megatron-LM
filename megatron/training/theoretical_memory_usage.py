@@ -175,8 +175,10 @@ def report_theoretical_memory(args, num_microbatches=None, verbose=False):
         compute_weight_and_optimizer_memory(args, verbose=verbose) / NUM_BYTES_IN_GIGABYTE
     )
 
-    # Formulae here assume sequence parallelism and selective activation recomputation.
-    if not args.sequence_parallel or args.recompute_granularity != 'selective':
+    # Formulae here assume sequence parallelism and selective activation recomputation or flash-attention.
+    if not args.sequence_parallel or not (
+        args.recompute_granularity == 'selective' or args.use_flash_attn is True
+    ):
         print(
             f"Theoretical memory footprints: weight and optimizer={weight_and_optimizer_memory:.2f} GB"
         )
