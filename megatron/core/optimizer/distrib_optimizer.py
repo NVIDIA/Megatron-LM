@@ -384,6 +384,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # When using precision-aware optimizer, main params are held by FusedAdam.
                         shard_main_param = None
 
+                    # Store handle to main_param.
+                    model_param.main_param = shard_main_param
+                    model_param.main_param_sharded = True
+
                     # Add to group.
                     model_float16_params_this_group.append(model_param)
                     shard_float16_params_this_group.append(shard_model_param)
@@ -534,6 +538,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             )
             self.gbuf_ranges.append(self._build_gbuf_range_map(buffer))
         self.model_param_gbuf_map = self._build_model_param_gbuf_map(self.gbuf_ranges)
+
+        # Add main_param field to each parameter. We will use this fp32 copy to compute
+        # the param norm.
+        # For parameters with optimizer state on this rank, None will be overwritten by
+        # the corresponding sharded main_param tensor.
+        for param_group in self.optimizer.param_groups:
+            # For all the parameters in this group.
+            for param in param_group['params']:
+                if param.requires_grad:
+                    # fp32 copy only needed for 16-bit parameters.
+                    if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
+                        param.main_param = None
+                        param.main_param_sharded = True
 
         # Optimizer ranges.
         (self.model_param_group_index_map, self.opt_group_ranges) = (
