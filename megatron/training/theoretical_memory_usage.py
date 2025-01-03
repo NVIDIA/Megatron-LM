@@ -83,8 +83,11 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
                 f"{num_parameters_on_other_model_shards / 10**9:.4f}"
             )
 
+    gradient_accumulation_factor = 4 if args.accumulate_allreduce_grads_in_fp32 else 2
+    # parameters: bf16 + gradients: fp32
+    # optimizer states: param: fp32, momentum: fp32, variance: fp32
     num_bytes_per_parameter = (
-        18 if not args.use_distributed_optimizer else 6 + (12 / args.data_parallel_size)
+        (2 + gradient_accumulation_factor + (4 + 4 + 4)) if not args.use_distributed_optimizer else (2 + gradient_accumulation_factor) + (12 / args.data_parallel_size / args.context_parallel_size)
     )
     weight_and_optimizer_memory = (
         num_parameters_on_most_loaded_model_shard * num_bytes_per_parameter
