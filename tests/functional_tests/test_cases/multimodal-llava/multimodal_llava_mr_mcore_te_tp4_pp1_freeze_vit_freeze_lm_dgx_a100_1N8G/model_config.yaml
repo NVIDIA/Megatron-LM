@@ -54,4 +54,5 @@ MODEL_ARGS:
   --mock-data: true
   --freeze-ViT: true
   --freeze-LM: true
+  --log-memory-to-tensorboard: true
 TEST_TYPE: regular

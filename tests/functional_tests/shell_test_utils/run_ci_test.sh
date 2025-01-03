@@ -32,19 +32,20 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
     fi
 done
 
-SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 ROOT_DIR=$(realpath $SCRIPT_DIR/../../../)
 
 # Extract settings from params file
-TEST_TYPE=$(cat $TRAINING_PARAMS_PATH \
-            | yq '.TEST_TYPE')
-NVTE_ALLOW_NONDETERMINISTIC_ALGO=$(cat $TRAINING_PARAMS_PATH \
-                                   | yq '.ENV_VARS.NVTE_ALLOW_NONDETERMINISTIC_ALGO')
-SKIP_PYTEST=$(cat $TRAINING_PARAMS_PATH \
-              | yq '.ENV_VARS.SKIP_PYTEST')
+TEST_TYPE=$(cat $TRAINING_PARAMS_PATH |
+    yq '.TEST_TYPE')
+NVTE_ALLOW_NONDETERMINISTIC_ALGO=$(cat $TRAINING_PARAMS_PATH |
+    yq '.ENV_VARS.NVTE_ALLOW_NONDETERMINISTIC_ALGO')
+SKIP_PYTEST=$(cat $TRAINING_PARAMS_PATH |
+    yq '.ENV_VARS.SKIP_PYTEST')
+TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
+    yq '.MODEL_ARGS."--train-iters" // "100"')
 
-for i in $(seq 1 $N_REPEAT);
-do
+for i in $(seq 1 $N_REPEAT); do
     if [[ $i -gt 1 ]]; then
         rm -rf $CHECKPOINT_PATH/*
     fi
@@ -54,10 +55,10 @@ do
     bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
 
     # Maybe checkpoint resume training
-    if [[ "$TEST_TYPE" == "ckpt-resume" ]]; then 
+    if [[ "$TEST_TYPE" == "ckpt-resume" ]]; then
         if [[ ${SLURM_PROCID} -eq 0 ]]; then
-            rm -rf $CHECKPOINT_PATH/iter_0000100; 
-            echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt;
+            rm -rf "$CHECKPOINT_PATH/iter_0000$TRAIN_ITERS"
+            echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_PATH/latest_checkpointed_iteration.txt
         fi
 
         export RUN_NUMBER=2
@@ -75,29 +76,38 @@ do
     else
         EXTRACT_ARGS=("--is-normal-test")
     fi
+
     python3 $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
         --logs-dir $TENSORBOARD_PATH \
+        --train-iters $TRAIN_ITERS \
         --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
         "${EXTRACT_ARGS[@]}"
 
     # Maybe run tests
     if [[ ${SKIP_PYTEST:-0} != 1 ]]; then
         export NVTE_ALLOW_NONDETERMINISTIC_ALGO
-        export LOGS_DIR=$TENSORBOARD_PATH
-        
+        if [[ "${NVTE_ALLOW_NONDETERMINISTIC_ALGO}" == "1" ]]; then
+            ALLOW_NONDETERMINISTIC_ALGO_ARG="--allow-nondeterministic-algo"
+        fi
+
+        echo "Running pytest checks against golden values"
+
+        pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_regular_pipeline.py \
+            --golden-values-path $GOLDEN_VALUES_PATH \
+            --tensorboard-path $TENSORBOARD_PATH \
+            --model-config-path ${TRAINING_PARAMS_PATH} \
+            $ALLOW_NONDETERMINISTIC_ALGO_ARG
+
         if [[ "$TEST_TYPE" == "ckpt-resume" ]]; then
             echo "Running pytest 1st vs 2nd run comparison"
-            pytest -s $ROOT_DIR/tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py
-
-        elif [[ "$TEST_TYPE" == "regular" ]]; then
-            echo "Running pytest checks against golden values"
-            export EXPECTED_METRICS_FILE=$GOLDEN_VALUES_PATH 
-            pytest -s $ROOT_DIR/tests/functional_tests/python_test_utils/test_ci_pipeline.py
+            pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py \
+                --tensorboard-path $TENSORBOARD_PATH \
+                --train-iters $TRAIN_ITERS \
+                --model-config-path ${TRAINING_PARAMS_PATH} \
+                $ALLOW_NONDETERMINISTIC_ALGO_ARG
 
         else
             echo "Test type $TEST_TYPE not yet implemented."
         fi
     fi
 done
-
-

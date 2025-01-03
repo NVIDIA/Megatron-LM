@@ -48,33 +48,29 @@ functional:configure:
         RELEASE_ARGS=()
       fi
     - |
+      ARGS=(
+        "--scope $FUNCTIONAL_TEST_SCOPE"
+        "--n-repeat $FUNCTIONAL_TEST_REPEAT"
+        "--time-limit $FUNCTIONAL_TEST_TIME_LIMIT"
+        "--test-cases $FUNCTIONAL_TEST_CASES"
+        "--a100-cluster $A100_CLUSTER"
+        "--h100-cluster $H100_CLUSTER"
+        "--container-image ${UTILITY_IMAGE}"
+        "--container-tag ${CI_PIPELINE_ID}"
+        "--dependent-job functional:configure"
+      )
+    - |
       export PYTHONPATH=$(pwd)
       python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
-        --scope $FUNCTIONAL_TEST_SCOPE \
+        ${ARGS[@]} \
         --environment dev \
-        --n-repeat "$FUNCTIONAL_TEST_REPEAT" \
-        --time-limit "$FUNCTIONAL_TEST_TIME_LIMIT" \
-        --test-cases $FUNCTIONAL_TEST_CASES \
-        --a100-cluster $A100_CLUSTER \
-        --h100-cluster $H100_CLUSTER \
-        --container-image ${UTILITY_IMAGE} \
-        --container-tag ${CI_PIPELINE_ID} \
-        --dependent-job "functional:configure" \
         --output-path "functional-test-job-dev.yaml" \
         ${RELEASE_ARGS[@]}
     - |
       export PYTHONPATH=$(pwd)
       python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
-        --scope $FUNCTIONAL_TEST_SCOPE \
+        ${ARGS[@]} \
         --environment lts \
-        --n-repeat "$FUNCTIONAL_TEST_REPEAT" \
-        --time-limit "$FUNCTIONAL_TEST_TIME_LIMIT" \
-        --test-cases $FUNCTIONAL_TEST_CASES \
-        --a100-cluster $A100_CLUSTER \
-        --h100-cluster $H100_CLUSTER \
-        --container-image ${UTILITY_IMAGE} \
-        --container-tag ${CI_PIPELINE_ID} \
-        --dependent-job "functional:configure" \
         --output-path "functional-test-job-lts.yaml" \
         ${RELEASE_ARGS[@]}
   artifacts:
@@ -140,4 +136,23 @@ functional:notify:
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $FUNCTIONAL_TEST == "yes"
       when: always
+    - when: never
+
+functional:download_golden_values:
+  extends: [.functional_tests_rules]
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  tags:
+    - mcore-docker-node-small
+  script:
+    - env
+    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
+    - export GITLAB_ENDPOINT
+    - python tests/test_utils/python_scripts/download_golden_values.py --pipeline-id ${CI_PIPELINE_ID}
+  artifacts:
+    paths:
+      - tests/
+  rules:
+    - if: $FUNCTIONAL_TEST == "yes"
+      when: manual
+      allow_failure: true
     - when: never
