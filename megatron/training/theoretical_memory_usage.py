@@ -32,10 +32,11 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
             # MLP.
             + ((args.ffn_hidden_size / args.hidden_size) * num_experts * gated_linear_multiplier)
             # Transformer layernorms.
-            + (2 / args.hidden_size)
-            # Final layernorm.
-            + (1 / (args.num_layers * args.hidden_size))
+            + (1 / args.hidden_size)
         )
+    ) + (
+        # final layernorm
+        args.hidden_size
     )
     embedding_size = args.hidden_size * args.padded_vocab_size
     if args.untie_embeddings_and_output_weights:
