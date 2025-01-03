@@ -1108,7 +1108,7 @@ class TEDelayedScaling(te.common.recipe.DelayedScaling):
 
     def __init__(
         self,
-        config: ModelParallelConfig,
+        config: TransformerConfig,
         fp8_format: int,
         override_linear_precision: tuple = (False, False, False),
     ):
