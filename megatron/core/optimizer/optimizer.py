@@ -555,6 +555,9 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             # Replace the optimizer params with the new fp32 copy.
                             param_group['params'][i] = main_param
 
+                            # Store handle to main_param.
+                            param.main_param = main_param
+
                             fp32_from_float16_params_this_group.append(main_param)
                             # Reset existing state dict key to the new main param.
                             if param in self.optimizer.state:

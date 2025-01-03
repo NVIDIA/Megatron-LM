@@ -1,12 +1,18 @@
 import os
 import time
 import urllib.request as req
+from types import SimpleNamespace
 
+import mock
 import numpy as np
 import pytest
 import torch
 
 import megatron.core.utils as util
+import megatron.training.utils as training_util
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -72,7 +78,7 @@ def test_check_param_hashes_across_dp_replicas():
     # Setup.
     _init_distributed(world, rank)
     Utils.initialize_model_parallel()
-    model = torch.nn.Linear(100, 100, bias=False)
+    model = torch.nn.Linear(100, 100, bias=False, device='cuda')
 
     # First check case where all replicas agree.
     model.weight.data.fill_(1.0)
@@ -96,7 +102,7 @@ def test_cross_check_param_hashes_across_dp_replicas():
     # Setup.
     _init_distributed(world, rank)
     Utils.initialize_model_parallel()
-    model = torch.nn.Linear(100, 100, bias=False)
+    model = torch.nn.Linear(100, 100, bias=False, device='cuda')
 
     # First check case where all replicas agree.
     model.weight.data.fill_(1.0)
@@ -106,6 +112,55 @@ def test_cross_check_param_hashes_across_dp_replicas():
     if rank == 0:
         model.weight.data.fill_(0.0)
     assert not util.check_param_hashes_across_dp_replicas([model], True)
+
+    # Teardown.
+    _deinit_distributed()
+
+
+@pytest.mark.parametrize("use_distributed_optimizer", [False, True])
+def test_param_norm(use_distributed_optimizer: bool):
+    world = int(os.getenv('WORLD_SIZE', '1'))
+    rank = int(os.getenv('RANK', '0'))
+
+    # Setup: distributed, model, mock_args.
+    _init_distributed(world, rank)
+    Utils.initialize_model_parallel()
+    model = torch.nn.Linear(100, 100, bias=False, dtype=torch.bfloat16, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=use_distributed_optimizer)
+    # Use dummy TransformerConfig which doesn't trigger __post_init__ assertions.
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+    )
+    for param in model.parameters():
+        assert param.requires_grad
+    mock_args = SimpleNamespace(bf16=True)
+
+    with mock.patch('megatron.training.utils.get_args', new=lambda: mock_args):
+        # Make sure norm is correct when `main_param` attribute is not available.
+        assert training_util.calc_params_l2_norm(
+            model, force_create_fp32_copy=False
+        ) == pytest.approx(100.0)
+        assert training_util.calc_params_l2_norm(
+            model, force_create_fp32_copy=True
+        ) == pytest.approx(100.0)
+
+        # Make sure norm is correct when `main_param` attribute is available.
+        optimizer_config = OptimizerConfig(
+            bf16=True, use_distributed_optimizer=use_distributed_optimizer
+        )
+        _ = get_megatron_optimizer(optimizer_config, [model])
+        for param in model.parameters():
+            assert hasattr(param, 'main_param')
+            if use_distributed_optimizer:
+                assert getattr(param, 'main_param_sharded', False)
+        assert training_util.calc_params_l2_norm(
+            model, force_create_fp32_copy=False
+        ) == pytest.approx(100.0)
+        assert training_util.calc_params_l2_norm(
+            model, force_create_fp32_copy=True
+        ) == pytest.approx(100.0)
 
     # Teardown.
     _deinit_distributed()
