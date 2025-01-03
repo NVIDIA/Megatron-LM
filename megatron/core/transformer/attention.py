@@ -116,6 +116,7 @@ class Attention(MegatronModule, ABC):
             attn_mask_type=self.attn_mask_type,
             attention_type=self.attention_type,
             cp_comm_type=cp_comm_type,
+            softmax_scale=self.config.softmax_scale,
         )
 
         self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'

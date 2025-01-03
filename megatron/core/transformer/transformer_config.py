@@ -46,6 +46,9 @@ class TransformerConfig(ModelParallelConfig):
     If attention backend is local we use the local pytorch implementation in mcore. 
     Users can specify exact backend by changing this config. """
 
+    softmax_scale: float = None
+    """Softmax scale for attention scaling."""
+
     num_query_groups: int = None
     """Number of query groups for group query attention. If None, normal attention is used."""
 
