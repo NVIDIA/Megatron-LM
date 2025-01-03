@@ -57,12 +57,15 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
 
     # Most loaded model shard has (1/pp_size transformer layers + 1 embedding layer) / tp_size.
     num_parameters_on_most_loaded_model_shard = (
-        (num_parameters_in_transformer_layers / args.pipeline_model_parallel_size) + embedding_size
+        (    # - last layer norm
+            (num_parameters_in_transformer_layers - args.hidden_size) / args.pipeline_model_parallel_size
+        ) + embedding_size  # (embedding layer) for first stage
     ) / args.tensor_model_parallel_size
     if args.untie_embeddings_and_output_weights and args.pipeline_model_parallel_size == 1:
         num_parameters_on_most_loaded_model_shard += (
             embedding_size / args.tensor_model_parallel_size
         )
+        num_parameters_on_most_loaded_model_shard += args.hidden_size  # last layer norm
     if verbose:
         print(
             f"Number of parameters in most loaded shard in billions: "
