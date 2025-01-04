@@ -34,5 +34,7 @@ products:
     scope: [mr]
     n_repeat: [5]
     test_case:
-      - gpt3-nemo_126m_mr_mbs1_gbs8_mcore_te_tp2_pp4_vp3_seq_par_overlap_p2p_dgx_a100_1N8G
-      - gpt3-nemo_126m_mr_mbs4_gbs64_mcore_te_tp1_pp1_dgx_a100_1N8G
+    - gpt3-nemo_126m_mr_mbs1_gbs8_mcore_te_tp2_pp4_vp3_seq_par_overlap_p2p_dgx_a100_1N8G
+    - gpt3-nemo_126m_mr_mbs4_gbs64_mcore_te_tp1_pp1_dgx_a100_1N8G
+    - gpt3-nemo_126m_mr_mbs1_gbs8_mcore_te_8experts_tp2_ep2_pp1_dgx_a100_1N8G
+

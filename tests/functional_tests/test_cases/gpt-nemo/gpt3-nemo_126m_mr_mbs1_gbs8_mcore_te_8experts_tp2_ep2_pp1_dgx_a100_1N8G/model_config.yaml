@@ -1,0 +1,43 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  SKIP_PYTEST: 1
+MODEL_ARGS:
+  trainer.num_nodes: 1
+  trainer.devices: 8
+  trainer.max_steps: 50
+  trainer.val_check_interval: 50
+  trainer.limit_val_batches: 50
+  trainer.max_epochs: 'null'
+  trainer.precision: bf16
+  model.num_layers: 12
+  model.hidden_size: 768
+  model.num_attention_heads: 12
+  model.micro_batch_size: 1
+  model.global_batch_size: 8
+  model.tensor_model_parallel_size: 2
+  model.pipeline_model_parallel_size: 1
+  model.expert_model_parallel_size: 2
+  model.virtual_pipeline_model_parallel_size: 'null'
+  model.encoder_seq_length: 2048
+  model.max_position_embeddings: 2048
+  model.ffn_hidden_size: 3072
+  model.mcore_gpt: 'True'
+  model.apply_query_key_layer_scaling: 'True'
+  model.megatron_amp_O2: 'True'
+  model.data.data_prefix: '[]'
+  model.data.data_impl: mock
+  model.data.splits_string: '[99990,8,2]'
+  model.optim.name: mcore_distributed_optim
+  model.optim.weight_decay: 0.1
+  exp_manager.create_checkpoint_callback: 'False'
+  model.sequence_parallel: 'True'
+  model.overlap_p2p_comm: 'True'
+  model.batch_p2p_comm: 'False'
+  model.bias: 'False'
+  model.bias_activation_fusion: 'False'
+  ++model.num_moe_experts: 8
+  ++model.moe_grouped_gemm: 'True'
+  ++model.moe_router_load_balancing_type: aux_loss
+  ++model.moe_router_topk: 2
+  ++model.moe_aux_loss_coeff: 1e-2
+TEST_TYPE: regular
