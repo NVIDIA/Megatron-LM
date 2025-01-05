@@ -131,6 +131,7 @@ def main(
                 f"--environment {test_case.spec.environment}",
                 f"--n-repeat {n_repeat}",
                 f"--time-limit {time_limit}",
+                f"--scope {scope}",
                 f"--test-case '{test_case.spec.test_case}'",
                 f"--container-tag {container_tag}",
                 f"--cluster {cluster}",

@@ -40,6 +40,7 @@ def launch_and_wait_for_completion(
     environment: str,
     n_repeat: int,
     time_limit: int,
+    scope: str,
     container_image: Optional[str],
     container_tag: str,
     cluster: str,
@@ -63,6 +64,7 @@ def launch_and_wait_for_completion(
                 n_repeat=n_repeat,
                 time_limit=time_limit,
                 tag=tag,
+                scope=scope,
                 container_image=container_image,
                 container_tag=container_tag,
                 environment=environment,
@@ -160,6 +162,7 @@ def parse_finished_training(logs: List[str]) -> Optional[bool]:
 )
 @click.option("--n-repeat", required=False, default=1, type=int)
 @click.option("--time-limit", required=False, default=1800, type=int)
+@click.option("--scope", required=False, default="mr", type=str)
 @click.option(
     "--account",
     required=False,
@@ -187,6 +190,7 @@ def main(
     environment: str,
     n_repeat: int,
     time_limit: int,
+    scope: str,
     account: str,
     partition: Optional[str],
     cluster: str,
@@ -236,6 +240,7 @@ def main(
             environment=environment,
             n_repeat=n_repeat,
             time_limit=time_limit,
+            scope=scope,
             container_image=container_image,
             container_tag=container_tag,
             cluster=cluster,
