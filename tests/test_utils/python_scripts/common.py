@@ -25,9 +25,12 @@ def flatten_products(
     workload_manifest: jetclient.JETWorkloadManifest,
 ) -> jetclient.JETWorkloadManifest:
     """Flattens a nested dict of products"""
+
     workload_manifest.products = [
-        dict(zip(inp.keys(), values))
-        for inp in workload_manifest.products
+        dict(**dict(zip(inp.keys(), values)), **{"test_case": product['test_case'][0]})
+        for product in workload_manifest.products
+        if "products" in product
+        for inp in product['products']
         for values in itertools.product(*inp.values())
     ]
 

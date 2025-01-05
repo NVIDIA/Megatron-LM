@@ -9,6 +9,8 @@ spec:
   build: mcore-pyt-{environment}
   gpus: 8
   platforms: dgx_a100
+  time_limit:
+  n_repeat:
   artifacts:
     /workspace/data/bert_data: text/the_pile/bert_shard00
   script: |-
@@ -30,26 +32,71 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  - environment: [lts, dev]
-    scope: [mr]
-    time_limit: [1800]
-    n_repeat: [5]
-    test_case:
-      - bert_mr_mcore_tp2_pp2_dgx_a100_1N8G
-      - bert_mr_mcore_tp2_pp2_local_spec_dgx_a100_1N8G
-      - bert_mr_mcore_tp2_pp2_resume_torch_dist_dgx_a100_1N8G
-      - bert_mr_mcore_tp2_pp2_resume_torch_dist_local_spec_dgx_a100_1N8G
-      - bert_mr_tp1_pp4_vp2_dgx_a100_1N8G
-      - bert_mr_tp1_pp4_vp2_resume_torch_dgx_a100_1N8G
-      - bert_mr_tp2_pp2_dgx_a100_1N8G
-      - bert_mr_tp2_pp2_resume_torch_dgx_a100_1N8G
-  - environment: [lts, dev]
-    scope: [nightly]
-    n_repeat: [5]
-    time_limit: [3600]
-    test_case:
-      - bert_nightly_dgx_a100_1N8G_mcore_tp1_pp2
-      - bert_nightly_dgx_a100_1N8G_mcore_tp1_pp4_vp2
-      - bert_nightly_dgx_a100_1N8G_mcore_tp4_pp1
-      - bert_nightly_dgx_a100_1N8G_tp1_pp2
-      - bert_nightly_dgx_a100_1N8G_tp4_pp1
+  - test_case: [bert_mr_mcore_tp2_pp2_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [bert_mr_mcore_tp2_pp2_local_spec_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [bert_mr_mcore_tp2_pp2_resume_torch_dist_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [bert_mr_mcore_tp2_pp2_resume_torch_dist_local_spec_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [bert_mr_tp1_pp4_vp2_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [bert_mr_tp1_pp4_vp2_resume_torch_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [bert_mr_tp2_pp2_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [bert_mr_tp2_pp2_resume_torch_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [bert_nightly_dgx_a100_1N8G_mcore_tp1_pp2]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [bert_nightly_dgx_a100_1N8G_mcore_tp1_pp4_vp2]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [bert_nightly_dgx_a100_1N8G_mcore_tp4_pp1]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [bert_nightly_dgx_a100_1N8G_tp1_pp2]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [bert_nightly_dgx_a100_1N8G_tp4_pp1]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
