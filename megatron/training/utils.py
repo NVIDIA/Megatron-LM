@@ -70,7 +70,7 @@ def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
     return unwrapped_model
 
 
-def calc_params_l2_norm(model):
+def calc_params_l2_norm(model, force_create_fp32_copy=False):
     """Calculate l2 norm of parameters """
     args = get_args()
     if not isinstance(model, list):
@@ -78,45 +78,84 @@ def calc_params_l2_norm(model):
     # Seperate moe and dense params
     params_data = []
     moe_params_data = []
+    sharded_params_data = []
     data_parallel_group = None
 
     for model_chunk in model:
-        for i, param in enumerate(model_chunk.parameters()):
+        for param in model_chunk.parameters():
             data_parallel_group = get_data_parallel_group_if_dtensor(param, data_parallel_group)
             is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
-            if not (param.requires_grad and is_not_tp_duplicate):
+            if not is_not_tp_duplicate:
                 continue
             assert is_not_tp_duplicate
             if not getattr(param, 'allreduce', True):
+                # TODO: Implement memory optimization for MoE parameters.
                 assert param_is_not_shared(param)
                 param = to_local_if_dtensor(param)
                 moe_params_data.append(param.data.float() if args.bf16 else param.data)
             else:
                 if param_is_not_shared(param):
                     param = to_local_if_dtensor(param)
-                    params_data.append(param.data.float() if args.bf16 else param.data)
+                    if args.bf16:
+                        if not force_create_fp32_copy and hasattr(param, 'main_param'):
+                            if getattr(param, 'main_param_sharded', False):
+                                if param.main_param is not None:
+                                    sharded_params_data.append(param.main_param)
+                            else:
+                                params_data.append(param.main_param)
+                        else:
+                            # Fallback to original logic of making a fp32 copy of the
+                            # parameter if `.main_param` attribute is not available.
+                            params_data.append(param.data.float())
+                    else:
+                        params_data.append(param.data)
 
-    # Calculate dense param norm
+    # Calculate norm.
     dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device=get_current_device())
     if len(params_data) > 0:
         norm, _ = multi_tensor_applier(
             multi_tensor_l2norm,
             dummy_overflow_buf,
             [params_data],
-            False # no per-parameter norm
+            False # no per-parameter norm.
         )
         norm_2 = norm * norm
     else:
-        norm_2 = torch.tensor([0.0], dtype=torch.float32, device=get_current_device())
+        norm_2 = torch.zeros((1,), dtype=torch.float32, device=get_current_device())
 
     if data_parallel_group is not None:
         torch.distributed.all_reduce(norm_2,
                                     op=torch.distributed.ReduceOp.SUM,
                                     group=data_parallel_group)
 
-    # Sum across all model-parallel GPUs(tensor + pipeline).
+    # Add norm contribution from params with sharded main_params. These norms need to be
+    # accumulated across the DP group since the main parameters are sharded because
+    # of distributed optimizer.
+    if len(sharded_params_data) > 0:
+        dummy_overflow_buf = torch.tensor([0], dtype=torch.int,device=get_current_device())
+        sharded_norm, _ = multi_tensor_applier(
+            multi_tensor_l2norm,
+            dummy_overflow_buf,
+            [sharded_params_data],
+            False # no per-parameter norm.
+        )
+        sharded_norm_2 = sharded_norm * sharded_norm
+        # Sum over all DP groups.
+        if xm:
+            xm.all_reduce(xm.REDUCE_SUM, [sharded_norm_2], 
+                          groups=mpu.get_data_parallel_groups(), pin_layout=False)
+        else:
+            torch.distributed.all_reduce(
+                sharded_norm_2,
+                op=torch.distributed.ReduceOp.SUM,
+                group=mpu.get_data_parallel_group()
+            )
+        norm_2 += sharded_norm_2
+
+    # Sum across all model-parallel GPUs (tensor + pipeline).
     if xm:
-        xm.all_reduce(xm.REDUCE_SUM, [norm_2], groups=mpu.get_model_parallel_groups())
+        xm.all_reduce(xm.REDUCE_SUM, [norm_2], 
+                      groups=mpu.get_model_parallel_groups(), pin_layout=False)
     else:
         torch.distributed.all_reduce(
             norm_2,
@@ -124,22 +163,27 @@ def calc_params_l2_norm(model):
             group=mpu.get_model_parallel_group()
         )
 
-    # Calculate moe norm
+    # Add norm contribution from expert layers in MoEs.
     if len(moe_params_data) > 0:
         moe_norm, _ = multi_tensor_applier(
             multi_tensor_l2norm,
             dummy_overflow_buf,
             [moe_params_data],
-            False # no per-parameter norm
+            False # no per-parameter norm.
         )
         moe_norm_2 = moe_norm * moe_norm
         # Sum across expert tensor, model and pipeline parallel GPUs.
-        torch.distributed.all_reduce(
-            moe_norm_2,
-            op=torch.distributed.ReduceOp.SUM,
-            group=mpu.get_expert_tensor_model_pipeline_parallel_group()
-        )
+        if xm:
+            xm.all_reduce(xm.REDUCE_SUM, [moe_norm_2], 
+                          groups=mpu.get_expert_tensor_model_pipeline_parallel_groups(), pin_layout=False)
+        else:
+            torch.distributed.all_reduce(
+                moe_norm_2,
+                op=torch.distributed.ReduceOp.SUM,
+                group=mpu.get_expert_tensor_model_pipeline_parallel_group()
+            )
         norm_2 += moe_norm_2
+
     return norm_2.item() ** 0.5
 
 
@@ -150,7 +194,7 @@ def average_losses_across_data_parallel_group(losses):
     xm = get_xla_model()
     if xm:
         xm.all_reduce(xm.REDUCE_SUM, [averaged_losses], 
-                                    groups=mpu.get_data_parallel_groups())
+                                    groups=mpu.get_data_parallel_groups(), pin_layout=False)
     else:
         torch.distributed.all_reduce(averaged_losses,
                                     group=mpu.get_data_parallel_group())
@@ -170,10 +214,13 @@ def reduce_max_stat_across_model_parallel_group(stat: float) -> float:
     """
     if stat is None:
         stat = -1.0
-    stat = torch.tensor([stat], dtype=torch.float32, device=torch.cuda.current_device())
-    torch.distributed.all_reduce(
-        stat, op=torch.distributed.ReduceOp.MAX, group=mpu.get_model_parallel_group()
-    )
+    stat = torch.tensor([stat], dtype=torch.float32, device=get_current_device())
+    if xm:
+        xm.all_reduce(xm.REDUCE_MAX, [stat], groups=mpu.get_model_parallel_groups(), pin_layout=False)
+    else:
+        torch.distributed.all_reduce(
+            stat, op=torch.distributed.ReduceOp.MAX, group=mpu.get_model_parallel_group()
+        )
     if stat.item() == -1.0:
         return None
     else:
@@ -188,10 +235,13 @@ def logical_and_across_model_parallel_group(input: bool) -> bool:
         input = 1
     else:
         input = 0
-    input = torch.tensor([input], dtype=torch.int, device=torch.cuda.current_device())
-    torch.distributed.all_reduce(
-        input, op=torch.distributed.ReduceOp.MIN, group=mpu.get_model_parallel_group()
-    )
+    input = torch.tensor([input], dtype=torch.int, device=get_current_device())
+    if xm:
+        xm.all_reduce(xm.REDUCE_MIN, [input], groups=mpu.get_model_parallel_groups(), pin_layout=False)
+    else:
+        torch.distributed.all_reduce(
+            input, op=torch.distributed.ReduceOp.MIN, group=mpu.get_model_parallel_group()
+        )
     return bool(input.item())
 
 

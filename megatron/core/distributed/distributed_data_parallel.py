@@ -5,7 +5,7 @@ from contextlib import contextmanager
 
 import torch
 
-from megatron.core.device_utils import get_xla_model
+from megatron.core.device_utils import get_current_device, get_xla_model
 
 from .. import parallel_state
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
@@ -214,7 +214,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 assert (
                     self.ddp_config.use_distributed_optimizer
                 ), 'Partial DistOpt cannot be used without DistOpt'
-                communication_stream = torch.cuda.Stream(device=torch.cuda.current_device())
+                communication_stream = torch.cuda.Stream(device=get_current_device())
                 for bucket_group in bucket_groups:
                     bucket_group.inter_distributed_optimizer_instance_group = (
                         parallel_state.get_inter_partial_data_parallel_group()

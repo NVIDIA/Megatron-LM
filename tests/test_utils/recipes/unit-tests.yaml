@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: '{test_case}'
+  name: '{test_case}_{environment}_{tag}'
   model: unit-tests
   nodes: 1
   build: mcore-pyt-{environment}
@@ -66,15 +66,45 @@ spec:
     done
 
 products:
-  - environment: [lts, dev]
-    tag: [latest, legacy]
-    scope: [unit-tests]
-    n_repeat: [1]
-    time_limit: [1800]
-    test_case:
-      - tests/unit_tests/data/
-      - tests/unit_tests/dist_checkpointing/*.py
-      - tests/unit_tests/dist_checkpointing/models/
-      - tests/unit_tests/transformer/*.py
-      - tests/unit_tests/transformer/moe
-      - tests/unit_tests
+  - test_case: [tests/unit_tests/data/]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/dist_checkpointing/*.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/dist_checkpointing/models/]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/transformer/*.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/transformer/moe]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]

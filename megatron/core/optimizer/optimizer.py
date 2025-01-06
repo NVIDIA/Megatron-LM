@@ -564,6 +564,9 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             # Replace the optimizer params with the new fp32 copy.
                             param_group['params'][i] = main_param
 
+                            # Store handle to main_param.
+                            param.main_param = main_param
+
                             fp32_from_float16_params_this_group.append(main_param)
                             # Reset existing state dict key to the new main param.
                             if param in self.optimizer.state:
@@ -991,7 +994,7 @@ class ChainedOptimizer(MegatronOptimizer):
         if self.chained_optimizers:
             return self.chained_optimizers[0].get_loss_scale()
         else:
-            return torch.tensor([1.0], dtype=torch.float32, device=torch.cuda.current_device())
+            return torch.tensor([1.0], dtype=torch.float32, device=get_current_device())
 
     def reload_model_params(self):
         for optimizer in self.chained_optimizers:

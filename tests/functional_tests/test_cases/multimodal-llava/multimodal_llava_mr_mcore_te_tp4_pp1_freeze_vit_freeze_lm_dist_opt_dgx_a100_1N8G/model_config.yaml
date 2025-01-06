@@ -55,4 +55,5 @@ MODEL_ARGS:
   --freeze-ViT: true
   --freeze-LM: true
   --use-distributed-optimizer: true
+  --log-memory-to-tensorboard: true
 TEST_TYPE: regular

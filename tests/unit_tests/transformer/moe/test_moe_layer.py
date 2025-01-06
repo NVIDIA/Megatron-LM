@@ -125,7 +125,7 @@ class TestMoELayerInit:
         _set_random_seed(seed_=123, data_parallel_random_init=False)
 
         input_data = torch.randn(
-            16, 4, hidden_size, device=torch.cuda.current_device(), dtype=torch.bfloat16
+            16, 4, hidden_size, device=get_current_device(), dtype=torch.bfloat16
         )
         output = moe_layer(input_data)
 

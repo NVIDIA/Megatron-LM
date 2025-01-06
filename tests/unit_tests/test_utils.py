@@ -1,7 +1,9 @@
 import os
 import time
 import urllib.request as req
+from types import SimpleNamespace
 
+import unittest.mock as mock
 import numpy as np
 import pytest
 import torch
@@ -9,6 +11,10 @@ import torch
 import megatron.core.utils as util
 from tests.unit_tests.test_utilities import Utils, TestModel
 from megatron.core.device_utils import get_current_device, get_xla_model
+import megatron.training.utils as training_util
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.transformer import TransformerConfig
 
 xm = get_xla_model()
 
@@ -23,7 +29,6 @@ class TestUtils:
 
     def test_divide_properly(self):
         assert util.divide(4, 2) == 2
-
 
     def test_divide_improperly(self):
         with pytest.raises(AssertionError):
@@ -88,6 +93,48 @@ class TestUtils:
             model.layers[0].weight.data.fill_(0.0)
         assert not util.check_param_hashes_across_dp_replicas([model], True)
 
+
+    @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
+    def test_param_norm(self, use_distributed_optimizer: bool):
+        use_distributed_optimizer = use_distributed_optimizer and xm is None
+        model = TestModel(input_dim=100, output_dim=100, num_layers=1, bias=False)
+        model.to(device=self.device, dtype=torch.bfloat16)
+        model.requires_grad_(True)
+        model.layers[0].weight.data.fill_(1.0)
+        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=use_distributed_optimizer)
+        # Use dummy TransformerConfig which doesn't trigger __post_init__ assertions.
+        model = DistributedDataParallel(
+            TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+        )
+        for param in model.parameters():
+            assert param.requires_grad
+        mock_args = SimpleNamespace(bf16=True)
+
+        with mock.patch('megatron.training.utils.get_args', new=lambda: mock_args):
+            # Make sure norm is correct when `main_param` attribute is not available.
+            assert training_util.calc_params_l2_norm(
+                model, force_create_fp32_copy=False
+            ) == pytest.approx(100.0)
+            assert training_util.calc_params_l2_norm(
+                model, force_create_fp32_copy=True
+            ) == pytest.approx(100.0)
+
+            # Make sure norm is correct when `main_param` attribute is available.
+            optimizer_config = OptimizerConfig(
+                bf16=True, use_distributed_optimizer=use_distributed_optimizer
+            )
+            _ = get_megatron_optimizer(optimizer_config, [model])
+            for param in model.parameters():
+                assert hasattr(param, 'main_param')
+                if use_distributed_optimizer:
+                    assert getattr(param, 'main_param_sharded', False)
+            assert training_util.calc_params_l2_norm(
+                model, force_create_fp32_copy=False
+            ) == pytest.approx(100.0)
+            assert training_util.calc_params_l2_norm(
+                model, force_create_fp32_copy=True
+            ) == pytest.approx(100.0)
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_straggler_detector(self):
         world = int(os.getenv('WORLD_SIZE', '1'))
@@ -117,8 +164,8 @@ class TestUtils:
             M = 20
             K = 30
             N = 40
-            mat1 = torch.randn(M, K, device=self.device)
-            mat2 = torch.randn(K, N, device=self.device)
+            mat1 = torch.randn(M, K, device=get_current_device())
+            mat2 = torch.randn(K, N, device=get_current_device())
             # batch_data.
             with stimer(bdata=True):
                 time.sleep(s)
@@ -141,7 +188,7 @@ class TestUtils:
                     x = 1 / 0
             # non-batch-data
             with pytest.raises(ValueError, match=r".* value .*"):
-                with stimer(self):
+                with stimer():
                     straggler_value_error()
 
         # Reporting.
@@ -150,8 +197,8 @@ class TestUtils:
             N = 20
             P = 30
             M = 40
-            mat1 = torch.randn(N, P, device=self.device)
-            mat2 = torch.randn(P, M, device=self.device)
+            mat1 = torch.randn(N, P, device=get_current_device())
+            mat2 = torch.randn(P, M, device=get_current_device())
             tfp = (N * M) * (2 * P - 1)  # Theoretical.
             iter = 10  # Mock.
             # batch_data.
@@ -164,10 +211,9 @@ class TestUtils:
             rb = True if rank == 0 else False
             assert r == rb
 
-
         # Create a straggler_detector with enabled set to false.
         stimer = util.StragglerDetector()
-        stimer.configure(Utils.world_size, Utils.rank, enabled=False, port=port)
+        stimer.configure(world, rank, enabled=False, port=port)
         # Check if configuration was success.
         assert stimer.configured == True
 
@@ -184,3 +230,4 @@ class TestUtils:
         # Check that exception is not suppressed.
         straggler_detector_exception_propagate()
         util.StragglerDetector._configured = False
+    

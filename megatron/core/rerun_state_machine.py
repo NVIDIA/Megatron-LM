@@ -9,6 +9,7 @@ from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Iterable, NamedTuple, Optional, Set, Tuple, Union
 
+from megatron.core.device_utils import get_current_device
 import numpy as np
 import torch
 
@@ -279,7 +280,7 @@ class RerunStateMachine:
                 self.state = RerunState.NOT_RUNNING_YET
                 return False
             will_rerun_tensor: torch.Tensor = torch.tensor(
-                [self.rerun_requested], dtype=torch.int32, device='cuda'
+                [self.rerun_requested], dtype=torch.int32, device=get_current_device()
             )
             torch.distributed.all_reduce(will_rerun_tensor)
             if will_rerun_tensor.item() == 0:
@@ -303,7 +304,7 @@ class RerunStateMachine:
                 self.saved_results = defaultdict(list)
                 return False
             will_checkpoint_tensor: torch.Tensor = torch.tensor(
-                [self.checkpoint_requested], dtype=torch.int32, device='cuda'
+                [self.checkpoint_requested], dtype=torch.int32, device=get_current_device()
             )
             torch.distributed.all_reduce(will_checkpoint_tensor)
             if will_checkpoint_tensor.item() > 0:
@@ -320,7 +321,7 @@ class RerunStateMachine:
         # Are we done re-running from a checkpoint?
         elif self.state == RerunState.RERUNNING_FROM_CHECKPOINT:
             will_restart_again_tensor: torch.Tensor = torch.tensor(
-                [self.restart_again_requested], dtype=torch.int32, device='cuda'
+                [self.restart_again_requested], dtype=torch.int32, device=get_current_device()
             )
             torch.distributed.all_reduce(will_restart_again_tensor)
             if will_restart_again_tensor.item() > 0:
@@ -332,7 +333,7 @@ class RerunStateMachine:
                 self.state = RerunState.RERUNNING_AGAIN_FROM_CHECKPOINT
             else:
                 will_continue_tensor: torch.Tensor = torch.tensor(
-                    [self.continue_requested], dtype=torch.int32, device='cuda'
+                    [self.continue_requested], dtype=torch.int32, device=get_current_device()
                 )
                 torch.distributed.all_reduce(will_continue_tensor)
                 if will_continue_tensor.item() > 0:
@@ -497,7 +498,7 @@ class RerunStateMachine:
         def log_failure(message: str) -> None:
             rank: int = _safe_get_rank()
             node: str = os.uname()[1]
-            device: int = torch.cuda.current_device()
+            device = get_current_device()
             logger.error(f"Rank {rank}, node {node}, device {device}: {message}!")
 
         # Emit message in log so that we can identify which jobs have this instrumentation
@@ -546,7 +547,7 @@ class RerunStateMachine:
                     # Remember the node and device we're running on so that we can check we're not
                     # rerunning on the same GPU when we resume from the checkpoint.
                     self.suspicious_node = os.uname()[1]
-                    self.suspicious_device = torch.cuda.current_device()
+                    self.suspicious_device = get_current_device()
                     logger.warning(
                         "First rerun: unexpected result is reproducible within the tolerance "
                         f"({result} = {self.initial_result}). "
@@ -556,7 +557,7 @@ class RerunStateMachine:
             elif self.state == RerunState.RERUNNING_FROM_CHECKPOINT:
                 # Ensure we're not on the same GPU as the first rerun.
                 node: str = os.uname()[1]
-                device: int = torch.cuda.current_device()
+                device = get_current_device()
                 if node == self.suspicious_node and device == self.suspicious_device:
                     logger.error(
                         f"Got rescheduled on the same GPU. Need to resume again from the same "
