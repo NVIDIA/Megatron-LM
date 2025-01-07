@@ -173,3 +173,41 @@ class TestTextGenerationController:
             ), f"Status should be completed but its {request.status}"
             assert request.generated_length > 0, f"Generated length should be greater than zero"
             assert request.generated_text is not None, "Generated text should not be None"
+
+    def test_output_log_probs(self):
+        self.mock_tokenizer.vocab_size = self.vocab_size
+        self.mock_tokenizer.bos = 0
+        self.mock_tokenizer.eod = self.vocab_size - 1
+        self.mock_tokenizer.detokenize.return_value = ''.join(
+            random.choices(string.ascii_letters, k=random.randint(4, 10))
+        )
+
+        prompt = ""
+        active_requests: Dict[int, InferenceRequest] = OrderedDict()
+        for i in range(self.batch_size):
+            self.mock_tokenizer.tokenize.return_value = torch.randn(
+                self.batch_size, self.vocab_size
+            ).cuda()
+            inference_request = InferenceRequest(
+                request_id=i,
+                prompt=prompt,
+                inference_parameters=SamplingParams(
+                    num_tokens_to_generate=1, return_log_probs=True
+                ),
+                arrival_time=time.time(),
+                prompt_tokens=[self.mock_tokenizer.bos],
+                status=Status.ACTIVE_BUT_NOT_GENERATING_TOKENS,
+            )
+            active_requests[i] = inference_request
+
+        requests = self.text_generation_controller.generate_all_output_tokens_static_batch(
+            active_requests
+        )
+
+        for request_id, request in requests.items():
+            assert (
+                request.status == Status.COMPLETED
+            ), f"Status should be completed but its {request.status}"
+            assert request.generated_length > 0, f"Generated length should be greater than zero"
+            assert request.generated_text is not None, "Generated text should not be None"
+            assert len(request.generated_log_probs) == request.generated_length
