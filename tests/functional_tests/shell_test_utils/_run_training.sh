@@ -29,6 +29,7 @@ MANDATORY_VARS=(
     "CHECKPOINT_PATH"
     "DATA_PATH"
     "RUN_NUMBER"
+    "REPEAT"
 )
 for mandatory_var in "${MANDATORY_VARS[@]}"; do
     if [[ -z "${!mandatory_var}" ]]; then
@@ -36,9 +37,6 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
         exit 1
     fi
 done
-
-cp $TRAINING_PARAMS_PATH "$TRAINING_PARAMS_PATH.${SLURM_PROCID}"
-TRAINING_PARAMS_PATH="$TRAINING_PARAMS_PATH.${SLURM_PROCID}"
 
 # Envsubst model_params
 cat $TRAINING_PARAMS_PATH | envsubst "$(env | cut -d= -f1 | sed -e 's/^/$/')" >$TRAINING_PARAMS_PATH.tmp
@@ -88,5 +86,28 @@ PARAMS="$PARAMS $TRAINING_PARAMS_FROM_CONFIG"
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
 
+######## Distributed training settings. ########
+echo "------ARGUMENTS for SLURM ---"
+MASTER_ADDR=${MASTER_ADDR:-localhost}
+MASTER_PORT=${MASTER_PORT:-6000}
+NUM_NODES=${NUM_NODES:-${SLURM_NNODES}}
+GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID}}
+DISTRIBUTED_ARGS=(
+    --nproc_per_node $GPUS_PER_NODE
+    --nnodes $NUM_NODES
+    --master_addr $MASTER_ADDR
+    --master_port $MASTER_PORT
+    --node_rank $SLURM_NODEID
+    --log-dir $OUTPUT_PATH
+    --tee "0:3"
+    --redirects "3"
+)
+
 # Start training
-python $TRAINING_SCRIPT_PATH $PARAMS
+torchrun ${DISTRIBUTED_ARGS[@]} $TRAINING_SCRIPT_PATH $PARAMS
+
+find "$OUTPUT_PATH" -type f \( -name "stdout.log" -o -name "stderr.log" \) | while read -r file; do
+    rank_dir=$(basename "$(dirname "$file")")
+    mv "$file" "$(dirname "$file")/repeat$REPEAT-run$RUN_NUMBER-rank${rank_dir}-$(basename "$file")"
+done
