@@ -177,7 +177,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         self.txt_to_token_dict = {}
 
         self.img_h, self.img_w = self.args.img_h, self.args.img_w
-
+        self.img_token_id = self.tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
         # This map is used to reduce the number of tiles used per image if the number of tokens is
         # larger than the decoder_seq_length.
         self.num_tiles_degradation_map = {12:8, 8:6, 6:4, 4:2, 2:1, 1:1}
@@ -314,15 +314,15 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         """Encode SFT sample."""
         augment = sample.__subflavors__['augmentation'] if 'augmentation' in sample.__subflavors__ else False
         has_video = sample.__subflavors__['has_video'] if 'has_video' in sample.__subflavors__ else False
-
         has_image = False
-        if hasattr(sample, "images"):
+        # We infer whether the sample has image or not.
+        if hasattr(sample, "images") and not has_video:
             # If this is a text-only sample and we are freezing the LM,
             # then use a dummy input image.
             if len(sample.images) == 0 and self.args.freeze_LM:
                 empty_img = Image.new('RGB', (self.args.img_w, self.args.img_h), (255, 255, 255))
                 sample.images.append(empty_img)
-            if len(sample.images) > 0 and not has_video:
+            if len(sample.images) > 0:
                 has_image = True
 
         # Note: Some tokenizers may ignore the system prompt.
@@ -343,10 +343,10 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                 image_tag_ids = [int(x) - 1 for x in re.findall(r"<image-(\d+)>", turn["content"])]
                 image_tag_ids_list.extend(image_tag_ids)
                 turn["content"] = re.sub(r"<image-\d+>", IMAGE_TOKEN, turn["content"])
-                number_image_tags += turn["content"].count(IMAGE_TOKEN)
-                # For videos, we replace the image tag with the video tag
+                # For videos, we use the image token to locate where to put the frames.
                 if has_video:
-                    turn["content"] = turn["content"].replace(IMAGE_TOKEN, VIDEO_TOKEN)
+                    turn["content"] = turn["content"].replace(VIDEO_TOKEN, IMAGE_TOKEN)
+                number_image_tags += turn["content"].count(IMAGE_TOKEN)
 
         # We re-order the images in sample.images according to how they appear in the conversation.
         if len(image_tag_ids_list) > 0:
@@ -354,10 +354,11 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
 
         # If there is only one image, but several image tags, we assume all the tags refer to the
         # same image and duplicate the image:
-        if len(sample.images) == 1 and number_image_tags > 1:
+        if not has_video and len(sample.images) == 1 and number_image_tags > 1:
             sample.images = sample.images * number_image_tags
 
-        number_of_images = len(sample.images)
+        # We currently only support one video per sample.
+        number_of_images = 1 if has_video else len(sample.images)
         # Fail if there are more image or video tags than image or videos:
         error_msg = (
             f"Found {number_image_tags} image tags for {number_of_images} images. {sample.texts}")
@@ -368,8 +369,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         if number_image_tags < number_of_images:
             for turn in conversation:
                 if turn["role"] == "user":
-                    tag_to_add = VIDEO_TOKEN if has_video else IMAGE_TOKEN
-                    turn["content"] = tag_to_add*(number_of_images-number_image_tags) + "\n" + turn["content"]
+                    turn["content"] = IMAGE_TOKEN*(number_of_images-number_image_tags) + "\n" + turn["content"]
                     break
 
         input_ids, target = self.tokenizer.tokenize_conversation(conversation, True, False)
@@ -394,7 +394,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                     num_tiles += [len(img_tiles)]
                 if max_num_tiles == 1:
                     break
-                if sum(num_tiles) * self.token_per_img_tile > max_image_token_allowed:
+                if sum(num_tiles) * self.num_image_embeddings_per_tile > max_image_token_allowed:
                     if max_num_tiles in self.num_tiles_degradation_map:
                         max_num_tiles = self.num_tiles_degradation_map[max_num_tiles]
                     else:
@@ -408,7 +408,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             use_tiling=False
             # Grab the selected frames of the video as a tensor with shape
             # fhwc: (num_frames, num_channels, height, width).
-            video_fchw = sample.images[0].permute(0, 1, 2, 3)
+            video_fchw = sample.images.frames
             selected_frames = torch.linspace(
                 0, video_fchw.shape[0] - 1, self.args.num_frames).long()
             video_fchw = video_fchw[selected_frames]
