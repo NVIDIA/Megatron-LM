@@ -52,21 +52,16 @@ for i in $(seq 1 $N_REPEAT); do
 
     # Training
     export RUN_NUMBER=1
+    export REPEAT=$i
     bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
 
     # Maybe checkpoint resume training
     if [[ "$TEST_TYPE" == "ckpt-resume" ]]; then
-        if [[ ${SLURM_PROCID} -eq 0 ]]; then
-            rm -rf "$CHECKPOINT_PATH/iter_0000$TRAIN_ITERS"
-            echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_PATH/latest_checkpointed_iteration.txt
-        fi
+        rm -rf "$CHECKPOINT_PATH/iter_0000$TRAIN_ITERS"
+        echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_PATH/latest_checkpointed_iteration.txt
 
         export RUN_NUMBER=2
         bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
-    fi
-
-    if [[ ${SLURM_PROCID} -gt 0 ]]; then
-        continue
     fi
 
     # Save run results

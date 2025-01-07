@@ -2,9 +2,6 @@ type: basic
 format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
-launchers:
-  type:slurm:
-    ntasks_per_node: '{gpus}'
 spec:
   name: '{test_case}_{environment}'
   model: multimodal-llava
@@ -39,47 +36,35 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
-        gpus: [8]
       - environment: [lts]
         scope: [nightly]
-        gpus: [8]
   - test_case: [multimodal_llava_mr_mcore_te_tp2_pp3_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
-        gpus: [8]
       - environment: [lts]
         scope: [nightly]
-        gpus: [8]
   - test_case: [multimodal_llava_mr_mcore_te_tp4_pp1_etp3_dgx_a100_1N7G]
     products:
       - environment: [dev]
         scope: [mr]
-        gpus: [7]
       - environment: [lts]
         scope: [nightly]
-        gpus: [7]
   - test_case: [multimodal_llava_mr_mcore_te_tp4_pp1_freeze_vit_freeze_lm_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
-        gpus: [8]
       - environment: [lts]
         scope: [nightly]
-        gpus: [8]
   - test_case: [multimodal_llava_mr_mcore_te_tp4_pp1_freeze_vit_freeze_lm_dist_opt_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
-        gpus: [8]
       - environment: [lts]
         scope: [nightly]
-        gpus: [8]
   - test_case: [multimodal_llava_mr_mcore_te_tp4_pp1_resume_torch_etp3_dgx_a100_1N7G]
     products:
       - environment: [dev]
         scope: [mr]
-        gpus: [7]
       - environment: [lts]
         scope: [nightly]
-        gpus: [7]

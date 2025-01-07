@@ -50,7 +50,7 @@ def launch_and_wait_for_completion(
     run_name: Optional[str],
     wandb_experiment: Optional[str],
 ) -> jetclient.JETPipeline:
-    cluster_config = {"account": account, "ntasks_per_node": 8}
+    cluster_config = {"account": account}
     if partition is not None:
         cluster_config['partition'] = partition
 
