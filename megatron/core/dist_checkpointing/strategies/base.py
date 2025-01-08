@@ -30,7 +30,7 @@ def get_default_strategy(action: StrategyAction, backend: str, version: int):
     """Retrieves a default strategy for a given action, backend and version."""
     try:
         if backend == 'zarr':
-            error_hint = ' Please install `zarr` and `tensorstore<=0.1.45` packages'
+            error_hint = ' Please install `zarr` and `tensorstore!=0.1.46` packages'
             from .tensorstore import register_default_tensorstore_strategies
 
             register_default_tensorstore_strategies()
