@@ -18,7 +18,7 @@ make -C docker release_build
 Once the container is built, install `nvidia-modelopt` and additional dependencies for sharded checkpoint support:
 ```sh
 pip install "nvidia-modelopt[all]~=0.13.0" --extra-index-url https://pypi.nvidia.com
-pip install zarr tensorstore==0.1.45
+pip install zarr tensorstore!=0.1.46
 ```
 TensorRT-LLM quantization functionalities are currently packaged in `nvidia-modelopt`.
 You can find more documentation about `nvidia-modelopt` [here](https://nvidia.github.io/TensorRT-Model-Optimizer/).
