@@ -259,11 +259,18 @@ def main(
                 jet_log = main_job.get_logs()
                 logs = extract_logs_to_string(logs=jet_log)
                 download_job_assets(logs=jet_log, iteration=n_iteration)
+                no_log = False
                 break
             except (requests.exceptions.ConnectionError, json.decoder.JSONDecodeError) as e:
-                print(e)
+                logger.error(e)
                 time.sleep((3**n_download_attempt) * 60)
                 n_download_attempt += 1
+            except KeyError as e:
+                logger.error(e)
+                no_log = True
+
+        if no_log:
+            continue
 
         concat_logs = "\n".join(logs)
         print(f"Logs:\n{concat_logs}")

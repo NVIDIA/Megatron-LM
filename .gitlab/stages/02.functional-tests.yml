@@ -117,9 +117,9 @@ functional:run_nemo:
     variables: true
   variables:
     MCORE_COMMIT: $CI_COMMIT_SHA
-    TEST_LLM_MODULE: true
-    TEST_ALIGNER_MODULE: false
-    TEST_DATA_CURATOR_MODULE: false
+    TEST_LLM_MODULE: 'True'
+    TEST_ALIGNER_MODULE: 'False'
+    TEST_DATA_CURATOR_MODULE: 'False'
     TESTS_TO_RUN_ON_THIS_COMMIT: nightly
   rules:
     - if: $FUNCTIONAL_TEST == "yes"
