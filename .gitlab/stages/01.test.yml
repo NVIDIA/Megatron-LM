@@ -330,6 +330,8 @@ test:pypi_build_wheel:
         PRE_RELEASE=$(sed -n "s/.*PRE_RELEASE = '\(.*\)'/\1/p" megatron/core/package_info.py)
         sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '${PRE_RELEASE}.dev$((RANDOM % 900000 + 100000))'" megatron/core/package_info.py 
       fi
+
+
     - /opt/python/cp310-cp310/bin/python -m build
     - /opt/python/cp311-cp311/bin/python -m build
     - auditwheel repair dist/*.whl
@@ -353,6 +355,8 @@ test:pypi_test_wheel:
     - RELEASE_NUMBER=$(python -c "from megatron import core; print(core.__version__)")
     - >
       echo "$EXPECTED_RELEASE_NUMBER" == "$RELEASE_NUMBER"
+
+
     - test "$EXPECTED_RELEASE_NUMBER" == "$RELEASE_NUMBER"
     - echo "RELEASE_NUMBER=$EXPECTED_RELEASE_NUMBER" | tee -a build.env
   artifacts:
@@ -380,11 +384,15 @@ test:pypi_push_wheel:
         export TWINE_USERNAME=$TWINE_PROD_USERNAME
         export TWINE_PASSWORT=$TWINE_PROD_PASSWORD
       fi
+
+
     - pip install twine
     - >
       for i in 1 2 3 4 5; do 
         twine upload --verbose -u $TWINE_USERNAME -p $TWINE_PASSWORT --repository $REPOSITORY wheelhouse/* && break || sleep $(( 60*2**i )); 
       done
+
+
   rules:
     - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
@@ -418,6 +426,8 @@ test:gh_release:
                       "generate_release_notes": false
                   }'
               )
+
+
     - >
       CMD=$(echo curl -L \
         -X POST \
@@ -427,12 +437,13 @@ test:gh_release:
         https://api.github.com/repos/NVIDIA/Megatron-LM/releases \
         -d "$PAYLOAD"
       )
-
+      
       if [[ "$PUBLISH_DRYRUN" == "yes" ]]; then
         echo "$CMD"
       else
         eval "$CMD"
       fi
+
 
 test:notify_release:
   needs: [test:pypi_test_wheel, test:pypi_push_wheel, test:gh_release]
@@ -455,6 +466,8 @@ test:notify_release:
             }
           ]
         }'
+
+
     - echo "$MESSAGE"
     - >
       CMD=$(echo curl \
@@ -462,9 +475,10 @@ test:notify_release:
         -H "Content-type: application/json" \
         --data "$MESSAGE" ${MCORE_NOTIFICATION_HOOK_MAIN}
       )
-
+      
       if [[ "$PUBLISH_DRYRUN" == "yes" ]]; then
         echo "$CMD"
       else
         eval "$CMD"
       fi
+
