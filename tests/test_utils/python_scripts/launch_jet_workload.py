@@ -271,6 +271,9 @@ def main(
         success = pipeline.get_status() == PipelineStatus.SUCCESS
         logger.info("Pipeline terminated with status %s", pipeline.get_status().name)
 
+        if test_type == "unit_test":
+            sys.exit(int(not success))  # invert for exit 0
+
         if test_type != "release":
             if success:
                 sys.exit(int(not success))  # invert for exit 0
