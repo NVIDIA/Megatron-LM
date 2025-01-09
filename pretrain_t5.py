@@ -141,6 +141,8 @@ def model_provider(
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
+            relative_attention_num_buckets=args.relative_attention_num_buckets,
+            relative_attention_max_distance=args.relative_attention_max_distance,
             add_encoder=add_encoder,
             add_decoder=add_decoder,
         )
