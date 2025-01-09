@@ -668,6 +668,12 @@ def validate_args(args, defaults={}):
     if not args.add_position_embedding and args.position_embedding_type != 'rope':
         raise RuntimeError('--no-position-embedding is deprecated, use --position-embedding-type')
 
+    # Relative position embeddings arguments
+    if args.position_embedding_type == 'relative':
+        assert (
+            args.transformer_impl == "transformer_engine"
+        ), 'Local transformer implementation currently does not support attention bias-based position embeddings.'
+
     # MoE Spec check
     if args.num_experts == 0:
         args.num_experts = None
@@ -965,8 +971,12 @@ def _add_network_size_args(parser):
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
     group.add_argument('--position-embedding-type', type=str, default='learned_absolute',
-                       choices=['learned_absolute', 'rope', 'none'],
-                       help='Position embedding type.')
+                        choices=['learned_absolute', 'rope', 'relative', 'none'],
+                        help='Position embedding type.')
+    group.add_argument('--relative-attention-num-buckets', type=int, default=32,
+                        help='Number of buckets for relative position embeddings.')
+    group.add_argument('--relative-attention-max-distance', type=int, default=128,
+                        help='Maximum distance for relative position embeddings calculation.')
     group.add_argument('--use-rotary-position-embeddings', action='store_true',
                        help='Use rotary positional embeddings or not. '
                        'Deprecated: use --position-embedding-type')
