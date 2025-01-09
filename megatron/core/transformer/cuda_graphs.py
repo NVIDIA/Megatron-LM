@@ -31,6 +31,8 @@ except:
 
 _IS_GRAPH_CAPTURING = False
 
+logger = logging.getLogger(__name__)
+
 
 def is_graph_capturing():
     """Query if currently capturing."""
@@ -53,7 +55,9 @@ def _set_capture_end():
 def _check_supported_type(arg):
     """Check if arg is a supported type for cudagraph input/outputs."""
 
-    _SUPPORTED_TYPES = {torch.Tensor, type(None), bool, int, str, float}
+    from megatron.core import InferenceParams  # guard against circular import
+
+    _SUPPORTED_TYPES = {torch.Tensor, type(None), bool, int, str, float, InferenceParams}
     assert type(arg) in _SUPPORTED_TYPES or is_dataclass(
         arg
     ), f"Cudagraphs recieved an arg of type {type(arg)} which is not supported."
@@ -153,7 +157,6 @@ class _CudagraphGlobalRecord:
             vpp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
             if vpp_size is None or vpp_size == 1:
                 bwd_mempool = fwd_mempool
-
             if optimize_transformer_layer_graph_buffers:
                 if graph_type == 'fwd':
                     args, kwargs = g[3:]
@@ -550,6 +553,7 @@ class _CudaGraphRunner(torch.nn.Module):
         'create_cudagraphs()` is called. Subsequent fwd passes will replay the cudagraph.
         """
         if not self.fwd_graph_recorded:
+            logger.debug(f"Recording forward graph creation...")
             _CudagraphGlobalRecord.record_fwd_graph(self, args, kwargs)
             self.fwd_graph_recorded = True
 
@@ -598,10 +602,11 @@ class _CudaGraphRunner(torch.nn.Module):
         return out
 
     def matches_graph_inputs(self, args, kwargs):
-        """Check the the passed args, kwargs match with the arg, kwargs
+        """Check that the passed args, kwargs match with the arg, kwargs
         the graph was created with."""
 
         def check(val, ref):
+
             _check_supported_type(val)
             _check_supported_type(ref)
 
@@ -758,9 +763,12 @@ class CudaGraphManager(torch.nn.Module):
             if self.training and torch.is_grad_enabled():
                 runner = _CudaGraphRunner(megatron_module, len(self.cudagraph_runners))
                 self.cudagraph_runners.append(runner)
+            elif 'inference_params' in kwargs.keys() and kwargs['inference_params']:
+                # Instantiate the cudagraphed version of the module in inference mode
+                runner = _CudaGraphRunner(megatron_module, len(self.cudagraph_runners))
+                runner.eval()
+                self.cudagraph_runners.append(runner)
             else:
-                # No cudagraphs were found in inference mode, so fallback to eager since
-                # tensor.requires_grad is needed to correctly trace the backward graph.
                 return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
 
         # Trigger Mcore DDP pre-forward hooks

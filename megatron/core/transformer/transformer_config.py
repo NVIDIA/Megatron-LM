@@ -385,6 +385,12 @@ class TransformerConfig(ModelParallelConfig):
     flash_decode: bool = False
     """ Use the optimized flash decoding kernel during inference. """
 
+    use_te_rng_tracker: bool = False
+    """ Whether to use the TE or MCore version of the RNG tracker. """
+
+    inference_rng_tracker: bool = False
+    """ Whether we should instantiate a separate RNG tracker for inference. """
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -604,6 +610,12 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.flash_decode and self.fp8:
             raise ValueError("FP8 inference is currently not support with flash decoding.")
+
+        if self.enable_cuda_graph:
+            if self.cpu_offloading:
+                raise ValueError("CUDA graphs not supported with CPU offloading.")
+            if self.recompute_granularity:
+                raise ValueError("CUDA graphs not supported with activation recomputation.")
 
         if self.moe_token_dispatcher_type in ['allgather', 'alltoall_seq']:
             if self.variable_seq_lengths is True:
