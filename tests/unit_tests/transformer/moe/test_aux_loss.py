@@ -114,7 +114,7 @@ class TestSeqAuxLoss:
             moe_aux_loss_coeff=0.1,
         )
         moe_layer = baseline_container.moe_layer
-        self.input = torch.randn((32, 8, moe_layer.config.hidden_size)).cuda()
+        self.input = torch.randn((32, 8, moe_layer.config.hidden_size)).to(device=get_current_device())
         self.input.requires_grad = True
         probs, indices = moe_layer.router(self.input)
         probs.sum().mul_(0).backward()  # zero out the main gradients

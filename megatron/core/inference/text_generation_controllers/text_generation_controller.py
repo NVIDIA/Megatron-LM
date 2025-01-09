@@ -382,7 +382,10 @@ class TextGenerationController:
             request.generated_log_probs = (
                 None
                 if output_log_probs is None
-                else output_log_probs[idx, input_prompt_length:required_sequence_length]
+                else output_log_probs[
+                    idx,
+                    input_prompt_length - 1 : (input_prompt_length + required_sequence_length - 1),
+                ]
             )
             request.status = Status.COMPLETED
             request.generated_text = self.detokenize_generations(required_result_tokens)

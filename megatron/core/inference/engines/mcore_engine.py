@@ -72,21 +72,25 @@ class MCoreEngine(AbstractEngine):
         if self.random_seed:
             set_manual_seed(self.random_seed)
 
+        request_ids = []
         for i in range(len(prompts)):
             prompt = prompts[i]
             encoder_prompt = encoder_prompts[i] if encoder_prompts is not None else None
             prompt_tokens = self.text_generation_controller.tokenize_prompt(prompt, add_BOS)
 
-            self.scheduler.add_request(
+            request_id = self.scheduler.add_request(
                 prompt=prompt,
                 prompt_tokens=prompt_tokens,
                 encoder_prompt=encoder_prompt,
                 inference_parameters=sampling_params,
             )
+            request_ids.append(request_id)
 
         self.run_engine()
 
-        result: List[InferenceRequest] = self.scheduler.completed_request_pool.values()
+        result: List[InferenceRequest] = [
+            self.scheduler.completed_request_pool[request_id] for request_id in request_ids
+        ]
         return result
 
     def run_engine(self):

@@ -83,6 +83,7 @@ class MoEModelTestContainer:
             self.config, transformer_layer_spec.submodules.mlp.submodules
         ).to(device=get_current_device())
         self.moe_layer.set_layer_number(0)
+        return self.moe_layer
 
     def __del__(self):
         torch.distributed.barrier()

@@ -107,6 +107,26 @@ functional:run_dev:
   variables:
     ENVIRONMENT: dev
 
+functional:run_nemo:
+  extends: [.functional_tests_rules]
+  trigger:
+    project: 'dl/joc/nemo-ci'
+    branch: main-mirror
+    strategy: depend
+  inherit:
+    variables: true
+  variables:
+    MCORE_COMMIT: $CI_COMMIT_SHA
+    TEST_LLM_MODULE: 'True'
+    TEST_ALIGNER_MODULE: 'False'
+    TEST_DATA_CURATOR_MODULE: 'False'
+    TESTS_TO_RUN_ON_THIS_COMMIT: nightly
+  rules:
+    - if: $FUNCTIONAL_TEST == "yes"
+      when: manual
+      allow_failure: true
+    - when: never
+
 functional:notify:
   extends: [.functional_tests_rules]
   image: badouralix/curl-jq

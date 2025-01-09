@@ -3,7 +3,7 @@ import pathlib
 import pytest
 import yaml
 
-YAML_DIR = pathlib.Path(__file__).parent / ".." / "tests/" / "functional_tests" / "test_cases"
+YAML_DIR = pathlib.Path(__file__).parent / ".." / "functional_tests" / "test_cases"
 
 
 def get_yaml_files(directory):
@@ -24,6 +24,7 @@ def load_yaml(file_path):
 @pytest.mark.parametrize("yaml_file", get_yaml_files(YAML_DIR))
 def test_model_config_tracks_memory(yaml_file, metric):
     """Test if each YAML file contains the required record."""
+    print("gpt3-nemo" in str(yaml_file) or "ckpt_converter" in str(yaml_file))
     if "gpt3-nemo" in str(yaml_file) or "ckpt_converter" in str(yaml_file):
         pytest.skip("Skipping for gpt-nemo")
 
@@ -33,4 +34,4 @@ def test_model_config_tracks_memory(yaml_file, metric):
         "MODEL_ARGS" in model_config
         and metric in model_config["MODEL_ARGS"]
         and model_config["MODEL_ARGS"][metric] is True
-    ), f"Please add {metric} to {yaml_file.parent.name}."
+    ), f"Please add argument `{metric}` to `{yaml_file.parent.name}/model_config.yaml` that its metric gets tracked."

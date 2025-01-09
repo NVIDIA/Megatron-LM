@@ -30,15 +30,32 @@ def load_script(config_path: str) -> str:
     "--test-case", required=False, type=str, help="Returns a single test-case with matching name."
 )
 @click.option(
+    "--environment",
+    required=True,
+    type=str,
+    help="Pass 'lts' for PyTorch 24.01 and 'dev' for a more recent version.",
+)
+@click.option(
     "--output-path",
     required=True,
     type=str,
     help="Directory where the functional test will write its artifacts to (Tensorboard logs)",
     default="/opt/megatron-lm",
 )
-def main(model: Optional[str], scope: Optional[str], test_case: Optional[str], output_path: str):
+def main(
+    model: Optional[str],
+    scope: Optional[str],
+    test_case: Optional[str],
+    environment: str,
+    output_path: str,
+):
     workloads = common.load_workloads(
-        container_image='none', scope=scope, model=model, test_case=test_case, container_tag='none'
+        container_image='none',
+        scope=scope,
+        model=model,
+        test_case=test_case,
+        environment=environment,
+        container_tag='none',
     )
 
     for workload in workloads:

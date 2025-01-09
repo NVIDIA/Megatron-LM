@@ -47,6 +47,9 @@ class Scheduler:
             encoder_prompt (str): Encoder input string
             inference_parameters (SamplingParams): The inference parameters
             arrival_time (float, optional): The incoming request time. Defaults to None.
+
+        Returns:
+            The request_id for the new request.
         """
         request_id = str(next(self.request_counter))
 
@@ -73,6 +76,8 @@ class Scheduler:
             self.active_request_pool[request_id] = inference_request
         else:
             self.waiting_request_pool[request_id] = inference_request
+
+        return request_id
 
     def have_requests_pending(self) -> bool:
         """Method to check if there are requests pending

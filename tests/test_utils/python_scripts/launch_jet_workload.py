@@ -50,7 +50,7 @@ def launch_and_wait_for_completion(
     run_name: Optional[str],
     wandb_experiment: Optional[str],
 ) -> jetclient.JETPipeline:
-    cluster_config = {"account": account, "ntasks_per_node": 8}
+    cluster_config = {"account": account}
     if partition is not None:
         cluster_config['partition'] = partition
 
@@ -259,17 +259,27 @@ def main(
                 jet_log = main_job.get_logs()
                 logs = extract_logs_to_string(logs=jet_log)
                 download_job_assets(logs=jet_log, iteration=n_iteration)
+                no_log = False
                 break
             except (requests.exceptions.ConnectionError, json.decoder.JSONDecodeError) as e:
-                print(e)
+                logger.error(e)
                 time.sleep((3**n_download_attempt) * 60)
                 n_download_attempt += 1
+            except KeyError as e:
+                logger.error(e)
+                no_log = True
+
+        if no_log:
+            continue
 
         concat_logs = "\n".join(logs)
         print(f"Logs:\n{concat_logs}")
 
         success = pipeline.get_status() == PipelineStatus.SUCCESS
         logger.info("Pipeline terminated with status %s", pipeline.get_status().name)
+
+        if test_type == "unit_test":
+            sys.exit(int(not success))  # invert for exit 0
 
         if test_type != "release":
             if success:

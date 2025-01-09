@@ -87,7 +87,7 @@ def test_precision_aware_fused_adam():
             # Skip the test if TE doesn't support precision aware FusedAdam.
             return
 
-    tensor = torch.rand(278011, dtype=torch.bfloat16).cuda()
+    tensor = torch.rand(278011, dtype=torch.bfloat16).to(device=get_current_device())
     params_1 = [torch.nn.Parameter(tensor.float())]  # FP32 reference
     params_2 = [torch.nn.Parameter(tensor.clone())]  # BF16
 
