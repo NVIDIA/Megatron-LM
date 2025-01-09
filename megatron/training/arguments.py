@@ -861,6 +861,11 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--fp8-param-gather', action='store_true',
                        help='Keep the compute param in fp8 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp8.')
+    group.add_argument('--te-rng-tracker', action='store_true', default=False,
+                       help='Use the Transformer Engine version of the random number generator. '
+                            'Required for CUDA graphs support.')
+    group.add_argument('--inference-rng-tracker', action='store_true', default=False,
+                       help='Use a random number generator configured for inference.')
     return parser
 
 def _add_inference_args(parser):
@@ -887,6 +892,8 @@ def _add_inference_args(parser):
                        'Bert embedder.')
     group.add_argument('--flash-decode', default=False, action="store_true",
                        help='Whether to use the flash decoding kernel.')
+    group.add_argument('--enable-cuda-graph', default=False, action="store_true",
+                       help='Use CUDA graph capture and replay.')
     group.add_argument('--inference-max-seq-length', type=int, default=2560,
                        help='Maximum sequence length allocated for prefill during inference.',
                        dest='inference_max_seq_length')

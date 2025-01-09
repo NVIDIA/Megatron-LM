@@ -93,10 +93,12 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
     ):
         super().__init__(config=config)
 
-        if config.enable_cuda_graph and self.training:
-            assert (
-                not config.cpu_offloading and config.recompute_granularity is None
-            ), "Cudagraphs not supported"
+        if config.enable_cuda_graph:
+            if not self.training:
+                # Cudagraphs for inference are only enabled with the flash decoding kernel
+                assert (
+                    self.config.flash_decode
+                ), "--flash-decode is required to use CUDA graphs during inference"
             self.cudagraph_manager = CudaGraphManager()
 
         self.submodules_config = submodules
@@ -263,6 +265,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         attention_bias=None,
         inference_params=None,
         packed_seq_params=None,
+        sequence_len_offset=None,
     ):
         """
         Perform a forward pass through the transformer layer.
@@ -304,6 +307,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             rotary_pos_sin=rotary_pos_sin,
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
         )
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
@@ -392,6 +396,12 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         return sharded_state_dict
 
     def __call__(self, *args, **kwargs):
-        if hasattr(self, 'cudagraph_manager'):
+        # Training and validation mode CUDA graphs
+        if hasattr(self, 'cudagraph_manager') and kwargs.get('inference_params') is None:
+            return self.cudagraph_manager(self, args, kwargs)
+        # Inference mode. CUDA graphs are used in the decode phase only, when attn mask is None
+        elif not self.training and (
+            hasattr(self, 'cudagraph_manager') and kwargs['attention_mask'] is None
+        ):
             return self.cudagraph_manager(self, args, kwargs)
         return super(MegatronModule, self).__call__(*args, **kwargs)
