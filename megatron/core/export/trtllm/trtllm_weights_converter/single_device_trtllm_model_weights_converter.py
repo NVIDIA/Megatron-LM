@@ -63,6 +63,11 @@ class SingleDeviceTRTLLMModelWeightsConverter:
             else:
                 num_kv_heads = self.transformer_config.num_attention_heads
         self.num_kv_heads = num_kv_heads
+        # Config for Mamba hybrid
+        self.rnn_hidden_size = 2 * self.transformer_config.hidden_size
+        self.state_size = 128
+        self.ngroups = 8
+        self.rnn_head_size = 64
 
     def _convert_non_transformer_layer(self, model_state_dict: dict, layer_name: str):
         """Convert Non Transformer layers to TRTLLM weights
@@ -111,11 +116,12 @@ class SingleDeviceTRTLLMModelWeightsConverter:
                     self.trtllm_model_weights[f'{layer_name}.{split_num}.bin'] = (
                         split_val.to(self.storage_type).detach().contiguous()
                     )
-            elif split_type == 'conv':
-                val = val.unsqueeze(-1)
-                self.trtllm_model_weights[layer_name] = (
-                    val.to(self.storage_type).detach().contiguous()
-                )
+            elif split_type == 'conv_weight':
+                for split_num, split_val in enumerate(val):
+                    split_val = split_val.unsqueeze(-1)
+                    self.trtllm_model_weights[f'{layer_name}.{split_num}.bin'] = (
+                        split_val.to(self.storage_type).detach().contiguous()
+                    )
             else:
                 if val.ndim >= 2:
                     val = torch.transpose(val.reshape(val.shape[0], -1), 1, 0)
@@ -135,12 +141,6 @@ class SingleDeviceTRTLLMModelWeightsConverter:
             or layer_name.endswith(suffix(TRTLLMLayers.attention_dense_bias))
             or layer_name.endswith(suffix(TRTLLMLayers.mlp_projection_bias))
             or layer_name.endswith(suffix(TRTLLMLayers.mlp_router_weight))
-            or layer_name.endswith(suffix(TRTLLMLayers.mixer_dt_bias))
-            or layer_name.endswith(suffix(TRTLLMLayers.mixer_D))
-            or layer_name.endswith(suffix(TRTLLMLayers.mixer_conv_bias))
-            or layer_name.endswith(suffix(TRTLLMLayers.mixer_in_proj_weight))
-            or layer_name.endswith(suffix(TRTLLMLayers.mixer_norm_weight))
-            or layer_name.endswith(suffix(TRTLLMLayers.mixer_out_proj_weight))
         ):
             # Same as layernorm1p in NeMo
             if (
@@ -152,9 +152,14 @@ class SingleDeviceTRTLLMModelWeightsConverter:
 
             _add_to_trtllm_model_weights(val=val, layer_name=layer_name, split_type=None)
 
-        elif layer_name.endswith(
-            suffix(TRTLLMLayers.attention_dense_weight)
-        ) or layer_name.endswith(suffix(TRTLLMLayers.mlp_projection_weight)):
+        elif (
+            layer_name.endswith(suffix(TRTLLMLayers.attention_dense_weight))
+            or layer_name.endswith(suffix(TRTLLMLayers.mlp_projection_weight))
+            or layer_name.endswith(suffix(TRTLLMLayers.mixer_norm_weight))
+            or layer_name.endswith(suffix(TRTLLMLayers.mixer_dt_bias))
+            or layer_name.endswith(suffix(TRTLLMLayers.mixer_D))
+            or layer_name.endswith(suffix(TRTLLMLayers.mixer_out_proj_weight))
+        ):
             split_vals = torch.chunk(val, self.export_config.inference_tp_size, axis=0)
             _add_to_trtllm_model_weights(
                 val=split_vals, layer_name=layer_name, split_type='tensor_split'
@@ -274,10 +279,56 @@ class SingleDeviceTRTLLMModelWeightsConverter:
             )
         elif layer_name.endswith(suffix(TRTLLMLayers.mixer_A_log)):
             val = -torch.exp(val.float())
-            _add_to_trtllm_model_weights(val=val, layer_name=layer_name, split_type=None)
-        elif layer_name.endswith(suffix(TRTLLMLayers.mixer_conv_weight)):
+            split_vals = torch.chunk(val, self.export_config.inference_tp_size, axis=0)
             _add_to_trtllm_model_weights(
-                val=val, layer_name=layer_name, split_type='conv'
+                val=split_vals, layer_name=layer_name, split_type='tensor_split'
+            )
+        elif (
+            layer_name.endswith(suffix(TRTLLMLayers.mixer_conv_weight))
+            or layer_name.endswith(suffix(TRTLLMLayers.mixer_conv_bias))
+        ):
+            bc_num = self.state_size * self.ngroups
+
+            xBC = torch.split(val, [self.rnn_hidden_size, bc_num, bc_num], dim=0)
+            x_split = torch.chunk(xBC[0], self.export_config.inference_tp_size, axis=0)
+            b_split = torch.chunk(xBC[1], self.export_config.inference_tp_size, axis=0)
+            c_split = torch.chunk(xBC[2], self.export_config.inference_tp_size, axis=0)
+
+            split_vals = [
+                torch.concatenate(item, dim=0)
+                for item in zip(x_split, b_split, c_split)
+            ]
+
+            if layer_name.endswith("weight"):
+                _add_to_trtllm_model_weights(
+                    val=split_vals, layer_name=layer_name, split_type='conv_weight'
+                )
+            else:
+                _add_to_trtllm_model_weights(
+                    val=split_vals, layer_name=layer_name, split_type='tensor_split'
+                )
+        elif layer_name.endswith(suffix(TRTLLMLayers.mixer_in_proj_weight)):
+            bc_num = self.state_size * self.ngroups
+            dt_num = self.rnn_hidden_size // self.rnn_head_size
+
+            in_proj = torch.split(
+                val,
+                [self.rnn_hidden_size, self.rnn_hidden_size, bc_num, bc_num, dt_num],
+                dim=1
+            )
+
+            z_split = torch.chunk(in_proj[0], self.export_config.inference_tp_size, axis=1)
+            x_split = torch.chunk(in_proj[1], self.export_config.inference_tp_size, axis=1)
+            b_split = torch.chunk(in_proj[2], self.export_config.inference_tp_size, axis=1)
+            c_split = torch.chunk(in_proj[3], self.export_config.inference_tp_size, axis=1)
+            dt_split = torch.chunk(in_proj[4], self.export_config.inference_tp_size, axis=1)
+
+            split_vals = [
+                torch.concatenate(item, dim=1)
+                for item in zip(z_split, x_split, b_split, c_split, dt_split)
+            ]
+            _add_to_trtllm_model_weights(
+                val=split_vals, layer_name=layer_name, split_type='tensor_split'
             )
         else:
             raise ValueError(f"{layer_name} cannot be handled by converter")
