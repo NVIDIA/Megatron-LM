@@ -107,7 +107,7 @@ def initialize_megatron(
         # Random seeds for reproducibility.
         if args.rank == 0:
             print("> setting random seeds to {} ...".format(args.seed))
-        _set_random_seed(args.seed, args.data_parallel_random_init)
+        _set_random_seed(args.seed, args.data_parallel_random_init, args.te_rng_tracker, args.inference_rng_tracker)
 
     if skip_mpu_initialization:
         return None
@@ -336,7 +336,7 @@ def _init_autoresume():
         torch.distributed.barrier()
 
 
-def _set_random_seed(seed_, data_parallel_random_init=False):
+def _set_random_seed(seed_, data_parallel_random_init=False, te_rng_tracker=False, inference_rng_tracker=False):
     """Set random seed for reproducability."""
     if seed_ is not None and seed_ > 0:
         # Ensure that different pipeline MP stages get different seeds.
@@ -348,7 +348,7 @@ def _set_random_seed(seed_, data_parallel_random_init=False):
         np.random.seed(seed)
         set_manual_seed(seed)
         if get_local_device_count() > 0:
-            tensor_parallel.model_parallel_device_manual_seed(seed)
+            tensor_parallel.model_parallel_device_manual_seed(seed, te_rng_tracker, inference_rng_tracker)
     else:
         raise ValueError("Seed ({}) should be a positive integer.".format(seed_))
 

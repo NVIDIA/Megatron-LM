@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from megatron.training import get_args, get_tokenizer
 from megatron.core import mpu
 from megatron.training.utils import get_ltor_masks_and_position_ids
+from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from .communication import (
     copy_from_last_to_first_pipeline_stage,
     broadcast_from_last_pipeline_stage,
@@ -203,7 +204,7 @@ def generate_tokens_probs_and_return_on_first_stage(
                                      device=get_current_device())
 
     # =============
-    # Run infernece
+    # Run inference
     # =============
 
     with torch.no_grad():
@@ -212,14 +213,21 @@ def generate_tokens_probs_and_return_on_first_stage(
         prev_context_length = 0
         for context_length in range(min_prompt_length, max_sequence_length):
 
+            prefill = context_length == min_prompt_length
+
             # Pick the slice that we need to pass through the network.
             tokens2use = tokens[:, prev_context_length:context_length]
             positions2use = position_ids[:, prev_context_length:context_length]
+
+            # Do not pass a variable-shape attention mask in the decode phase.
             attention_mask2use = attention_mask[
-                ..., prev_context_length:context_length, :context_length]
+                ..., prev_context_length:context_length, :context_length] if prefill else None
 
             # logits will be meanigful only in the last pipeline stage.
             logits = forward_step(tokens2use, positions2use, attention_mask2use)
+
+            if args.enable_cuda_graph:
+                create_cudagraphs()
 
             if mpu.is_pipeline_last_stage():
                 if prevent_newline_after_colon:
@@ -344,7 +352,7 @@ def beam_search_and_return_on_first_stage(model, forward_step, tokens, lengths, 
                          device=get_current_device()).unsqueeze(1)
     scores_size_tensor, tokens_size_tensor = None, None
     # =============
-    # Run infernece
+    # Run inference
     # =============
     with torch.no_grad():
         tokens = tokens.repeat(beam_size, 1)
@@ -352,11 +360,15 @@ def beam_search_and_return_on_first_stage(model, forward_step, tokens, lengths, 
         prev_context_length = 0
         for context_length in range(prompt_length, final_sequence_length):
 
+            prefill = context_length == prompt_length
+
             # Pick the slice that we need to pass through the network.
             tokens2use = tokens[:, prev_context_length:context_length]
             positions2use = position_ids[:, prev_context_length:context_length]
+
+            # Do not pass a variable-shape attention mask in the decode phase.
             attention_mask2use = attention_mask[
-                ..., prev_context_length:context_length, :context_length]
+                ..., prev_context_length:context_length, :context_length] if not prefill else None
 
             # logits will be meanigful only in the last pipeline stage.
             logits = forward_step(tokens2use, positions2use, attention_mask2use)

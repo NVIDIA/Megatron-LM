@@ -130,7 +130,7 @@ _DEVICE_RNG_STATE_TRACKER = None
 _DEVICE_RNG_STATE_TRACKER_INITIALIZED = False
 
 
-def initialize_rng_tracker(use_te_rng_tracker: bool = False):
+def initialize_rng_tracker(use_te_rng_tracker: bool = False, inference_rng_tracker: bool = False):
     """Create the RNG tracker. 'use_te_rng_tracker' determines whether to use
     Megatron or TransformerEngine's implementation.
     In particular, TransformerEngine's implementation is cudagraphable and supports FP8.
@@ -146,16 +146,40 @@ def initialize_rng_tracker(use_te_rng_tracker: bool = False):
         import warnings
         warnings.warn("XLA model fall back: use_te_rng_tracker=False")
         use_te_rng_tracker = False
-    
+
+    # Get the base tracker class
+    base_tracker = None
     if use_te_rng_tracker:
         if not is_te_min_version("1.5.0"):
             raise RuntimeError("use_te_rng_tracker requires TransformerEngine version >= 1.5")
         from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
 
-        _DEVICE_RNG_STATE_TRACKER = TECudaRNGStatesTracker()
+        base_tracker = TECudaRNGStatesTracker
     else:
-        _DEVICE_RNG_STATE_TRACKER = DeviceRNGStatesTracker()
+        base_tracker = DeviceRNGStatesTracker
 
+    if inference_rng_tracker:
+
+        class InferenceDeviceRNGStatesTracker(base_tracker):
+            """RNG tracker for inference."""
+
+            def add(self, name, seed):
+                """Mirrors the interface from the training RNG tracker."""
+                pass
+
+            def set_states(self, states):
+                """Mirrors the interface from the training RNG tracker."""
+                pass
+
+            def fork(self, name=_MODEL_PARALLEL_RNG_TRACKER_NAME):
+                """Mirrors the interface from the training RNG tracker."""
+                return contextlib.nullcontext()
+
+        tracker_class = InferenceDeviceRNGStatesTracker
+    else:
+        tracker_class = base_tracker
+
+    _DEVICE_RNG_STATE_TRACKER = tracker_class()
     _DEVICE_RNG_STATE_TRACKER_INITIALIZED = True
 
 
@@ -165,7 +189,7 @@ def get_device_rng_tracker():
     return _DEVICE_RNG_STATE_TRACKER
 
 
-def model_parallel_device_manual_seed(seed):
+def model_parallel_device_manual_seed(seed, te_rng_tracker=False, inference_rng_tracker=False):
     """Initialize model parallel device seed.
 
     This function should be called after the model parallel is
@@ -189,8 +213,9 @@ def model_parallel_device_manual_seed(seed):
     # Data parallel gets the original seed.
     data_parallel_seed = seed
 
-    initialize_rng_tracker()
+    initialize_rng_tracker(te_rng_tracker, inference_rng_tracker)
     _DEVICE_RNG_STATE_TRACKER.reset()
+    
     # Set the default state.
     set_manual_seed(data_parallel_seed)
     _DEVICE_RNG_STATE_TRACKER.add(_DATA_PARALLEL_RNG_TRACKER_NAME, data_parallel_seed)
@@ -214,6 +239,7 @@ class CheckpointFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, run_function, distribute_saved_activations, *args):
+        """Forward pass."""
         ctx.run_function = run_function
         ctx.distribute_saved_activations = distribute_saved_activations
 
@@ -245,6 +271,7 @@ class CheckpointFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *args):
+        """Backward pass."""
         if not torch.autograd._is_checkpoint_valid():
             raise RuntimeError(
                 "Checkpointing is not compatible with .grad(), "

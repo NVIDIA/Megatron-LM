@@ -382,7 +382,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         return self.grad_scaler.scale
 
     def reload_model_params(self):
-        self._copy_model_params_to_main_params()
+        if self.param_groups:
+            self._copy_model_params_to_main_params()
 
     def _unscale_main_grads_and_check_for_nan(self):
 

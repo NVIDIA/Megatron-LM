@@ -404,6 +404,7 @@ class TransformerBlock(MegatronModule):
         attention_bias: Tensor = None,
         inference_params: InferenceParams = None,
         packed_seq_params: PackedSeqParams = None,
+        sequence_len_offset: Tensor = None,
     ):
         """
         Perform the forward pass through the transformer block.
@@ -435,6 +436,10 @@ class TransformerBlock(MegatronModule):
         if not self.pre_process:
             # See set_input_tensor()
             hidden_states = self.input_tensor
+
+        # Update the inference parameters with the current batch size in case it is variable
+        if inference_params and not self.training:
+            inference_params.current_batch_size = hidden_states.size(1)
 
         # Viewless tensor.
         # - We only need to create a viewless tensor in the case of micro batch
@@ -512,6 +517,7 @@ class TransformerBlock(MegatronModule):
                                 attention_bias=attention_bias,
                                 inference_params=inference_params,
                                 packed_seq_params=packed_seq_params,
+                                sequence_len_offset=sequence_len_offset,
                             )
                         else:
                             # CUDA graph replay for layer `l_no` and microbatch
