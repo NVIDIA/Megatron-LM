@@ -26,7 +26,8 @@ MANDATORY_VARS=(
     "TRAINING_PARAMS_PATH"
     "OUTPUT_PATH"
     "TENSORBOARD_PATH"
-    "CHECKPOINT_PATH"
+    "CHECKPOINT_SAVE_PATH"
+    "CHECKPOINT_LOAD_PATH"
     "DATA_PATH"
     "RUN_NUMBER"
     "REPEAT"
@@ -40,7 +41,7 @@ done
 
 # Envsubst model_params
 cat $TRAINING_PARAMS_PATH | envsubst "$(env | cut -d= -f1 | sed -e 's/^/$/')" >$TRAINING_PARAMS_PATH.tmp
-mv $TRAINING_PARAMS_PATH.tmp "$TRAINING_PARAMS_PATH"
+TRAINING_PARAMS_PATH="$TRAINING_PARAMS_PATH.tmp"
 
 # Pull env vars to export
 ENV_VARS=$(yq '... comments="" | .ENV_VARS | to_entries | .[] | [.key + "=" + .value] | join(" ")' "$TRAINING_PARAMS_PATH")

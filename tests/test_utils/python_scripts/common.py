@@ -21,6 +21,18 @@ def resolve_cluster_config(cluster: str) -> str:
     raise ValueError(f"Unknown cluster {cluster} provided.")
 
 
+def resolve_artifact_config(cluster: str) -> str:
+    if cluster == "dgxh100_eos":
+        return "eos_lustre"
+    if cluster == "dgxa100_dracooci":
+        return "draco-oci_lustre"
+    if cluster == "dgxa100_dracooci-ord":
+        return "draco-oci-ord_lustre"
+    if cluster == "dgxh100_coreweave":
+        return "coreweave_lustre"
+    raise ValueError(f"Unknown cluster {cluster} provided.")
+
+
 def flatten_products(
     workload_manifest: jetclient.JETWorkloadManifest,
 ) -> jetclient.JETWorkloadManifest:
@@ -198,6 +210,7 @@ def load_workloads(
     model: Optional[str] = None,
     test_case: Optional[str] = None,
     container_image: Optional[str] = None,
+    record_checkpoints: Optional[str] = None,
 ) -> List[jetclient.JETWorkloadManifest]:
     """Return all workloads from disk that match scope and platform."""
     recipes_dir = BASE_PATH / ".." / "recipes"
@@ -241,4 +254,17 @@ def load_workloads(
                 workloads.append(build_workload)
         workload.spec.n_repeat = n_repeat
         workload.spec.time_limit = time_limit
+
+        if record_checkpoints == 'true':
+            workload.outputs = [
+                {
+                    "type": "artifact",
+                    "key": f"unverified/model/mcore-ci/{container_tag}/{{model}}/{{name}}",
+                    "subdir": "checkpoints",
+                    "name": r"{model}/{name}",
+                    "description": r"Checkpoint of {model}/{name}",
+                    "pic": {"name": "Mcore CI", "email": "okoenig@nvidia.com"},
+                    "labels": {"origin": "ADLR/Megatron-LM"},
+                }
+            ]
     return workloads

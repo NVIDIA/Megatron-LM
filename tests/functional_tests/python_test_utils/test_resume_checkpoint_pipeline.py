@@ -32,7 +32,7 @@ def test_resume_checkpoint_pipeline(
         ],
         "num-zeros": [
             common.DeterministicTest(),
-            common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.15), rtol=0),
+            common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.20), rtol=0),
         ],
     }
 

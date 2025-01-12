@@ -1,4 +1,3 @@
-
 ENV_VARS:
   CUDA_DEVICE_MAX_CONNECTIONS: 1
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
@@ -20,8 +19,8 @@ MODEL_ARGS:
   --train-iters: 50
   --timing-log-level: 2
   --lr-decay-iters: 320000
-  --save: ${CHECKPOINT_PATH}
-  --load: ${CHECKPOINT_PATH}
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
   --data-path: ${DATA_PATH}/my-gpt3_00_text_document
   --vocab-file: ${DATA_PATH}/bpe/vocab.json
   --merge-file: ${DATA_PATH}/bpe/merges.txt
