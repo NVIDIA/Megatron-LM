@@ -21,8 +21,8 @@ MODEL_ARGS:
   --train-iters: 50
   --timing-log-level: 2
   --lr-decay-iters: 320000
-  --save: ${CHECKPOINT_PATH}
-  --load: ${CHECKPOINT_PATH}
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
   --split: 949,50,1
   --tokenizer-type: NullTokenizer
   --vocab-size: 8192

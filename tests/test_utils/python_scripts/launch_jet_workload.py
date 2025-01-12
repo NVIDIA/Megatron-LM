@@ -45,6 +45,7 @@ def launch_and_wait_for_completion(
     container_tag: str,
     cluster: str,
     account: str,
+    record_checkpoints: str,
     partition: Optional[str],
     tag: Optional[str],
     run_name: Optional[str],
@@ -68,6 +69,7 @@ def launch_and_wait_for_completion(
                 container_image=container_image,
                 container_tag=container_tag,
                 environment=environment,
+                record_checkpoints=record_checkpoints,
             ),
             config_id=f"mcore/{common.resolve_cluster_config(cluster)}",
             custom_config={
@@ -84,6 +86,10 @@ def launch_and_wait_for_completion(
                             }
                         }
                     }
+                },
+                "outputs": {
+                    "enabled": True,
+                    "artifacts_storages": [common.resolve_artifact_config(cluster)],
                 },
             },
             wait_for_validation=True,
@@ -175,6 +181,7 @@ def parse_finished_training(logs: List[str]) -> Optional[bool]:
 @click.option("--container-tag", required=True, type=str, help="Base image of Mcore image")
 @click.option("--container-image", required=False, type=str, help="Base image of Mcore image")
 @click.option("--tag", required=False, type=str, help="Tag (only relevant for unit tests)")
+@click.option("--record-checkpoints", required=False, type=str, help="Values are 'true' or 'false'")
 @click.option(
     "--run-name", required=False, type=str, help="Run name (only relevant for release tests)"
 )
@@ -195,6 +202,7 @@ def main(
     partition: Optional[str],
     cluster: str,
     container_tag: str,
+    record_checkpoints: str,
     tag: Optional[str] = None,
     container_image: Optional[str] = None,
     run_name: Optional[str] = None,
@@ -249,6 +257,7 @@ def main(
             tag=tag,
             run_name=run_name,
             wandb_experiment=wandb_experiment,
+            record_checkpoints=record_checkpoints,
         )
 
         main_job = [job for job in pipeline.get_jobs() if job.name.startswith("basic")][0]
@@ -290,6 +299,8 @@ def main(
                 or "uncorrectable ECC error encountered" in concat_logs
                 or "illegal memory access" in concat_logs
                 or "illegal instruction" in concat_logs
+                or "NCCL WARN [Service thread] Accept failed Resource temporarily unavailable"
+                in concat_logs
             ):
                 logger.error("Detected NCCL failure, attempt restart.")
                 n_attempts += 1
