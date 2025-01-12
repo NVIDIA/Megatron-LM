@@ -494,7 +494,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         if self.cuda_sync_point == "before_permutation_1" and torch.cuda.is_available():
             torch.cuda.current_stream().synchronize()
         permutated_local_input_tokens, self.reversed_local_input_permutation_mapping = permute(
-            hidden_states, routing_map, num_out_tokens=self.num_out_tokens
+            hidden_states,
+            routing_map,
+            num_out_tokens=self.num_out_tokens,
+            drop_and_pad=self.drop_and_pad,
         )
 
         # Perform expert parallel AlltoAll communication
@@ -517,11 +520,25 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         # Permutation 2: Sort tokens by local expert.
         if self.num_local_experts > 1:
-            global_input_tokens = sort_chunks_by_idxs(
-                global_input_tokens,
-                self.num_global_tokens_per_local_expert_cpu.ravel(),
-                self.sort_input_by_local_experts,
-            )
+            if self.drop_and_pad:
+                # Example:
+                global_input_tokens = (
+                    global_input_tokens.view(
+                        self.tp_size * self.ep_size,
+                        self.num_local_experts,
+                        self.capacity,
+                        *global_input_tokens.size()[1:]
+                    )
+                    .transpose(0, 1)
+                    .contiguous()
+                    .flatten(start_dim=0, end_dim=2)
+                )
+            else:
+                global_input_tokens = sort_chunks_by_idxs(
+                    global_input_tokens,
+                    self.num_global_tokens_per_local_expert_cpu.ravel(),
+                    self.sort_input_by_local_experts,
+                )
 
         if self.cuda_sync_point == "before_finish" and torch.cuda.is_available():
             torch.cuda.current_stream().synchronize()
@@ -552,11 +569,24 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         # Unpermutation 2: Unsort tokens by local expert.
         if self.num_local_experts > 1:
-            hidden_states = sort_chunks_by_idxs(
-                hidden_states,
-                self.num_global_tokens_per_local_expert_cpu.T.ravel(),
-                self.restore_output_by_local_experts,
-            )
+            if self.drop_and_pad:
+                hidden_states = (
+                    hidden_states.view(
+                        self.num_local_experts,
+                        self.tp_size * self.ep_size,
+                        self.capacity,
+                        *hidden_states.size()[1:]
+                    )
+                    .transpose(0, 1)
+                    .contiguous()
+                    .flatten(start_dim=0, end_dim=2)
+                )
+            else:
+                hidden_states = sort_chunks_by_idxs(
+                    hidden_states,
+                    self.num_global_tokens_per_local_expert_cpu.T.ravel(),
+                    self.restore_output_by_local_experts,
+                )
 
         if self.tp_size > 1:
             hidden_states = reduce_scatter_to_sequence_parallel_region(
@@ -583,6 +613,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             restore_shape=self.hidden_shape_before_permute,
             probs=self.probs,
             routing_map=self.routing_map,
+            drop_and_pad=self.drop_and_pad,
         )
 
         # Reshape the output tensor
