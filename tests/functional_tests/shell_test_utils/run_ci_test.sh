@@ -21,7 +21,8 @@ MANDATORY_VARS=(
     "GOLDEN_VALUES_PATH"
     "OUTPUT_PATH"
     "TENSORBOARD_PATH"
-    "CHECKPOINT_PATH"
+    "CHECKPOINT_SAVE_PATH"
+    "CHECKPOINT_LOAD_PATH"
     "DATA_PATH"
     "DATA_CACHE_PATH"
 )
@@ -31,6 +32,13 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
         exit 1
     fi
 done
+
+TEST_TYPES=("regular" "ckpt-resume" "frozen-resume" "release")
+
+mkdir -p $CHECKPOINT_SAVE_PATH
+mkdir -p $CHECKPOINT_LOAD_PATH
+_CHECKPOINT_LOAD_PATH=$CHECKPOINT_LOAD_PATH
+_CHECKPOINT_SAVE_PATH=$CHECKPOINT_SAVE_PATH
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 ROOT_DIR=$(realpath $SCRIPT_DIR/../../../)
@@ -47,21 +55,50 @@ TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
 
 for i in $(seq 1 $N_REPEAT); do
     if [[ $i -gt 1 ]]; then
-        rm -rf $CHECKPOINT_PATH/*
+        rm -rf $CHECKPOINT_SAVE_PATH/*
+        rm -rf /tmp/checkpoints/*
+        rm -rf $TENSORBOARD_PATH/*
     fi
 
-    # Training
+    # First run never loads from a checkpoint
     export RUN_NUMBER=1
     export REPEAT=$i
+    export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
+    export CHECKPOINT_LOAD_PATH=/tmp/checkpoints/
+
     bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
 
-    # Maybe checkpoint resume training
+    if [[ "$TEST_TYPE" = "frozen-resume" && -z "$(ls -A "$_CHECKPOINT_LOAD_PATH" 2>/dev/null)" ]]; then
+        echo "No frozen checkpoint found. Will skip second run."
+
+        export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
+        rm -rf "$CHECKPOINT_SAVE_PATH/iter_0000$TRAIN_ITERS"
+        echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_SAVE_PATH/latest_checkpointed_iteration.txt
+        break
+    fi
+
     if [[ "$TEST_TYPE" == "ckpt-resume" ]]; then
-        rm -rf "$CHECKPOINT_PATH/iter_0000$TRAIN_ITERS"
-        echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_PATH/latest_checkpointed_iteration.txt
+        export CHECKPOINT_LOAD_PATH=$CHECKPOINT_SAVE_PATH
+
+        rm -rf "$CHECKPOINT_LOAD_PATH/iter_0000$TRAIN_ITERS"
+        echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_LOAD_PATH/latest_checkpointed_iteration.txt
 
         export RUN_NUMBER=2
         bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
+    fi
+
+    if [[ "$TEST_TYPE" == "frozen-resume" ]]; then
+
+        # Checkpoint-resume tests load from prev run
+        export CHECKPOINT_LOAD_PATH=$_CHECKPOINT_LOAD_PATH
+        export CHECKPOINT_SAVE_PATH=/tmp/checkpoints/
+
+        export RUN_NUMBER=2
+        bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
+
+        export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
+        rm -rf "$CHECKPOINT_SAVE_PATH/iter_0000$TRAIN_ITERS"
+        echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_SAVE_PATH/latest_checkpointed_iteration.txt
     fi
 
     # Save run results
@@ -93,15 +130,16 @@ for i in $(seq 1 $N_REPEAT); do
             --model-config-path ${TRAINING_PARAMS_PATH} \
             $ALLOW_NONDETERMINISTIC_ALGO_ARG
 
-        if [[ "$TEST_TYPE" == "ckpt-resume" ]]; then
+        if [[ "$TEST_TYPE" == "ckpt-resume" || "$TEST_TYPE" == "frozen-resume" ]]; then
             echo "Running pytest 1st vs 2nd run comparison"
             pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py \
                 --tensorboard-path $TENSORBOARD_PATH \
                 --train-iters $TRAIN_ITERS \
                 --model-config-path ${TRAINING_PARAMS_PATH} \
                 $ALLOW_NONDETERMINISTIC_ALGO_ARG
+        fi
 
-        else
+        if [[ ! " ${TEST_TYPES[*]} " =~ " ${TEST_TYPE} " ]]; then
             echo "Test type $TEST_TYPE not yet implemented."
         fi
     fi

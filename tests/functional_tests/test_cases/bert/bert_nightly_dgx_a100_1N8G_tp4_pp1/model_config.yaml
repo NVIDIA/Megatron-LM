@@ -21,8 +21,8 @@ MODEL_ARGS:
   --train-iters: 50
   --timing-log-level: 2
   --lr-decay-iters: 990000
-  --save: ${CHECKPOINT_PATH}
-  --load: ${CHECKPOINT_PATH}
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
   --data-path: ${DATA_PATH}/my-bert_00_text_sentence
   --vocab-file: ${DATA_PATH}/vocab.txt
   --split: 949,50,1
