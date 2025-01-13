@@ -311,6 +311,8 @@ def main(
                 n_nondeterminism_attemps += 1
                 continue
 
+            sys.exit(1)
+
         if parse_failed_job(logs=logs):
             n_attempts += 1
             continue
