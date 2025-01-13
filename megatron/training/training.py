@@ -979,6 +979,9 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                 args.skipped_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time_per_iteration * 1000.0)
+        free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
+        mem_usages = 1 - free_gpu_memory / total_gpu_memory
+        log_string += " mem usages: {:.4f} |".format(mem_usages)
         if args.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
             if args.log_timers_to_tensorboard:
