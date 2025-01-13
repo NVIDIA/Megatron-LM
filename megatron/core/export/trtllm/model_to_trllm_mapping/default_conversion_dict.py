@@ -21,6 +21,10 @@ DEFAULT_CONVERSION_DICT = {
     'decoder.layers.mlp.linear_fc1.bias': TRTLLMLayers.mlp_fc_bias,
     'decoder.layers.mlp.linear_fc2.weight': TRTLLMLayers.mlp_projection_weight,
     'decoder.layers.mlp.linear_fc2.bias': TRTLLMLayers.mlp_projection_bias,
+    # EXPERTS
+    'decoder.layers.mlp.experts.experts.linear_fc1.weight': TRTLLMLayers.mlp_fc_weight_mixture_of_experts,
+    'decoder.layers.mlp.experts.experts.linear_fc2.weight': TRTLLMLayers.mlp_projection_weight_mixture_of_experts,
+    'decoder.layers.mlp.router.weight': TRTLLMLayers.mlp_router_weight,
     # FINAL LAYER NORM
     'decoder.final_layernorm.weight': TRTLLMLayers.final_layernorm_weight,
     'decoder.final_layernorm.bias': TRTLLMLayers.final_layernorm_bias,
