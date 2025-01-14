@@ -8,6 +8,7 @@ from unittest import mock
 
 import pytest
 import torch
+
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.mapping import ShardedBase, ShardedTensorFactory
