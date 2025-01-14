@@ -12,9 +12,11 @@ import torch
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.mapping import ShardedBase, ShardedTensorFactory
-from megatron.core.dist_checkpointing.state_dict_transformation import (
-    prepare_state_dict_for_save,
-    recreate_state_dict_after_load,
+prepare_state_dict_for_save = pytest.importorskip(
+    "megatron.core.dist_checkpointing.state_dict_transformation.prepare_state_dict_for_save"
+)
+recreate_state_dict_after_load = pytest.importorskip(
+    "megatron.core.dist_checkpointing.state_dict_transformation.recreate_state_dict_after_load"
 )
 from megatron.core.dist_checkpointing.utils import extract_nonpersistent
 from megatron.training.async_utils import maybe_finalize_async_save
@@ -61,6 +63,7 @@ class TestLocalCheckpointing:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(('tp,pp'), [(2, 4)])
+    @pytest.mark.internal
     def test_sharded_tensors(self, tp, pp):
         Utils.initialize_model_parallel(tp, pp)
         num_floating_point_operations_so_far = 0
