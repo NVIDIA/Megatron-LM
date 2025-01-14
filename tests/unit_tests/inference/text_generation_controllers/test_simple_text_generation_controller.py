@@ -1,3 +1,4 @@
+import copy
 import os
 import random
 import string
@@ -145,23 +146,28 @@ class TestTextGenerationController:
             random.choices(string.ascii_letters, k=random.randint(4, 10))
         )
 
-        active_requests: Dict[int, InferenceRequest] = OrderedDict()
+        active_requests: Dict[str, InferenceRequest] = OrderedDict()
+        all_prompt_tokens: Dict[str, List[int]] = OrderedDict()
         for i in range(self.batch_size):
             prompt = "sample" * (i + 1)
             self.mock_tokenizer.tokenize.return_value = torch.randn(
                 self.batch_size, self.vocab_size
             ).cuda()
+            prompt_tokens = torch.randint(
+                low=0, high=self.vocab_size - 1, size=(len(prompt),)
+            ).tolist()
+
+            request_id = str(i)
             inference_request = InferenceRequest(
-                request_id=i,
+                request_id=request_id,
                 prompt=prompt,
                 inference_parameters=SamplingParams(num_tokens_to_generate=10),
                 arrival_time=time.time(),
-                prompt_tokens=torch.randint(
-                    low=0, high=self.vocab_size - 1, size=(len(prompt),)
-                ).tolist(),
+                prompt_tokens=prompt_tokens,
                 status=Status.ACTIVE_BUT_NOT_GENERATING_TOKENS,
             )
-            active_requests[i] = inference_request
+            active_requests[request_id] = inference_request
+            all_prompt_tokens[request_id] = copy.deepcopy(prompt_tokens)
 
         requests = self.text_generation_controller.generate_all_output_tokens_static_batch(
             active_requests
@@ -173,6 +179,9 @@ class TestTextGenerationController:
             ), f"Status should be completed but its {request.status}"
             assert request.generated_length > 0, f"Generated length should be greater than zero"
             assert request.generated_text is not None, "Generated text should not be None"
+            assert (
+                all_prompt_tokens[request_id] == request.prompt_tokens
+            ), "Prompt tokens should not have changed during generation"
 
     def test_output_log_probs(self):
         self.mock_tokenizer.vocab_size = self.vocab_size

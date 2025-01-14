@@ -1,5 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 
@@ -31,7 +31,7 @@ class MCoreEngine(AbstractEngine):
         self,
         text_generation_controller: TextGenerationController,
         max_batch_size,
-        random_seed: int = None,
+        random_seed: Optional[int] = None,
     ):
         self.text_generation_controller = text_generation_controller
         self.random_seed = random_seed
@@ -41,10 +41,10 @@ class MCoreEngine(AbstractEngine):
         self,
         prompts: List[str],
         add_BOS: bool = False,
-        encoder_prompts: List[str] = None,
-        common_inference_params: SamplingParams = None,
-        sampling_params: SamplingParams = None,
-    ) -> dict:
+        encoder_prompts: Optional[List[str]] = None,
+        common_inference_params: Optional[SamplingParams] = None,
+        sampling_params: Optional[SamplingParams] = None,
+    ) -> List[InferenceRequest]:
         """The megatron core inference backend generate function
 
         This backend returns the output generations as a dictionary.
@@ -67,6 +67,8 @@ class MCoreEngine(AbstractEngine):
 
         if common_inference_params:
             sampling_params = common_inference_params
+        if sampling_params is None:
+            sampling_params = SamplingParams()
 
         if self.random_seed:
             torch.random.manual_seed(self.random_seed)
@@ -103,8 +105,8 @@ class MCoreEngine(AbstractEngine):
                 Defaults to False.
         """
         while self.scheduler.have_requests_pending():
-            active_requests: Dict[int, InferenceRequest] = self.scheduler.active_request_pool.copy()
-            result_dict: Dict[int, InferenceRequest] = (
+            active_requests: Dict[str, InferenceRequest] = self.scheduler.active_request_pool.copy()
+            result_dict: Dict[str, InferenceRequest] = (
                 self.text_generation_controller.generate_all_output_tokens_static_batch(
                     active_requests
                 )
@@ -116,7 +118,7 @@ class MCoreEngine(AbstractEngine):
         """ 
             if dynamic_batching:
                 result_dict: Dict[
-                    int, InferenceRequest
+                    str, InferenceRequest
                 ] = self.text_generation_controller.generate_output_tokens_one_step_dynamic_batch(
                     active_requests
                 )

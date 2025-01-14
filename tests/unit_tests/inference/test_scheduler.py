@@ -52,7 +52,7 @@ class TestScheduler:
             self.scheduler.have_requests_pending()
         ), "Scheduler should have requests pending, but it seems to be having no requests"
 
-        active_request_dict: Dict[int, InferenceRequest] = self.scheduler.active_request_pool
+        active_request_dict: Dict[str, InferenceRequest] = self.scheduler.active_request_pool
         assert set(active_request_dict.keys()) == set(
             active_request_ids
         ), f"Active request pool IDs should match returned request IDs"
@@ -74,7 +74,7 @@ class TestScheduler:
             len(self.scheduler.completed_request_pool) == 2
         ), f"Completed request pool should have 2 requests but it has {len(self.scheduler.completed_request_pool)} requests "
 
-        active_request_dict: Dict[int, InferenceRequest] = self.scheduler.active_request_pool
+        active_request_dict: Dict[str, InferenceRequest] = self.scheduler.active_request_pool
         for request_id, request in active_request_dict.items():
             # Mark all requests compelted
             request.status = Status.COMPLETED

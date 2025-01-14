@@ -2,7 +2,7 @@
 import time
 import typing
 from collections import OrderedDict
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 
@@ -23,18 +23,18 @@ class Scheduler:
 
     def __init__(self, max_batch_size: int):
         self.max_batch_size = max_batch_size
-        self.active_request_pool: Dict[int, InferenceRequest] = OrderedDict()
-        self.waiting_request_pool: Dict[int, InferenceRequest] = OrderedDict()
-        self.completed_request_pool: Dict[int, InferenceRequest] = OrderedDict()
+        self.active_request_pool: Dict[str, InferenceRequest] = OrderedDict()
+        self.waiting_request_pool: Dict[str, InferenceRequest] = OrderedDict()
+        self.completed_request_pool: Dict[str, InferenceRequest] = OrderedDict()
         self.request_counter = Counter()
 
     def add_request(
         self,
         prompt: str,
         prompt_tokens: torch.Tensor,
-        encoder_prompt: str = None,
-        inference_parameters: SamplingParams = None,
-        arrival_time: float = None,
+        encoder_prompt: Optional[str] = None,
+        inference_parameters: Optional[SamplingParams] = None,
+        arrival_time: Optional[float] = None,
     ):
         """Add an incoming request
 
@@ -61,6 +61,9 @@ class Scheduler:
             if len(self.active_request_pool) < self.max_batch_size
             else Status.WAITING_IN_QUEUE
         )
+
+        if inference_parameters is None:
+            inference_parameters = SamplingParams()
 
         inference_request = InferenceRequest(
             request_id=request_id,
@@ -103,7 +106,9 @@ class Scheduler:
             earliest_waiting_request.status = Status.ACTIVE_BUT_NOT_GENERATING_TOKENS
             self.active_request_pool[earliest_waiting_request_request_id] = earliest_waiting_request
 
-    def update_requests_pools(self, result_dict: typing.OrderedDict[int, InferenceRequest] = None):
+    def update_requests_pools(
+        self, result_dict: Optional[typing.OrderedDict[str, InferenceRequest]] = None
+    ):
         """Update request pool status
 
         This method will full up the active request pool, if it has less than max batch size
@@ -112,7 +117,7 @@ class Scheduler:
         request pool and add waiting request into active pool.
 
         Args:
-            result (typing.OrderedDict[int, InferenceRequest], optional): The result returned
+            result (typing.OrderedDict[str, InferenceRequest], optional): The result returned
                 by the engine. A dictionary with keys as the request ids, and values as the
                 requests. Defaults to None
         """
