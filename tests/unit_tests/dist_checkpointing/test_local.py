@@ -8,10 +8,10 @@ from unittest import mock
 
 import pytest
 import torch
-
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.mapping import ShardedBase, ShardedTensorFactory
+
 prepare_state_dict_for_save = pytest.importorskip(
     "megatron.core.dist_checkpointing.state_dict_transformation.prepare_state_dict_for_save"
 )
