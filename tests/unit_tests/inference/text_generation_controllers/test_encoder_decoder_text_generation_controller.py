@@ -115,7 +115,7 @@ class TestEncoderDecoderTextGenerationController:
             self.vocab_size, size=(self.encoder_sequence_length - 5)
         ).tolist()
 
-        active_requests: Dict[int, InferenceRequest] = OrderedDict()
+        active_requests: Dict[str, InferenceRequest] = OrderedDict()
         for i in range(self.batch_size):
             prompt = "decoder_sample"
             prompt_tokens = np.random.randint(
