@@ -195,13 +195,13 @@ test:unit_tests_pyt(DEV)_mcore(legacy):
 test:unit_tests_pyt(LTS)_mcore(legacy):
   extends: [.unit_tests_run]
   variables:
-    ENVIRONMENT: dev
+    ENVIRONMENT: lts
     TAG: legacy
 
 test:unit_tests_pyt(DEV)_mcore(latest):
   extends: [.unit_tests_run]
   variables:
-    ENVIRONMENT: lts
+    ENVIRONMENT: dev
     TAG: latest
 
 test:unit_tests_pyt(LTS)_mcore(latest):

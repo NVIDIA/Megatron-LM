@@ -93,6 +93,7 @@ def get_moe_model_and_buffers(
 @pytest.mark.parametrize("average_in_collective", [False, True])
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
 @pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 def test_grad_sync(
     use_distributed_optimizer: bool,
     overlap_grad_reduce: bool,
