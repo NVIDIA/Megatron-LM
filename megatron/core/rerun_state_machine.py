@@ -9,7 +9,7 @@ from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Iterable, NamedTuple, Optional, Set, Tuple, Union
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_current_rng_state, set_current_rng_state
 import numpy as np
 import torch
 
@@ -768,7 +768,7 @@ class RerunStateMachine:
                 'random_rng_state': random.getstate(),
                 'np_rng_state': np.random.get_state(),
                 'torch_rng_state': torch.get_rng_state(),
-                'cuda_rng_state': torch.cuda.get_rng_state(),
+                'current_rng_state': get_current_rng_state(),
             },
             'other_state': self.state_save_func() if self.state_save_func else None,
             # any other state to save to guarantee deterministic execution?
@@ -781,7 +781,7 @@ class RerunStateMachine:
         random.setstate(rng_state['random_rng_state'])
         np.random.set_state(rng_state['np_rng_state'])
         torch.set_rng_state(rng_state['torch_rng_state'])
-        torch.cuda.set_rng_state(rng_state['cuda_rng_state'])
+        set_current_rng_state(rng_state['current_rng_state'])
         if self.saved_state['other_state'] and self.state_restore_func:
             self.state_restore_func(self.saved_state['other_state'])
 

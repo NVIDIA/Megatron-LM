@@ -7,7 +7,7 @@ import contextlib
 import logging
 from importlib.metadata import PackageNotFoundError, version
 
-from megatron.core.device_utils import get_current_rng_state, get_xla_model, set_current_rng_state, set_manual_seed
+from megatron.core.device_utils import get_current_rng_state, get_xla_model, set_current_rng_state, set_device_manual_seed
 import torch
 from pkg_resources import packaging
 from torch.utils.checkpoint import detach_variable
@@ -94,7 +94,7 @@ class DeviceRNGStatesTracker:
         orig_rng_state = get_current_rng_state()
             
         # Set the new state and store it.
-        set_manual_seed(seed)
+        set_device_manual_seed(seed)
         self.states_[name] = get_current_rng_state()
         # Reset rng state to what it was.
         set_current_rng_state(orig_rng_state)
@@ -217,7 +217,7 @@ def model_parallel_device_manual_seed(seed, te_rng_tracker=False, inference_rng_
     _DEVICE_RNG_STATE_TRACKER.reset()
     
     # Set the default state.
-    set_manual_seed(data_parallel_seed)
+    set_device_manual_seed(data_parallel_seed)
     _DEVICE_RNG_STATE_TRACKER.add(_DATA_PARALLEL_RNG_TRACKER_NAME, data_parallel_seed)
 
     # and model parallel state.

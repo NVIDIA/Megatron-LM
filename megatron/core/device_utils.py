@@ -97,13 +97,16 @@ def get_current_rng_state() -> Union[torch.Tensor, int]:
     return rng_state
 
 
-def set_manual_seed(seed: int):
+def set_device_manual_seed(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
     elif xm is not None:
         xm.set_rng_state(seed, device=get_current_device())
-    else:
-        torch.manual_seed(seed)
+
+
+def set_manual_seed(seed: int):
+    set_device_manual_seed(seed)
+    torch.manual_seed(seed)
 
 
 def set_current_rng_state(new_state):
