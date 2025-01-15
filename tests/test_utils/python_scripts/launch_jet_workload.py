@@ -276,12 +276,18 @@ def main(
                 n_download_attempt += 1
             except KeyError as e:
                 logger.error(e)
+                break
                 no_log = True
 
         if no_log:
             continue
 
         concat_logs = "\n".join(logs)
+        if concat_logs.strip() == "":
+            logger.error("No logs found. Try again.")
+            n_attempts += 1
+            continue
+
         print(f"Logs:\n{concat_logs}")
 
         success = pipeline.get_status() == PipelineStatus.SUCCESS
@@ -298,9 +304,7 @@ def main(
                 "Some NCCL operations have failed or timed out." in concat_logs
                 or "uncorrectable ECC error encountered" in concat_logs
                 or "illegal memory access" in concat_logs
-                or "illegal instruction" in concat_logs
-                or "NCCL WARN [Service thread] Accept failed Resource temporarily unavailable"
-                in concat_logs
+                or "illegal instruction" in concat_logs in concat_logs
             ):
                 logger.error("Detected NCCL failure, attempt restart.")
                 n_attempts += 1
