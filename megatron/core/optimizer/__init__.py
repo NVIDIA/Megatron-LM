@@ -56,7 +56,8 @@ def _get_param_groups(
     Creates parameter groups based on weight decay condition (regularized vs
     non regularized), learning rate scale condition (lr vs lr_mult * lr),
     and whether it is expert parameters. scale_lr_cond is used during finetuning
-    where head of the network requires a scaled version of the base learning rate.
+    where head of the network can have a scaled version of the base learning rate or 
+    during pre-training where down-projection layer (linear_fc2) can have a lower learning rate.
 
     Args:
         model_chunks (List[MegatronModule]): model chunks to create parameter
