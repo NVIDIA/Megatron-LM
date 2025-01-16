@@ -3,13 +3,16 @@
 from abc import abstractmethod
 from typing import List, Optional, Tuple
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 from megatron.core.parallel_state import (
     get_expert_model_parallel_group,
+    get_expert_model_parallel_groups,
     get_expert_tensor_and_model_parallel_group,
+    get_expert_tensor_and_model_parallel_groups,
     get_expert_tensor_parallel_group,
+    get_expert_tensor_parallel_groups,
     get_expert_tensor_parallel_rank,
 )
 from megatron.core.tensor_parallel import (
@@ -36,6 +39,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
      num_global_tokens: num_local_tokens*TP*EP
 """
 
+xm = get_xla_model()
 
 class MoETokenDispatcher:
     """
@@ -55,12 +59,14 @@ class MoETokenDispatcher:
     @property
     def ep_group(self):
         """Get expert model parallel group."""
-        return get_expert_model_parallel_group()
+        return get_expert_model_parallel_group() if not xm else \
+            get_expert_model_parallel_groups()
 
     @property
     def tp_group(self):
         """Get expert tensor parallel group."""
-        return get_expert_tensor_parallel_group()
+        return get_expert_tensor_parallel_group() if not xm else \
+            get_expert_tensor_parallel_groups()
 
     @property
     def tp_rank(self):
@@ -70,7 +76,8 @@ class MoETokenDispatcher:
     @property
     def tp_ep_group(self):
         """Get expert tensor and model parallel group."""
-        return get_expert_tensor_and_model_parallel_group()
+        return get_expert_tensor_and_model_parallel_group() if not xm else \
+            get_expert_tensor_and_model_parallel_groups()
 
     @abstractmethod
     def token_permutation(

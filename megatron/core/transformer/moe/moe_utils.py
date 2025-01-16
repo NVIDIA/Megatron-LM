@@ -8,6 +8,7 @@ import torch
 
 from megatron.core import parallel_state
 
+xm = get_xla_model()
 
 def switch_load_balancing_loss_func(
     probs: torch.Tensor,
@@ -41,8 +42,12 @@ def switch_load_balancing_loss_func(
     if sequence_partition_group is not None:
         # We can keep `aggregated_probs_per_expert` local since we don't need the gradient for
         # `tokens_per_expert`, saving one allreduce operation for `aggregated_probs_per_expert`.
-        num_sub_sequence = torch.distributed.get_world_size(sequence_partition_group)
-        torch.distributed.all_reduce(tokens_per_expert, group=sequence_partition_group)
+        if xm:
+            num_sub_sequence = len(sequence_partition_group[0])
+            xm.all_reduce(xm.REDUCE_SUM, [tokens_per_expert], groups=sequence_partition_group)
+        else:
+            num_sub_sequence = torch.distributed.get_world_size(sequence_partition_group)
+            torch.distributed.all_reduce(tokens_per_expert, group=sequence_partition_group)
 
     num_tokens = probs.shape[0] * num_sub_sequence
     num_experts = probs.shape[1]
@@ -80,8 +85,12 @@ def sequence_load_balancing_loss_func(
     if sequence_partition_group is not None:
         # We can keep `aggregated_probs_per_expert` local since we don't need the gradient for
         # `tokens_per_expert`, saving one allreduce operation for `aggregated_probs_per_expert`.
-        num_sub_sequence = torch.distributed.get_world_size(sequence_partition_group)
-        torch.distributed.all_reduce(tokens_per_expert, group=sequence_partition_group)
+        if xm:
+            num_sub_sequence = len(sequence_partition_group[0])
+            xm.all_reduce(xm.REDUCE_SUM, [tokens_per_expert], groups=sequence_partition_group)
+        else:
+            num_sub_sequence = torch.distributed.get_world_size(sequence_partition_group)
+            torch.distributed.all_reduce(tokens_per_expert, group=sequence_partition_group)
 
     assert num_sub_sequence == 1, "Do not support sequence aux loss in sequence partition case"
 

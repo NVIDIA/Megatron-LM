@@ -36,6 +36,7 @@ class AuxlossTestContainer(MoEModelTestContainer):
 
 class TestAuxLoss:
     def setup_method(self, method):
+        Utils.initialize_model_parallel()
         baseline_container = AuxlossTestContainer(
             tp_size=1,
             ep_size=1,
