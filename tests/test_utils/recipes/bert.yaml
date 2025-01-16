@@ -13,7 +13,7 @@ spec:
   n_repeat:
   artifacts:
     /workspace/data/bert_data: text/the_pile/bert_shard00
-    # /workspace/checkpoints/bert_mr_mcore_tp2_pp2_frozen_resume_torch_dist_dgx_a100_1N8G_dev: model/mcore_bert/bert_mr_mcore_tp2_pp2_frozen_resume_torch_dist_dgx_a100_1N8G_dev/22390338
+    /workspace/checkpoints/bert_mr_mcore_tp2_pp2_frozen_resume_torch_dist_dgx_a100_1N8G_dev: model/mcore_bert/bert_mr_mcore_tp2_pp2_frozen_resume_torch_dist_dgx_a100_1N8G_dev/22410107
   script: |-
     ls
     cd /opt/megatron-lm
