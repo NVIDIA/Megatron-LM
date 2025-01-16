@@ -324,11 +324,12 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         pre_cross_attn_layernorm_output = self.pre_cross_attn_layernorm(hidden_states)
 
         # Cross attention.
+        # Cross attention do not need kv_cache, we set the inference_params to None
         attention_output_with_bias = self.cross_attention(
             pre_cross_attn_layernorm_output,
             attention_mask=context_mask,
             key_value_states=context,
-            inference_params=inference_params,
+            inference_params=None,
         )
 
         if isinstance(attention_output_with_bias, dict) and "context" in attention_output_with_bias:

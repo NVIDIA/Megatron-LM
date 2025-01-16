@@ -347,6 +347,10 @@ class T5Model(LanguageModule):
         # Decoder position ids
         decoder_position_ids = t5_position_ids(decoder_input_ids)
 
+        # Add offset to the postion_ids when kv-cache is enabled
+        if inference_params is not None:
+            decoder_position_ids = decoder_position_ids + inference_params.sequence_len_offset
+
         # Decoder embedding.
         if self.pre_process:
             decoder_input = self.embedding(
