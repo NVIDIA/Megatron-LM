@@ -124,7 +124,7 @@ class TestDeviceLimitedTop2Router:
         num_weights = sum([p.numel() for p in self.router.parameters()])
         assert num_weights == 12 * 8, num_weights
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
     @pytest.mark.parametrize("moe_router_pre_softmax", [(True), (False)])
     def test_router_forward(self, moe_router_pre_softmax):
         with torch.no_grad():

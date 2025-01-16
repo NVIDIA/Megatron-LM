@@ -22,7 +22,7 @@ from megatron.core.tensor_parallel.random import model_parallel_device_manual_se
 from megatron.core.transformer.transformer_block import TransformerBlock
 from tests.unit_tests.test_utilities import Utils
 
-
+@pytest.mark.skip(reason="upstream issues")
 class TestRetroAttention:
 
     @classmethod

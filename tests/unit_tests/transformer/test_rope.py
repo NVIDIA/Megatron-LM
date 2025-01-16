@@ -3,11 +3,12 @@
 import pytest
 import torch
 
-from megatron.core.device_utils import get_current_device_type
+from megatron.core.device_utils import get_current_device_type, get_xla_model
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from tests.unit_tests.test_utilities import Utils
 
+xm = get_xla_model()
 
 class TestRotaryEmbedding:
     def setup_method(self):
@@ -27,14 +28,14 @@ class TestRotaryEmbedding:
         del self.rope_cpu_init
         Utils.destroy_model_parallel()
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
     def test_constructor(self):
         assert isinstance(self.rope_cpu_init, RotaryEmbedding)
         assert self.rope_cpu_init.inv_freq.device.type == 'cpu'
         assert isinstance(self.rope_gpu_init, RotaryEmbedding)
         assert self.rope_gpu_init.inv_freq.device.type == get_current_device_type()
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
     def test_gpu_forward(self):
         output = self.rope_gpu_init(64)
         assert output.shape[0] == 64
@@ -44,7 +45,7 @@ class TestRotaryEmbedding:
         assert output.dtype == torch.float32
         assert output.device.type == get_current_device_type()
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="CUDA not available")
     def test_cpu_forward(self):
         output = self.rope_cpu_init(64)
         assert output.shape[0] == 64

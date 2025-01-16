@@ -5,7 +5,11 @@ from megatron.core.device_utils import get_current_device, get_current_device_ty
 import pytest
 import torch
 
-from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
+try:
+    from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
@@ -73,7 +77,7 @@ class TestParallelSequentialMLP:
         assert output.device.type == get_current_device_type()
         assert output_bias.device.type == get_current_device_type()
 
-
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine is required.")
 class TestTEParallelSequentialMLP:
     def setup_method(self, method):
         Utils.initialize_model_parallel(tensor_model_parallel_size=2, expert_model_parallel_size=2)

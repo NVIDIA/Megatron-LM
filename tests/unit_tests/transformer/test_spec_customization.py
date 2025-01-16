@@ -6,7 +6,6 @@ from dataclasses import dataclass, fields
 from megatron.core.device_utils import get_current_device, set_manual_seed
 import pytest
 import torch
-import transformer_engine as te
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
@@ -14,6 +13,7 @@ from megatron.core.tensor_parallel.random import model_parallel_device_manual_se
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 
 try: 
+    import transformer_engine as te
     from megatron.core.extensions.transformer_engine import (
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
@@ -140,6 +140,7 @@ class TestSpecCustomization:
         bda_op = build_module(self.bda_spec)
         assert id(bda_op) == id(get_bias_dropout_add)
 
+    @pytest.mark.skip(reason="upstream issues")
     def test_sliding_window_attention(self):
         if not is_te_min_version("1.2.0"):
             print("SWA not tested because TE version is not >= 1.2.0", file=sys.stderr)

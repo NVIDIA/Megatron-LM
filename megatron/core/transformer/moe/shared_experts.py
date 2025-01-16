@@ -125,8 +125,7 @@ class SharedExpertMLP(MLP):
                     )
                 else:
                     self.cached_fc1_input = copy_to_tensor_model_parallel_region(input)
-                set_tensor_grad_fn_sequence_sr(self.cached_fc1_input, 
-                                               torch.iinfo(torch.int, device=get_current_device()).max)
+                set_tensor_grad_fn_sequence_sr(self.cached_fc1_input, torch.iinfo(torch.int).max)
         else:
             if self.use_shared_expert_gate:
                     logits = torch.nn.functional.linear(input, self.gate_weight)
@@ -137,8 +136,7 @@ class SharedExpertMLP(MLP):
                 )
             else:
                 self.cached_fc1_input = copy_to_tensor_model_parallel_region(input)
-            set_tensor_grad_fn_sequence_sr(self.cached_fc1_input, 
-                                            torch.iinfo(torch.int, device=get_current_device()).max)
+            set_tensor_grad_fn_sequence_sr(self.cached_fc1_input, torch.iinfo(torch.int).max)
     def linear_fc1_forward_and_act(self, overlapped_comm_output=None):
         """
         Do Linear FC1 and activation function forward.

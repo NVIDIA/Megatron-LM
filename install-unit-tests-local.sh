@@ -1,0 +1,22 @@
+#!/bin/bash
+
+pip3 install --upgrade pip
+pip3 install packaging
+pip3 install torch==2.5.0 torchaudio==2.5.0 torchvision --extra-index-url https://download.pytorch.org/whl/cu121
+
+pip3 install --extra-index-url https://pypi.nvidia.com --no-cache-dir --upgrade-strategy only-if-needed -v \
+    einops \
+    flask-restful \
+    nltk \
+    pytest \
+    pytest-cov \
+    pytest_mock \
+    pytest-random-order \
+    sentencepiece \
+    tiktoken \
+    wrapt \
+    zarr \
+    wandb \
+    tensorstore==0.1.45 \
+    pynvml==11.5.3
+

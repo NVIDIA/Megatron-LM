@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_current_device_type, get_xla_model
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 import pytest
 import torch
 
@@ -10,6 +11,8 @@ from megatron.core.tensor_parallel.random import model_parallel_device_manual_se
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
+
+xm = get_xla_model()
 
 class TestParallelMLP:
 
@@ -41,7 +44,7 @@ class TestParallelMLP:
         assert output.dtype == torch.float32
     """
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
     def test_gpu_forward(self):
         mlp = self.mlp
         mlp.to(device=get_current_device())

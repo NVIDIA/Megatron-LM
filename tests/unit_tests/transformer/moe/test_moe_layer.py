@@ -18,6 +18,11 @@ from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
+    HAVE_TE =True
+except ImportError:
+    HAVE_TE = False
 
 class TestMoELayerInit:
     def setup_method(self, method):
@@ -107,9 +112,15 @@ class TestMoELayerInit:
             bf16=True,
             params_dtype=torch.bfloat16,
         )
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            num_experts=num_moe_experts, moe_grouped_gemm=grouped_gemm
-        )
+
+        if HAVE_TE:
+            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                num_experts=num_moe_experts, moe_grouped_gemm=grouped_gemm
+            )
+        else:
+            transformer_layer_spec = get_gpt_layer_local_spec(
+                num_experts=num_moe_experts, moe_grouped_gemm=grouped_gemm
+            )
 
         # Fake initialization as NeMo does
         Utils.fake_initialize_model_parallel(

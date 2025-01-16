@@ -8,7 +8,6 @@ slurm*
 logs
 .vscode
 local/
-*.sh
 *.log
 .gitmodules
 *.out

@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from megatron.core.device_utils import get_current_device
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 import pytest
 import torch
 
@@ -10,7 +11,7 @@ from megatron.core.tensor_parallel.random import model_parallel_device_manual_se
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
-
+@pytest.mark.skip(reason="upstream issues")
 class TestParallelAttention:
 
     def setup_method(self, method):

@@ -30,6 +30,12 @@ from tests.unit_tests.test_utilities import Utils
 
 _SEED = 42
 
+try:
+    import apex  # pylint: disable=unused-import
+
+    HAVE_APEX = True
+except ImportError:
+    HAVE_APEX = False
 
 def model_provider(
     pre_process=True, post_process=True, layer_spec_fn=get_gpt_layer_local_spec, **config_kwargs
@@ -38,7 +44,9 @@ def model_provider(
     args = get_args()
 
     config = core_transformer_config_from_args(args)
-
+    config.persist_layer_norm = HAVE_APEX
+    config.gradient_accumulation_fusion = HAVE_APEX
+    
     model = GPTModel(
         config=config,
         transformer_layer_spec=layer_spec_fn(

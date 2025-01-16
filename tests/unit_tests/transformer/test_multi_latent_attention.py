@@ -5,7 +5,6 @@ from importlib.metadata import version
 
 import pytest
 import torch
-import transformer_engine as te
 
 from megatron.core.device_utils import get_current_device
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -17,6 +16,13 @@ from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
+    HAVE_TE =True
+except ImportError:
+    HAVE_TE = False
+
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine is required")
 class TestParallelMLAAttention:
 
     def setup_method(self, method):

@@ -126,7 +126,7 @@ class TestSeqAuxLoss:
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
     @pytest.mark.internal
     @pytest.mark.parametrize("tp_size,ep_size,cp_size", [(1, 8, 1)])
     def test_a2a_dispatcher(self, tp_size, ep_size, cp_size):
