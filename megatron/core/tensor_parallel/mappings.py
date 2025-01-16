@@ -101,7 +101,7 @@ def _gather_along_last_dim(input_):
     dim_size[0] = dim_size[0] * world_size
 
     if xm:
-        output = xm.all_gather(input_.contiguous(), dim=-1, groups=get_tensor_model_parallel_groups(), pin_layut=False)
+        output = xm.all_gather(input_.contiguous(), dim=-1, groups=get_tensor_model_parallel_groups(), pin_layout=False)
     else:
         output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
         torch.distributed.all_gather_into_tensor(
