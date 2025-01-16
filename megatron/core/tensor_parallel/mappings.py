@@ -466,7 +466,7 @@ class _AllToAll(torch.autograd.Function):
             if output_split_sizes is None:
                 orig_dtype = input.dtype
                 input = input.to(dtype=torch.float32)
-                output = all_to_all(value=input,
+                output = xm.all_to_all(value=input,
                     split_dimension=0,
                     concat_dimension=0,
                     split_count=world_size,
