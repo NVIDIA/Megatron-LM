@@ -274,12 +274,14 @@ def main(
                 logger.error(e)
                 time.sleep((3**n_download_attempt) * 60)
                 n_download_attempt += 1
+                no_log = True
             except KeyError as e:
                 logger.error(e)
                 break
                 no_log = True
 
         if no_log:
+            logger.error("Did not find any logs to download, retry.")
             continue
 
         concat_logs = "\n".join(logs)
