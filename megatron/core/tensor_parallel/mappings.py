@@ -35,7 +35,7 @@ def _reduce(input_):
     # All-reduce.
     input_ = input_.contiguous()
     if xm:
-        xm.all_reduce(xm.REDUCE_SUM, [input_], groups=get_tensor_model_parallel_groups())
+        xm.all_reduce(xm.REDUCE_SUM, [input_], groups=get_tensor_model_parallel_groups(), pin_layput=False)
     else:
         torch.distributed.all_reduce(input_, group=get_tensor_model_parallel_group())
 
@@ -101,7 +101,7 @@ def _gather_along_last_dim(input_):
     dim_size[0] = dim_size[0] * world_size
 
     if xm:
-        output = xm.all_gather(input_.contiguous(), dim=-1, groups=get_tensor_model_parallel_groups())
+        output = xm.all_gather(input_.contiguous(), dim=-1, groups=get_tensor_model_parallel_groups(), pin_layut=False)
     else:
         output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
         torch.distributed.all_gather_into_tensor(
@@ -153,7 +153,7 @@ def _gather_along_first_dim(input_, group: Union[torch.distributed.ProcessGroup,
         dim_size[0] = dim_size[0] * world_size
     
         if xm:
-            output = xm.all_gather(input_.contiguous(), dim=0, groups=group)
+            output = xm.all_gather(input_.contiguous(), dim=0, groups=group, pin_layout=False)
         else:
             if use_global_buffer:
                 output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
@@ -163,7 +163,7 @@ def _gather_along_first_dim(input_, group: Union[torch.distributed.ProcessGroup,
     else:
         dim_size[0] = sum(output_split_sizes)
         if xm:
-            output = xm.all_gather(input_.contiguous(), groups=group)
+            output = xm.all_gather(input_.contiguous(), groups=group, pin_layout=False)
             output_tensor_list = list(torch.split(output, output_split_sizes, dim=0))
         else:
             if use_global_buffer:
@@ -206,7 +206,7 @@ def _reduce_scatter_along_first_dim(
     
         if xm:
             output = xm.reduce_scatter(xm.REDUCE_SUM, input_.contiguous(), 1.0, 0, world_size,
-                                       groups=group)
+                                       groups=group, pin_layout=False)      
         else:
             if use_global_buffer:
                 output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
@@ -217,9 +217,9 @@ def _reduce_scatter_along_first_dim(
         input_tensor_list = list(torch.split(input_, input_split_sizes, dim=0))
 
         if xm:
-            output_tensor_list = xm.reduce_scatter(xm.REDUCE_SUM, input_tensor_list, 1.0, 0, world_size,
-                                       groups=group)
-            output = output_tensor_list[rank]
+            xm.reduce_scatter(xm.REDUCE_SUM, input_tensor_list, 1.0, 0, world_size,
+                                       groups=group, pin_layout=False)
+            output = input_tensor_list[rank]
         else:
             if use_global_buffer:
                 output = get_global_memory_buffer().get_tensor(
@@ -456,15 +456,32 @@ class _AllToAll(torch.autograd.Function):
         ctx.output_split_sizes = output_split_sizes
         ctx.input_split_sizes = input_split_sizes
 
-        world_size, _ = get_group_world_size_and_rank(group=group)
+        world_size, rank = get_group_world_size_and_rank(group=group)
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input
 
         input = input.contiguous()
         if xm:
-            output = xm.all_gather(input, dim=0, groups=group)
-            xm.all_reduce(xm.REDUCE_SUM, [output], groups=group)
+            if output_split_sizes is None:
+                orig_dtype = input.dtype
+                input = input.to(dtype=torch.float32)
+                output = all_to_all(value=input,
+                    split_dimension=0,
+                    concat_dimension=0,
+                    split_count=world_size,
+                    groups=group,
+                    pin_layout=False)
+                output = output.to(dtype=orig_dtype)
+            else:
+                input_splits = torch.tensor(input_split_sizes, device=input.device, dtype=torch.int)
+                all_input_splits = xm.all_gather(input_splits, dim=0, groups=group, pin_layout=False).split(world_size)
+                all_input_splits = [ [ y.item() for y in x] for x in all_input_splits ]
+
+                all_inputs = xm.all_gather(input, dim=0, groups=group, pin_layout=False).split(input.size()[0])
+                all_inputs = [ torch.split(x, all_input_splits[i]) for i, x in enumerate(all_inputs) ]
+                scattered_inputs = [ [ x[r] for x in all_inputs] for r in range(world_size) ]
+                output = torch.cat( scattered_inputs[rank], dim=0).to(device=input.device)
         else:
             if output_split_sizes is None:
                 # Equal split (all2all)
