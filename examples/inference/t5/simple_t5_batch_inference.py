@@ -5,7 +5,7 @@ from argparse import Namespace
 import torch
 
 import pretrain_t5
-from megatron.core.inference.common_inference_params import CommonInferenceParams
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines.mcore_engine import MCoreEngine
 from megatron.core.inference.inference_request import InferenceRequest
@@ -120,7 +120,7 @@ def main():
 
     inference_engine = get_inference_engine(args, model)
 
-    common_inference_params = CommonInferenceParams(
+    sampling_params = SamplingParams(
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
@@ -138,7 +138,7 @@ def main():
         prompts=args.prompts,
         add_BOS=True,
         encoder_prompts=args.encoder_prompts,
-        common_inference_params=common_inference_params,
+        sampling_params=sampling_params,
     )
 
     if torch.distributed.get_rank() == 0:

@@ -1,10 +1,10 @@
-from megatron.core.inference.common_inference_params import CommonInferenceParams
+from megatron.core.inference.sampling_params import SamplingParams
 
 
-class TestCommonInferenceParams:
+class TestSamplingParams:
 
     def test_inference_params(self):
-        inference_parameters = CommonInferenceParams()
+        inference_parameters = SamplingParams()
         inference_parameters.add_attributes({"min_tokens": 45})
         assert (
             inference_parameters.min_tokens == 45

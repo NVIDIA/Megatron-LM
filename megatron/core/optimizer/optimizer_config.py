@@ -47,6 +47,23 @@ class OptimizerConfig:
     params_dtype: torch.dtype = torch.float32
     """dtype used when intializing the weights. Defaults to torch.float32."""
 
+    use_precision_aware_optimizer: bool = False
+    """If true, allows optimizer-related tensors (master_param, gradients and optimizer states)
+    to be set to lower precision. Defaults to False.
+    """
+
+    main_grads_dtype: torch.dtype = torch.float32
+    """dtype of main grads when enabling precision-aware-optimizer"""
+
+    main_params_dtype: torch.dtype = torch.float32
+    """dtype of main params when enabling precision-aware-optimizer"""
+
+    exp_avg_dtype: torch.dtype = torch.float32
+    """dtype of exp_avg when enabling precision-aware-optimizer"""
+
+    exp_avg_sq_dtype: torch.dtype = torch.float32
+    """dtype of exp_avg_sq when enabling precision-aware-optimizer"""
+
     ###############
     # Loss scaling
     ###############
@@ -114,3 +131,51 @@ class OptimizerConfig:
 
     config_logger_dir: str = ""
     """When non-empty, dumps entry-point configs to config_logger_dir"""
+
+    def __post_init__(self):
+        """Check the validity of the config."""
+        if self.use_precision_aware_optimizer:
+            assert (
+                self.optimizer == 'adam'
+            ), '--use-precision-aware-optimizer only supported with adam'
+            assert (
+                self.use_distributed_optimizer
+            ), '--use-precision-aware-optimizer only supported with distributed optimizer'
+
+            # Only the FusedAdam in TE supports --use-precision-aware-optimizer.
+            # TODO: Remove this check when apex's FusedAdam is no longer used.
+            try:
+                import inspect
+
+                from transformer_engine.pytorch.optimizers import FusedAdam as Adam
+
+                adam_args = inspect.signature(Adam).parameters
+                arg_names = [
+                    'master_weight_dtype',
+                    'exp_avg_dtype',
+                    'exp_avg_sq_dtype',
+                    'use_decoupled_grad',
+                ]
+                for name in arg_names:
+                    assert name in adam_args, (
+                        "Current FusedAdam of TE doesn't support --use-precision-aware-optimizer, "
+                        "please update TE version."
+                    )
+            except ImportError:
+                raise RuntimeError(
+                    '--use-precision-aware-optimizer requires FusedAdam from TransformerEngine, '
+                    'but not found.'
+                )
+        else:
+            assert (
+                self.main_grads_dtype == torch.float32
+            ), "main_grads_dtype can only be fp32 when not using precision-aware optimizer"
+            assert (
+                self.main_params_dtype == torch.float32
+            ), "main_params_dtype can only be fp32 when not using precision-aware optimizer"
+            assert (
+                self.exp_avg_dtype == torch.float32
+            ), "exp_avg_dtype can only be fp32 when not using precision-aware optimizer"
+            assert (
+                self.exp_avg_sq_dtype == torch.float32
+            ), "exp_avg_sq_dtype can only be fp32 when not using precision-aware optimizer"

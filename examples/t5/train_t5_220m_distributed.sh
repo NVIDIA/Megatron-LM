@@ -51,6 +51,7 @@ T5_ARGS="
     --transformer-impl transformer_engine \
     --tensor-model-parallel-size 1 \
     --pipeline-model-parallel-size 1 \
+    --attention-backend auto \
 "
 
 DATA_ARGS="

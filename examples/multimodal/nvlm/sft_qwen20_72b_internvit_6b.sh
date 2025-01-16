@@ -67,7 +67,7 @@ OPTIONS=" \
     --exit-duration-in-mins 230 \
     --disable-bias-linear \
     --tokenizer-type MultimodalTokenizer \
-    --tokenizer-model ${WORKSPACE}/<tokenizer model path> \
+    --tokenizer-model Qwen/Qwen2-72B-Instruct \
     --tokenizer-prompt-format qwen2p0 \
     --transformer-impl transformer_engine \
     --normalization RMSNorm \
@@ -130,7 +130,6 @@ OPTIONS=" \
     --tensorboard-dir ${TENSORBOARD_DIR} \
     --language-model-type qwen2.0_72B \
     ${EXTRA_ARGS} \
-    --allow-missing-vision-projection-checkpoint \
     --vision-model-type internvit \
     --disable-vision-class-token \
     --log-params-norm \
@@ -141,7 +140,7 @@ OPTIONS=" \
     --max-num-tiles 6 \
     --use-thumbnail \
     --use-tile-tags \
-    --use-image-tag
+    --image-tag-type nvlm
 "
 
 

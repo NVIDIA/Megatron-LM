@@ -23,15 +23,16 @@ from megatron.training.checkpointing import get_checkpoint_name
 def datasets_provider(worker_config=None):
     """Create multimodal train, validation and test datasets."""
     args = get_args()
+
     dname = args.data_path[0] if type(args.data_path) is list else args.data_path
     train_dataset = get_train_dataset(
         dname,
         batch_size=args.micro_batch_size,
         task_encoder=TaskEncoder(),
         worker_config=worker_config,
-        virtual_epoch_length=1000,
-        max_samples_per_sequence=100,
-        shuffle_buffer_size=100,
+        max_samples_per_sequence=None,
+        shuffle_buffer_size=None,
+        packing_buffer_size=args.packing_buffer_size,
         handler=print_error_handler,
         image_decode="pil",
     )
@@ -43,6 +44,7 @@ def datasets_provider(worker_config=None):
         # limit=args.eval_iters * get_num_microbatches(),
         task_encoder=TaskEncoder(),
         worker_config=worker_config,
+        packing_buffer_size=args.packing_buffer_size,
         handler=print_error_handler,
         image_decode="pil",
     )
@@ -67,10 +69,9 @@ def is_first_or_last_stage(pp_size, encoder_pipeline_model_parallel_size):
         return True
 
     is_valid_rank = False
-
+    pp_rank = get_pipeline_model_parallel_rank()
     if encoder_pipeline_model_parallel_size == 0:
         # No separate pipeline stage for the vision model. Run the dataloader on the first and last pipeline stage.
-        pp_rank = get_pipeline_model_parallel_rank()
         is_valid_rank = pp_rank in (0, pp_size-1)
     elif encoder_pipeline_model_parallel_size == 1:
         # Separate pipeline stage for the vision model. Run the dataloader on the first vision and LM stage and last LM stage.

@@ -13,6 +13,7 @@ FROM $FROM_IMAGE_NAME as build_mamba_ssm
 WORKDIR /opt
 RUN MAMBA_FORCE_BUILD=TRUE pip3 wheel -v git+https://github.com/state-spaces/mamba.git@v2.0.3
 
+ARG FROM_IMAGE_NAME
 FROM $FROM_IMAGE_NAME as main
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -23,31 +24,21 @@ RUN apt-get update && \
     wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq && \
     chmod a+x /usr/local/bin/yq
 
-COPY --from=build_causal_conv1d /opt/causal_conv1d-1.2.2.post1-cp310-cp310-linux_x86_64.whl ./
-COPY --from=build_grouped_gemm /opt/grouped_gemm-1.1.2-cp310-cp310-linux_x86_64.whl ./
-COPY --from=build_mamba_ssm /opt/mamba_ssm-2.0.3-cp310-cp310-linux_x86_64.whl ./
+COPY --from=build_causal_conv1d /opt/causal_conv1d-*.whl ./
+COPY --from=build_grouped_gemm /opt/grouped_gemm-*.whl ./
+COPY --from=build_mamba_ssm /opt/mamba_ssm-*.whl ./
 
-RUN pip3 uninstall -y nvidia-modelopt[torch] && \
-    pip3 install --extra-index-url https://pypi.nvidia.com --no-cache-dir --upgrade-strategy only-if-needed -v \
-    einops \
-    flask-restful \
-    nltk \
-    pytest \
-    pytest-cov \
-    pytest_mock \
-    pytest-random-order \
-    sentencepiece \
-    tiktoken \
-    wrapt \
-    zarr \
-    wandb \
-    triton==2.1.0 \
-    causal_conv1d-1.2.2.post1-cp310-cp310-linux_x86_64.whl \
-    mamba_ssm-2.0.3-cp310-cp310-linux_x86_64.whl \
-    grouped_gemm-1.1.2-cp310-cp310-linux_x86_64.whl \
-    tensorstore==0.1.45 \
-    "nvidia-modelopt[torch]>=0.19.0" && \
-    rm *.whl
+RUN \
+    --mount=type=bind,source=requirements,target=requirements \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    --mount=type=bind,source=setup.py,target=setup.py \
+    --mount=type=bind,source=megatron/core/package_info.py,target=megatron/core/package_info.py \
+    --mount=type=bind,source=megatron/core/README.md,target=megatron/core/README.md \
+    --mount=type=bind,source=megatron/core/__init__.py,target=megatron/core/__init__.py <<"EOF" bash -ex
+
+pip install causal_conv1d-*.whl mamba_ssm-*.whl grouped_gemm-*.whl
+PY_ENV=pytorch:24.07 pip install .
+EOF
 
 # Since megatron does not have any dependencies (and isn't a dependency to any other package), we can install it separately to make everything a bit quicker
 ARG MCORE_REPO
@@ -65,7 +56,7 @@ git checkout $MCORE_REF
 
 # Checkout backwards-ref
 cd /opt
-rm -rf /opt/megatron-lm-$MCORE_BACKWARDS_REF; mkdir megatron-lm-$MCORE_BACKWARDS_REF; cd megatron-lm-$MCORE_BACKWARDS_REF
+rm -rf /opt/megatron-lm-legacy; mkdir megatron-lm-legacy; cd megatron-lm-legacy
 git init
 git remote add origin ${MCORE_REPO}
 git fetch origin $MCORE_BACKWARDS_REF
@@ -73,7 +64,7 @@ git checkout $MCORE_BACKWARDS_REF
 rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
 EOF
 
-RUN pip install -e /opt/megatron-lm
+RUN PY_ENV=pytorch:24.01 pip install -e /opt/megatron-lm
 ENV PYTHONPATH="/opt/megatron-lm:$PYTHONPATH"
 
 ##### For NVIDIANS only #####
@@ -81,7 +72,6 @@ FROM main as jet
 ARG CACHEBUST=0
 RUN --mount=type=secret,id=JET_INDEX_URLS \
     JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS) && \
-    pip install jet-client --upgrade $JET_INDEX_URLS && \
-    /opt/jet/bin/pip install jet-api --upgrade $JET_INDEX_URLS 
+    pip install jet-api "jet-client<2.0.0" --upgrade $JET_INDEX_URLS
 ENV PATH="$PATH:/opt/jet/bin"
 ###

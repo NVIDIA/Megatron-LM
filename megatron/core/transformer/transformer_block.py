@@ -15,7 +15,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import BaseTransformerLayer
+from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import is_te_min_version, make_viewless_tensor
 
@@ -404,6 +404,7 @@ class TransformerBlock(MegatronModule):
         attention_bias: Tensor = None,
         inference_params: InferenceParams = None,
         packed_seq_params: PackedSeqParams = None,
+        sequence_len_offset: Tensor = None,
     ):
         """
         Perform the forward pass through the transformer block.
@@ -435,6 +436,10 @@ class TransformerBlock(MegatronModule):
         if not self.pre_process:
             # See set_input_tensor()
             hidden_states = self.input_tensor
+
+        # Update the inference parameters with the current batch size in case it is variable
+        if inference_params and not self.training:
+            inference_params.current_batch_size = hidden_states.size(1)
 
         # Viewless tensor.
         # - We only need to create a viewless tensor in the case of micro batch
@@ -484,7 +489,7 @@ class TransformerBlock(MegatronModule):
         else:
             fp8_context = nullcontext()
 
-        with rng_context and fp8_context:
+        with rng_context, fp8_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = self._checkpointed_forward(
@@ -512,6 +517,7 @@ class TransformerBlock(MegatronModule):
                                 attention_bias=attention_bias,
                                 inference_params=inference_params,
                                 packed_seq_params=packed_seq_params,
+                                sequence_len_offset=sequence_len_offset,
                             )
                         else:
                             # CUDA graph replay for layer `l_no` and microbatch
@@ -576,12 +582,18 @@ class TransformerBlock(MegatronModule):
         non_homogeneous_layers = metadata is not None and metadata.get(
             'non_homogeneous_layers', False
         )
+        if isinstance(self.config.moe_layer_freq, int):
+            if self.config.moe_layer_freq > 1:
+                non_homogeneous_layers = True
+        elif isinstance(self.config.moe_layer_freq, list):
+            non_homogeneous_layers = True
+
         sharded_state_dict = {}
 
         layer_prefix = f'{prefix}layers.'
         num_layers = self.config.num_layers
         for layer in self.layers:
-            offset = layer._get_layer_offset()
+            offset = TransformerLayer._get_layer_offset(self.config)
 
             global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
             state_dict_prefix = f'{layer_prefix}{global_layer_offset - offset}.'  # module list index in TransformerBlock # pylint: disable=line-too-long

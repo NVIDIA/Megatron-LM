@@ -64,6 +64,8 @@ def _reshard_if_dtensor(
             setattr(sharded_tensor, k, v)
         return sharded_tensor
     return reference_tensor
+
+
 def _allreduce_conditional_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig):
     """
     All-reduce conditional embedding grads.

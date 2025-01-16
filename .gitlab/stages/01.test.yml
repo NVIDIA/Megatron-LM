@@ -41,7 +41,7 @@ test:build_image:
     DOCKER_TLS_VERIFY: 1
     DOCKER_CERT_PATH: '$DOCKER_TLS_CERTDIR/client'
     TAG: purpose/builder-large
-    STAGE: main
+    STAGE: jet
   script:
     - apk add bash
     - |
@@ -88,136 +88,146 @@ test:build_image:
   retry:
     max: 2
 
-.unit_tests:
-  extends: [.test_rules, .dind_rules]
+test:unit_tests_configure:
+  extends: [.test_rules]
   needs:
     - test:build_image
-    - test:docs_build
-    - test:formatting
-    - test:copyright
-  timeout: 180m
-  tags: [8xL40S]
-  variables:
-    GIT_STRATEGY: none
-  parallel:
-    matrix:
-      - BUCKET: tests/unit_tests/data/
-        BACKWARDS: 'true'
-      - BUCKET: tests/unit_tests/dist_checkpointing/
-        BACKWARDS: 'true'
-      - BUCKET: tests/unit_tests/distributed/
-        BACKWARDS: 'true'
-      - BUCKET: other
-        BACKWARDS: 'true'
-      - BUCKET: test_inference.py test_tokenizer.py test_utilities.py test_training.py
-        BACKWARDS: 'false'
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  tags: [mcore-docker-node-small]
+  before_script:
+    - git rm -r tests/test_utils/local_recipes || true
+    - git submodule add --force https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/ADLR/megatron-lm-convergence-tests.git tests/test_utils/local_recipes
+    - ls tests/test_utils/local_recipes
   script:
-    - docker run --name mcore_ci_${CI_PIPELINE_ID} -d --rm -e BUCKET -e BACKWARDS -e TAG -e IMAGE -e UNIT_TEST_REPEAT -e UNIT_TEST_TIMEOUT --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 ${IMAGE}:${CI_PIPELINE_ID} bash -c "sleep $(( ${UNIT_TEST_TIMEOUT} * 60 + 60 ))"
+    - set -x
     - |
-      CMD=$(cat <<"RUN_TEST_EOF"
-      set -euxo pipefail
-        
-      MCORE_DIR=$([[ "$TAG" == "latest" ]] && echo "" || echo "-$TAG/")
-
-      if [[ "$TAG" != "latest" && $BACKWARDS == "false" ]]; then
-        echo "No backwards checks on $BUCKET"
-        exit 0
-      fi
-
-      cd /opt/megatron-lm$MCORE_DIR;
-
-      for i in $(seq $UNIT_TEST_REPEAT); do
-        SEED=$((RANDOM % 9000 + 1000));
-        MARKER=()
-        if [[ $TAG != latest ]]; then
-          MARKER+=("not internal")
-        fi
-        if [[ "$IMAGE" == *dev* ]]; then
-          MARKER+=("not flaky_in_dev")
-        else
-          MARKER+=("not flaky")
-        fi
-        MARKER_ARG=$(printf "%s" "${MARKER[0]}")
-        for element in "${MARKER[@]:1}"; do
-          MARKER_ARG+=" and $element"
-        done
-
-        if [[ $BUCKET == other ]]; then
-          BUCKETS=($(cat /opt/megatron-lm/.gitlab/stages/01.test.yml | yq '.".unit_tests".parallel.matrix | del(.[] | select(.BUCKET == "other")) | .[].BUCKET' | tr " " "\n" | sed 's/[^ ]*/--ignore &/g' | tr "\n" " "))
-          IGNORE_ARGS=(${BUCKETS[@]})
-          BUCKET=tests/unit_tests
-        else
-          IGNORE_ARGS=()
-          BUCKET=${BUCKET}
-        fi
-
-        if [[ -d $BUCKET ]]; then
-          timeout ${UNIT_TEST_TIMEOUT}m torchrun --nproc_per_node=8 -m pytest -xvs --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail "${IGNORE_ARGS[@]}" -m "${MARKER_ARG}" $BUCKET
-        fi
-      done
-      RUN_TEST_EOF
+      A100_CLUSTER=$([[ "$FUNCTIONAL_TEST_CLUSTER_A100" != "" ]] && echo $FUNCTIONAL_TEST_CLUSTER_A100 || echo $DEFAULT_A100_CLUSTER)
+      H100_CLUSTER=$([[ "$FUNCTIONAL_TEST_CLUSTER_H100" != "" ]] && echo $FUNCTIONAL_TEST_CLUSTER_H100 || echo $DEFAULT_H100_CLUSTER)
+    - |
+      ARGS=(
+        "--scope unit-tests"
+        "--n-repeat ${UNIT_TEST_REPEAT}"
+        "--time-limit $(( UNIT_TEST_TIMEOUT * 60 ))"
+        "--test-cases all"
+        "--a100-cluster dgxa100_dracooci-ord"
+        "--h100-cluster dgxh100_coreweave"
+        "--h100-partition batch_short,batch"
+        "--container-image ${UTILITY_IMAGE}"
+        "--container-tag ${CI_PIPELINE_ID}"
+        "--dependent-job test:unit_tests_configure"
       )
-
-      docker exec mcore_ci_${CI_PIPELINE_ID} bash -c "$CMD"
-  after_script:
-    - docker container stop mcore_ci_${CI_PIPELINE_ID} || true
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment "lts" \
+        --tag "legacy" \
+        --output-path "unit-test-job-lts-legacy.yaml"
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment "lts" \
+        --tag "latest" \
+        --output-path "unit-test-job-lts-latest.yaml"
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment "dev" \
+        --tag "legacy" \
+        --output-path "unit-test-job-dev-legacy.yaml"
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment "dev" \
+        --tag "latest" \
+        --output-path "unit-test-job-dev-latest.yaml"
+  rules:
+    - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+      allow_failure: true
+      when: on_success
+    - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
+      when: on_success
   artifacts:
     paths:
-      - coverage
+      - unit-test-job-dev-legacy.yaml
+      - unit-test-job-dev-latest.yaml
+      - unit-test-job-lts-legacy.yaml
+      - unit-test-job-lts-latest.yaml
+      - tests/test_utils/local_recipes
+
+.unit_tests_run:
+  needs:
+    - test:formatting
+    - test:copyright
+    - job: test:secret_detection
+      optional: true
+    - test:unit_tests_configure
+  extends: [.test_rules]
+  trigger:
+    include:
+      - artifact: unit-test-job-$ENVIRONMENT-$TAG.yaml
+        job: test:unit_tests_configure
+    strategy: depend
+  variables:
+    RO_API_TOKEN: $PAT
+    CONTAINER_TAG: $CI_PIPELINE_ID
+    CI_MCORE_LTS_IMAGE: $CI_MCORE_LTS_IMAGE
+    GITLAB_ENDPOINT: $GITLAB_ENDPOINT
+    PARENT_PIPELINE_ID: $CI_PIPELINE_ID
+  inherit:
+    variables: true
   rules:
-    - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true" && $UNIT_TEST_REPEAT != '0'
+    - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
       when: on_success
     - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
       when: on_success
 
-test:pyt(LTS)_mcore(latest):
-  extends: [.unit_tests]
-  needs:
-    - test:pyt(LTS)_mcore(0.9.0)
-    - test:pyt(DEV)_mcore(0.9.0)
+test:unit_tests_pyt(DEV)_mcore(legacy):
+  extends: [.unit_tests_run]
   variables:
+    ENVIRONMENT: dev
+    TAG: legacy
+
+test:unit_tests_pyt(LTS)_mcore(legacy):
+  extends: [.unit_tests_run]
+  variables:
+    ENVIRONMENT: lts
+    TAG: legacy
+
+test:unit_tests_pyt(DEV)_mcore(latest):
+  extends: [.unit_tests_run]
+  variables:
+    ENVIRONMENT: dev
     TAG: latest
-    IMAGE: ${CI_MCORE_LTS_IMAGE}
 
-test:pyt(LTS)_mcore(0.9.0):
-  extends: [.unit_tests]
+test:unit_tests_pyt(LTS)_mcore(latest):
+  extends: [.unit_tests_run]
   variables:
-    TAG: core_r0.9.0
-    IMAGE: ${CI_MCORE_LTS_IMAGE}
-
-test:pyt(DEV)_mcore(latest):
-  extends: [.unit_tests]
-  needs:
-    - test:pyt(LTS)_mcore(0.9.0)
-    - test:pyt(DEV)_mcore(0.9.0)
-  variables:
+    ENVIRONMENT: lts
     TAG: latest
-    IMAGE: ${CI_MCORE_DEV_IMAGE}
-
-test:pyt(DEV)_mcore(0.9.0):
-  extends: [.unit_tests]
-  variables:
-    TAG: core_r0.9.0
-    IMAGE: ${CI_MCORE_DEV_IMAGE}
 
 test:notify_unit_tests:
   extends: [.test_rules]
-  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  image: badouralix/curl-jq
   needs:
-    - test:pyt(LTS)_mcore(latest)
-    - test:pyt(DEV)_mcore(latest)
-    - test:pyt(LTS)_mcore(0.9.0)
-    - test:pyt(DEV)_mcore(0.9.0)
+    - test:unit_tests_pyt(DEV)_mcore(latest)
+    - test:unit_tests_pyt(LTS)_mcore(latest)
   tags:
     - mcore-docker-node-small
   script:
+    - apk add bash
+    - apk add --update coreutils
     - env
     - export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
+    - export CONTEXT="unit-tests-extended"
     - export DATE=$(date +"%Y-%m-%d")
-    - bash tests/functional_tests/shell_test_utils/notify_unit_tests.sh ${CI_PIPELINE_ID}
+    - bash tests/test_utils/shell_scripts/notify.sh ${CI_PIPELINE_ID} "test:unit_tests_pyt"
   artifacts:
     when: always
     paths:
@@ -312,6 +322,7 @@ test:pypi_build_wheel:
   tags: [mcore-docker-node-small]
   variables:
     PUBLISH_DRYRUN: 'yes'
+    PY_ENV: pytorch:24.07
   script:
     - echo $PUBLISH_DRYRUN
     - >
@@ -319,6 +330,8 @@ test:pypi_build_wheel:
         PRE_RELEASE=$(sed -n "s/.*PRE_RELEASE = '\(.*\)'/\1/p" megatron/core/package_info.py)
         sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '${PRE_RELEASE}.dev$((RANDOM % 900000 + 100000))'" megatron/core/package_info.py 
       fi
+
+
     - /opt/python/cp310-cp310/bin/python -m build
     - /opt/python/cp311-cp311/bin/python -m build
     - auditwheel repair dist/*.whl
@@ -342,6 +355,8 @@ test:pypi_test_wheel:
     - RELEASE_NUMBER=$(python -c "from megatron import core; print(core.__version__)")
     - >
       echo "$EXPECTED_RELEASE_NUMBER" == "$RELEASE_NUMBER"
+
+
     - test "$EXPECTED_RELEASE_NUMBER" == "$RELEASE_NUMBER"
     - echo "RELEASE_NUMBER=$EXPECTED_RELEASE_NUMBER" | tee -a build.env
   artifacts:
@@ -369,11 +384,15 @@ test:pypi_push_wheel:
         export TWINE_USERNAME=$TWINE_PROD_USERNAME
         export TWINE_PASSWORT=$TWINE_PROD_PASSWORD
       fi
+
+
     - pip install twine
     - >
       for i in 1 2 3 4 5; do 
         twine upload --verbose -u $TWINE_USERNAME -p $TWINE_PASSWORT --repository $REPOSITORY wheelhouse/* && break || sleep $(( 60*2**i )); 
       done
+
+
   rules:
     - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
@@ -407,6 +426,8 @@ test:gh_release:
                       "generate_release_notes": false
                   }'
               )
+
+
     - >
       CMD=$(echo curl -L \
         -X POST \
@@ -416,12 +437,13 @@ test:gh_release:
         https://api.github.com/repos/NVIDIA/Megatron-LM/releases \
         -d "$PAYLOAD"
       )
-
+      
       if [[ "$PUBLISH_DRYRUN" == "yes" ]]; then
         echo "$CMD"
       else
         eval "$CMD"
       fi
+
 
 test:notify_release:
   needs: [test:pypi_test_wheel, test:pypi_push_wheel, test:gh_release]
@@ -444,6 +466,8 @@ test:notify_release:
             }
           ]
         }'
+
+
     - echo "$MESSAGE"
     - >
       CMD=$(echo curl \
@@ -451,9 +475,10 @@ test:notify_release:
         -H "Content-type: application/json" \
         --data "$MESSAGE" ${MCORE_NOTIFICATION_HOOK_MAIN}
       )
-
+      
       if [[ "$PUBLISH_DRYRUN" == "yes" ]]; then
         echo "$CMD"
       else
         eval "$CMD"
       fi
+

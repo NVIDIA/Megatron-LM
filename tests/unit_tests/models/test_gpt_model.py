@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import os
+
 import pytest
 import torch
 
@@ -13,6 +15,9 @@ from tests.unit_tests.test_utilities import Utils
 class TestGPTModel:
 
     def setup_method(self, method):
+        os.environ.pop('NVTE_FUSED_ATTN', None)
+        os.environ.pop('NVTE_FLASH_ATTN', None)
+        os.environ.pop('NVTE_UNFUSED_ATTN', None)
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
         transformer_config = TransformerConfig(
@@ -28,6 +33,7 @@ class TestGPTModel:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     def test_constructor(self):
         assert isinstance(self.gpt_model, GPTModel)
 
@@ -36,6 +42,7 @@ class TestGPTModel:
         num_weights = sum([p.numel() for p in self.gpt_model.parameters()])
         assert num_weights == 6240
 
+    @pytest.mark.internal
     def test_set_input_tensor(self):
         config: TransformerConfig = self.gpt_model.config
         sequence_length = self.gpt_model.max_sequence_length
@@ -50,6 +57,7 @@ class TestGPTModel:
         assert self.gpt_model.decoder.input_tensor.shape[1] == micro_batch_size
         assert self.gpt_model.decoder.input_tensor.shape[2] == config.hidden_size
 
+    @pytest.mark.internal
     def test_post_process_forward(self):
         config: TransformerConfig = self.gpt_model.config
         sequence_length = self.gpt_model.max_sequence_length
@@ -71,15 +79,3 @@ class TestGPTModel:
         assert logits.shape[0] == micro_batch_size
         assert logits.shape[1] == sequence_length
         assert logits.shape[2] == self.gpt_model.vocab_size
-
-    def test_no_post_process_forward(self):
-        pass
-
-    def test_no_preprocess_forward(self):
-        pass
-
-    def test_state_dict_for_save_checkpoint(self):
-        pass
-
-    def test_load_state_dict(self):
-        pass

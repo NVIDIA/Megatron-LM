@@ -38,6 +38,7 @@ class TRTLLMEngineBuilder:
         multiple_profiles: bool = False,
         gpt_attention_plugin: str = "auto",
         gemm_plugin: str = "auto",
+        reduce_fusion: bool = False,
     ):
         """Method to build the TRTLLM Engine
 
@@ -90,6 +91,7 @@ class TRTLLMEngineBuilder:
         plugin_config.remove_input_padding = remove_input_padding
         plugin_config.use_paged_context_fmha = paged_context_fmha
         plugin_config.multiple_profiles = multiple_profiles
+        plugin_config.reduce_fusion = reduce_fusion
 
         if max_seq_len is None:
             max_seq_len = max_input_len + max_output_len
@@ -137,12 +139,16 @@ class TRTLLMEngineBuilder:
             build_config.lora_config = lora_config
 
         model = model_cls.from_config(trtllm_model_config)
+
         model = optimize_model(
             model,
             use_parallel_embedding=trtllm_model_config.use_parallel_embedding,
             share_embedding_table=trtllm_model_config.share_embedding_table,
         )
+
         preprocess_weights(trtllm_model_weights, trtllm_model_config)
         model.load(trtllm_model_weights)
         engine = build_trtllm(model, build_config)
+
         engine.save(engine_dir)
+        return engine

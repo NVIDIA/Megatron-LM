@@ -5,6 +5,8 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import torch.nn.functional as F
 
+from megatron.core.transformer.enums import AttnBackend
+
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import get_te_version, init_method_normal, is_te_min_version, scaled_init_method_normal
 
@@ -36,6 +38,15 @@ class TransformerConfig(ModelParallelConfig):
 
     num_attention_heads: int = 0
     """Number of transformer attention heads."""
+
+    attention_backend: AttnBackend = AttnBackend.auto
+    """Attention backend to run. By default we let transformer engine
+    decide the best backend to run (except in the case of local).
+    If attention backend is local we use the local pytorch implementation in mcore. 
+    Users can specify exact backend by changing this config. """
+
+    softmax_scale: float = None
+    """Softmax scale for attention scaling."""
 
     num_query_groups: int = None
     """Number of query groups for group query attention. If None, normal attention is used."""
@@ -247,23 +258,47 @@ class TransformerConfig(ModelParallelConfig):
     """Enable overlapping between shared expert computations and dispatcher communications.
     Without this, the shared epxerts execute after the routed experts."""
 
+    moe_layer_freq: int = 1
+    """Frequency between MoE layers and Dense layers. Accepts either:
+    - An integer N: Represents a 1:N ratio, meaning one expert layer for every N-1 dense layers.
+    - A string containing a Python list expression that defines a custom pattern, e.g.:
+    "([1]*3+[0]*1)*3" evaluates to [1,1,1,0,1,1,1,0,1,1,1,0]
+    where 1 indicates an expert layer and 0 indicates a dense layer."""
+
+    moe_ffn_hidden_size: int = None
+    """MoE Feed-Forward Network hidden size"""
+
     moe_router_load_balancing_type: str = "aux_loss"
-    """Determines the load balancing strategy for the router. "aux_loss" corresponds to the load
-    balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing
-    algorithm used in S-BASE, and "none" implies no load balancing."""
+    """The load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss 
+    used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the loss used in DeepSeekV2, 
+    which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing 
+    algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss"."""
 
     moe_router_topk: int = 2
     """Number of experts to route to for each token."""
 
+    moe_router_topk_limited_devices: int = None
+    """Number of expert parallel ranks to consider for each token during routing. Perform top-k
+    routing on a subset of expert parallel ranks by first selecting N ranks for each token, then
+    conducting top-k selection among experts on these devices. None means no device limitation."""
+
     moe_router_pre_softmax: bool = False
     """Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. 
     By default, softmax is done after top-k."""
+
+    moe_router_topk_scaling_factor: float = None
+    """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax 
+    enabled. Defaults to None, which means no scaling."""
 
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
     in a single kernel launch to improve the utilization and performance by leveraging the Grouped
     GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
     """
+
+    moe_use_legacy_grouped_gemm: bool = False
+    """Use legacy GroupedMLP rather than TEGroupedMLP.
+    Note: The legacy one will be deprecated soon."""
 
     moe_aux_loss_coeff: float = 0  # 1e-2 would be a good start value for load balance loss.
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended."""
@@ -336,6 +371,11 @@ class TransformerConfig(ModelParallelConfig):
     enable_cuda_graph: bool = False
     """When set to true, TransformerLayer layers are swapped with a CUDA graphed version."""
 
+    cuda_graph_retain_backward_graph: bool = False
+    """When set to true, cudagraph backward passes will be graph captured with 'retain_grad=True'
+    This may enable cudagraphs for certain modules that are not completely cudagraph safe. For 
+    more details, see: https://pytorch.org/docs/stable/generated/torch.Tensor.backward.html."""
+
     external_cuda_graph: bool = False
     """When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
 
@@ -344,6 +384,12 @@ class TransformerConfig(ModelParallelConfig):
 
     flash_decode: bool = False
     """ Use the optimized flash decoding kernel during inference. """
+
+    use_te_rng_tracker: bool = False
+    """ Whether to use the TE or MCore version of the RNG tracker. """
+
+    inference_rng_tracker: bool = False
+    """ Whether we should instantiate a separate RNG tracker for inference. """
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
@@ -386,6 +432,9 @@ class TransformerConfig(ModelParallelConfig):
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError('num_moe_experts must be non-negative.')
 
+        if self.moe_ffn_hidden_size is None:
+            self.moe_ffn_hidden_size = self.ffn_hidden_size
+
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:
                 raise ValueError(
@@ -407,7 +456,7 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.moe_expert_capacity_factor < 0:
                 self.moe_expert_capacity_factor = None
-            if self.moe_router_load_balancing_type not in ["aux_loss", "none"]:
+            if self.moe_router_load_balancing_type not in ["aux_loss", "seq_aux_loss", "none"]:
                 raise ValueError(
                     'moe_expert_capacity_factor only works with aux_loss or none load balancing'
                 )
@@ -508,9 +557,12 @@ class TransformerConfig(ModelParallelConfig):
             if self.rotary_interleaved:
                 raise ValueError("rotary_interleaved does not work with apply_rope_fusion.")
 
-            from megatron.core.models.common.embeddings.rope_utils import HAVE_APPLY_ROPE_FUSION
+            from megatron.core.models.common.embeddings.rope_utils import (
+                fused_apply_rotary_pos_emb,
+                fused_apply_rotary_pos_emb_thd,
+            )
 
-            if not HAVE_APPLY_ROPE_FUSION:
+            if fused_apply_rotary_pos_emb is None and fused_apply_rotary_pos_emb_thd is None:
                 raise ValueError(
                     "apply_rope_fusion is not available. Please install TE >= 1.4 or Apex."
                 )
@@ -526,17 +578,13 @@ class TransformerConfig(ModelParallelConfig):
                 self.init_method_std, self.num_layers
             )
 
-        if self.moe_extended_tp:
-            if self.moe_token_dispatcher_type != 'allgather':
-                raise ValueError(
-                    "Moe extended TP parallelism only applies to allgather based token dispatcher."
-                )
-            extended_tp_size = self.tensor_model_parallel_size * self.expert_model_parallel_size
-            if self.ffn_hidden_size % extended_tp_size != 0:
-                raise ValueError(
-                    f'ffn_hidden_size: {self.ffn_hidden_size} must be divisible by '
-                    f'extended_tp_size {extended_tp_size}'
-                )
+        if (
+            self.moe_token_dispatcher_type == "alltoall_seq"
+            and self.tensor_model_parallel_size != self.expert_tensor_parallel_size
+        ):
+            raise ValueError(
+                "alltoall_seq dispatcher not support different TP size for MoE and Dense layer."
+            )
 
         if self.num_moe_experts and self.fp8:
             # TE version below 1.7.0 will raise Error when handle zeros tokens for expert
@@ -552,8 +600,22 @@ class TransformerConfig(ModelParallelConfig):
                     f"but your version is {get_te_version()}."
                 )
 
+        if self.moe_router_topk_limited_devices:
+            if self.moe_router_topk_limited_devices > self.expert_model_parallel_size:
+                raise ValueError(
+                    f"moe_router_topk_limited_devices: {self.moe_router_topk_limited_devices} "
+                    f"must be smaller than expert_model_parallel_size "
+                    f"{self.expert_model_parallel_size}"
+                )
+
         if self.flash_decode and self.fp8:
             raise ValueError("FP8 inference is currently not support with flash decoding.")
+
+        if self.enable_cuda_graph:
+            if self.cpu_offloading:
+                raise ValueError("CUDA graphs not supported with CPU offloading.")
+            if self.recompute_granularity:
+                raise ValueError("CUDA graphs not supported with activation recomputation.")
 
         if self.moe_token_dispatcher_type in ['allgather', 'alltoall_seq']:
             if self.variable_seq_lengths is True:

@@ -2,12 +2,12 @@
 import time
 import typing
 from collections import OrderedDict
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 
-from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.inference_request import InferenceRequest, Status
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import Counter
 
 
@@ -23,18 +23,18 @@ class Scheduler:
 
     def __init__(self, max_batch_size: int):
         self.max_batch_size = max_batch_size
-        self.active_request_pool: Dict[int, InferenceRequest] = OrderedDict()
-        self.waiting_request_pool: Dict[int, InferenceRequest] = OrderedDict()
-        self.completed_request_pool: Dict[int, InferenceRequest] = OrderedDict()
+        self.active_request_pool: Dict[str, InferenceRequest] = OrderedDict()
+        self.waiting_request_pool: Dict[str, InferenceRequest] = OrderedDict()
+        self.completed_request_pool: Dict[str, InferenceRequest] = OrderedDict()
         self.request_counter = Counter()
 
     def add_request(
         self,
         prompt: str,
         prompt_tokens: torch.Tensor,
-        encoder_prompt: str = None,
-        inference_parameters: CommonInferenceParams = None,
-        arrival_time: float = None,
+        encoder_prompt: Optional[str] = None,
+        inference_parameters: Optional[SamplingParams] = None,
+        arrival_time: Optional[float] = None,
     ):
         """Add an incoming request
 
@@ -45,8 +45,11 @@ class Scheduler:
             prompt (str): Input prompt string
             prompt_tokens (torch.Tensor): A torch tensor having the input prompts tokenized
             encoder_prompt (str): Encoder input string
-            inference_parameters (CommonInferenceParams): The inference parameters
+            inference_parameters (SamplingParams): The inference parameters
             arrival_time (float, optional): The incoming request time. Defaults to None.
+
+        Returns:
+            The request_id for the new request.
         """
         request_id = str(next(self.request_counter))
 
@@ -58,6 +61,9 @@ class Scheduler:
             if len(self.active_request_pool) < self.max_batch_size
             else Status.WAITING_IN_QUEUE
         )
+
+        if inference_parameters is None:
+            inference_parameters = SamplingParams()
 
         inference_request = InferenceRequest(
             request_id=request_id,
@@ -73,6 +79,8 @@ class Scheduler:
             self.active_request_pool[request_id] = inference_request
         else:
             self.waiting_request_pool[request_id] = inference_request
+
+        return request_id
 
     def have_requests_pending(self) -> bool:
         """Method to check if there are requests pending
@@ -98,7 +106,9 @@ class Scheduler:
             earliest_waiting_request.status = Status.ACTIVE_BUT_NOT_GENERATING_TOKENS
             self.active_request_pool[earliest_waiting_request_request_id] = earliest_waiting_request
 
-    def update_requests_pools(self, result_dict: typing.OrderedDict[int, InferenceRequest] = None):
+    def update_requests_pools(
+        self, result_dict: Optional[typing.OrderedDict[str, InferenceRequest]] = None
+    ):
         """Update request pool status
 
         This method will full up the active request pool, if it has less than max batch size
@@ -107,7 +117,7 @@ class Scheduler:
         request pool and add waiting request into active pool.
 
         Args:
-            result (typing.OrderedDict[int, InferenceRequest], optional): The result returned
+            result (typing.OrderedDict[str, InferenceRequest], optional): The result returned
                 by the engine. A dictionary with keys as the request ids, and values as the
                 requests. Defaults to None
         """

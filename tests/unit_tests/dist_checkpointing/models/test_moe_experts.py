@@ -15,7 +15,10 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
 )
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -43,22 +46,25 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
     )
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs)
-    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-        num_experts=num_moe_experts, moe_grouped_gemm=(expert_type != 'sequential'), fp8=fp8
-    )
     if expert_type == 'grouped':
         model = GroupedMLP(num_local_experts, transformer_config)
     elif expert_type == 'te_grouped':
+        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=num_moe_experts, moe_grouped_gemm=True
+        )
         model = TEGroupedMLP(
             num_local_experts,
             transformer_config,
-            transformer_layer_spec.submodules.mlp.submodules.experts,
+            transformer_layer_spec.submodules.mlp.submodules.experts.submodules,
         )
     elif expert_type == 'sequential':
+        transformer_layer_spec = get_gpt_layer_local_spec(
+            num_experts=num_moe_experts, moe_grouped_gemm=False
+        )
         model = SequentialMLP(
             num_local_experts,
             transformer_config,
-            transformer_layer_spec.submodules.mlp.submodules.experts,
+            transformer_layer_spec.submodules.mlp.submodules.experts.submodules,
         )
     else:
         raise ValueError('expert_type can only be one of ["sequential", "grouped", "te_grouped"]')
@@ -86,38 +92,65 @@ class TestExpertLayerReconfiguration:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     @pytest.mark.parametrize(
-        "use_fpsl,src_tp_pp_exp,dest_tp_pp_exp,use_glu",
+        "use_fpsl,src_tp_pp_ep_etp,dest_tp_pp_ep_etp,use_glu",
         [
             # changing PP is impossible because the number of layers must be the same
-            (False, (2, 4, 1), (2, 4, 1), False),
-            (True, (2, 4, 1), (2, 4, 1), False),
-            (False, (1, 1, 1), (1, 1, 1), False),
-            (True, (1, 1, 1), (1, 1, 4), False),
-            (False, (1, 1, 8), (1, 1, 2), False),
-            (False, (2, 2, 2), (4, 2, 1), False),
-            (True, (1, 1, 4), (8, 1, 1), False),
-            (False, (1, 8, 1), (1, 8, 1), False),
-            (False, (1, 1, 4), (2, 1, 1), False),
-            (False, (1, 1, 1), (1, 1, 1), True),
-            (False, (1, 1, 1), (1, 1, 4), True),
-            (True, (1, 1, 1), (2, 1, 1), True),
-            (False, (1, 1, 4), (8, 1, 1), True),
+            (False, (2, 4, 1, 2), (2, 4, 1, 2), False),
+            (True, (2, 4, 1, 2), (2, 4, 1, 2), False),
+            (False, (2, 4, 1, 2), (1, 4, 1, 2), False),
+            (True, (2, 1, 1, 2), (1, 1, 1, 2), False),
+            (False, (1, 1, 1, 1), (1, 1, 1, 1), False),
+            (True, (1, 1, 1, 1), (1, 1, 4, 1), False),
+            (False, (1, 1, 8, 1), (1, 1, 2, 1), False),
+            (False, (2, 2, 2, 2), (4, 2, 1, 4), False),
+            (True, (1, 1, 4, 1), (8, 1, 1, 1), False),
+            (False, (1, 8, 1, 1), (1, 8, 1, 1), False),
+            (False, (1, 1, 4, 1), (2, 1, 1, 2), False),
+            (False, (2, 1, 4, 1), (2, 1, 1, 4), False),
+            (False, (1, 1, 1, 1), (1, 1, 1, 1), True),
+            (False, (1, 1, 1, 1), (1, 1, 4, 1), True),
+            (True, (1, 1, 1, 1), (2, 1, 1, 1), True),
+            (False, (1, 1, 4, 1), (8, 1, 1, 8), True),
         ],
     )
     @pytest.mark.parametrize("expert_type", expert_type)
+    @pytest.mark.parametrize(
+        "load_order,store_order",
+        [
+            ("tp-ep-dp-pp", "tp-ep-dp-pp"),
+            # ("tp-ep-dp-pp", "ep-tp-dp-pp"),
+            # ("ep-tp-dp-pp", "ep-tp-dp-pp"),
+            # ("ep-tp-dp-pp", "tp-ep-dp-pp"),
+        ],
+    )
     def test_parallel_reconfiguration_e2e(
-        self, tmp_path_dist_ckpt, src_tp_pp_exp, dest_tp_pp_exp, use_glu, use_fpsl, expert_type
+        self,
+        tmp_path_dist_ckpt,
+        src_tp_pp_ep_etp,
+        dest_tp_pp_ep_etp,
+        use_glu,
+        use_fpsl,
+        expert_type,
+        load_order,
+        store_order,
     ):
-        """Test model saving and loading with different TP/PP/expert parallelism"""
-        src_tp, src_pp, src_exp = src_tp_pp_exp
-        dest_tp, dest_pp, dest_exp = dest_tp_pp_exp
+        """Test model saving and loading with different TP/PP/EP/ETP(expert-tensor-parallel)"""
+        src_tp, src_pp, src_ep, src_etp = src_tp_pp_ep_etp
+        dest_tp, dest_pp, dest_ep, dest_etp = dest_tp_pp_ep_etp
         if expert_type == 'grouped':
             add_bias_linear = False
         else:
             add_bias_linear = True
         # Save checkpoint A
-        Utils.initialize_model_parallel(src_tp, src_pp, expert_model_parallel_size=src_exp)
+        Utils.initialize_model_parallel(
+            src_tp,
+            src_pp,
+            expert_model_parallel_size=src_ep,
+            expert_tensor_parallel_size=src_etp,
+            order=store_order,
+        )
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_expert_layer_reconfiguration_model_A'
         ) as ckpt_dir_A, TempNamedDir(
@@ -138,9 +171,15 @@ class TestExpertLayerReconfiguration:
             save(sharded_state_dict, ckpt_dir_A, save_strategy)
             Utils.destroy_model_parallel()
 
-            # Load checkpoint A with different TP/PP/expert and save as checkpoint B
+            # Load checkpoint A with different TP/PP/EP and save as checkpoint B
             # No FPS this time, only FPL
-            Utils.initialize_model_parallel(dest_tp, dest_pp, expert_model_parallel_size=dest_exp)
+            Utils.initialize_model_parallel(
+                dest_tp,
+                dest_pp,
+                expert_model_parallel_size=dest_ep,
+                expert_tensor_parallel_size=dest_etp,
+                order=load_order,
+            )
             model_B = initialize_expert_layer(
                 1, use_glu, expert_type, add_bias_linear=add_bias_linear
             )
@@ -168,6 +207,7 @@ class TestExpertLayerReconfiguration:
             diffs = diff(state_dict_A, state_dict_B)
             assert not any(map(bool, diffs)), diffs
 
+    @pytest.mark.internal
     @pytest.mark.parametrize(
         "src_tp_pp_exp,dest_tp_pp_exp,use_glu",
         [
@@ -316,5 +356,30 @@ class TestExpertLayerReconfiguration:
                 rtol=0,
                 atol=0,
             )
+
+            Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not is_te_min_version("1.9.0"),
+        reason="TEGroupedMLP is only supported in TE 1.9.0 and later.",
+    )
+    @pytest.mark.parametrize("ep_size", [1, 2])
+    def test_te_grouped_linear_torch_native(self, tmp_path_dist_ckpt, ep_size):
+        """Test saving and loading torch native checkpoints"""
+        use_glu = True
+        Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=ep_size)
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_te_grouped_linear_torch_native') as ckpt_dir:
+            tokens_per_expert = torch.tensor([16] * (8 // ep_size))
+            input_tensor = torch.randn(tokens_per_expert.sum(), 16, device="cuda")
+
+            # Save checkpoint
+            model = initialize_expert_layer(1, use_glu, expert_type="te_grouped")
+            model = model.cuda()
+            model(input_tensor, tokens_per_expert)
+            torch.save(model.state_dict(), ckpt_dir / f"model_ep{torch.distributed.get_rank()}.pt")
+
+            # Load checkpoint
+            state_dict = torch.load(ckpt_dir / f"model_ep{torch.distributed.get_rank()}.pt")
+            model.load_state_dict(state_dict)
 
             Utils.destroy_model_parallel()

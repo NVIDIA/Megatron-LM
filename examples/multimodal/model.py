@@ -4,7 +4,7 @@ from copy import deepcopy
 
 import torch
 from config import get_language_model_config, get_vision_model_config, get_vision_projection_config
-from layer_specs import get_layer_spec, get_layer_spec_te, get_mlp_module_spec
+from layer_specs import get_layer_spec, get_layer_spec_te, get_mlp_module_spec, get_norm_mlp_module_spec_te
 
 from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN, LLaVAModel
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
@@ -131,7 +131,24 @@ def model_provider(
     # Make sure the vision model does not inherit first and last pipeline num layers from the language model.
     vision_config.first_pipeline_num_layers = vision_config.last_pipeline_num_layers = None
 
-    vision_projection_layer_spec = get_mlp_module_spec(use_te=use_te).submodules
+    if vision_projection_config.normalization:
+        vision_projection_layer_spec = get_norm_mlp_module_spec_te().submodules
+    else:
+        vision_projection_layer_spec = get_mlp_module_spec(use_te=use_te).submodules
+
+    # Toggle --recompute* for the vision and language model separately.
+    if args.recompute_vision:
+        if vision_config.recompute_method is not None and vision_config.recompute_granularity is not None:
+            vision_config.recompute_num_layers = vision_config.num_layers
+    else:
+        vision_config.recompute_granularity = None
+        vision_config.recompute_method = None
+        vision_config.recompute_num_layers = None
+
+    vision_projection_config.recompute_granularity = None
+    vision_projection_config.recompute_method = None
+    vision_projection_config.recompute_num_layers = None
+
 
     tokenizer = get_tokenizer()
     image_token_index = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
@@ -183,7 +200,7 @@ def _get_tile_tags(args, tokenizer):
 
     # We expect the tokenized length of the tags is same.
     thumbnail_tag_text = "<tile_global_thumbnail>"
-    if args.tokenizer_prompt_format == "chatml":
+    if args.tokenizer_prompt_format == "nvlm-yi-34b":
         thumbnail_tag_text = "<tile_global>"
 
     assert args.max_num_tiles <= 6, "Up to 6 tile tags used"

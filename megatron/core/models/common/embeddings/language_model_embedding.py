@@ -20,7 +20,9 @@ class LanguageModelEmbedding(MegatronModule):
                              is used for positional embedding
         add_position_embedding (bool): Add a position embedding.
         embedding_dropout_prob (float): dropout probability for embeddings
-        num_tokentypes (int): Set to 0 without binary head, and 2 with a binary head . Defaults to 0.
+        num_tokentypes (int): Set to 0 without binary head, and 2 with a binary head. Defaults to 0.
+        scatter_to_sequence_parallel (bool): Set to False to disable scatter of embedding
+            across sequence parallel region. Defaults to True.
     """
 
     def __init__(
@@ -30,6 +32,7 @@ class LanguageModelEmbedding(MegatronModule):
         max_sequence_length: int,
         position_embedding_type: Literal['learned_absolute', 'rope', 'none'] = 'learned_absolute',
         num_tokentypes: int = 0,
+        scatter_to_sequence_parallel: bool = True,
     ):
         super().__init__(config=config)
 
@@ -38,10 +41,12 @@ class LanguageModelEmbedding(MegatronModule):
         self.max_sequence_length: int = max_sequence_length
         self.add_position_embedding: bool = position_embedding_type == 'learned_absolute'
         self.num_tokentypes = num_tokentypes
+        self.scatter_to_sequence_parallel = scatter_to_sequence_parallel
         self.reduce_scatter_embeddings = (
             (not self.add_position_embedding)
             and self.num_tokentypes <= 0
             and self.config.sequence_parallel
+            and self.scatter_to_sequence_parallel
         )
 
         # Word embeddings (parallel).
@@ -92,7 +97,8 @@ class LanguageModelEmbedding(MegatronModule):
         Args:
             input_ids (Tensor): The input tokens
             position_ids (Tensor): The position id's used to calculate position embeddings
-            tokentype_ids (int): The token type ids. Used when args.bert_binary_head is set to True. Defaults to None
+            tokentype_ids (int): The token type ids. Used when args.bert_binary_head is
+                set to True. Defaults to None
 
         Returns:
             Tensor: The output embeddings
@@ -122,12 +128,12 @@ class LanguageModelEmbedding(MegatronModule):
 
         # Dropout.
         if self.config.sequence_parallel:
-            if not self.reduce_scatter_embeddings:
+            if not self.reduce_scatter_embeddings and self.scatter_to_sequence_parallel:
                 embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
             # `scatter_to_sequence_parallel_region` returns a view, which prevents
             # the original tensor from being garbage collected. Clone to facilitate GC.
             # Has a small runtime cost (~0.5%).
-            if self.config.clone_scatter_output_in_embedding:
+            if self.config.clone_scatter_output_in_embedding and self.scatter_to_sequence_parallel:
                 embeddings = embeddings.clone()
             with tensor_parallel.get_cuda_rng_tracker().fork():
                 embeddings = self.embedding_dropout(embeddings)

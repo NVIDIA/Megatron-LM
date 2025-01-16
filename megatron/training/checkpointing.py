@@ -28,6 +28,7 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import \
     FullyParallelSaveStrategyWrapper, FullyParallelLoadStrategyWrapper
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.utils import is_float8tensor
+from megatron.core.rerun_state_machine import get_rerun_state_machine
 from .async_utils import schedule_async_save
 from .global_vars import get_args, get_one_logger
 from .utils import unwrap_model, print_rank_0, append_to_progress_log, is_last_rank
@@ -360,6 +361,12 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     # Collect rng state across data parallel ranks.
     rng_state = get_rng_state(ckpt_type != CheckpointType.LEGACY)
 
+    # Collect rerun state across all ranks
+    rerun_state_machine = get_rerun_state_machine()
+    rerun_state = rerun_state_machine.state_dict(
+        data_iterator=train_data_iterator, use_dist_ckpt=ckpt_type != CheckpointType.LEGACY
+    )
+
     # Checkpoint name.
     return_base_dir = (ckpt_type != CheckpointType.LEGACY)
     checkpoint_name = get_checkpoint_name(save_dir, iteration, release=False, pipeline_parallel=pipeline_parallel,
@@ -378,7 +385,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         optim_checkpoint_name = \
             get_distributed_optimizer_checkpoint_name(checkpoint_name)
         ensure_directory_exists(optim_checkpoint_name)
-        optimizer.save_parameter_state(optim_checkpoint_name)
+        if not optimizer.is_stub_optimizer:
+            optimizer.save_parameter_state(optim_checkpoint_name)
 
     async_save_request = None
     if args.async_save:
@@ -391,7 +399,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     # Collect args, model, RNG.
     if not torch.distributed.is_initialized() \
-            or mpu.get_data_modulo_expert_parallel_rank(with_context_parallel=True) == 0 \
+            or mpu.get_expert_data_parallel_rank() == 0 \
             or ckpt_type != CheckpointType.LEGACY:
         optim_sd_kwargs = {}
         if ckpt_type != CheckpointType.LEGACY and args.use_distributed_optimizer:
@@ -405,9 +413,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             optimizer,
             opt_param_scheduler,
             rng_state,
-            ckpt_type != CheckpointType.LEGACY,
-            iteration,
+            use_dist_ckpt=ckpt_type != CheckpointType.LEGACY,
+            iteration=iteration,
             optim_sd_kwargs=optim_sd_kwargs,
+            rerun_state=rerun_state,
         )
 
         if args.enable_ft_package and ft_client is not None:
@@ -481,8 +490,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             def iter_finalize_fn():
                 with open(tracker_filename, 'w') as f:
                     f.write(str(iteration))
-                print_rank_0('  successfully saved checkpoint from iteration {:7d} to {}'
-                             .format(iteration, args.save))
+                print_rank_0(f'  successfully saved checkpoint from iteration {int(iteration):7d} to {args.save} '
+                             f'[ t {(tensor_rank if tensor_rank is not None else mpu.get_tensor_model_parallel_rank()) + 1}/{mpu.get_tensor_model_parallel_world_size()}, '
+                             f'p {(pipeline_rank if pipeline_rank is not None else mpu.get_pipeline_model_parallel_rank()) + 1}/{mpu.get_pipeline_model_parallel_world_size()} ]')
                 if args.log_progress and args.async_save:
                     append_to_progress_log(f'Saved async checkpoint\tIteration: {iteration}',
                                            barrier=False)
@@ -590,7 +600,7 @@ def save_dataloader_state(train_iterator, iteration, dataloader_save_path):
 
 def generate_state_dict(args, model, optimizer, opt_param_scheduler,
                         rng_state, use_dist_ckpt=False, iteration=None,
-                        optim_sd_kwargs=None):
+                        optim_sd_kwargs=None, rerun_state=None):
     # Arguments, iteration, and model.
     state_dict = {}
     state_dict['args'] = args
@@ -611,13 +621,17 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
                 model[i].state_dict_for_save_checkpoint())
     # Optimizer stuff.
     if not args.no_save_optim:
-        if optimizer is not None:
+        if optimizer is not None and not optimizer.is_stub_optimizer:
             state_dict['optimizer'] = (optimizer.sharded_state_dict(state_dict, **(optim_sd_kwargs or {}))
                                        if use_dist_ckpt else
                                        optimizer.state_dict())
         if opt_param_scheduler is not None:
             state_dict['opt_param_scheduler'] = \
                 opt_param_scheduler.state_dict()
+
+    # Rerun state
+    state_dict['rerun_state_machine'] = rerun_state
+
     # RNG states.
     if not args.no_save_rng:
         state_dict["rng_state"] = rng_state
@@ -944,6 +958,7 @@ def load_args_from_checkpoint(
         else:
             print_rank_0(f"Checkpoint did not provide arguments {arg_name}")
 
+    # Model args.
     _set_arg('num_layers')
     _set_arg('hidden_size')
     _set_arg('ffn_hidden_size')
@@ -956,24 +971,56 @@ def load_args_from_checkpoint(
     _set_arg('position_embedding_type', force=True)
     _set_arg('add_position_embedding', force=True)
     _set_arg('use_rotary_position_embeddings', force=True)
+    _set_arg('rotary_base', force=True)
     _set_arg('rotary_percent', force=True)
     _set_arg('rotary_interleaved', force=True)
     _set_arg('add_bias_linear', force=True)
     _set_arg('add_qkv_bias', force=True)
+    _set_arg('squared_relu', force=True)
     _set_arg('swiglu', force=True)
     _set_arg('untie_embeddings_and_output_weights', force=True)
     _set_arg('apply_layernorm_1p', force=True)
     _set_arg('normalization', force=True)
-    _set_arg('tokenizer_type')
-    _set_arg('padded_vocab_size')
     _set_arg('apply_query_key_layer_scaling', force=True)
-    if checkpoint_version < 3.0:
-        _set_arg('tensor_model_parallel_size', 'model_parallel_size')
-    else:
-        _set_arg('tensor_model_parallel_size', force=True)
-        _set_arg('pipeline_model_parallel_size', force=True)
-        _set_arg('virtual_pipeline_model_parallel_size', force=True)
-        _set_arg('num_layers_per_virtual_pipeline_stage')
+    _set_arg('attention_dropout', force=True)
+    _set_arg('hidden_dropout', force=True)
+
+    _set_arg('hybrid_override_pattern', force=True)
+    _set_arg('spec', force=True)
+    _set_arg('hybrid_attention_ratio', force=True)
+    _set_arg('hybrid_mlp_ratio', force=True)
+
+    _set_arg('num_experts', force=True)
+    _set_arg('moe_layer_freq', force=True)
+    _set_arg('moe_ffn_hidden_size', force=True)
+    _set_arg('moe_router_topk', force=True)
+    _set_arg('moe_token_dispatcher_type', force=True)
+    _set_arg('moe_router_pre_softmax', force=True)
+    _set_arg('moe_grouped_gemm', force=True)
+    _set_arg('moe_shared_expert_intermediate_size', force=True)
+
+    # Tokenizer args.
+    _set_arg('tokenizer_type', force=True)
+    # Using checkpoint version might not always be safe (e.g., if running on different cluster).
+    if args.use_tokenizer_model_from_checkpoint_args:
+        _set_arg('tokenizer_model', force=True)
+    _set_arg('tiktoken_pattern', force=True)
+    _set_arg('padded_vocab_size')
+
+    # Checkpoint args.
+    _set_arg('ckpt_format')
+
+    # Model parallelism args.
+    if args.use_mp_args_from_checkpoint_args:
+        if checkpoint_version < 3.0:
+            _set_arg('tensor_model_parallel_size', 'model_parallel_size')
+        else:
+            _set_arg('tensor_model_parallel_size', force=True)
+            _set_arg('pipeline_model_parallel_size', force=True)
+            _set_arg('virtual_pipeline_model_parallel_size', force=True)
+            _set_arg('num_layers_per_virtual_pipeline_stage')
+            _set_arg('expert_model_parallel_size', force=True)
+
     return args, checkpoint_args
 
 
@@ -1093,6 +1140,17 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 gen_sd_optim = None
                 gen_sd_opt_param_scheduler = None
 
+            # Determine if rerun state will be loaded
+            if (ckpt_tp_pp == run_tp_pp and not release and not args.finetune):
+                rerun_state_machine = get_rerun_state_machine()
+                gen_sd_rerun_state = rerun_state_machine.state_dict(
+                    data_iterator=None, use_dist_ckpt=True
+                )
+            else:
+                gen_sd_rerun_state = None
+                if ckpt_tp_pp != run_tp_pp:
+                    print_rank_0("{}: Rerun state will be ignored".format(mismatch_msg))
+
             # [ModelOpt]: Initial loading from non-resume sharded checkpoint to a Distillation Model
             # will result in key mismatch with loss modules potentially containing parameters, since
             # it requires generating a state_dict before loading. Here we hide those modules if present.
@@ -1100,8 +1158,10 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 if args.finetune and hasattr(model[0], "hide_loss_modules"):
                     for m in model:
                         stack.enter_context(m.hide_loss_modules())
-                load_kwargs['sharded_state_dict'] = generate_state_dict(args, model, gen_sd_optim, gen_sd_opt_param_scheduler,
-                                                                        gen_sd_rng_state, True, optim_sd_kwargs=optim_sd_kwargs)
+                load_kwargs['sharded_state_dict'] = generate_state_dict(
+                    args, model, gen_sd_optim, gen_sd_opt_param_scheduler, gen_sd_rng_state,
+                    use_dist_ckpt=True, optim_sd_kwargs=optim_sd_kwargs, rerun_state=gen_sd_rerun_state
+                )
 
             # When "--fp8-param-gather" is disabled, this function doesn't modify anything.
             fix_fp8_params_lose_precision_when_loading_dist_ckpt(load_kwargs['sharded_state_dict'])
@@ -1185,7 +1245,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     if not release and not args.finetune and not args.no_load_optim:
         try:
             # Load state dict.
-            if not skip_load_to_model_and_opt and optimizer is not None:
+            if not skip_load_to_model_and_opt and optimizer is not None and not optimizer.is_stub_optimizer:
                 optimizer.load_state_dict(state_dict['optimizer'])
 
             # Load distributed optimizer's custom parameter state.
@@ -1219,6 +1279,14 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     else:
         if (args.fp16 or args.bf16) and optimizer is not None:
             optimizer.reload_model_params()
+
+    # rerun state
+    try:
+        if 'rerun_state_machine' in state_dict:
+            get_rerun_state_machine().load_state_dict(state_dict['rerun_state_machine'])
+    except Exception as e:
+        print(f"Unable to restore RerunMachine from checkpoint: {e}")
+        sys.exit()
 
     # rng states.
     if not release and not args.finetune and not args.no_load_rng:
@@ -1260,8 +1328,8 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         torch.distributed.barrier()
 
     print_rank_0(f'  successfully loaded checkpoint from {load_dir} '
-                 f'[ t {mpu.get_tensor_model_parallel_rank()}, '
-                 f'p {mpu.get_pipeline_model_parallel_rank()} ] '
+                 f'[ t {mpu.get_tensor_model_parallel_rank() + 1}/{mpu.get_tensor_model_parallel_world_size()}, '
+                 f'p {mpu.get_pipeline_model_parallel_rank() + 1}/{mpu.get_pipeline_model_parallel_world_size()} ] '
                  f'at iteration {iteration}')
 
     torch.cuda.empty_cache()

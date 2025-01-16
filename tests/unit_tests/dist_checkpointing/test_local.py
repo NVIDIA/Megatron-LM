@@ -82,8 +82,8 @@ class TestLocalCheckpointing:
             optimizer,
             opt_param_scheduler,
             rng_state,
-            use_dist_ckpt,
-            iteration,
+            use_dist_ckpt=use_dist_ckpt,
+            iteration=iteration,
             optim_sd_kwargs=optim_sd_kwargs,
         )
         sharded_tensor_factories = find_matching_values(
@@ -114,8 +114,8 @@ class TestLocalCheckpointing:
             optimizer,
             opt_param_scheduler,
             rng_state,
-            True,
-            iteration,
+            use_dist_ckpt=True,
+            iteration=iteration,
             optim_sd_kwargs=optim_sd_kwargs,
         )
         nonpersistent_state_dict, _ = extract_nonpersistent(state_dict)

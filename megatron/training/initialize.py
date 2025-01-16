@@ -16,6 +16,7 @@ from megatron.training import get_adlr_autoresume
 from megatron.training import get_args
 from megatron.training import get_tensorboard_writer
 from megatron.core import mpu, tensor_parallel
+from megatron.core.rerun_state_machine import initialize_rerun_state_machine, RerunErrorInjector, RerunDiagnostic, RerunMode
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.yaml_arguments import validate_yaml
 from megatron.training.checkpointing import load_args_from_checkpoint
@@ -75,6 +76,27 @@ def initialize_megatron(
     # set logging level
     setup_logging()
 
+    # init rerun state
+    def state_save_func():
+        return {
+            'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states()
+        }
+    
+    def state_restore_func(state_dict):
+        if state_dict['rng_tracker_states']:
+            tensor_parallel.get_cuda_rng_tracker().set_states(state_dict['rng_tracker_states'])
+
+    args = get_args()
+    initialize_rerun_state_machine(
+        state_save_func=state_save_func,
+        state_restore_func=state_restore_func,
+        mode=RerunMode(args.rerun_mode),
+        error_injector=RerunErrorInjector(
+            error_injection_rate=args.error_injection_rate,
+            error_injection_type=RerunDiagnostic(args.error_injection_type),
+        ),
+    )
+
     # torch.distributed initialization
     def finish_mpu_init():
         args = get_args()
@@ -84,7 +106,7 @@ def initialize_megatron(
         # Random seeds for reproducibility.
         if args.rank == 0:
             print("> setting random seeds to {} ...".format(args.seed))
-        _set_random_seed(args.seed, args.data_parallel_random_init)
+        _set_random_seed(args.seed, args.data_parallel_random_init, args.te_rng_tracker, args.inference_rng_tracker)
 
     if skip_mpu_initialization:
         return None
@@ -284,6 +306,8 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
                 context_parallel_size=args.context_parallel_size,
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
                 expert_model_parallel_size=args.expert_model_parallel_size,
+                num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
+                expert_tensor_parallel_size=args.expert_tensor_parallel_size,
                 distributed_timeout_minutes=args.distributed_timeout_minutes,
                 nccl_communicator_config_path=args.nccl_communicator_config_path,
                 order='tp-cp-ep-dp-pp' if not args.use_tp_pp_dp_mapping else 'tp-pp-dp',
@@ -312,7 +336,7 @@ def _init_autoresume():
         torch.distributed.barrier()
 
 
-def _set_random_seed(seed_, data_parallel_random_init=False):
+def _set_random_seed(seed_, data_parallel_random_init=False, te_rng_tracker=False, inference_rng_tracker=False):
     """Set random seed for reproducability."""
     if seed_ is not None and seed_ > 0:
         # Ensure that different pipeline MP stages get different seeds.
@@ -324,7 +348,7 @@ def _set_random_seed(seed_, data_parallel_random_init=False):
         np.random.seed(seed)
         torch.manual_seed(seed)
         if torch.cuda.device_count() > 0:
-            tensor_parallel.model_parallel_cuda_manual_seed(seed)
+            tensor_parallel.model_parallel_cuda_manual_seed(seed, te_rng_tracker, inference_rng_tracker)
     else:
         raise ValueError("Seed ({}) should be a positive integer.".format(seed_))
 

@@ -104,8 +104,6 @@ def load(
 
     checkpoint_dir = Path(checkpoint_dir)
     common_state_dict = common_strategy.load_common(checkpoint_dir)
-    if not sharded_state_dict:
-        return common_state_dict
 
     sharded_state_dict, nonpersistent_state_dict, sh_ten_factories = load_preprocess(
         sharded_state_dict
@@ -279,6 +277,12 @@ def load_plain_tensors(checkpoint_dir: str) -> StateDict:
 #     # Don't validate integrity because shards will be overlapped
 #     # if world_size > 1 (all processes load whole tensors)
 #     return load(sharded_state_dict, checkpoint_dir, validate_access_integrity=False)
+
+
+def remove_sharded_tensors(checkpoint_dir: str, key_prefix: str):
+    """determine the appropriate sharding strategy and delegate removal to the sharded strategy"""
+    sharded_strategy, common_strategy = verify_checkpoint_and_load_strategy(checkpoint_dir)
+    sharded_strategy.remove_sharded_tensors(checkpoint_dir, key_prefix)
 
 
 def save(

@@ -38,7 +38,7 @@ class TransformerLayerSubmodules:
             after cross-attention.
         pre_mlp_layernorm (Union[ModuleSpec, type]): Specification for the layer normalization
             before the MLP.
-        mlp (Union[ModuleSpec, type]): Specification for the MLP.
+        mlp (Union[ModuleSpec, type]): Specification for the MLP in Dense layer.
         mlp_bda (Union[ModuleSpec, type]): Specification for the bias-dropout-add operation
             after the MLP.
         sharded_state_dict_keys_map (Dict[str, str]): Mapping for sharded tensor keys to be applied
@@ -93,14 +93,16 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
     ):
         super().__init__(config=config)
 
-        if config.enable_cuda_graph and self.training:
-            assert (
-                not config.cpu_offloading and config.recompute_granularity is None
-            ), "Cudagraphs not supported"
+        if config.enable_cuda_graph:
+            if not self.training:
+                # Cudagraphs for inference are only enabled with the flash decoding kernel
+                assert (
+                    self.config.flash_decode
+                ), "--flash-decode is required to use CUDA graphs during inference"
             self.cudagraph_manager = CudaGraphManager()
 
         self.submodules_config = submodules
-        self.layer_number = layer_number + self._get_layer_offset()
+        self.layer_number = layer_number + TransformerLayer._get_layer_offset(self.config)
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
@@ -156,10 +158,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
-
         # [Module 8: MLP block]
-        # TODO how to set the gpt_layer_spec.py when we have moe_frequency > 1,
-        #      where MLP and MoE layer both appear alternately?
         self.mlp = build_module(submodules.mlp, config=self.config)
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)
@@ -175,42 +174,41 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
-    def _get_layer_offset(self):
-        """Get the index number of this layer, given the level of pipelining."""
+    @staticmethod
+    def _get_layer_offset(config: TransformerConfig):
+        """Get the index offset of current pipeline stage, given the level of pipelining."""
         pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
         if not parallel_state.is_inside_encoder():
             pp_decoder_start = parallel_state.get_pipeline_model_parallel_decoder_start()
             if pp_decoder_start is not None:
                 pipeline_rank = pipeline_rank - pp_decoder_start
 
-        num_layers_per_pipeline_rank = (
-            self.config.num_layers // self.config.pipeline_model_parallel_size
-        )
+        num_layers_per_pipeline_rank = config.num_layers // config.pipeline_model_parallel_size
 
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
             vp_rank = parallel_state.get_virtual_pipeline_model_parallel_rank()
             vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
 
-            total_num_layers = self.config.num_layers
+            total_num_layers = config.num_layers
             num_layers_per_virtual_rank = num_layers_per_pipeline_rank // vp_size
             total_virtual_chunks = total_num_layers // vp_size
             offset = vp_rank * total_virtual_chunks + (pipeline_rank * num_layers_per_virtual_rank)
 
         else:
             # Each stage gets a contiguous set of layers.
-            if self.config.pipeline_model_parallel_size > 1:
+            if config.pipeline_model_parallel_size > 1:
                 if (
-                    self.config.first_pipeline_num_layers is not None
-                    or self.config.last_pipeline_num_layers is not None
+                    config.first_pipeline_num_layers is not None
+                    or config.last_pipeline_num_layers is not None
                 ):
                     # Calculate number of pipelines for distributing layers
-                    middle_pipeline_stages = self.config.pipeline_model_parallel_size
+                    middle_pipeline_stages = config.pipeline_model_parallel_size
                     middle_pipeline_stages -= sum(
                         [
                             1 if x is not None else 0
                             for x in (
-                                self.config.first_pipeline_num_layers,
-                                self.config.last_pipeline_num_layers,
+                                config.first_pipeline_num_layers,
+                                config.last_pipeline_num_layers,
                             )
                         ]
                     )
@@ -218,17 +216,17 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                     # Calculate layers to distribute
                     first_pipeline_offset = (
                         0
-                        if self.config.first_pipeline_num_layers is None
-                        else self.config.first_pipeline_num_layers
+                        if config.first_pipeline_num_layers is None
+                        else config.first_pipeline_num_layers
                     )
                     last_pipeline_offset = (
                         0
-                        if self.config.last_pipeline_num_layers is None
-                        else self.config.last_pipeline_num_layers
+                        if config.last_pipeline_num_layers is None
+                        else config.last_pipeline_num_layers
                     )
 
                     middle_num_layers = (
-                        self.config.num_layers - first_pipeline_offset - last_pipeline_offset
+                        config.num_layers - first_pipeline_offset - last_pipeline_offset
                     )
 
                     if middle_pipeline_stages > 0:
@@ -238,7 +236,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
                     middle_pipeline_rank = (
                         pipeline_rank
-                        if self.config.first_pipeline_num_layers is None
+                        if config.first_pipeline_num_layers is None
                         else pipeline_rank - 1
                     )
 
@@ -267,6 +265,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         attention_bias=None,
         inference_params=None,
         packed_seq_params=None,
+        sequence_len_offset=None,
     ):
         """
         Perform a forward pass through the transformer layer.
@@ -308,6 +307,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             rotary_pos_sin=rotary_pos_sin,
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
         )
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
@@ -396,6 +396,12 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         return sharded_state_dict
 
     def __call__(self, *args, **kwargs):
-        if hasattr(self, 'cudagraph_manager'):
+        # Training and validation mode CUDA graphs
+        if hasattr(self, 'cudagraph_manager') and kwargs.get('inference_params') is None:
+            return self.cudagraph_manager(self, args, kwargs)
+        # Inference mode. CUDA graphs are used in the decode phase only, when attn mask is None
+        elif not self.training and (
+            hasattr(self, 'cudagraph_manager') and kwargs['attention_mask'] is None
+        ):
             return self.cudagraph_manager(self, args, kwargs)
         return super(MegatronModule, self).__call__(*args, **kwargs)

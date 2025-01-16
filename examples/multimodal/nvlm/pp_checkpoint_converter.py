@@ -40,11 +40,11 @@ def split(input_dir, base_output_dir, input_pp, output_pp, num_tp, num_layers_pe
                     new_sd["model"][k] = v
 
                 # Only the last pp rank has the output layer.
-                if "language_model.output_layer" in k and pp == input_pp - 1:
+                if "language_model.output_layer" in k and pp == output_pp - 1:
                     new_sd["model"][k] = v
 
                 # Only the last pp rank has final layer norm.
-                if "language_model.decoder.final_layernorm" in k and pp == input_pp - 1:
+                if "language_model.decoder.final_layernorm" in k and pp == output_pp - 1:
                     new_sd["model"][k] = v
 
                 if "language_model.decoder.layers" in k:
@@ -70,7 +70,7 @@ def split(input_dir, base_output_dir, input_pp, output_pp, num_tp, num_layers_pe
             layer_lb = layer_ub
 
     # This is needed for megatron checkpoint loading.
-    with open(os.path.join(base_output_dir, "iter_0000001/latest_checkpointed_iteration.txt"), "w") as f:
+    with open(os.path.join(base_output_dir, "latest_checkpointed_iteration.txt"), "w") as f:
         f.write("1")
 
 
@@ -136,7 +136,7 @@ def combine(input_dir, base_output_dir, input_pp, output_pp, num_tp, num_layers_
         torch.save(new_sd, output_path)
 
     # This is needed for megatron checkpoint loading.
-    with open(os.path.join(base_output_dir, "iter_0000001/latest_checkpointed_iteration.txt"), "w") as f:
+    with open(os.path.join(base_output_dir, "latest_checkpointed_iteration.txt"), "w") as f:
         f.write("1")
 
 

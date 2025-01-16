@@ -33,6 +33,13 @@ mistral_custom_template = """
 """
 
 
+nvlm_yi_34b_template = "{{- bos_token }}{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
+
+
+qwen2p0_custom_template = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
+
+
+
 @dataclass
 class PromptConfig:
     """Config options for different prompt formats."""
@@ -97,12 +104,29 @@ class MultimodalTokenizer(MegatronTokenizer):
                 has_bos=True,
                 has_system_role=True,
             )
+        elif prompt_format == "nvlm-yi-34b":
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=4,
+                pad_token_id=tokenizer.pad_token_id,
+                custom_chat_template=nvlm_yi_34b_template,
+                has_bos=True,
+                has_system_role=True,
+            )
         elif prompt_format == "chatml":
-            # "<|im_start|>assistant\n" is the prefix for assistant messages,
+            # "<|im_start|>assistant\n" is the prefix for assistant messages
             self._prompt_config = PromptConfig(
                 assistant_prefix_len=3,
                 pad_token_id=tokenizer.pad_token_id,
                 custom_chat_template=None,
+                has_bos=False,
+                has_system_role=True,
+            )
+        elif prompt_format in ("qwen2p0", "qwen2p5"):
+            # "<|im_start|>assistant\n" is the prefix for assistant messages
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=3,
+                pad_token_id=tokenizer.pad_token_id,
+                custom_chat_template=qwen2p0_custom_template,
                 has_bos=False,
                 has_system_role=True,
             )
@@ -178,6 +202,9 @@ class MultimodalTokenizer(MegatronTokenizer):
         # Mask system and user tokens in the target.
         idx = 0
         for turn_idx, turn in enumerate(conversation):
+            if len(turn["content"]) == 0:
+                raise ValueError(f"empty turn in conversation: {conversation}. Skipping.")
+
             turn_tokens = self._tokenizer.apply_chat_template(
                 [turn], tokenize=True, chat_template=self._prompt_config.custom_chat_template
             )

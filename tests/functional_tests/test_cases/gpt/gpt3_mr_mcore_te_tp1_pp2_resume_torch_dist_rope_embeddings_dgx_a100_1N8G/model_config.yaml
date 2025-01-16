@@ -19,8 +19,8 @@ MODEL_ARGS:
   --train-iters: 100
   --timing-log-level: 2
   --lr-decay-iters: 320000
-  --save: ${CHECKPOINT_PATH}
-  --load: ${CHECKPOINT_PATH}
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
   --data-path: ${DATA_PATH}/my-gpt3_00_text_document
   --vocab-file: ${DATA_PATH}/bpe/vocab.json
   --merge-file: ${DATA_PATH}/bpe/merges.txt
@@ -40,7 +40,6 @@ MODEL_ARGS:
   --tensor-model-parallel-size: 1
   --pipeline-model-parallel-size: 2
   --position-embedding-type: rope
-  --no-rope-fusion: true
   --no-ckpt-fully-parallel-save: true
   --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
@@ -50,4 +49,5 @@ MODEL_ARGS:
   --ckpt-format: torch_dist
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
+  --log-memory-to-tensorboard: true
 TEST_TYPE: ckpt-resume

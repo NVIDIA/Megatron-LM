@@ -9,6 +9,7 @@ from torch.autograd.variable import Variable
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import p2p_communication
+from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
@@ -495,6 +496,9 @@ def forward_backward_no_pipelining(
 
     if config.timers is not None:
         config.timers('forward-backward').stop()
+
+    if hasattr(config, 'enable_cuda_graph') and config.enable_cuda_graph:
+        create_cudagraphs()
 
     return forward_data_store
 
@@ -1479,6 +1483,9 @@ def forward_backward_pipelining_with_interleaving(
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
+    if hasattr(config, 'enable_cuda_graph') and config.enable_cuda_graph:
+        create_cudagraphs()
+
     return forward_data_store
 
 
@@ -1873,5 +1880,8 @@ def forward_backward_pipelining_without_interleaving(
 
     if config.timers is not None:
         config.timers('forward-backward').stop()
+
+    if hasattr(config, 'enable_cuda_graph') and config.enable_cuda_graph:
+        create_cudagraphs()
 
     return forward_data_store

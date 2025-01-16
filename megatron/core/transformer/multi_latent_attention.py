@@ -48,6 +48,7 @@ class MultiLatentAttention(Attention):
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
+        cp_comm_type: str = None,
     ) -> None:
         world_size = parallel_state.get_tensor_model_parallel_world_size()
         assert (
@@ -90,6 +91,7 @@ class MultiLatentAttention(Attention):
             softmax_scale=self.softmax_scale,
             k_channels=self.q_head_dim,
             v_channels=self.config.v_head_dim,
+            cp_comm_type=cp_comm_type,
         )
 
         # Output.
@@ -113,6 +115,8 @@ class MultiLatentAttention(Attention):
         key_value_states=None,
         inference_params=None,
         rotary_pos_emb=None,
+        rotary_pos_cos=None,
+        rotary_pos_sin=None,
         attention_bias=None,
         packed_seq_params=None,
         position_ids=None,
@@ -120,6 +124,9 @@ class MultiLatentAttention(Attention):
         """Forward pass for multi-latent attention"""
         assert rotary_pos_emb is None, "Rotary position embeddings should not be passed into MLA."
         assert attention_bias is None, "Attention bias should not be passed into MLA."
+        assert (
+            rotary_pos_cos is None and rotary_pos_sin is None
+        ), "MLA does not support Flash Decoding"
 
         # hidden_states: [sq, b, h]
 
@@ -191,6 +198,7 @@ class MLASelfAttention(MultiLatentAttention):
         submodules: MLASelfAttentionSubmodules,
         layer_number: int,
         attn_mask_type=AttnMaskType.padding,
+        cp_comm_type: str = None,
     ):
         super().__init__(
             config=config,
@@ -369,6 +377,7 @@ class MLASelfAttention(MultiLatentAttention):
         query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
 
         # key: [s, b, n, 192]
+        k_pos_emb = k_pos_emb.expand(-1, -1, self.config.num_attention_heads, -1)
         key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
 
         query = query.contiguous()

@@ -1,0 +1,39 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: '{test_case}_{environment}'
+  model: gpt
+  build: mcore-pyt-{environment}
+  nodes: 1
+  gpus: 2
+  platforms: dgx_a100
+  time_limit:
+  n_repeat:
+  artifacts:
+    /workspace/data/gpt3_data: text/the_pile/shard00
+    /workspace/checkpoints/teacher: model/gpt_dummy_pyt/ckpt/24.10.0_bf16_teacher
+  script: |-
+    ls
+    cd /opt/megatron-lm
+
+    ARGUMENTS=(
+        "DATA_PATH=/workspace/data/gpt3_data"
+        "DATA_CACHE_PATH=/workspace/data/cache"
+        "OUTPUT_PATH={assets_dir}"
+        "TENSORBOARD_PATH={assets_dir}/tensorboard"
+        "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
+        "CHECKPOINT_LOAD_PATH=/workspace/checkpoints"
+        "TRAINING_SCRIPT_PATH=./examples/export/knowledge_distillation/pretrain_gpt_modelopt.py"
+        "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}.json"
+    )
+
+    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
+
+products:
+  - test_case: [gpt3_nightly_mcore_te_tp2_pp1_modelopt_distill_resume]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]

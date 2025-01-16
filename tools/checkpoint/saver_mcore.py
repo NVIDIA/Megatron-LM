@@ -1,269 +1,12 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-
-import os
-import sys
-import torch
 from importlib.metadata import version
-from pkg_resources import packaging
+import os
+from packaging.version import Version as PkgVersion
+import sys
 
-from setter import ModelSetter
-from utils import get_mcore_transformer_block_key, print_memory_usage
+import torch
 
-
-class MCoreSetter(ModelSetter):
-
-    transformer_block_key = None
-
-    @classmethod
-    def get_transformer_block(cls, model):
-        return getattr(model, cls.transformer_block_key)
-
-    @classmethod
-    def has_position_embeddings(cls, model):
-        return hasattr(model.embedding, "position_embeddings")
-
-    @classmethod
-    def set_embeddings(
-        cls,
-        model,
-        word=None,
-        pos=None,
-    ):
-        cls.set_tensor(model.embedding.word_embeddings.weight, word)
-        if pos is not None:
-            cls.set_tensor(model.embedding.position_embeddings.weight, pos)
-
-    @classmethod
-    def set_final_norm(
-        cls,
-        model,
-        weight=None,
-        bias=None,
-    ):
-        block = cls.get_transformer_block(model)
-        cls.set_tensor(block.final_layernorm.weight, weight)
-        if bias is not None:
-            cls.set_tensor(block.final_layernorm.bias, bias)
-
-    @classmethod
-    def set_output_word_embeddings(
-        cls,
-        model,
-        emb=None,
-    ):
-        cls.set_tensor(model.output_layer.weight, emb)
-
-    @classmethod
-    def set_output_layer(
-        cls,
-        model,
-        weight=None,
-    ):
-        cls.set_tensor(model.output_layer.weight, weight)
-
-    @classmethod
-    def set_pooler(
-        cls,
-        model,
-        weight=None,
-        bias=None,
-    ):
-        cls.set_tensor(model.pooler.dense.weight, weight)
-        if bias is not None:
-            cls.set_tensor(model.pooler.dense.bias, bias)
-
-    @classmethod
-    def set_lm_head(
-        cls,
-        model,
-        dense_weight=None,
-        dense_bias=None,
-        norm_weight=None,
-        norm_bias=None,
-    ):
-
-        cls.set_tensor(model.lm_head.dense.weight, dense_weight)
-        if dense_bias is not None:
-            cls.set_tensor(model.lm_head.dense.bias, dense_bias)
-
-        cls.set_tensor(model.lm_head.layer_norm.weight, norm_weight)
-        if norm_bias is not None:
-            cls.set_tensor(model.lm_head.layer_norm.bias, norm_bias)
-
-    @classmethod
-    def set_binary_head(
-        cls,
-        model,
-        weight=None,
-        bias=None,
-    ):
-        cls.set_tensor(model.binary_head.weight, weight)
-        if bias is not None:
-            cls.set_tensor(model.binary_head.bias, bias)
-
-
-class MCoreLocalSetter(MCoreSetter):
-
-    @classmethod
-    def set_layer(
-        cls,
-        model,
-        layer_idx,
-        self_attn_norm_weight=None,
-        self_attn_norm_bias=None,
-        self_attn_qkv_weight=None,
-        self_attn_qkv_bias=None,
-        self_attn_proj_weight=None,
-        self_attn_proj_bias=None,
-        mlp_norm_weight=None,
-        mlp_norm_bias=None,
-        mlp_fc1_weight=None,
-        mlp_fc1_bias=None,
-        mlp_fc2_weight=None,
-        mlp_fc2_bias=None,
-    ):
-
-        block = cls.get_transformer_block(model)
-        l = block.layers[layer_idx]
-
-        # Self attention.
-        cls.set_tensor(l.input_layernorm.weight, self_attn_norm_weight)
-        if self_attn_norm_bias is not None:
-            cls.set_tensor(l.input_layernorm.bias, self_attn_norm_bias)
-
-        cls.set_tensor(l.self_attention.linear_qkv.weight, self_attn_qkv_weight)
-        if self_attn_qkv_bias is not None:
-            cls.set_tensor(l.self_attention.linear_qkv.bias, self_attn_qkv_bias)
-
-        cls.set_tensor(l.self_attention.linear_proj.weight, self_attn_proj_weight)
-        if self_attn_proj_bias is not None:
-            cls.set_tensor(l.self_attention.linear_proj.bias, self_attn_proj_bias)
-
-        # MLP.
-        cls.set_tensor(l.pre_mlp_layernorm.weight, mlp_norm_weight)
-        if mlp_norm_bias is not None:
-            cls.set_tensor(l.pre_mlp_layernorm.bias, mlp_norm_bias)
-
-        cls.set_tensor(l.mlp.linear_fc1.weight, mlp_fc1_weight)
-        if mlp_fc1_bias is not None:
-            cls.set_tensor(l.mlp.linear_fc1.bias, mlp_fc1_bias)
-
-        cls.set_tensor(l.mlp.linear_fc2.weight, mlp_fc2_weight)
-        if mlp_fc2_bias is not None:
-            cls.set_tensor(l.mlp.linear_fc2.bias, mlp_fc2_bias)
-
-
-class MCoreTESetter(MCoreSetter):
-
-    @classmethod
-    def set_layer(
-        cls,
-        model,
-        layer_idx,
-        self_attn_norm_weight=None,
-        self_attn_norm_bias=None,
-        self_attn_qkv_weight=None,
-        self_attn_qkv_bias=None,
-        self_attn_proj_weight=None,
-        self_attn_proj_bias=None,
-        mlp_norm_weight=None,
-        mlp_norm_bias=None,
-        mlp_fc1_weight=None,
-        mlp_fc1_bias=None,
-        mlp_fc2_weight=None,
-        mlp_fc2_bias=None,
-    ):
-
-        block = cls.get_transformer_block(model)
-        l = block.layers[layer_idx]
-
-        # Self attention.
-        cls.set_tensor(l.self_attention.linear_qkv.layer_norm_weight, self_attn_norm_weight)
-        if self_attn_norm_bias is not None:
-            cls.set_tensor(l.self_attention.linear_qkv.layer_norm_bias, self_attn_norm_bias)
-
-        cls.set_tensor(l.self_attention.linear_qkv.weight, self_attn_qkv_weight)
-        if self_attn_qkv_bias is not None:
-            cls.set_tensor(l.self_attention.linear_qkv.bias, self_attn_qkv_bias)
-
-        cls.set_tensor(l.self_attention.linear_proj.weight, self_attn_proj_weight)
-        if self_attn_proj_bias is not None:
-            cls.set_tensor(l.self_attention.linear_proj.bias, self_attn_proj_bias)
-
-        # MLP.
-        cls.set_tensor(l.mlp.linear_fc1.layer_norm_weight, mlp_norm_weight)
-        if mlp_norm_bias is not None:
-            cls.set_tensor(l.mlp.linear_fc1.layer_norm_bias, mlp_norm_bias)
-
-        cls.set_tensor(l.mlp.linear_fc1.weight, mlp_fc1_weight)
-        if mlp_fc1_bias is not None:
-            cls.set_tensor(l.mlp.linear_fc1.bias, mlp_fc1_bias)
-
-        cls.set_tensor(l.mlp.linear_fc2.weight, mlp_fc2_weight)
-        if mlp_fc2_bias is not None:
-            cls.set_tensor(l.mlp.linear_fc2.bias, mlp_fc2_bias)
-
-class MCoreMoETESetter(MCoreSetter):
-
-    @classmethod
-    def set_layer(
-        cls,
-        model,
-        layer_idx,
-        router_weight=None,
-        self_attn_norm_weight=None,
-        self_attn_norm_bias=None,
-        self_attn_qkv_weight=None,
-        self_attn_qkv_bias=None,
-        self_attn_proj_weight=None,
-        self_attn_proj_bias=None,
-        mlp_norm_weight=None,
-        mlp_norm_bias=None,
-        mlp_fc1_weight=None,
-        mlp_fc1_bias=None,
-        mlp_fc2_weight=None,
-        mlp_fc2_bias=None,
-    ):
-
-        block = cls.get_transformer_block(model)
-        l = block.layers[layer_idx]
-
-        # Self attention.
-        cls.set_tensor(l.self_attention.linear_qkv.layer_norm_weight, self_attn_norm_weight)
-        if self_attn_norm_bias is not None:
-            cls.set_tensor(l.self_attention.linear_qkv.layer_norm_bias, self_attn_norm_bias)
-        cls.set_tensor(l.self_attention.linear_qkv.weight, self_attn_qkv_weight)
-        if self_attn_qkv_bias is not None:
-            cls.set_tensor(l.self_attention.linear_qkv.bias, self_attn_qkv_bias)
-        cls.set_tensor(l.self_attention.linear_proj.weight, self_attn_proj_weight)
-        if self_attn_proj_bias is not None:
-            cls.set_tensor(l.self_attention.linear_proj.bias, self_attn_proj_bias)
-
-        # MLP.
-        cls.set_tensor(l.pre_mlp_layernorm.weight, mlp_norm_weight)
-        if model.config.normalization == "LayerNorm":
-            cls.set_tensor(l.pre_mlp_layernorm.bias, mlp_norm_bias)
-
-        cls.set_tensor(l.mlp.router.weight, router_weight)
-
-        num_local_experts = mlp_fc1_weight.shape[0]
-        for expert_idx in range(num_local_experts):
-            cls.set_tensor(l.mlp.experts.local_experts[expert_idx].linear_fc1.weight, mlp_fc1_weight[expert_idx])
-            cls.set_tensor(l.mlp.experts.local_experts[expert_idx].linear_fc2.weight, mlp_fc2_weight[expert_idx])
-
-
-def get_model_setter(model_type, transformer_impl, num_experts=0):
-    if num_experts is not None and num_experts > 0:
-        # Only support TE setter for MOE
-        assert transformer_impl == "transformer_engine"
-        setter = MCoreMoETESetter
-    else:
-        setter = {
-            "local" : MCoreLocalSetter,
-            "transformer_engine" : MCoreTESetter,
-        }[transformer_impl]
-    setter.transformer_block_key = get_mcore_transformer_block_key(model_type)
-    return setter
+from schema_mcore import get_model_schema
 
 
 def add_arguments(parser):
@@ -288,8 +31,8 @@ def add_arguments(parser):
 def save_checkpoint(queue, args):
 
     # Transformer engine >= 0.12.0, for CPU initialization.
-    te_version = packaging.version.Version(version("transformer-engine"))
-    assert te_version >= packaging.version.Version("0.12.0"), \
+    te_version = PkgVersion(version("transformer-engine"))
+    assert te_version >= PkgVersion("0.12.0"), \
         "transformer engine version: %s (>=0.12.0 required)." % te_version
 
     # Search in directory above this
@@ -391,6 +134,7 @@ def save_checkpoint(queue, args):
                 '--save-interval', '1',
                 '--save', args.save_dir,
                 '--ckpt-format', 'torch', # only 'torch' supported for conversion
+                '--no-one-logger',
                 ]
 
     if md.make_vocab_size_divisible_by is not None:
@@ -536,8 +280,13 @@ def save_checkpoint(queue, args):
     # Split into new tensor model parallel sizes
     out_word_embed = torch.chunk(full_word_embed, args.target_tensor_parallel_size, dim=0)
 
-    # Parameter setter class.
-    setter = get_model_setter(md.model_type, margs.transformer_impl, margs.num_experts)
+    # Model schema.
+    schema = get_model_schema(
+        md.model_type,
+        margs.transformer_impl,
+        margs.num_experts,
+        margs.expert_model_parallel_size,
+    )
 
     # Construct a 3D(PPxEPxTP) arry for models, fill it with None
     models = [[[None for _ in range(args.target_tensor_parallel_size)] for _ in range(args.target_expert_parallel_size)] for _ in range(args.target_pipeline_parallel_size)]
@@ -556,12 +305,11 @@ def save_checkpoint(queue, args):
         for tp_rank in range(args.target_tensor_parallel_size):
             model = get_local_model(0, ep_rank, tp_rank)
             if pos_embed is None:
-                assert not setter.has_position_embeddings(model)
-            setter.set_embeddings(
-                model,
-                word=out_word_embed[tp_rank],
-                pos=pos_embed,
-            )
+                assert not schema.has_position_embeddings(model)
+            schema.set("embeddings", model, {
+                "pos" : pos_embed,
+                "word" : out_word_embed[tp_rank],
+            })
 
     def chunk_weight(weight, parallel_mode, tp_size=1, ep_size=1):
         assert parallel_mode in ["row", "column"]
@@ -605,7 +353,7 @@ def save_checkpoint(queue, args):
         mpu.set_pipeline_model_parallel_rank(pp_rank)
         # initial the first module in pp stage to get the layer_num, pooler, lm_head. binary_head
         get_local_model(pp_rank,0,0)
-        for layer_id in range(len(setter.get_transformer_block(models[pp_rank][0][0]).layers)):
+        for layer_id in range(schema.get_num_layers(models[pp_rank][0][0])):
             msg = queue_get(f"transformer layer {total_layer_num}")
 
             # duplicated tensors
@@ -689,7 +437,7 @@ def save_checkpoint(queue, args):
                             "router_weight":  router
                         })
                     model = get_local_model(pp_rank, ep_rank, tp_rank)
-                    setter.set_layer(model, layer_id, **params_dict)
+                    schema.set_layer(model, layer_id, params_dict)
 
             total_layer_num = total_layer_num + 1
             check_message(msg)
@@ -704,17 +452,15 @@ def save_checkpoint(queue, args):
                 for tp_rank in range(args.target_tensor_parallel_size)]
             for eptp_rank, model in enumerate(pp_local_models):
                 tp_rank = eptp_rank % args.target_tensor_parallel_size
-                setter.set_final_norm(
-                    model,
-                    weight=final_norm_weight,
-                    bias=final_norm_bias if md.norm_has_bias else None,
-                )
+                schema.set("final_norm", model, {
+                    "weight" : final_norm_weight,
+                    "bias" : final_norm_bias if md.norm_has_bias else None,
+                })
                 if pp_rank != 0 and not md.output_layer:
                     # Copy word embeddings to final pipeline rank
-                    setter.set_output_word_embeddings(
-                        model,
-                        emb=out_word_embed[tp_rank],
-                    )
+                    schema.set("output_layer", model, {
+                        "weight" : out_word_embed[tp_rank],
+                    })
             del final_norm_weight
             if md.norm_has_bias:
                 del final_norm_bias
@@ -729,7 +475,9 @@ def save_checkpoint(queue, args):
                 output_layer_weight = torch.chunk(output_layer_weight, args.target_tensor_parallel_size, dim=0)
                 for eptp_rank, model in enumerate(pp_local_models):
                     tp_rank = eptp_rank % args.target_tensor_parallel_size
-                    setter.set_output_layer(model, output_layer_weight[tp_rank])
+                    schema.set("output_layer", model, {
+                        "weight" : output_layer_weight[tp_rank],
+                    })
                 check_message(msg)
 
             msg = queue_get()
@@ -741,11 +489,10 @@ def save_checkpoint(queue, args):
                 pooler_weight = msg.pop("weight")
                 pooler_bias = msg.pop("bias")
                 for model in pp_local_models:
-                    setter.set_pooler(
-                        model=model,
-                        weight=pooler_weight,
-                        bias=pooler_bias,
-                    )
+                    schema.set("pooler", model, {
+                        "weight" : pooler_weight,
+                        "bias" : pooler_bias,
+                    })
                 del pooler_weight
                 del pooler_bias
                 check_message(msg)
@@ -762,13 +509,12 @@ def save_checkpoint(queue, args):
                 if md.norm_has_bias:
                     lm_head_norm_bias = msg.pop("norm bias")
                 for model in pp_local_models:
-                    setter.set_lm_head(
-                        model=model,
-                        dense_weight=lm_head_dense_weight,
-                        dense_bias=lm_head_dense_bias,
-                        norm_weight=lm_head_norm_weight,
-                        norm_bias=lm_head_norm_bias if md.norm_has_bias else None,
-                    )
+                    schema.set("lm_head", model, {
+                        "dense_weight" : lm_head_dense_weight,
+                        "dense_bias" : lm_head_dense_bias,
+                        "norm_weight" : lm_head_norm_weight,
+                        "norm_bias" : lm_head_norm_bias if md.norm_has_bias else None,
+                    })
                 check_message(msg)
                 msg = queue_get()
 
@@ -780,11 +526,10 @@ def save_checkpoint(queue, args):
                 binary_head_weight = msg.pop("weight")
                 binary_head_bias = msg.pop("bias")
                 for model in pp_local_models:
-                    setter.set_binary_head(
-                        model=model,
-                        weight=binary_head_weight,
-                        bias=binary_head_bias,
-                    )
+                    schema.set("binary_head", model, {
+                        "weight" : binary_head_weight,
+                        "bias" : binary_head_bias,
+                    })
                 check_message(msg)
                 msg = queue_get()
 

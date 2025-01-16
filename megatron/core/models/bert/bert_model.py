@@ -1,5 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
-import os
+
 import warnings
 from typing import Literal, Optional
 
@@ -8,13 +8,15 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
-from megatron.core.models.bert.bert_layer_specs import bert_layer_local_spec
 from megatron.core.models.bert.bert_lm_head import BertLMHead
 from megatron.core.models.bert.pooler import Pooler
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.transformer.enums import AttnMaskType, ModelType
+from megatron.core.transformer.dot_product_attention import (
+    DotProductAttention as MCoreDotProductAttention,
+)
+from megatron.core.transformer.enums import AttnBackend, AttnMaskType, ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -175,16 +177,22 @@ class BertModel(LanguageModule):
         Returns:
             str: A string showing the format of the attn mask dimensions
         """
+        attention_backend = self.config.attention_backend
         attn_mask_dimensions = None
         # For local layer spec we just use b1ss
-        if self.transformer_layer_spec == bert_layer_local_spec:
+        if (
+            self.transformer_layer_spec.submodules.self_attention.submodules.core_attention
+            == MCoreDotProductAttention
+        ):
+            assert attention_backend in [
+                AttnBackend.local,
+                AttnBackend.auto,
+            ], f'Expected AttnBackend to be local or auto while using mcore self attention, but found {attention_backend}. Set --attn-backend to local or dont use MCore SelfAttention submodule in layer specs'
             attn_mask_dimensions = "b1ss"
         else:
             attn_mask_type = self.transformer_layer_spec.submodules.self_attention.params[
                 'attn_mask_type'
             ]
-            flash_attention_enabled = os.getenv('NVTE_FLASH_ATTN') == '1'
-            fused_attention_enabled = os.getenv('NVTE_FUSED_ATTN') == '1'
             # For TE >= 1.10 (We always use padding mask and use b11s)
             if is_te_min_version("1.10.0"):
                 attn_mask_dimensions = "b11s"
@@ -197,7 +205,7 @@ class BertModel(LanguageModule):
                     ] = AttnMaskType.padding
             # For 1.7 >= TE < 1.10 flash and fused path use padding mask with b11s and unfused path uses arbitrary mask with b1ss
             elif is_te_min_version("1.7.0"):
-                if flash_attention_enabled or fused_attention_enabled:
+                if attention_backend in [AttnBackend.flash, AttnBackend.fused, AttnBackend.auto]:
                     attn_mask_dimensions = "b11s"
                 else:
                     if attn_mask_type != AttnMaskType.arbitrary:
@@ -211,10 +219,9 @@ class BertModel(LanguageModule):
             # For TE < 1.7 we only support unfused attention with b1ss and padding mask
             else:
                 attn_mask_dimensions = "b1ss"
-                assert not flash_attention_enabled and not fused_attention_enabled, (
+                assert not (attention_backend in [AttnBackend.flash, AttnBackend.fused]), (
                     "Flash and fused attention is not supported with transformer engine version "
-                    "< 1.7. Set NVTE_FLASH_ATTN=0 and NVTE_FUSED_ATTN=0 or upgrade transformer "
-                    "engine >= 1.7"
+                    "< 1.7. Set --attention-backend to unfused or leave it to be default (auto) or upgrade transformer engine >= 1.7"
                 )
 
         return attn_mask_dimensions

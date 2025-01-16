@@ -35,6 +35,7 @@ def add_arguments(parser):
                        help='Tokenizer model file.')
     group.add_argument('--megatron-path', type=str, default=None,
                        help='Base directory of Megatron repository')
+    group.add_argument("--make-vocab-size-divisible-by", type=int, default=None, help="Make vocab size divisible by")
     group.add_argument('--loader-transformer-impl', default='local',
                        choices=['local', 'transformer_engine'],
                        help='Which Transformer implementation to use.')
@@ -456,15 +457,21 @@ def _load_checkpoint(queue, args):
                 '--no-save-rng',
                 '--mock-data', # To pass the "blend data checks" in arguments.py
                 '--no-initialization',
-                '--load', args.load_dir
+                '--load', args.load_dir,
+                '--no-one-logger',
                 ]
+
+    if args.make_vocab_size_divisible_by is not None:
+        sys.argv.extend(["--make-vocab-size-divisible-by", str(args.make_vocab_size_divisible_by)])
 
     margs = parse_args()
     margs.tokenizer_model = args.tokenizer_model
     load_args_from_checkpoint(margs)
 
-    if "llama2" in args.model_size or "yi" in args.model_size:
+    if "llama2" in args.model_size:
         margs.tokenizer_type = "Llama2Tokenizer"
+    elif "yi" in args.model_size:
+        margs.tokenizer_type = "HuggingFaceTokenizer"
     elif "llama3" in args.model_size:
         margs.tokenizer_type = "HuggingFaceTokenizer"
     elif "mistral" in args.model_size:
@@ -549,7 +556,7 @@ def _load_checkpoint(queue, args):
     md.swiglu = margs.swiglu
     md.previous_tensor_parallel_size = margs.tensor_model_parallel_size
     md.previous_pipeline_parallel_size = margs.pipeline_model_parallel_size
-    md.make_vocab_size_divisible_by = None
+    md.make_vocab_size_divisible_by = margs.make_vocab_size_divisible_by
     md.checkpoint_args = margs
     md.consumed_train_samples = 0
     md.consumed_valid_samples = 0

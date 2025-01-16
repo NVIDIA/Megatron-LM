@@ -11,9 +11,11 @@ Additionally, InternViT introduces some unique features like Layer Scaling.
 Those code changes are gathered here.
 """
 from functools import partial
+from typing import Dict
 
 import torch
 
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
     TEDotProductAttention,
@@ -29,12 +31,14 @@ from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubm
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
 
-class InternViTRMSNorm(torch.nn.Module):
+class InternViTRMSNorm(MegatronModule):
 
     def __init__(
         self,
@@ -54,7 +58,7 @@ class InternViTRMSNorm(torch.nn.Module):
               this marks the weights as needing to be allreduced.
             compute_var (bool): Indicator to compute statistic manually.
         """
-        super().__init__()
+        super().__init__(config=config)
         self.config = config
         self.eps = eps
         self.weight = torch.nn.Parameter(torch.ones(hidden_size))
@@ -111,6 +115,18 @@ class InternViTRMSNorm(torch.nn.Module):
         output = torch.cat(tensor_list, dim=last_dim).contiguous()
 
         return output.sum(-1, keepdim=True)
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata={}):
+
+        # in InternVitSelfAttention the q_layernorm and k_layernorm weights
+        # are tensor-parallel so must be converted to sharded tensors
+        if 'q_layernorm' in prefix or 'k_layernorm' in prefix:
+            state_dict = self.state_dict(prefix='', keep_vars=True)
+            return make_sharded_tensors_for_checkpoint(
+                state_dict, prefix, {'weight': 0}, sharded_offsets
+            )
+        else:
+            return super().sharded_state_dict(prefix, sharded_offsets, metadata)
 
 
 def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
@@ -191,6 +207,7 @@ class InternViTSelfAttention(SelfAttention):
         qk_layernorm_hidden_size = (
             self.hidden_size_per_attention_head * self.num_attention_heads_per_partition
         )  # 512 for internvit
+
         self.q_layernorm = build_module(
             submodules.q_layernorm,
             hidden_size=qk_layernorm_hidden_size,

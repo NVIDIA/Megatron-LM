@@ -81,7 +81,7 @@ pre:maybe_cherry_pick_commit:
     - when: never
   tags: [mcore-docker-node-small]
   stage: .pre
-  image: badouralix/curl-jq
+  image: nentangso/alpine-git-curl-jq
   variables:
     GIT_STRATEGY: 'clone'
   script:
@@ -147,7 +147,7 @@ pre:maybe_cherry_pick_commit:
                 "type": "section",
                 "text": {
                   "type": "mrkdwn",
-                  "text": ":alert: Cherrypick bot 🤖: Cherry-pick of <'$URL'|!'$MR_ID'> failed\ncc '$SLACK_ADMIN'"
+                  "text": "beep boop 🤖: Cherry-pick of <'$URL'|!'$MR_ID'> failed\ncc '$SLACK_ADMIN'"
                 }
               }
             ]

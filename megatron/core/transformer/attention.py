@@ -110,6 +110,7 @@ class Attention(MegatronModule, ABC):
             attn_mask_type=self.attn_mask_type,
             attention_type=self.attention_type,
             cp_comm_type=cp_comm_type,
+            softmax_scale=self.config.softmax_scale,
         )
 
         self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
@@ -168,14 +169,14 @@ class Attention(MegatronModule, ABC):
 
         return hidden_states
 
-    def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
+    def _allocate_memory(self, inference_max_sequence_length, batch_size, dtype):
         """Allocate memory to store kv cache during inference."""
 
         return torch.empty(
             inference_max_sequence_length,
             batch_size,
             self.num_query_groups_per_partition,
-            dim,
+            self.hidden_size_per_attention_head,
             dtype=dtype,
             device=torch.cuda.current_device(),
         )
@@ -189,6 +190,7 @@ class Attention(MegatronModule, ABC):
         rotary_pos_emb: Tensor,
         rotary_pos_cos: Tensor = None,
         rotary_pos_sin: Tensor = None,
+        sequence_len_offset=None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
         Saves the generated key and value tensors to the end of the buffers in inference_params.
@@ -209,10 +211,10 @@ class Attention(MegatronModule, ABC):
             inf_max_seq_length = inference_params.max_sequence_length
             inf_max_batch_size = inference_params.max_batch_size
             inference_key_memory = self._allocate_memory(
-                inf_max_seq_length, inf_max_batch_size, key.shape[-1], key.dtype
+                inf_max_seq_length, inf_max_batch_size, key.dtype
             )
             inference_value_memory = self._allocate_memory(
-                inf_max_seq_length, inf_max_batch_size, value.shape[-1], value.dtype
+                inf_max_seq_length, inf_max_batch_size, value.dtype
             )
             inference_params.key_value_memory_dict[self.layer_number] = (
                 inference_key_memory,
@@ -245,7 +247,7 @@ class Attention(MegatronModule, ABC):
                 rotary_pos_sin_q = rotary_pos_sin[sequence_end - 1 : sequence_end]
                 rotary_pos_cos_k = rotary_pos_cos[sequence_end - 1 : sequence_end]
                 rotary_pos_sin_k = rotary_pos_sin[sequence_end - 1 : sequence_end]
-            else:
+            else:  # Prefill
                 rotary_pos_cos_q = rotary_pos_cos[:sequence_end]
                 rotary_pos_sin_q = rotary_pos_sin[:sequence_end]
                 rotary_pos_cos_k = rotary_pos_cos[:sequence_end]
@@ -340,6 +342,7 @@ class Attention(MegatronModule, ABC):
         rotary_pos_sin=None,
         attention_bias=None,
         packed_seq_params=None,
+        sequence_len_offset=None,
     ):
         """
         Perform a forward pass through the attention module.
@@ -379,7 +382,7 @@ class Attention(MegatronModule, ABC):
                 self.layer_number
             ]
             output = self.flash_decoding(
-                sequence_len_offset=inference_params.sequence_len_offset,
+                sequence_len_offset=sequence_len_offset,
                 query_layer=query,
                 key_layer=key,
                 value_layer=value,
@@ -394,7 +397,14 @@ class Attention(MegatronModule, ABC):
             return output, bias
 
         query, key, value, rotary_pos_emb, attn_mask_type = self._adjust_key_value_for_inference(
-            inference_params, query, key, value, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin
+            inference_params,
+            query,
+            key,
+            value,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            sequence_len_offset,
         )
 
         if packed_seq_params is not None:
@@ -454,7 +464,7 @@ class Attention(MegatronModule, ABC):
                 packed_seq_params=packed_seq_params,
             )
 
-        if packed_seq_params is not None:
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
             # t is the pack size = sum (sq_i)

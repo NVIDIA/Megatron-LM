@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLPSubmodules
@@ -35,7 +35,7 @@ class TestParallelSequentialMLP:
             moe_router_load_balancing_type="sinkhorn",
             moe_router_topk=1,
         )
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+        transformer_layer_spec = get_gpt_layer_local_spec(
             num_experts=num_moe_experts, moe_grouped_gemm=False
         )
         self.sequential_mlp = MoELayer(
@@ -111,6 +111,7 @@ class TestTEParallelSequentialMLP:
             self.num_local_experts, self.transformer_config, self.te_mlp_spec
         )
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_te_min_version("1.7.0"),
         reason="Transformer Engine under v1.7.0 doesn't support MoE training.",
@@ -127,6 +128,7 @@ class TestTEParallelSequentialMLP:
                 self.te_sequential_mlp.local_experts[i].linear_fc2.weight,
             )
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_te_min_version("1.7.0"),
         reason="Transformer Engine under v1.7.0 doesn't support MoE training.",
@@ -149,6 +151,7 @@ class TestTEParallelSequentialMLP:
         output_te, _ = self.te_sequential_mlp(hidden_states, tokens_per_expert)
         assert torch.equal(output_local, output_te)
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_te_min_version("1.7.0"),
         reason="Transformer Engine under v1.7.0 doesn't support MoE training.",
@@ -173,6 +176,7 @@ class TestTEParallelSequentialMLP:
         output_te, _ = te_sequential_mlp(hidden_states, tokens_per_expert)
         assert torch.equal(output_local, output_te)
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_te_min_version("1.7.0"),
         reason="Transformer Engine under v1.7.0 doesn't support MoE training.",

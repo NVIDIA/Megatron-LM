@@ -26,7 +26,7 @@ MODEL_ARGS:
   --seq-length: 1024
   --max-position-embeddings: 1024
   --position-embedding-type: rope
-  --no-rope-fusion: true  #TODO: We can remove this once upgrading to the DEV container
+  --no-rope-fusion: true #TODO: We can remove this once upgrading to the DEV container
   --rotary-percent: 0.5
   --swiglu: true
   --untie-embeddings-and-output-weights: true
@@ -34,8 +34,8 @@ MODEL_ARGS:
   --train-iters: 100
   --timing-log-level: 2
   --lr-decay-iters: 320000
-  --save: ${CHECKPOINT_PATH}
-  --load: ${CHECKPOINT_PATH}
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
   --data-path: ${DATA_PATH}/my-gpt3_00_text_document
   --vocab-file: ${DATA_PATH}/bpe/vocab.json
   --merge-file: ${DATA_PATH}/bpe/merges.txt
@@ -62,4 +62,6 @@ MODEL_ARGS:
   --ckpt-format: torch_dist
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
+  --attention-backend: unfused
+  --log-memory-to-tensorboard: true
 TEST_TYPE: ckpt-resume

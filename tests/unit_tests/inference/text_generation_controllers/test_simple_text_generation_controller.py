@@ -1,3 +1,5 @@
+import copy
+import os
 import random
 import string
 import time
@@ -8,7 +10,6 @@ from unittest import mock
 import pytest
 import torch
 
-from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
@@ -16,17 +17,19 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
-from megatron.core.inference.text_generation_controllers.simple_text_generation_controller import (
-    SimpleTextGenerationController,
+from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
-class TestSimpleTextGenerationController:
+class TestTextGenerationController:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(
@@ -42,6 +45,7 @@ class TestSimpleTextGenerationController:
             hidden_size=self.hidden_size,
             num_attention_heads=4,
             use_cpu_initialization=True,
+            attention_backend=AttnBackend.local,
         )
 
         gpt_model = GPTModel(
@@ -64,7 +68,7 @@ class TestSimpleTextGenerationController:
 
         self.mock_tokenizer = mock.Mock()
 
-        self.text_generation_controller = SimpleTextGenerationController(
+        self.text_generation_controller = TextGenerationController(
             inference_wrapped_model=inference_wrapped_model, tokenizer=self.mock_tokenizer
         )
 
@@ -75,7 +79,7 @@ class TestSimpleTextGenerationController:
         with pytest.raises(AssertionError) as aerror:
             self.text_generation_controller.sample_from_logits(
                 last_token_logits=None,
-                common_inference_params=CommonInferenceParams(top_k=2, top_p=0.4),
+                sampling_params=SamplingParams(top_k=2, top_p=0.4),
                 vocab_size=self.vocab_size,
             )
         assert str(aerror.value) == 'Cannot have top-p and top-k both greater than zero'
@@ -83,7 +87,7 @@ class TestSimpleTextGenerationController:
         with pytest.raises(AssertionError) as aerror:
             self.text_generation_controller.sample_from_logits(
                 last_token_logits=None,
-                common_inference_params=CommonInferenceParams(top_p=1.4, top_k=0),
+                sampling_params=SamplingParams(top_p=1.4, top_k=0),
                 vocab_size=self.vocab_size,
             )
         assert str(aerror.value) == 'top-p should be in (0,1]'
@@ -91,7 +95,7 @@ class TestSimpleTextGenerationController:
         with pytest.raises(AssertionError) as aerror:
             self.text_generation_controller.sample_from_logits(
                 last_token_logits=torch.randn(self.batch_size, 1),
-                common_inference_params=CommonInferenceParams(top_k=self.vocab_size + 10),
+                sampling_params=SamplingParams(top_k=self.vocab_size + 10),
                 vocab_size=self.vocab_size,
             )
         assert str(aerror.value) == 'top-k is larger than logit size.'
@@ -100,14 +104,14 @@ class TestSimpleTextGenerationController:
             torch.arange(0, self.vocab_size).repeat(self.batch_size, 1).float().cuda()
         )
         sampled_logits = self.text_generation_controller.sample_from_logits(
-            last_token_logits, CommonInferenceParams(top_k=1), self.vocab_size
+            last_token_logits, SamplingParams(top_k=1), self.vocab_size
         )
         assert torch.all(
             sampled_logits.cpu() == torch.ones(self.batch_size) * self.vocab_size - 1
         ), f"The sampled logits should all be {self.vocab_size} but its {sampled_logits}"
 
         sampled_logits = self.text_generation_controller.sample_from_logits(
-            last_token_logits, CommonInferenceParams(top_k=2), self.vocab_size
+            last_token_logits, SamplingParams(top_k=2), self.vocab_size
         )
         assert torch.all(
             sampled_logits >= self.vocab_size - 2
@@ -117,7 +121,7 @@ class TestSimpleTextGenerationController:
         top_p = 0.3
         expected_min_value = l[l.softmax(dim=-1).cumsum(dim=-1) > top_p][0].item()
         sampled_logits = self.text_generation_controller.sample_from_logits(
-            last_token_logits, CommonInferenceParams(top_p=top_p, top_k=0), self.vocab_size
+            last_token_logits, SamplingParams(top_p=top_p, top_k=0), self.vocab_size
         )
         assert torch.all(
             sampled_logits >= expected_min_value
@@ -128,7 +132,7 @@ class TestSimpleTextGenerationController:
         expected_min_value = l[l.div_(temperature).softmax(dim=-1).cumsum(dim=-1) > top_p][0].item()
         sampled_logits = self.text_generation_controller.sample_from_logits(
             last_token_logits,
-            CommonInferenceParams(top_p=top_p, temperature=temperature, top_k=0),
+            SamplingParams(top_p=top_p, temperature=temperature, top_k=0),
             self.vocab_size,
         )
         assert torch.all(
@@ -142,20 +146,65 @@ class TestSimpleTextGenerationController:
             random.choices(string.ascii_letters, k=random.randint(4, 10))
         )
 
-        active_requests: Dict[int, InferenceRequest] = OrderedDict()
+        active_requests: Dict[str, InferenceRequest] = OrderedDict()
+        all_prompt_tokens: Dict[str, List[int]] = OrderedDict()
         for i in range(self.batch_size):
             prompt = "sample" * (i + 1)
+            self.mock_tokenizer.tokenize.return_value = torch.randn(
+                self.batch_size, self.vocab_size
+            ).cuda()
+            prompt_tokens = torch.randint(
+                low=0, high=self.vocab_size - 1, size=(len(prompt),)
+            ).tolist()
+
+            request_id = str(i)
+            inference_request = InferenceRequest(
+                request_id=request_id,
+                prompt=prompt,
+                inference_parameters=SamplingParams(num_tokens_to_generate=10),
+                arrival_time=time.time(),
+                prompt_tokens=prompt_tokens,
+                status=Status.ACTIVE_BUT_NOT_GENERATING_TOKENS,
+            )
+            active_requests[request_id] = inference_request
+            all_prompt_tokens[request_id] = copy.deepcopy(prompt_tokens)
+
+        requests = self.text_generation_controller.generate_all_output_tokens_static_batch(
+            active_requests
+        )
+
+        for request_id, request in requests.items():
+            assert (
+                request.status == Status.COMPLETED
+            ), f"Status should be completed but its {request.status}"
+            assert request.generated_length > 0, f"Generated length should be greater than zero"
+            assert request.generated_text is not None, "Generated text should not be None"
+            assert (
+                all_prompt_tokens[request_id] == request.prompt_tokens
+            ), "Prompt tokens should not have changed during generation"
+
+    def test_output_log_probs(self):
+        self.mock_tokenizer.vocab_size = self.vocab_size
+        self.mock_tokenizer.bos = 0
+        self.mock_tokenizer.eod = self.vocab_size - 1
+        self.mock_tokenizer.detokenize.return_value = ''.join(
+            random.choices(string.ascii_letters, k=random.randint(4, 10))
+        )
+
+        prompt = ""
+        active_requests: Dict[int, InferenceRequest] = OrderedDict()
+        for i in range(self.batch_size):
             self.mock_tokenizer.tokenize.return_value = torch.randn(
                 self.batch_size, self.vocab_size
             ).cuda()
             inference_request = InferenceRequest(
                 request_id=i,
                 prompt=prompt,
-                inference_parameters=CommonInferenceParams(num_tokens_to_generate=10),
+                inference_parameters=SamplingParams(
+                    num_tokens_to_generate=1, return_log_probs=True
+                ),
                 arrival_time=time.time(),
-                prompt_tokens=torch.randint(
-                    low=0, high=self.vocab_size - 1, size=(len(prompt),)
-                ).tolist(),
+                prompt_tokens=[self.mock_tokenizer.bos],
                 status=Status.ACTIVE_BUT_NOT_GENERATING_TOKENS,
             )
             active_requests[i] = inference_request
@@ -170,3 +219,4 @@ class TestSimpleTextGenerationController:
             ), f"Status should be completed but its {request.status}"
             assert request.generated_length > 0, f"Generated length should be greater than zero"
             assert request.generated_text is not None, "Generated text should not be None"
+            assert len(request.generated_log_probs) == request.generated_length

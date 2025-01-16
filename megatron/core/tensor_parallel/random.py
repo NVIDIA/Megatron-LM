@@ -14,6 +14,7 @@ from torch.utils.checkpoint import detach_variable
 
 from megatron.core.parallel_state import (
     get_expert_model_parallel_rank,
+    get_expert_tensor_parallel_rank,
     get_tensor_model_parallel_rank,
 )
 from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_data
@@ -163,48 +164,75 @@ _CUDA_RNG_STATE_TRACKER = None
 _CUDA_RNG_STATE_TRACKER_INITIALIZED = False
 
 
-def initialize_rng_tracker(use_te_rng_tracker: bool = False):
+def initialize_rng_tracker(use_te_rng_tracker: bool = False, inference_rng_tracker: bool = False):
     """Create the RNG tracker. 'use_te_rng_tracker' determines whether to use
     Megatron or TransformerEngine's implementation.
     In particular, TransformerEngine's implementation is cudagraphable and supports FP8.
     """
-
     global _CUDA_RNG_STATE_TRACKER
     global _CUDA_RNG_STATE_TRACKER_INITIALIZED
     if _CUDA_RNG_STATE_TRACKER_INITIALIZED:
         return
 
+    # Get the base tracker class
+    base_tracker = None
     if use_te_rng_tracker:
         if not is_te_min_version("1.5.0"):
             raise RuntimeError("use_te_rng_tracker requires TransformerEngine version >= 1.5")
         from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
 
-        _CUDA_RNG_STATE_TRACKER = TECudaRNGStatesTracker()
+        base_tracker = TECudaRNGStatesTracker
     else:
-        _CUDA_RNG_STATE_TRACKER = CudaRNGStatesTracker()
+        base_tracker = CudaRNGStatesTracker
+
+    if inference_rng_tracker:
+
+        class InferenceCudaRNGStatesTracker(base_tracker):
+            """RNG tracker for inference."""
+
+            def add(self, name, seed):
+                """Mirrors the interface from the training RNG tracker."""
+                pass
+
+            def set_states(self, states):
+                """Mirrors the interface from the training RNG tracker."""
+                pass
+
+            def fork(self, name=_MODEL_PARALLEL_RNG_TRACKER_NAME):
+                """Mirrors the interface from the training RNG tracker."""
+                return contextlib.nullcontext()
+
+        tracker_class = InferenceCudaRNGStatesTracker
+    else:
+        tracker_class = base_tracker
+
+    _CUDA_RNG_STATE_TRACKER = tracker_class()
     _CUDA_RNG_STATE_TRACKER_INITIALIZED = True
 
 
-def get_cuda_rng_tracker(use_te_rng_tracker=False):
+def get_cuda_rng_tracker(use_te_rng_tracker=False, inference_rng_tracker=False):
     """Get cuda rng tracker."""
-    initialize_rng_tracker(use_te_rng_tracker)
+    initialize_rng_tracker(use_te_rng_tracker, inference_rng_tracker)
     return _CUDA_RNG_STATE_TRACKER
 
 
-def model_parallel_cuda_manual_seed(seed):
+def model_parallel_cuda_manual_seed(seed, te_rng_tracker=False, inference_rng_tracker=False):
     """Initialize model parallel cuda seed.
 
     This function should be called after the model parallel is
     initialized. Also, no torch.cuda.manual_seed should be called
     after this function. Basically, this is replacement for that
     function.
-    Two set of RNG states are tracked:
+    Three set of RNG states are tracked:
     default state: This is for data parallelism and is the same among a set of model parallel GPUs
     but different across different model parallel groups. This is used for example for dropout
     in the non-tensor-model-parallel regions.
     tensor-model-parallel state: This state is different among a set of model parallel GPUs,
     but the same across data parallel groups. This is used for example for dropout
     in model parallel regions.
+    expert-parallel-seed: This state is only used for the expert layer of MoE models.
+    It is different among expert-tensor and expert-model parallel GPUs, and the same
+    across expert-data parallel groups.
     """
     # 2718 is just for fun and any POSITIVE value will work.
     offset = seed + 2718
@@ -212,7 +240,7 @@ def model_parallel_cuda_manual_seed(seed):
     # Data parallel gets the original seed.
     data_parallel_seed = seed
 
-    initialize_rng_tracker()
+    initialize_rng_tracker(te_rng_tracker, inference_rng_tracker)
     _CUDA_RNG_STATE_TRACKER.reset()
     # Set the default state.
     torch.cuda.manual_seed(data_parallel_seed)
@@ -222,7 +250,7 @@ def model_parallel_cuda_manual_seed(seed):
     _CUDA_RNG_STATE_TRACKER.add(_MODEL_PARALLEL_RNG_TRACKER_NAME, tensor_model_parallel_seed)
 
     expert_parallel_seed = (
-        seed + 1024 + 100 * get_expert_model_parallel_rank() + get_tensor_model_parallel_rank()
+        seed + 1024 + 100 * get_expert_model_parallel_rank() + get_expert_tensor_parallel_rank()
     )
     _CUDA_RNG_STATE_TRACKER.add(_EXPERT_PARALLEL_RNG_TRACKER_NAME, expert_parallel_seed)
 
@@ -237,6 +265,7 @@ class CheckpointFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, run_function, distribute_saved_activations, *args):
+        """Forward pass."""
         ctx.run_function = run_function
         ctx.distribute_saved_activations = distribute_saved_activations
 
@@ -263,6 +292,7 @@ class CheckpointFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *args):
+        """Backward pass."""
         if not torch.autograd._is_checkpoint_valid():
             raise RuntimeError(
                 "Checkpointing is not compatible with .grad(), "

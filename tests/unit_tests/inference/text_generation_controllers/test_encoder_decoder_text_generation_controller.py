@@ -10,7 +10,6 @@ import numpy as np
 import pytest
 import torch
 
-from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
@@ -18,6 +17,7 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
 from megatron.core.inference.model_inference_wrappers.t5.t5_inference_wrapper import (
     T5InferenceWrapper,
 )
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.encoder_decoder_text_generation_controller import (
     EncoderDecoderTextGenerationController,
 )
@@ -27,6 +27,7 @@ from megatron.core.models.T5.t5_spec import (
     get_t5_encoder_with_transformer_engine_block_spec,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -50,6 +51,7 @@ class TestEncoderDecoderTextGenerationController:
             num_attention_heads=12,
             tensor_model_parallel_size=4,
             pipeline_model_parallel_size=1,
+            attention_backend=AttnBackend.unfused,
         )
 
         encoder_config = deepcopy(transformer_config)
@@ -113,7 +115,7 @@ class TestEncoderDecoderTextGenerationController:
             self.vocab_size, size=(self.encoder_sequence_length - 5)
         ).tolist()
 
-        active_requests: Dict[int, InferenceRequest] = OrderedDict()
+        active_requests: Dict[str, InferenceRequest] = OrderedDict()
         for i in range(self.batch_size):
             prompt = "decoder_sample"
             prompt_tokens = np.random.randint(
@@ -124,7 +126,7 @@ class TestEncoderDecoderTextGenerationController:
                 request_id=i,
                 prompt=prompt,
                 encoder_prompt=encoder_prompt,
-                inference_parameters=CommonInferenceParams(num_tokens_to_generate=10),
+                inference_parameters=SamplingParams(num_tokens_to_generate=10),
                 arrival_time=time.time(),
                 prompt_tokens=prompt_tokens,
                 status=Status.ACTIVE_BUT_NOT_GENERATING_TOKENS,
