@@ -1349,9 +1349,8 @@ def get_tensor_model_parallel_world_size() -> int:
     global _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
     if _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE is not None:
         return _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
-    group = get_tensor_model_parallel_group() if xm is None else \
-        get_tensor_model_parallel_groups()
-    return get_group_world_size(group=group)
+    group = get_tensor_model_parallel_group()
+    return torch.distributed.get_world_size(group)
 
 
 def get_pipeline_model_parallel_world_size() -> int :
@@ -1395,9 +1394,8 @@ def get_tensor_model_parallel_rank() -> int:
     global _MPU_TENSOR_MODEL_PARALLEL_RANK
     if _MPU_TENSOR_MODEL_PARALLEL_RANK is not None:
         return _MPU_TENSOR_MODEL_PARALLEL_RANK
-    group = get_tensor_model_parallel_group() if xm is None else \
-        get_tensor_model_parallel_groups()
-    return get_group_rank(group=group)
+    group = get_tensor_model_parallel_group()
+    return torch.distributed.get_rank(group)
 
 
 def get_pipeline_model_parallel_rank() -> int:
@@ -1670,11 +1668,8 @@ def get_data_parallel_world_size(with_context_parallel=False, partial_data_paral
         group = get_data_parallel_group(
                 with_context_parallel=with_context_parallel,
                 partial_data_parallel=partial_data_parallel,
-            ) if xm is None else \
-            get_data_parallel_groups(
-                with_context_parallel=with_context_parallel
             )
-        return get_group_world_size(group=group)
+        return torch.distributed.get_world_size(group)
     else:
         return 0
 
@@ -1704,9 +1699,8 @@ def get_data_parallel_rank(with_context_parallel=False, partial_data_parallel=Fa
 def get_context_parallel_world_size() -> int:
     """Return world size for the context parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        group = get_context_parallel_group() if xm is None else \
-            get_context_parallel_groups()
-        return get_group_world_size(group=group)
+        group = get_context_parallel_group()
+        return torch.distributed.get_world_size(group)
     else:
         return 0
 
@@ -1714,9 +1708,8 @@ def get_context_parallel_world_size() -> int:
 def get_context_parallel_rank() -> int:
     """Return caller's rank in the context-parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        group = get_context_parallel_group() if xm is None else \
-            get_context_parallel_groups()
-        return get_group_rank(group=group)
+        group = get_context_parallel_group()
+        return torch.distributed.get_rank(group)
     else:
         return 0
 
@@ -1724,9 +1717,8 @@ def get_context_parallel_rank() -> int:
 def get_tensor_and_context_parallel_world_size() -> int:
     """Return world size for the tensor and context-parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        group = get_tensor_and_context_parallel_group() if xm is None else \
-            get_tensor_and_context_parallel_groups()
-        return get_group_world_size(group=group)
+        group = get_tensor_and_context_parallel_group()
+        return torch.distributed.get_world_size(group)
     else:
         return 0
 
@@ -1734,9 +1726,8 @@ def get_tensor_and_context_parallel_world_size() -> int:
 def get_tensor_and_context_parallel_rank() -> int:
     """Return caller's rank in the joint tensor-model-parallel and context-parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        group = get_tensor_and_context_parallel_group() if xm is None else \
-            get_tensor_and_context_parallel_groups()
-        return get_group_rank(group=group)
+        group = get_tensor_and_context_parallel_group()
+        return torch.distributed.get_rank(group)
     else:
         return 0
 
@@ -1764,9 +1755,8 @@ def get_expert_model_parallel_world_size() -> int:
     if _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE is not None:
         return _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        group = get_expert_model_parallel_group() if xm is None else \
-            get_expert_model_parallel_groups()
-        return get_group_world_size(group=group)
+        group = get_expert_model_parallel_group()
+        return torch.distributed.get_world_size(group)
     else:
         return 0
 
@@ -1782,9 +1772,8 @@ def get_expert_model_parallel_rank() -> int:
     if _MPU_EXPERT_MODEL_PARALLEL_RANK is not None:
         return _MPU_EXPERT_MODEL_PARALLEL_RANK
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        group = get_expert_model_parallel_group() if xm is None else \
-            get_expert_model_parallel_groups()
-        return get_group_rank(group=group)
+        group = get_expert_model_parallel_group()
+        return torch.distributed.get_rank(group)
     else:
         return 0
 
@@ -1820,9 +1809,8 @@ def get_expert_tensor_parallel_world_size() -> int:
     if not _EXPERT_TENSOR_PARALLEL_GROUP:
         return _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
     else:
-        group = get_expert_tensor_parallel_group() if xm is None else \
-            get_expert_tensor_parallel_groups()
-        return get_group_world_size(group=group)
+        group = get_expert_tensor_parallel_group()
+        return torch.distributed.get_world_size(group)
 
 
 def set_expert_tensor_parallel_world_size(world_size) -> int:
@@ -1840,9 +1828,8 @@ def get_expert_tensor_parallel_rank() -> int:
     if not _EXPERT_TENSOR_PARALLEL_GROUP:
         return _MPU_TENSOR_MODEL_PARALLEL_RANK
     else:
-        group = get_expert_tensor_parallel_group() if xm is None else \
-            get_expert_tensor_parallel_groups()
-        return get_group_rank(group=group)
+        group = get_expert_tensor_parallel_group()
+        return torch.distributed.get_rank(group)
 
 
 def set_expert_tensor_parallel_rank(rank) -> int:
@@ -1870,9 +1857,8 @@ def get_expert_tensor_and_model_parallel_groups(check_initialized=True) -> List[
 def get_expert_tensor_and_model_parallel_world_size() -> int:
     """Return world size for the expert model parallel group times expert tensor parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        group = get_expert_tensor_and_model_parallel_group() if xm is None else \
-            get_expert_tensor_and_model_parallel_groups()
-        return get_group_world_size(group=group)
+        group = get_expert_tensor_and_model_parallel_group()
+        return torch.distributed.get_world_size(group)
     else:
         return 0
 
@@ -1880,9 +1866,8 @@ def get_expert_tensor_and_model_parallel_world_size() -> int:
 def get_expert_tensor_and_model_parallel_rank() -> int:
     """Return caller's rank in the joint tensor- and expert-model-parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        group = get_expert_tensor_and_model_parallel_group() if xm is None else \
-            get_expert_tensor_and_model_parallel_groups()
-        return get_group_rank(group=group)
+        group = get_expert_tensor_and_model_parallel_group()
+        return torch.distributed.get_rank(group)
     else:
         return 0
 
@@ -1920,9 +1905,8 @@ def get_expert_data_parallel_group_gloo() -> ProcessGroup:
 def get_expert_data_parallel_rank() -> int:
     """Return caller's rank in the expert data parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        group = get_expert_data_parallel_group() if xm is None else \
-            get_expert_data_parallel_groups()
-        return get_group_rank(group=group)
+        group = get_expert_data_parallel_group()
+        return torch.distributed.get_rank(group)
     else:
         return 0
 
@@ -2129,24 +2113,3 @@ def destroy_model_parallel():
 
     global _MOE_LAYER_WISE_LOGGING_TRACKER
     _MOE_LAYER_WISE_LOGGING_TRACKER = {}
-
-def get_group_world_size(group: Union[torch.distributed.ProcessGroup, List[List[int]]]) -> int:
-    if isinstance(group, torch.distributed.ProcessGroup):
-            world_size = torch.distributed.get_world_size(group)
-    else:
-        world_size = len(group[0])
-
-    return world_size
-
-
-def get_group_rank(group: Union[torch.distributed.ProcessGroup, List[List[int]]]) -> int:
-    if isinstance(group, torch.distributed.ProcessGroup):
-            rank = torch.distributed.get_rank(group)
-    else:
-        rank = torch.distributed.get_rank()
-        for sub_group in group:
-            if rank in sub_group:
-                rank = sub_group.index(rank)
-                break
-
-    return rank
