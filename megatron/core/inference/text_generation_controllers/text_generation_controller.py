@@ -52,18 +52,53 @@ class TextGenerationController:
 
         return prompt_tokens
 
-    def detokenize_generations(self, prompt_tokens_with_generated_tokens: torch.Tensor) -> str:
-        """Detokenize the output generations
+    def detokenize_generations(
+        self,
+        tokens_gpu_tensor: torch.Tensor,
+        lengths_gpu_tensor: torch.Tensor,
+        detokenize_segments: bool,
+    ) -> tuple[str, List[str] | None]:
+        """Detokenize the generated tokens.
 
         Args:
-            prompt_tokens_with_generated_tokens (torch.Tensor): The input prompt
-            tokens plus the generated tokens
+            tokens_gpu_tensor (torch.Tensor): Tensor containing the generated tokens
+            lengths_gpu_tensor (torch.Tensor): Tensor containing the lengths of each sequence
+            detokenize_segments (bool): If True, returns individually detokenized tokens. If False,
+            returns None as second element. Helpful for understanding per-token boundaries in
+            generated text.
 
         Returns:
-            str: The detokenized output
+            tuple[str, List[str] | None]: A tuple containing:
+            - str: The complete detokenized text
+            - List[str] | None: List of segmented tokens if detokenize_segments is True, else None
         """
-        tokens = prompt_tokens_with_generated_tokens.cpu().numpy().tolist()
-        return self.tokenizer.detokenize(tokens)
+        # TODO(helenn): Unify with `detokenize_generations` from legacy textgen path
+
+        if not detokenize_segments:
+            tokens = tokens_gpu_tensor.cpu().numpy().tolist()
+            return self.tokenizer.detokenize(tokens), None
+
+        prompts_plus_generations = []
+        prompts_plus_generations_segments = []
+
+        tokens_gpu_tensor = torch.unsqueeze(tokens_gpu_tensor, 0)
+        tokens = tokens_gpu_tensor.cpu().numpy().tolist()
+        lengths = lengths_gpu_tensor.cpu().numpy().tolist()
+
+        for sequence_tokens, length in zip(tokens, lengths):
+            sequence_tokens = sequence_tokens[:length]
+            detok_str = self.tokenizer.detokenize(sequence_tokens)
+            prompts_plus_generations.append(detok_str)
+            offsets = self.tokenizer.offsets(sequence_tokens, detok_str)
+            words = [
+                detok_str[start:end] for start, end in zip(offsets, offsets[1:] + [len(detok_str)])
+            ]
+
+            prompts_plus_generations_segments.append(words)
+
+        text = self.tokenizer.detokenize(tokens[0])
+
+        return text, prompts_plus_generations_segments
 
     def sample_from_logits(
         self,
@@ -386,9 +421,17 @@ class TextGenerationController:
             required_result_tokens = batch_prompt_tokens_with_generations[
                 idx, input_prompt_length : (input_prompt_length + required_sequence_length)
             ]
-
+            generated_sequence_lengths = generated_sequence_lengths.to(dtype=torch.int32)
+            request.generated_sequence_lengths = generated_sequence_lengths.to(dtype=torch.int32)
             request.generated_length = required_sequence_length
             request.generated_tokens = required_result_tokens
+
+            request.prompt_log_probs = (
+                None
+                if output_log_probs is None
+                else output_log_probs[idx, :input_prompt_length].cpu().numpy().tolist()
+            )
+
             request.generated_log_probs = (
                 None
                 if output_log_probs is None
@@ -396,9 +439,16 @@ class TextGenerationController:
                     idx,
                     input_prompt_length - 1 : (input_prompt_length + required_sequence_length - 1),
                 ]
+                .cpu()
+                .numpy()
+                .tolist()
             )
             request.status = Status.COMPLETED
-            request.generated_text = self.detokenize_generations(required_result_tokens)
+            request.generated_text, request.segments = self.detokenize_generations(
+                required_result_tokens,
+                input_prompt_length + generated_sequence_lengths,
+                sampling_params.return_segments,
+            )
 
         return active_requests
 
