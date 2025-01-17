@@ -35,7 +35,7 @@ def _reduce(input_):
     # All-reduce.
     input_ = input_.contiguous()
     if xm:
-        xm.all_reduce(xm.REDUCE_SUM, [input_], groups=get_tensor_model_parallel_groups(), pin_layput=False)
+        xm.all_reduce(xm.REDUCE_SUM, [input_], groups=get_tensor_model_parallel_groups(), pin_layout=False)
     else:
         torch.distributed.all_reduce(input_, group=get_tensor_model_parallel_group())
 
