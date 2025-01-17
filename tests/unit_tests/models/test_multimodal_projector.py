@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from megatron.core.models.gpt.gpt_layer_specs import _get_mlp_module_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -20,7 +20,7 @@ class TestMultimodalProjector:
         transformer_config = TransformerConfig(
             num_layers=1, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
         )
-        mlp_layer_spec = _get_mlp_module_spec().submodules
+        mlp_layer_spec = get_mlp_module_spec().submodules
 
         affine_layer_spec = MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=None)
         self.mlp = MultimodalProjector(
