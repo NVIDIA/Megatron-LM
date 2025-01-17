@@ -21,7 +21,7 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version, make_sharded_tensor_for_checkpoint
-
+from contextlib import nullcontext
 
 class SharedExpertMLP(MLP):
     """
@@ -77,7 +77,7 @@ class SharedExpertMLP(MLP):
             self.cached_output = None
             self.gate_score = None
 
-            if self.stream is None:
+            if torch.cuda.is_available() and self.stream is None:
                 self.stream = torch.cuda.Stream()
 
     def forward(self, hidden_states):
@@ -115,21 +115,14 @@ class SharedExpertMLP(MLP):
         assert self.cached_output is None
         if torch.cuda.is_available():
             self.stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(self.stream):
-                if self.use_shared_expert_gate:
-                    logits = torch.nn.functional.linear(input, self.gate_weight)
-                    self.gate_score = torch.nn.functional.sigmoid(logits)
-                if self.config.sequence_parallel:
-                    self.cached_fc1_input = gather_from_sequence_parallel_region(
-                        input, tensor_parallel_output_grad=True
-                    )
-                else:
-                    self.cached_fc1_input = copy_to_tensor_model_parallel_region(input)
-                set_tensor_grad_fn_sequence_sr(self.cached_fc1_input, torch.iinfo(torch.int).max)
+            ctx = torch.cuda.stream(self.stream)
         else:
+            ctx = nullcontext()
+
+        with ctx:
             if self.use_shared_expert_gate:
-                    logits = torch.nn.functional.linear(input, self.gate_weight)
-                    self.gate_score = torch.nn.functional.sigmoid(logits)
+                logits = torch.nn.functional.linear(input, self.gate_weight)
+                self.gate_score = torch.nn.functional.sigmoid(logits)
             if self.config.sequence_parallel:
                 self.cached_fc1_input = gather_from_sequence_parallel_region(
                     input, tensor_parallel_output_grad=True
@@ -137,6 +130,7 @@ class SharedExpertMLP(MLP):
             else:
                 self.cached_fc1_input = copy_to_tensor_model_parallel_region(input)
             set_tensor_grad_fn_sequence_sr(self.cached_fc1_input, torch.iinfo(torch.int).max)
+
     def linear_fc1_forward_and_act(self, overlapped_comm_output=None):
         """
         Do Linear FC1 and activation function forward.
@@ -147,7 +141,12 @@ class SharedExpertMLP(MLP):
         assert self.cached_fc1_input is not None
         if overlapped_comm_output is not None:
             set_tensor_grad_fn_sequence_sr(overlapped_comm_output, torch.iinfo(torch.int).max)
-        with torch.cuda.stream(self.stream):
+        if torch.cuda.is_available():
+            ctx = torch.cuda.stream(self.stream)
+        else:
+            ctx = nullcontext()
+
+        with ctx:
             # [s, b, 4 * h/p]
             intermediate_parallel, bias_parallel = self.linear_fc1(self.cached_fc1_input)
             self.cached_fc1_input = None
@@ -183,6 +182,7 @@ class SharedExpertMLP(MLP):
                     intermediate_parallel = self.activation_func(intermediate_parallel)
 
             self.cached_fc2_input = intermediate_parallel
+        
 
     def linear_fc2_forward(self, overlapped_comm_output=None):
         """
@@ -194,7 +194,12 @@ class SharedExpertMLP(MLP):
         assert self.cached_fc2_input is not None
         if overlapped_comm_output is not None:
             set_tensor_grad_fn_sequence_sr(overlapped_comm_output, torch.iinfo(torch.int).max)
-        with torch.cuda.stream(self.stream):
+        if torch.cuda.is_available():
+            ctx = torch.cuda.stream(self.stream)
+        else:
+            ctx = nullcontext()
+
+        with ctx:
             # [s, b, h]
             self.cached_fc2_output, _ = self.linear_fc2(self.cached_fc2_input)
             self.cached_fc2_input = None
@@ -207,7 +212,12 @@ class SharedExpertMLP(MLP):
         """
         assert self.config.moe_shared_expert_overlap
         assert self.cached_fc2_output is not None
-        with torch.cuda.stream(self.stream):
+        if torch.cuda.is_available():
+            ctx = torch.cuda.stream(self.stream)
+        else:
+            ctx = nullcontext()
+
+        with ctx:
             if self.config.sequence_parallel:
                 self.cached_output = reduce_scatter_to_sequence_parallel_region(
                     self.cached_fc2_output
@@ -218,7 +228,7 @@ class SharedExpertMLP(MLP):
                 )
             self.cached_fc2_output = None
             set_tensor_grad_fn_sequence_sr(self.cached_output, torch.iinfo(torch.int).max)
-
+        
     def get_output(self):
         """
         Gets the module forward output.
@@ -227,7 +237,12 @@ class SharedExpertMLP(MLP):
         """
         assert self.config.moe_shared_expert_overlap
         assert self.cached_output is not None
-        with torch.cuda.stream(self.stream):
+        if torch.cuda.is_available():
+            ctx = torch.cuda.stream(self.stream)
+        else:
+            ctx = nullcontext()
+
+        with ctx:
             if self.use_shared_expert_gate:
                 assert self.gate_score is not None
                 output = self.cached_output * self.gate_score
@@ -235,8 +250,10 @@ class SharedExpertMLP(MLP):
             else:
                 output = self.cached_output
             self.cached_output = None
+        
         if torch.cuda.is_available():
             torch.cuda.current_stream().wait_stream(self.stream)
+            
         return output
 
 

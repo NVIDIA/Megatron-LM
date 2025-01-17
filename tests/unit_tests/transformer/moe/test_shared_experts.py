@@ -53,7 +53,8 @@ class TestSharedExperts:
         num_weights = sum([p.numel() for p in self.moe_layer.parameters()])
         assert num_weights == 3480 + 1152
         assert self.moe_layer.shared_experts is not None
-        assert self.moe_layer.shared_experts.stream is None
+        if torch.cuda.is_available():
+            assert self.moe_layer.shared_experts.stream is None
         assert self.moe_layer.token_dispatcher.shared_experts is None
 
         moe_layer = self.moe_layer
@@ -112,7 +113,8 @@ class TestSharedExpertsOverlap:
         num_weights = sum([p.numel() for p in self.moe_layer.parameters()])
         assert num_weights == 3480 + 1152
         assert self.moe_layer.shared_experts is not None
-        assert self.moe_layer.shared_experts.stream is not None
+        if torch.cuda.is_available():
+            assert self.moe_layer.shared_experts.stream is not None
         assert self.moe_layer.token_dispatcher.shared_experts is not None
 
         moe_layer = self.moe_layer
