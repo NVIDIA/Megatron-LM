@@ -69,7 +69,7 @@ class TorchCommonLoadStrategy(LoadCommonStrategy):
         """
         load_path = Path(checkpoint_dir) / COMMON_STATE_FNAME
         try:
-            return torch.load(load_path, map_location='cpu')
+            return torch.load(load_path, map_location='cpu', weights_only=False)
         except FileNotFoundError as e:
             err_msg = f'Common file {load_path} does not exist'
             ckpt_files = [f.name for f in checkpoint_dir.iterdir()]
@@ -95,12 +95,12 @@ class TorchCommonLoadStrategy(LoadCommonStrategy):
             sh_obj.data = None
             load_path = checkpoint_dir / f'{sh_obj.unique_key}.pt'
             try:
-                loaded_obj = torch.load(load_path)
+                loaded_obj = torch.load(load_path, weights_only=False)
             except FileNotFoundError as e:
                 # Backward compatible logic: previously the save format was incorrect
                 old_load_path = (checkpoint_dir / sh_obj.unique_key).with_suffix('.pt')
                 try:
-                    loaded_obj = torch.load(old_load_path)
+                    loaded_obj = torch.load(old_load_path, weights_only=False)
                 except FileNotFoundError:
                     err_msg = f'Object shard {load_path} not found'
                     obj_subdir = checkpoint_dir / sh_obj.key
