@@ -179,7 +179,6 @@ class TestDistributedOptimizer:
         ],
     )
 
-    @pytest.mark.failing_on_rocm
     def test_dp_sharding(self, tmp_path_dist_ckpt, tp_pp, src_dp, dest_dp, use_fpsl, initialize_fn):
         src_world_size = tp_pp[0] * tp_pp[1] * src_dp
         dest_world_size = tp_pp[0] * tp_pp[1] * dest_dp
@@ -257,7 +256,6 @@ class TestDistributedOptimizer:
         ('src_tp_pp', 'dest_tp_pp', 'use_glu'),
         [((2, 2), (2, 4), False), ((1, 8), (4, 1), True), ((2, 4), (4, 2), False)],
     )
-    @pytest.mark.failing_on_rocm
     def test_finetune_doesnt_load_optimizer(
         self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_glu
     ):
@@ -335,7 +333,6 @@ class TestDistributedOptimizer:
                 assert not diffs[0] and not diffs[1] and diffs[2]
                 assert not any(diff(optimizer.state_dict(), optim_unloaded_state_dict))
 
-    @pytest.mark.failing_on_rocm
     def test_can_load_deprecated_bucket_space_format(self, tmp_path_dist_ckpt):
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
         tp = 4
@@ -404,7 +401,6 @@ class TestFP32Optimizer:
     @pytest.mark.parametrize(
         ('src_tp_pp', 'dest_tp_pp'), [((2, 4), (2, 4)), ((2, 4), (4, 2)), ((8, 1), (1, 2))]
     )
-    @pytest.mark.failing_on_rocm
     def test_fp32_optimizer_resharding(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp):
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
 
@@ -485,7 +481,6 @@ class TestOptimizerResharding:
         ('src_tp_pp', 'dest_tp_pp'),
         [((2, 4), (2, 4)), ((2, 4), (2, 2)), ((2, 4), (4, 2)), ((8, 1), (1, 2))],
     )
-    @pytest.mark.failing_on_rocm
     def test_optimizer_resharding(
         self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_dist_opt, bf16
     ):
@@ -537,7 +532,6 @@ class TestOptimizerResharding:
             ((2, 1, 2), (1, 1, 8)),
         ],
     )
-    @pytest.mark.failing_on_rocm
     def test_chained_optimizer_resharding(
         self,
         tmp_path_dist_ckpt,

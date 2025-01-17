@@ -8,6 +8,8 @@ import logging
 from collections import deque
 from time import time
 from typing import Callable, List, NamedTuple, Optional, Tuple
+from functools import partial
+
 
 import torch
 from torch import multiprocessing as mp
@@ -65,6 +67,10 @@ class AsyncRequest(NamedTuple):
         """
         return self._replace(is_frozen=True)
 
+def initialize_and_run(async_fn: Callable, save_args: Tuple) -> None:
+    """Initialize the process group and run the async function."""
+    torch.distributed.init_process_group(backend='nccl')
+    async_fn(*save_args)
 
 class DistributedAsyncCaller:
     """Wrapper around mp.Process that ensures correct semantic of distributed finalization.
@@ -95,9 +101,10 @@ class DistributedAsyncCaller:
             f"rank: {torch.distributed.get_rank()}, takes {end_sync - start_sync} to finish D2H "
         )
 
-        ctx = mp.get_context('fork')
+        ctx = mp.get_context('spawn')
         self.start_time = time()
-        self.process = ctx.Process(target=async_fn, args=save_args)
+        target_function = partial(initialize_and_run, async_fn, save_args)
+        self.process = ctx.Process(target=target_function)
         self.process.start()
         init_time = time()
         logger.debug(
