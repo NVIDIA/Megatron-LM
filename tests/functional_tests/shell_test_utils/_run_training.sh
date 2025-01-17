@@ -102,13 +102,20 @@ DISTRIBUTED_ARGS=(
     --node_rank $SLURM_NODEID
     --log-dir $OUTPUT_PATH
     --tee "0:3"
-    --redirects "3"
 )
 
 # Start training
-torchrun ${DISTRIBUTED_ARGS[@]} $TRAINING_SCRIPT_PATH $PARAMS
+set -e
+EXIT_CODE=0
+torchrun ${DISTRIBUTED_ARGS[@]} $TRAINING_SCRIPT_PATH $PARAMS || EXIT_CODE=$?
+echo $EXIT_CODE
+set +e
 
 find "$OUTPUT_PATH" -type f \( -name "stdout.log" -o -name "stderr.log" \) | while read -r file; do
     rank_dir=$(basename "$(dirname "$file")")
     mv "$file" "$(dirname "$file")/repeat$REPEAT-run$RUN_NUMBER-rank${rank_dir}-$(basename "$file")"
 done
+
+if [[ $EXIT_CODE -ne 0 ]]; then
+    exit $EXIT_CODE
+fi

@@ -277,8 +277,8 @@ def main(
                 no_log = True
             except KeyError as e:
                 logger.error(e)
-                break
                 no_log = True
+                break
 
         if no_log:
             logger.error("Did not find any logs to download, retry.")
