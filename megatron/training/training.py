@@ -1397,12 +1397,14 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     def get_e2e_base_metrics():
         """Get base metrics values for one-logger to calculate E2E tracking metrics.
         """
+        num_floating_point_operations_since_current_train_start = \
+            num_floating_point_operations_so_far - args.num_floating_point_operations_so_far
         return {
             'iteration': iteration,
             'train_duration': timers('interval-time').active_time(),
             'eval_duration': eval_duration,
             'eval_iterations': eval_iterations,
-            'total_flops': num_floating_point_operations_since_last_log_event,
+            'total_flops_since_current_train_start': num_floating_point_operations_since_current_train_start,
             'num_floating_point_operations_so_far': num_floating_point_operations_so_far,
             'consumed_train_samples': args.consumed_train_samples,
             'world_size': args.world_size,
