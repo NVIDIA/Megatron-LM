@@ -320,21 +320,27 @@ class TestLLaVAModel:
         # Try with labels and PackedSeqParams. Only micro batch size 1 is supported in this mode.
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
-            cu_seqlens_q=[0, 512, 1024, 1600],  # Just example values.
-            cu_seqlens_kv=[0, 512, 1024, 1600],
-            max_seqlen_q=[1600],
-            max_seqlen_kv=[1600],
+            cu_seqlens_q=torch.tensor(
+                [0, 512, 1024, 1600], dtype=torch.int32
+            ).cuda(),  # Just example values.
+            cu_seqlens_kv=torch.tensor([0, 512, 1024, 1600], dtype=torch.int32).cuda(),
+            max_seqlen_q=torch.tensor(1600, dtype=torch.int32).cuda(),
+            max_seqlen_kv=torch.tensor(1600, dtype=torch.int32).cuda(),
         )
 
+        # NOTE: Packing is only supported with BF16. Use BF16 here and switch back to default.
+        self.model.to(torch.bfloat16)
         loss, new_loss_mask = self.model.forward(
-            img[:1],
+            img[:1].to(torch.bfloat16),
             input_ids[:1],
             position_ids[:1],
             attention_mask,
             labels[:1],
             loss_mask[:1],
             num_image_tiles=num_image_tiles[:1],
+            packed_seq_params=packed_seq_params,
         )
+        self.model.to(torch.float32)
 
         # 1600 = 577 (img_seq_len) + 1024 (text tokens in the first sample) - 1 (image token).
         assert loss.shape == new_loss_mask.shape == torch.Size((1, 1600))
