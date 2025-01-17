@@ -72,6 +72,6 @@ FROM main as jet
 ARG CACHEBUST=0
 RUN --mount=type=secret,id=JET_INDEX_URLS \
     JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS) && \
-    pip install jet-api jet-client<2.0.0 --upgrade $JET_INDEX_URLS
+    pip install jet-api "jet-client<2.0.0" --upgrade $JET_INDEX_URLS
 ENV PATH="$PATH:/opt/jet/bin"
 ###
