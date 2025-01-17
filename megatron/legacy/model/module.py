@@ -113,7 +113,7 @@ class MegatronModule(torch.nn.Module):
             xm = get_xla_model()
             if xm:
                 xm.all_reduce(xm.REDUCE_SUM, [self.shared_embedding_or_output_weight().data], 
-                                    groups=mpu.get_embedding_groups())
+                                    groups=mpu.get_embedding_groups(), pin_layout=False)
             else:
                 torch.distributed.all_reduce(self.shared_embedding_or_output_weight().data,
                                          group=mpu.get_embedding_group())
@@ -129,7 +129,7 @@ class MegatronModule(torch.nn.Module):
             xm = get_xla_model()
             if xm:
                 xm.all_reduce(xm.REDUCE_SUM, [position_embeddings.weight.data], 
-                                    groups=mpu.get_position_embedding_groups())
+                                    groups=mpu.get_position_embedding_groups(), pin_layout=False)
             else:
                 torch.distributed.all_reduce(position_embeddings.weight.data,
                                          group=mpu.get_position_embedding_group())

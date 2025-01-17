@@ -129,7 +129,7 @@ class ORQAEvaluator(object):
                 
         xm = get_xla_model()
         if xm:
-            tensor_list = list(xm.all_gather(query_tensor, groups=groups).split(query_tensor.size()[0]))
+            tensor_list = list(xm.all_gather(query_tensor, groups=groups, pin_layout=False).split(query_tensor.size()[0]), pin_layout=False)
         else:
             input_ = torch.empty_like(query_tensor).copy_(query_tensor).detach_()
             tensor_list = [torch.empty_like(input_) for _ in range(device_count)]
@@ -154,10 +154,12 @@ class ORQAEvaluator(object):
         if xm:
             xm.collective_broadcast([distance],
                             device_start_rank,
-                            groups=groups)
+                            groups=groups, 
+                            pin_layout=False)
             xm.collective_broadcast([topkindex],
                             device_start_rank,
-                            groups=groups)
+                            groups=groups, 
+                            pin_layout=False)
         else:
             torch.distributed.broadcast(distance, src=device_start_rank, \
                 group=group)

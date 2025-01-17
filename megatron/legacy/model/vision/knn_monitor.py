@@ -70,7 +70,7 @@ def compute_feature_bank(model):
 
     xm = get_xla_model()
     if xm:
-        feature_banks = list(xm.all_gather(feature_bank, groups=mpu.get_data_parallel_groups()).split(feature_bank.size()[0]))
+        feature_banks = list(xm.all_gather(feature_bank, groups=mpu.get_data_parallel_groups(), pin_layout=False).split(feature_bank.size()[0]))
     else:
         feature_banks = [torch.zeros_like(feature_bank)
                         for i in range(mpu.get_data_parallel_world_size())]
@@ -82,7 +82,7 @@ def compute_feature_bank(model):
                               feature_bank))
 
     if xm:
-        feature_labels = list(xm.all_gather(feature_label, groups=mpu.get_data_parallel_groups()).split(feature_label.size()[0]))
+        feature_labels = list(xm.all_gather(feature_label, groups=mpu.get_data_parallel_groups(), pin_layout=False).split(feature_label.size()[0]))
     else:
         feature_labels = [torch.zeros_like(feature_label)
                         for i in range(mpu.get_data_parallel_world_size())]

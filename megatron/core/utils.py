@@ -581,7 +581,7 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
     all_gathered_input = [None, None]
     if config.sequence_parallel:
         if xm:
-            all_gather_buffer = xm.all_gather(input, groups=parallel_state.get_tensor_model_parallel_groups())
+            all_gather_buffer = xm.all_gather(input, groups=parallel_state.get_tensor_model_parallel_groups(), pin_layout=False)
         else:
             all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu_0")
             handle = dist_all_gather_func(
@@ -623,7 +623,7 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
             name = "mpu_" + str((i + 1) % 2)
             handle = None
             if xm:
-                all_gather_buffer = xm.all_gather(input, groups=parallel_state.get_tensor_model_parallel_groups())
+                all_gather_buffer = xm.all_gather(input, groups=parallel_state.get_tensor_model_parallel_groups(), pin_layout=False)
             else:
                 all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, name)
                 handle = dist_all_gather_func(

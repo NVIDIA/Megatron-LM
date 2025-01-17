@@ -44,7 +44,7 @@ def _build_key_size_numel_dictionaries(keys, data):
     if xm:
         xm.collective_broadcast([sizes_device],
                          get_tensor_model_parallel_src_rank(),
-                         groups=get_tensor_model_parallel_groups())
+                         groups=get_tensor_model_parallel_groups(), pin_layout=False)
     else:
         torch.distributed.broadcast(
             sizes_device, get_tensor_model_parallel_src_rank(), group=get_tensor_model_parallel_group()
@@ -101,7 +101,7 @@ def broadcast_data(keys, data, datatype):
     if xm:
         xm.collective_broadcast([flatten_data],
                          get_tensor_model_parallel_src_rank(),
-                         groups=get_tensor_model_parallel_groups())
+                         groups=get_tensor_model_parallel_groups(), pin_layout=False)
     else:
         torch.distributed.broadcast(
             flatten_data, get_tensor_model_parallel_src_rank(), group=get_tensor_model_parallel_group()

@@ -150,7 +150,7 @@ def loss_func(loss_mask, output_tensor):
     reporting_loss = loss.clone().detach()
     xm = get_xla_model()
     if xm:
-        xm.all_reduce(xm.REDUCE_SUM, [reporting_loss], groups=mpu.get_data_parallel_groups())
+        xm.all_reduce(xm.REDUCE_SUM, [reporting_loss], groups=mpu.get_data_parallel_groups(), pin_layout=False)
     else:
         torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
 

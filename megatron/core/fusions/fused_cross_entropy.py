@@ -89,7 +89,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         vocab_parallel_logits, logits_max = calculate_logits_max(vocab_parallel_logits)
         xm = get_xla_model()
         if xm:
-            xm.all_reduce(xm.REDUCE_MAX, [logits_max], groups=get_tensor_model_parallel_groups())
+            xm.all_reduce(xm.REDUCE_MAX, [logits_max], groups=get_tensor_model_parallel_groups(), pin_layout=False)
         else:
             torch.distributed.all_reduce(
                 logits_max, op=torch.distributed.ReduceOp.MAX, group=get_tensor_model_parallel_group()
@@ -112,7 +112,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         # In the fused case, tensors are batches to invoke a single
         # AllReduce call
         if xm:
-            xm.all_reduce(xm.REDUCE_SUM, [predicted_logits_sum_exp_logits], groups=get_tensor_model_parallel_groups())
+            xm.all_reduce(xm.REDUCE_SUM, [predicted_logits_sum_exp_logits], groups=get_tensor_model_parallel_groups(), pin_layout=False)
         else:
             torch.distributed.all_reduce(
                 predicted_logits_sum_exp_logits,

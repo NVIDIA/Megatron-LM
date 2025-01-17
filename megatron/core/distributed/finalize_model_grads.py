@@ -101,7 +101,7 @@ def _allreduce_conditional_embedding_grads(model: List[torch.nn.Module], config:
             coalesced = _flatten_dense_tensors(grads)
             if xm:
                 coalesced=xm.all_reduce(xm.REDUCE_SUM, coalesced, 
-                                        groups=parallel_state.get_pipeline_model_parallel_groups())
+                                        groups=parallel_state.get_pipeline_model_parallel_groups(), pin_layout=False)
             else:
                 torch.distributed.all_reduce(
                     coalesced, group=parallel_state.get_pipeline_model_parallel_group()
@@ -142,7 +142,7 @@ def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: Transf
             orig_grad = getattr(weight, grad_attr)
             grad = _unshard_if_dtensor(orig_grad)
             if xm:
-                xm.all_reduce(xm.REDUCE_SUM, [grad], groups=parallel_state.get_embedding_groups())
+                xm.all_reduce(xm.REDUCE_SUM, [grad], groups=parallel_state.get_embedding_groups(), pin_layout=False)
             else:
                 torch.distributed.all_reduce(grad, group=parallel_state.get_embedding_group())
             setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
@@ -171,7 +171,7 @@ def _allreduce_position_embedding_grads(model: List[torch.nn.Module], config: Tr
         orig_grad = getattr(weight, grad_attr)
         grad = _unshard_if_dtensor(orig_grad)
         if xm:
-            xm.all_reduce(xm.REDUCE_SUM, [grad], groups=parallel_state.get_position_embedding_groups())
+            xm.all_reduce(xm.REDUCE_SUM, [grad], groups=parallel_state.get_position_embedding_groups(), pin_layout=False)
         else:
             torch.distributed.all_reduce(grad, group=parallel_state.get_position_embedding_group())
         setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
@@ -213,7 +213,7 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
         if grads:
             coalesced = _flatten_dense_tensors(grads)
             if xm:
-                xm.all_reduce(xm.REDUCE_SUM, [coalesced], groups=parallel_state.get_tensor_model_parallel_groups())
+                xm.all_reduce(xm.REDUCE_SUM, [coalesced], groups=parallel_state.get_tensor_model_parallel_groups(), pin_layout=False)
             else:
                 torch.distributed.all_reduce(
                     coalesced, group=parallel_state.get_tensor_model_parallel_group()
@@ -296,7 +296,7 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
 
         # all-reduce across DP ranks.
         if xm:
-            xm.all_reduce(xm.REDUCE_SUM, [num_tokens], groups=parallel_state.get_data_parallel_groups())
+            xm.all_reduce(xm.REDUCE_SUM, [num_tokens], groups=parallel_state.get_data_parallel_groups(), pin_layout=False)
         else:
             torch.distributed.all_reduce(num_tokens, group=parallel_state.get_data_parallel_group())
         for model_chunk in model:

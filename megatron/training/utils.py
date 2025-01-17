@@ -458,7 +458,8 @@ def get_batch_on_this_tp_rank(data_iterator):
             if xm:
                 xm.collective_broadcast([item],
                                 mpu.get_tensor_model_parallel_src_rank(),
-                                groups=mpu.get_tensor_model_parallel_groups())
+                                groups=mpu.get_tensor_model_parallel_groups(), 
+                                pin_layout=False)
             else:
                 torch.distributed.broadcast(item, mpu.get_tensor_model_parallel_src_rank(), 
                                             group=mpu.get_tensor_model_parallel_group())

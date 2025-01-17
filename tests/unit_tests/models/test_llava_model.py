@@ -875,7 +875,7 @@ def test_llava_model_parallelism(dtp, dpp, etp, epp):
         group = ps.get_tensor_model_parallel_group() if xm is None else ps.get_tensor_model_parallel_groups()
         test_vit_params_tensor = torch.tensor([test_vit_tp_params], dtype=torch.int32).to(device=get_current_device())
         if xm:
-            xm.all_reduce(xm.REDUCE_SUM, [test_vit_params_tensor], groups=group)
+            xm.all_reduce(xm.REDUCE_SUM, [test_vit_params_tensor], groups=group, pin_layout=False)
         else:
             torch.distributed.all_reduce(
                 test_vit_params_tensor, op=torch.distributed.ReduceOp.SUM, group=group
@@ -900,7 +900,7 @@ def test_llava_model_parallelism(dtp, dpp, etp, epp):
         )
         test_proj_params_tensor = torch.tensor([test_proj_tp_params], dtype=torch.int32).to(device=get_current_device())
         if xm:
-            xm.all_reduce(xm.REDUCE_SUM, [test_proj_params_tensor], groups=group)
+            xm.all_reduce(xm.REDUCE_SUM, [test_proj_params_tensor], groups=group, pin_layout=False)
         else:
             torch.distributed.all_reduce(
                 test_proj_params_tensor, op=torch.distributed.ReduceOp.SUM, group=group

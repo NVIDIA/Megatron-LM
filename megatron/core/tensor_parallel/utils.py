@@ -85,7 +85,7 @@ def gather_split_1d_tensor(tensor):
     numel_gathered = torch.numel(tensor) * parallel_state.get_tensor_model_parallel_world_size()
     xm = get_xla_model()
     if xm:
-        gathered = xm.all_gather(tensor, groups=parallel_state.get_tensor_model_parallel_groups()).view(numel_gathered)
+        gathered = xm.all_gather(tensor, groups=parallel_state.get_tensor_model_parallel_groups(), pin_layout=False).view(numel_gathered)
     else:
         gathered = torch.empty(
             numel_gathered, dtype=tensor.dtype, device=get_current_device(), requires_grad=False

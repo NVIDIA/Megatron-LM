@@ -326,7 +326,7 @@ class LinearWithFrozenWeight(torch.autograd.Function):
         if ctx.allreduce_dgrad:
             # All-reduce. Note: here async and sync are effectively the same.
             if xm:
-                xm.all_reduce(xm.REDUCE_SUM, [grad_input], groups=get_tensor_model_parallel_groups())
+                xm.all_reduce(xm.REDUCE_SUM, [grad_input], groups=get_tensor_model_parallel_groups(), pin_layout=False)
             else:
                 torch.distributed.all_reduce(grad_input, group=get_tensor_model_parallel_group())
 
@@ -434,7 +434,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         if sequence_parallel:
             if xm:
-                all_gather_buffer = xm.all_gather(input, groups=get_tensor_model_parallel_groups())
+                all_gather_buffer = xm.all_gather(input, groups=get_tensor_model_parallel_groups(), pin_layout=False)
             else:
                 world_size = get_tensor_model_parallel_world_size()
                 dim_size = list(input.size())
@@ -469,7 +469,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         if wgrad_compute:
             if ctx.sequence_parallel:
                 if xm:
-                    all_gather_buffer = xm.all_gather(input, groups=get_tensor_model_parallel_groups())
+                    all_gather_buffer = xm.all_gather(input, groups=get_tensor_model_parallel_groups(), pin_layout=False)
                 else:
                     world_size = get_tensor_model_parallel_world_size()
                     dim_size = list(input.size())
@@ -499,7 +499,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         if ctx.allreduce_dgrad:
             if xm:
-                xm.all_reduce(xm.REDUCE_SUM, [grad_input], groups=get_tensor_model_parallel_groups())
+                xm.all_reduce(xm.REDUCE_SUM, [grad_input], groups=get_tensor_model_parallel_groups(), pin_layout=False)
             else:
                 # Asynchronous all-reduce
                 handle = torch.distributed.all_reduce(
@@ -514,7 +514,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             if xm:
                 world_size = get_tensor_model_parallel_world_size()
                 sub_grad_input = xm.reduce_scatter(xm.REDUCE_SUM, grad_input, 1.0, 0, world_size,
-                                                   groups=get_tensor_model_parallel_groups())
+                                                   groups=get_tensor_model_parallel_groups(), pin_layout=False)
             else:
                 sub_grad_input = torch.empty(
                     dim_size, dtype=input.dtype, device=get_current_device(), requires_grad=False

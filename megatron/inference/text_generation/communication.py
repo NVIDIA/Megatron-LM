@@ -100,7 +100,7 @@ def broadcast_from_last_pipeline_stage(size, dtype, tensor=None):
         groups = mpu.get_pipeline_model_parallel_groups()
         xm.collective_broadcast([tensor],
                          src,
-                         groups=groups)
+                         groups=groups, pin_layout=False)
     else:
         group = mpu.get_pipeline_model_parallel_group()
         torch.distributed.broadcast(tensor, src, group)
@@ -158,7 +158,7 @@ def broadcast_from_last_to_first_pipeline_stage(size, dtype, tensor=None):
             groups = mpu.get_embedding_groups()
             xm.collective_broadcast([tensor],
                             src,
-                            groups=groups)
+                            groups=groups, pin_layout=False)
         else:
             group = mpu.get_embedding_group()
             torch.distributed.broadcast(tensor, src, group)
@@ -192,14 +192,17 @@ def copy_from_last_to_first_pipeline_stage(size, dtype, tensor=None):
                 tensor_ = torch.empty(size,
                                       dtype=dtype,
                                       device=get_current_device())
+        src = mpu.get_pipeline_model_parallel_last_rank()
+
         # Broadcast from last stage into the first stage.
         xm = get_xla_model()
         if xm:
             groups = mpu.get_embedding_groups()
             xm.collective_broadcast([tensor_],
                             src,
-                            groups=groups)
+                            groups=groups, pin_layout=False)
         else:
+            group = mpu.get_embedding_group()
             torch.distributed.broadcast(tensor_, src, group)
         # Update the first stage tensor
         if is_first_stage and not is_contiguous:

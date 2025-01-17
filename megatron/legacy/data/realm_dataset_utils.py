@@ -184,7 +184,7 @@ def get_block_samples_mapping(block_dataset, title_dataset, data_prefix, num_epo
     xm = get_xla_model()
     if xm:
         xm.all_reduce(xm.REDUCE_SUM, [counts], 
-                                    groups=mpu.get_data_parallel_groups())
+                                    groups=mpu.get_data_parallel_groups(), pin_layout=False)
     else:
         torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
     assert counts[0].item() == torch.distributed.get_world_size(

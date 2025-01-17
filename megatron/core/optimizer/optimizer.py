@@ -402,7 +402,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
         # Update across all model parallel instances.
         if xm:
-            xm.all_reduce(xm.REDUCE_MAX, [self.found_inf], groups=self.get_grad_stats_parallel_group())
+            xm.all_reduce(xm.REDUCE_MAX, [self.found_inf], groups=self.get_grad_stats_parallel_group(), pin_layout=False)
         else:
             torch.distributed.all_reduce(
                 self.found_inf, op=torch.distributed.ReduceOp.MAX, group=self.get_grad_stats_parallel_group()

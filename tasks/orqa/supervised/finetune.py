@@ -30,7 +30,7 @@ def check_and_append_tensor_for_gather(group, rank, world_size, input_, groups=N
         device=get_current_device())
     xm = get_xla_model()
     if xm:
-        input_list = list(xm.all_gather(first_dim, groups=groups).split(first_dim.size()[0]))
+        input_list = list(xm.all_gather(first_dim, groups=groups, pin_layout=False).split(first_dim.size()[0]), pin_layout=False)
     else:
         input_list = [torch.empty_like(first_dim) for _ in range(world_size)]
         input_list[rank].copy_(first_dim)
@@ -114,7 +114,7 @@ def orqa(Dataset):
                 context_logits).detach_()
            
             if xm:
-                tensor_list = list(xm.all_gather(input_, groups=groups).split(input_.size()[0]))
+                tensor_list = list(xm.all_gather(input_, groups=groups, pin_layout=False).split(input_.size()[0]), pin_layout=False)
             else:
                 tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
                 tensor_list[rank].copy_(input_)
@@ -132,7 +132,7 @@ def orqa(Dataset):
             input_ = torch.empty_like(query_logits).copy_(\
                 query_logits).detach_()
             if xm:
-                tensor_list = list(xm.all_gather(input_, groups=groups).split(input_.size()[0]))
+                tensor_list = list(xm.all_gather(input_, groups=groups, pin_layout=False).split(input_.size()[0]), pin_layout=False)
             else:
                 tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
                 tensor_list[rank].copy_(input_)

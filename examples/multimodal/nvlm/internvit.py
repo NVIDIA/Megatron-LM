@@ -113,7 +113,7 @@ class InternViTRMSNorm(MegatronModule):
             var = input_.sum(-1, keepdim=True) * 0.0  # Zero-out the dummy heads.
 
         if xm:
-            output = xm.all_gather(var, groups=get_tensor_model_parallel_groups())
+            output = xm.all_gather(var, groups=get_tensor_model_parallel_groups(), pin_layout=False)
         else:
             tensor_list = [torch.empty_like(var) for _ in range(world_size)]
             tensor_list[rank] = var

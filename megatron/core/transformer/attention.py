@@ -571,7 +571,7 @@ class SelfAttention(Attention):
         )
    
         if xm:
-            dp_list = list(xm.all_gather(inputs, groups=get_data_parallel_groups()).split(inputs.size()[0]))
+            dp_list = list(xm.all_gather(inputs, groups=get_data_parallel_groups(), pin_layout=False).split(inputs.size()[0]))
         else:
             dp_list = [torch.empty_like(inputs) for _ in range(get_data_parallel_world_size())]
             dp_list[rank] = inputs
@@ -600,7 +600,7 @@ class SelfAttention(Attention):
             )
 
         if xm:
-            tp_list = list(xm.all_gather(inputs, groups=get_tensor_model_parallel_groups()).split(inputs.size()[0]))
+            tp_list = list(xm.all_gather(inputs, groups=get_tensor_model_parallel_groups(), pin_layout=False).split(inputs.size()[0]))
         else:
             rank = get_tensor_model_parallel_rank()
             tp_list = [torch.empty_like(inputs) for _ in range(get_tensor_model_parallel_world_size())]

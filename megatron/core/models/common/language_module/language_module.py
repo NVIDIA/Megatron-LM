@@ -141,7 +141,7 @@ class LanguageModule(MegatronModule):
                 weight.data = weight.data.to(device=get_current_device())
                 xm = get_xla_model()
                 if xm:
-                     xm.all_reduce(xm.REDUCE_SUM, [weight.data], groups=parallel_state.get_embedding_groups())
+                     xm.all_reduce(xm.REDUCE_SUM, [weight.data], groups=parallel_state.get_embedding_groups(), pin_layout=False)
                 else:
                     torch.distributed.all_reduce(
                         weight.data, group=parallel_state.get_embedding_group()

@@ -227,7 +227,7 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
                 assert self.data_parallel_group_gloo is not None
                 xm.collective_broadcast([exchange_tensor],
                          src_rank,
-                         groups=self.data_parallel_group_gloo)
+                         groups=self.data_parallel_group_gloo, pin_layout=False)
             else:
                 torch.distributed.broadcast(
                     exchange_tensor, group=self.data_parallel_group, src=src_rank

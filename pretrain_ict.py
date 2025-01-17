@@ -53,7 +53,7 @@ class AllgatherFromDataParallelRegion(torch.autograd.Function):
         
         if xm:
             xm.mark_step()
-            output = xm.all_gather(input_, groups=mpu.get_data_parallel_groups())
+            output = xm.all_gather(input_, groups=mpu.get_data_parallel_groups(), pin_layout=False)
         else:
             group, rank, world_size = get_group_world_size_rank()
             tensor_list = [torch.empty_like(input_) for _ in range(world_size)]

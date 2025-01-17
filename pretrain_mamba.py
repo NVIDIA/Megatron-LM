@@ -132,7 +132,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     xm = get_xla_model()
     if args.context_parallel_size > 1:
         if xm:
-            xm.all_reduce(xm.REDUCE_SUM, [loss], groups=mpu.get_context_parallel_groups())
+            xm.all_reduce(xm.REDUCE_SUM, [loss], groups=mpu.get_context_parallel_groups(), pin_layout=False)
         else:
             torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
 
@@ -148,7 +148,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     # Reduce loss for logging.
     reporting_loss = loss.clone().detach()
     if xm:
-        xm.all_reduce(xm.REDUCE_SUM, [reporting_loss], groups=mpu.get_data_parallel_groups())
+        xm.all_reduce(xm.REDUCE_SUM, [reporting_loss], groups=mpu.get_data_parallel_groups(), pin_layout=False)
     else:
         torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
 

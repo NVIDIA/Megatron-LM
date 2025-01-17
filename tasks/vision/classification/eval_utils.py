@@ -111,7 +111,7 @@ def calculate_correct_answers(model, dataloader, epoch):
         xm = get_xla_model()
         if xm:
             xm.all_reduce(xm.REDUCE_SUM, [unreduced], 
-                                    groups=mpu.get_data_parallel_groups())
+                                    groups=mpu.get_data_parallel_groups(), pin_layout=False)
         else:
             torch.distributed.all_reduce(unreduced,
                                      group=mpu.get_data_parallel_group())

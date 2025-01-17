@@ -712,7 +712,7 @@ def get_samples_mapping(indexed_dataset,
     xm = get_xla_model()
     if xm:
         xm.all_reduce(xm.REDUCE_SUM, [counts], 
-                                    groups=mpu.get_data_parallel_groups())
+                                    groups=mpu.get_data_parallel_groups(), pin_layout=False)
         xm.all_reduce(xm.REDUCE_SUM, [counts], 
                                     groups=mpu.get_pipeline_model_parallel_group())
     else:

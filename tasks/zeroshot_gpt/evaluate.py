@@ -134,7 +134,7 @@ def evaluate(data_loader, model, eval_metric):
                 xm = get_xla_model()
                 if xm:
                     xm.all_reduce(xm.REDUCE_SUM, [output], 
-                                  groups=parallel_state.get_data_parallel_groups())
+                                  groups=parallel_state.get_data_parallel_groups(), pin_layout=False)
                 else:
                     torch.distributed.all_reduce(output,
                                              group=parallel_state.get_data_parallel_group())

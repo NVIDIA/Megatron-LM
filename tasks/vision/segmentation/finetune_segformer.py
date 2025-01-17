@@ -187,7 +187,7 @@ def segmentation():
             xm = get_xla_model()
             if xm:
                 xm.all_reduce(xm.REDUCE_SUM, [performs_tensor], 
-                                  groups=mpu.get_data_parallel_groups())
+                                  groups=mpu.get_data_parallel_groups(), pin_layout=False)
             else:
                 torch.distributed.all_reduce(performs_tensor,
                                          group=mpu.get_data_parallel_group())

@@ -44,7 +44,7 @@ def switch_load_balancing_loss_func(
         # `tokens_per_expert`, saving one allreduce operation for `aggregated_probs_per_expert`.
         if xm:
             num_sub_sequence = len(sequence_partition_group[0])
-            xm.all_reduce(xm.REDUCE_SUM, [tokens_per_expert], groups=sequence_partition_group)
+            xm.all_reduce(xm.REDUCE_SUM, [tokens_per_expert], groups=sequence_partition_group, pin_layout=False)
         else:
             num_sub_sequence = torch.distributed.get_world_size(sequence_partition_group)
             torch.distributed.all_reduce(tokens_per_expert, group=sequence_partition_group)
@@ -87,7 +87,7 @@ def sequence_load_balancing_loss_func(
         # `tokens_per_expert`, saving one allreduce operation for `aggregated_probs_per_expert`.
         if xm:
             num_sub_sequence = len(sequence_partition_group[0])
-            xm.all_reduce(xm.REDUCE_SUM, [tokens_per_expert], groups=sequence_partition_group)
+            xm.all_reduce(xm.REDUCE_SUM, [tokens_per_expert], groups=sequence_partition_group, pin_layout=False)
         else:
             num_sub_sequence = torch.distributed.get_world_size(sequence_partition_group)
             torch.distributed.all_reduce(tokens_per_expert, group=sequence_partition_group)
@@ -523,7 +523,7 @@ def reduce_aux_losses_tracker_across_ranks():
         xm = get_xla_model()
         if xm:
             xm.all_reduce(xm.REDUCE_SUM, [values], 
-                                        groups=parallel_state.get_pipeline_model_parallel_groups())
+                                        groups=parallel_state.get_pipeline_model_parallel_groups(), pin_layout=False)
         else:
             torch.distributed.all_reduce(
                 values, group=parallel_state.get_pipeline_model_parallel_group()
@@ -532,13 +532,13 @@ def reduce_aux_losses_tracker_across_ranks():
         if tracker[name].get('reduce_group') is not None:
             if xm:
                 xm.all_reduce(xm.REDUCE_SUM, [values], 
-                                        groups=tracker[name].get('reduce_group'))
+                                        groups=tracker[name].get('reduce_group'), pin_layout=False)
             else:
                 torch.distributed.all_reduce(values, group=tracker[name].get('reduce_group'))
         if tracker[name].get('avg_group') is not None:
             if xm:
                 xm.all_reduce(xm.REDUCE_SUM, [values], 
-                                        groups=tracker[name].get('avg_group'))
+                                        groups=tracker[name].get('avg_group'), pin_layout=False)
                 values = values / parallel_state.get_pipeline_model_parallel_world_size()
             else:
                 torch.distributed.all_reduce(

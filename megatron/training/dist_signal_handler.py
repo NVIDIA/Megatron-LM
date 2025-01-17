@@ -52,7 +52,7 @@ def all_gather_item(item, dtype, group=None, async_op=False, local_rank=None, gr
     tensor = torch.tensor([item], device=device, dtype=dtype)
     xm = get_xla_model()
     if xm:
-        output_tensors = list(xm.all_gather(tensor, groups=groups).split(tensor.size()[0]))
+        output_tensors = list(xm.all_gather(tensor, groups=groups).split(tensor.size()[0]), pin_layout=False)
     else:
         output_tensors = [
             torch.zeros(1, dtype=tensor.dtype, device=tensor.device)
