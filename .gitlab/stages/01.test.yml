@@ -262,13 +262,13 @@ test:formatting:
         exit 0
       fi
     - set +e
-    - git fetch origin $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
     - git fetch origin main:main
-    - git checkout $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
     - |
       if [[ "$CI_MERGE_REQUEST_PROJECT_PATH" == "$CI_MERGE_REQUEST_SOURCE_PROJECT_PATH" ]]; then 
         bash tools/autoformat.sh
         set -e
+        git fetch origin $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+        git checkout $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
         git config --global user.email "mcore-bot@nvidia.com"
         git config --global user.name "Mcore Bot"
         git remote set-url origin "https://gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
@@ -342,7 +342,7 @@ test:pypi_build_wheel:
 
 test:pypi_test_wheel:
   extends: [.test_rules]
-  image: nvcr.io/nvidia/pytorch:24.01-py3
+  image: nvcr.io/nvidia/pytorch:24.07-py3
   needs: [test:pypi_build_wheel]
   tags: [mcore-docker-node-small]
   variables:
