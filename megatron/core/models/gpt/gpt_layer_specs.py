@@ -83,7 +83,7 @@ def get_gpt_layer_with_transformer_engine_spec(
             ' and will be removed soon. Please update your code accordingly.'
         )
 
-    mlp = _get_mlp_module_spec(
+    mlp = get_mlp_module_spec(
         use_te=True,
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
@@ -173,7 +173,7 @@ def get_gpt_layer_local_spec(
             ' and will be removed soon. Please update your code accordingly.'
         )
 
-    mlp = _get_mlp_module_spec(
+    mlp = get_mlp_module_spec(
         use_te=False,
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
@@ -235,6 +235,27 @@ def get_gpt_layer_local_spec(
 
 
 def _get_mlp_module_spec(
+    use_te: Optional[bool] = True,
+    num_experts: Optional[int] = None,
+    moe_grouped_gemm: Optional[bool] = False,
+    fp8: Optional[str] = None,  # pylint: disable=unused-arguments
+    moe_use_legacy_grouped_gemm: Optional[bool] = False,
+):
+    warnings.warn(
+        """This private function is on a deprecation track. Please switch to `get_mlp_module_spec`
+        since it will be removed in a future release."""
+    )
+
+    return get_mlp_module_spec(
+        use_te=use_te,
+        num_experts=num_experts,
+        moe_grouped_gemm=moe_grouped_gemm,
+        fp8=fp8,
+        moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
+    )
+
+
+def get_mlp_module_spec(
     use_te: Optional[bool] = True,
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,

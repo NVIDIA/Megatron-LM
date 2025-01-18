@@ -63,6 +63,7 @@ def main(
             continue
         magic_values = dict(workload.spec)
         magic_values["assets_dir"] = output_path
+        magic_values["artifacts_dir"] = output_path
 
         file_path = (
             pathlib.Path.cwd()

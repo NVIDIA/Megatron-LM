@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from megatron.core.device_utils import get_current_device
+import inspect
 import os
 
 import pytest
@@ -8,7 +9,8 @@ import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
-    get_gpt_layer_local_spec
+    get_gpt_layer_local_spec,
+    get_mlp_module_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
@@ -69,7 +71,7 @@ class TestGPTModel:
 
     @pytest.mark.internal
     def test_post_process_forward(self):
-        config: TransformerConfig = self.gpt_model.config
+        _ = self.gpt_model.config
         sequence_length = self.gpt_model.max_sequence_length
         micro_batch_size = 2
 
@@ -89,3 +91,36 @@ class TestGPTModel:
         assert logits.shape[0] == micro_batch_size
         assert logits.shape[1] == sequence_length
         assert logits.shape[2] == self.gpt_model.vocab_size
+
+
+def test_get_mlp_module_spec_interface():
+    # Get the function signature
+    sig = inspect.signature(get_mlp_module_spec)
+
+    # Define the expected signature
+    expected_params = {
+        "use_te": inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        "num_experts": inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        "moe_grouped_gemm": inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        "fp8": inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        "moe_use_legacy_grouped_gemm": inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    }
+
+    expected_defaults = {
+        "use_te": True,
+        "num_experts": None,
+        "moe_grouped_gemm": False,
+        "fp8": None,
+        "moe_use_legacy_grouped_gemm": False,
+    }
+
+    # Check parameter kinds
+    for param_name, param in sig.parameters.items():
+        assert param_name in expected_params.keys(), f"Unexpected parameter: {param_name}"
+        assert param.kind is expected_params[param_name], f"Wrong kind for parameter: {param_name}"
+
+    # Check default values
+    defaults = {
+        k: v.default for k, v in sig.parameters.items() if v.default is not inspect.Parameter.empty
+    }
+    assert defaults == expected_defaults, "Default values do not match the expected ones."

@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from typing import List, OrderedDict, Tuple
+import copy
+from typing import List, Optional, OrderedDict, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -52,24 +53,59 @@ class TextGenerationController:
 
         return prompt_tokens
 
-    def detokenize_generations(self, prompt_tokens_with_generated_tokens: torch.Tensor) -> str:
-        """Detokenize the output generations
+    def detokenize_generations(
+        self,
+        tokens_gpu_tensor: torch.Tensor,
+        lengths_gpu_tensor: torch.Tensor,
+        detokenize_segments: bool,
+    ) -> tuple[str, List[str] | None]:
+        """Detokenize the generated tokens.
 
         Args:
-            prompt_tokens_with_generated_tokens (torch.Tensor): The input prompt
-            tokens plus the generated tokens
+            tokens_gpu_tensor (torch.Tensor): Tensor containing the generated tokens
+            lengths_gpu_tensor (torch.Tensor): Tensor containing the lengths of each sequence
+            detokenize_segments (bool): If True, returns individually detokenized tokens. If False,
+            returns None as second element. Helpful for understanding per-token boundaries in
+            generated text.
 
         Returns:
-            str: The detokenized output
+            tuple[str, List[str] | None]: A tuple containing:
+            - str: The complete detokenized text
+            - List[str] | None: List of segmented tokens if detokenize_segments is True, else None
         """
-        tokens = prompt_tokens_with_generated_tokens.cpu().numpy().tolist()
-        return self.tokenizer.detokenize(tokens)
+        # TODO(helenn): Unify with `detokenize_generations` from legacy textgen path
+
+        if not detokenize_segments:
+            tokens = tokens_gpu_tensor.cpu().numpy().tolist()
+            return self.tokenizer.detokenize(tokens), None
+
+        prompts_plus_generations = []
+        prompts_plus_generations_segments = []
+
+        tokens_gpu_tensor = torch.unsqueeze(tokens_gpu_tensor, 0)
+        tokens = tokens_gpu_tensor.cpu().numpy().tolist()
+        lengths = lengths_gpu_tensor.cpu().numpy().tolist()
+
+        for sequence_tokens, length in zip(tokens, lengths):
+            sequence_tokens = sequence_tokens[:length]
+            detok_str = self.tokenizer.detokenize(sequence_tokens)
+            prompts_plus_generations.append(detok_str)
+            offsets = self.tokenizer.offsets(sequence_tokens, detok_str)
+            words = [
+                detok_str[start:end] for start, end in zip(offsets, offsets[1:] + [len(detok_str)])
+            ]
+
+            prompts_plus_generations_segments.append(words)
+
+        text = self.tokenizer.detokenize(tokens[0])
+
+        return text, prompts_plus_generations_segments
 
     def sample_from_logits(
         self,
         last_token_logits: torch.Tensor,
-        sampling_params: SamplingParams = None,
-        vocab_size: int = None,
+        sampling_params: Optional[SamplingParams] = None,
+        vocab_size: Optional[int] = None,
         **kwargs
     ) -> torch.Tensor:
         """Samples the logits to generate outputs
@@ -156,7 +192,7 @@ class TextGenerationController:
         current_context_end_position: int,
         is_generation_done_tensor: torch.Tensor,
         generated_sequence_lengths: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Checks which prompts have reached an end condition
 
         We check which prompts have reached an end condition and set the corresponding
@@ -178,7 +214,7 @@ class TextGenerationController:
                 Each value represents the generated sequence lengths for that prompt.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Returns the boolean
+            Tuple[torch.Tensor, torch.Tensor]: Returns the boolean
                 is_generation_done_tensor and the generated_sequence_lengths after updating it
         """
         latest_samples = updated_prompts_tokens[:, current_context_end_position]
@@ -221,8 +257,8 @@ class TextGenerationController:
         return torch.tensor(batch_prompt_tokens_list).to(device=get_current_device())
 
     def generate_output_tokens_dynamic_batch(
-        self, active_requests: OrderedDict[int, InferenceRequest]
-    ) -> OrderedDict[int, InferenceRequest]:
+        self, active_requests: OrderedDict[str, InferenceRequest]
+    ) -> OrderedDict[str, InferenceRequest]:
         """Utility to generate the output tokens and probabilities for the prompts
 
         This utility generates the output tokens for a dynamic batch. It will run one forward step
@@ -230,17 +266,17 @@ class TextGenerationController:
         this method again.
 
         Args:
-            active_requests (OrderedDict[int, InferenceRequest]): The input active requests.
+            active_requests (OrderedDict[str, InferenceRequest]): The input active requests.
 
         Returns:
-            OrderedDict[int, InferenceRequest]: The result for each of the incoming requests
+            OrderedDict[str, InferenceRequest]: The result for each of the incoming requests
             after running one forward step.
         """
         raise Exception("Not implemented yet")
 
     def generate_all_output_tokens_static_batch(
-        self, active_requests: OrderedDict[int, InferenceRequest]
-    ) -> OrderedDict[int, InferenceRequest]:
+        self, active_requests: OrderedDict[str, InferenceRequest]
+    ) -> OrderedDict[str, InferenceRequest]:
         """Utility to generate the all the output tokens and probabilities for the prompts .
 
         This utility generates the output tokens for a static batch. It runs the forward steps till
@@ -248,13 +284,14 @@ class TextGenerationController:
         the generated result and returns these requests
 
         Args:
-            active_requests (OrderedDict[int, InferenceRequest]): The input active requests.
+            active_requests (OrderedDict[str, InferenceRequest]): The input active requests.
 
         Returns:
-            OrderedDict[int, InferenceRequest]: The result for each of the incoming requests
+            OrderedDict[str, InferenceRequest]: The result for each of the incoming requests
         """
+        # Perform a deep copy so that the request prompt tokens do not get modified.
         batch_prompt_tokens_list = list(
-            map(lambda request: request.prompt_tokens, active_requests.values())
+            map(lambda request: copy.deepcopy(request.prompt_tokens), active_requests.values())
         )
         prompt_lengths_in_batch = torch.tensor(
             [len(prompt_tokens) for prompt_tokens in batch_prompt_tokens_list]
@@ -335,6 +372,7 @@ class TextGenerationController:
                         2,
                     )
                     # Get the log probabilities for only the prompt tokens
+                    assert output_log_probs is not None
                     output_log_probs[:, context_start_position:context_end_position] = torch.gather(
                         log_probs, 2, indices
                     ).squeeze(2)
@@ -360,6 +398,7 @@ class TextGenerationController:
         # Include all the generated tokens
         batch_prompt_tokens_with_generations = batch_prompt_tokens[:, : (context_end_position + 1)]
         if sampling_params.return_log_probs:
+            assert output_log_probs is not None
             output_log_probs = output_log_probs[:, :context_end_position]
 
         generated_sequence_lengths[
@@ -376,9 +415,17 @@ class TextGenerationController:
             required_result_tokens = batch_prompt_tokens_with_generations[
                 idx, input_prompt_length : (input_prompt_length + required_sequence_length)
             ]
-
+            generated_sequence_lengths = generated_sequence_lengths.to(dtype=torch.int32)
+            request.generated_sequence_lengths = generated_sequence_lengths.to(dtype=torch.int32)
             request.generated_length = required_sequence_length
             request.generated_tokens = required_result_tokens
+
+            request.prompt_log_probs = (
+                None
+                if output_log_probs is None
+                else output_log_probs[idx, :input_prompt_length].cpu().numpy().tolist()
+            )
+
             request.generated_log_probs = (
                 None
                 if output_log_probs is None
@@ -386,19 +433,26 @@ class TextGenerationController:
                     idx,
                     input_prompt_length - 1 : (input_prompt_length + required_sequence_length - 1),
                 ]
+                .cpu()
+                .numpy()
+                .tolist()
             )
             request.status = Status.COMPLETED
-            request.generated_text = self.detokenize_generations(required_result_tokens)
+            request.generated_text, request.segments = self.detokenize_generations(
+                required_result_tokens,
+                input_prompt_length + generated_sequence_lengths,
+                sampling_params.return_segments,
+            )
 
         return active_requests
 
     def prep_model_for_inference(
-        self, prompts_tokens: torch.Tensor, active_requests: OrderedDict[int, InferenceRequest]
+        self, prompts_tokens: torch.Tensor, active_requests: OrderedDict[str, InferenceRequest]
     ):
         """Preparing batch for inference, using respective wrapper's prep_model_for_inference method
 
         Args:
             prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_sequence_length]
-            active_requests (OrderedDict[int, InferenceRequest]): The input active requests
+            active_requests (OrderedDict[str, InferenceRequest]): The input active requests
         """
         self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=prompts_tokens)

@@ -44,7 +44,7 @@ except ImportError:
 
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-    warnings.warn(f'Apex is not installed. Falling back to Torch Norm')
+    warnings.warn('Apex is not installed. Falling back to Torch Norm')
     LNImpl = WrappedTorchNorm
 
 # Use this spec to use lower level Transformer Engine modules (required for fp8 training)

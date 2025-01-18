@@ -274,14 +274,22 @@ def main(
                 logger.error(e)
                 time.sleep((3**n_download_attempt) * 60)
                 n_download_attempt += 1
+                no_log = True
             except KeyError as e:
                 logger.error(e)
                 no_log = True
+                break
 
         if no_log:
+            logger.error("Did not find any logs to download, retry.")
             continue
 
         concat_logs = "\n".join(logs)
+        if concat_logs.strip() == "":
+            logger.error("No logs found. Try again.")
+            n_attempts += 1
+            continue
+
         print(f"Logs:\n{concat_logs}")
 
         success = pipeline.get_status() == PipelineStatus.SUCCESS
@@ -298,9 +306,7 @@ def main(
                 "Some NCCL operations have failed or timed out." in concat_logs
                 or "uncorrectable ECC error encountered" in concat_logs
                 or "illegal memory access" in concat_logs
-                or "illegal instruction" in concat_logs
-                or "NCCL WARN [Service thread] Accept failed Resource temporarily unavailable"
-                in concat_logs
+                or "illegal instruction" in concat_logs in concat_logs
             ):
                 logger.error("Detected NCCL failure, attempt restart.")
                 n_attempts += 1
@@ -310,6 +316,8 @@ def main(
                 logger.error("Non-determinism, let's try another node.")
                 n_nondeterminism_attemps += 1
                 continue
+
+            sys.exit(1)
 
         if parse_failed_job(logs=logs):
             n_attempts += 1

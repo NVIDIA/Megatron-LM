@@ -1,7 +1,10 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from typing import Optional
+
 import torch
+
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.gpt.gpt_layer_specs import _get_mlp_module_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import (
     CrossAttention,
@@ -47,19 +50,14 @@ except ImportError:
 
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-    warnings.warn(f'Apex is not installed. Falling back to Torch Norm')
+    warnings.warn('Apex is not installed. Falling back to Torch Norm')
     LNImpl = WrappedTorchNorm
 
 def decoder_model_with_transformer_engine_default_spec(
-    num_experts: int = None, moe_grouped_gemm: bool = False, qk_layernorm: bool = False
+    num_experts: Optional[int] = None, moe_grouped_gemm: bool = False, qk_layernorm: bool = False
 ) -> ModuleSpec:
     """LLava decoder TE spec (uses Transformer Engine components)."""
-
-    if not HAVE_TE:
-        return decoder_model_with_local_default_spec(num_experts=num_experts,
-                                                     moe_grouped_gemm=moe_grouped_gemm,
-                                                     qk_layernorm=qk_layernorm)
-    mlp = _get_mlp_module_spec(
+    mlp = get_mlp_module_spec(
         use_te=True, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
     )
     return ModuleSpec(
@@ -84,10 +82,10 @@ def decoder_model_with_transformer_engine_default_spec(
 
 
 def decoder_model_with_local_default_spec(
-    num_experts: int = None, moe_grouped_gemm: bool = False, qk_layernorm: bool = False
+    num_experts: Optional[int] = None, moe_grouped_gemm: bool = False, qk_layernorm: bool = False
 ) -> ModuleSpec:
     """LLava decoder local spec."""
-    mlp = _get_mlp_module_spec(
+    mlp = get_mlp_module_spec(
         use_te=False, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
     )
     return ModuleSpec(

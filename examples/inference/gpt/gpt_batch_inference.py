@@ -107,7 +107,7 @@ def main():
                 'id': result.request_id,
                 'input_prompt': result.prompt, 
                 'generated_text': result.generated_text,
-                'generated_tokens' : result.generated_tokens
+                'generated_tokens': result.generated_tokens
                 }
             print(result)
 

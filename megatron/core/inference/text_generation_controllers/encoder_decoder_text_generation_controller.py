@@ -18,13 +18,13 @@ class EncoderDecoderTextGenerationController(TextGenerationController):
     """
 
     def prep_model_for_inference(
-        self, prompts_tokens: torch.Tensor, active_requests: OrderedDict[int, InferenceRequest]
+        self, prompts_tokens: torch.Tensor, active_requests: OrderedDict[str, InferenceRequest]
     ):
         """Preparing batch for inference, using respective wrapper's prep_model_for_inference method
 
         Args:
             prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_sequence_length]
-            active_requests (OrderedDict[int, InferenceRequest]): The input active requests
+            active_requests (OrderedDict[str, InferenceRequest]): The input active requests
         """
         encoder_prompts = list(
             map(lambda request: request.encoder_prompt, active_requests.values())
