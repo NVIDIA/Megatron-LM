@@ -19,7 +19,7 @@ from jetclient.services.dtos.pipeline import PipelineStatus
 from tests.test_utils.python_scripts import common
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
-
+GITLAB_PREFIX = "assets/basic/tests-unit-tests-data-{environment}-{tag}/"
 
 logger = logging.getLogger(__name__)
 
@@ -125,11 +125,18 @@ def download_job_assets(logs: List[jet_log.JETLog], iteration: int = 0) -> List[
         assets = log.get_assets()
         assets_path = assets_base_path / f"restart={restart_idx}"
         assets_path.mkdir(parents=True, exist_ok=True)
-        for log_filename in assets.keys():
-            with open(assets_path / log_filename, "w") as fh:
+        for asset in assets:
+            (assets_path / asset.source_path.removeprefix(GITLAB_PREFIX)).parent.mkdir(
+                parents=True, exist_ok=True
+            )
+            with open(assets_path / asset.source_path.removeprefix(GITLAB_PREFIX), "w") as fh:
                 dest = pathlib.Path(fh.name)
-                logger.info("Downloading log %s to %s", log_filename, str(dest))
-                assets[log_filename].download(dest)
+                logger.info(
+                    "Downloading log %s to %s",
+                    asset.source_path.removeprefix(GITLAB_PREFIX),
+                    str(dest),
+                )
+                asset.download(dest)
     return assets
 
 
@@ -139,7 +146,9 @@ def extract_logs_to_string(logs: List[jet_log.JETLog]) -> List[str]:
         return [""]
 
     with tempfile.NamedTemporaryFile() as tmp_file:
-        logs[-1].get_assets()["output_script-0.log"].download(pathlib.Path(tmp_file.name))
+        assets = logs[-1].get_assets()
+        asset = [asset for asset in assets if asset.name == "output_script-0.log"][0]
+        asset.download(pathlib.Path(tmp_file.name))
         with open(pathlib.Path(tmp_file.name), "r") as fh:
             return fh.readlines()
 
@@ -210,6 +219,9 @@ def main(
 ):
     logging.basicConfig(level=logging.INFO)
     logger.info('Started')
+
+    global GITLAB_PREFIX
+    GITLAB_PREFIX = GITLAB_PREFIX.format(environment=environment, tag=tag)
 
     model_config_path = pathlib.Path(
         BASE_PATH
