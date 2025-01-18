@@ -224,7 +224,7 @@ def permute(tokens, routing_map, num_out_tokens: int = None, drop_and_pad: bool 
             :, :capacity
         ].contiguous()
         # flatten from [num_experts, capacity] to 1D
-        token_indices = token_indices.view(-1)
+        sorted_indices = token_indices.view(-1)
     else:
         # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
         routing_map = routing_map.bool().T.contiguous()
