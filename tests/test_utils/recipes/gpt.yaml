@@ -580,6 +580,19 @@ products:
         scope: [mr]
       - environment: [lts]
         scope: [nightly]
+  - test_case: [gpt3_7b_mr_dgx_a100_1N8G_tp1_pp4_memory_speed]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_7b_mr_dgx_a100_1N8G_tp4_pp1_memory_speed]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+
   # - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_ddp_average_in_collective_dgx_a100_1N8G]
   #   products:
   #     - environment: [dev]

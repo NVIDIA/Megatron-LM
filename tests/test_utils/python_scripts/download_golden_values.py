@@ -24,11 +24,13 @@ def main(pipeline_id: int):
 
     project = gl.projects.get(19378)
     pipeline = project.pipelines.get(pipeline_id)
+    print(pipeline.bridges.list())
 
     pipeline_bridges = [
         pipeline_bridge
         for pipeline_bridge in pipeline.bridges.list()
         if pipeline_bridge.name.startswith("functional")
+        and pipeline_bridge.downstream_pipeline is not None
     ]
 
     ASSETS_DIR = pathlib.Path("tmp") / "results" / "iteration=0"
