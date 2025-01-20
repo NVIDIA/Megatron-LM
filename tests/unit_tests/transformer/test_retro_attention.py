@@ -196,7 +196,7 @@ class TestRetroAttention:
             config.retro_num_neighbors * micro_batch_size * n_chunks_per_sample,
             config.hidden_size,
         )
-    @pytest.mark.failing_on_rocm
+    @pytest.mark.failing_on_upstream
     def test_gpu_forward(self):
         for recompute_granularity in (None, 'selective'):
             for use_transformer_engine in (True, False):

@@ -107,7 +107,7 @@ class TestT5Model:
             assert self.t5_model.encoder_hidden_state.shape[1] == micro_batch_size
             assert self.t5_model.encoder_hidden_state.shape[2] == config.hidden_size
 
-    @pytest.mark.failing_on_rocm
+    @pytest.mark.failing_on_upstream
     def test_post_process_forward(self):
         config: TransformerConfig = self.t5_model.config
         sequence_length = self.t5_model.max_sequence_length
@@ -157,7 +157,7 @@ class TestT5Model:
             assert encoder_hidden_states.shape[1] == micro_batch_size
             assert encoder_hidden_states.shape[2] == config.hidden_size
 
-    @pytest.mark.failing_on_rocm
+    @pytest.mark.failing_on_upstream
     def test_forward_output_encoder_hidden_only(self):
         config: TransformerConfig = self.t5_model.config
         sequence_length = self.t5_model.max_sequence_length
@@ -193,7 +193,7 @@ class TestT5Model:
             assert encoder_hidden_states.shape[1] == micro_batch_size
             assert encoder_hidden_states.shape[2] == config.hidden_size
 
-    @pytest.mark.failing_on_rocm
+    @pytest.mark.failing_on_upstream
     def test_forward_with_encoder_hidden_states(self):
         config: TransformerConfig = self.t5_model.config
         sequence_length = self.t5_model.max_sequence_length

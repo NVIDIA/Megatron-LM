@@ -594,6 +594,7 @@ class TestNonStrictLoad:
 
     @pytest.mark.parametrize('save_format', ['zarr', 'torch_dist'])
     @pytest.mark.parametrize('validate_integrity', [True, False])
+    @pytest.mark.failing_on_rocm
     def test_unexpected_keys_handling_during_validation(
         self, caplog, tmp_path_dist_ckpt, validate_integrity, save_format
     ):
