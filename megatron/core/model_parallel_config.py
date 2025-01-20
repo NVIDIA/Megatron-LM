@@ -22,6 +22,9 @@ class ModelParallelConfig:
     pipeline_model_parallel_size: int = 1
     """Inter-layer model parallelism. Splits transformer layers across GPU ranks."""
 
+    pipeline_model_parallel_comm_backend: str = "nccl"
+    """Configuring backend option of pipeline parallel communication (e.g., nccl, ucc, mpi)"""
+
     virtual_pipeline_model_parallel_size: Optional[int] = None
     """Interleaved pipeline parallelism is used to improve performance by reducing the pipeline
        bubble.  Considers a transformer block as a list of smaller transformer (virtual) blocks.
