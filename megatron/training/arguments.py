@@ -21,9 +21,22 @@ from megatron.core.models.retro.utils import (
 )
 from megatron.core.transformer import TransformerConfig, MLATransformerConfig
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.utils import is_torch_min_version
+from megatron.core.utils import get_torch_version, is_torch_min_version
 from megatron.training.activations import squared_relu
 from megatron.training.utils import update_use_dist_ckpt
+
+
+try:
+    import transformer # pylint: disable=unused-import
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
+try:
+    import apex # pylint: disable=unused-import
+    HAVE_APEX = True
+except ImportError:
+    HAVE_APEX = False
 
 xm = get_xla_model()
 
@@ -762,6 +775,30 @@ def validate_args(args, defaults={}):
         if not args.no_load_rng:
             args.no_load_rng = True
             print('Warning: disabling --no-load-rng for upcycling.')
+
+    if not HAVE_APEX:
+        print('Warning: No Apex found: forcing persist_layer_norm=False')
+        args.no_persist_layer_norm = True
+        args.persist_layer_norm = not args.no_persist_layer_norm
+        print('Warning: No Apex found: forcing gradient_accumulation_fusion=False')
+        args.no_gradient_accumulation_fusion = True
+        args.gradient_accumulation_fusion = not args.no_gradient_accumulation_fusion
+        print('Warning: No Apex found: forcing memory_efficient_layer_norm=False')
+        args.memory_efficient_layer_norm=False
+
+    if not HAVE_TE:
+        print('Warning: No Transformer Engine found: forcing transformer_impl=local')
+        args.transformer_impl = "local"
+        print('Warning: No Transformer Engine found: forcing scaled_masked_softmax_fusion=False')
+        args.scaled_masked_softmax_fusion=False
+        print('Warning: No Transformer Engine found: forcing masked_softmax_fusion=False')
+        args.masked_softmax_fusion=False
+        print('Warning: No Transformer Engine found: forcing apply_rope_fusion=False')
+        args.apply_rope_fusion=False
+        print('Warning: No Transformer Engine found: forcing bias_dropout_fusion=False')
+        args.bias_dropout_fusion=False
+        print('Warning: No Transformer Engine found: forcing bias_swiglu_fusion=False')
+        args.bias_swiglu_fusion=False
 
     # Print arguments.
     _print_args("arguments", args)
