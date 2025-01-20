@@ -75,7 +75,7 @@ test:build_image:
           --build-arg CACHEBUST=$(cat /proc/sys/kernel/random/uuid) \
           --build-arg MCORE_REPO=${CI_REPOSITORY_URL} \
           --build-arg MCORE_REF=$CI_COMMIT_SHA \
-          --build-arg MCORE_BACKWARDS_REF="core_r0.9.0" \
+          --build-arg MCORE_BACKWARDS_REF="core_r0.10.0" \
           --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_PIPELINE_ID} \
           --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID:-noop} \
           --cache-from type=registry,ref=${IMAGE}-buildcache:main \
@@ -331,7 +331,6 @@ test:pypi_build_wheel:
         sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '${PRE_RELEASE}.dev$((RANDOM % 900000 + 100000))'" megatron/core/package_info.py 
       fi
 
-
     - /opt/python/cp310-cp310/bin/python -m build
     - /opt/python/cp311-cp311/bin/python -m build
     - auditwheel repair dist/*.whl
@@ -355,7 +354,6 @@ test:pypi_test_wheel:
     - RELEASE_NUMBER=$(python -c "from megatron import core; print(core.__version__)")
     - >
       echo "$EXPECTED_RELEASE_NUMBER" == "$RELEASE_NUMBER"
-
 
     - test "$EXPECTED_RELEASE_NUMBER" == "$RELEASE_NUMBER"
     - echo "RELEASE_NUMBER=$EXPECTED_RELEASE_NUMBER" | tee -a build.env
@@ -385,13 +383,11 @@ test:pypi_push_wheel:
         export TWINE_PASSWORT=$TWINE_PROD_PASSWORD
       fi
 
-
     - pip install twine
     - >
       for i in 1 2 3 4 5; do 
         twine upload --verbose -u $TWINE_USERNAME -p $TWINE_PASSWORT --repository $REPOSITORY wheelhouse/* && break || sleep $(( 60*2**i )); 
       done
-
 
   rules:
     - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
@@ -426,7 +422,6 @@ test:gh_release:
                       "generate_release_notes": false
                   }'
               )
-
 
     - >
       CMD=$(echo curl -L \
@@ -466,7 +461,6 @@ test:notify_release:
             }
           ]
         }'
-
 
     - echo "$MESSAGE"
     - >
