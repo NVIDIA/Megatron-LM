@@ -641,11 +641,12 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         # This only needs to be done for the float16 group.
         for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
             for model_param, main_param in zip(model_group, main_group):
+                assert main_param.device is not None, f"{main_param.device}"
                 if hasattr(model_param, 'main_grad'):
-                    main_param.grad = model_param.main_grad.float().to(device=main_param.grad.device)
+                    main_param.grad = model_param.main_grad.float().to(device=main_param.device)
                 else:
                     if model_param.grad is not None:
-                        main_param.grad = model_param.grad.float().to(device=main_param.grad.device)
+                        main_param.grad = model_param.grad.float().to(device=main_param.device)
 
                 # Safe to deallocate model's grad/main_grad after copying.
                 # (If using contiguous buffers, main_grad's memory should
