@@ -466,6 +466,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 grad_output_buffer.append(grad_output)
                 wgrad_compute = False
 
+        handle = None
         if wgrad_compute:
             if ctx.sequence_parallel:
                 if xm:
@@ -566,12 +567,13 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         grad_bias = grad_output.sum(dim=0) if use_bias else None
 
         if ctx.sequence_parallel:
-            handle.wait()
+            if handle:
+                handle.wait()
             # Need to return None's as gradient has to flow for all the input arguments
             # provided during forward
             return sub_grad_input, grad_weight, grad_bias, None, None, None, None, None
 
-        if ctx.allreduce_dgrad:
+        if ctx.allreduce_dgrad and handle:
             handle.wait()
 
         return grad_input, grad_weight, grad_bias, None, None, None, None, None

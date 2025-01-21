@@ -293,7 +293,8 @@ def pretrain(
         append_to_progress_log("Starting job")
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
-    set_jit_fusion_options()
+    if xm is None:
+        set_jit_fusion_options()
 
     # Adjust the startup time so it reflects the largest value.
     # This will be closer to what scheduler will see (outside of

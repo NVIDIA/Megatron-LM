@@ -258,7 +258,7 @@ class Timers:
         # See the note above for why we are not using gather.
         xm = get_xla_model()
         if xm:
-            rank_name_to_time = xm.all_gather(rank_name_to_time[rank, :].view(-1)).view(-1)
+            rank_name_to_time = xm.all_gather(rank_name_to_time[rank, :], pin_layout=False).view(rank_name_to_time.size())
         else:
             dist_all_gather_func(rank_name_to_time.view(-1), rank_name_to_time[rank, :].view(-1))
 

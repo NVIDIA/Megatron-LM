@@ -7,7 +7,7 @@ import os
 import time
 import warnings
 
-from megatron.core.device_utils import get_current_device, get_distributed_backend, get_local_device_count, set_manual_seed
+from megatron.core.device_utils import get_current_device, get_distributed_backend, get_local_device_count, get_xla_model, set_manual_seed
 from megatron.core.device_utils import get_distributed_init_method
 import numpy as np
 import torch
@@ -27,6 +27,8 @@ from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_trai
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
 from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version
+
+xm = get_xla_model()
 
 logger = logging.getLogger(__name__)
 
@@ -131,11 +133,12 @@ def initialize_megatron(
         _init_autoresume()
 
         # Compile dependencies.
-        _compile_dependencies()
+        if torch.cuda.is_available():
+            _compile_dependencies()
 
-        if args.tp_comm_overlap:
-            #TODO: Should this be activated with just decoder-tp-comm-overlap too?
-           _initialize_tp_communicators()
+            if args.tp_comm_overlap:
+                #TODO: Should this be activated with just decoder-tp-comm-overlap too?
+                _initialize_tp_communicators()
 
         # No continuation function
         return None
@@ -260,7 +263,6 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
     """Initialize torch.distributed and core model parallel."""
     args = get_args()
 
-    device_count = get_local_device_count()
     if torch.distributed.is_initialized():
 
         if args.rank == 0:
@@ -275,11 +277,6 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
     else:
         if args.rank == 0:
             print("> initializing torch distributed ...", flush=True)
-        # Manually set the device ids.
-        if device_count > 0:
-            device_id = get_current_device()
-        else:
-            device_id = None
 
         # Call the init process
         init_process_group_kwargs = {
@@ -294,6 +291,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
+    device_count = get_local_device_count()
     if device_count > 0:
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
@@ -364,6 +362,11 @@ def write_args_to_tensorboard():
 
 def set_jit_fusion_options():
     """Set PyTorch JIT layer fusion options."""
+
+    if xm:
+        logger.warning(f"Torch JIT comile not supported for XLA")
+        return
+    
     # flags required to enable jit fusion kernels
     if is_torch_min_version("2.2.0a0"):
         pass  # we're using torch.compile for jit fusion

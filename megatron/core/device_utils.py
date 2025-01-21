@@ -28,6 +28,8 @@ def get_current_device() -> torch.device:
     except NameError:
         if xm is not None:
             __current_device = xm.xla_device()
+            compiler_cache_path = os.path.join(os.getenv("XDG_CACHE_HOME", "/tmp"), "xla", "compiler-cache")
+            xr.initialize_cache(compiler_cache_path, readonly=False)
         elif torch.cuda.is_available():
             local_rank = int(os.getenv("LOCAL_RANK", 0))
             __current_device = torch.device(f'cuda:{local_rank}')
