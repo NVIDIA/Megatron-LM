@@ -291,7 +291,7 @@ class TestExpertLayerReconfiguration:
             ('te_grouped', 'sequential', (1, 1, 4), (1, 1, 1)),
         ],
     )
-    @pytest.mark.failing_on_rocm
+    @pytest.mark.failing_on_upstream
     def test_sequential_grouped_mlp_extra_state(
         self, tmp_path_dist_ckpt, src_tp_pp_exp, dest_tp_pp_exp, src_module, dst_module
     ):
