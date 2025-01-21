@@ -17,11 +17,6 @@ from megatron.core.datasets.masked_dataset import (
 from megatron.core.datasets.utils import Split
 from megatron.core.utils import get_te_version
 
-try:
-    import transformer # pylint: disable=unused-import
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
 @dataclass
 class T5MaskedWordPieceDatasetConfig(MaskedWordPieceDatasetConfig):
     """Configuration object for Megatron Core T5 WordPiece datasets

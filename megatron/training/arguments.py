@@ -27,7 +27,7 @@ from megatron.training.utils import update_use_dist_ckpt
 
 
 try:
-    import transformer # pylint: disable=unused-import
+    import transformer_engine # pylint: disable=unused-import
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
