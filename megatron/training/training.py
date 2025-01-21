@@ -1001,6 +1001,11 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                 iteration,
             )
             writer.add_scalar(
+                "mem-max-allocated-bytes",
+                mem_stats["allocated_bytes.all.peak"],
+                iteration,
+            )
+            writer.add_scalar(
                 "mem-allocated-count",
                 mem_stats["allocation.all.current"],
                 iteration,
