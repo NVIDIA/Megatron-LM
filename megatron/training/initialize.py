@@ -24,6 +24,7 @@ from megatron.training.global_vars import set_global_variables
 from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
+from megatron.core.parallel_state import create_group
 from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version
 
 logger = logging.getLogger(__name__)
@@ -250,7 +251,7 @@ def _initialize_tp_communicators():
                 f"Transformer Engine v{get_te_version()} supports only MPI bootstrap backend."
             )
         # Create a MPI process group to help with TP communication overlap bootstrap.
-        torch.distributed.new_group(backend='mpi')
+        create_group(backend='mpi', group_desc='TP_BOOTSTRAP_GROUP_MPI')
     
         te_module.base.initialize_ub(shape = input_shape, tp_size = args.tensor_model_parallel_size,
                                      use_fp8 = (args.fp8 is not None) , ub_cfgs = ub_cfgs)
