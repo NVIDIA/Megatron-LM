@@ -10,6 +10,7 @@ from megatron.legacy.data.orqa_wiki_dataset import get_open_retrieval_wiki_datas
 from megatron.legacy.data.realm_index import OpenRetreivalDataStore, FaissMIPSIndex
 from megatron.legacy.model.biencoder_model import get_model_provider
 from megatron.training import get_model
+from megatron.core.parallel_state import create_group
 from tasks.orqa.unsupervised.nq import get_nq_dataset
 from tasks.orqa.unsupervised.nq import get_one_epoch_nq_dataloader
 from tasks.orqa.unsupervised.nq import process_nq_batch
@@ -121,7 +122,7 @@ class ORQAEvaluator(object):
             ranks_list = list(range(start_rank, end_rank))
 
             groups.append(ranks_list)
-            node_group = torch.distributed.new_group(ranks=ranks_list)
+            node_group = create_group(ranks=ranks_list, group_desc=f'QA_EVALUATOR_NODE_GROUP')
 
             if node_id == node:
                 device_start_rank = start_rank
