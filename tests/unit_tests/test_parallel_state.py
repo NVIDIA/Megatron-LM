@@ -178,12 +178,17 @@ def test_encoder_tensor_pipeline_parallelism(order):
     if rank < 2:
         assert ps.get_tensor_model_parallel_world_size() == 3
         assert isinstance(ps._PIPELINE_GLOBAL_RANKS[0], list)
+        last_ranks = ps.get_pipeline_model_parallel_last_rank()
+        assert isinstance(last_ranks, list)
+        assert len(last_ranks) == 2
     elif rank == 2:
         assert ps.get_tensor_model_parallel_world_size() == 3
         assert isinstance(ps._PIPELINE_GLOBAL_RANKS[0], int)
+        assert isinstance(ps.get_pipeline_model_parallel_last_rank(), int)
     else:
         assert ps.get_tensor_model_parallel_world_size() == 5
         assert isinstance(ps._PIPELINE_GLOBAL_RANKS[0], int)
+        assert isinstance(ps.get_pipeline_model_parallel_last_rank(), int)
     Utils.destroy_model_parallel()
 
 
