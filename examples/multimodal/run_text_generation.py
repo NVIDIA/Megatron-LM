@@ -451,7 +451,7 @@ def get_conversation(task, question):
 
 def get_prompt_and_generated(prompt_and_generation, prompt_format):
     """Strip prompt and other unnecessary text from generation."""
-    if prompt_format == "llama3":
+    if prompt_format in ("llama3", "llama3p1"):
         splitted = prompt_and_generation.split("<|start_header_id|>assistant<|end_header_id|>\n\n")
         prompt = splitted[0]
         generated = splitted[1]

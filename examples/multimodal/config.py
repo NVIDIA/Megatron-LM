@@ -20,6 +20,32 @@ def get_language_model_config(config):
         config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
         config.ffn_hidden_size = 14336
+    elif config.language_model_type == "llama3.1_8b":
+        config.activation_func = torch.nn.functional.silu
+        config.add_bias_linear = False
+        config.bias_activation_fusion = False
+        config.gated_linear_unit = True
+        config.apply_query_key_layer_scaling = False
+        config.layernorm_zero_centered_gamma = (
+            False  # Zero centered gamma not supported for RMSNorm
+        )
+        config.bias_dropout_fusion = False
+        config.apply_rope_fusion = False
+        config.attention_softmax_in_fp32 = True
+        config.ffn_hidden_size = 14336
+    elif config.language_model_type == "llama3.1_70B":
+        config.activation_func = torch.nn.functional.silu
+        config.add_bias_linear = False
+        config.bias_activation_fusion = False
+        config.gated_linear_unit = True
+        config.apply_query_key_layer_scaling = False
+        config.layernorm_zero_centered_gamma = (
+            False  # Zero centered gamma not supported for RMSNorm
+        )
+        config.bias_dropout_fusion = False
+        config.apply_rope_fusion = False
+        config.attention_softmax_in_fp32 = True
+        config.ffn_hidden_size = 28672
     elif config.language_model_type == "mistral_7b":
         config.activation_func = torch.nn.functional.silu
         config.add_bias_linear = False
@@ -157,6 +183,9 @@ def get_vision_projection_config(config, hidden_size):
     config.hidden_size = hidden_size  # Used as the vision projection output size, i.e., the input to the language model.
     if config.language_model_type == "llama3_8b":
         config.ffn_hidden_size = 14336
+        config.activation_func = torch.nn.functional.gelu
+    elif config.language_model_type == "llama3.1_8b":
+        config.ffn_hidden_size = 4096
         config.activation_func = torch.nn.functional.gelu
     elif config.language_model_type == "mistral_7b":
         config.ffn_hidden_size = 14336
