@@ -220,11 +220,11 @@ def permute(tokens, routing_map, num_out_tokens: int = None, drop_and_pad: bool 
         routing_map = routing_map.to(dtype=torch.int8).T.contiguous()
         # use argsort to put indices of all non-zeros in the beginning of list
         # and keep the first `capacity` number of indices
-        token_indices = routing_map.argsort(dim=-1, descending=True, stable=True)[
+        sorted_indices = routing_map.argsort(dim=-1, descending=True, stable=True)[
             :, :capacity
         ].contiguous()
         # flatten from [num_experts, capacity] to 1D
-        token_indices = token_indices.view(-1)
+        sorted_indices = sorted_indices.view(-1)
     else:
         # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
         routing_map = routing_map.bool().T.contiguous()
