@@ -110,6 +110,39 @@ class SwigluFactoryModel(torch.nn.Module):
         return sharded_state_dict
 
 
+class Model1dFlattenTensor(torch.nn.Module):
+    """This model is used to test whether a 1d flatten tensor can be correctly
+    transformed into torch dist-ckpt form
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.config = TransformerConfig(hidden_size=128, num_attention_heads=1, num_layers=1)
+        self.weight_1d = torch.nn.Parameter(torch.randn(self.config.hidden_size))
+
+    def sharded_state_dict(self):
+        sharded_state_dict = self.state_dict(keep_vars=True)
+        sharded_state_dict['weight_1d'] = ShardedTensor.from_rank_offsets(
+            'weight_1d',
+            sharded_state_dict['weight_1d'],
+            (
+                (
+                    0,
+                    parallel_state.get_tensor_model_parallel_rank(),
+                    parallel_state.get_tensor_model_parallel_world_size(),
+                )
+            ),
+            replica_id=(
+                (
+                    parallel_state.get_pipeline_model_parallel_rank(),
+                    0,
+                    parallel_state.get_data_parallel_rank(with_context_parallel=True),
+                )
+            ),
+        )
+        return sharded_state_dict
+
+
 class TestOptimizer:
     def setup_method(self, method):
         pass
@@ -152,6 +185,17 @@ def initialize_small_model(pre_process=True, post_process=True, seed=0, **config
     return SwigluFactoryModel()
 
 
+def initialize_1d_flatten_tensor_model(
+    pre_process=True, post_process=True, seed=0, **config_kwargs
+):
+    # This model is used to test whether a 1d flatten tensor can be correctly
+    # transformed into torch dist-ckpt form
+    torch.manual_seed(seed)
+    model_parallel_cuda_manual_seed(seed)
+
+    return Model1dFlattenTensor()
+
+
 def load_checkpoint_no_arg_checks(*args, **kwargs):
     with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
         with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
@@ -165,7 +209,10 @@ class TestDistributedOptimizer:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize("initialize_fn", [initialize_small_model, initialize_gpt_model])
+    @pytest.mark.parametrize(
+        "initialize_fn",
+        [initialize_small_model, initialize_gpt_model, initialize_1d_flatten_tensor_model],
+    )
     @pytest.mark.parametrize("use_fpsl", [False, True])
     # TODO: changing DP doesn't work in unit tests because of NCCL crashes
     @pytest.mark.parametrize(
@@ -331,63 +378,6 @@ class TestDistributedOptimizer:
                 # we expect only values diff
                 assert not diffs[0] and not diffs[1] and diffs[2]
                 assert not any(diff(optimizer.state_dict(), optim_unloaded_state_dict))
-
-    def test_can_load_deprecated_bucket_space_format(self, tmp_path_dist_ckpt):
-        # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
-        tp = 4
-        pp = 2
-
-        Utils.initialize_model_parallel(tp, pp)
-        with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_can_load_deprecated_bucket_space_format', sync=True
-        ) as ckpt_dir:
-            mock_args = SimpleNamespace()
-            with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
-
-                init_basic_mock_args(mock_args, tp=tp, pp=pp)
-                init_checkpointing_mock_args(mock_args, ckpt_dir, True)
-
-                model, optimizer = setup_model_and_optimizer(
-                    seed=2, tp=tp, pp=pp, initialize_fn=initialize_gpt_model
-                )
-
-                # Mock optimizer sharded_state_dict so that it ignores the externally
-                # passed sharding_type and uses 'fully_sharded_bucket_space' instead
-                orig_optim_sharded_state_dict_fn = optimizer.sharded_state_dict
-
-                def sharded_state_dict_bucket_space(
-                    self, *args, sharding_type: str = 'fully_sharded_model_space', **kwargs
-                ):
-                    return orig_optim_sharded_state_dict_fn(
-                        *args, sharding_type='fully_sharded_bucket_space', **kwargs
-                    )
-
-                optimizer.sharded_state_dict = MethodType(
-                    sharded_state_dict_bucket_space, optimizer
-                )
-                save_checkpoint(10, model, optimizer, None, 0)
-
-                flag = 0
-                key_list = []
-                torch.distributed.barrier()
-                if Utils.rank == 0:
-                    sharded_metadata = load_tensors_metadata(ckpt_dir / 'iter_0000010')
-                    key_list = list(sharded_metadata.keys())
-                    # Check if actually using `fully_parallel_bucket_space` format.
-                    key = (
-                        "optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_"
-                        "(torch.bfloat16, torch.bfloat16).bucket_idx_0.exp_avg_sq"
-                    )
-                    if key in key_list:
-                        flag = 1
-
-                tensor = torch.tensor([flag], dtype=torch.long, device='cuda')
-                torch.distributed.broadcast(tensor, 0)
-                flag = tensor[0].item()
-                assert flag == 1, key_list
-
-                optimizer.sharded_state_dict = orig_optim_sharded_state_dict_fn
-                load_checkpoint_no_arg_checks(model, optimizer, None)
 
 
 class TestFP32Optimizer:
