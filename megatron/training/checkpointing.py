@@ -35,6 +35,7 @@ from .utils import unwrap_model, print_rank_0, append_to_progress_log, is_last_r
 from ..core.dist_checkpointing.serialization import \
     get_default_save_sharded_strategy
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
+from . import wandb_utils
 
 # [ModelOpt]: Import
 try:
@@ -513,6 +514,17 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             async_save_request.add_finalize_fn(onelogger_finalize_fn)
         else:
             onelogger_finalize_fn()
+
+    # Additional callback for wandb (last rank)
+    if not torch.distributed.is_initialized() \
+       or is_last_rank():
+        def wandb_finalize_fn():
+            wandb_utils.on_save_checkpoint_success(checkpoint_name, get_checkpoint_tracker_filename(save_dir), save_dir, iteration)
+        if args.async_save:
+            assert async_save_request is not None
+            async_save_request.add_finalize_fn(wandb_finalize_fn)
+        else:
+            wandb_finalize_fn()
 
     if args.async_save:
         schedule_async_save(async_save_request)
