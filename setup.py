@@ -31,8 +31,13 @@ long_description_content_type = "text/markdown"
 def req_file(filename, folder="requirements"):
     environment = os.getenv("PY_ENV", "pytorch:24.07")
 
+    content = []
     with open(os.path.join(folder, environment, filename), encoding='utf-8') as f:
-        content = f.readlines()
+        content += f.readlines()
+
+    with open(os.path.join("megatron", "core", "requirements.txt"), encoding='utf-8') as f:
+        content += f.readlines()
+
     # you may also want to remove whitespace characters
     # Example: `\n` at the end of each line
     return [x.strip() for x in content]

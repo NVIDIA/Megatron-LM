@@ -102,7 +102,7 @@ products:
     products:
       - environment: [dev, lts]
         scope: [nightly]
-  - test_case: [bert_mr_mcore_tp2_pp2_frozen_resume_torch_dist_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
+  # - test_case: [bert_mr_mcore_tp2_pp2_frozen_resume_torch_dist_dgx_a100_1N8G]
+  #   products:
+  #     - environment: [dev] Update checkpoint
+  #       scope: [mr]
