@@ -37,7 +37,14 @@ def collect_train_test_metrics(
     summaries = {
         golden_value_key: golden_value
         for (golden_value_key, golden_value) in summaries.items()
-        if golden_value_key in ["iteration-time", "mem-allocated-bytes", "lm loss", "num-zeros"]
+        if golden_value_key
+        in [
+            "iteration-time",
+            "mem-allocated-bytes",
+            "mem-max-allocated-bytes",
+            "lm loss",
+            "num-zeros",
+        ]
     }
 
     if output_path is not None:

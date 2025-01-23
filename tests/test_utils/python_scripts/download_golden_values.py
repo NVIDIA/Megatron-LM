@@ -56,7 +56,12 @@ def main(pipeline_id: int):
             os.unlink(file_name)
             restart_dir = os.listdir(pathlib.Path("tmp") / "results" / "iteration=0")[-1]
             golden_values_source = (
-                pathlib.Path(ASSETS_DIR) / f"{restart_dir}" / f"golden_values_{environment}.json"
+                pathlib.Path(ASSETS_DIR)
+                / f"{restart_dir}"
+                / "assets"
+                / "basic"
+                / f"{job.name.replace('_', '-').lower()}-{environment}"
+                / f"golden_values_{environment}.json"
             )
             golden_values_target = (
                 pathlib.Path("tests")

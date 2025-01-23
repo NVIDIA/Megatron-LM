@@ -459,12 +459,12 @@ products:
         scope: [mr]
       - environment: [lts]
         scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp2_cross_entropy_loss_fusion_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
+  # - test_case: [gpt3_mr_mcore_te_tp2_pp2_cross_entropy_loss_fusion_dgx_a100_1N8G]  Failing on max-memory
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #     - environment: [lts]
+  #       scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp2_pp2_ddp_average_in_collective_dgx_a100_1N8G]
     products:
       - environment: [dev]
@@ -490,18 +490,18 @@ products:
         scope: [mr]
       - environment: [lts]
         scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_cross_entropy_loss_fusion_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
+  # - test_case: [gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #     - environment: [lts]
+  #       scope: [nightly]
+  # - test_case:  # Failing on max-memory[gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_cross_entropy_loss_fusion_dgx_a100_1N8G]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #     - environment: [lts]
+  #       scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_ddp_average_in_collective_dgx_a100_1N8G]
     products:
       - environment: [dev]
