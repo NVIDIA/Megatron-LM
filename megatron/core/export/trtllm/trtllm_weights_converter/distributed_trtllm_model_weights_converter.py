@@ -53,6 +53,11 @@ class DistributedTRTLLMModelWeightsConverter:
             else:
                 num_kv_heads = self.transformer_config.num_attention_heads
         self.num_kv_heads = num_kv_heads
+        # Config for Mamba hybrid
+        self.rnn_hidden_size = 2 * self.transformer_config.hidden_size
+        self.state_size = 128
+        self.ngroups = 8
+        self.rnn_head_size = 64
 
         self.inference_pp_size = parallel_state.get_pipeline_model_parallel_world_size()
         self.inference_tp_size = parallel_state.get_tensor_model_parallel_world_size()
@@ -65,11 +70,11 @@ class DistributedTRTLLMModelWeightsConverter:
             vp_size is None or vp_size == 1
         ), "Virtual parallelism is not supported in GPU Converter. Gather the VP chunks and use PP config."
 
-    def _add_to_trtllm_model_weights(self, val: torch.Tensor, layer_name: str):
+    def _add_to_trtllm_model_weights(self, val: torch.Tensor, layer_name: str, transpose=True):
         assert torch.is_tensor(val), f"Expected a tensor for {layer_name} but got {type(val)}"
         val = val.to(self.storage_type)
         val = val.detach().contiguous()
-        if val.ndim >= 2:
+        if val.ndim >= 2 and transpose:
             val = torch.transpose(val.reshape(val.shape[0], -1), 0, 1)
         if layer_name not in self.trtllm_model_weights:
             self.trtllm_model_weights[layer_name] = torch.empty(
@@ -100,6 +105,11 @@ class DistributedTRTLLMModelWeightsConverter:
             or layer_name.endswith(suffix(TRTLLMLayers.mlp_router_weight))
             or layer_name.endswith(suffix(TRTLLMLayers.attention_dense_weight))
             or layer_name.endswith(suffix(TRTLLMLayers.mlp_projection_weight))
+            or layer_name.endswith(suffix(TRTLLMLayers.mixer_norm_weight))
+            or layer_name.endswith(suffix(TRTLLMLayers.mixer_dt_bias))
+            or layer_name.endswith(suffix(TRTLLMLayers.mixer_D))
+            or layer_name.endswith(suffix(TRTLLMLayers.mixer_out_proj_weight))
+            or layer_name.endswith(suffix(TRTLLMLayers.mixer_in_proj_weight))
         ):
             # Same as layernorm1p in NeMo
             if (
@@ -167,6 +177,17 @@ class DistributedTRTLLMModelWeightsConverter:
                 dim=1,
             )
             self._add_to_trtllm_model_weights(val=split_vals, layer_name=layer_name)
+
+        elif layer_name.endswith(suffix(TRTLLMLayers.mixer_A_log)):
+            val = -torch.exp(val.float())
+            self._add_to_trtllm_model_weights(val=val, layer_name=layer_name)
+
+        elif (
+            layer_name.endswith(suffix(TRTLLMLayers.mixer_conv_weight))
+            or layer_name.endswith(suffix(TRTLLMLayers.mixer_conv_bias))
+        ):
+            val = val.unsqueeze(-1)
+            self._add_to_trtllm_model_weights(val=val, layer_name=layer_name, transpose=False)
 
         else:
             raise ValueError(f"{layer_name} cannot be handled by GPU converter")
@@ -265,3 +286,14 @@ class DistributedTRTLLMModelWeightsConverter:
             model_state_dict.items(), desc="Converting to TRTLLM Weights"
         ):
             self._convert_transformer_layer(layer_name, value)
+
+    def rename_weight(self, trtllm_model_config: dict):
+        is_mamba = hasattr(trtllm_model_config, "mamba_version")
+        if not is_mamba:
+            return
+        for layer_name in list(self.trtllm_model_weights.keys()):
+            new_key = layer_name.replace("transformer", "backbone")
+            new_key = new_key.replace("mlp", "layer")
+            new_key = new_key.replace("attention", "layer")
+            self.trtllm_model_weights[new_key] = self.trtllm_model_weights[layer_name]
+            del self.trtllm_model_weights[layer_name]

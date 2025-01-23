@@ -343,6 +343,8 @@ class TRTLLMHelper:
             pp_size=export_config.inference_pp_size,
         )
 
+        self.weights_converter.rename_weight(trtllm_model_config)
+
         return self.weights_converter.trtllm_model_weights, trtllm_model_config
 
     def _get_trtllm_pretrained_config_and_model_weights_list_on_single_device(
