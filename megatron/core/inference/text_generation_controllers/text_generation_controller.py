@@ -1,6 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import copy
-from typing import List, Optional, OrderedDict, Tuple
+from typing import Any, Dict, List, Optional, OrderedDict, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -331,7 +331,11 @@ class TextGenerationController:
 
         with torch.no_grad():
 
-            self.prep_model_for_inference(
+            self.inference_wrapped_model.prep_model_for_inference(
+                prompts_tokens=batch_prompt_tokens
+            )
+
+            inference_input: Dict[str, Any] = self.prep_inference_input(
                 prompts_tokens=batch_prompt_tokens, active_requests=active_requests
             )
 
@@ -339,13 +343,17 @@ class TextGenerationController:
             # Pick the context window that we need to pass through the network.
             for context_end_position in range(min_prompt_length_in_batch, max_sequence_length):
 
-                inference_input = self.inference_wrapped_model.get_batch_for_context_window(
-                    context_start_position, context_end_position
+                inference_input_for_context_window: Dict[str, Any] = (
+                    self.inference_wrapped_model.get_batch_for_context_window(
+                        inference_input, context_start_position, context_end_position
+                    )
                 )
 
                 # Returns the final logits of shape [batch_size, context_length, vocab_size]
                 # Note: This is returned in all TP ranks or last PP stage in PP models
-                logits = self.inference_wrapped_model.run_one_forward_step(inference_input)
+                logits = self.inference_wrapped_model.run_one_forward_step(
+                    inference_input_for_context_window
+                )
                 if self.model_is_pipeline_parallel:
                     context_length = context_end_position - context_start_position
                     logits = broadcast_from_last_pipeline_stage(
@@ -452,13 +460,16 @@ class TextGenerationController:
 
         return active_requests
 
-    def prep_model_for_inference(
+    def prep_inference_input(
         self, prompts_tokens: torch.Tensor, active_requests: OrderedDict[str, InferenceRequest]
-    ):
-        """Preparing batch for inference, using respective wrapper's prep_model_for_inference method
+    ) -> Dict[str, Any]:
+        """Preparing input data for inference, using respective wrapper's prep_inference_input method # pylint: disable=line-too-long
 
         Args:
             prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_sequence_length]
             active_requests (OrderedDict[str, InferenceRequest]): The input active requests
+
+        Returns:
+            A dict of the inference input for the current batch.
         """
-        self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=prompts_tokens)
+        return self.inference_wrapped_model.prep_inference_input(prompts_tokens)

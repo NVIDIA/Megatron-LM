@@ -1,5 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from typing import OrderedDict
+from typing import Any, Dict, OrderedDict
 
 import torch
 
@@ -17,19 +17,22 @@ class EncoderDecoderTextGenerationController(TextGenerationController):
 
     """
 
-    def prep_model_for_inference(
+    def prep_inference_input(
         self, prompts_tokens: torch.Tensor, active_requests: OrderedDict[str, InferenceRequest]
-    ):
-        """Preparing batch for inference, using respective wrapper's prep_model_for_inference method
+    ) -> Dict[str, Any]:
+        """Preparing input data for inference, using respective wrapper's prep_inference_input method # pylint: disable=line-too-long
 
         Args:
             prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_sequence_length]
             active_requests (OrderedDict[str, InferenceRequest]): The input active requests
+
+        Returns:
+            A dict of the inference input for the current batch.
         """
         encoder_prompts = list(
             map(lambda request: request.encoder_prompt, active_requests.values())
         )
 
-        self.inference_wrapped_model.prep_model_for_inference(
-            prompts_tokens=prompts_tokens, encoder_prompts=encoder_prompts, tokenizer=self.tokenizer
+        return self.inference_wrapped_model.prep_inference_input(
+            prompts_tokens, encoder_prompts, tokenizer=self.tokenizer
         )
