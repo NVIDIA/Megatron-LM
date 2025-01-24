@@ -170,7 +170,8 @@ def save_checkpoint(queue, args):
                         'distribute_saved_activations',
                         'train_iters', 'lr_decay_iters', 'lr_warmup_iters', 'lr_warmup_fraction',
                         'start_weight_decay', 'end_weight_decay',
-                        'ckpt_format',
+                        'ckpt_format', 
+                        'main_params_dtype', 'main_grads_dtype', 'exp_avg_dtype', 'exp_avg_sq_dtype'
         ]
 
         for arg, value in vars(md.checkpoint_args).items():
