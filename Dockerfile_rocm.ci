@@ -1,4 +1,4 @@
-ARG BASE_DOCKER=rocm/pytorch:latest
+ARG BASE_DOCKER=rocm/pytorch:rocm6.3_ubuntu22.04_py3.10_pytorch_release_2.5.1_preview
 FROM $BASE_DOCKER
 
 ARG PYTORCH_ROCM_ARCH_OVERRIDE="gfx942"
@@ -60,10 +60,18 @@ RUN git clone --recursive https://github.com/ROCm/TransformerEngine.git &&\
     cd TransformerEngine &&\
     pip install .
 
+RUN git clone https://github.com/caaatch22/grouped_gemm.git &&\
+    cd grouped_gemm &&\
+    git checkout rocm &&\
+    git submodule update --init --recursive &&\
+    pip install .
+
 WORKDIR $WORKSPACE_DIR
 COPY . Megatron-LM
 WORKDIR $WORKSPACE_DIR/Megatron-LM
 RUN pip install -e .
+
+ENV PYTHONPATH=/var/lib/jenkins/triton/python
 
 # record configuration for posterity
 RUN pip list

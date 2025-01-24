@@ -1,7 +1,9 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import os
 import types
 
+import pytest
 import torch
 import pytest
 
@@ -76,12 +78,14 @@ class TestRetroAttention:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
+        os.environ['NVTE_FLASH_ATTN'] = "0"
+        os.environ['NVTE_FUSED_ATTN'] = "0"
+
         model_parallel_cuda_manual_seed(123)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.failing_on_rocm
     def test_constructor(self):
 
         config = self.get_config()
@@ -103,7 +107,6 @@ class TestRetroAttention:
         assert get_nparams(modules.encoder_bda) == 0
         assert get_nparams(modules.encoder_norm) == 32
 
-    @pytest.mark.failing_on_rocm
     def test_cpu_forward(self):
         # we can't currently do this because the global memory buffer is on GPU
         pass
@@ -193,7 +196,7 @@ class TestRetroAttention:
             config.retro_num_neighbors * micro_batch_size * n_chunks_per_sample,
             config.hidden_size,
         )
-    @pytest.mark.failing_on_rocm
+    @pytest.mark.failing_on_upstream
     def test_gpu_forward(self):
         for recompute_granularity in (None, 'selective'):
             for use_transformer_engine in (True, False):

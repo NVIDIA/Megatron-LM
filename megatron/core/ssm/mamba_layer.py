@@ -1,6 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2024, Tri Dao, Albert Gu.
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 # Some of this code was adopted from https://github.com/state-spaces/mamba/
 # This source code is licensed under the Apache license found in the
@@ -20,12 +19,33 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 @dataclass
 class MambaLayerSubmodules:
+    """
+    Configuration class for specifying the submodules of a Mamba layer.
+
+    This class defines the structure and default implementations for various
+    components of a Mamba layer, allowing for flexible customization of the
+    layer's architecture.
+
+    Args:
+        norm (Union[ModuleSpec, type]): Specification for the input layer normalization.
+        mixer (Union[ModuleSpec, type]): Specification for the along-sequence mixing mechanism.
+        mamba_bda (Union[ModuleSpec, type]): Specification for the bias-dropout-add operation
+            after the mixer.
+    """
+
     norm: Union[ModuleSpec, type] = IdentityOp
     mixer: Union[ModuleSpec, type] = IdentityOp
     mamba_bda: Union[ModuleSpec, type] = IdentityOp
 
 
 class MambaLayer(MegatronModule):
+    """
+    A single Mamba layer.
+
+    Mamba layer takes input with size [s, b, h] and returns an
+    output of the same size.
+    """
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -34,9 +54,7 @@ class MambaLayer(MegatronModule):
         layer_number: int = 1,
         residual_in_fp32=False,
     ):
-        """
-        Top level Mamba Layer
-        """
+        """Initialize Mamba Layer."""
         super().__init__(config)
         self.config = config
         self.layer_number = layer_number
@@ -60,6 +78,22 @@ class MambaLayer(MegatronModule):
         inference_params=None,
         rotary_pos_emb: Tensor = None,  # Not used in MambaLayer
     ):
+        """
+        Perform a forward pass through the Mamba layer.
+
+        This method implements the core computation of a Mamba layer, including
+        the convolution and the selective SSM/SSD.
+
+        Args:
+            hidden_states (Tensor): Input tensor of shape [s, b, h] where s is sequence length,
+                b is batch size, and h is hidden size.
+            attention_mask (Tensor): Mask tensor for self-attention. Not used by this layer.
+            inference_params (object, optional): Parameters for inference-time optimizations.
+            rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
+
+        Returns:
+            output (Tensor): Transformed hidden states of shape [s, b, h].
+        """
 
         residual = hidden_states
         if self.residual_in_fp32:
@@ -78,4 +112,5 @@ class MambaLayer(MegatronModule):
         return hidden_states
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
+        """Allocate the inference cache."""
         return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype)

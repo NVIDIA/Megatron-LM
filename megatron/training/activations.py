@@ -2,10 +2,7 @@
 import torch
 import torch.nn.functional as F
 
-try:
-    jit_fuser = torch.compile
-except AttributeError:
-    jit_fuser = torch.jit.script
+from megatron.core.jit import jit_fuser
 
 
 @jit_fuser

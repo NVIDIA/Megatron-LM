@@ -2,14 +2,24 @@
 
 import io
 import logging
+import os
 
 import numpy as np
 import pytest
 import torch
 from torch.distributed.checkpoint import CheckpointException as PyTCheckpointingException
+from torch.distributed.checkpoint import FileSystemReader
+
+try:
+    from torch.distributed import DeviceMesh
+    from torch.distributed._tensor import DTensor
+
+    HAVE_DTENSOR = True
+except ImportError:
+    HAVE_DTENSOR = False
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing import ShardedTensor, load, save
+from megatron.core.dist_checkpointing import ShardedTensor, load, remove_sharded_tensors, save
 from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_load_config
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensorFactory
@@ -18,7 +28,9 @@ from megatron.core.dist_checkpointing.serialization import (
     load_tensors_metadata,
 )
 from megatron.core.dist_checkpointing.strategies.base import StrategyAction, get_default_strategy
+from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
 from megatron.core.dist_checkpointing.validation import StrictHandling
+from megatron.core.utils import is_torch_min_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -30,6 +42,7 @@ class TestSerialization:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.failing_on_rocm
     def test_single_process_save_load(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(1, 1)
 
@@ -41,6 +54,16 @@ class TestSerialization:
                 'keyB', torch.ones(3, 5, 7), replica_id=Utils.rank
             ),
         }
+
+        if HAVE_DTENSOR:
+            mesh = DeviceMesh.from_group(
+                parallel_state.get_data_parallel_group(with_context_parallel=True), "cuda"
+            )
+            sharded_state_dict['sd_keyD'] = ShardedTensor.from_rank_offsets(
+                'keyD',
+                DTensor.from_local(torch.ones(3, 5, 7), mesh)._local_tensor,
+                replica_id=Utils.rank,
+            )
 
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
         with TempNamedDir(
@@ -55,6 +78,9 @@ class TestSerialization:
                 assert (ckpt_dir / 'keyB').is_dir()
                 assert not (ckpt_dir / 'keyC').exists()
                 assert not (ckpt_dir / 'sd_keyA').is_dir()
+
+                if HAVE_DTENSOR:
+                    assert (ckpt_dir / 'keyD').is_dir()
 
             load_ssd = {
                 'load_sd_keyA': ShardedTensor.from_rank_offsets(
@@ -79,11 +105,22 @@ class TestSerialization:
             'sd_keyB': ShardedTensor.from_rank_offsets(
                 'keyB', torch.ones(3, 5, 7), (2, Utils.rank, Utils.world_size)
             ),
+            'lr': 0.01,
+            'rank': torch.distributed.get_rank(),
         }
+
+        def preprocess_fn(x):
+            del x['rank']
+            return x
 
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
         with TempNamedDir(tmp_path_dist_ckpt / 'test_multi_process_save', sync=True) as ckpt_dir:
-            save(state_dict, ckpt_dir)
+            save(
+                state_dict,
+                ckpt_dir,
+                validate_access_integrity=True,
+                preprocess_common_before_consistancy_check=preprocess_fn,
+            )
 
             saved_config = maybe_load_config(ckpt_dir)
             if saved_config.sharded_backend == 'zarr':
@@ -91,6 +128,42 @@ class TestSerialization:
                 assert (ckpt_dir / 'keyB').is_dir()
                 assert not (ckpt_dir / 'keyC').exists()
                 assert not (ckpt_dir / 'sd_keyA').is_dir()
+
+        Utils.destroy_model_parallel()
+
+    def test_multi_process_save_log_difference(self, tmp_path_dist_ckpt, caplog):
+        Utils.initialize_model_parallel(2, 4)
+
+        state_dict = {
+            'sd_keyA': ShardedTensor.from_rank_offsets(
+                'keyA', torch.ones(2, 4), (0, Utils.rank, Utils.world_size)
+            ),
+            'sd_keyB': ShardedTensor.from_rank_offsets(
+                'keyB', torch.ones(3, 5, 7), (2, Utils.rank, Utils.world_size)
+            ),
+            'rank': torch.distributed.get_rank(),
+        }
+
+        def preprocess_fn(x):
+            return x
+
+        with caplog.at_level(logging.WARNING):
+            # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
+            with TempNamedDir(
+                tmp_path_dist_ckpt / 'test_multi_process_save', sync=True
+            ) as ckpt_dir:
+                save(
+                    state_dict,
+                    ckpt_dir,
+                    validate_access_integrity=True,
+                    preprocess_common_before_consistancy_check=preprocess_fn,
+                )
+            # pylint: disable=line-too-long
+            if torch.distributed.get_rank() == 0:
+                assert (
+                    "There is difference in the common state dict in different ranks. The differences are {1: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 2: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 3: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 4: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 5: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 6: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 7: ([], [], [(('rank',), <class 'int'>, <class 'int'>)])}"
+                    in caplog.text
+                )
 
         Utils.destroy_model_parallel()
 
@@ -443,6 +516,59 @@ class TestSerialization:
 
         Utils.destroy_model_parallel()
 
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.3.0"),
+        reason="remove_sharded_tensors relies on Torch APIs introduced in v2.3.0",
+    )
+    def test_remove_sharded_tensors(self, tmp_path_dist_ckpt):
+        Utils.initialize_model_parallel(2, 4)
+
+        # Global tensor is just a range(32) repeated twice over the first dimension
+        global_tensor = torch.arange(4).unsqueeze(0).expand(2, 4)
+        state_dict = {
+            'sd_keyA': ShardedTensor.from_rank_offsets(
+                'keyA', torch.ones(2, 4), (0, Utils.rank, Utils.world_size)
+            ),
+            'sd_prefix_key_to_remove': ShardedTensor.from_rank_offsets(
+                'prefix_key_to_remove', torch.ones(3, 5, 7), (2, Utils.rank, Utils.world_size)
+            ),
+        }
+
+        prefix_name = "prefix"  ## we will drop all tensors whose keys begin with "prefix"
+
+        # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_remove_sharded_tensor_prefix', sync=True
+        ) as ckpt_dir:
+            save_strategy = TorchDistSaveShardedStrategy(
+                "torch_dist", 1, separation_hint=prefix_name
+            )
+            save(state_dict, ckpt_dir, save_strategy)
+
+            files = os.listdir(ckpt_dir)
+            prefix_files = [f for f in files if f.startswith(prefix_name)]
+            assert len(prefix_files) == torch.distributed.get_world_size()
+
+            fs_reader = FileSystemReader(ckpt_dir)
+            original_metadata = fs_reader.read_metadata()
+            assert set(original_metadata.state_dict_metadata.keys()) == {
+                'keyA',
+                'prefix_key_to_remove',
+            }
+
+            if torch.distributed.get_rank() == 0:
+                remove_sharded_tensors(ckpt_dir, key_prefix=prefix_name)
+            torch.distributed.barrier()
+
+            files = os.listdir(ckpt_dir)
+            prefix_files = [f for f in files if f.startswith(prefix_name)]
+            assert len(prefix_files) == 0
+
+            new_metadata = fs_reader.read_metadata()
+            assert set(new_metadata.state_dict_metadata.keys()) == {'keyA'}
+
+        Utils.destroy_model_parallel()
+
 
 class TestNonStrictLoad:
     def setup_method(self, method):
@@ -468,6 +594,7 @@ class TestNonStrictLoad:
 
     @pytest.mark.parametrize('save_format', ['zarr', 'torch_dist'])
     @pytest.mark.parametrize('validate_integrity', [True, False])
+    @pytest.mark.failing_on_rocm
     def test_unexpected_keys_handling_during_validation(
         self, caplog, tmp_path_dist_ckpt, validate_integrity, save_format
     ):

@@ -37,7 +37,7 @@ class TestParallelAttention:
     def test_cpu_forward(self):
         # we can't currently do this because the global memory buffer is on GPU
         pass
-    @pytest.mark.failing_on_rocm
+    @pytest.mark.failing_on_upstream
     def test_gpu_forward(self):
 
         config = self.parallel_attention.config
@@ -61,7 +61,7 @@ class TestParallelAttention:
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == config.hidden_size
         assert bias.shape[0] == config.hidden_size
-    @pytest.mark.failing_on_rocm
+    @pytest.mark.failing_on_upstream
     def test_fused_rope_gpu_forward(self):
         self.parallel_attention.config.apply_rope_fusion = True
         config = self.parallel_attention.config
@@ -90,7 +90,7 @@ class TestParallelAttention:
         assert output.shape[2] == config.hidden_size
         assert bias.shape[0] == config.hidden_size
         self.parallel_attention.config.apply_rope_fusion = False
-    @pytest.mark.failing_on_rocm
+    @pytest.mark.failing_on_upstream
     def test_checkpointed_gpu_forward(self):
         transformer_config = self.transformer_config
         transformer_config.recompute_granularity = 'selective'

@@ -4,7 +4,6 @@
 
 import copy
 import math
-import warnings
 from abc import ABC, abstractmethod
 from itertools import chain
 from logging import getLogger
@@ -13,23 +12,27 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 
 try:
-    from transformer_engine.pytorch.optimizers import multi_tensor_applier
+    from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_scale
+
+    multi_tensor_scale_impl = multi_tensor_scale
 except ImportError:
     try:
-        from apex.multi_tensor_apply import multi_tensor_applier
-    except ImportError:
-        from megatron.core.utils import local_multi_tensor_applier
-
-        multi_tensor_applier = local_multi_tensor_applier
-    try:
         import amp_C
+        from apex.multi_tensor_apply import multi_tensor_applier
 
-        l2_norm_impl = amp_C.multi_tensor_l2norm
         multi_tensor_scale_impl = amp_C.multi_tensor_scale
     except ImportError:
-        from megatron.core.utils import local_multi_tensor_l2_norm, local_multi_tensor_scale
+        import warnings
 
-        l2_norm_impl = local_multi_tensor_l2_norm
+        warnings.warn(
+            'Transformer Engine and Apex are not installed. '
+            'Falling back to local implementations of '
+            'multi_tensor_applier and multi_tensor_scale'
+        )
+
+        from megatron.core.utils import local_multi_tensor_applier, local_multi_tensor_scale
+
+        multi_tensor_applier = local_multi_tensor_applier
         multi_tensor_scale_impl = local_multi_tensor_scale
 
 from .. import parallel_state, tensor_parallel
@@ -75,7 +78,7 @@ def _multi_tensor_copy_this_to_that(
     is not provided, we default back to simple loop copy to be compatible
     with bfloat16.
     """
-    if overflow_buf:
+    if overflow_buf is not None:
         overflow_buf.fill_(0)
         # Scaling with factor `1.0` is equivalent to copy.
         multi_tensor_applier(multi_tensor_scale_impl, overflow_buf, [this, that], 1.0)
@@ -137,10 +140,24 @@ class MegatronOptimizer(ABC):
 
         return grads_for_norm
 
-    def get_model_parallel_group(self) -> torch.distributed.ProcessGroup:
-        """Default returned here, but the distributed optimizer overrides this."""
+    def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
+        """Process group for reducing gradient statistics (num_zeros & norm).
+
+        The two most common cases are:
+        - Non-distributed optimizer (default): Return the model-parallel group.
+        - Distributed optimizer (overridden in distrib_optimizer.py): Return the entire world.
+        """
         if hasattr(self, 'model_parallel_group'):
-            return self.model_parallel_group
+            warnings.warn(
+                "WARNING: `optimizer.model_parallel_group` deprecated and renamed to "
+                "`optimizer.grad_stats_parallel_group`. The previous name will be "
+                "removed in a future release."
+            )
+            self.grad_stats_parallel_group = self.model_parallel_group
+            delattr(self, "model_parallel_group")
+            return self.grad_stats_parallel_group
+        if hasattr(self, 'grad_stats_parallel_group'):
+            return self.grad_stats_parallel_group
         return parallel_state.get_model_parallel_group()
 
     @abstractmethod
@@ -158,7 +175,7 @@ class MegatronOptimizer(ABC):
         """Compute and return grad norm."""
         grads_for_norm = self.get_main_grads_for_grad_norm()
         total_norm = get_grad_norm_fp32(
-            grads_for_norm, model_parallel_group=self.get_model_parallel_group()
+            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
         )
         return total_norm
 
@@ -167,7 +184,7 @@ class MegatronOptimizer(ABC):
         params = self.get_parameters()
         grads_for_norm = self.get_main_grads_for_grad_norm()
         grad_norm = get_grad_norm_fp32(
-            grads_for_norm, model_parallel_group=self.get_model_parallel_group()
+            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
         )
         clip_grad_by_total_norm_fp32(params, clip_grad, grad_norm)
         return grad_norm
@@ -175,7 +192,9 @@ class MegatronOptimizer(ABC):
     def count_zeros(self) -> float:
         """Count number of zeros in model's gradients."""
         params = self.get_parameters()
-        return count_zeros_fp32(params, model_parallel_group=self.get_model_parallel_group())
+        return count_zeros_fp32(
+            params, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+        )
 
     @abstractmethod
     def zero_grad(self, set_to_none: bool = True):
@@ -193,13 +212,6 @@ class MegatronOptimizer(ABC):
     def scale_loss(self, loss: torch.Tensor) -> torch.Tensor:
         """Simple scaling."""
         return self.get_loss_scale() * loss
-
-    def start_param_sync(self, model_index: int, *unused):
-        """
-        Start parameter synchronization for all optimizers.
-        This is a no-op for all non-distributed optimizers.
-        """
-        pass
 
     @abstractmethod
     def reload_model_params(self):
@@ -354,7 +366,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
         # Update across all model parallel instances.
         torch.distributed.all_reduce(
-            self.found_inf, op=torch.distributed.ReduceOp.MAX, group=self.get_model_parallel_group()
+            self.found_inf,
+            op=torch.distributed.ReduceOp.MAX,
+            group=self.get_grad_stats_parallel_group(),
         )
 
         # Check for nan.
@@ -665,7 +679,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         optimizer_key = 'optimizer'
         if optimizer_key not in state_dict:
             optimizer_key = 'optimizer_state_dict'
-            logger.info('***WARNING*** loading optimizer from ' 'an old checkpoint ...')
+            logger.info('***WARNING*** loading optimizer from an old checkpoint ...')
         if 'common_step' in state_dict[optimizer_key]['state']:
             common_step = state_dict[optimizer_key]['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict[optimizer_key], common_step)
@@ -674,9 +688,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
             if self.config.fp16:
-                logger.info(
-                    '***WARNING*** found an old checkpoint, will not ' 'load grad scaler ...'
-                )
+                logger.info('***WARNING*** found an old checkpoint, will not load grad scaler ...')
         else:
             if self.grad_scaler:
                 self.grad_scaler.load_state_dict(state_dict['grad_scaler'])
@@ -738,7 +750,8 @@ class FP32Optimizer(MegatronOptimizer):
             )
         for param_group in self.optimizer.param_groups:
             for param in param_group['params']:
-                param.grad = param.main_grad
+                if hasattr(param, 'main_grad'):
+                    param.grad = param.main_grad
         if timers is not None:
             timers('optimizer-copy-to-main-grad').stop()
 
@@ -964,24 +977,6 @@ class ChainedOptimizer(MegatronOptimizer):
 
         return success
 
-    def disable_pre_hook(self):
-        """Disable pre-hooks for underlying distributed optimizers."""
-        warnings.warn(
-            "`ChainedOptimizer.disable_pre_hook` will be deprecated in a future release. "
-            "Use `DistributedDataParallel.disable_forward_pre_hook` directly."
-        )
-        for model_chunk in self.model_chunks:
-            model_chunk.disable_forward_pre_hook()
-
-    def enable_pre_hook(self):
-        """Enable pre-hooks for underlying distributed optimizers."""
-        warnings.warn(
-            "`ChainedOptimizer.enable_pre_hook` will be deprecated in a future release. "
-            "Use `DistributedDataParallel.enable_forward_pre_hook` directly."
-        )
-        for model_chunk in self.model_chunks:
-            model_chunk.enable_forward_pre_hook()
-
     @torch.no_grad()
     def step(self):
         """ChainedOptimizer will step all optimizers one by one."""
@@ -1060,8 +1055,3 @@ class ChainedOptimizer(MegatronOptimizer):
             optimizer.load_parameter_state_from_dp_zero(
                 state_dict, update_legacy_format=update_legacy_format
             )
-
-    def start_param_sync(self, model_index: int, *unused):
-        """Start parameter synchronization for all optimizers."""
-        for optimizer in self.chained_optimizers:
-            optimizer.start_param_sync(model_index, *unused)

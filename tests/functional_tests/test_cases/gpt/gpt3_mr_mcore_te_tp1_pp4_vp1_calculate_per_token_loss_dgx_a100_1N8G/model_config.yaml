@@ -3,7 +3,6 @@ ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Tree
   CUBLAS_WORKSPACE_CONFIG: :4096:8
-  N_REPEATS: 5
 MODEL_ARGS:
   --num-layers: 12
   --hidden-size: 512
@@ -49,4 +48,5 @@ MODEL_ARGS:
   --ckpt-format: torch_dist
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
+  --attention-backend: unfused
 TEST_TYPE: regular

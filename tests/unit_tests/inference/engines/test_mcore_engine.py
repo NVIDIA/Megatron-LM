@@ -29,6 +29,7 @@ class TestMCoreEngine:
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
+
         model_parallel_cuda_manual_seed(123)
         self.batch_size = 4
         self.hidden_size = 12

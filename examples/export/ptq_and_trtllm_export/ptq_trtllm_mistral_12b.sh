@@ -7,11 +7,6 @@ NAME="${1:-$DEFAULT_NAME}"
 DEFAULT_QUANT_CFG="fp8"
 QUANT_CFG="${2:-$DEFAULT_QUANT_CFG}"
 
-# NOTE: UNFUSED ATTENTION MUST BE USED TO AVOID ADDITIONAL STATE_DICT KEY MISMATCH.
-export NVTE_FLASH_ATTN=0
-export NVTE_FUSED_ATTN=0
-export NVTE_UNFUSED_ATTN=1
-
 # CHANGE THE FOLLOWING IF YOU MOUNT YOUR DATA AND CHECKPOINTS DIFFERENTLY IN THE CONTAINER.
 TP="8"
 INFERENCE_TP=${TP}
@@ -36,6 +31,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 options=" \
     --untie-embeddings-and-output-weights \
+    --attention-backend unfused \
     --disable-bias-linear \
     --use-rotary-position-embeddings \
     --rotary-percent 1.0 \

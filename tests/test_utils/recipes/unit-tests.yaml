@@ -1,0 +1,80 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: '{test_case}'
+  model: unit-tests
+  nodes: 1
+  build: mcore-pyt-{environment}
+  gpus: 8
+  platforms: dgx_h100
+  script: |-
+    ls
+
+    export TAG={tag}
+    export ENVIRONMENT={environment}
+    export BUCKET="{test_case}"
+    export UNIT_TEST_REPEAT={n_repeat}
+    export UNIT_TEST_TIMEOUT=10
+
+    set -euxo pipefail
+
+    if [[ "$TAG" == "latest" ]]; then
+      TEST_PATH="/opt/megatron-lm"
+    else
+      TEST_PATH="/opt/megatron-lm-legacy/"
+    fi
+
+    cd $TEST_PATH
+
+    MARKER=()
+    if [[ "$TAG" == "legacy" ]]; then
+      MARKER+=("not internal")
+    fi
+
+    if [[ "$ENVIRONMENT" == "lts" ]]; then
+      MARKER+=("not flaky")
+    fi
+
+    if [[ "$ENVIRONMENT" == "dev" ]]; then
+      MARKER+=("not flaky_in_dev")
+    fi
+
+    MARKER_ARG=$(printf "%s" "${{MARKER[0]}}")
+    for element in "${{MARKER[@]:1}}"; do
+      MARKER_ARG+=" and $element"
+    done
+
+    IGNORE_TEST_CASES=$(cat /opt/megatron-lm/tests/test_utils/recipes/unit-tests.yaml | yq eval 'with(.products[].test_case; del(.[] | select(. == env(BUCKET)))) | .products[].test_case[]' | tr " " "\n")
+    IGNORE_ARGS=()
+    while IFS= read -r test_case; do
+      if [[ $test_case == *\** ]]; then
+          FILES=($(ls $test_case))
+          echo ${{FILES[@]}}
+          for file in "${{FILES[@]}}"; do
+            IGNORE_ARGS+=("--ignore='$file'")
+          done          
+      else
+          IGNORE_ARGS+=("--ignore=$test_case")
+      fi
+    done <<< "$IGNORE_TEST_CASES"
+
+    for i in $(seq $UNIT_TEST_REPEAT); do
+      CMD=$(echo pytest -xvs --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail ${{IGNORE_ARGS[@]}} -m "'${{MARKER_ARG}}'" $BUCKET)
+      eval "$CMD"
+    done
+
+products:
+  - environment: [lts, dev]
+    tag: [latest, legacy]
+    scope: [unit-tests]
+    n_repeat: [1]
+    time_limit: [1800]
+    test_case:
+      - tests/unit_tests/data/
+      - tests/unit_tests/dist_checkpointing/*.py
+      - tests/unit_tests/dist_checkpointing/models/
+      - tests/unit_tests/transformer/*.py
+      - tests/unit_tests/transformer/moe
+      - tests/unit_tests

@@ -132,7 +132,6 @@ class TestSpecCustomization:
         bda_op = build_module(self.bda_spec)
         assert id(bda_op) == id(get_bias_dropout_add)
 
-    @pytest.mark.failing_on_rocm
     def test_sliding_window_attention(self):
         if not is_te_min_version("1.2.0"):
             print("SWA not tested because TE version is not >= 1.2.0", file=sys.stderr)
@@ -143,7 +142,7 @@ class TestSpecCustomization:
             hidden_size=12,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            window_size=[10, 0],
+            window_size=(10, 0),
         )
         # Make sure DotProductAttention throws (swa unsupported).
         threw = False

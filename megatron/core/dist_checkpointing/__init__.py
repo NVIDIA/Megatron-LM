@@ -7,5 +7,6 @@ from .serialization import (
     load_common_state_dict,
     load_plain_tensors,
     load_tensors_metadata,
+    remove_sharded_tensors,
     save,
 )

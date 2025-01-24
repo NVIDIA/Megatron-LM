@@ -17,7 +17,8 @@ echo "---------------------------------"
 # Check that mandatory vars are set
 MANDATORY_VARS=(
     "TRAINING_SCRIPT_PATH"
-    "TEST_CASE_PATH"
+    "TRAINING_PARAMS_PATH"
+    "GOLDEN_VALUES_PATH"
     "OUTPUT_PATH"
     "TENSORBOARD_PATH"
     "CHECKPOINT_PATH"
@@ -31,9 +32,6 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
     fi
 done
 
-export TRAINING_PARAMS_PATH=$TEST_CASE_PATH/model_config.yaml
-export GOLDEN_VALUES_PATH=$TEST_CASE_PATH/golden_values.json
-
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT_DIR=$(realpath $SCRIPT_DIR/../../../)
 
@@ -44,10 +42,8 @@ NVTE_ALLOW_NONDETERMINISTIC_ALGO=$(cat $TRAINING_PARAMS_PATH \
                                    | yq '.ENV_VARS.NVTE_ALLOW_NONDETERMINISTIC_ALGO')
 SKIP_PYTEST=$(cat $TRAINING_PARAMS_PATH \
               | yq '.ENV_VARS.SKIP_PYTEST')
-N_REPEATS=$(cat $TRAINING_PARAMS_PATH \
-              | yq '.ENV_VARS.N_REPEATS //1')
 
-for i in $(seq 1 $N_REPEATS);
+for i in $(seq 1 $N_REPEAT);
 do
     if [[ $i -gt 1 ]]; then
         rm -rf $CHECKPOINT_PATH/*
@@ -59,17 +55,30 @@ do
 
     # Maybe checkpoint resume training
     if [[ "$TEST_TYPE" == "ckpt-resume" ]]; then 
-        rm -rf $CHECKPOINT_PATH/iter_0000100; 
-        echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt;
+        if [[ ${SLURM_PROCID} -eq 0 ]]; then
+            rm -rf $CHECKPOINT_PATH/iter_0000100; 
+            echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt;
+        fi
+
         export RUN_NUMBER=2
         bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
     fi
 
+    if [[ ${SLURM_PROCID} -gt 0 ]]; then
+        continue
+    fi
+
     # Save run results
     export PYTHONPATH=$ROOT_DIR
+    if [[ "$TEST_TYPE" == "release" ]]; then
+        EXTRACT_ARGS=("--is-convergence-test")
+    else
+        EXTRACT_ARGS=("--is-normal-test")
+    fi
     python3 $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
         --logs-dir $TENSORBOARD_PATH \
-        --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH)
+        --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
+        "${EXTRACT_ARGS[@]}"
 
     # Maybe run tests
     if [[ ${SKIP_PYTEST:-0} != 1 ]]; then

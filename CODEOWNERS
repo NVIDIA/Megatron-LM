@@ -34,14 +34,16 @@ megatron/core/optimizer/distrib_optimizer/
 [Inference] @mcore-reviewers/inference
 megatron/core/inference/
 
-[Quantization and Inference (QAT)] @mcore-reviewers/quantization-and-inference
+^[Quantization and Inference (QAT)] @mcore-reviewers/quantization-and-inference
 megatron/core/inference/
 
 ; [Context Parallelism] @mcore-reviewers/context-parallelism
 ; 
 
 [CI] @mcore-reviewers/ci
+.gitlab/
+.github/
 .gitlab-ci.yml
-Dockerfile.ci
-jet-tests.yml
+Dockerfile.ci.lts
+Dockerfile.ci.dev
 tests/

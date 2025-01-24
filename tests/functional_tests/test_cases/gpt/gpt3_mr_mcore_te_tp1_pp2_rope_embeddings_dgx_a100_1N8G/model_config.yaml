@@ -3,7 +3,6 @@ ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Tree
   CUBLAS_WORKSPACE_CONFIG: :4096:8
-  N_REPEATS: 5
 MODEL_ARGS:
   --num-layers: 12
   --hidden-size: 512
@@ -41,6 +40,7 @@ MODEL_ARGS:
   --tensor-model-parallel-size: 1
   --pipeline-model-parallel-size: 2
   --position-embedding-type: rope
+  --no-rope-fusion: true
   --no-ckpt-fully-parallel-save: true
   --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
@@ -49,4 +49,5 @@ MODEL_ARGS:
   --ckpt-format: torch_dist
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
+  --attention-backend: unfused
 TEST_TYPE: regular

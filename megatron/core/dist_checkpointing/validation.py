@@ -11,11 +11,13 @@ import torch
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_load_config
 from megatron.core.dist_checkpointing.dict_utils import (
+    diff,
     extract_matching_values,
     map_reduce,
     nested_values,
 )
 from megatron.core.dist_checkpointing.mapping import (
+    CommonStateDict,
     ShardedBase,
     ShardedObject,
     ShardedStateDict,
@@ -34,10 +36,10 @@ if TYPE_CHECKING:
     from megatron.core.dist_checkpointing.serialization import CkptShardedMetadata
 
 logger = logging.getLogger(__name__)
-
+# pylint: disable=line-too-long
 # list of local saved/loaded ShardedBase objects
 _LocalMetadata = List[Union[ShardedTensor, ShardedObject]]
-# list of lists of global saved/loaded ShardedBase objects (each list element corresponds to global rank)
+# list of lists of global saved/loaded ShardedBase objects (each element corresponds to global rank)
 _GlobalMetadata = List[_LocalMetadata]
 
 
@@ -362,7 +364,36 @@ def maybe_report_missing_and_unexpected_keys(
         logger.warning(error_msg)
 
 
-def validate_sharding_integrity(global_metadata: _GlobalMetadata) -> None:
+def _validate_common_state_dict(common_state_dict: CommonStateDict) -> None:
+    """Validate consistancy across ranks for the common state dict
+
+    We save the common state dict only on rank 0. We validate to make sure that the common dict is consistant across ranks before saving.
+
+    Args:
+        common_state_dict: The common state dict present in all ransk
+    """
+
+    # Gather the common state dict across ranks onto rank 0 for comparison
+    rank = torch.distributed.get_rank()
+    other_rank_state_dicts = [None] * torch.distributed.get_world_size() if rank == 0 else None
+    torch.distributed.gather_object(common_state_dict, other_rank_state_dicts)
+    common_state_dict_diff = {}
+    if rank == 0:
+        main_rank_state_dict = common_state_dict
+        for rank, rank_state_dict in enumerate(other_rank_state_dicts[1:], 1):
+            only_left, only_right, mismatch = diff(main_rank_state_dict, rank_state_dict)
+            if only_left or only_right or mismatch:
+                common_state_dict_diff[rank] = (only_left, only_right, mismatch)
+
+        if len(common_state_dict_diff) != 0:
+            logger.warning(
+                f'There is difference in the common state dict in different ranks. The differences are {common_state_dict_diff}'
+            )
+
+
+def validate_sharding_integrity(
+    global_metadata: _GlobalMetadata, common_state_dict: CommonStateDict = None
+) -> None:
     """Validate if the ShardedTensors and ShardedObjects from multiple processes define correct sharding.
 
     Local ShardedTensors and ShardedObject metadata is exchanged with `torch.distributed.all_gather_object`
@@ -372,6 +403,7 @@ def validate_sharding_integrity(global_metadata: _GlobalMetadata) -> None:
 
     Args:
         global_metadata (_GlobalMetadata): ShardedTensor and ShardedObject objects from all ranks.
+        common_state_dict (CommonStateDict): The common state dict stored by rank 0
 
     Returns:
         None
@@ -379,6 +411,10 @@ def validate_sharding_integrity(global_metadata: _GlobalMetadata) -> None:
     Raises:
         CheckpointingException for invalid access pattern
     """
+
+    if common_state_dict:
+        _validate_common_state_dict(common_state_dict)
+
     if torch.distributed.get_rank() != 0:
         return
 

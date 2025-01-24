@@ -1,13 +1,9 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 """Generate text using a vision language model."""
-import glob
-import itertools
 import json
 import logging
 import os
-import re
 import sys
-from collections import defaultdict
 from functools import partial
 
 # Add megatron to the path.
@@ -15,30 +11,20 @@ sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 
-import datasets
-import numpy as np
 import torch
 import yaml
 from config import EvaluationConfig
-from dataset_helpers import tokenizer_image_token
-from image_processing import get_visual_transform
-from MMMU.mmmu.utils.data_utils import (
-    CAT_SHORT2LONG,
-    construct_prompt,
-    load_yaml,
-    process_single_sample,
-)
-from MMMU.mmmu.utils.eval_utils import parse_multi_choice_response
+from evaluation_datasets import get_evaluation_dataset
 from model import model_provider
 from multimodal_args import add_multimodal_extra_args
-from PIL import Image
-from torchvision.io import read_video
 
 from megatron.core import parallel_state
-from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN_INDEX
+from megatron.core.enums import ModelType
+from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.inference.text_generation.api import generate_and_post_process
 from megatron.inference.text_generation.forward_step import ForwardStep
+from megatron.inference.text_generation.communication import broadcast_int_list
 from megatron.training import get_args, get_model, get_tokenizer, print_rank_0
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
@@ -52,7 +38,7 @@ def add_text_generation_args(parser):
     group.add_argument("--top_p", type=float, default=0.0, help='Top p sampling.')
     group.add_argument("--top_k", type=int, default=0, help='Top k sampling.')
     group.add_argument(
-        "--out-seq-length", type=int, default=1024, help='Length of the output generated text.'
+        "--out-seq-length", type=int, default=128, help='Length of the output generated text.'
     )
     group.add_argument("--output-path", type=str, help='Output file path')
     group.add_argument('--input-image-path', type=str, help="Input image directory")
@@ -64,429 +50,28 @@ def add_text_generation_args(parser):
     group.add_argument(
         "--task",
         type=str,
-        choices=["captioning", "TextVQA", "VQAv2", "ChartQA", "MMMU", "VideoMME"],
+        choices=[
+            "captioning",
+            "TextVQA",
+            "VQAv2",
+            "ChartQA",
+            "MMMU",
+            "VideoMME",
+            "OCRBench",
+            "MathVista",
+            "AI2D",
+        ],
         help="Generation task to run",
     )
     group.add_argument(
         "--num-samples-per-partition", type=int, default=0, help="Number of samples per partition"
     )
-    group.add_argument(
-        "--prompt-format",
-        type=str,
-        default="mistral",
-        choices=["llama3", "mistral"],
-        help="Prompting format to use",
-    )
-    group.add_argument("--config-path", type=str, help="Config file to use.")
+    group.add_argument("--config-path", type=str, help="Evaluation config file to use.")
 
     # Add common multimodal arguments needed for e.g. building the model.
     parser = add_multimodal_extra_args(parser)
 
     return parser
-
-
-def _get_partition_bounds(
-    total_num_samples, num_samples_per_partition, num_partitions, partition_id
-):
-    if num_samples_per_partition == 0:
-        samples_per_partition = [
-            int(x) for x in np.linspace(0, total_num_samples, num_partitions + 1)
-        ]
-        return samples_per_partition[partition_id], samples_per_partition[partition_id + 1]
-    return num_samples_per_partition * partition_id, num_samples_per_partition * (partition_id + 1)
-
-
-class VQADataset(torch.utils.data.Dataset):
-    def __init__(
-        self,
-        input_image_path,
-        gt_path,
-        num_samples_per_partition,
-        num_partitions,
-        partition_id,
-        keys,
-        img_h,
-        img_w,
-        use_tiling,
-        max_num_tiles,
-        use_thumbnail,
-    ):
-        samples = json.load(open(gt_path, encoding='utf-8'))
-        if "data" in samples:
-            samples = samples["data"]
-
-        # Optionally, process only a subset of the input files.
-        if num_partitions > 0:
-            lb, ub = _get_partition_bounds(
-                len(samples), num_samples_per_partition, num_partitions, partition_id
-            )
-            samples = samples[lb:ub]
-
-        self._keys = keys
-        self._samples = samples
-        self._input_image_path = input_image_path
-        self._img_h = img_h
-        self._img_w = img_w
-        self._use_tiling = use_tiling
-        self._max_num_tiles = max_num_tiles
-        self._use_thumbnail = use_thumbnail
-
-    def __len__(self):
-        return len(self._samples)
-
-    def __getitem__(self, idx):
-        sample = self._samples[idx]
-
-        img_file = "{}/{}".format(self._input_image_path, sample[self._keys["image_id"]])
-        if not os.path.exists(img_file):
-            img_file += ".jpg"
-
-            if not os.path.exists(img_file):
-                img_file = img_file.replace('.jpg', '.png')
-
-        img = Image.open(img_file)
-        imgs = get_visual_transform(
-            img,
-            self._img_h,
-            self._img_w,
-            self._use_tiling,
-            self._max_num_tiles,
-            self._use_thumbnail,
-            augment=False,
-        )
-        tile_count = torch.tensor([len(imgs)], dtype=torch.int)
-
-        sample_id = idx
-        if "sample_id" in self._keys:
-            sample_id = sample[self._keys["sample_id"]]
-
-        metadata = ""  # Not used.
-
-        return (
-            torch.stack(imgs),
-            tile_count,
-            sample_id,
-            sample[self._keys["question"]],
-            sample[self._keys["answer"]],
-            metadata,
-        )
-
-
-class CaptioningDataset(torch.utils.data.Dataset):
-    def __init__(
-        self,
-        input_image_path,
-        gt_path,
-        num_samples_per_partition,
-        num_partitions,
-        partition_id,
-        img_h,
-        img_w,
-        use_tiling,
-        max_num_tiles,
-        use_thumbnail,
-    ):
-        image_files = sorted(glob.glob(input_image_path + "/*"))
-
-        # Optionally, process only a subset of the input files.
-        if num_partitions > 0:
-            lb, ub = _get_partition_bounds(
-                len(image_files), num_samples_per_partition, num_partitions, partition_id
-            )
-            image_files = image_files[lb:ub]
-
-        gts = json.load(open(gt_path))
-        answers = defaultdict(list)
-        for gt in gts["annotations"]:
-            answers[gt["image_id"]].append(gt['caption'])
-
-        self._image_files = image_files
-        self._answers = answers
-        self._img_h = img_h
-        self._img_w = img_w
-        self._use_tiling = use_tiling
-        self._max_num_tiles = max_num_tiles
-        self._use_thumbnail = use_thumbnail
-
-    def __len__(self):
-        return len(self._image_files)
-
-    def __getitem__(self, idx):
-        img_file = self._image_files[idx]
-        image_id = int(img_file.split("_")[-1].split(".")[0])
-
-        img = Image.open(img_file)
-        imgs = get_visual_transform(
-            img,
-            self._img_h,
-            self._img_w,
-            self._use_tiling,
-            self._max_num_tiles,
-            self._use_thumbnail,
-            augment=False,
-        )
-
-        tile_count = torch.tensor([len(imgs)], dtype=torch.int)
-
-        question = ""  # Fixed for all samples.
-        metadata = ""  # Not used.
-
-        return torch.stack(imgs), tile_count, image_id, question, self._answers[image_id], metadata
-
-
-class MMMUDataset(torch.utils.data.Dataset):
-    def __init__(
-        self,
-        input_image_path,
-        num_samples_per_partition,
-        num_partitions,
-        partition_id,
-        img_h,
-        img_w,
-        use_tiling,
-        max_num_tiles,
-        use_thumbnail,
-        single_image,
-    ):
-        # The following downloads the MMMU dataset from HuggingFace and uses the API from the MMMU github repo to run MMMU evaluation.
-        all_mmmu_datasets = []
-
-        hf_datasets_cache = os.environ["HF_DATASETS_CACHE"]
-        assert hf_datasets_cache != "", "Please set the environment variable HF_DATASETS_CACHE."
-
-        for subject in CAT_SHORT2LONG.values():
-            # Use a local copy of the dataset if exists (can be faster) or the HF one.
-            if os.path.exists(input_image_path):
-                subject_dataset = datasets.load_dataset(
-                    os.path.join(input_image_path, subject),
-                    split=datasets.Split.VALIDATION,
-                    cache_dir=hf_datasets_cache,
-                    verification_mode="no_checks",
-                )
-            else:
-                subject_dataset = datasets.load_dataset(
-                    "MMMU/MMMU",
-                    subject,
-                    split=datasets.Split.VALIDATION,
-                    cache_dir=hf_datasets_cache,
-                )
-
-            all_mmmu_datasets.append(subject_dataset)
-
-        dataset = datasets.concatenate_datasets(all_mmmu_datasets)
-
-        dataset = [s for s in dataset if s['id'].startswith("val")]
-
-        # Optionally, process only a subset of the input files.
-        if num_partitions > 0:
-            lb, ub = _get_partition_bounds(
-                len(dataset), num_samples_per_partition, num_partitions, partition_id
-            )
-            dataset = dataset[lb:ub]
-
-        # Using the LLaVA config from the MMMU repo.
-        config = load_yaml("examples/multimodal/MMMU/mmmu/configs/llava1.5.yaml")
-        for k, v in config.items():
-            if isinstance(v, list):
-                assert len(v) == 1, "only one value supported."
-                config[k] = v[0]
-
-        self._config = config
-
-        self._dataset = dataset
-
-        self._img_h = img_h
-        self._img_w = img_w
-        self._use_tiling = use_tiling
-        self._max_num_tiles = max_num_tiles
-        self._use_thumbnail = use_thumbnail
-        self._single_image = single_image
-
-    def __len__(self):
-        return len(self._dataset)
-
-    def __getitem__(self, idx):
-        sample = self._dataset[idx]
-
-        # Use the single image approach from the MMMU repo.
-        if self._single_image:
-            sample = process_single_sample(sample)
-            sample = construct_prompt(sample, self._config)
-
-            img = sample["image"]
-            sample_imgs = get_visual_transform(
-                img,
-                self._img_h,
-                self._img_w,
-                self._use_tiling,
-                self._max_num_tiles,
-                self._use_thumbnail,
-                augment=False,
-            )
-            sample_num_tiles = [len(sample_imgs)]
-        else:
-            sample = construct_prompt(sample, self._config)
-
-            sample_imgs = []
-            sample_num_tiles = []
-
-            img_indices = re.findall(r"<image (\d+)", sample["final_input_prompt"])
-            # If there are multiple input images, we need to avoid the number of image embeddings getting too large.
-            adjusted_max_num_tiles = max(1, self._max_num_tiles // len(img_indices))
-
-            for img_idx in img_indices:
-                img_key = f"image_{img_idx}"
-                img_str = f"<image {img_idx}>"
-
-                img = sample[img_key]
-                assert img is not None, f"{img_str} is in prompt but not in sample images"
-
-                # Note: Only replace the current image tag.
-                sample["final_input_prompt"] = sample["final_input_prompt"].replace(
-                    img_str, "<image>", 1
-                )
-
-                imgs = get_visual_transform(
-                    img,
-                    self._img_h,
-                    self._img_w,
-                    self._use_tiling,
-                    adjusted_max_num_tiles,
-                    self._use_thumbnail,
-                    augment=False,
-                )  # List of tiles.
-
-                sample_imgs.extend(imgs)
-                sample_num_tiles.append(len(imgs))
-
-            # Sanity check.
-            for i in range(1, 8):
-                assert (
-                    f"<image {i}>" not in sample["final_input_prompt"]
-                ), "prompt contains unhandled image tags"
-
-        # MMMU specific metadata.
-        metadata = {"question_type": sample["question_type"]}
-        if sample["question_type"] == "multiple-choice":
-            metadata["index2ans"] = sample["index2ans"]
-            metadata["all_choices"] = sample["all_choices"]
-
-        prompt = sample['final_input_prompt']
-        if self._single_image:
-            for i in range(8):
-                prompt = prompt.replace(f"<image {i}>", "")
-            prompt = f"<image>\n{prompt}"
-
-        tile_count = torch.tensor(sample_num_tiles, dtype=torch.int)
-
-        return (
-            torch.stack(sample_imgs),
-            tile_count,
-            sample["id"],
-            prompt,
-            sample["answer"],
-            metadata,
-        )
-
-
-class VideoMMMEDataset(torch.utils.data.Dataset):
-    def __init__(
-        self,
-        input_image_path,
-        gt_path,
-        num_samples_per_partition,
-        num_partitions,
-        partition_id,
-        img_h,
-        img_w,
-        use_tiling,
-        max_num_tiles,
-        use_thumbnail,
-        num_frames,
-    ):
-        ground_truth_original = json.load(open(gt_path))
-        ground_truth = []
-        for gt in ground_truth_original:
-            video_path = gt["url"]
-            video_path = video_path.replace("https://www.youtube.com/watch?v=", "")
-            video_path = video_path.replace("https://m.youtube.com/watch?v=", "")
-            video_path = os.path.join(input_image_path, video_path + ".mp4")
-            if not os.path.exists(video_path):
-                continue
-            gt["video_path"] = video_path
-            ground_truth.append(gt)
-
-        ground_truth = sorted(ground_truth, key=lambda gt: gt["video_path"])
-        print_rank_0(f"Found {len(ground_truth)} videos to process.")
-
-        if num_partitions > 0:
-            start_idx, end_idx = _get_partition_bounds(
-                len(ground_truth), num_samples_per_partition, num_partitions, partition_id
-            )
-            ground_truth = ground_truth[start_idx:end_idx]
-
-        self._ground_truth = ground_truth
-        self._img_h = img_h
-        self._img_w = img_w
-        self._use_tiling = use_tiling
-        self._max_num_tiles = max_num_tiles
-        self._use_thumbnail = use_thumbnail
-        self._num_frames = num_frames
-
-    def __len__(self):
-        return len(self._ground_truth)
-
-    def __getitem__(self, idx):
-        gt = self._ground_truth[idx]
-
-        video, _, _ = read_video(gt["video_path"], start_pts=0, end_pts=None, pts_unit='sec')
-        video = video.numpy()
-        selected_frames = torch.linspace(0, video.shape[0] - 1, self._num_frames).long()
-        video_frames = video[selected_frames]
-        if self._num_frames == 1:
-            video_frames = video_frames[None]
-
-        imgs = list(
-            itertools.chain.from_iterable(
-                get_visual_transform(
-                    img,
-                    self._img_h,
-                    self._img_w,
-                    self._use_tiling,
-                    self._max_num_tiles,
-                    self._use_thumbnail,
-                    augment=False,
-                )
-                for img in video_frames
-            )
-        )
-
-        for question in gt["questions"]:
-            # Very hacky, but we essentially re-create gt holding only the
-            # question of interest. This is the make this generation script
-            # compatible with the Video MME evaluation script.
-            question_dict = {
-                "video_id": gt["video_id"],
-                "duration_category": gt["duration_category"],
-                "video_category": gt["video_category"],
-                "video_subcategory": gt["video_subcategory"],
-                "url": gt["url"],
-                "questions": [question],
-            }
-
-        num_tiles = torch.tensor([len(imgs)], dtype=torch.int)
-
-        answer = ""
-        metadata = ""
-
-        return (
-            torch.stack(imgs),
-            num_tiles,
-            question["question_id"],
-            question_dict,
-            answer,
-            metadata,
-        )
 
 
 def get_evaluation_dataloader(
@@ -503,110 +88,24 @@ def get_evaluation_dataloader(
     partition_id,
     num_frames,
     num_workers,
+    vision_model_type,
 ):
     """Build evaluation dataset."""
-    if task == "TextVQA":
-        keys = {
-            "image_id": "image_id",
-            "sample_id": "question_id",
-            "question": "question",
-            "answer": "answers",
-        }
-
-        dataset = VQADataset(
-            input_image_path,
-            gt_path,
-            num_samples_per_partition,
-            num_partitions,
-            partition_id,
-            keys,
-            img_h,
-            img_w,
-            use_tiling,
-            max_num_tiles,
-            use_thumbnail,
-        )
-    elif task == "VQAv2":
-        keys = {
-            "image_id": "image",
-            "sample_id": "question_id",
-            "question": "question",
-            "answer": "answer",
-        }
-
-        dataset = VQADataset(
-            input_image_path,
-            gt_path,
-            num_samples_per_partition,
-            num_partitions,
-            partition_id,
-            keys,
-            img_h,
-            img_w,
-            use_tiling,
-            max_num_tiles,
-            use_thumbnail,
-        )
-    elif task == "ChartQA":
-        keys = {"image_id": "imgname", "question": "query", "answer": "label"}
-
-        dataset = VQADataset(
-            input_image_path,
-            gt_path,
-            num_samples_per_partition,
-            num_partitions,
-            partition_id,
-            keys,
-            img_h,
-            img_w,
-            use_tiling,
-            max_num_tiles,
-            use_thumbnail,
-        )
-    elif task == "captioning":
-        dataset = CaptioningDataset(
-            input_image_path,
-            gt_path,
-            num_samples_per_partition,
-            num_partitions,
-            partition_id,
-            img_h,
-            img_w,
-            use_tiling,
-            max_num_tiles,
-            use_thumbnail,
-        )
-    elif task == 'MMMU':
-        # Note: single_image=True uses only one image like in the MMMU repo example.
-        # single_image=False uses all images in the sample.
-        dataset = MMMUDataset(
-            input_image_path,
-            num_samples_per_partition,
-            num_partitions,
-            partition_id,
-            img_h,
-            img_w,
-            use_tiling,
-            max_num_tiles,
-            use_thumbnail,
-            single_image=True,
-        )
-    elif task == "VideoMME":
-        dataset = VideoMMMEDataset(
-            input_image_path,
-            gt_path,
-            num_samples_per_partition,
-            num_partitions,
-            partition_id,
-            img_h,
-            img_w,
-            use_tiling,
-            max_num_tiles,
-            use_thumbnail,
-            num_frames,
-        )
-    else:
-        raise NotImplementedError(f"unsupported task {task}")
+    dataset = get_evaluation_dataset(
+        task,
+        input_image_path,
+        gt_path,
+        img_h,
+        img_w,
+        use_tiling,
+        max_num_tiles,
+        use_thumbnail,
+        num_samples_per_partition,
+        num_partitions,
+        partition_id,
+        num_frames,
+        vision_model_type,
+    )
 
     dp_rank = parallel_state.get_data_parallel_rank()
     dp_world_size = parallel_state.get_data_parallel_world_size()
@@ -640,25 +139,33 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         config.partition_id,
         args.num_frames,
         args.num_workers,
+        args.vision_model_type,
     )
 
     num_img_embeddings_per_tile = get_num_image_embeddings(
-        args.img_h, args.img_w, args.patch_dim, args.vision_model_type, args.disable_vision_class_token, 1
+        args.img_h,
+        args.img_w,
+        args.patch_dim,
+        args.vision_model_type,
+        args.disable_vision_class_token,
+        1,
+        args.pixel_shuffle,
+        args.use_tile_tags,
     )
 
     for idx, (imgs, num_tiles, sample_id, question, answers, metadata) in enumerate(dataloader):
         imgs = imgs.to("cuda")
         num_tiles = num_tiles.to("cuda")
 
-        prompt = get_prompt(config.task, question, config.prompt_format)
+        conv = get_conversation(config.task, question)
 
-        forward_step = partial(VLMForwardStep, num_img_embeddings_per_tile, imgs, num_tiles)
+        forward_step = partial(VLMForwardStep, num_img_embeddings_per_tile, imgs, num_tiles, args.decoder_seq_length)
 
         if is_first_rank():
             resp_sentences, _, _, _ = generate_and_post_process(
                 model,
                 forward_step=forward_step,
-                prompts=[prompt],
+                prompts=[conv],
                 tokens_to_generate=config.out_seq_length,
                 top_k_sampling=config.top_k,
                 top_p_sampling=config.top_p,
@@ -669,43 +176,62 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                 data_parallel=True,
             )
 
-            for prompt, generation in zip([prompt], resp_sentences):
+            for generation in resp_sentences:
                 if isinstance(sample_id, torch.Tensor):
                     sample_id = sample_id.item()
 
-                output = {"sample_id": sample_id, "prompt": prompt}
+                output = {"sample_id": sample_id}
 
                 output_name = ""
                 if config.task == "captioning":
                     output_name = "caption"
-                elif config.task in ("TextVQA", "VQAv2", "ChartQA"):
+                elif config.task in (
+                    "TextVQA",
+                    "VQAv2",
+                    "ChartQA",
+                    "OCRBench",
+                    "MathVista",
+                    "AI2D",
+                ):
                     output_name = "answer"
                 elif config.task in ("MMMU"):
                     output_name = "text"
                 elif config.task == "VideoMME":
                     output_name = "response"
                     output = question
+                else:
+                    raise NotImplementedError("no output name defined for", config.task)
 
-                generated = get_generated(generation, config.prompt_format)
+                prompt, generated = get_prompt_and_generated(
+                    generation, args.tokenizer_prompt_format
+                )
                 if config.task == "VideoMME":
                     output["questions"][0][output_name] = generated
                 else:
+                    output["prompt"] = prompt
                     output[output_name] = generated
 
                 if config.task == "captioning":
                     output["ground_truth"] = answers
-                elif config.task in ("TextVQA", "VQAv2"):
-                    output["gt_answer"] = [ans for ans in answers]
-                elif config.task == "ChartQA":
-                    output["gt_answer"] = [answers]
-                elif config.task == "MMMU":
-                    prediction = generated
-                    if metadata["question_type"] == "multiple-choice":
-                        prediction = parse_multi_choice_response(
-                            generated, metadata["all_choices"], metadata["index2ans"]
-                        )
+                elif config.task in (
+                    "TextVQA",
+                    "VQAv2",
+                    "ChartQA",
+                    "OCRBench",
+                    "MathVista",
+                    "AI2D",
+                ):
+                    if isinstance(answers, str):
+                        answers = [answers]
+                    output["gt_answer"] = answers
 
-                    output["prediction"] = prediction
+                    if len(metadata) > 0:
+                        output.update(metadata)
+                elif config.task == "MMMU":
+                    output["prediction"] = generated
+                    output.update(metadata)
+                else:
+                    raise NotImplementedError("no output processing defined for", config.task)
 
                 if print_output:
                     print(output)
@@ -741,7 +267,6 @@ def get_evaluation_config():
             num_partitions=args.num_partitions,
             partition_id=args.partition_id,
             num_samples_per_partition=args.num_samples_per_partition,
-            prompt_format=args.prompt_format,
         )
 
     # Default output path if not defined...
@@ -753,6 +278,7 @@ def get_evaluation_config():
 
 
 def is_first_rank():
+    """First tensor and pipeline parallel rank."""
     return (
         parallel_state.is_pipeline_first_stage(ignore_virtual=True)
         and parallel_state.get_tensor_model_parallel_rank() == 0
@@ -760,6 +286,7 @@ def is_first_rank():
 
 
 def get_output_path(config, dp_rank):
+    """Generation output path."""
     return (
         f"{config.output_path}-{config.task}-dprank={dp_rank}-partition={config.partition_id}.jsonl"
     )
@@ -792,6 +319,7 @@ class VLMForwardStep(ForwardStep):
         num_img_embeddings_per_tile,
         images,
         num_tiles,
+        decoder_seq_length,
         model,
         max_batch_size,
         max_sequence_length,
@@ -803,6 +331,18 @@ class VLMForwardStep(ForwardStep):
         super().__init__(model, max_batch_size, max_sequence_length + num_img_embeddings)
         self._images = images
         self._num_tiles = num_tiles
+        self._num_img_embeddings = num_img_embeddings
+        self.decoder_seq_length = decoder_seq_length
+
+        self._recv_only_vision_embeds = False
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        # Checks if the previous stage only has a vision encoder, and that the current stage has part of the LM decoder.
+        # In this case, the current stage should only receive vision embeddings.
+        if pp_rank > 0:
+            self._recv_only_vision_embeds = parallel_state.is_inside_encoder(pp_rank - 1) and (not parallel_state.is_inside_decoder(pp_rank - 1)) and parallel_state.is_inside_decoder()
+
+        # Checks if the current stage only has a vision encoder
+        self._encoder_only = parallel_state.is_inside_encoder() and not parallel_state.is_inside_decoder()
 
     def _forward(self, tokens, position_ids, attention_mask):
         return self.model(
@@ -816,62 +356,79 @@ class VLMForwardStep(ForwardStep):
         )
 
     def __call__(self, tokens, position_ids, attention_mask):
-        logits = super().__call__(tokens, position_ids, attention_mask)
+        num_image_tokens = (tokens == self.model.module.image_token_index).sum().item()
+        num_tokens = tokens.size(1)
+        recv_buffer_seq_length = None
+        if num_image_tokens > 0:
+            # When there are image tokens and this stage only receives vision embeddings, adjust the recv buffer seq length to match the image embeddings sequence length.
+            # If there are image tokens and this stage receives full embeddings, make sure we compensate for expansion of image tokens.
+            # Note that this will set a recv_buffer_seq_length for the encoder stage, this length is irrelevant since that recv buffer is never allocated.
+            if self._recv_only_vision_embeds:
+                recv_buffer_seq_length = self._num_img_embeddings
+            else:
+                recv_buffer_seq_length = min(self._num_img_embeddings + num_tokens - num_image_tokens, self.decoder_seq_length)
+        elif self._recv_only_vision_embeds:
+            # If this stage only receives vision embeddings and there are no image tokens we won't run the encoder and therefore shouldn't try to recv.
+            recv_buffer_seq_length = 0
+
+        # If the pipeline stage only has a vision encoder, then it only needs to run when there are image tokens
+        if not (self._encoder_only and num_image_tokens == 0):
+            output = super().__call__(tokens, position_ids, attention_mask, recv_buffer_seq_length=recv_buffer_seq_length)
+        else:
+            output = None
+        if isinstance(output, tuple):
+            logits, _ = output
+        else:
+            logits = output
 
         # On the first inference iteration, we compute image tokens.
-        # Update the sequence length offset by the number of image tokens.
-        num_image_tokens = (tokens == -200).sum().item()
-        num_tokens = tokens.size(1)
+        # On every PP stage(although inference params should only matter for decoder),
+        # update the sequence length offset by the number of image tokens.
         if num_tokens > 1 and num_image_tokens > 0:
-            self.inference_params.sequence_len_offset += (
-                self.inference_params.key_value_memory_dict["image_tokens_count"] - num_image_tokens
-            )
+            if "image_tokens_count" not in self.inference_params.key_value_memory_dict:
+                self.inference_params.key_value_memory_dict["image_tokens_count"] = self._num_img_embeddings
+
+            if self._num_img_embeddings + num_tokens - num_image_tokens > self.decoder_seq_length:
+                self.inference_params.sequence_len_offset += self.decoder_seq_length - num_tokens
+            else:
+                self.inference_params.sequence_len_offset += (
+                    self.inference_params.key_value_memory_dict["image_tokens_count"] - num_image_tokens
+                )
 
         return logits
 
 
-def get_prompt(task, question, prompt_format):
-    """Get a prompt for the evaluation task."""
+def get_conversation(task, question):
+    """Get a conversation for a given task and evaluation question."""
+    conversation = []
+
+    # In all cases, the tokenizer adds possible header tokens for the assistant.
     if task == "captioning":
-        if prompt_format == "llama3":
-            prompt = "<|start_header_id|>system<|end_header_id|>\n\nA chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n<image>\nProvide a one-sentence caption for provided image.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-        elif prompt_format == "mistral":
-            prompt = (
-                "[INST] <image>Give a short and clear explanation of the subsequent image. [/INST]"
-            )
-    elif task == "TextVQA":
-        if prompt_format == "llama3":
-            prompt = "<|start_header_id|>system<|end_header_id|>\n\nAnswer the questions.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n<image>\n{}\nAnswer the question using a single word or phrase.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n".format(
-                question
-            )
-        elif prompt_format == "mistral":
-            prompt = "[INST] <image>\n{}\nAnswer the question using a single word or phrase. [/INST]".format(
-                question
-            )
-    elif task == "VQAv2":
-        if prompt_format == "llama3":
-            prompt = "<|start_header_id|>system<|end_header_id|>\n\nAnswer the questions.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n<image>\n{}\nAnswer the question using a single word or phrase.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n".format(
-                question
-            )
-        elif prompt_format == "mistral":
-            prompt = "[INST] <image>\n{}\nAnswer the question using a single word or phrase. [/INST]".format(
-                question
-            )
-    elif task == "ChartQA":
-        if prompt_format == "llama3":
-            prompt = "<|start_header_id|>system<|end_header_id|>\n\nAnswer the questions.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n<image>\n{}\nAnswer the question using a single word or phrase.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n".format(
-                question
-            )
-        elif prompt_format == "mistral":
-            prompt = "[INST] <image>\n{}\nAnswer the question using a single word or phrase. [/INST]".format(
-                question
-            )
+        conversation = [
+            {"role": "system", "content": "Answer the questions."},
+            {
+                "role": "user",
+                "content": f"{IMAGE_TOKEN}\nProvide a one-sentence caption for provided image.",
+            },
+        ]
+    elif task in ("TextVQA", "VQAv2", "ChartQA"):
+        conversation = [
+            {"role": "system", "content": "Answer the questions."},
+            {
+                "role": "user",
+                "content": f"{IMAGE_TOKEN}\n{question}\nAnswer the question using a single word or phrase.",
+            },
+        ]
+    elif task in ("OCRBench", "MathVista", "AI2D"):
+        conversation = [
+            {"role": "system", "content": "Answer the questions."},
+            {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}"},
+        ]
     elif task == "MMMU":
-        if prompt_format == "llama3":
-            prompt = "<|start_header_id|>system<|end_header_id|>\n\nAnswer the questions.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-            prompt = prompt.format(question)
-        elif prompt_format == "mistral":
-            prompt = "[INST] {} [/INST]".format(question)
+        conversation = [
+            {"role": "system", "content": "Answer the questions."},
+            {"role": "user", "content": question},
+        ]
     elif task == "VideoMME":
         q = (
             "Select the best answer to the following multiple-choice "
@@ -884,76 +441,63 @@ def get_prompt(task, question, prompt_format):
         q += question["questions"][0]["choices"][2] + "\n"
         q += question["questions"][0]["choices"][3] + "\n"
 
-        if prompt_format == "llama3":
-            prompt = "<|start_header_id|>system<|end_header_id|>\n\nAnswer the questions.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n<image>\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-            prompt = prompt.format(q)
-        elif prompt_format == "mistral":
-            prompt = "[INST] <image>\n{} [/INST]".format(q)
+        conversation = [
+            {"role": "system", "content": "Answer the questions."},
+            {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}"},
+        ]
 
-    return prompt
+    return conversation
 
 
-def get_generated(prompt_and_generation, prompt_format):
+def get_prompt_and_generated(prompt_and_generation, prompt_format):
     """Strip prompt and other unnecessary text from generation."""
     if prompt_format == "llama3":
-        generated = prompt_and_generation.split(
-            "<|start_header_id|>assistant<|end_header_id|>\n\n"
-        )[-1]
+        splitted = prompt_and_generation.split("<|start_header_id|>assistant<|end_header_id|>\n\n")
+        prompt = splitted[0]
+        generated = splitted[1]
         generated = generated.split("<|eot_id|>")[0]
     elif prompt_format == "mistral":
-        generated = prompt_and_generation.split("[/INST]")[-1]
+        splitted = prompt_and_generation.split("[/INST]")
+        prompt = splitted[0]
+        generated = splitted[1]
         generated = generated.split("</s>")[0]
+    elif prompt_format == "chatml":
+        splitted = prompt_and_generation.split("<|im_start|> assistant\n")
+        prompt = splitted[0]
+        generated = splitted[1]
+        generated = generated.split("<|im_end|>")[0]
+    elif prompt_format in ("nvlm-yi-34b", "qwen2p0", "qwen2p5"):
+        splitted = prompt_and_generation.split("<|im_start|>assistant\n")
+        prompt = splitted[0]
+        generated = splitted[1]
+        generated = generated.split("<|im_end|>")[0]
+    else:
+        raise ValueError(f"Prompt format {prompt_format} is not supported.")
 
+    # Remove possible garbage.
     generated = generated.strip()
     generated = generated.split("\n\n")[0]
     generated = generated.split("\n")[0]
 
-    return generated
-
-
-def patch_tokenizer(args):
-    """Patch tokenizer with image token support."""
-
-    def _decorate_tokenize(f):
-        # When tokenizing, replace <image> with the image token index (-200)
-        def wrapper(prompt):
-            tokens = tokenizer_image_token(args, prompt, f)
-
-            return tokens
-
-        return wrapper
-
-    def _decorate_detokenize(f):
-        # When detokenizing, skip image token index.
-        def wrapper(tokens):
-            tokens = np.array(tokens)
-            tokens = tokens[tokens != IMAGE_TOKEN_INDEX]
-            tokens = tokens.tolist()
-
-            return f(tokens)
-
-        return wrapper
-
-    tokenizer = get_tokenizer()
-    tokenizer.tokenize = _decorate_tokenize(tokenizer.tokenize)
-    tokenizer.detokenize = _decorate_detokenize(tokenizer.detokenize)
+    return prompt, generated
 
 
 def main():
     """Vision language model text generation."""
-    logging.getLogger(__name__).warning("Models using pipeline parallelism are not supported yet.")
-
     initialize_megatron(extra_args_provider=add_text_generation_args)
+
+    if torch.distributed.get_rank() == 0:
+        logging.getLogger(__name__).warning(
+            "Models using pipeline parallelism are not supported yet."
+        )
 
     args = get_args()
 
-    patch_tokenizer(args)  # Make the tokenizer support image tokens.
-
-    def wrapped_model_provider(pre_process, post_process):
-        return model_provider(pre_process, post_process, parallel_output=False)
+    def wrapped_model_provider(pre_process, post_process, add_encoder, add_decoder):
+        return model_provider(pre_process, post_process, add_encoder, add_decoder, parallel_output=False)
 
     # Set up model and load checkpoint.
-    model = get_model(wrapped_model_provider, wrap_with_ddp=False)
+    model = get_model(wrapped_model_provider, model_type=ModelType.encoder_and_decoder, wrap_with_ddp=False)
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None)

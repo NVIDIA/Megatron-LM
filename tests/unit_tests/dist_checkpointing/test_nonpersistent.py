@@ -29,8 +29,6 @@ class TestNonPersistentSaveAndLoad:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(('tp,pp'), [(2, 4)])
-    @pytest.mark.flaky
-    @pytest.mark.failing_on_rocm
     def test_basic_save_load_scenarios(self, tmp_path_dist_ckpt, tp, pp):
         Utils.initialize_model_parallel(tp, pp)
         num_floating_point_operations_so_far = 0
@@ -119,8 +117,6 @@ class TestNonPersistentSaveAndLoad:
 
 class TestLegacySaveAndLoad:
     @pytest.mark.parametrize(('tp,pp'), [(2, 4)])
-    @pytest.mark.flaky
-    @pytest.mark.failing_on_rocm
     def test_basic_save_load_scenario(self, tmp_path_dist_ckpt, tp, pp):
         Utils.initialize_model_parallel(tp, pp)
         num_floating_point_operations_so_far = 0

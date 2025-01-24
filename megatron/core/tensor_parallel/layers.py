@@ -5,22 +5,23 @@
 
 import os
 import warnings
+from functools import partial
 from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import custom_bwd, custom_fwd
 from torch.nn.parameter import Parameter
 
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
+    get_expert_tensor_parallel_rank,
+    get_expert_tensor_parallel_world_size,
     get_global_memory_buffer,
-    get_tensor_and_expert_parallel_rank,
-    get_tensor_and_expert_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from megatron.core.utils import is_torch_min_version
 
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..transformer.utils import make_sharded_tensors_for_checkpoint
@@ -47,6 +48,22 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     'partition_dim': -1,
     'partition_stride': 1,
 }
+
+
+if is_torch_min_version("2.4.0a0"):
+    custom_fwd = partial(torch.amp.custom_fwd, device_type="cuda")
+    custom_bwd = partial(torch.amp.custom_bwd, device_type="cuda")
+else:
+    custom_fwd = torch.cuda.amp.custom_fwd
+    custom_bwd = torch.cuda.amp.custom_bwd
+
+
+if is_torch_min_version("1.13.0"):
+    dist_all_gather_func = torch.distributed.all_gather_into_tensor
+    dist_reduce_scatter_func = torch.distributed.reduce_scatter_tensor
+else:
+    dist_all_gather_func = torch.distributed._all_gather_base
+    dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
 
 def param_is_not_tensor_parallel_duplicate(param):
@@ -90,16 +107,14 @@ def copy_tensor_model_parallel_attributes(destination_tensor, source_tensor):
         maybe_copy(attribute)
 
 
-def _initialize_affine_weight_gpu(
-    weight, init_method, partition_dim, stride=1, expert_parallel=False
-):
+def _initialize_affine_weight_gpu(weight, init_method, partition_dim, stride=1, is_expert=False):
     """Initialize affine weight for model parallel on GPU."""
 
     set_tensor_model_parallel_attributes(
         tensor=weight, is_parallel=True, dim=partition_dim, stride=stride
     )
 
-    if not expert_parallel:
+    if not is_expert:
         with get_cuda_rng_tracker().fork():
             init_method(weight)
     else:
@@ -315,11 +330,11 @@ def linear_with_frozen_weight(
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
     gradient_accumulation_fusion: bool,
-    async_grad_allreduce: bool,
+    allreduce_dgrad: bool,
     sequence_parallel: bool,
     grad_output_buffer: Optional[List[torch.Tensor]] = None,
     wgrad_deferral_limit: None = None,
-    allreduce_dgrad: bool = None,
+    async_grad_allreduce: Optional[bool] = None,
 ) -> torch.Tensor:
     """Linear layer execution with weight.requires_grad == False.
 
@@ -339,8 +354,9 @@ def linear_with_frozen_weight(
     gradient_accumulation_fusion (bool required): dummy argument, used to
     keep the API unified between all forward implementation functions.
 
-    async_grad_allreduce (bool required): dummy argument, used to
-    keep the API unified between all forward implementation functions.
+    allreduce_dgrad (bool, required): Do the allreduce of input gradients.
+        Here, async and sync allreduce are the same. If sequence_parallel is
+        True, this must be False, as no all reduce is performed.
 
     sequence_parallel (bool required): Indicates that sequence
         parallelism is used and thus in the forward pass the input is
@@ -353,11 +369,17 @@ def linear_with_frozen_weight(
     wgrad_deferral_limit (int optional): dummy argument, used to
     keep the API unified between all forward implementation functions.
 
-    allreduce_dgrad (bool): Do the allreduce of input gradients.
-        Here, async and sync allreduce are the same. If sequence_parallel is
-        True, this must be False, as no all reduce is performed.
+
+    async_grad_allreduce (bool optional): Will be removed with 0.11.0.
+                                          Please use allreduce_dgrad instead.
 
     """
+
+    if async_grad_allreduce is not None:
+        warnings.warn(
+            "async_grad_allreduce is deprecated, not in use anymore and will"
+            " be fully removed with 0.11.0. Please use allreduce_dgrad instead."
+        )
 
     assert grad_output_buffer is None, (
         "grad_output_buffer kwarg is only supported with "
@@ -372,13 +394,6 @@ def linear_with_frozen_weight(
         input = gather_from_sequence_parallel_region(input, tensor_parallel_output_grad=True)
     else:
         input = input
-
-    if allreduce_dgrad is None:
-        warnings.warn(
-            "`async_grad_allreduce` is deprecated and will be removed in a future release. "
-            "Please ue `allreduce_dgrad` instead."
-        )
-        allreduce_dgrad = async_grad_allreduce
 
     args = [input, weight, bias, allreduce_dgrad]
 
@@ -416,9 +431,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             dim_size[0] = dim_size[0] * world_size
 
             all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
-            torch.distributed._all_gather_base(
-                all_gather_buffer, input, group=get_tensor_model_parallel_group()
-            )
+            dist_all_gather_func(all_gather_buffer, input, group=get_tensor_model_parallel_group())
             total_input = all_gather_buffer
         else:
             total_input = input
@@ -452,7 +465,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 all_gather_buffer = get_global_memory_buffer().get_tensor(
                     dim_size, input.dtype, "mpu"
                 )
-                handle = torch.distributed._all_gather_base(
+                handle = dist_all_gather_func(
                     all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
                 )
 
@@ -486,7 +499,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 dim_size, dtype=input.dtype, device=torch.cuda.current_device(), requires_grad=False
             )
             # reduce_scatter
-            handle = torch.distributed._reduce_scatter_base(
+            handle = dist_reduce_scatter_func(
                 sub_grad_input, grad_input, group=get_tensor_model_parallel_group(), async_op=True
             )
             # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
@@ -548,11 +561,11 @@ def linear_with_grad_accumulation_and_async_allreduce(
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
     gradient_accumulation_fusion: bool,
-    sequence_parallel: bool,
     allreduce_dgrad: bool,
-    async_grad_allreduce: Optional[bool] = None,
+    sequence_parallel: bool,
     grad_output_buffer: Optional[List[torch.Tensor]] = None,
     wgrad_deferral_limit: Optional[int] = 0,
+    async_grad_allreduce: Optional[bool] = None,
 ) -> torch.Tensor:
     """Linear layer execution with asynchronous communication and
     gradient accumulation fusion in backprop.
@@ -600,11 +613,6 @@ def linear_with_grad_accumulation_and_async_allreduce(
             gradients. If sequence_parallel is True, this must be
             False, as no all reduce is performed.
 
-        async_grad_allreduce (bool optional): Do the allreduce of input
-            gradients asyncronously with the computation of weight
-            gradients. If sequence_parallel is True, this must be
-            False, as no all reduce is performed. Will be deprecated with 0.10.0
-
         sequence_parallel (bool required): Indicates that sequence
             parallelism is used and thus in the forward pass the input is
             all gathered, and the backward pass the input gradients are
@@ -618,11 +626,14 @@ def linear_with_grad_accumulation_and_async_allreduce(
             micro-batches for which embedding weight gradient GEMM should be
             deferred. Disable by setting this to 0. Defaults to 0.
 
+        async_grad_allreduce (bool optional): Will be removed with 0.11.0.
+                                            Please use allreduce_dgrad instead.
     """
+
     if async_grad_allreduce is not None:
         warnings.warn(
             "async_grad_allreduce is deprecated, not in use anymore and will"
-            " be fully removed with 0.10.0. Please use allreduce_dgrad instead."
+            " be fully removed with 0.11.0. Please use allreduce_dgrad instead."
         )
 
     args = [
@@ -743,15 +754,13 @@ class ColumnParallelLinear(torch.nn.Module):
         self.config = config
         self.disable_grad_reduce = disable_grad_reduce
 
-        self.explicit_expert_comm = self.is_expert and (
-            config.tensor_model_parallel_size > 1 or self.expert_parallel
-        )
-        if self.explicit_expert_comm and config.moe_extended_tp:
-            world_size = get_tensor_and_expert_parallel_world_size()
-            rank = get_tensor_and_expert_parallel_rank()
+        if is_expert:
+            world_size = get_expert_tensor_parallel_world_size()
+            rank = get_expert_tensor_parallel_rank()
         else:
             world_size = get_tensor_model_parallel_world_size()
             rank = get_tensor_model_parallel_rank()
+        self.explicit_expert_comm = self.is_expert and (world_size > 1 or self.expert_parallel)
 
         self.output_size_per_partition = divide(output_size, world_size)
 
@@ -794,7 +803,7 @@ class ColumnParallelLinear(torch.nn.Module):
                         init_method,
                         partition_dim=0,
                         stride=stride,
-                        expert_parallel=(self.is_expert and self.expert_parallel),
+                        is_expert=self.is_expert,
                     )
 
             setattr(self.weight, 'allreduce', not (self.is_expert and self.expert_parallel))
@@ -936,7 +945,7 @@ class ColumnParallelLinear(torch.nn.Module):
             weight=weight,
             bias=bias,
             gradient_accumulation_fusion=self.gradient_accumulation_fusion,
-            async_grad_allreduce=allreduce_dgrad,
+            allreduce_dgrad=allreduce_dgrad,
             sequence_parallel=False if self.explicit_expert_comm else self.sequence_parallel,
             grad_output_buffer=(
                 self.grad_output_buffer if self.config.defer_embedding_wgrad_compute else None
@@ -946,7 +955,6 @@ class ColumnParallelLinear(torch.nn.Module):
                 if self.config.defer_embedding_wgrad_compute
                 else None
             ),
-            allreduce_dgrad=allreduce_dgrad,
         )
 
         gather_output = self.gather_output
@@ -1044,17 +1052,14 @@ class RowParallelLinear(torch.nn.Module):
         if self.sequence_parallel and not self.input_is_parallel:
             raise RuntimeError("To enable `sequence_parallel`, `input_is_parallel` must be `True`")
 
-        self.explicit_expert_comm = self.is_expert and (
-            config.tensor_model_parallel_size > 1 or self.expert_parallel
-        )
-
         # Divide the weight matrix along the last dimension.
-        if self.explicit_expert_comm and config.moe_extended_tp:
-            world_size = get_tensor_and_expert_parallel_world_size()
-            rank = get_tensor_and_expert_parallel_rank()
+        if self.is_expert:
+            world_size = get_expert_tensor_parallel_world_size()
+            rank = get_expert_tensor_parallel_rank()
         else:
             world_size = get_tensor_model_parallel_world_size()
             rank = get_tensor_model_parallel_rank()
+        self.explicit_expert_comm = self.is_expert and (world_size > 1 or self.expert_parallel)
 
         self.input_size_per_partition = divide(input_size, world_size)
 
@@ -1097,7 +1102,7 @@ class RowParallelLinear(torch.nn.Module):
                     init_method,
                     partition_dim=1,
                     stride=stride,
-                    expert_parallel=(self.is_expert and self.expert_parallel),
+                    is_expert=self.is_expert,
                 )
         setattr(self.weight, 'allreduce', not (self.is_expert and self.expert_parallel))
 
@@ -1167,10 +1172,9 @@ class RowParallelLinear(torch.nn.Module):
             weight=self.weight,
             bias=None,
             gradient_accumulation_fusion=self.gradient_accumulation_fusion,
-            async_grad_allreduce=allreduce_dgrad,
+            allreduce_dgrad=allreduce_dgrad,
             sequence_parallel=False,
             grad_output_buffer=None,
-            allreduce_dgrad=allreduce_dgrad,
         )
 
         # All-reduce across all the partitions.

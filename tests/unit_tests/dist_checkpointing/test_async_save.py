@@ -71,6 +71,7 @@ class TestAsyncSave:
 
     @pytest.mark.parametrize('async_save', [False, True])
     @pytest.mark.parametrize('worker_fn', [write_data_os_err_mock_fn])
+    @pytest.mark.failing_on_rocm
     def test_errors_are_reported(self, tmp_path_dist_ckpt, async_save, worker_fn):
         Utils.initialize_model_parallel(2, 4)
         sharded_state_dict = {

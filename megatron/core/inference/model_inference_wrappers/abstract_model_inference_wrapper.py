@@ -1,13 +1,11 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import abc
 import math
-from argparse import Namespace
 from typing import Iterable, List, Union
 
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.communication_utils import (
     recv_from_prev_pipeline_rank_,
     send_to_next_pipeline_rank,
@@ -19,7 +17,13 @@ from megatron.core.inference_params import InferenceParams
 from megatron.core.models.gpt.gpt_model import GPTModel
 
 
+# pylint: disable=line-too-long
 class AbstractModelInferenceWrapper(abc.ABC):
+    """Abstract inference wrapper
+
+    Extend this to create a version for your model.
+    """
+
     def __init__(
         self,
         model: Union['LegacyGPTModel', GPTModel],
@@ -31,7 +35,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
         Args:
             model (Union[GPTModel, LegacyGPTModel]): The actual GPT model (MCore or MLM)
-            args (Namespace): The commadline arguments that were passed
+            inference_wrapper_config (InferenceWrapperConfig): Has info like hidden size, vocab size etc.
         """
         assert not isinstance(
             model, Iterable
