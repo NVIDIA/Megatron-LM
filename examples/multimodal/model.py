@@ -152,6 +152,7 @@ def model_provider(
 
     tokenizer = get_tokenizer()
     image_token_index = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
+    assert image_token_index is not None, f"IMAGE_TOKEN={IMAGE_TOKEN} needs to be added using the --special-tokens arg."
 
     tile_tags = _get_tile_tags(args, tokenizer)
 

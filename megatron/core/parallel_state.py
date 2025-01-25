@@ -1713,7 +1713,10 @@ def get_pipeline_model_parallel_last_rank() -> int:
     """Return the global rank of the last stage in the current rank's pipeline."""
     assert _PIPELINE_GLOBAL_RANKS is not None, "Pipeline parallel group is not initialized"
     last_rank_local = get_pipeline_model_parallel_world_size() - 1
-    return _PIPELINE_GLOBAL_RANKS[last_rank_local]
+    if isinstance(_PIPELINE_GLOBAL_RANKS[0], list):
+        return [group[last_rank_local] for group in _PIPELINE_GLOBAL_RANKS]
+    else:
+        return _PIPELINE_GLOBAL_RANKS[last_rank_local]
 
 
 def get_pipeline_model_parallel_next_rank() -> int:

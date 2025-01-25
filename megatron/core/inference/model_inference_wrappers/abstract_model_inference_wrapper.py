@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import abc
 import math
-from typing import Iterable, List, Union
+from typing import Any, Dict, Iterable, Union
 
 from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
@@ -53,7 +53,8 @@ class AbstractModelInferenceWrapper(abc.ABC):
     def prep_model_for_inference(self, prompts_tokens: torch.Tensor):
         """A utility function for preparing model for inference
 
-        The function gets called once before the auto regressive inference loop. It puts the model in eval mode , and gets some model and inference data parameters. Extend this to build position ids ,attention mask etc, so that required slices can be extracted during the forward pass.
+        The function gets called once before the auto regressive inference loop.
+        It puts the model in eval mode and initializes the inference_params.
 
         Args:
             prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_seq_len]
@@ -65,31 +66,46 @@ class AbstractModelInferenceWrapper(abc.ABC):
         self.model_is_pipeline_parallel = not (
             parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
         )
-        self.prompts_tokens = prompts_tokens
-        batch_size, max_sequence_length = self.prompts_tokens.shape
+        batch_size, max_sequence_length = prompts_tokens.shape
         self.inference_params = InferenceParams(batch_size, max_sequence_length)
 
     @abc.abstractmethod
-    def get_batch_for_context_window(self) -> List:
+    def prep_inference_input(self, prompt_tokens) -> Dict[str, Any]:
+        """Prepares the inference input data.
+
+        Args:
+            prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_seq_len]
+
+        Returns:
+            A dict with all the inference input needed for the batch.
+        """
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def get_batch_for_context_window(self, *args, **kwargs) -> Dict[str, Any]:
         """Returns the input data for inference
 
         This function gets called iteratively in the inference loop . It can be used to extract relevant input from the prompt tokens, attention mask etc. required for each step in inference.
 
         """
-        pass
+        raise NotImplementedError()
 
-    def forward_pass_without_pipeline_parallel(self, inference_input: List) -> torch.Tensor:
+    def forward_pass_without_pipeline_parallel(
+        self, inference_input: Dict[str, Any]
+    ) -> torch.Tensor:
         """Utility to carry out simple forward pass for TP or no model parallel models
 
         Runs a very simple forward pass for model. Used  in the case of models without any parallelism or only tensor parallelism.
 
         Args:
-            inference_input (List): A list containg the inputs for the gpt model [tokens, position ids, attention mask]
+            inference_input (Dict[str, Any]): A dict containg the inputs for the gpt model [tokens, position ids, attention mask]
 
         Returns:
             torch.Tensor: The output logits of shape [batch_size, seq_len, padded_vocab_size]
         """
-        tokens, position_ids, attention_mask = inference_input
+        tokens = inference_input["tokens"]
+        position_ids = inference_input["position_ids"]
+        attention_mask = inference_input["attention_mask"]
         logits = self.model(
             tokens, position_ids, attention_mask, inference_params=self.inference_params
         )
@@ -106,19 +122,21 @@ class AbstractModelInferenceWrapper(abc.ABC):
         )
 
     def forward_pass_with_pipeline_parallel_small_input_batch(
-        self, inference_input: List
+        self, inference_input: Dict[str, Any]
     ) -> torch.Tensor:
         """Utility to carry out forward pass for PP models with very small inputs
 
         If a model is pipeline parallel, yet, the input global batch is very small, we compute a foward pass on the entire global batch, rather than splitting it up into micro batches and doing something more complex as in the forward_pass_with_pipeline_parallel_large_input_batch method
 
         Args:
-            inference_input (List): A list containg the inputs for the gpt model [tokens, position ids, attention mask]
+            inference_input (Dict[str, Any]): A dict containing the inputs for the gpt model [tokens, position ids, attention mask]
 
         Returns:
             torch.Tensor: The output logits of shape [batch_size, seq_len, padded_vocab_size]
         """
-        tokens, position_ids, attention_mask = inference_input
+        tokens = inference_input["tokens"]
+        position_ids = inference_input["position_ids"]
+        attention_mask = inference_input["attention_mask"]
         batch_size, seq_len = tokens.shape
         recv_buffer = None
         if not parallel_state.is_pipeline_first_stage():
@@ -143,19 +161,21 @@ class AbstractModelInferenceWrapper(abc.ABC):
         return logits
 
     def forward_pass_with_pipeline_parallel_large_input_batch(
-        self, inference_input: List
+        self, inference_input: Dict[str, Any]
     ) -> torch.Tensor:
         """Utility to carry out forward pass PP models.
 
         Runs the forward pass for models which are pipeline parallel. This is more complex than forward_pass_with_pipeline_parallel_small_input_batch coz this splits the global batch into small micro batches and runs them through the model.
 
         Args:
-            inference_input (List): A list containg the inputs for the gpt model [tokens, position ids, attention mask]
+            inference_input (Dict[str, Any]): A dict containg the inputs for the gpt model [tokens, position ids, attention mask]
 
         Returns:
             torch.Tensor: The output logits of shape [batch_size, seq_len, padded_vocab_size]
         """
-        tokens, position_ids, attention_mask = inference_input
+        tokens = inference_input["tokens"]
+        position_ids = inference_input["position_ids"]
+        attention_mask = inference_input["attention_mask"]
         micro_batch_size = max(
             1,
             self.inference_wrapper_config.inference_batch_times_seqlen_threshold // tokens.size(1),
@@ -213,7 +233,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         # NOTE: Only returns the logits on the last pipeline stage
         return logits
 
-    def run_one_forward_step(self, inference_input: List) -> torch.Tensor:
+    def run_one_forward_step(self, inference_input: Dict[str, Any]) -> torch.Tensor:
         """The forward pass of the model for inference
 
         Appropriate utility is called for the forward pass depending on the type of model parallelism used
@@ -228,7 +248,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             xm.mark_step()
 
         if self.model_is_pipeline_parallel:
-            tokens = inference_input[0]
+            tokens = inference_input["tokens"]
             current_batch_size, seq_len = tokens.shape
             # If input batch is large, we need to split into micro batches and run the forward pass
             if (
