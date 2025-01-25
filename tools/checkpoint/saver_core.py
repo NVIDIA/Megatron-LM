@@ -1,12 +1,12 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from importlib.metadata import version
+
 import os
-from packaging.version import Version as PkgVersion
 import sys
-
 import torch
+from importlib.metadata import version
+from packaging.version import Version as PkgVersion
 
-from schema_mcore import get_model_schema
+from schema_core import get_model_schema
 
 
 def add_arguments(parser):

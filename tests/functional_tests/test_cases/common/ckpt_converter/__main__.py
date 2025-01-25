@@ -67,7 +67,7 @@ class ModelMeta:
     """Basic information about a model.
 
     Args:
-        format (str): 'mcore', 'megatron', 'meta', or 'hf'.
+        format (str): 'core', 'legacy', 'meta', or 'hf'.
         mp (ModelParallelState): Defines TP, PP, EP.
         transformer_impl (str): 'transformer_engine' or 'local'.
     """
@@ -77,9 +77,9 @@ class ModelMeta:
         if isinstance(mp, tuple):
             mp = ModelParallelState(*mp)
         if transformer_impl is None:
-            transformer_impl = "transformer_engine" if format == "mcore" else "local"
+            transformer_impl = "transformer_engine" if format == "core" else "local"
 
-        assert format in ("mcore", "megatron", "meta", "hf")
+        assert format in ("core", "legacy", "meta", "hf")
         assert isinstance(mp, ModelParallelState)
         assert transformer_impl in ("transformer_engine", "local")
 
@@ -176,7 +176,7 @@ class Pipeline:
             sys.argv.append("--exit-on-missing-checkpoint")
 
         # Use legacy.
-        if meta.format == "megatron":
+        if meta.format == "legacy":
             sys.argv.append("--use-legacy-models")
 
         # Parse args.
@@ -576,26 +576,26 @@ class GPTPipeline(Pipeline):
 def get_gpt_pipelines():
     """Get GPT (non-MoE) pipelines."""
     return [
-        GPTPipeline(("mcore", (8, 1)), ("mcore", (1, 8))),
-        GPTPipeline(("mcore", (4, 2)), ("mcore", (2, 4))),
-        GPTPipeline(("mcore", (2, 4)), ("mcore", (4, 2))),
-        GPTPipeline(("mcore", (1, 8)), ("mcore", (8, 1))),
-        GPTPipeline(("mcore", (4, 2)), ("mcore", (2, 4), "local")),
-        GPTPipeline(("megatron", (4, 2)), ("mcore", (2, 4))),
-        GPTPipeline(("mcore", (4, 2), "local"), ("mcore", (2, 4), "local")),
-        GPTPipeline(("mcore", (4, 2), "local"), ("mcore", (2, 4))),
-        # [todo] GPTPipeline(("megatron", (4, 2)), ("megatron", (2, 4))),
-        # [todo] GPTPipeline(("megatron", (4, 2), "te"), ("megatron", (2, 4), "te")),
-        # [todo] GPTPipeline("meta", "mcore", None, (8, 1)),
-        # [todo] GPTPipeline("hf", "mcore", None, (8, 1)),
+        GPTPipeline(("core", (8, 1)), ("core", (1, 8))),
+        GPTPipeline(("core", (4, 2)), ("core", (2, 4))),
+        GPTPipeline(("core", (2, 4)), ("core", (4, 2))),
+        GPTPipeline(("core", (1, 8)), ("core", (8, 1))),
+        GPTPipeline(("core", (4, 2)), ("core", (2, 4), "local")),
+        GPTPipeline(("legacy", (4, 2)), ("core", (2, 4))),
+        GPTPipeline(("core", (4, 2), "local"), ("core", (2, 4), "local")),
+        GPTPipeline(("core", (4, 2), "local"), ("core", (2, 4))),
+        # [todo] GPTPipeline(("legacy", (4, 2)), ("legacy", (2, 4))),
+        # [todo] GPTPipeline(("legacy", (4, 2), "te"), ("legacy", (2, 4), "te")),
+        # [todo] GPTPipeline("meta", "core", None, (8, 1)),
+        # [todo] GPTPipeline("hf", "core", None, (8, 1)),
     ]
 
 
 def get_moe_pipelines():
     """Get MoE pipelines."""
     return [
-        GPTPipeline(("mcore", (2, 1, 2)), ("mcore", (1, 4, 1)), num_moe_experts=8),
-        GPTPipeline(("mcore", (1, 4, 1)), ("mcore", (2, 1, 2)), num_moe_experts=4),
+        GPTPipeline(("core", (2, 1, 2)), ("core", (1, 4, 1)), num_moe_experts=8),
+        GPTPipeline(("core", (1, 4, 1)), ("core", (2, 1, 2)), num_moe_experts=4),
     ]
 
 
@@ -605,7 +605,7 @@ def test_all_pipelines():
     # Collect pipelines.
     pipelines = [
         *get_gpt_pipelines(),
-        # [todo] *get_moe_pipelines(), # todo: MoE support in loader_mcore.py.
+        # [todo] *get_moe_pipelines(), # todo: MoE support in loader_core.py.
         # [todo] *get_bert_pipelines(),
         # [todo] *get_t5_pipelines(),
     ]
