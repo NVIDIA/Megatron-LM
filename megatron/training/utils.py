@@ -248,7 +248,7 @@ def logical_and_across_model_parallel_group(input: bool) -> bool:
 def report_memory(name):
     """Simple GPU memory report."""
 
-    if not torch.cuda.is_avalable():
+    if not torch.cuda.is_available():
         return
     
     mega_bytes = 1024.0 * 1024.0
