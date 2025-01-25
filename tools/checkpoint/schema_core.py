@@ -1,23 +1,23 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-"""Mcore model schemas."""
+"""Core model schemas."""
 
 import typing as T
 
 from schema_base import ModelSchema
 
 
-def get_mcore_transformer_block_key(model_key):
+def get_core_transformer_block_key(model_key):
     return {
         "GPT" : "decoder",
         "BERT" : "encoder",
     }[model_key]
 
 
-class MCoreSchema(ModelSchema):
+class CoreSchema(ModelSchema):
 
     def __init__(self, model_type, layer_schema):
-        block_key = get_mcore_transformer_block_key(model_type)
+        block_key = get_core_transformer_block_key(model_type)
         super().__init__({
             "embeddings" : {
                 "pos" : "embedding.position_embeddings.weight",
@@ -49,7 +49,7 @@ class MCoreSchema(ModelSchema):
         })
 
 
-class MCoreLocalSchema(MCoreSchema):
+class CoreLocalSchema(CoreSchema):
 
     def __init__(self, model_type):
         super().__init__(model_type, layer_schema={
@@ -73,7 +73,7 @@ class MCoreLocalSchema(MCoreSchema):
         })
 
 
-class MCoreTESchema(MCoreSchema):
+class CoreTESchema(CoreSchema):
 
     def __init__(self, model_type):
         super().__init__(model_type, layer_schema={
@@ -98,7 +98,7 @@ class MCoreTESchema(MCoreSchema):
         })
 
 
-class MCoreMoETESchema(MCoreSchema):
+class CoreMoETESchema(CoreSchema):
 
     def __init__(self, model_type, num_experts, expert_model_parallel_size):
         num_local_experts = num_experts // expert_model_parallel_size
@@ -131,13 +131,13 @@ def get_model_schema(
     transformer_impl: T.Literal["transformer_engine", "local"],
     num_experts: T.Optional[int] = None,
     expert_model_parallel_size: T.Optional[int] = None,
-) -> MCoreSchema:
+) -> CoreSchema:
     if num_experts is not None and num_experts > 0:
         # Only support TE setter for MOE
         assert transformer_impl == "transformer_engine"
         assert isinstance(expert_model_parallel_size, int)
-        return MCoreMoETESchema(model_type, num_experts, expert_model_parallel_size)
+        return CoreMoETESchema(model_type, num_experts, expert_model_parallel_size)
     return {
-        "local" : MCoreLocalSchema,
-        "transformer_engine" : MCoreTESchema,
+        "local" : CoreLocalSchema,
+        "transformer_engine" : CoreTESchema,
     }[transformer_impl](model_type)

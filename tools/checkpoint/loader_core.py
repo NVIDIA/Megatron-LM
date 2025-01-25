@@ -6,7 +6,7 @@ import sys
 import torch
 import types
 
-from schema_mcore import get_model_schema
+from schema_core import get_model_schema
 from utils import print_memory_usage
 
 

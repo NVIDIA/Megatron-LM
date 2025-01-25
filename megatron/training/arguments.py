@@ -194,6 +194,9 @@ def validate_args(args, defaults={}):
     load_retro_args(args)
 
     # Set args.use_dist_ckpt from args.ckpt_format.
+    if args.use_legacy_models:
+        assert args.ckpt_format == "torch", \
+            "legacy model format only supports the 'torch' checkpoint format."
     update_use_dist_ckpt(args)
 
 
@@ -525,7 +528,9 @@ def validate_args(args, defaults={}):
         args.seq_length = args.encoder_seq_length
 
     if args.seq_length is not None:
-        assert args.max_position_embeddings >= args.seq_length
+        assert args.max_position_embeddings >= args.seq_length, \
+            f"max_position_embeddings ({args.max_position_embeddings}) must be greater than " \
+            f"or equal to seq_length ({args.seq_length})."
     if args.decoder_seq_length is not None:
         assert args.max_position_embeddings >= args.decoder_seq_length
     if args.lr is not None:

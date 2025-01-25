@@ -16,9 +16,8 @@ Megatron-LM & Megatron-Core
 - **[2024/6]** Megatron-Core added supports for Mamba-based models. Check out our paper [An Empirical Study of Mamba-based Language Models](https://arxiv.org/pdf/2406.07887) and [code example](https://github.com/NVIDIA/Megatron-LM/tree/ssm/examples/mamba).
 - **[2024/1 Announcement]** NVIDIA has released the core capabilities in **Megatron-LM** into [**Megatron-Core**](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core) in this repository. Megatron-Core expands upon Megatron-LM's GPU-optimized techniques with more cutting-edge innovations on system-level optimizations, featuring composable and modular APIs. Explore the [Megatron-Core intro](#megatron-core) for more details.
 
-
-
 # Table of Contents
+
 - [Megatron-LM \& Megatron-Core](#megatron-lm--megatron-core)
 - [Latest News](#latest-news)
 - [Table of Contents](#table-of-contents)
@@ -42,7 +41,6 @@ Megatron-LM & Megatron-Core
   - [Retro and InstructRetro](#retro-and-instructretro)
   - [Mamba-based Language Models](#mamba-based-language-models)
   - [Mixture of Experts](#mixture-of-experts)
-    - [Key Features of MoE](#key-features-of-moe)
 - [Evaluation and Tasks](#evaluation-and-tasks)
   - [GPT Text Generation](#gpt-text-generation)
     - [Detoxify GPT via Self-generation](#detoxify-gpt-via-self-generation)
@@ -59,7 +57,10 @@ Megatron-LM & Megatron-Core
   - [Collecting Wikipedia Training Data](#collecting-wikipedia-training-data)
   - [Collecting GPT Webtext Data](#collecting-gpt-webtext-data)
 - [Reproducibility](#reproducibility)
-  - [Projects Using Megatron](#projects-using-megatron)
+- [Checkpoint conversion](#checkpoint-conversion)
+  - [Model class conversion](#model-class-conversion)
+  - [Checkpoint format conversion](#checkpoint-format-conversion)
+- [Projects Using Megatron](#projects-using-megatron)
 
 # Megatron Overview
 This repository comprises two essential components: **Megatron-LM** and **Megatron-Core**. Megatron-LM serves as a research-oriented framework leveraging Megatron-Core for large language model (LLM) training. Megatron-Core, on the other hand, is a library of GPU optimized training techniques that comes with formal product support including versioned APIs and regular releases. You can use Megatron-Core alongside Megatron-LM or [Nvidia NeMo Framework](https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/main/nlp/nemo_megatron/mcore_customization.html) for an end-to-end and cloud-native solution. Alternatively, you can integrate Megatron-Core's building blocks into your preferred training framework.
@@ -589,7 +590,63 @@ There are currently three known Megatron optimizations that break reproducibilit
 
 In addition, determinisim has only been verified in NGC PyTorch containers up to and newer than 23.12. If you observe nondeterminism in Megatron training under other circumstances please open an issue.
 
-## Projects Using Megatron
+# Checkpoint conversion
+
+We support two forms of model conversion:
+
+1. Model class conversion (i.e., the `GPTModel` in `model.legacy` vs. `model.core`)
+2. Checkpoint format conversion (i.e., distributed vs. non-distributed checkpoint)
+
+## Model class conversion
+
+Megatron supports converting between different model classes, including internal model classes (we currently have the older `legacy` models, and the newer `core` models) and external model classes (such as Meta, Huggingface, Mistral, and Mixtral models). Additionally, during this conversion, one can update the parallel state of the model (i.e., changing tensor and pipeline model parallelism).
+
+ We provide the tool `tools/checkpoint/convert.py` to convert between model classes. Some important arguments include:
+
+- `--model-type`: `GPT` or `BERT`
+- `--loader`: format of the existing checkpoint. Supported formats include:
+  - `legacy`: our older model classes (under `megatron.legacy.model`)
+  - `core`: our newer model classes (under `megatron.core.models`)
+  - `llama_mistral`: for loading Llama and Mistral models (supports Meta and Huggingface formats)
+  - `mixtral_hf`: for loading Mixtral models (Huggingface only)
+- `--load-dir`: directory for loading the existing checkpoint
+- `--saver`: `legacy` or `core` (see descriptions under `--loader`)
+- `--save-dir`: directory for saving the new checkpoint
+- `--target-tensor-parallel-size`: new tensor model parallel size
+- `--target-pipeline-parallel-size`: new pipeline model parallel size
+
+For more argument details, please see the main script (`convert.py`), loader scripts (`loader_core.py`, `loader_legacy.py`, `loader_llama_mistral.py`, `loader_mixtral_hf.py`), or saver scripts (`saver_core.py`, `saver_legacy.py`).
+
+An example command for converting a GPT model from the old format (`legacy`) to the new format (`core`) would look as follows:
+
+```
+python tools/checkpoint/convert.py \
+>   --model-type GPT \
+>   --loader legacy \
+>   --load-dir ${LEGACY_FORMAT_DIR} \
+>   --saver core \
+>   --save-dir ${CORE_FORMAT_DIR} \
+>   --target-tensor-parallel-size ${TP} \
+>   --target-pipeline-parallel-size ${PP} \
+```
+
+For examples of converting Llama/Mistral models into Megatron, please see [here](docs/llama_mistral.md).
+
+## Checkpoint format conversion
+
+Megatron offers multiple checkpoint formats, including:
+
+- `torch`: Basic checkpoint format with sequential read & writes, and is tied to a specific tensor/pipeline model parallel state (TP/PP states, respectively). (While a specific checkpoint is tied to a specific TP/PP state, a checkpoint can still be manually converted via the model class converter described above).
+- `torch_dist`: Distributed checkpoint format, for fast parallel reads & writes, and also is parallel state agnostic (i.e., one can load the same checkpoint to different TP/PP setups).
+
+Generally speaking, `torch_dist` is the more modern and recommended checkpoint format due to its speed. However, depending on the use case, it may be desirable to convert between these two formats. To do so, launch your *training* script (e.g., via `pretrain_gpt.py`) as you normally would, but with two additional arguments:
+
+- `--ckpt-convert-format ${FORMAT}`: `${FORMAT}` can be one of `torch` or `torch_dist`, as described above.
+- `--ckpt-convert-save ${PATH_TO_SAVE_NEW_FORMAT}`: this path should be different than your existing `--load`/`--save` paths, to avoid overwriting the existing checkpoint. After converting, use this new path for your `--load`/`--save` paths.
+
+The general idea of this checkpoint format converter is that it launches the model just as one normally would for training, but before running any training iterations, it saves to the new checkpoint format, and then exits. It is important to note that all other launch args should remain the same, in order for the system to understand the previous checkpoint format.
+
+# Projects Using Megatron
 Below are some of the projects where we have directly used Megatron:
 * [BERT and GPT Studies Using Megatron](https://arxiv.org/pdf/1909.08053.pdf)
 * [BioMegatron: Larger Biomedical Domain Language Model](https://www.aclweb.org/anthology/2020.emnlp-main.379.pdf)
