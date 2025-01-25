@@ -9,7 +9,10 @@ from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTenso
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import (
+    TransformerLayer,
+    get_transformer_layer_offset,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -55,6 +58,10 @@ class TestParallelTransformerLayer:
         assert hidden_states.shape[0] == sequence_length
         assert hidden_states.shape[1] == micro_batch_size
         assert hidden_states.shape[2] == config.hidden_size
+
+    def test_get_layer_offset(self):
+        config = self.parallel_transformer_layer.config
+        assert get_transformer_layer_offset(config) == 0
 
     @pytest.mark.parametrize('order', ['tp-pp-dp', 'tp-dp-pp'])
     @pytest.mark.parametrize('tp_pp', [(4, 2), (1, 1), (8, 1), (2, 2)])
