@@ -37,10 +37,10 @@ except ImportError:
 try:
     import apex  # pylint: disable=unused-import
 
-    from megatron.core.fusions.fused_layer_norm import WrappedTorchNorm
+    from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 
     HAVE_APEX = True
-    LNImpl = WrappedTorchNorm
+    LNImpl = FusedLayerNorm
 except ImportError:
     import warnings
 

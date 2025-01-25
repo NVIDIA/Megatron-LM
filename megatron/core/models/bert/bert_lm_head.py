@@ -1,19 +1,26 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+import warnings
 import torch
 from torch import Tensor
 
-from megatron.core.fusions.fused_layer_norm import HAVE_FUSED_LAYER_NORM, FusedLayerNorm
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import get_linear_layer
 
-if HAVE_FUSED_LAYER_NORM:
-    LNImpl = FusedLayerNorm
-else:
-    import warnings
+try:
+    import apex  # pylint: disable=unused-import
 
-    warnings.warn(f'Apex is not installed. Falling back to Torch Norm')
-    from megatron.core.transformer.torch_norm import WrappedTorchNorm as LNImpl
+    from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+
+    HAVE_APEX = True
+    LNImpl = FusedLayerNorm
+except ImportError:
+
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
+
+    warnings.warn('Apex is not installed. Falling back to Torch Norm')
+    LNImpl = WrappedTorchNorm
+
 
 class BertLMHead(MegatronModule):
     """Masked LM head for Bert.
