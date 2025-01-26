@@ -989,6 +989,14 @@ class ColumnParallelLinear(torch.nn.Module):
         """Keep compatibility with TE state dict."""
         return None
 
+    def __repr__(self):
+        tp = self.output_size // self.output_size_per_partition
+        use_bias = self.bias is not None and self.bias is True
+        return (
+            f"{type(self).__name__}(in_features={self.input_size}, "
+            f"out_features={self.output_size}, bias={use_bias}, TP={tp})"
+        )
+
 
 class RowParallelLinear(torch.nn.Module):
     """Linear layer with row parallelism.
@@ -1213,3 +1221,11 @@ class RowParallelLinear(torch.nn.Module):
     def get_extra_state(self) -> None:
         """Keep compatibility with TE state dict."""
         return None
+
+    def __repr__(self):
+        tp = self.input_size // self.input_size_per_partition
+        use_bias = self.bias is not None and self.bias is True
+        return (
+            f"{type(self).__name__}(in_features={self.input_size}, "
+            f"out_features={self.output_size}, bias={use_bias}, TP={tp})"
+        )
