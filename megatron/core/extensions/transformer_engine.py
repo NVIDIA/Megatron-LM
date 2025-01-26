@@ -386,6 +386,12 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             state_dict, prefix, {'weight': 0, 'bias': 0}, sharded_offsets
         )
 
+    def __repr__(self):
+        return (
+            f"{type(self).__name__}(in_features={self.in_features}, "
+            f"out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})"
+        )
+
 
 class TEColumnParallelLinear(TELinear):
     """
@@ -464,6 +470,12 @@ class TEColumnParallelLinear(TELinear):
             state_dict, prefix, {'weight': 0, 'bias': 0}, sharded_offsets
         )
 
+    def __repr__(self):
+        return (
+            f"{type(self).__name__}(in_features={self.in_features}, "
+            f"out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})"
+        )
+
 
 class TERowParallelLinear(TELinear):
     """
@@ -540,6 +552,12 @@ class TERowParallelLinear(TELinear):
         state_dict = self.state_dict(prefix='', keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
             state_dict, prefix, {'weight': 1}, sharded_offsets
+        )
+
+    def __repr__(self):
+        return (
+            f"{type(self).__name__}(in_features={self.in_features}, "
+            f"out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})"
         )
 
 
