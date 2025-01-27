@@ -194,7 +194,6 @@ class TopKRouter(Router):
                 sequence_load_balancing_loss_func,
                 probs=scores,
                 routing_map=routing_map,
-                tokens_per_expert=tokens_per_expert,
                 batch_size=bsz,
                 seq_length=seq_length,
                 topk=self.topk,
@@ -214,7 +213,7 @@ class TopKRouter(Router):
         if self.config.moe_token_dispatcher_type == "alltoall_seq":
             sequence_partition_group = parallel_state.get_context_parallel_group()
             moe_aux_loss_coeff /= parallel_state.get_tensor_model_parallel_world_size()
-        else:
+        elif parallel_state.get_tensor_and_context_parallel_world_size() > 1:
             sequence_partition_group = parallel_state.get_tensor_and_context_parallel_group()
 
         aux_loss = load_balancing_loss_func(
