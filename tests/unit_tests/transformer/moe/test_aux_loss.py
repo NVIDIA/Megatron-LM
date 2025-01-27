@@ -12,7 +12,7 @@ from tests.unit_tests.transformer.moe.test_token_dispatcher import MoEModelTestC
 class AuxlossTestContainer(MoEModelTestContainer):
     def partition_input(self, input):
         partitioned_input = input.chunk(
-            parallel_state.get_tensor_and_context_parallel_world_size(), dim=1
+            parallel_state.get_tensor_and_context_parallel_world_size(), dim=0
         )[parallel_state.get_tensor_and_context_parallel_rank()]
         output = partitioned_input.clone().detach()
         output.requires_grad = True
@@ -126,7 +126,9 @@ class TestSeqAuxLoss:
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
-    @pytest.mark.parametrize("tp_size,ep_size,cp_size", [(1, 8, 1)])
+    @pytest.mark.parametrize(
+        "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
+    )
     def test_a2a_dispatcher(self, tp_size, ep_size, cp_size):
         container = AuxlossTestContainer(
             tp_size=tp_size,

@@ -6,6 +6,7 @@ from typing import Optional
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 
 
 def switch_load_balancing_loss_func(
@@ -59,7 +60,6 @@ def switch_load_balancing_loss_func(
 def sequence_load_balancing_loss_func(
     probs: torch.Tensor,
     routing_map: torch.Tensor,
-    tokens_per_expert: torch.Tensor,
     batch_size: int,
     seq_length: int,
     topk: int,
@@ -70,25 +70,40 @@ def sequence_load_balancing_loss_func(
     Calculate the auxiliary loss in sequence-level by computing the loss for each individual sample.
     Refer to the DeepSeek-V2 huggingface repo
     (https://huggingface.co/deepseek-ai/DeepSeek-V2) for details.
+
+    Args:
+        probs (torch.Tensor): Softmax probabilities output by the router for each token.
+                              Shape in [num_tokens, num_experts].
+        routing_map (torch.Tensor): Mapping of tokens to experts assignment.
+                                    Shape in [num_tokens, num_experts].
+        batch_size (int): Batch size to process.
+        seq_length (int): Sequence length to process.
+        topk (int): Number of experts to route to for each token.
+        moe_aux_loss_coeff (float): Scaling coefficient for the auxiliary loss.
+        sequence_partition_group (optional): The parallel group over which the sequence is
+                                             partitioned. If None, no partitioning is applied.
+                                             Defaults to None.
+
+    Returns:
+        torch.Tensor: The sequence auxiliary loss for load balancing.
     """
     num_sub_sequence = 1
+    num_experts = probs.shape[1]
+
+    probs_for_aux_loss = probs.view(seq_length, batch_size, -1)
+    routing_map = routing_map.view(seq_length, batch_size, -1)
 
     # If the sequence is partitioned by certain parallelism strategies like Sequence Parallelism
     # or Context Parallelism, compute the gradient of the auxiliary loss with respect to the full
     # sequence.
     if sequence_partition_group is not None:
-        # We can keep `aggregated_probs_per_expert` local since we don't need the gradient for
-        # `tokens_per_expert`, saving one allreduce operation for `aggregated_probs_per_expert`.
         num_sub_sequence = torch.distributed.get_world_size(sequence_partition_group)
-        torch.distributed.all_reduce(tokens_per_expert, group=sequence_partition_group)
+        seq_length *= num_sub_sequence
+        probs_for_aux_loss = gather_from_sequence_parallel_region(
+            probs_for_aux_loss, group=sequence_partition_group
+        )
 
-    assert num_sub_sequence == 1, "Do not support sequence aux loss in sequence partition case"
-
-    num_experts = probs.shape[1]
-
-    probs_for_aux_loss = probs.view(seq_length, batch_size, -1)
-    cost_coeff = routing_map.view(seq_length, batch_size, -1).sum(dim=0).float()
-    cost_coeff.div_(seq_length * topk / num_experts)
+    cost_coeff = routing_map.sum(dim=0, dtype=torch.float).div_(seq_length * topk / num_experts)
     seq_aux_loss = (cost_coeff * probs_for_aux_loss.mean(dim=0)).sum(dim=1).mean()
     seq_aux_loss *= moe_aux_loss_coeff
 
