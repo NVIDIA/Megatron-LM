@@ -3,10 +3,10 @@
 import os
 import sys
 import torch
-from importlib.metadata import PackageNotFoundError, version
-from pkg_resources import packaging
+from importlib.metadata import version
+from packaging.version import Version as PkgVersion
 
-from schema_mcore import get_model_schema
+from schema_core import get_model_schema
 
 
 def add_arguments(parser):
@@ -31,12 +31,8 @@ def add_arguments(parser):
 def save_checkpoint(queue, args):
 
     # Transformer engine >= 0.12.0, for CPU initialization.
-    try:
-        te_version = packaging.version.Version(version("transformer-engine"))
-    except PackageNotFoundError:
-        te_version = None
-        
-    assert te_version >= packaging.version.Version("0.12.0"), \
+    te_version = PkgVersion(version("transformer-engine"))
+    assert te_version >= PkgVersion("0.12.0"), \
         "transformer engine version: %s (>=0.12.0 required)." % te_version
 
     # Search in directory above this

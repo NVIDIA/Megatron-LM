@@ -1,5 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-
+import warnings
 from abc import ABC
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Union
@@ -15,6 +15,78 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_viewless_tensor
+
+
+def get_transformer_layer_offset(config: TransformerConfig):
+    """Get the index offset of current pipeline stage, given the level of pipelining."""
+    pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
+    if not parallel_state.is_inside_encoder():
+        pp_decoder_start = parallel_state.get_pipeline_model_parallel_decoder_start()
+        if pp_decoder_start is not None:
+            pipeline_rank = pipeline_rank - pp_decoder_start
+
+    num_layers_per_pipeline_rank = config.num_layers // config.pipeline_model_parallel_size
+
+    if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+        vp_rank = parallel_state.get_virtual_pipeline_model_parallel_rank()
+        vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+
+        total_num_layers = config.num_layers
+        num_layers_per_virtual_rank = num_layers_per_pipeline_rank // vp_size
+        total_virtual_chunks = total_num_layers // vp_size
+        offset = vp_rank * total_virtual_chunks + (pipeline_rank * num_layers_per_virtual_rank)
+
+    else:
+        # Each stage gets a contiguous set of layers.
+        if config.pipeline_model_parallel_size > 1:
+            if (
+                config.first_pipeline_num_layers is not None
+                or config.last_pipeline_num_layers is not None
+            ):
+                # Calculate number of pipelines for distributing layers
+                middle_pipeline_stages = config.pipeline_model_parallel_size
+                middle_pipeline_stages -= sum(
+                    [
+                        1 if x is not None else 0
+                        for x in (config.first_pipeline_num_layers, config.last_pipeline_num_layers)
+                    ]
+                )
+
+                # Calculate layers to distribute
+                first_pipeline_offset = (
+                    0
+                    if config.first_pipeline_num_layers is None
+                    else config.first_pipeline_num_layers
+                )
+                last_pipeline_offset = (
+                    0
+                    if config.last_pipeline_num_layers is None
+                    else config.last_pipeline_num_layers
+                )
+
+                middle_num_layers = config.num_layers - first_pipeline_offset - last_pipeline_offset
+
+                if middle_pipeline_stages > 0:
+                    num_layers_per_pipeline_rank = middle_num_layers // middle_pipeline_stages
+                else:
+                    num_layers_per_pipeline_rank = 0
+
+                middle_pipeline_rank = (
+                    pipeline_rank if config.first_pipeline_num_layers is None else pipeline_rank - 1
+                )
+
+                if pipeline_rank == 0:
+                    offset = 0
+                else:
+                    offset = (
+                        middle_pipeline_rank * num_layers_per_pipeline_rank
+                    ) + first_pipeline_offset
+            else:
+                offset = pipeline_rank * num_layers_per_pipeline_rank
+        else:
+            offset = 0
+
+    return offset
 
 
 @dataclass
@@ -176,82 +248,18 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
     @staticmethod
     def _get_layer_offset(config: TransformerConfig):
-        """Get the index offset of current pipeline stage, given the level of pipelining."""
-        pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
-        if not parallel_state.is_inside_encoder():
-            pp_decoder_start = parallel_state.get_pipeline_model_parallel_decoder_start()
-            if pp_decoder_start is not None:
-                pipeline_rank = pipeline_rank - pp_decoder_start
+        """
+        Get the layer offset for the current pipeline stage.
 
-        num_layers_per_pipeline_rank = config.num_layers // config.pipeline_model_parallel_size
+        Deprecated: please use `get_transformer_layer_offset` instead.
+        """
 
-        if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
-            vp_rank = parallel_state.get_virtual_pipeline_model_parallel_rank()
-            vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+        warnings.warn(
+            "TransformerLayer._get_layer_offset is deprecated."
+            "Please use get_transformer_layer_offset instead."
+        )
 
-            total_num_layers = config.num_layers
-            num_layers_per_virtual_rank = num_layers_per_pipeline_rank // vp_size
-            total_virtual_chunks = total_num_layers // vp_size
-            offset = vp_rank * total_virtual_chunks + (pipeline_rank * num_layers_per_virtual_rank)
-
-        else:
-            # Each stage gets a contiguous set of layers.
-            if config.pipeline_model_parallel_size > 1:
-                if (
-                    config.first_pipeline_num_layers is not None
-                    or config.last_pipeline_num_layers is not None
-                ):
-                    # Calculate number of pipelines for distributing layers
-                    middle_pipeline_stages = config.pipeline_model_parallel_size
-                    middle_pipeline_stages -= sum(
-                        [
-                            1 if x is not None else 0
-                            for x in (
-                                config.first_pipeline_num_layers,
-                                config.last_pipeline_num_layers,
-                            )
-                        ]
-                    )
-
-                    # Calculate layers to distribute
-                    first_pipeline_offset = (
-                        0
-                        if config.first_pipeline_num_layers is None
-                        else config.first_pipeline_num_layers
-                    )
-                    last_pipeline_offset = (
-                        0
-                        if config.last_pipeline_num_layers is None
-                        else config.last_pipeline_num_layers
-                    )
-
-                    middle_num_layers = (
-                        config.num_layers - first_pipeline_offset - last_pipeline_offset
-                    )
-
-                    if middle_pipeline_stages > 0:
-                        num_layers_per_pipeline_rank = middle_num_layers // middle_pipeline_stages
-                    else:
-                        num_layers_per_pipeline_rank = 0
-
-                    middle_pipeline_rank = (
-                        pipeline_rank
-                        if config.first_pipeline_num_layers is None
-                        else pipeline_rank - 1
-                    )
-
-                    if pipeline_rank == 0:
-                        offset = 0
-                    else:
-                        offset = (
-                            middle_pipeline_rank * num_layers_per_pipeline_rank
-                        ) + first_pipeline_offset
-                else:
-                    offset = pipeline_rank * num_layers_per_pipeline_rank
-            else:
-                offset = 0
-
-        return offset
+        return get_transformer_layer_offset(config)
 
     def forward(
         self,

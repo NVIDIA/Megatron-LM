@@ -22,7 +22,11 @@ from megatron.core.transformer.transformer_block import (
     get_num_layers_to_build,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.transformer.transformer_layer import (
+    TransformerLayer,
+    TransformerLayerSubmodules,
+    get_transformer_layer_offset,
+)
 from megatron.core.utils import is_te_min_version
 
 try:
@@ -366,7 +370,7 @@ def get_gpt_decoder_block_spec(
 
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
     # Note: MCore layer_number starts at 1
-    offset = TransformerLayer._get_layer_offset(config)
+    offset = get_transformer_layer_offset(config)
     num_layers_to_build = get_num_layers_to_build(config)
     layer_specs = layer_specs[offset : offset + num_layers_to_build]
 

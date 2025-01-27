@@ -23,6 +23,7 @@ def add_arguments(parser):
                         help='Model size can be `llama2-7B`, `llama2-13B`, `llama2-70B`, `llama3-8B`, `llama3-70B`, `mistral-7B`, `qwen2.5-7B`, `qwen2.5-72B` (for pretrained models), '
                         'and `llama2-7Bf`, `llama2-13Bf`, `llama2-70Bf`, `llama3-8Bf`, `llama3-70bf`, `mistral-7Bf`, `qwen2.5-7Bf`, and `qwen2.5-72Bf` (for chat-finetuned models).')
     parser.add_argument('--checkpoint-type', type=str, required=True,
+                        choices=['meta', 'hf'],
                         help='Type of checkpoint to convert, options are "meta" or "hf"')
     parser.add_argument('--bf16', action='store_true', help='Whether to load weights in bf16.')
     parser.add_argument('--fp16', action='store_true', help='Whether to load weights in fp16.')
@@ -112,7 +113,7 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
     if base > 10000.0:
         max_position_embeddings = 32768 if "mistral" in model_size else 16384
     else:
-        max_position_embeddings = 4096 if "mistral" in model_size else 2048
+        max_position_embeddings = 4096
 
     if "llama2" in model_size:
         tokenizer_class = LlamaTokenizer if LlamaTokenizerFast is None else LlamaTokenizerFast
@@ -296,15 +297,21 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
     return model_path
 
 
-def load_args_from_checkpoint(args):
+def load_args_from_checkpoint(args, model_size):
 
     # Read Llama args.
     model_args_path = os.path.join(args.load, "config.json")
     with open(model_args_path) as f:
         model_args = json.load(f)
+
     # Update Megatron args.
     args.seq_length = 4096
-    args.max_position_embeddings = model_args["max_position_embeddings"]
+    if "llama2" in model_size:
+        # Correct bug in earlier conversion script.
+        args.max_position_embeddings = 4096
+    else:
+        args.max_position_embeddings = model_args["max_position_embeddings"]
+    # <<<
     args.hidden_size = model_args["hidden_size"]
     args.num_attention_heads = model_args["num_attention_heads"]
     args.num_layers = model_args["num_hidden_layers"]
@@ -430,6 +437,7 @@ def _load_checkpoint(queue, args):
     if args.checkpoint_type == "meta":
         model_tmp_path = convert_to_hf(model_path=os.path.join(args.save_dir, 'tmp'), input_base_path=args.load_dir, model_size=args.model_size, tokenizer_path=args.tokenizer_model)
         args.load_dir = model_tmp_path
+        args.tokenizer_model = model_tmp_path # point to HF tokenizer model
 
     try:
         from megatron.training.arguments import parse_args, validate_args
@@ -466,7 +474,7 @@ def _load_checkpoint(queue, args):
 
     margs = parse_args()
     margs.tokenizer_model = args.tokenizer_model
-    load_args_from_checkpoint(margs)
+    load_args_from_checkpoint(margs, args.model_size)
 
     if "llama2" in args.model_size:
         margs.tokenizer_type = "Llama2Tokenizer"
@@ -661,7 +669,7 @@ def _load_checkpoint(queue, args):
     queue.put("done")
 
     if args.checkpoint_type == "meta":
-        shutil.rmtree(os.path.join(args.save_dir, 'tmp'))
+        shutil.rmtree(os.path.join(args.load_dir))
 
 
 def load_checkpoint(queue, args):
