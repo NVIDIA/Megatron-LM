@@ -61,6 +61,8 @@ USE_LAZY_MODE=${HL_USE_LAZY_MODE:-1}
 SKIP_TRAIN=${HL_SKIP_TRAIN:-0}
 NUM_WORKERS=${HL_NUM_WORKERS:-2}
 FP8_COVERAGE=${HL_FP8_COVERAGE:-"mlp_row_parallel=False attention=False"}
+OVERLAP_GRAD_REDUCE=${HL_OVERLAP_GRAD_REDUCE:-0}
+LOG_ZEROS_IN_GRAD=${HL_LOG_ZEROS_IN_GRAD:-0}
 
 if [[ -z "${MEGATRON_LM_ROOT}" ]]; then
     MEGATRON_LM_ROOT=$(realpath "$(dirname "$0")"/../../)
@@ -360,6 +362,16 @@ CMD="${CMD} \
     --data-path ${DATA_PATH} \
     --num-workers ${NUM_WORKERS} \
     "
+
+##     --OVERLAP_GRAD_REDUCE
+if [[ "${OVERLAP_GRAD_REDUCE}" -eq 1 ]]; then
+    CMD="${CMD} --overlap-grad-reduce"
+fi
+
+##     --LOG_ZEROS_IN_GRAD
+if [[ "${LOG_ZEROS_IN_GRAD}" -eq 1 ]]; then
+    CMD="${CMD} -log-num-zeros-in-grad"
+fi
 
 if [[ "${SEQ_PARALLEL}" -eq 1 ]]; then
     CMD="${CMD} --sequence-parallel"

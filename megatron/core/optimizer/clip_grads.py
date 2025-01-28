@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Gradient clipping."""
-
+import habana_frameworks.torch.core as htcore
 import os
 from typing import List, Optional, Union
 
@@ -182,7 +182,7 @@ def count_zeros_fp32(
             grad = param.grad.detach()
             num_zeros = grad.numel() - torch.count_nonzero(grad)
             total_num_zeros = num_zeros + total_num_zeros
-
+            htcore.mark_step()
     # Sum across all model-parallel GPUs.
     torch.distributed.all_reduce(
         total_num_zeros, op=torch.distributed.ReduceOp.SUM, group=model_parallel_group
