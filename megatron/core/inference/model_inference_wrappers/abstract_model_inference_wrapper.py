@@ -135,6 +135,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         tokens = inference_input["tokens"]
         position_ids = inference_input["position_ids"]
         attention_mask = inference_input["attention_mask"]
+
         batch_size, seq_len = tokens.shape
         recv_buffer = None
         if not parallel_state.is_pipeline_first_stage():
@@ -237,7 +238,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         Appropriate utility is called for the forward pass depending on the type of model parallelism used
 
         Args:
-            inference_input (List): A list containg the inputs for the gpt model [tokens, position ids, attention mask]
+            inference_input (Dict[str, Any]): A dict containg the inputs for the gpt model [tokens, position ids, attention mask]
 
         Returns:
             torch.Tensor: The output logits of shape [batch_size, seq_len, padded_vocab_size]. The logits are returned only in the last pipeline stage for PP models.

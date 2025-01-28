@@ -110,7 +110,7 @@ class _CudagraphGlobalRecord:
             return
 
         # Otherwise, create all the recorded cudagraphs.
-        logging.getLogger(__name__).info(f"Creating {len(cls.cudagraph_record)} cudagraphs")
+        logging.getLogger(__name__).info(f"Creating {len(cls.cudagraph_record)} CUDA graphs")
 
         has_te_modules = False
         for g in cls.cudagraph_record:
@@ -371,11 +371,13 @@ class _CudaGraphRunner(torch.nn.Module):
         self.backward_retain_grad = False
         self.fp8_enabled = False
         self.deallocate_pipeline_outputs = False
+        self.num_warmup_steps = 2
         if isinstance(self.base_module.config, TransformerConfig):
             self.fuse_wgrad_accumulation = self.base_module.config.gradient_accumulation_fusion
             self.backward_retain_grad = self.base_module.config.cuda_graph_retain_backward_graph
             self.fp8_enabled = self.base_module.config.fp8 is not None
             self.deallocate_pipeline_outputs = self.base_module.config.deallocate_pipeline_outputs
+            self.num_warmup_steps = self.base_module.config.cuda_graph_warmup_steps
 
             if self.fp8_enabled:
                 self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
@@ -447,7 +449,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 self.fwd_graph.register_generator_state(state)
 
         # warmup again as case graph capture mode may execute a different codepath
-        for _ in range(2):
+        for _ in range(self.num_warmup_steps):
             with self.get_fp8_context():
                 outputs = self.base_module.forward(
                     *self.fwd_graph_input_args, **self.fwd_graph_input_kwargs

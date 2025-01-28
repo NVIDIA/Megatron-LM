@@ -12,6 +12,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.transformer.cuda_graphs import create_cudagraphs
 
 
 class TextGenerationController:
@@ -329,6 +330,14 @@ class TextGenerationController:
             batch_size, device=torch.cuda.current_device()
         ).cuda()
 
+        # Check whether CUDA graphs are enabled
+        if hasattr(self.inference_wrapped_model.model, "module"):  # if model is Float16Module
+            enable_cuda_graph = self.inference_wrapped_model.model.module.config.enable_cuda_graph
+        else:
+            enable_cuda_graph = self.inference_wrapped_model.model.config.enable_cuda_graph
+
+        use_attention_mask = True
+
         with torch.no_grad():
 
             self.inference_wrapped_model.prep_model_for_inference(
@@ -349,11 +358,21 @@ class TextGenerationController:
                     )
                 )
 
+                if (
+                    not use_attention_mask
+                    and "attention_mask" in inference_input_for_context_window
+                ):
+                    inference_input_for_context_window["attention_mask"] = None
+
                 # Returns the final logits of shape [batch_size, context_length, vocab_size]
                 # Note: This is returned in all TP ranks or last PP stage in PP models
                 logits = self.inference_wrapped_model.run_one_forward_step(
                     inference_input_for_context_window
                 )
+
+                if enable_cuda_graph:
+                    create_cudagraphs()
+
                 if self.model_is_pipeline_parallel:
                     context_length = context_end_position - context_start_position
                     logits = broadcast_from_last_pipeline_stage(
@@ -408,6 +427,10 @@ class TextGenerationController:
                 all_prompts_done = torch.all(is_generation_done_tensor)
                 if all_prompts_done:
                     break
+
+                # Disable attention mask for CUDA graphs (decode only)
+                if use_attention_mask and enable_cuda_graph and torch.all(generation_started):
+                    use_attention_mask = False
 
         # Include all the generated tokens
         batch_prompt_tokens_with_generations = batch_prompt_tokens[:, : (context_end_position + 1)]
