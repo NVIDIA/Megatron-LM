@@ -899,6 +899,8 @@ def _add_inference_args(parser):
                        help='Whether to use the flash decoding kernel.')
     group.add_argument('--enable-cuda-graph', default=False, action="store_true",
                        help='Use CUDA graph capture and replay.')
+    group.add_argument("--cuda-graph-warmup-steps", type=int, default=2,
+                       help="Number of CUDA graph warmup steps")
     group.add_argument('--inference-max-seq-length', type=int, default=2560,
                        help='Maximum sequence length allocated for prefill during inference.',
                        dest='inference_max_seq_length')

@@ -379,6 +379,9 @@ class TransformerConfig(ModelParallelConfig):
     external_cuda_graph: bool = False
     """When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
 
+    cuda_graph_warmup_steps: int = 3
+    """Number of warmup steps for CUDA graphs"""
+
     config_logger_dir: str = ""
     """When non-empty, dumps entry-point configs to config_logger_dir"""
 

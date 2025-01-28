@@ -243,7 +243,11 @@ class GPTModel(LanguageModule):
                     packed_seq=packed_seq_params is not None
                     and packed_seq_params.qkv_format == 'thd',
                 )
-        if (self.config.enable_cuda_graph or self.config.flash_decode) and inference_params:
+        if (
+            (self.config.enable_cuda_graph or self.config.flash_decode)
+            and rotary_pos_cos is not None
+            and inference_params
+        ):
             sequence_len_offset = torch.tensor(
                 [inference_params.sequence_len_offset] * inference_params.current_batch_size,
                 dtype=torch.int32,
