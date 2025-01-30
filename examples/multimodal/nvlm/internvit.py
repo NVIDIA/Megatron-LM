@@ -11,11 +11,10 @@ Additionally, InternViT introduces some unique features like Layer Scaling.
 Those code changes are gathered here.
 """
 from functools import partial
-from typing import Dict
 
 import torch
 
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.utils import divide
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
     TEDotProductAttention,
@@ -92,21 +91,28 @@ class InternViTRMSNorm(MegatronModule):
 
         return output
 
-    def _gather_var(self, input_, max_dim, valid_ranks=6):
+    def _gather_var(self, input_, max_dim):
         """Compute statistic across the non-dummy heads."""
         world_size = get_tensor_model_parallel_world_size()
-        assert world_size == 8, "tested only with TP=8"
 
         # Size and dimension.
         last_dim = input_.dim() - 1
         rank = get_tensor_model_parallel_rank()
 
-        if rank < valid_ranks:  # Ranks 0-5 have 24 non-dummy attention heads.
+        num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
+        valid_ranks = 24 // num_attention_heads_per_partition
+
+        residual_heads = 25 % num_attention_heads_per_partition
+        if residual_heads == 0:
+            residual_heads = num_attention_heads_per_partition
+        max_dim = max_dim * residual_heads
+
+        if rank < valid_ranks:  # Ranks without any dummy attention heads.
             var = input_.sum(-1, keepdim=True)
-        elif rank == valid_ranks:  # Rank 6 has 1 non-dummy attention head.
+        elif rank == valid_ranks:  # The only rank which may contain 'residual_heads' dummy attention heads.
             var = input_[..., :max_dim].sum(-1, keepdim=True)
         else:
-            var = input_.sum(-1, keepdim=True) * 0.0  # Zero-out the dummy heads.
+            var = input_.sum(-1, keepdim=True) * 0.0  # All heads in these ranks are dummy heads: Zero-out.
 
         tensor_list = [torch.empty_like(var) for _ in range(world_size)]
         tensor_list[rank] = var
