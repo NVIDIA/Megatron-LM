@@ -24,12 +24,20 @@ class TimerBase(ABC):
 
     @abstractmethod
     def start(self, barrier=False):
-        """Start the timer."""
+        """Start the timer.
+
+        Args:
+            barrier (bool, optional): Synchronizes ranks before starting. Defaults to False.
+        """
         pass
 
     @abstractmethod
     def stop(self, barrier=False):
-        """Stop the timer."""
+        """Stop the timer.
+
+        Args:
+            barrier (bool, optional): Synchronizes ranks before stopping. Defaults to False.
+        """
         pass
 
     @abstractmethod
@@ -39,7 +47,15 @@ class TimerBase(ABC):
 
     @abstractmethod
     def elapsed(self, reset=True, barrier=False):
-        """Calculates the elapsed time."""
+        """Calculates the elapsed time and restarts timer.
+
+        Args:
+            reset (bool, optional): Resets timer before restarting. Defaults to True.
+            barrier (bool, optional): Synchronizes ranks before stopping. Defaults to False.
+
+        Returns:
+            float: Elapsed time.
+        """
         pass
 
 
@@ -59,7 +75,19 @@ class DummyTimer(TimerBase):
         return
 
     def elapsed(self, reset=True, barrier=False):
-        raise Exception('dummy timer should not be used to calculate elapsed time')
+        raise Exception(
+            'dummy timer should not be used to calculate elapsed time, '
+            'check if timer\'s log_level <= self._log_level.'
+        )
+
+    def active_time(self):
+        """Returns the cumulative duration the timer has been active.
+        Note: Not supported for DummyTimer.
+        """
+        raise Exception(
+            'active timer should not be used to calculate elapsed time, '
+            'check if timer\'s log_level <= self._log_level.'
+        )
 
 
 class Timer(TimerBase):
@@ -155,7 +183,7 @@ class Timer(TimerBase):
         return _elapsed
 
     def active_time(self):
-        """Returns the active time."""
+        """Calculates the cumulative duration for which the timer has been active"""
         return self._active_time
 
 
@@ -397,8 +425,8 @@ class Timers:
         reset: bool = True,
         barrier: bool = False,
     ):
-        """Write timers to a tensorboard writer. Note that we only report maximum time across ranks
-           to tensorboard.
+        """Write timers to a tensorboard writer.
+        Note that we only report maximum time across ranks to tensorboard.
 
         Args:
             names (List[str]): Names of the timers to log.

@@ -1,7 +1,9 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
 """ Helpers for manipulating sharded tensors and sharded state dicts. """
-
+import logging
+from contextlib import contextmanager
+from time import time
 from typing import Dict, Optional, Tuple
 
 from .dict_utils import dict_list_map_inplace, extract_matching_values
@@ -18,6 +20,18 @@ from .mapping import (
 # _ShardId uniquely identifies a ShardedTensor. This is a subset of ShardedTensor
 # attributes: key (str), global_offset (tuple) and flattened_range (optional tuple)
 _ShardId = Tuple[str, tuple, Optional[tuple]]
+
+
+def zip_strict(*args):
+    """
+    Alternative to Python's builtin zip(..., strict=True) (available in 3.10+).
+    Apart from providing functionality in earlier versions of Python is also more verbose.
+    (Python's zip does not print lengths, only which iterable has finished earlier)
+    """
+    args = [list(a) for a in args]
+    lens = [len(a) for a in args]
+    assert len(set(lens)) <= 1, f"Tried to zip iterables of unequal lengths: {lens}!"
+    return zip(*args)
 
 
 def _sharded_tensor_shard_id(sharded_tensor: ShardedTensor) -> _ShardId:
@@ -217,3 +231,89 @@ def apply_prefix_mapping(sharded_state_dict: ShardedStateDict, prefix_map: Dict[
         return x
 
     dict_list_map_inplace(_replace_prefixes, sharded_state_dict)
+
+
+fallback_logger = logging.getLogger(__name__)
+__LOGGER_NAME_STACK = []
+__LOGGER_STACK = []
+
+
+@contextmanager
+def logger_stack(name: Optional[str] = None, current_logger: Optional[logging.Logger] = None):
+    """Context manager for managing logger and name stack.
+
+    Temporarily pushes a logger and/or name onto their respective stacks, allowing hierarchical
+    logging and contextual logger usage. Ensures the logger stack is restored afterward.
+
+    Args:
+        name (str, optional): Name to add to the logger stack. Defaults to None.
+        current_logger (logging.Logger, optional): Logger to use. Defaults to the last logger in
+                                                  the stack or a fallback if none exist.
+
+    Yields:
+        Tuple[str, logging.Logger]: A tuple with the concatenated logger name stack and
+                                    the current logger for the block.
+
+    Example:
+        with logger_stack("scope", logger):
+            logger.info("Log within 'scope'")
+    """
+    if name:
+        __LOGGER_NAME_STACK.append(name)
+    if current_logger:
+        __LOGGER_STACK.append(current_logger)
+        last_logger = current_logger
+    elif __LOGGER_STACK:
+        last_logger = __LOGGER_STACK[-1]
+    else:
+        last_logger = fallback_logger
+    try:
+        yield ".".join(__LOGGER_NAME_STACK), last_logger
+    finally:
+        if name and __LOGGER_NAME_STACK:
+            __LOGGER_NAME_STACK.pop(-1)
+        if current_logger and __LOGGER_STACK:
+            __LOGGER_STACK.pop(-1)
+
+
+@contextmanager
+def debug_time(
+    name: str, logger: Optional[logging.Logger] = None, threshold: float = float("-inf"), level=None
+):
+    """Simple context manager for timing functions/code blocks.
+
+    Args:
+        name (str): Label describing the code being measured.
+        logger (logging.Logger, optional): Logger for output. Defaults to the lowest logger.
+        threshold (float, optional): Minimum time (seconds) to log. Skips logging if faster.
+        level (int, optional): Logging level. Defaults to DEBUG if `threshold` is unset;
+                               WARNING otherwise.
+    """
+    with logger_stack(name, logger) as (stacked_name, last_logger):
+        start = time()
+        try:
+            yield
+        finally:
+            result = time() - start
+            if result < threshold:
+                return
+            if level is None:
+                level = logging.DEBUG if threshold == float("-inf") else logging.WARNING
+            last_logger.log(level, f"{stacked_name} took {result:.4f}s")
+
+
+def debug_msg(msg: str):
+    """Logs a debug message using the current logger stack.
+
+    This function formats and logs a debug message with the current logger
+    and name stack, preserving context from the logger_stack context manager.
+
+    Args:
+        msg (str): The message to be logged at the debug level.
+
+    Example:
+        debug_msg("Checkpoint initialized")
+        # Logs: "scope_name Checkpoint initialized" if called within logger_stack("scope_name")
+    """
+    with logger_stack(None, None) as (stacked_name, last_logger):
+        last_logger.debug(f"{stacked_name} {msg}")

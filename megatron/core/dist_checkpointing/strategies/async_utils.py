@@ -12,6 +12,8 @@ from typing import Callable, List, NamedTuple, Optional, Tuple
 import torch
 from torch import multiprocessing as mp
 
+from ..utils import debug_time
+
 logger = logging.getLogger(__name__)
 
 
@@ -101,7 +103,8 @@ class DistributedAsyncCaller:
         self.process.start()
         init_time = time()
         logger.debug(
-            f"rank: {torch.distributed.get_rank()}, takes {init_time - self.start_time} to schedule async ckpt "
+            f"rank: {torch.distributed.get_rank()}, takes {init_time - self.start_time} "
+            "to schedule async ckpt "
         )
 
     def is_current_async_call_done(self, blocking=False) -> bool:
@@ -119,7 +122,7 @@ class DistributedAsyncCaller:
             bool: True if all ranks are done (immediately of after active wait
                 if `blocking` is True), False if at least one rank is still active.
         """
-        # The following takes the same overhead as torch.distributed.barrier (single integer all-reduce)
+        # Same overhead as torch.distributed.barrier (single integer all-reduce)
         is_alive = int(self.process.is_alive()) if self.process is not None else 0
         ten = torch.tensor([is_alive], dtype=torch.int, device=torch.cuda.current_device())
         logger.debug(
@@ -135,7 +138,8 @@ class DistributedAsyncCaller:
                 self.process = None
 
                 logger.debug(
-                    f"DistributedAsyncCaller: Async process join finished after {time() - self.start_time:.2f}s from forking"
+                    "DistributedAsyncCaller: Async process join finished after "
+                    f"{time() - self.start_time:.2f}s from forking"
                 )
                 self.start_time = None
             return True
@@ -204,15 +208,15 @@ class AsyncCallsQueue:
             next_async_done = self.async_calls[0].async_caller.is_current_async_call_done(blocking)
             if not next_async_done:
                 break
-            call_idx, _, async_request = self.async_calls.popleft()
-            for finalize_fn in async_request.finalize_fns:
-                finalize_fn()
-            ten = torch.tensor([call_idx], dtype=torch.int, device=torch.cuda.current_device())
-            torch.distributed.all_reduce(ten, op=torch.distributed.ReduceOp.MAX)
-            assert (
-                ten.item() == call_idx
-            ), 'Unmatched async calls. That probably means not all ranks are participating in async finalization'
-            call_idx_finalized.append(call_idx)
+            with debug_time("finalize", logger):
+                call_idx, _, async_request = self.async_calls.popleft()
+                for finalize_fn in async_request.finalize_fns:
+                    finalize_fn()
+                ten = torch.tensor([call_idx], dtype=torch.int, device=torch.cuda.current_device())
+                torch.distributed.all_reduce(ten, op=torch.distributed.ReduceOp.MAX)
+                assert ten.item() == call_idx, 'Unmatched async calls. '
+                'That probably means not all ranks are participating in async finalization'
+                call_idx_finalized.append(call_idx)
         return call_idx_finalized
 
     def get_num_unfinalized_calls(self):
