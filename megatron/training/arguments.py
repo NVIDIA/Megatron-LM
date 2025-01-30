@@ -187,8 +187,14 @@ def moe_freq_type(x):
 def validate_args(args, defaults={}):
 
     # Temporary
-    assert args.non_persistent_ckpt_type in ['global', None], \
-        'Currently only global checkpoints are supported'
+    assert args.non_persistent_ckpt_type in ['global', 'local', None], \
+        'Currently only global and local checkpoints are supported'
+    if args.non_persistent_ckpt_type == 'local':
+        try:
+            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import \
+                LocalCheckpointManager
+        except ModuleNotFoundError as e:
+            raise RuntimeError('nvidia_resiliency_ext is required for local checkpointing') from e
 
     # Load saved args from Retro (if applicable).
     load_retro_args(args)
@@ -763,6 +769,15 @@ def validate_args(args, defaults={}):
         if not args.no_load_rng:
             args.no_load_rng = True
             print('Warning: disabling --no-load-rng for upcycling.')
+
+    if args.non_persistent_ckpt_type == "local":
+        assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
+    if args.replication:
+        assert args.replication_jump is not None, "--replication requires the value of --replication-jump!"
+        assert args.non_persistent_ckpt_type == "local", f"--replication requires args.non_persistent_ckpt_type == 'local', but got: {args.non_persistent_ckpt_type}"
+    elif args.replication_jump:
+        print("Warning: --replication-jump was specified despite not using replication. Ignoring.")
+        args.replication_jump = None
 
     # Print arguments.
     _print_args("arguments", args)
@@ -1574,8 +1589,7 @@ def _add_checkpointing_args(parser):
                        choices=['global', 'local', 'in_memory', None],
                        help='Type of non-persistent model checkpoints. '
                            '"global" - Saved as a standard checkpoint (e.g., on Lustre) with old checkpoints being removed. '
-                           '"local" - [TBD] Each rank saves a portion of the checkpoint locally (e.g., on SSD/ramdisk). '
-                           '"in_memory" - [TBD] A special kind of local checkpoint that avoids serialization. '
+                           '"local" - Each rank saves a portion of the checkpoint locally (e.g., on SSD/ramdisk). '
                            'None - No non-persistent checkpointing (default option).')
     group.add_argument('--non-persistent-global-ckpt-dir', type=str, default=None,
                        help='Directory containing global non-persistent model checkpoints.')
@@ -1813,6 +1827,16 @@ def _add_distributed_args(parser):
                         help='If set, distributed ranks initialize order is changed '
                         'from tp-dp-pp to tp-pp-dp. Make sure EP and CP aren\'t used '
                         'with this option enabled')
+    group.add_argument('--replication', action='store_true', default=False,
+                       help="If set, replication of local checkpoints is enabled. "
+                       "Needs to be enabled on all ranks.")
+    group.add_argument('--replication-jump', default=None, type=int,
+                       help="Specifies `J`, the spacing between ranks storing replicas of a given rank's data. "
+                       "Replicas for rank `n` may be on ranks `n+J`, `n+2J`, ..., or `n-J`, `n-2J`, etc. "
+                       "This flag has an effect only if --replication is used. "
+                       "and must be consistent across all ranks.")
+    group.add_argument('--replication-factor', default=2, type=int,
+                       help="Number of machines storing the replica of a given rank's data.")
     return parser
 
 
