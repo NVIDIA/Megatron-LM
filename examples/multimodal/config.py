@@ -151,9 +151,8 @@ def get_vision_model_config(config, apply_query_key_layer_scaling):
         config.layernorm_epsilon = 1e-6
     elif config.vision_model_type == "internvit":
         config.num_layers = 45
-        config.num_attention_heads = 32     # Padded for TP=8.
-        config.num_query_groups = 32    # Padded for TP=8.
-        config.kv_channels = 128
+        config.num_attention_heads = ((24 // config.tensor_model_parallel_size) + 1) * config.tensor_model_parallel_size
+        config.num_query_groups = config.num_attention_heads
         config.add_bias_linear = True
         config.add_qkv_bias = False
         config.hidden_size = 3200
