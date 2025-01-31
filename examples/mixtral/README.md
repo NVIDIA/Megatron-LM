@@ -126,6 +126,19 @@ docker run \
 
 The above functionality also applys to Mixtral 8x22B actually, you should set the model config (including hidden_size/head_num/num_layers/ffn_hidden_size) properly according to the original [config](https://huggingface.co/mistralai/Mixtral-8x22B-v0.1/blob/main/config.json).
 
+## LoRA from pretrained Mixtral 8x7B
+
+By default `lora_mixtral_8x7b_distributed.sh` uses TP1PP1EP8 parallelizm. To run LoRA from pretrained Mixtral 8x7B, use the following command:
+
+```bash
+bash lora_mixtral_8x7b_distributed.sh \
+    /workspace/checkpoints/mixtral-mcore-TP1PP1EP8 \
+    /workspace/checkpoints/mixtral-hf/tokenizer.model \
+    path/to/data
+```
+
+To run LoRA with another parallelizm setting convert model to the Megatron-LM checkpoint with target paralleizm and modify `MODEL_PARALLEL_ARGS` arguments in `lora_mixtral_8x7b_distributed.sh`.
+
 ## Acknowledgements
 Contributors outside NVIDIA for the huggingface converter and example of Mixtral models in Megatron-Core:
 - Peng Li <jerry.lp@alibaba-inc.com>
