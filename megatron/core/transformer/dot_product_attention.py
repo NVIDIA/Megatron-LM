@@ -1,5 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
-
+# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
 from typing import Optional
@@ -42,6 +42,8 @@ class DotProductAttention(MegatronModule):
         attention_dropout: float = None,
         softmax_scale: float = None,
         cp_comm_type: str = None,
+        # Add kwargs for MultiLatentAttention
+        **kwargs
     ):
         super().__init__(config=config)
 

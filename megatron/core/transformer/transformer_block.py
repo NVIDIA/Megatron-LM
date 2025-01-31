@@ -1,4 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -185,6 +186,7 @@ class TransformerBlock(MegatronModule):
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
+        self.world_size = parallel_state.get_tensor_model_parallel_world_size()
         # Dictionary to store CUDA graphs. Number of items in the dictionary = len(self.layers).
         # Item `i` in the dictionary is a list of `N` CUDA graphs for layer 'i' where N is the
         # number of microbatches. Multiple CUDA graphs per layer is required to support
@@ -267,12 +269,14 @@ class TransformerBlock(MegatronModule):
         rotary_pos_emb: Tensor,
         attention_bias: Tensor,
         packed_seq_params: PackedSeqParams,
+        # Add kwargs to handle position_ids.
+        **kwargs
     ):
         """Forward method with activation checkpointing."""
 
         def custom(start: int, end: int):
             def custom_forward(
-                hidden_states, attention_mask, context, context_mask, rotary_pos_emb
+                hidden_states, attention_mask, context, context_mask, rotary_pos_emb, **kwargs
             ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
@@ -285,6 +289,7 @@ class TransformerBlock(MegatronModule):
                         attention_bias=attention_bias,
                         inference_params=None,
                         packed_seq_params=packed_seq_params,
+                        **kwargs
                     )
                 return hidden_states, context
 
@@ -303,6 +308,7 @@ class TransformerBlock(MegatronModule):
                     context,
                     context_mask,
                     rotary_pos_emb,
+                    **kwargs
                 )
             else:
                 return tensor_parallel.checkpoint(
@@ -313,6 +319,7 @@ class TransformerBlock(MegatronModule):
                     context,
                     context_mask,
                     rotary_pos_emb,
+                    **kwargs
                 )
 
         if self.config.recompute_method == 'uniform':
@@ -345,7 +352,7 @@ class TransformerBlock(MegatronModule):
                     hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
                 else:
                     hidden_states, context = custom(layer_idx, layer_idx + 1)(
-                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb
+                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb, **kwargs
                     )
         else:
             raise ValueError("Invalid activation recompute method.")
@@ -404,6 +411,8 @@ class TransformerBlock(MegatronModule):
         attention_bias: Tensor = None,
         inference_params: InferenceParams = None,
         packed_seq_params: PackedSeqParams = None,
+        # Handle position_ids with kwargs.
+        **kwargs
     ):
         """
         Perform the forward pass through the transformer block.
@@ -495,6 +504,7 @@ class TransformerBlock(MegatronModule):
                     rotary_pos_emb=rotary_pos_emb,
                     attention_bias=attention_bias,
                     packed_seq_params=packed_seq_params,
+                    **kwargs
                 )
             else:
                 for l_no, layer in enumerate(self.layers):
@@ -512,6 +522,7 @@ class TransformerBlock(MegatronModule):
                                 attention_bias=attention_bias,
                                 inference_params=inference_params,
                                 packed_seq_params=packed_seq_params,
+                                **kwargs
                             )
                         else:
                             # CUDA graph replay for layer `l_no` and microbatch

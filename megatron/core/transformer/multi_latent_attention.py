@@ -1,4 +1,16 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, Alibaba PAI and Nvidia Megatron-LM Team.
+# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 
 import math
@@ -81,7 +93,9 @@ class MultiLatentAttention(Attention):
             mscale=self.config.mscale,
             mscale_all_dim=self.config.mscale_all_dim,
         )
-
+        # Add kv channels as kwargs for DotProductAttention 
+        kwargs = {"k_channels": self.q_head_dim,
+                  "v_channels": self.config.v_head_dim}
         self.core_attention = build_module(
             submodules.core_attention,
             config=self.config,
@@ -89,9 +103,9 @@ class MultiLatentAttention(Attention):
             attn_mask_type=self.attn_mask_type,
             attention_type=self.attention_type,
             softmax_scale=self.softmax_scale,
-            k_channels=self.q_head_dim,
-            v_channels=self.config.v_head_dim,
             cp_comm_type=cp_comm_type,
+            **kwargs
+            
         )
 
         # Output.

@@ -1,4 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
@@ -19,6 +20,8 @@ class TransformerConfig(ModelParallelConfig):
     including those in ModelParallelConfig.
     """
 
+    moe_ffn_hidden_size: int = None
+    
     ####################
     # model architecture
     ####################
@@ -632,6 +635,55 @@ class MLATransformerConfig(TransformerConfig):
 
     max_position_embeddings: int = 163840
     """Maximum position embeddings for the original model."""
+
+    beta_fast: float = 32
+    """Beta fast for YaRN RoPE."""
+
+    beta_slow: float = 1
+    """Beta slow for YaRN RoPE."""
+
+    mscale: float = 0.707
+    """Mscale for YaRN RoPE in Multi-Latent Attention."""
+
+    mscale_all_dim: float = 0.707
+    """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention."""
+
+    qk_nope_head_dim: int = 128
+
+@dataclass
+class DeepSeekV2TransformerConfig(TransformerConfig):
+
+    moe_ffn_hidden_size: int = None
+
+    enable_shared_expert: bool = False
+
+    q_lora_rank: int = None
+
+    kv_lora_rank: int = None
+
+    qk_nope_head_dim: int = None
+
+    qk_rope_head_dim: int = None
+
+    v_head_dim: int = None
+
+    num_shared_experts: int = None
+
+    moe_layer_freq: int = None
+
+    rotary_base: int = None
+
+    rotary_scaling_factor: int = None
+
+    max_position_embeddings: int = None
+
+    moe_aux_loss_coeff: float = 0.0
+
+    qk_head_dim: int = 128
+    """Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim"""
+
+    qk_pos_emb_head_dim: int = 64
+    """Dimension of the position embedding in the QK projection."""
 
     beta_fast: float = 32
     """Beta fast for YaRN RoPE."""

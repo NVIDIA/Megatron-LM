@@ -1,4 +1,16 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024 Alibaba PAI and Nvidia Megatron-LM Team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Pretrain utilities."""
 
@@ -53,6 +65,7 @@ from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
 from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+from megatron.training.memory_tracer.memstats_collector import MemStatsCollector
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
 from megatron.core.parallel_state import (
@@ -746,7 +759,8 @@ def setup_model_and_optimizer(model_provider_func,
 
 
 def train_step(forward_step_func, data_iterator,
-               model, optimizer, opt_param_scheduler, config): 
+               model, optimizer, opt_param_scheduler, config,
+               memory_stats_collector: MemStatsCollector = None):
     """Single training step."""
     args = get_args()
     timers = get_timers()
@@ -1367,6 +1381,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         gc.disable()
         gc.collect()
 
+    memory_stats_collector = None
+    if args.optimizer == 'hybridadam':
+        memory_stats_collector = MemStatsCollector()
+        memory_stats_collector.start_collection()
+
     # Singleton initialization of straggler detector.
     if args.log_straggler:
         global stimer
@@ -1468,7 +1487,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                        model,
                        optimizer,
                        opt_param_scheduler,
-                       config)
+                       config,
+                       memory_stats_collector)
         if should_checkpoint:
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler,

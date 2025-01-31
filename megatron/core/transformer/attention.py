@@ -1,4 +1,17 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024 Alibaba PAI and Nvidia Megatron-LM Team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Tuple, Union
@@ -54,6 +67,13 @@ class SelfAttentionSubmodules:
     q_layernorm: Union[ModuleSpec, type] = None
     k_layernorm: Union[ModuleSpec, type] = None
 
+    linear_q_proj: Union[ModuleSpec, type] = None
+    linear_q_down_proj: Union[ModuleSpec, type] = None
+    linear_q_up_proj: Union[ModuleSpec, type] = None
+    linear_kv_down_proj: Union[ModuleSpec, type] = None
+    linear_kv_up_proj: Union[ModuleSpec, type] = None
+    kv_layernorm: Union[ModuleSpec, type] = None
+    
 
 @dataclass
 class CrossAttentionSubmodules:
@@ -96,12 +116,12 @@ class Attention(MegatronModule, ABC):
         self.kv_projection_size = self.config.kv_channels * self.config.num_query_groups
 
         # Per attention head and per partition values.
-        world_size = parallel_state.get_tensor_model_parallel_world_size()
+        self.world_size = parallel_state.get_tensor_model_parallel_world_size()
         self.hidden_size_per_attention_head = divide(
             self.query_projection_size, self.config.num_attention_heads
         )
-        self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
-        self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
+        self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, self.world_size)
+        self.num_query_groups_per_partition = divide(self.config.num_query_groups, self.world_size)
 
         self.core_attention = build_module(
             submodules.core_attention,
