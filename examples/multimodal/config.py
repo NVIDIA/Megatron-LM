@@ -186,6 +186,9 @@ def get_vision_projection_config(config, hidden_size):
     elif config.language_model_type == "llama3.1_8b":
         config.ffn_hidden_size = 4096
         config.activation_func = torch.nn.functional.gelu
+        config.layernorm_epsilon = 1e-5
+        config.add_bias_linear = True
+        config.normalization = "LayerNorm"
     elif config.language_model_type == "mistral_7b":
         config.ffn_hidden_size = 14336
         config.activation_func = torch.nn.functional.gelu
