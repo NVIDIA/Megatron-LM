@@ -192,63 +192,15 @@ def test_builder():
         assert datasets[1] is None
         assert datasets[2] is None
 
+        # This build used to fail when building datasets without a sample buffer
         config = BlendedMegatronDatasetConfig(
             random_seed=1234,
             sequence_length=_SEQUENCE_LENGTH,
             blend_per_split=[blends[Split.train], None, None],
         )
-        try:
-            datasets = BlendedMegatronDatasetBuilder(
-                TestDataset, [1000, None, None], lambda: True, config
-            ).build()
-            raise RuntimeError
-        except IndexError:
-            ##
-            #
-            # The size per dataset is a function of the requested size, the weight per dataset,
-            # and a constant coefficient. The sizes, and consequently the total size to request,
-            # are modified such that the weights may or may not be sufficiently representative.
-            # To fix this, the weights should be reset according to the new sizes:
-            #
-            # S := size
-            # W := weights
-            #
-            # S = func(S, W)
-            #
-            # W = S / sum(S)
-            #
-            ##
-            config = BlendedMegatronDatasetConfig(
-                random_seed=1234,
-                sequence_length=_SEQUENCE_LENGTH,
-                blend_per_split=[blends[Split.train], None, None],
-                renormalize_blend_weights=True,
-            )
-            datasets = BlendedMegatronDatasetBuilder(
-                TestDataset, [1000, None, None], lambda: True, config
-            ).build()
-            assert (
-                len(datasets[0]) >= 1000
-                and len(datasets[0]) <= 1000 * (1 + _MARGIN) + _NUM_DATASETS
-            )
-
-            config = BlendedMegatronDatasetConfig(
-                random_seed=1234,
-                sequence_length=_SEQUENCE_LENGTH,
-                blend_per_split=[blends[Split.train], blends[Split.valid], blends[Split.test]],
-            )
-            datasets = BlendedMegatronDatasetBuilder(
-                TestDataset, [100, 100, 100], lambda: True, config
-            ).build()
-            assert (
-                len(datasets[0]) >= 100 and len(datasets[0]) <= 100 * (1 + _MARGIN) + _NUM_DATASETS
-            )
-            assert (
-                len(datasets[1]) >= 100 and len(datasets[1]) <= 100 * (1 + _MARGIN) + _NUM_DATASETS
-            )
-            assert (
-                len(datasets[2]) >= 100 and len(datasets[2]) <= 100 * (1 + _MARGIN) + _NUM_DATASETS
-            )
+        datasets = BlendedMegatronDatasetBuilder(
+            TestDataset, [1000, None, None], lambda: True, config
+        ).build()
 
         config = BlendedMegatronDatasetConfig(
             random_seed=1234,
@@ -322,73 +274,16 @@ def test_builder():
         assert len(datasets[1]) == sum(_SIZES[Split.train]) / 2
         assert datasets[2] is None
 
-        # 990 9 1
-        # 100000 1000 1
-        # []
+        # This build used to fail when building datasets without a sample buffer
         config = BlendedMegatronDatasetConfig(
             random_seed=1234,
             sequence_length=_SEQUENCE_LENGTH,
             blend=blends[Split.train],
             split="990,9,1",
         )
-        try:
-            # All three of 100000, 1000, and 1 result in error, yet 10000 and 100 do not
-            datasets = BlendedMegatronDatasetBuilder(
-                TestDataset, [100000, 1000, 1], lambda: True, config
-            ).build()
-        except IndexError:
-            ##
-            #
-            # The size per dataset is a function of the requested size, the weight per dataset,
-            # and a constant coefficient. The sizes, and consequently the total size to request,
-            # are modified such that the weights may or may not be sufficiently representative.
-            # To fix this, the weights should be reset according to the new sizes:
-            #
-            # S := size
-            # W := weights
-            #
-            # S = func(S, W)
-            #
-            # W = S / sum(S)
-            #
-            ##
-            config = BlendedMegatronDatasetConfig(
-                random_seed=1234,
-                sequence_length=_SEQUENCE_LENGTH,
-                blend=blends[Split.train],
-                split="990,9,1",
-                renormalize_blend_weights=True,
-            )
-            datasets = BlendedMegatronDatasetBuilder(
-                TestDataset, [100000, 1000, 1], lambda: True, config
-            ).build()
-            assert (
-                len(datasets[0]) >= 100000
-                and len(datasets[0]) <= 100000 * (1 + _MARGIN) + _NUM_DATASETS
-            )
-            assert (
-                len(datasets[1]) >= 1000
-                and len(datasets[1]) <= 1000 * (1 + _MARGIN) + _NUM_DATASETS
-            )
-            assert len(datasets[2]) >= 1 and len(datasets[2]) <= 1 * (1 + _MARGIN) + _NUM_DATASETS
-
-            config = BlendedMegatronDatasetConfig(
-                random_seed=1234,
-                sequence_length=_SEQUENCE_LENGTH,
-                blend=blends[Split.train],
-                split="990,9,1",
-            )
-            datasets = BlendedMegatronDatasetBuilder(
-                TestDataset, [10000, 100, 0], lambda: True, config
-            ).build()
-            assert (
-                len(datasets[0]) >= 10000
-                and len(datasets[0]) <= 10000 * (1 + _MARGIN) + _NUM_DATASETS
-            )
-            assert (
-                len(datasets[1]) >= 100 and len(datasets[1]) <= 100 * (1 + _MARGIN) + _NUM_DATASETS
-            )
-            assert len(datasets[2]) == 0
+        datasets = BlendedMegatronDatasetBuilder(
+            TestDataset, [100000, 1000, 1], lambda: True, config
+        ).build()
 
 
 if __name__ == "__main__":
