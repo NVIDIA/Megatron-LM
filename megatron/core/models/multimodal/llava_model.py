@@ -11,6 +11,7 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel, get_num_image_embeddings
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
+from megatron.core.models.vision.radio import RADIOViTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_group, get_context_parallel_world_size
 from megatron.core.transformer import MegatronModule
@@ -171,24 +172,53 @@ class LLaVAModel(MegatronModule):
         if self.add_encoder:
             self._drop_vision_class_token = drop_vision_class_token
             add_class_token = True
-            if vision_transformer_config.vision_model_type == "siglip":
-                class_token_len = 0
-                add_class_token = False
-                error_msg = (
-                    "Siglip does not support vision class token, "
-                    "set disable-vision-class-token to False."
+            if vision_transformer_config.vision_model_type.startswith(
+                ("clip", "siglip", "internvit")
+            ):
+                if vision_transformer_config.vision_model_type == "siglip":
+                    class_token_len = 0
+                    add_class_token = False
+                    error_msg = (
+                        "Siglip does not support vision class token, "
+                        "set disable-vision-class-token to False."
+                    )
+                    assert not self._drop_vision_class_token, error_msg
+                self.vision_model = CLIPViTModel(
+                    vision_transformer_config,
+                    vision_transformer_layer_spec,
+                    img_h=img_h,
+                    img_w=img_w,
+                    class_token_len=class_token_len,
+                    patch_dim=patch_dim,
+                    model_subtype=vision_transformer_config.vision_model_type,
+                    add_class_token=add_class_token,
                 )
-                assert not self._drop_vision_class_token, error_msg
-            self.vision_model = CLIPViTModel(
-                vision_transformer_config,
-                vision_transformer_layer_spec,
-                img_h=img_h,
-                img_w=img_w,
-                class_token_len=class_token_len,
-                patch_dim=patch_dim,
-                model_subtype=vision_transformer_config.vision_model_type,
-                add_class_token=add_class_token,
-            )
+            elif vision_transformer_config.vision_model_type in ("radio"):
+                # TODO: should refactor into model code itself?
+                class_token_len = 8
+                max_img_h = 2048
+                max_img_w = 2048
+                embedder_bias = False
+                use_mask_token = False
+                self.vision_model = RADIOViTModel(
+                    vision_transformer_config,
+                    vision_transformer_layer_spec,
+                    img_h=img_h,
+                    img_w=img_w,
+                    max_img_h=max_img_h,
+                    max_img_w=max_img_w,
+                    class_token_len=class_token_len,
+                    patch_dim=patch_dim,
+                    add_class_token=add_class_token,
+                    embedder_bias=embedder_bias,
+                    use_mask_token=use_mask_token,
+                )
+            else:
+                raise ValueError(
+                    "Vision model "
+                    f"{vision_transformer_config.vision_model_type} is not "
+                    "supported."
+                )
 
             vision_projection_input_size = vision_transformer_config.hidden_size
             vision_projection_input_size *= 4 if pixel_shuffle else 1
@@ -388,6 +418,7 @@ class LLaVAModel(MegatronModule):
             new_position_ids = torch.cumsum((image_token_mask_lens + 1), dim=-1) - 1
             text_position_ids = new_position_ids[batch_indices, non_image_indices]
 
+            label_batch_indices = None  # dummy value to pass formatting
             # Labels are shifted to left by one.
             # So, shift text position ids and non-image indices to left by one.
             if has_labels:
