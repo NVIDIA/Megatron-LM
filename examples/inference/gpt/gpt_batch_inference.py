@@ -20,7 +20,6 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.transformer.module import MegatronModule
-from megatron.legacy.model.module import Float16Module
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -32,7 +31,9 @@ from megatron.training.checkpointing import load_checkpoint
 from megatron.core import mpu
 from megatron.training.initialize import initialize_megatron
 from megatron.training import get_model
-from typing import List
+import asyncio
+from typing import AsyncIterator, List
+
 
 
 def add_text_generate_args(parser):
@@ -64,6 +65,7 @@ def add_text_generate_args(parser):
     group.add_argument(
         "--max-batch-size", type=int, default=1, help='Max number of prompts to process at once'
     )
+    group.add_argument("--stream", action="store_true", default=False, help="Stream output tokens")
     return parser
 
 
@@ -90,13 +92,44 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
     )
 
     inference_wrapped_model = GPTInferenceWrapper(model, inference_wrapper_config)
-    text_generation_controller = TextGenerationController(
-        inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
-    )
-    return MCoreEngine(
-        text_generation_controller=text_generation_controller, max_batch_size=args.max_batch_size
-    )
+    text_generation_controller = TextGenerationController(inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer)
+    return MCoreEngine(text_generation_controller=text_generation_controller, max_batch_size=args.max_batch_size)
 
+
+async def generate(
+    inference_engine: MCoreEngine,
+    sampling_params: SamplingParams,
+    prompts: List[str],
+) -> List[InferenceRequest]:
+    async def collect_stream(prompt, request_id, stream_generator):
+        print(f"Request {request_id}: {prompt}", end="", flush=True)
+        prev_idx = 0
+        async for output in stream_generator:
+            print(output.generated_text[prev_idx:], end="", flush=True)
+            prev_idx = len(output.generated_text)
+        print()
+
+    request_ids: List[str] = [
+        inference_engine.add_request(
+            prompt=prompt, inference_parameters=sampling_params, streaming=True
+        )
+        for prompt in prompts
+    ]
+    stream_generators = [inference_engine.get_stream_generator(request_id) for request_id in request_ids]
+
+    tasks = [
+        asyncio.create_task(collect_stream(prompt, request_id, stream_generator))
+        for (prompt, request_id, stream_generator) in zip(prompts, request_ids, stream_generators)
+    ]
+
+    await inference_engine.run_engine_async()
+    await asyncio.gather(*tasks)
+
+    results: List[InferenceRequest] = [
+        inference_engine.scheduler.completed_request_pool[request_id] for request_id in request_ids
+    ]
+
+    return results
 
 def main():
     """Main program."""
@@ -137,9 +170,12 @@ def main():
             )
 
     start_time = time.perf_counter()
-    results: List[InferenceRequest] = inference_engine.generate(
-        prompts=args.prompts, sampling_params=sampling_params
-    )
+    if args.stream:
+        results: List[InferenceRequest] = asyncio.run(generate(inference_engine, sampling_params, args.prompts))
+    else:
+        results: List[InferenceRequest] = inference_engine.generate(
+            prompts=args.prompts, sampling_params=sampling_params,
+        )
     end_time = time.perf_counter()
     latency = end_time - start_time
 
@@ -155,6 +191,7 @@ def main():
             }
             print(result)
 
+    torch.distributed.destroy_process_group()
 
 if __name__ == "__main__":
     main()

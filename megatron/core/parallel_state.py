@@ -150,6 +150,7 @@ def create_group(
     use_local_synchronization=False,
     group_desc=None,
 ):
+    """Creates a ProcessGroup."""
     kwargs = {
         'ranks': ranks,
         'timeout': timeout,

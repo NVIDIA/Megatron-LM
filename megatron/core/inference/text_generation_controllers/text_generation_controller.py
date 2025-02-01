@@ -1,11 +1,14 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+import concurrent
 import copy
-from typing import Any, Dict, List, Optional, OrderedDict, Tuple
+import functools
+from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
+from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.communication_utils import broadcast_from_last_pipeline_stage
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
@@ -58,7 +61,7 @@ class TextGenerationController:
         tokens_gpu_tensor: torch.Tensor,
         lengths_gpu_tensor: torch.Tensor,
         detokenize_segments: bool,
-    ) -> tuple[str, List[str] | None]:
+    ) -> tuple[str, Optional[List[List[str]]]]:
         """Detokenize the generated tokens.
 
         Args:
@@ -79,8 +82,8 @@ class TextGenerationController:
             tokens = tokens_gpu_tensor.cpu().numpy().tolist()
             return self.tokenizer.detokenize(tokens), None
 
-        prompts_plus_generations = []
-        prompts_plus_generations_segments = []
+        prompts_plus_generations: List[str] = []
+        prompts_plus_generations_segments: List[List[str]] = []
 
         tokens_gpu_tensor = torch.unsqueeze(tokens_gpu_tensor, 0)
         tokens = tokens_gpu_tensor.cpu().numpy().tolist()
@@ -106,7 +109,7 @@ class TextGenerationController:
         last_token_logits: torch.Tensor,
         sampling_params: Optional[SamplingParams] = None,
         vocab_size: Optional[int] = None,
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
         """Samples the logits to generate outputs
 
@@ -226,7 +229,7 @@ class TextGenerationController:
         # EOD and generation has started
         generated_sequence_lengths += ~is_generation_done_tensor & generation_started
 
-        return is_generation_done_tensor, generated_sequence_lengths
+        return is_generation_done_tensor, generated_sequence_lengths.int()
 
     def pad_input_prompt_tokens(
         self,
@@ -275,7 +278,9 @@ class TextGenerationController:
         raise Exception("Not implemented yet")
 
     def generate_all_output_tokens_static_batch(
-        self, active_requests: OrderedDict[str, InferenceRequest]
+        self,
+        active_requests: OrderedDict[str, InferenceRequest],
+        active_streams: Optional[OrderedDict[str, AsyncStream]] = None,
     ) -> OrderedDict[str, InferenceRequest]:
         """Utility to generate the all the output tokens and probabilities for the prompts .
 
@@ -329,6 +334,23 @@ class TextGenerationController:
         generated_sequence_lengths = torch.zeros(
             batch_size, device=torch.cuda.current_device()
         ).cuda()
+
+        streaming_enabled = active_streams is not None and len(active_streams) > 0
+        if streaming_enabled:
+            # Start a separate thread for streaming tokens to avoid blocking the
+            # main computation
+            streaming_idx: List[int] = [
+                i
+                for (i, request_id) in enumerate(active_requests.keys())
+                if request_id in active_streams
+            ]
+            streaming_request_ids: List[str] = list(active_streams.keys())
+            streams: List[AsyncStream] = list(active_streams.values())
+            streaming_requests: List[InferenceRequest] = [
+                active_requests[request_id] for request_id in streaming_request_ids
+            ]
+            streaming_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            stream_tokens = functools.partial(self.stream_tokens, sampling_params)
 
         # Check whether CUDA graphs are enabled
         if hasattr(self.inference_wrapped_model.model, "module"):  # if model is Float16Module
@@ -423,6 +445,26 @@ class TextGenerationController:
                         generated_sequence_lengths=generated_sequence_lengths,
                     )
                 )
+
+                # Stream intermediate outputs
+                if streaming_enabled:
+                    streaming_executor.submit(
+                        stream_tokens,
+                        streaming_request_ids,
+                        streaming_requests,
+                        streams,
+                        generation_started[streaming_idx].cpu(),
+                        is_generation_done_tensor[streaming_idx].cpu(),
+                        batch_prompt_tokens[streaming_idx].cpu(),
+                        prompt_lengths_in_batch[streaming_idx].cpu(),
+                        generated_sequence_lengths[streaming_idx].cpu(),
+                        (
+                            output_log_probs[streaming_idx].cpu()
+                            if output_log_probs is not None
+                            else [None] * len(streaming_idx)
+                        ),
+                    )
+
                 # Boolean flag indicating if all prompts are finished
                 all_prompts_done = torch.all(is_generation_done_tensor)
                 if all_prompts_done:
@@ -431,6 +473,12 @@ class TextGenerationController:
                 # Disable attention mask for CUDA graphs (decode only)
                 if use_attention_mask and enable_cuda_graph and torch.all(generation_started):
                     use_attention_mask = False
+
+        # Close all streams
+        if streaming_enabled:
+            streaming_executor.shutdown()
+            for stream in streams:
+                stream.finish()
 
         # Include all the generated tokens
         batch_prompt_tokens_with_generations = batch_prompt_tokens[:, : (context_end_position + 1)]
@@ -475,7 +523,7 @@ class TextGenerationController:
                 .tolist()
             )
             request.status = Status.COMPLETED
-            request.generated_text, request.segments = self.detokenize_generations(
+            request.generated_text, request.generated_segments = self.detokenize_generations(
                 required_result_tokens,
                 input_prompt_length + generated_sequence_lengths,
                 sampling_params.return_segments,
@@ -496,3 +544,107 @@ class TextGenerationController:
             A dict of the inference input for the current batch.
         """
         return self.inference_wrapped_model.prep_inference_input(prompts_tokens)
+
+    def stream_tokens(
+        self,
+        sampling_params: SamplingParams,
+        request_ids: List[str],
+        requests: List[InferenceRequest],
+        streams: List[AsyncStream],
+        generation_started: List[bool],
+        is_generation_done: List[bool],
+        tokens: torch.Tensor,
+        prompt_lengths: List[int],
+        generated_lengths: List[int],
+        output_log_probs: Union[torch.Tensor, None],
+    ):
+        """Asynchronously streams tokens for the given requests.
+
+        Args:
+            sampling_params (SamplingParams): The sampling parameters.
+            request_ids (List[str]): The request IDs.
+            request (List[InferenceRequest]): The requests.
+            stream (List[AsyncStream]): The streams over which to send tokens.
+            generation_started (List[bool]): Whether the decode step has started.
+            is_generation_done (List[bool]): Whether generation has completed.
+            tokens (torch.Tensor): The tokens for this request.
+            prompt_lengths (List[int]): The number of prompt tokens for each request.
+            generated_lengths (List[int]): The number of output tokens for each request.
+            output_log_probs (torch.Tensor, optional): The log probs for each request.
+        """
+
+        def stream_token(
+            request_id: str,
+            request: InferenceRequest,
+            stream: AsyncStream,
+            generation_started: bool,
+            is_generation_done: bool,
+            tokens: torch.Tensor,
+            prompt_length: int,
+            generated_length: int,
+            output_log_probs: Union[torch.Tensor, None],
+        ):
+            """Asynchronously streams a token for the given request."""
+
+            if not generation_started or stream.finished:
+                return
+
+            num_tokens_to_generate = sampling_params.num_tokens_to_generate
+            return_segments = sampling_params.return_segments
+            detokenize_streaming_text = not getattr(
+                sampling_params, "no_detokenize_streaming_text", False
+            )
+
+            generated_tokens = tokens[prompt_length : prompt_length + generated_length]
+
+            if detokenize_streaming_text:
+                generated_text, generated_segments = self.detokenize_generations(
+                    generated_tokens, prompt_length + generated_length, return_segments
+                )
+            else:
+                generated_text = ""
+                generated_segments = []
+
+            if output_log_probs is not None:
+                generated_log_probs = (
+                    output_log_probs[prompt_length - 1 : prompt_length + generated_length - 1]
+                    .cpu()
+                    .numpy()
+                    .tolist()
+                )
+            else:
+                generated_log_probs = None
+
+            stream.put(
+                InferenceRequest(
+                    request_id=request_id,
+                    prompt=request.prompt,
+                    inference_parameters=request.inference_parameters,
+                    prompt_tokens=request.prompt_tokens,
+                    arrival_time=request.arrival_time,
+                    status=request.status,
+                    encoder_prompt=request.encoder_prompt,
+                    generated_text=generated_text,
+                    generated_segments=generated_segments,
+                    generated_tokens=generated_tokens,
+                    generated_log_probs=generated_log_probs,
+                    generated_length=generated_length,
+                )
+            )
+
+            if is_generation_done or generated_length == num_tokens_to_generate:
+                stream.finish()
+
+        ret = map(
+            stream_token,
+            request_ids,
+            requests,
+            streams,
+            generation_started,
+            is_generation_done,
+            tokens,
+            prompt_lengths,
+            generated_lengths,
+            output_log_probs,
+        )
+        list(ret)

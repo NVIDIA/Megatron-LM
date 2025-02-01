@@ -1,11 +1,13 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+import functools
 import time
 import typing
 from collections import OrderedDict
-from typing import Dict, Optional
+from typing import Dict, Optional, Type, Union
 
 import torch
 
+from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import Counter
@@ -23,6 +25,8 @@ class Scheduler:
 
     def __init__(self, max_batch_size: int):
         self.max_batch_size = max_batch_size
+        self.requests: Dict[str, InferenceRequest] = OrderedDict()
+        self.streams: Dict[str, AsyncStream] = OrderedDict()
         self.active_request_pool: Dict[str, InferenceRequest] = OrderedDict()
         self.waiting_request_pool: Dict[str, InferenceRequest] = OrderedDict()
         self.completed_request_pool: Dict[str, InferenceRequest] = OrderedDict()
@@ -35,7 +39,8 @@ class Scheduler:
         encoder_prompt: Optional[str] = None,
         inference_parameters: Optional[SamplingParams] = None,
         arrival_time: Optional[float] = None,
-    ):
+        streaming: bool = False,
+    ) -> str:
         """Add an incoming request
 
         This method will add the request to either the active pool or the waiting pool
@@ -47,6 +52,7 @@ class Scheduler:
             encoder_prompt (str): Encoder input string
             inference_parameters (SamplingParams): The inference parameters
             arrival_time (float, optional): The incoming request time. Defaults to None.
+            streaming (bool, optional): Whether to asynchronously stream tokens for this request.
 
         Returns:
             The request_id for the new request.
@@ -62,6 +68,10 @@ class Scheduler:
             else Status.WAITING_IN_QUEUE
         )
 
+        if streaming:
+            abort_request = functools.partial(self.abort_request, request_id=request_id)
+            self.streams[request_id] = AsyncStream(request_id, abort_request)
+
         if inference_parameters is None:
             inference_parameters = SamplingParams()
 
@@ -74,6 +84,8 @@ class Scheduler:
             status=status,
             encoder_prompt=encoder_prompt,
         )
+
+        self.requests[request_id] = inference_request
 
         if status == status.ACTIVE_BUT_NOT_GENERATING_TOKENS:
             self.active_request_pool[request_id] = inference_request
@@ -135,3 +147,14 @@ class Scheduler:
             and len(self.waiting_request_pool) > 0
         ):
             self.add_earliest_waiting_request_to_active_pool()
+
+    def abort_request(
+        self,
+        request_id: str,
+        *,
+        exception: Optional[Union[BaseException, Type[BaseException]]] = None
+    ):
+        """Cancels the given request"""
+        stream = self.streams.get(request_id, None)
+        if stream is not None:
+            stream.finish(exception=exception)
