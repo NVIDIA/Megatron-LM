@@ -19,9 +19,8 @@ def add_arguments(parser):
 
     # TODO(jbarker): Need assertion to make sure *exactly* one of these is used
     parser.add_argument('--model-size', type=str, required=True,
-                        choices=['llama2-7B', 'llama2-13B', 'llama2-70B', 'llama2-7Bf', 'llama2-13Bf', 'llama2-70Bf', 'llama3-8B', 'llama3-70B', 'llama3-8Bf', 'llama3-70Bf', 'mistral-7B', 'mistral-7Bf', 'yi-34B', 'qwen2.5-7B', 'qwen2.5-72B', 'qwen2.5-7Bf', 'qwen2.5-72Bf'],
-                        help='Model size can be `llama2-7B`, `llama2-13B`, `llama2-70B`, `llama3-8B`, `llama3-70B`, `mistral-7B`, `qwen2.5-7B`, `qwen2.5-72B` (for pretrained models), '
-                        'and `llama2-7Bf`, `llama2-13Bf`, `llama2-70Bf`, `llama3-8Bf`, `llama3-70bf`, `mistral-7Bf`, `qwen2.5-7Bf`, and `qwen2.5-72Bf` (for chat-finetuned models).')
+                        choices=['llama2-7B', 'llama2-13B', 'llama2-70B', 'llama2-7Bf', 'llama2-13Bf', 'llama2-70Bf', 'llama3', 'mistral', 'yi-34B', 'qwen2.5'],
+                        help='Select model size/type')
     parser.add_argument('--checkpoint-type', type=str, required=True,
                         choices=['meta', 'hf'],
                         help='Type of checkpoint to convert, options are "meta" or "hf"')
@@ -54,17 +53,6 @@ NUM_SHARDS = {
     "llama2-13Bf": 2,
     "llama2-70B": 8,
     "llama2-70Bf": 8,
-    "llama3-8B": 1,
-    "llama3-8Bf": 1,
-    "llama3-70B": 8,
-    "llama3-70Bf": 8,
-    "mistral-7B": 1,
-    "mistral-7Bf": 1,
-    "yi-34B": 8,
-    "qwen2.5-7B": 1,
-    "qwen2.5-7Bf": 1,
-    "qwen2.5-72B": 8,
-    "qwen2.5-72Bf": 8,
 }
 
 
@@ -85,14 +73,11 @@ def write_json(text, path):
 # This conversion is adapted from
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/convert_llama_weights_to_hf.py
 def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
-
     if "llama2" in model_size:
         from transformers import LlamaConfig as ModelConfig
         from transformers import  LlamaTokenizer, LlamaTokenizerFast
-    elif "llama3" in model_size:
-        from transformers import LlamaConfig as ModelConfig
-    elif "mistral" in model_size:
-        from transformers import MistralConfig as ModelConfig
+    else:
+        raise NotImplementedError(f"converting {model_size} is only supported using HuggingFace weights")
 
     # for backward compatibility, before you needed the repo to be called `my_repo/model_size`
     if not os.path.isfile(os.path.join(input_base_path, "params.json")):
@@ -117,21 +102,14 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
 
     if "llama2" in model_size:
         tokenizer_class = LlamaTokenizer if LlamaTokenizerFast is None else LlamaTokenizerFast
-    elif model_size in ["llama3", "mistral"]:
-        tokenizer_class = transformers.AutoTokenizer.from_pretrained
     else:
         raise AttributeError(f"model_size={model_size} not supported")
+
     if tokenizer_path is not None:
-        if "llama" in model_size:
+        if "llama2" in model_size:
             tokenizer = tokenizer_class(tokenizer_path)
-            if "llama2" in model_size:
-                tokenizer.save_pretrained(model_path)
-                vocab_size = tokenizer.vocab_size if tokenizer_path is not None else 32000
-            elif "llama3" in model_size:
-                 vocab_size = 128256
-        elif "mistral" in model_size:
-            tokenizer = tokenizer_class.from_file(tokenizer_path)
-            vocab_size = 32768
+            tokenizer.save_pretrained(model_path)
+            vocab_size = tokenizer.vocab_size if tokenizer_path is not None else 32000
         else:
             raise AttributeError(f"model_size={model_size} is not supported")
 
@@ -311,7 +289,7 @@ def load_args_from_checkpoint(args, model_size):
         args.max_position_embeddings = 4096
     else:
         args.max_position_embeddings = model_args["max_position_embeddings"]
-    # <<<
+
     args.hidden_size = model_args["hidden_size"]
     args.num_attention_heads = model_args["num_attention_heads"]
     args.num_layers = model_args["num_hidden_layers"]
@@ -322,7 +300,7 @@ def load_args_from_checkpoint(args, model_size):
     args.swiglu = True
     args.normalization = "RMSNorm"
     args.add_bias_linear = False
-    args.untie_embeddings_and_output_weights = True
+    args.untie_embeddings_and_output_weights = not model_args.get("tie_word_embeddings", False)
     args.vocab_size = model_args["vocab_size"]
     args.padded_vocab_size = model_args["vocab_size"]
     args.ffn_hidden_size = model_args["intermediate_size"]
@@ -341,7 +319,8 @@ def set_preprocess_state(args, model, hf_model):
 def set_postprocess_state(args, model, hf_model):
     '''Set output layer & norm params.'''
     model.language_model.encoder.final_norm.weight.data.copy_(hf_model.model.norm.weight)
-    model.language_model.output_layer.weight.data.copy_(hf_model.lm_head.weight)
+    if args.untie_embeddings_and_output_weights:
+        model.language_model.output_layer.weight.data.copy_(hf_model.lm_head.weight)
 
 
 def set_attn_state(args, layer, hf_layer):

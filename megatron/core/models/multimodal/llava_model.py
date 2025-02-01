@@ -58,6 +58,7 @@ class LLaVAModel(MegatronModule):
             missing when loading a checkpoint. Default False.
         parallel_output (bool): Keep outputs split across tensor parallel ranks.
             This is typically True for training and False for inference.
+        share_embeddings_and_output_weights (bool): Input embedding and output layer share weights.
         language_position_embedding_type (str): Language model position embedding type.
         language_rotary_percent (float): RoPE percent. Defaults to 1.0.
         pre_process (bool): Include embedding layer in the decoder (used with pipeline parallel).
@@ -71,6 +72,7 @@ class LLaVAModel(MegatronModule):
         patch_dim (int): The size of each image patch side.
         language_rotary_base (int): RoPE base.
         language_rope_scaling (bool): Toggle RoPE scaling.
+        language_rope_scaling_factor (float): RoPE scaling factor. Defaults to 8.
         image_token_index (int): Token ID for image token such as <image>.
         pixel_shuffle (bool): Enable pixel shuffle.
         tile_tags (list): Optional tile tags.
@@ -90,6 +92,7 @@ class LLaVAModel(MegatronModule):
         vision_projection_type: str = "mlp",
         allow_missing_vision_projection_checkpoint: bool = False,
         parallel_output: bool = True,
+        share_embeddings_and_output_weights: bool = False,
         language_position_embedding_type: str = 'learned_absolute',
         language_rotary_percent: float = 1.0,
         pre_process: bool = True,
@@ -101,6 +104,7 @@ class LLaVAModel(MegatronModule):
         patch_dim: int = 14,
         language_rotary_base: int = 10000,
         language_rope_scaling: bool = False,
+        language_rope_scaling_factor: float = 8.0,
         image_token_index: int = DEFAULT_IMAGE_TOKEN_INDEX,
         pixel_shuffle: bool = False,
         tile_tags: Optional[list] = None,
@@ -143,7 +147,7 @@ class LLaVAModel(MegatronModule):
 
         # This attribute is needed to check if an all-reduce is required
         # on the word embeddings inside `finalize_model_grads._allreduce_word_embedding_grads`.
-        self.share_embeddings_and_output_weights = False
+        self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         if self.add_decoder:
             self.language_model = GPTModel(
                 config=language_transformer_config,
@@ -151,12 +155,14 @@ class LLaVAModel(MegatronModule):
                 vocab_size=language_vocab_size,
                 max_sequence_length=language_max_sequence_length,
                 parallel_output=parallel_output,
+                share_embeddings_and_output_weights=share_embeddings_and_output_weights,
                 position_embedding_type=language_position_embedding_type,
                 rotary_percent=language_rotary_percent,
                 pre_process=self.pre_process,
                 post_process=self.post_process,
                 rotary_base=language_rotary_base,
                 rope_scaling=language_rope_scaling,
+                rope_scaling_factor=language_rope_scaling_factor,
                 scatter_embedding_sequence_parallel=False,
             )
             self.share_embeddings_and_output_weights = (
@@ -390,6 +396,7 @@ class LLaVAModel(MegatronModule):
 
             # Labels are shifted to left by one.
             # So, shift text position ids and non-image indices to left by one.
+            label_batch_indices = None
             if has_labels:
                 label_text_position_ids = text_position_ids - 1
                 valid_label_text_position_ids = label_text_position_ids >= 0

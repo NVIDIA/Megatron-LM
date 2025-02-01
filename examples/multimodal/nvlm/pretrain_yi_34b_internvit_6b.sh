@@ -101,6 +101,7 @@ OPTIONS=" \
     --init-method-std 0.014 \
     --attention-dropout ${AD} \
     --hidden-dropout ${HD} \
+    --untie-embeddings-and-output-weights \
     --eod-mask-loss \
     --bf16 \
     --tensorboard-dir=${TENSORBOARD_DIR} \

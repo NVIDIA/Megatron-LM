@@ -2,7 +2,7 @@
 
 NOTE: In order to simplify code we now only support converting llama-3.x and mistral checkpoints downloaded from Huggingface.
 
-The [Llama-2](https://ai.meta.com/llama/) and [Llama-3](https://llama.meta.com/) family of models are an open-source set of pretrained & finetuned (for chat) models that have achieved strong results across a wide set of benchmarks. At their times of release, both Llama-2 and Llama-3 models achieved among the best results for open-source models, and were competitive with leading closed-source models (see https://arxiv.org/pdf/2307.09288.pdf and https://ai.meta.com/blog/meta-llama-3/).
+The [Llama-2](https://ai.meta.com/llama/) and [Llama-3.x](https://llama.meta.com/) family of models are an open-source set of pretrained & finetuned (for chat) models that have achieved strong results across a wide set of benchmarks. At their times of release, both Llama-2 and Llama-3 models achieved among the best results for open-source models, and were competitive with leading closed-source models (see https://arxiv.org/pdf/2307.09288.pdf and https://ai.meta.com/blog/meta-llama-3/).
 
 Similarly, [Mistral-7b](https://mistral.ai/news/announcing-mistral-7b/) is an open-source model with pretrained and finetuned (for chat) variants that achieve strong benchmark results.
 
@@ -26,18 +26,12 @@ Architecturally Llama-2, Llama-3 and Mistral-7b are very similar. As such Megatr
     - [Multilingual](#multilingual)
     - [LM Evaluation Harness](#lm-evaluation-harness)
     - [MMLU](#mmlu)
-- [Llama-3](#llama-3)
+- [Llama-3.x](#llama-3x)
   - [Download Huggingface checkpoints](#download-huggingface-checkpoints)
   - [Convert checkpoint format](#convert-checkpoint-format-1)
     - [Huggingface format](#huggingface-format-1)
   - [(Optional) Validate checkpoints](#optional-validate-checkpoints)
   - [Launch model](#launch-model-1)
-- [Llama-3.1](#llama-31)
-  - [Download Huggingface checkpoints](#download-huggingface-checkpoints-1)
-  - [Convert checkpoint format](#convert-checkpoint-format-2)
-    - [Huggingface format](#huggingface-format-2)
-  - [(Optional) Validate checkpoints](#optional-validate-checkpoints-1)
-  - [Launch model](#launch-model-2)
 - [Mistral-7b](#mistral-7b)
   - [Download Huggingface checkpoints](#download-huggingface-checkpoints-2)
   - [Convert checkpoint format](#convert-checkpoint-format-3)
@@ -220,9 +214,9 @@ Note: the number in brackets is the number of sub-tasks for each supercategory.
 | other (business, health, misc.) [14]  | 0.08% | 0.06% | 0.12% |
 | social sciences [12]  | 0.37% | 0.21% | 0.01% |
 
-# Llama-3
+# Llama-3.x
 
-Llama-3 checkpoints can be loaded into Megatron for inference and for finetuning. Loading these checkpoints consists of several steps:
+Llama-3.x checkpoints can be loaded into Megatron for inference and for finetuning. Loading these checkpoints consists of several steps:
 
 1. Get access to download the checkpoints (weights and tokenizer).
 2. Convert the checkpoints from Huggingface format to Megatron format.
@@ -233,7 +227,7 @@ The following sections detail these steps.
 
 ## Download Huggingface checkpoints
 
-Users must first apply for access to download the Llama-3 checkpoints from [Huggingface](https://huggingface.co/meta-llama).
+Users must first apply for access to download the Llama-3.x checkpoints from [Huggingface](https://huggingface.co/meta-llama).
 
 ## Convert checkpoint format
 
@@ -241,14 +235,16 @@ We recommend passing `--dtype bf16` for training or finetuning. Inference can be
 
 ### Huggingface format
 
-The HF checkpoints can be converted to Megatron format by using Megatron's own Llama-3 checkpoint converter for HF format (see script `tools/checkpoint/loader_llama_mistral.py`). One important argument that must be set correctly is the tensor parallel size (`TP`) for each model. The following table shows these values:
+The HF checkpoints can be converted to Megatron format by using Megatron's own Llama-3.x checkpoint converter for HF format (see script `tools/checkpoint/loader_llama_mistral.py`). One important argument that must be set correctly is the tensor parallel size (`TP`) for each model. The following table shows these values:
 
 | Model size | Tensor parallel size (`TP`) |
 | ---------- | --------------------------- |
+|  1B        | 1                           |
+|  3B        | 1                           |
 |  8B        | 1                           |
 | 70B        | 8                           |
 
-Using these values for `TP`, along with the path to the Llama-3 tokenizer model (automatically downloaded with original checkpoint download; see `${TOKENIZER_MODEL}` below), run the following command from the root of your Megatron source code to convert from HF format to Megatron format:
+Using these values for `TP`, along with the path to the Llama-3.x tokenizer model (automatically downloaded with original checkpoint download; see `${TOKENIZER_MODEL}` below), run the following command from the root of your Megatron source code to convert from HF format to Megatron format:
 
 ```
 $>: python tools/checkpoint/convert.py \
@@ -261,16 +257,14 @@ $>: python tools/checkpoint/convert.py \
  >    --load-dir ${HF_FORMAT_DIR} \
  >    --save-dir ${MEGATRON_FORMAT_DIR} \
  >    --tokenizer-model ${TOKENIZER_MODEL} \
- >    --model-size llama3-8B \
+ >    --model-size llama3 \
 ```
-
-Valid values for `--model-size` are `llama3-8B` and `llama3-70B` (for pretrained-only models), and `llama3-8Bf` and `llama3-70Bf` (for chat-finetuned models).
 
 After this conversion, we are ready to load the checkpoints into a Megatron GPT model.
 
 ## (Optional) Validate checkpoints
 
-A Megatron-LM text generation server for Llama3 can be launched using the script `examples/llama_mistral/run_text_generation_llama3.sh <PATH_TO_CONVERTED_CORE_CHECKPOINT> <PATH_TO_DOWNLOADED_HUGGINGFACE_CHECKPOINT>`.
+A Megatron-LM text generation server for Llama3 can be launched using the script `examples/inference/llama_mistral/run_text_generation_llama3.sh <PATH_TO_CONVERTED_CORE_CHECKPOINT> <PATH_TO_DOWNLOADED_HUGGINGFACE_CHECKPOINT>`. For Llama3.1, please use `examples/inference/llama_mistral/run_text_generation_llama3.1.sh`.
 
 Once running, query the server with `curl 'http://<TEXT_GENERATION_SERVER_IP>:5000/api' -X 'PUT' -H 'Content-Type: application/json; charset=UTF-8'  -d '{"prompts":["<SOME_PROMPT>"], "tokens_to_generate":100, "top_k":1}'`.
 
@@ -278,7 +272,7 @@ A reference generation for comparison can be obtained from the Huggingface trans
 
 ## Launch model
 
-If loading for either inference or finetuning, use the following arguments:
+If loading for either inference or finetuning, use the following arguments for Llama 3.0:
 
 ```
 --tensor-model-parallel-size ${TP} \
@@ -310,67 +304,7 @@ If loading for either inference or finetuning, use the following arguments:
 --bf16 \
 ```
 
-**Note:** If you converted to the legacy model format (i.e., `--saver legacy`), please see [here](#using-legacy-model-format).
-
-# Llama-3.1
-
-Llama-3 checkpoints can be loaded into Megatron for inference and for finetuning. Loading these checkpoints consists of several steps:
-
-1. Get access to download the checkpoints (weights and tokenizer).
-2. Convert the checkpoints from Huggingface format to Megatron format.
-3. (Optional) Validate converted checkpoints
-4. Setup arguments for launching the model.
-
-The following sections detail these steps.
-
-## Download Huggingface checkpoints
-
-Users must first apply for access to download the Llama-3 checkpoints from [Huggingface](https://huggingface.co/meta-llama).
-
-## Convert checkpoint format
-
-We recommend passing `--dtype bf16` for training or finetuning. Inference can be done in bfloat16 or float16.
-
-### Huggingface format
-
-The HF checkpoints can be converted to Megatron format by using Megatron's own Llama-3 checkpoint converter for HF format (see script `tools/checkpoint/loader_llama_mistral.py`). One important argument that must be set correctly is the tensor parallel size (`TP`) for each model. The following table shows these values:
-
-| Model size | Tensor parallel size (`TP`) |
-| ---------- | --------------------------- |
-|  8B        | 1                           |
-| 70B        | 8                           |
-
-Using these values for `TP`, along with the path to the Llama-3 tokenizer model (automatically downloaded with original checkpoint download; see `${TOKENIZER_MODEL}` below), run the following command from the root of your Megatron source code to convert from HF format to Megatron format:
-
-```
-$>: python tools/checkpoint/convert.py \
- >    --bf16 \
- >    --model-type GPT \
- >    --loader llama_mistral \
- >    --saver core \
- >    --target-tensor-parallel-size ${TP} \
- >    --checkpoint-type hf \
- >    --load-dir ${HF_FORMAT_DIR} \
- >    --save-dir ${MEGATRON_FORMAT_DIR} \
- >    --tokenizer-model ${TOKENIZER_MODEL} \
- >    --model-size llama3-8B \
-```
-
-Valid values for `--model-size` are `llama3.1-8B` and `llama3.1-70B` (for pretrained-only models), and `llama3.1-8Bf` and `llama3.1-70Bf` (for chat-finetuned models).
-
-After this conversion, we are ready to load the checkpoints into a Megatron GPT model.
-
-## (Optional) Validate checkpoints
-
-A Megatron-LM text generation server for Llama3.1 can be launched using the script `examples/llama_mistral/run_text_generation_llama3.1.sh <PATH_TO_CONVERTED_CORE_CHECKPOINT> <PATH_TO_DOWNLOADED_HUGGINGFACE_CHECKPOINT>`.
-
-Once running, query the server with `curl 'http://<TEXT_GENERATION_SERVER_IP>:5000/api' -X 'PUT' -H 'Content-Type: application/json; charset=UTF-8'  -d '{"prompts":["<SOME_PROMPT>"], "tokens_to_generate":100, "top_k":1}'`.
-
-A reference generation for comparison can be obtained from the Huggingface transformers library by running `python examples/llama_mistral/huggingface_reference.py --model_path <PATH_TO_DOWNLOADED_HUGGINGFACE_CHECKPOINT> --prompt <SOME_PROMPT>`.
-
-## Launch model
-
-If loading for either inference or finetuning, use the following arguments:
+For Llama3.1 please use the following arguments:
 
 ```
 --tensor-model-parallel-size ${TP} \
@@ -437,20 +371,18 @@ $>: python tools/checkpoint/convert.py \
  >    --load-dir ${HF_FORMAT_DIR} \
  >    --save-dir ${MEGATRON_FORMAT_DIR} \
  >    --tokenizer-model ${TOKENIZER_MODEL} \
- >    --model-size mistral-7B \
+ >    --model-size mistral \
 ```
-
-Valid values for `--model-size` are mistral-7B for the pretrained model or mistral-7Bf for the chat fine-tuned model.
 
 After this conversion, we are ready to load the checkpoints into a Megatron core GPT model.
 
 ## (Optional) Validate checkpoints
 
-A Megatron-LM text generation server for Mistral-7B can be launched using the script `examples/llama_mistral/run_text_generation_mistral.sh <PATH_TO_CONVERTED_CORE_CHECKPOINT> <PATH_TO_DOWNLOADED_HUGGINGFACE_CHECKPOINT>`.
+A Megatron-LM text generation server for Mistral-7B can be launched using the script `examples/inference/llama_mistral/run_text_generation_mistral.sh <PATH_TO_CONVERTED_MCORE_CHECKPOINT> <PATH_TO_DOWNLOADED_HUGGINGFACE_CHECKPOINT>`.
 
 Once running, query the server with `curl 'http://<TEXT_GENERATION_SERVER_IP>:5000/api' -X 'PUT' -H 'Content-Type: application/json; charset=UTF-8'  -d '{"prompts":["<SOME_PROMPT>"], "tokens_to_generate":100, "top_k":1}'`.
 
-A reference generation for comparison can be obtained from the Huggingface transformers library by running `python examples/llama_mistral/huggingface_reference.py --model_path <PATH_TO_DOWNLOADED_HUGGINGFACE_CHECKPOINT> --prompt <SOME_PROMPT>`.
+A reference generation for comparison can be obtained from the Huggingface transformers library by running `python examples/inference/llama_mistral/huggingface_reference.py --model_path <PATH_TO_DOWNLOADED_HUGGINGFACE_CHECKPOINT> --prompt <SOME_PROMPT>`.
 
 ## Launch model
 
@@ -490,7 +422,7 @@ If loading for either inference or finetuning, use the following arguments:
 
 *Note: Experimental*
 
-Many models such as Yi-34B use the Llama architecture and may be converted from HuggingFace to Megatron using the commands in [Llama3](#llama-3).
+Many models such as Yi-34B and Qwen2.x use the Llama architecture and may be converted from HuggingFace to Megatron using the commands in [Llama-3.x](#llama-3x).
 
 # Known numerical differences
 

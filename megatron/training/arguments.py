@@ -411,10 +411,12 @@ def validate_args(args, defaults={}):
     dtype_map = {
         'fp32': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16, 'fp8': torch.uint8,
     }
-    args.main_grads_dtype = dtype_map[args.main_grads_dtype]
-    args.main_params_dtype = dtype_map[args.main_params_dtype]
-    args.exp_avg_dtype = dtype_map[args.exp_avg_dtype]
-    args.exp_avg_sq_dtype = dtype_map[args.exp_avg_sq_dtype]
+    map_dtype = lambda d: d if isinstance(d, torch.dtype) else dtype_map[d]
+
+    args.main_grads_dtype = map_dtype(args.main_grads_dtype)
+    args.main_params_dtype = map_dtype(args.main_params_dtype)
+    args.exp_avg_dtype = map_dtype(args.exp_avg_dtype)
+    args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
 
     if args.fp8_param_gather:
         assert args.use_distributed_optimizer, \
@@ -1018,7 +1020,9 @@ def _add_network_size_args(parser):
     group.add_argument('--rotary-seq-len-interpolation-factor', type=int, default=None,
                        help='Sequence length interpolation factor for rotary embeddings.')
     group.add_argument('--use-rope-scaling', action='store_true',
-                       help='Apply rope scaling as used in llama3.1')
+                       help='Apply rope scaling as used in llama3.x')
+    group.add_argument('--rope-scaling-factor', type=float, default=8.0,
+                       help='Rope scaling factor in llama3.x models')
     group.add_argument('--no-position-embedding',
                        action='store_false',
                        help='Disable position embedding. Deprecated: use --position-embedding-type',
@@ -2156,7 +2160,7 @@ def _add_moe_args(parser):
                        help='Number of experts to route to for each token. The default is 2.')
     group.add_argument('--moe-router-pre-softmax', action='store_true',
                        help='Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. By default, softmax is done after top-k.')
-    group.add_argument('--moe-router-topk-limited-devices', type=int, default=None, 
+    group.add_argument('--moe-router-topk-limited-devices', type=int, default=None,
                        help='Number of expert parallel ranks to consider for each token during routing. Perform top-k routing on a subset of expert parallel ranks by first selecting N ranks for each token, then conducting top-k selection among experts on these devices. Default is None, which means no limited devices.')
     group.add_argument('--moe-router-topk-scaling-factor', type=float, default=None,
                        help='Scaling factor for routing score in top-k selection, only works when --moe-router-pre-softmax enabled. Defaults to None, which means no scaling.')

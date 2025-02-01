@@ -46,7 +46,8 @@ class RotaryEmbedding(nn.Module):
             for longer sequences. The value must be a float larger than 1.0. Defaults to None
         rotary_base (int, optional): Base period for rotary position embeddings. Defaults to
             10000.
-        rope_scaling (bool, optional): Apply rope scaling as used in llama 3.1
+        rope_scaling (bool, optional): Apply rope scaling as used in llama 3.x.
+        rope_scaling_factor (float, optional): rope scaling factor in llama 3.x. Defaults to 8.
         use_cpu_initialization (bool, optional): If False, initialize the inv_freq directly
             on the GPU. Defaults to False
     """
@@ -59,6 +60,7 @@ class RotaryEmbedding(nn.Module):
         seq_len_interpolation_factor: float = None,
         rotary_base: int = 10000,
         rope_scaling: bool = False,
+        rope_scaling_factor: float = 8.0,
         use_cpu_initialization: bool = False,
     ) -> None:
         super().__init__()
@@ -75,7 +77,7 @@ class RotaryEmbedding(nn.Module):
         )
 
         if rope_scaling:
-            self.inv_freq = self._apply_scaling(self.inv_freq)
+            self.inv_freq = self._apply_scaling(self.inv_freq, factor=rope_scaling_factor)
 
     def _apply_scaling(
         self,
