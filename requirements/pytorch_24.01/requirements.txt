@@ -2,6 +2,7 @@ einops
 flask-restful
 nltk
 pytest
+pytest_asyncio
 pytest-cov
 pytest_mock
 pytest-random-order
