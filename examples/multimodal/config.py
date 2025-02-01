@@ -100,6 +100,19 @@ def get_language_model_config(config):
         config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
         config.ffn_hidden_size = 29568
+    elif config.language_model_type == "llama3.2_1b":
+        config.activation_func = torch.nn.functional.silu
+        config.add_bias_linear = False
+        config.bias_activation_fusion = False
+        config.gated_linear_unit = True
+        config.apply_query_key_layer_scaling = False
+        config.layernorm_zero_centered_gamma = (
+            False  # Zero centered gamma not supported for RMSNorm
+        )
+        config.bias_dropout_fusion = False
+        config.apply_rope_fusion = False
+        config.attention_softmax_in_fp32 = True
+        config.ffn_hidden_size = 8192
     else:
         raise ValueError(f"unknown language model type {config.language_model_type}")
 
@@ -204,6 +217,10 @@ def get_vision_projection_config(config, hidden_size):
         config.ffn_hidden_size = 29568
         config.normalization = "LayerNorm"
         config.activation_func = torch.nn.functional.gelu
+    elif config.language_model_type == "llama3.2_1b":
+        config.ffn_hidden_size = 2048
+        config.activation_func = torch.nn.functional.gelu
+        config.normalization = "LayerNorm"
     else:
         raise ValueError(f"unknown language model type {config.language_model_type}")
 
