@@ -45,7 +45,7 @@ class TestRotaryEmbedding:
         assert output.dtype == torch.float32
         assert output.device.type == get_current_device_type()
 
-    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
     def test_cpu_forward(self):
         output = self.rope_cpu_init(64)
         assert output.shape[0] == 64

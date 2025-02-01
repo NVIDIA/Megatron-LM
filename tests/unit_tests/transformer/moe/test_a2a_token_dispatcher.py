@@ -3,13 +3,15 @@
 import pytest
 import torch
 
+from megatron.core.device_utils import get_xla_model
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.moe.test_token_dispatcher import MoEModelTestContainer
 
+xm = get_xla_model()
 
-def test_placeholder():
-    """This is here because otherwise there's no other test in this module (all disabled) and pytest would fail."""
-    pass
+#def test_placeholder():
+    #"""This is here because otherwise there's no other test in this module (all disabled) and pytest would fail."""
+    #pass
 
 
 class TestAlltoAllDispatcher:
@@ -19,7 +21,7 @@ class TestAlltoAllDispatcher:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Device not available")
     @pytest.mark.internal
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2), (1, 1)])
@@ -37,7 +39,7 @@ class TestAlltoAllDispatcher:
         )
         container.dispatcher_dropless_test()
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Device not available")
     @pytest.mark.internal
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2), (1, 1)])
@@ -55,7 +57,7 @@ class TestAlltoAllDispatcher:
         )
         container.dispatcher_dropless_test()
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Device not available")
     @pytest.mark.internal
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2), (1, 1)])
@@ -76,7 +78,7 @@ class TestAlltoAllDispatcher:
         )
         container.dispatcher_capacity_test()
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Device not available")
     @pytest.mark.internal
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2), (1, 1)])

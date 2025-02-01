@@ -331,12 +331,14 @@ test:pypi_build_wheel:
         sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '${PRE_RELEASE}.dev$((RANDOM % 900000 + 100000))'" megatron/core/package_info.py 
       fi
 
-    - /opt/python/cp310-cp310/bin/python -m build
+
     - /opt/python/cp311-cp311/bin/python -m build
     - auditwheel repair dist/*.whl
 
-    - /opt/python/cp310-cp310/bin/pip install .
-    - EXPECTED_RELEASE_NUMBER=$(/opt/python/cp310-cp310/bin/python -c "from megatron import core; print(core.__version__)")
+    # Install with no-deps since we
+    - /opt/python/cp311-cp311/bin/pip install --no-deps .
+    - /opt/python/cp311-cp311/bin/pip install numpy torch
+    - EXPECTED_RELEASE_NUMBER=$(/opt/python/cp311-cp311/bin/python -c "from megatron import core; print(core.__version__)")
     - echo "EXPECTED_RELEASE_NUMBER=$EXPECTED_RELEASE_NUMBER" | tee -a build.env
   artifacts:
     paths:
@@ -347,18 +349,19 @@ test:pypi_build_wheel:
 
 test:pypi_test_wheel:
   extends: [.test_rules]
-  image: python:3.10
+  image: python:3.11
   needs: [test:pypi_build_wheel]
   tags: [mcore-docker-node-small]
   variables:
     PUBLISH_DRYRUN: 'yes'
   script:
     - rm -rf megatron
-    - pip install wheelhouse/*cp310*.whl
+    - pip install wheelhouse/*cp311*.whl
 
     - RELEASE_NUMBER=$(python -c "from megatron import core; print(core.__version__)")
     - >
       echo "$EXPECTED_RELEASE_NUMBER" == "$RELEASE_NUMBER"
+
 
     - test "$EXPECTED_RELEASE_NUMBER" == "$RELEASE_NUMBER"
     - echo "RELEASE_NUMBER=$EXPECTED_RELEASE_NUMBER" | tee -a build.env
@@ -370,7 +373,7 @@ test:pypi_test_wheel:
 
 test:pypi_push_wheel:
   extends: [.test_rules]
-  image: python:3.10
+  image: python:3.11
   tags: [mcore-docker-node-small]
   needs: [test:pypi_test_wheel]
   variables:
@@ -388,11 +391,13 @@ test:pypi_push_wheel:
         export TWINE_PASSWORT=$TWINE_PROD_PASSWORD
       fi
 
+
     - pip install twine
     - >
       for i in 1 2 3 4 5; do 
         twine upload --verbose -u $TWINE_USERNAME -p $TWINE_PASSWORT --repository $REPOSITORY wheelhouse/* && break || sleep $(( 60*2**i )); 
       done
+
 
   rules:
     - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
@@ -427,6 +432,7 @@ test:gh_release:
                       "generate_release_notes": false
                   }'
               )
+
 
     - >
       CMD=$(echo curl -L \
@@ -466,6 +472,7 @@ test:notify_release:
             }
           ]
         }'
+
 
     - echo "$MESSAGE"
     - >

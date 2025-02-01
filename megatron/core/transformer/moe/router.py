@@ -194,7 +194,6 @@ class TopKRouter(Router):
                 sequence_load_balancing_loss_func,
                 probs=scores,
                 routing_map=routing_map,
-                tokens_per_expert=tokens_per_expert,
                 batch_size=bsz,
                 seq_length=seq_length,
                 topk=self.topk,
@@ -213,9 +212,12 @@ class TopKRouter(Router):
         sequence_partition_group = None
         xm = get_xla_model()
         if self.config.moe_token_dispatcher_type == "alltoall_seq":
-            sequence_partition_group = parallel_state.get_context_parallel_group()
+            if xm:
+                sequence_partition_group = parallel_state.get_context_parallel_groups()
+            else:
+                sequence_partition_group = parallel_state.get_context_parallel_group()
             moe_aux_loss_coeff /= parallel_state.get_tensor_model_parallel_world_size()
-        else:
+        elif parallel_state.get_tensor_and_context_parallel_world_size() > 1:
             if xm:
                 sequence_partition_group = parallel_state.get_tensor_and_context_parallel_groups()
             else:
@@ -335,5 +337,4 @@ class TopKRouter(Router):
         logits = self.gating(input)
 
         scores, routing_map = self.routing(logits)
-
         return scores, routing_map

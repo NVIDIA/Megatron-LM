@@ -50,7 +50,7 @@ class Test:
         assert tp4.shape[0] * 4 == tp1.shape[0]
         assert torch.equal(tp1[rank * 4 : (rank + 1) * 4], tp4)
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
     def test_row_init(self):
 
         Utils.initialize_model_parallel(1, 1)
@@ -82,7 +82,7 @@ class Test:
             assert tp4.shape[1] * 4 == tp1.shape[1]
             assert torch.allclose(tp1[:, :4], tp4)
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
     def test_col_init(self):
 
         Utils.initialize_model_parallel(1, 1)

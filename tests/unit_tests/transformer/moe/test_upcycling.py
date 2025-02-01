@@ -147,12 +147,12 @@ class TestGPTModel:
         args = create_test_args(tp, pp, enable_vp, enable_grouped_gemm)
         set_args(args)
 
-        set_manual_seed(_SEED)
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp,
             pipeline_model_parallel_size=pp,
             virtual_pipeline_model_parallel_size=args.virtual_pipeline_model_parallel_size,
         )
+        set_manual_seed(_SEED)
 
         dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
             model_provider, ModelType.encoder_or_decoder

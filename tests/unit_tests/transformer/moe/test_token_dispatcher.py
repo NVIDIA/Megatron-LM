@@ -115,9 +115,8 @@ class MoEModelTestContainer:
         (permuted_local_hidden_states, tokens_per_expert) = (
             moe_layer.token_dispatcher.token_permutation(hidden_states, probs, indices)
         )
-
+        
         scale = moe_layer.config.expert_tensor_parallel_size
-
         permuted_local_hidden_states /= scale
 
         restored_hidden_states, restored_bias = moe_layer.token_dispatcher.token_unpermutation(

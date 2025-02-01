@@ -143,7 +143,7 @@ def _gather_along_first_dim(input_, group: Union[torch.distributed.ProcessGroup,
 
     if group is None:
         group = get_tensor_model_parallel_group() if xm is None else get_tensor_model_parallel_groups()
-    world_size, _ = get_group_world_size_and_rank(group)
+    world_size, rank = get_group_world_size_and_rank(group)
     # Bypass the function if we are using only 1 GPU.
     if world_size == 1:
         return input_
@@ -477,11 +477,25 @@ class _AllToAll(torch.autograd.Function):
                 input_splits = torch.tensor(input_split_sizes, device=input.device, dtype=torch.int)
                 all_input_splits = xm.all_gather(input_splits, dim=0, groups=group, pin_layout=False).split(world_size)
                 all_input_splits = [ [ y.item() for y in x] for x in all_input_splits ]
+                all_input_sizes = [ sum(x) for x in all_input_splits]
 
-                all_inputs = xm.all_gather(input, dim=0, groups=group, pin_layout=False).split(input.size()[0])
-                all_inputs = [ torch.split(x, all_input_splits[i]) for i, x in enumerate(all_inputs) ]
-                scattered_inputs = [ [ x[r] for x in all_inputs] for r in range(world_size) ]
-                output = torch.cat( scattered_inputs[rank], dim=0).to(device=input.device)
+                output_splits = torch.tensor(output_split_sizes, device=input.device, dtype=torch.int)
+                all_output_splits = xm.all_gather(output_splits, dim=0, groups=group, pin_layout=False).split(world_size)
+                all_output_splits = [ [ y.item() for y in x] for x in all_output_splits ]
+
+                max_dim = max(all_input_sizes)
+                input = torch.nn.functional.pad(input, (0, 0, 0, (max_dim - input.size()[0])), value=0.0)
+                all_inputs = xm.all_gather(input, dim=0, groups=group, pin_layout=False)
+                all_inputs = all_inputs.split(max_dim)
+                all_inputs = [ torch.split(x[:all_input_sizes[i]], all_input_splits[i]) for i, x in enumerate(all_inputs) ]
+
+                for i, x in enumerate(all_inputs[rank]):
+                    assert x.size()[0] == all_input_splits[rank][i], f"{x.size()[0]} != {all_input_splits[rank][i]}"
+
+                all_outputs = [ [ x[r] for x in all_inputs] for r in range(world_size) ]
+                for i, x in enumerate(all_outputs[rank]):
+                    assert x.size()[0] == all_output_splits[rank][i], f"{x.size()[0]} != {all_output_splits[rank][i]}"
+                output = torch.cat( all_outputs[rank], dim=0).to(device=input.device)
         else:
             if output_split_sizes is None:
                 # Equal split (all2all)
