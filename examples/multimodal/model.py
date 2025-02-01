@@ -91,7 +91,7 @@ def model_provider(
     )
 
     vision_model_type = args.vision_model_type
-    if vision_model_type in ["clip", "siglip"]:
+    if vision_model_type in ["clip", "siglip", "radio"]:
         if use_te:
             vision_transformer_layer_spec = get_layer_spec_te(
                 is_vit=True
