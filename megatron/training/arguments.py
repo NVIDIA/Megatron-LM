@@ -616,6 +616,10 @@ def validate_args(args, defaults={}):
 
     if args.tp_comm_overlap:
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
+        
+    if args.multi_latent_attention:
+        if args.tensor_model_parallel_size > 1:
+            assert args.sequence_parallel == True, 'Sequence parallelism should be enabled when MLA is used with tensor parallel'
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
