@@ -16,6 +16,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
+from megatron.core.utils import get_attr_wrapped_model, get_model_config
 
 
 class TextGenerationController:
@@ -335,6 +336,13 @@ class TextGenerationController:
             batch_size, device=torch.cuda.current_device()
         ).cuda()
 
+        # Use model vocab size since tokenizer vocab size might not include padding
+        # to nearest power of 2
+        vocab_size = get_attr_wrapped_model(self.inference_wrapped_model.model, "vocab_size")
+
+        # Check whether CUDA graphs are enabled
+        enable_cuda_graph = get_model_config(self.inference_wrapped_model.model).enable_cuda_graph
+
         streaming_enabled = active_streams is not None and len(active_streams) > 0
         if streaming_enabled:
             # Start a separate thread for streaming tokens to avoid blocking the
@@ -351,12 +359,6 @@ class TextGenerationController:
             ]
             streaming_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             stream_tokens = functools.partial(self.stream_tokens, sampling_params)
-
-        # Check whether CUDA graphs are enabled
-        if hasattr(self.inference_wrapped_model.model, "module"):  # if model is Float16Module
-            enable_cuda_graph = self.inference_wrapped_model.model.module.config.enable_cuda_graph
-        else:
-            enable_cuda_graph = self.inference_wrapped_model.model.config.enable_cuda_graph
 
         use_attention_mask = True
 
@@ -398,7 +400,7 @@ class TextGenerationController:
                 if self.model_is_pipeline_parallel:
                     context_length = context_end_position - context_start_position
                     logits = broadcast_from_last_pipeline_stage(
-                        [batch_size, context_length, self.tokenizer.vocab_size],
+                        [batch_size, context_length, vocab_size],
                         dtype=self.inference_wrapped_model.inference_wrapper_config.params_dtype,
                         tensor=logits,
                     )
@@ -409,7 +411,7 @@ class TextGenerationController:
                 generation_started = prompt_lengths_in_batch <= context_end_position
                 last_token_logits = logits[:, -1, :]
                 sampled_logits = self.sample_from_logits(
-                    last_token_logits, sampling_params, self.tokenizer.vocab_size
+                    last_token_logits, sampling_params, vocab_size
                 )
 
                 # Substitute the sampled logits only for only the prompts that

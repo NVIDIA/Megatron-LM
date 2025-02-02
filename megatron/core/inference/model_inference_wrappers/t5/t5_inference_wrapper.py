@@ -14,6 +14,7 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
     InferenceWrapperConfig,
 )
 from megatron.core.models.T5 import T5Model
+from megatron.core.utils import get_attr_wrapped_model
 
 
 # pylint: disable=line-too-long
@@ -56,10 +57,7 @@ class T5InferenceWrapper(AbstractModelInferenceWrapper):
             A dict with all the inference input needed for the batch.
         """
         # get max_sequence_length
-        if hasattr(self.model, "module"):  # if self.model is Float16Module
-            max_sequence_length = self.model.module.max_sequence_length
-        else:
-            max_sequence_length = self.model.max_sequence_length
+        max_sequence_length = get_attr_wrapped_model(self.model, "max_sequence_length")
 
         encoder_prompts_tokens_list = [
             self.tokenize_encoder_prompt(encoder_prompt, tokenizer)
