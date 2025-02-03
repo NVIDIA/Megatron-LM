@@ -10,7 +10,7 @@ from typing import Callable
 import torch
 import transformer_engine as te
 import transformer_engine.pytorch.ops as te_ops 
-from pkg_resources import packaging
+#from pkg_resources import packaging
 from packaging.version import Version as PkgVersion
 from torch import Tensor
 from torch.nn.parameter import Parameter
@@ -121,7 +121,7 @@ class TESequentialLinear(te_ops.Sequential):
         extra_kwargs = _get_extra_te_kwargs(config)
 
         rng_tracker_name = None
-        if _te_version >= packaging.version.Version("1.7.0.dev"):
+        if is_te_min_version("1.7.0.dev"):
             extra_kwargs["rng_tracker_name"] = rng_tracker_name
 
         self.expert_parallel = self.config.expert_model_parallel_size > 1
@@ -129,14 +129,14 @@ class TESequentialLinear(te_ops.Sequential):
             rng_tracker_name = get_expert_parallel_rng_tracker_name()
         else:
             rng_tracker_name = None
-        if _te_version >= packaging.version.Version("1.7.0.dev"):
+        if is_te_min_version("1.7.0.dev"):
             extra_kwargs["rng_tracker_name"] = rng_tracker_name
         self.expert_parallel = self.config.expert_model_parallel_size > 1
         if is_expert and self.expert_parallel:
             rng_tracker_name = get_expert_parallel_rng_tracker_name()
         else:
             rng_tracker_name = None
-        if _te_version >= packaging.version.Version("1.7.0.dev"):
+        if is_te_min_version("1.7.0.dev"):
             extra_kwargs["rng_tracker_name"] = rng_tracker_name
 
         # Disable communications in TE when using SP or EP by making TE agnostic of model parallel.
@@ -173,11 +173,6 @@ class TESequentialLinear(te_ops.Sequential):
             state_dict, prefix, {'weight': 0, 'bias': 0}, sharded_offsets
         )
 
-
-
-
-
-
 class TESwigluLinear(te_ops.Sequential):
     """
     Wrapper for Transformer-Engine's SwiGLU + Linear layer.
@@ -186,7 +181,7 @@ class TESwigluLinear(te_ops.Sequential):
     def __init__(
         self,
         input_size: int,
-        output_size: int,
+        output_size: int,      # output_size
         *,
         config: ModelParallelConfig,
         init_method: Callable,
@@ -210,7 +205,7 @@ class TESwigluLinear(te_ops.Sequential):
         extra_kwargs = _get_extra_te_kwargs(config)
 
         rng_tracker_name = None
-        if _te_version >= packaging.version.Version("1.7.0.dev"):
+        if is_te_min_version("1.7.0.dev"):
             extra_kwargs["rng_tracker_name"] = rng_tracker_name
 
         self.expert_parallel = self.config.expert_model_parallel_size > 1
@@ -218,7 +213,7 @@ class TESwigluLinear(te_ops.Sequential):
             rng_tracker_name = get_expert_parallel_rng_tracker_name()
         else:
             rng_tracker_name = None
-        if _te_version >= packaging.version.Version("1.7.0.dev"):
+        if is_te_min_version("1.7.0.dev"):
             extra_kwargs["rng_tracker_name"] = rng_tracker_name
 
         # Disable communications in TE when using SP or EP by making TE agnostic of model parallel.
@@ -236,7 +231,7 @@ class TESwigluLinear(te_ops.Sequential):
             tp_group = None
 
         super().__init__(
-            te_ops.CastFloat8(forward=False, backward=True),
+            te_ops.Quantize(forward=False, backward=True),
             te_ops.SwiGLU(), 
             te_ops.Linear(
                 in_features=input_size,
