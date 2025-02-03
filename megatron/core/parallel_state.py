@@ -725,9 +725,13 @@ def initialize_model_parallel(
             _DATA_PARALLEL_GLOBAL_RANKS = ranks
 
     assert (
-        data_parallel_size % num_distributed_optimizer_instances == 0
-    ), 'Data parallel size should be divisible by partial DistOpt shard factor'
-    intra_partial_data_parallel_size = data_parallel_size // num_distributed_optimizer_instances
+        data_parallel_size * context_parallel_size
+    ) % num_distributed_optimizer_instances == 0, (
+        'Data parallel size should be divisible by partial DistOpt shard factor'
+    )
+    intra_partial_data_parallel_size = (
+        data_parallel_size * context_parallel_size
+    ) // num_distributed_optimizer_instances
 
     for ranks_with_cp in generator_wrapper('dp-cp'):
         group_with_cp = torch.distributed.new_group(
