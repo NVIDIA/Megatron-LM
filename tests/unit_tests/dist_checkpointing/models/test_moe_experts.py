@@ -43,6 +43,7 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
         num_moe_experts=num_moe_experts,
         use_cpu_initialization=True,
         gated_linear_unit=glu,
+        fp8="hybrid" if fp8 else None,
     )
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs)
@@ -66,8 +67,20 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
             transformer_config,
             transformer_layer_spec.submodules.mlp.submodules.experts.submodules,
         )
+    elif expert_type == 'te_sequential':
+        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=num_moe_experts, moe_grouped_gemm=False
+        )
+        model = SequentialMLP(
+            num_local_experts,
+            transformer_config,
+            transformer_layer_spec.submodules.mlp.submodules.experts.submodules,
+        )
     else:
-        raise ValueError('expert_type can only be one of ["sequential", "grouped", "te_grouped"]')
+        raise ValueError(
+            'expert_type can only be one of ["sequential", "te_sequential", "grouped",'
+            ' "te_grouped"]'
+        )
     return model
 
 
@@ -79,10 +92,14 @@ def get_pp_offsets():
 
 expert_type = ['sequential', 'grouped']
 src_dest_expert_type = [('sequential', 'grouped'), ('grouped', 'sequential')]
+if is_te_min_version("1.7.0.dev0"):
+    expert_type.append('te_sequential')
+    src_dest_expert_type.append(('sequential', 'te_sequential'))
+    src_dest_expert_type.append(('te_sequential', 'sequential'))
 if is_te_min_version("1.9.0.dev0"):
     expert_type.append('te_grouped')
-    src_dest_expert_type.append(('sequential', 'te_grouped'))
-    src_dest_expert_type.append(('te_grouped', 'sequential'))
+    src_dest_expert_type.append(('te_sequential', 'te_grouped'))
+    src_dest_expert_type.append(('te_grouped', 'te_sequential'))
 
 
 class TestExpertLayerReconfiguration:
@@ -283,10 +300,10 @@ class TestExpertLayerReconfiguration:
         "src_module,dst_module,src_tp_pp_exp,dest_tp_pp_exp",
         [
             # Changing tp/pp/dp doesn't affect _extra_state
-            ('sequential', 'te_grouped', (1, 1, 1), (1, 1, 4)),
-            ('sequential', 'te_grouped', (1, 1, 4), (1, 1, 1)),
-            ('te_grouped', 'sequential', (1, 1, 1), (1, 1, 4)),
-            ('te_grouped', 'sequential', (1, 1, 4), (1, 1, 1)),
+            ('te_sequential', 'te_grouped', (1, 1, 1), (1, 1, 4)),
+            ('te_sequential', 'te_grouped', (1, 1, 4), (1, 1, 1)),
+            ('te_grouped', 'te_sequential', (1, 1, 1), (1, 1, 4)),
+            ('te_grouped', 'te_sequential', (1, 1, 4), (1, 1, 1)),
         ],
     )
     def test_sequential_grouped_mlp_extra_state(

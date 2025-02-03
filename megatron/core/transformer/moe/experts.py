@@ -33,7 +33,10 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import make_sharded_object_for_checkpoint
+from megatron.core.transformer.utils import (
+    make_sharded_object_for_checkpoint,
+    sharded_state_dict_default,
+)
 
 try:
 
@@ -369,6 +372,7 @@ class GroupedMLP(MegatronModule):
                         v_tensors = []
                         w_lens = []
                         v_lens = []
+                        expert_global_idx = local_expert_indices_offset + local_expert_idx
                         for input_dim_idx in range(self.config.hidden_size):
                             for glu_idx in range(2):
                                 local_idx = (
@@ -399,9 +403,6 @@ class GroupedMLP(MegatronModule):
                                         == local_flattened_range.stop - local_flattened_range.start
                                     )
                                     start_pos += len(local_tensor)
-                                    expert_global_idx = (
-                                        local_expert_indices_offset + local_expert_idx
-                                    )
                                     if glu_idx == 0:
                                         w_tensors.append(local_tensor)
                                         w_lens.append(len(local_tensor))
@@ -719,7 +720,7 @@ class TEGroupedMLP(MegatronModule):
         """
         sharded_state_dict = {}
         for name, module in self._modules.items():
-            sub_sd = module.sharded_state_dict(f'{name}.', sharded_offsets, metadata)
+            sub_sd = sharded_state_dict_default(module, f'{name}.', sharded_offsets, metadata)
             if name == 'linear_fc1' and self.config.gated_linear_unit:
                 num_global_experts = (
                     parallel_state.get_expert_model_parallel_world_size() * self.num_local_experts
