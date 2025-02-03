@@ -433,6 +433,14 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 save_strategy = get_default_save_sharded_strategy(args.ckpt_format)
                 if args.ckpt_assume_constant_structure and args.ckpt_format == 'torch_dist':
                     save_strategy.use_cached_ckpt_structure = args.ckpt_assume_constant_structure
+                    if checkpointing_context is not None and 'load_strategy' in checkpointing_context:
+                        cached_global_metadata = getattr(checkpointing_context['load_strategy'], 'cached_global_metadata', None)
+                        if cached_global_metadata is not None:
+                            logger.debug("Plugging in the read metadata from the load strategy...")
+                            save_strategy.cached_global_metadata = cached_global_metadata
+                        else:
+                            logger.debug("Failed to plug in the read metadata from the load strategy...")
+
                 if args.ckpt_fully_parallel_save:
                     save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, mpu.get_data_parallel_group(with_context_parallel=True),
                                                                      args.ckpt_assume_constant_structure)
@@ -771,7 +779,8 @@ def _load_non_persistent_base_checkpoint(
                 f'Loading from a non-persistent checkpoint (non-persistent iter {non_persistent_iteration})'
             )
         return _load_global_dist_base_checkpoint(
-            non_persistent_global_dir, args, rank0, sharded_state_dict, non_persistent_iteration, False
+            non_persistent_global_dir, args, rank0, sharded_state_dict, non_persistent_iteration, False,
+            checkpointing_context=checkpointing_context
         )
     elif args.non_persistent_ckpt_type == "local":
         intermediate_state_dict, checkpoint_name = checkpointing_context[
@@ -789,7 +798,7 @@ def _load_non_persistent_base_checkpoint(
 
 
 def _load_global_dist_base_checkpoint(
-    load_dir, args, rank0, sharded_state_dict, iteration, release
+    load_dir, args, rank0, sharded_state_dict, iteration, release, checkpointing_context=None
 ):
     """ Load the base state_dict from the given directory containing the global distributed checkpoint """
     if rank0:
@@ -813,6 +822,8 @@ def _load_global_dist_base_checkpoint(
         load_strategy = FullyParallelLoadStrategyWrapper(
             load_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
         )
+    if checkpointing_context is not None:
+        checkpointing_context["load_strategy"] = load_strategy
     state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name, load_strategy, strict=args.dist_ckpt_strictness)
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
@@ -886,7 +897,7 @@ def _load_base_checkpoint(
     # Handle global distributed checkpoint
     if is_dist_ckpt:
         return _load_global_dist_base_checkpoint(
-            load_dir, args, rank0, sharded_state_dict, iteration, release
+            load_dir, args, rank0, sharded_state_dict, iteration, release, checkpointing_context=checkpointing_context
         )
     # Handle global legacy checkpoint
     if rank0:
